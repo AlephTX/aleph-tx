@@ -135,11 +135,10 @@ impl BinanceAdapter {
     fn sign_request(&self, query_string: &str) -> String {
         // HMAC SHA256 signature
         use hmac::{Hmac, Mac};
-        type HmacSha256 = Hmac<sha2::Sha256>;
+        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
         
-        let mut mac = HmacSha256::new_from_slice(
-            self.config.api_secret.as_ref().unwrap_or(&"".to_string()).as_bytes()
-        ).unwrap();
+        let secret = self.config.api_secret.as_ref().unwrap_or(&"".to_string());
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(query_string.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }

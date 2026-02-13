@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-workspace = true
+# Will add MEV-specific dependencies later
 
 [lib]
 name = "aleph_mev"
