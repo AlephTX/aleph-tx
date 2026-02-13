@@ -11,6 +11,7 @@
 # Environment
 .env
 .env.local
+.env.*
 
 # Logs
 *.log
@@ -25,3 +26,7 @@ Thumbs.db
 *.key
 *secret*
 *password*
+*.hex
+
+# Keys directory
+keys/

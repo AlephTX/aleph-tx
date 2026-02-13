@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package aleph;
+
+option go_package = "github.com/AlephTX/aleph-tx/proto";
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────────────
+// Core Services
+// ─────────────────────────────────────────────────────────────────
+
+service AlephCore {
+    // Market Data
+    rpc SubscribeOrderbook(OrderbookRequest) returns (stream OrderbookUpdate);
+    rpc SubscribeTicker(TickerRequest) returns (stream Ticker);
+    
+    // Trading
+    rpc PlaceOrder(OrderRequest) returns (OrderResponse);
+    rpc CancelOrder(CancelRequest) returns (OrderResponse);
+    rpc GetOrder(OrderQuery) returns (Order);
+    rpc GetOpenOrders(OpenOrdersRequest) returns (OpenOrdersResponse);
+    
+    // Positions & Balance
+    rpc GetPositions(PositionsRequest) returns (PositionsResponse);
+    rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+    
+    // State
+    rpc GetGlobalState(StateRequest) returns (GlobalState);
+    
+    // Control
+    rpc HealthCheck(HealthRequest) returns (HealthResponse);
+    rpc Pause(PauseRequest) returns (PauseResponse);
+    rpc Resume(ResumeRequest) returns (ResumeResponse);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Messages
+// ─────────────────────────────────────────────────────────────────
+
+message OrderbookRequest {
+    repeated string symbols = 1;
+    int32 depth = 2;
+}
+
+message OrderbookUpdate {
+    string symbol = 1;
+    repeated PriceLevel bids = 2;
+    repeated PriceLevel asks = 3;
+    google.protobuf.Timestamp timestamp = 4;
+}
+
+message PriceLevel {
+    string price = 1;
+    string quantity = 2;
+}
+
+message TickerRequest {
+    repeated string symbols = 1;
+}
+
+message Ticker {
+    string symbol = 1;
+    string bid = 2;
+    string ask = 3;
+    string last = 4;
+    string volume_24h = 5;
+    google.protobuf.Timestamp timestamp = 6;
+}
+
+message OrderRequest {
+    string symbol = 1;
+    Side side = 2;
+    OrderType order_type = 3;
+    string quantity = 4;
+    string price = 5;
+    bool reduce_only = 6;
+    bool post_only = 7;
+}
+
+message OrderResponse {
+    string order_id = 1;
+    OrderStatus status = 2;
+    string filled_quantity = 3;
+    string filled_price = 4;
+    google.protobuf.Timestamp created_at = 5;
+}
+
+message CancelRequest {
+    string order_id = 1;
+}
+
+message OrderQuery {
+    string order_id = 1;
+}
+
+message OpenOrdersRequest {
+    string symbol = 1;
+}
+
+message OpenOrdersResponse {
+    repeated Order orders = 1;
+}
+
+message Order {
+    string id = 1;
+    string symbol = 2;
+    Side side = 3;
+    OrderType order_type = 4;
+    string quantity = 5;
+    string price = 6;
+    OrderStatus status = 7;
+    string filled_quantity = 8;
+    string filled_price = 9;
+    google.protobuf.Timestamp created_at = 10;
+    google.protobuf.Timestamp updated_at = 11;
+}
+
+message PositionsRequest {}
+
+message PositionsResponse {
+    repeated Position positions = 1;
+}
+
+message Position {
+    string symbol = 1;
+    Side side = 2;
+    string quantity = 3;
+    string entry_price = 4;
+    string unrealized_pnl = 5;
+    google.protobuf.Timestamp opened_at = 6;
+}
+
+message BalanceRequest {}
+
+message BalanceResponse {
+    repeated Balance balances = 1;
+}
+
+message Balance {
+    string asset = 1;
+    string free = 2;
+    string locked = 3;
+}
+
+message StateRequest {}
+
+message GlobalState {
+    repeated Position positions = 1;
+    repeated Balance balances = 2;
+    repeated Ticker tickers = 3;
+    bool is_paused = 4;
+    google.protobuf.Timestamp updated_at = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+    bool healthy = 1;
+    string version = 2;
+    int64 uptime_seconds = 3;
+}
+
+message PauseRequest {
+    string reason = 1;
+}
+
+message PauseResponse {
+    bool success = 1;
+}
+
+message ResumeRequest {}
+
+message ResumeResponse {
+    bool success = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────
+
+enum Side {
+    BUY = 0;
+    SELL = 1;
+}
+
+enum OrderType {
+    MARKET = 0;
+    LIMIT = 1;
+    STOP_LOSS = 2;
+    TAKE_PROFIT = 3;
+}
+
+enum OrderStatus {
+    PENDING = 0;
+    OPEN = 1;
+    PARTIALLY_FILLED = 2;
+    FILLED = 3;
+    CANCELLED = 4;
+    REJECTED = 5;
+    EXPIRED = 6;
+}

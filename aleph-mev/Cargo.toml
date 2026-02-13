@@ -1,0 +1,12 @@
+[package]
+name = "aleph-mev"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+workspace = true
+
+[lib]
+name = "aleph_mev"
+path = "src/lib.rs"
