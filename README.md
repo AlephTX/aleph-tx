@@ -1,35 +1,130 @@
-# AlephTX 量化交易系统
+# AlephTX - AI Quantitative Trading System
 
-AI-powered quantitative trading system
+> High-performance, extensible quantitative trading system built with Rust
 
-## 核心目标
-- **速度优先**：行情获取延迟最低
-- **代码质量**：严格规范
+## Core Principles
+- 🚀 **Speed First** - Rust for maximum performance
+- 🔒 **Security** - Never expose sensitive information
+- 🏗️ **Extensibility** - Support multiple exchanges & strategies
+- 📐 **Jeff Dean Quality** - Strict typing, zero-cost abstractions
 
-## 技术方案
+## Architecture
 
-### 1. 行情数据获取
-- **WebSocket** 优先于 REST API（ Binance WS: wss://stream.binance.com:9443 ）
-- 对于不支持 WS 的交易所，用 REST + 缓存，但主要交易所必须用 WS
-- 数据预处理在内存中完成，不落盘
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      AlephTX Core                           │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
+│  │   Feeds    │  │  Strategies  │  │  Risk Manager   │  │
+│  │  (Market)  │  │   (Logic)    │  │   (Protection)  │  │
+│  └──────┬──────┘  └──────┬──────────────┬────────┘  │
+┘  └│         │                 │                   │            │
+│  ┌──────┴─────────────────┴───────────────────┴────────┐ │
+│  │                    Execution Layer                     │ │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌───────────┐  │ │
+│  │  │Binance │ │   OKX   │ │ EdgeX   │ │  Others   │  │ │
+│  │  └─────────┘ └─────────┘ └─────────┘ └───────────┘  │ │
+│  └───────────────────────────────────────────────────────┘ │
+│                            │                                │
+│  ┌─────────────────────────┴─────────────────────────────┐ │
+│  │              Telegram Controller (@AlephTXBot)         │ │
+│  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### 2. 延迟优化
-- WSL2 → 目标交易所的网络延迟需要测试
-- 考虑用 China Edge 节点或香港服务器
-- 代码层面：异步非阻塞 + 连接池
+## Supported Exchanges (Planned)
 
-### 3. 代码规范
-- TypeScript 强制类型检查
-- ESLint + Prettier
-- 单元测试覆盖率 > 80%
-- Gitmoji commit 规范
-- CI/CD 自动化
+### Spot
+- [ ] Binance
+- [ ] OKX
 
-### 4. 架构
-- Node.js + TypeScript + CCXT
-- Telegram Bot (@AlephTXBot) 作为控制面板
-- Docker 容器化部署
+### Perpetual DEX
+- [ ] EdgeX
+- [ ] GMX
+- [ ] dYdX
+- [ ] 01.xyz
+- [ ] Vertex
+- [ ] Hyperliquid
 
-### 5. 待定
-- 交易所选择
-- 策略方向
+## Features
+
+- [ ] WebSocket real-time market data
+- [ ] REST API fallback
+- [ ] Cross-exchange arbitrage
+- [ ] Grid trading strategy
+- [ ] Trend following strategy
+- [ ] Paper trading mode
+- [ ] Telegram bot control
+
+## Code Standards
+
+```rust
+// Zero-cost abstractions, strong typing
+pub trait Exchange: Send + Sync {
+    async fn fetch_ticker(&self, symbol: &str) -> Result<Ticker, Error>;
+    async fn place_order(&self, order: Order) -> Result<Order, Error>;
+    // ... trait methods
+}
+```
+
+## Tech Stack
+
+- **Language**: Rust (2021 edition)
+- **Runtime**: Tokio (async)
+- **HTTP**: Reqwest
+- **WebSocket**: Tungstenite
+- **Serialization**: Serde + Protobuf
+- **Config**: TOML + Schema validation
+
+## Getting Started
+
+```bash
+# Build
+cargo build --release
+
+# Run (paper trading)
+cargo run -- --mode paper
+
+# Run with Telegram
+cargo run -- --telegram-bot-token YOUR_TOKEN
+```
+
+## Modules
+
+| Module | Description |
+|--------|-------------|
+| `core` | Common types, traits, errors |
+| `feeds` | Market data ingestion (WS + REST) |
+| `exchanges` | Exchange implementations |
+| `strategies` | Trading strategies |
+| `execution` | Order management |
+| `risk` | Risk controls |
+| `telegram` | Bot controller |
+
+## Development
+
+```bash
+# Format
+cargo fmt
+
+# Lint
+cargo clippy
+
+# Test
+cargo test --all
+
+# Benchmarks
+cargo bench
+```
+
+## Roadmap
+
+1. [x] Project setup (Rust)
+2. [ ] Core traits & types
+3. [ ] WebSocket feed implementation
+4. [ ] Exchange trait + Binance impl
+5. [ ] Basic strategy framework
+6. [ ] Paper trading mode
+7. [ ] Telegram integration
+8. [ ] Add more exchanges
+9. [ ] Arbitrage strategies
