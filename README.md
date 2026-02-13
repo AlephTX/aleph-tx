@@ -1,4 +1,6 @@
-# AlephTX 量化交易系统 - 技术规范
+# AlephTX 量化交易系统
+
+AI-powered quantitative trading system
 
 ## 核心目标
 - **速度优先**：行情获取延迟最低
