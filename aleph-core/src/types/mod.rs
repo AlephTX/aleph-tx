@@ -1,9 +1,8 @@
-//! Core types - Strong typing for safety
+//! Core Types - Strong typing for safety
 
-use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use rust_decimal::Decimal;
+use chrono::{DateTime, Utc};
 
 /// Tradeable symbol (e.g., "BTC/USDT")
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,6 +24,18 @@ impl std::fmt::Display for Symbol {
     }
 }
 
+impl From<&str> for Symbol {
+    fn from(s: &str) -> Self {
+        Symbol::new(s)
+    }
+}
+
+impl From<String> for Symbol {
+    fn from(s: String) -> Self {
+        Symbol::new(s)
+    }
+}
+
 /// Price with arbitrary precision
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price(Decimal);
@@ -35,7 +46,7 @@ impl Price {
     }
 
     pub fn from_f64(value: f64) -> Self {
-        Self(Decimal::try_from(value).unwrap())
+        Self(Decimal::try_from(value).unwrap_or(Decimal::ZERO))
     }
 
     pub fn as_decimal(&self) -> Decimal {
@@ -53,7 +64,7 @@ impl std::fmt::Display for Price {
     }
 }
 
-/// Quantity/Size
+/// Quantity
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Quantity(Decimal);
 
@@ -63,7 +74,7 @@ impl Quantity {
     }
 
     pub fn from_f64(value: f64) -> Self {
-        Self(Decimal::try_from(value).unwrap())
+        Self(Decimal::try_from(value).unwrap_or(Decimal::ZERO))
     }
 
     pub fn as_decimal(&self) -> Decimal {
@@ -98,17 +109,6 @@ pub enum OrderType {
     TakeProfit,
 }
 
-impl std::fmt::Display for OrderType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OrderType::Market => write!(f, "MARKET"),
-            OrderType::Limit => write!(f, "LIMIT"),
-            OrderType::StopLoss => write!(f, "STOP_LOSS"),
-            OrderType::TakeProfit => write!(f, "TAKE_PROFIT"),
-        }
-    }
-}
-
 /// Order status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -125,7 +125,7 @@ pub enum OrderStatus {
 /// Order
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    pub id: Uuid,
+    pub id: String,
     pub symbol: Symbol,
     pub side: Side,
     pub order_type: OrderType,
@@ -134,44 +134,8 @@ pub struct Order {
     pub status: OrderStatus,
     pub filled_quantity: Quantity,
     pub filled_price: Option<Price>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl Order {
-    pub fn new_market(symbol: Symbol, side: Side, quantity: Quantity) -> Self {
-        let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            symbol,
-            side,
-            order_type: OrderType::Market,
-            quantity,
-            price: None,
-            status: OrderStatus::Pending,
-            filled_quantity: Quantity::new(0),
-            filled_price: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    pub fn new_limit(symbol: Symbol, side: Side, quantity: Quantity, price: Price) -> Self {
-        let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            symbol,
-            side,
-            order_type: OrderType::Limit,
-            quantity,
-            price: Some(price),
-            status: OrderStatus::Pending,
-            filled_quantity: Quantity::new(0),
-            filled_price: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// Position
@@ -182,38 +146,7 @@ pub struct Position {
     pub quantity: Quantity,
     pub entry_price: Price,
     pub unrealized_pnl: Decimal,
-    pub opened_at: DateTime<Utc>,
-}
-
-/// Ticker/Market data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ticker {
-    pub symbol: Symbol,
-    pub bid: Price,
-    pub ask: Price,
-    pub last: Price,
-    pub volume_24h: Decimal,
-    pub timestamp: DateTime<Utc>,
-}
-
-/// Trade signal
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Signal {
-    pub id: Uuid,
-    pub symbol: Symbol,
-    pub signal_type: SignalType,
-    pub price: Price,
-    pub reason: String,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SignalType {
-    EntryLong,
-    EntryShort,
-    ExitLong,
-    ExitShort,
+    pub opened_at: u64,
 }
 
 /// Account balance
@@ -229,3 +162,35 @@ impl Balance {
         self.free + self.locked
     }
 }
+
+/// Orderbook
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Orderbook {
+    pub symbol: Symbol,
+    pub bids: Vec<crate::adapter::PriceLevel>,
+    pub asks: Vec<crate::adapter::PriceLevel>,
+    pub timestamp: u64,
+}
+
+/// Trade signal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Signal {
+    pub id: String,
+    pub symbol: Symbol,
+    pub signal_type: SignalType,
+    pub price: Price,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalType {
+    EntryLong,
+    EntryShort,
+    ExitLong,
+    ExitShort,
+}
+
+/// Timestamp alias
+pub type Timestamp = u64;

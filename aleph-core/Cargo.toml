@@ -1,0 +1,16 @@
+[package]
+name = "aleph-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+workspace = true
+
+[lib]
+name = "aleph_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aleph-core"
+path = "src/main.rs"
