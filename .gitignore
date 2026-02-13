@@ -1,7 +1,27 @@
-node_modules/
-dist/
+# Build outputs
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
 .env
+.env.local
+
+# Logs
 *.log
+logs/
+
+# OS
 .DS_Store
-coverage/
-*.tgz
+Thumbs.db
+
+# Keys/Secrets - NEVER commit!
+*.pem
+*.key
+*secret*
+*password*

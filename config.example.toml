@@ -1,0 +1,47 @@
+# AlephTX Configuration Example
+# Copy to config.toml and fill in your values
+
+[app]
+mode = "paper"           # "paper" or "live"
+log_level = "info"       # "debug", "info", "warn", "error"
+# data_dir = "./data"    # Optional: custom data directory
+
+# Exchange configurations
+[[exchanges]]
+id = "binance"
+# api_key = "${BINANCE_API_KEY}"      # From environment
+# api_secret = "${BINANCE_SECRET}"    # From environment
+testnet = true
+enabled = true
+
+[[exchanges]]
+id = "okx"
+# api_key = "${OKX_API_KEY}"
+# api_secret = "${OKX_SECRET}"
+testnet = true
+enabled = false
+
+[[exchanges]]
+id = "edgex"
+# rpc_url = "https://testnet.edgex.ai"
+testnet = true
+enabled = false
+
+# Trading settings
+[trading]
+symbols = ["BTC/USDT", "ETH/USDT"]
+max_positions = 3
+order_size_fraction = 0.1    # 10% of balance per trade
+
+# Risk management
+[risk]
+max_portfolio_risk = 0.2      # Max 20% portfolio at risk
+max_position_risk = 0.1       # Max 10% per position
+max_drawdown = 0.15           # Stop at 15% drawdown
+emergency_stop = true
+
+# Telegram bot (optional)
+[telegram]
+# bot_token = "${TELEGRAM_BOT_TOKEN}"
+# allowed_users = ["123456789"]      # Your Telegram user ID
+notifications = true
