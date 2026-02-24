@@ -1,4 +1,7 @@
 //! Arbitrage state machine — cross-DEX spread detection and execution.
+//!
+//! Maintains a fixed-size BBO matrix indexed by `[symbol_id][exchange_id]`.
+//! All operations are zero-allocation on the hot path.
 
 use crate::shm_reader::ShmBboMessage;
 
@@ -21,13 +24,14 @@ pub struct BboSnapshot {
 }
 
 impl BboSnapshot {
+    /// A snapshot is valid when both sides are quoted and not crossed.
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
         self.bid_price > 0.0 && self.ask_price > 0.0 && self.bid_price < self.ask_price
     }
 }
 
-/// Arbitrage signal — what to do.
+/// Arbitrage signal — describes a detected opportunity.
 #[derive(Debug, Clone)]
 pub struct ArbSignal {
     pub symbol_id: u16,
@@ -39,14 +43,17 @@ pub struct ArbSignal {
     pub spread_bps: f64,
 }
 
-/// Global market state — the "brain" of the arbitrage engine.
-/// Stack-allocated, no heap. Fixed-size arrays indexed by [symbol_id][exchange_id].
+/// Global market state — the core of the arbitrage engine.
+///
+/// Entirely stack-allocated. `bbo_matrix` is indexed as
+/// `[symbol_id][exchange_id]` for O(1) lookups with no indirection.
 pub struct GlobalMarketState {
     bbo_matrix: [[BboSnapshot; NUM_EXCHANGES]; MAX_SYMBOLS],
     min_spread_bps: f64,
 }
 
 impl GlobalMarketState {
+    /// Create a new state with the given minimum spread threshold (in basis points).
     pub fn new(min_spread_bps: f64) -> Self {
         Self {
             bbo_matrix: [[BboSnapshot::default(); NUM_EXCHANGES]; MAX_SYMBOLS],
@@ -71,11 +78,12 @@ impl GlobalMarketState {
     }
 
     /// Check for arbitrage between Hyperliquid and Lighter for a given symbol.
-    /// Returns `Some(ArbSignal)` if spread exceeds threshold.
     ///
-    /// Arb exists when:
-    ///   - HL bid > Lighter ask  → buy Lighter, sell HL
-    ///   - Lighter bid > HL ask  → buy HL, sell Lighter
+    /// Arb exists when prices cross:
+    /// - HL bid > Lighter ask → buy Lighter, sell HL
+    /// - Lighter bid > HL ask → buy HL, sell Lighter
+    ///
+    /// Returns `Some(ArbSignal)` if spread exceeds `min_spread_bps`.
     #[inline(always)]
     pub fn check_arbitrage(&self, symbol_id: u16) -> Option<ArbSignal> {
         let sym = symbol_id as usize;
@@ -92,48 +100,61 @@ impl GlobalMarketState {
 
         // Direction 1: buy on Lighter (at ask), sell on Hyperliquid (at bid)
         let spread_1 = hl.bid_price - lt.ask_price;
-        let mid_1 = (hl.bid_price + lt.ask_price) * 0.5;
-        let spread_bps_1 = (spread_1 / mid_1) * 10_000.0;
-
-        if spread_bps_1 > self.min_spread_bps {
-            let size = f64::min(hl.bid_size, lt.ask_size);
-            return Some(ArbSignal {
-                symbol_id,
-                buy_exchange: EXCHANGE_LIGHTER,
-                sell_exchange: EXCHANGE_HYPERLIQUID,
-                buy_price: lt.ask_price,
-                sell_price: hl.bid_price,
-                size,
-                spread_bps: spread_bps_1,
-            });
+        if spread_1 > 0.0 {
+            let mid = (hl.bid_price + lt.ask_price) * 0.5;
+            let spread_bps = (spread_1 / mid) * 10_000.0;
+            if spread_bps > self.min_spread_bps {
+                let size = f64::min(hl.bid_size, lt.ask_size);
+                return Some(ArbSignal {
+                    symbol_id,
+                    buy_exchange: EXCHANGE_LIGHTER,
+                    sell_exchange: EXCHANGE_HYPERLIQUID,
+                    buy_price: lt.ask_price,
+                    sell_price: hl.bid_price,
+                    size,
+                    spread_bps,
+                });
+            }
         }
 
         // Direction 2: buy on Hyperliquid (at ask), sell on Lighter (at bid)
         let spread_2 = lt.bid_price - hl.ask_price;
-        let mid_2 = (lt.bid_price + hl.ask_price) * 0.5;
-        let spread_bps_2 = (spread_2 / mid_2) * 10_000.0;
-
-        if spread_bps_2 > self.min_spread_bps {
-            let size = f64::min(lt.bid_size, hl.ask_size);
-            return Some(ArbSignal {
-                symbol_id,
-                buy_exchange: EXCHANGE_HYPERLIQUID,
-                sell_exchange: EXCHANGE_LIGHTER,
-                buy_price: hl.ask_price,
-                sell_price: lt.bid_price,
-                size,
-                spread_bps: spread_bps_2,
-            });
+        if spread_2 > 0.0 {
+            let mid = (lt.bid_price + hl.ask_price) * 0.5;
+            let spread_bps = (spread_2 / mid) * 10_000.0;
+            if spread_bps > self.min_spread_bps {
+                let size = f64::min(lt.bid_size, hl.ask_size);
+                return Some(ArbSignal {
+                    symbol_id,
+                    buy_exchange: EXCHANGE_HYPERLIQUID,
+                    sell_exchange: EXCHANGE_LIGHTER,
+                    buy_price: hl.ask_price,
+                    sell_price: lt.bid_price,
+                    size,
+                    spread_bps,
+                });
+            }
         }
 
         None
+    }
+
+    /// Get a reference to a BBO snapshot for diagnostics.
+    pub fn get_bbo(&self, symbol_id: u16, exchange_id: u8) -> Option<&BboSnapshot> {
+        let sym = symbol_id as usize;
+        let exch = exchange_id as usize;
+        if sym < MAX_SYMBOLS && exch < NUM_EXCHANGES {
+            Some(&self.bbo_matrix[sym][exch])
+        } else {
+            None
+        }
     }
 }
 
 /// Placeholder execution function — will be replaced with real order submission.
 pub fn execute_arbitrage(signal: &ArbSignal) {
     tracing::warn!(
-        "🚨 ARB DETECTED sym={} buy_exch={} sell_exch={} buy@{:.2} sell@{:.2} size={:.4} spread={:.1}bps",
+        "🚨 ARB sym={} buy_exch={} sell_exch={} buy@{:.2} sell@{:.2} size={:.4} spread={:.1}bps",
         signal.symbol_id,
         signal.buy_exchange,
         signal.sell_exchange,
@@ -149,39 +170,29 @@ pub fn execute_arbitrage(signal: &ArbSignal) {
 mod tests {
     use super::*;
 
+    fn make_msg(exchange_id: u8, symbol_id: u16, bid: f64, ask: f64) -> ShmBboMessage {
+        ShmBboMessage {
+            seqlock: 2,
+            msg_type: 1,
+            exchange_id,
+            symbol_id,
+            timestamp_ns: 1000,
+            bid_price: bid,
+            bid_size: 1.0,
+            ask_price: ask,
+            ask_size: 1.0,
+            _reserved: [0; 16],
+        }
+    }
+
     #[test]
     fn test_arb_detection() {
         let mut state = GlobalMarketState::new(5.0); // 5 bps threshold
 
-        // Hyperliquid: BTC-PERP bid=63100 ask=63105
-        let hl_msg = ShmBboMessage {
-            seqlock: 2,
-            msg_type: 1,
-            exchange_id: EXCHANGE_HYPERLIQUID,
-            symbol_id: 1001,
-            timestamp_ns: 1000,
-            bid_price: 63100.0,
-            bid_size: 1.0,
-            ask_price: 63105.0,
-            ask_size: 1.0,
-            _reserved: [0; 16],
-        };
-        state.update(&hl_msg);
-
-        // Lighter: BTC-PERP bid=63050 ask=63060 → HL bid > LT ask = arb
-        let lt_msg = ShmBboMessage {
-            seqlock: 2,
-            msg_type: 1,
-            exchange_id: EXCHANGE_LIGHTER,
-            symbol_id: 1001,
-            timestamp_ns: 1001,
-            bid_price: 63050.0,
-            bid_size: 0.5,
-            ask_price: 63060.0,
-            ask_size: 0.8,
-            _reserved: [0; 16],
-        };
-        state.update(&lt_msg);
+        // HL: BTC-PERP bid=63100 ask=63105
+        state.update(&make_msg(EXCHANGE_HYPERLIQUID, 1001, 63100.0, 63105.0));
+        // Lighter: BTC-PERP bid=63050 ask=63060 → HL bid(63100) > LT ask(63060) = arb
+        state.update(&make_msg(EXCHANGE_LIGHTER, 1001, 63050.0, 63060.0));
 
         let signal = state.check_arbitrage(1001);
         assert!(signal.is_some());
@@ -192,26 +203,39 @@ mod tests {
     }
 
     #[test]
-    fn test_no_arb() {
+    fn test_no_arb_same_prices() {
         let mut state = GlobalMarketState::new(5.0);
 
-        // Both exchanges at same price → no arb
         for exch in [EXCHANGE_HYPERLIQUID, EXCHANGE_LIGHTER] {
-            let msg = ShmBboMessage {
-                seqlock: 2,
-                msg_type: 1,
-                exchange_id: exch,
-                symbol_id: 1001,
-                timestamp_ns: 1000,
-                bid_price: 63100.0,
-                bid_size: 1.0,
-                ask_price: 63105.0,
-                ask_size: 1.0,
-                _reserved: [0; 16],
-            };
-            state.update(&msg);
+            state.update(&make_msg(exch, 1001, 63100.0, 63105.0));
         }
 
         assert!(state.check_arbitrage(1001).is_none());
+    }
+
+    #[test]
+    fn test_no_arb_below_threshold() {
+        let mut state = GlobalMarketState::new(50.0); // 50 bps — high threshold
+
+        // Tiny spread that won't exceed 50 bps
+        state.update(&make_msg(EXCHANGE_HYPERLIQUID, 1001, 63100.0, 63105.0));
+        state.update(&make_msg(EXCHANGE_LIGHTER, 1001, 63095.0, 63098.0));
+
+        assert!(state.check_arbitrage(1001).is_none());
+    }
+
+    #[test]
+    fn test_reverse_direction_arb() {
+        let mut state = GlobalMarketState::new(5.0);
+
+        // Lighter bid > HL ask → buy HL, sell Lighter
+        state.update(&make_msg(EXCHANGE_HYPERLIQUID, 1001, 63050.0, 63060.0));
+        state.update(&make_msg(EXCHANGE_LIGHTER, 1001, 63100.0, 63105.0));
+
+        let signal = state.check_arbitrage(1001);
+        assert!(signal.is_some());
+        let s = signal.unwrap();
+        assert_eq!(s.buy_exchange, EXCHANGE_HYPERLIQUID);
+        assert_eq!(s.sell_exchange, EXCHANGE_LIGHTER);
     }
 }
