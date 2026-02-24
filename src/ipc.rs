@@ -47,7 +47,7 @@ pub async fn listen(socket_path: String, tx: flume::Sender<Ticker>) -> anyhow::R
                                 volume_24h: Decimal::from_str(&raw.volume_24h).unwrap_or(Decimal::ZERO),
                                 timestamp: raw.ts as u64,
                             };
-                            let _ = tx.send_async(ticker).await;
+                            let _ = tx.try_send(ticker); // drop if full — latest data wins
                         }
                     }
                 }

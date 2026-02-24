@@ -10,7 +10,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "/tmp/aleph-feeder.sock".into());
 
     let state = Arc::new(StateMachine::new());
-    let (tx, rx) = flume::unbounded::<Ticker>();
+    // Bounded channel: ticker data is stateless (latest supersedes old).
+    // try_send drops on full instead of blocking — prevents backpressure buildup.
+    let (tx, rx) = flume::bounded::<Ticker>(256);
 
     // IPC listener task
     let ipc_task = tokio::spawn(ipc::listen(socket_path.clone(), tx));

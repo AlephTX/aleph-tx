@@ -1,12 +1,12 @@
-// Package ipc provides a Unix socket publisher for streaming market data to Rust.
+// Package ipc provides a Unix socket client that connects to the Rust core.
 package ipc
 
 import (
 	"encoding/json"
 	"log"
 	"net"
-	"os"
 	"sync"
+	"time"
 )
 
 // Message is the envelope sent over the socket.
@@ -15,38 +15,31 @@ type Message struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// Publisher listens on a Unix socket and broadcasts messages to all connected clients.
+// Publisher dials the Rust core Unix socket and streams messages to it.
 type Publisher struct {
-	ln      net.Listener
-	mu      sync.Mutex
-	clients []net.Conn
+	path string
+	mu   sync.Mutex
+	conn net.Conn
 }
 
 func NewPublisher(path string) (*Publisher, error) {
-	os.Remove(path) // clean up stale socket
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		return nil, err
-	}
-	p := &Publisher{ln: ln}
-	go p.accept()
+	p := &Publisher{path: path}
+	p.dial() // best-effort; Rust may not be ready yet
 	return p, nil
 }
 
-func (p *Publisher) accept() {
-	for {
-		conn, err := p.ln.Accept()
-		if err != nil {
-			return // listener closed
-		}
-		p.mu.Lock()
-		p.clients = append(p.clients, conn)
-		p.mu.Unlock()
-		log.Printf("ipc: client connected (%d total)", len(p.clients))
+func (p *Publisher) dial() {
+	conn, err := net.Dial("unix", p.path)
+	if err != nil {
+		return // will retry on next Publish
 	}
+	p.mu.Lock()
+	p.conn = conn
+	p.mu.Unlock()
+	log.Printf("ipc: connected to %s", p.path)
 }
 
-// Publish sends a typed message to all connected clients.
+// Publish sends a typed message to the Rust core.
 func (p *Publisher) Publish(msgType string, payload any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -57,22 +50,32 @@ func (p *Publisher) Publish(msgType string, payload any) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	alive := p.clients[:0]
-	for _, c := range p.clients {
-		if _, err := c.Write(msg); err != nil {
-			c.Close()
-		} else {
-			alive = append(alive, c)
+
+	for attempts := 0; attempts < 3; attempts++ {
+		if p.conn == nil {
+			p.mu.Unlock()
+			time.Sleep(500 * time.Millisecond)
+			p.mu.Lock()
+			conn, err := net.Dial("unix", p.path)
+			if err != nil {
+				continue
+			}
+			p.conn = conn
+			log.Printf("ipc: reconnected to %s", p.path)
 		}
+		if _, err := p.conn.Write(msg); err != nil {
+			p.conn.Close()
+			p.conn = nil
+			continue
+		}
+		return
 	}
-	p.clients = alive
 }
 
 func (p *Publisher) Close() {
-	p.ln.Close()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, c := range p.clients {
-		c.Close()
+	if p.conn != nil {
+		p.conn.Close()
 	}
 }
