@@ -25,6 +25,7 @@ hex = "0.4"
 flume = "0.11"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = "0.24"
+memmap2 = "0.9"
 
 [lib]
 name = "aleph_tx"
@@ -37,3 +38,4 @@ path = "src/main.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+memmap2 = "0.15"
