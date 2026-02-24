@@ -15,18 +15,6 @@ import (
 	"nhooyr.io/websocket/wsjson"
 )
 
-func packSymbol(s string) []byte {
-	b := make([]byte, 12)
-	copy(b, s)
-	return b
-}
-
-func packFixed(s string, n int) []byte {
-	b := make([]byte, n)
-	copy(b, s)
-	return b
-}
-
 // RingPublisher writes raw binary messages to shared memory ring.
 type RingPublisher struct {
 	ring *shm.RingBuffer
@@ -96,15 +84,14 @@ func (f *Feeder) connect(ctx context.Context, url string) error {
 			if json.Unmarshal(envelope.Data, &raw) != nil {
 				continue
 			}
-			// Binary: type(1) + symbol(12) + bid(16) + ask(16) + ts(8) = 53 bytes
-			var buf [53]byte
-			buf[0] = shm.MsgTypeTicker
-			copy(buf[1:13], packSymbol(raw.Symbol))
-			copy(buf[13:29], packFixed(raw.BidPrice, 16))
-			copy(buf[29:45], packFixed(raw.AskPrice, 16))
-			ts := time.Now().UnixMilli()
-			binary.LittleEndian.PutUint64(buf[45:53], uint64(ts))
-			f.pub.Publish(buf[0], buf[:])
+			// Format: symbol|bid|ask
+			payload := []byte(raw.Symbol + "|" + raw.BidPrice + "|" + raw.AskPrice)
+			// msg = type(1) + len(2) + payload
+			msg := make([]byte, 1+2+len(payload))
+			msg[0] = shm.MsgTypeTicker
+			binary.LittleEndian.PutUint16(msg[1:3], uint16(len(payload)))
+			copy(msg[3:], payload)
+			f.pub.Publish(msg[0], msg)
 		} else if strings.Contains(envelope.Stream, "@depth") {
 			var raw struct {
 				Symbol string     `json:"s"`
@@ -114,31 +101,30 @@ func (f *Feeder) connect(ctx context.Context, url string) error {
 			if json.Unmarshal(envelope.Data, &raw) != nil {
 				continue
 			}
-			// Fixed: type(1) + + 6 bids symbol(12)(96) + 6 asks(96) + ts(8) = 213 bytes
-			var buf [213]byte
-			buf[0] = shm.MsgTypeDepth
-			copy(buf[1:13], packSymbol(raw.Symbol))
-
-			off := 13
-			// 6 bids, each 16 bytes (price + qty)
-			for i := 0; i < 6; i++ {
-				if i < len(raw.Bids) && len(raw.Bids[i]) >= 2 {
-					copy(buf[off:], packFixed(raw.Bids[i][0], 8))
-					copy(buf[off+8:], packFixed(raw.Bids[i][1], 8))
+			// Format: symbol|bids|asks (price,qty;price,qty)
+			var bidsStr, asksStr string
+			for i, b := range raw.Bids {
+				if i > 0 {
+					bidsStr += ";"
 				}
-				off += 16
-			}
-			// 6 asks
-			for i := 0; i < 6; i++ {
-				if i < len(raw.Asks) && len(raw.Asks[i]) >= 2 {
-					copy(buf[off:], packFixed(raw.Asks[i][0], 8))
-					copy(buf[off+8:], packFixed(raw.Asks[i][1], 8))
+				if len(b) >= 2 {
+					bidsStr += b[0] + "," + b[1]
 				}
-				off += 16
 			}
-			ts := time.Now().UnixMilli()
-			binary.LittleEndian.PutUint64(buf[205:213], uint64(ts))
-			f.pub.Publish(buf[0], buf[:])
+			for i, a := range raw.Asks {
+				if i > 0 {
+					asksStr += ";"
+				}
+				if len(a) >= 2 {
+					asksStr += a[0] + "," + a[1]
+				}
+			}
+			payload := []byte(raw.Symbol + "|" + bidsStr + "|" + asksStr)
+			msg := make([]byte, 1+2+len(payload))
+			msg[0] = shm.MsgTypeDepth
+			binary.LittleEndian.PutUint16(msg[1:3], uint16(len(payload)))
+			copy(msg[3:], payload)
+			f.pub.Publish(msg[0], msg)
 		}
 	}
 }

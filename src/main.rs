@@ -18,18 +18,30 @@ fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(StateMachine::new());
     let mut orderbooks: HashMap<String, LocalOrderbook> = HashMap::new();
+    
+    let mut data = Vec::with_capacity(4 * 1024 * 1024);
     let mut pos = 0usize;
 
     tracing::info!("⏳ Waiting for data from {}...", path);
 
     loop {
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
         };
+        let current_size = metadata.len() as usize;
+
+        if current_size > data.len() {
+            data.resize(current_size, 0);
+            if let Ok(new_data) = std::fs::read(&path) {
+                if new_data.len() == data.len() {
+                    data.copy_from_slice(&new_data);
+                }
+            }
+        }
 
         if data.len() <= pos {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -49,67 +61,79 @@ fn main() -> anyhow::Result<()> {
 
             match msg_type {
                 MSG_TYPE_TICKER => {
-                    // symbol(12) + bid(16) + ask(16) + ts(8) = 52 bytes
-                    if payload.len() >= 52 {
-                        let symbol = std::str::from_utf8(&payload[0..12]).unwrap_or("").trim();
-                        // bid/ask are 16-byte fixed strings, need to parse as string
-                        let bid_slice = std::str::from_utf8(&payload[12..28]).unwrap_or("").trim_end_matches('\0');
-                        let ask_slice = std::str::from_utf8(&payload[28..44]).unwrap_or("").trim_end_matches('\0');
+                    // Format: symbol|bid|ask
+                    if let Ok(s) = std::str::from_utf8(payload) {
+                        let parts: Vec<&str> = s.split('|').collect();
+                        if parts.len() >= 3 {
+                            let symbol = parts[0].trim();
+                            let bid = Decimal::from_str(parts[1]).unwrap_or(Decimal::ZERO);
+                            let ask = Decimal::from_str(parts[2]).unwrap_or(Decimal::ZERO);
 
-                        let ticker = aleph_tx::types::Ticker {
-                            symbol: Symbol::new(symbol),
-                            bid: Decimal::from_str(bid_slice).unwrap_or(Decimal::ZERO),
-                            ask: Decimal::from_str(ask_slice).unwrap_or(Decimal::ZERO),
-                            last: Decimal::ZERO,
-                            volume_24h: Decimal::ZERO,
-                            timestamp: 0,
-                        };
-                        state.update_ticker(ticker);
+                            if !symbol.is_empty() && bid > Decimal::ZERO && ask > Decimal::ZERO {
+                                let ticker = aleph_tx::types::Ticker {
+                                    symbol: Symbol::new(symbol),
+                                    bid,
+                                    ask,
+                                    last: Decimal::ZERO,
+                                    volume_24h: Decimal::ZERO,
+                                    timestamp: 0,
+                                };
+                                state.update_ticker(ticker);
+                            }
+                        }
                     }
                 }
                 MSG_TYPE_DEPTH => {
-                    // symbol(12) + 6 bids(96) + 6 asks(96) + ts(8) = 212 bytes
-                    if payload.len() >= 212 {
-                        let symbol = std::str::from_utf8(&payload[0..12]).unwrap_or("").trim();
-
-                        let mut bids = Vec::new();
-                        let mut asks = Vec::new();
-                        let mut off = 12;
-
-                        // 6 bids
-                        for _ in 0..6 {
-                            if off + 16 > payload.len() { break; }
-                            let price_slice = std::str::from_utf8(&payload[off..off+8]).unwrap_or("").trim_end_matches('\0');
-                            let qty_slice = std::str::from_utf8(&payload[off+8..off+16]).unwrap_or("").trim_end_matches('\0');
-                            if !price_slice.is_empty() && !price_slice.starts_with('\0') {
-                                bids.push([price_slice.to_string(), qty_slice.to_string()]);
+                    // Format: symbol|bids|asks (price,qty;price,qty)
+                    if let Ok(s) = std::str::from_utf8(payload) {
+                        let parts: Vec<&str> = s.split('|').collect();
+                        if parts.len() >= 3 {
+                            let symbol = parts[0].trim();
+                            
+                            let mut bids = Vec::new();
+                            for b in parts[1].split(';') {
+                                let p: Vec<&str> = b.split(',').collect();
+                                if p.len() >= 2 {
+                                    let price = Decimal::from_str(p[0]).unwrap_or(Decimal::ZERO);
+                                    let qty = Decimal::from_str(p[1]).unwrap_or(Decimal::ZERO);
+                                    if price > Decimal::ZERO && qty > Decimal::ZERO {
+                                        bids.push([price.to_string(), qty.to_string()]);
+                                    }
+                                }
                             }
-                            off += 16;
-                        }
-                        // 6 asks
-                        for _ in 0..6 {
-                            if off + 16 > payload.len() { break; }
-                            let price_slice = std::str::from_utf8(&payload[off..off+8]).unwrap_or("").trim_end_matches('\0');
-                            let qty_slice = std::str::from_utf8(&payload[off+8..off+16]).unwrap_or("").trim_end_matches('\0');
-                            if !price_slice.is_empty() && !price_slice.starts_with('\0') {
-                                asks.push([price_slice.to_string(), qty_slice.to_string()]);
+                            
+                            let mut asks = Vec::new();
+                            for a in parts[2].split(';') {
+                                let p: Vec<&str> = a.split(',').collect();
+                                if p.len() >= 2 {
+                                    let price = Decimal::from_str(p[0]).unwrap_or(Decimal::ZERO);
+                                    let qty = Decimal::from_str(p[1]).unwrap_or(Decimal::ZERO);
+                                    if price > Decimal::ZERO && qty > Decimal::ZERO {
+                                        asks.push([price.to_string(), qty.to_string()]);
+                                    }
+                                }
                             }
-                            off += 16;
-                        }
 
-                        if !bids.is_empty() && !asks.is_empty() {
-                            let ob = orderbooks
-                                .entry(symbol.to_string())
-                                .or_insert_with(|| LocalOrderbook::new(Symbol::new(symbol)));
-                            ob.apply(&bids, &asks, 0);
-                            if let (Some(bid), Some(ask)) = (ob.best_bid(), ob.best_ask()) {
-                                tracing::info!(
-                                    "[OB {}] bid={} ask={} spread={}",
-                                    symbol,
-                                    bid.price,
-                                    ask.price,
-                                    ob.spread().unwrap_or_default()
-                                );
+                            if !bids.is_empty() && !asks.is_empty() && !symbol.is_empty() {
+                                let ob = orderbooks
+                                    .entry(symbol.to_string())
+                                    .or_insert_with(|| LocalOrderbook::new(Symbol::new(symbol)));
+                                ob.apply(&bids, &asks, 0);
+                                if let (Some(best_bid), Some(best_ask)) = (ob.best_bid(), ob.best_ask()) {
+                                    let spread = ob.spread().unwrap_or(Decimal::ZERO);
+                                    let mid = (best_bid.price + best_ask.price) / Decimal::from(2);
+                                    let spread_pct = spread / mid * Decimal::from(100);
+                                    // Log if spread looks reasonable (< 2%)
+                                    if spread_pct < Decimal::from(2) && spread_pct > Decimal::ZERO {
+                                        tracing::info!(
+                                            "[OB {}] bid={:.2} ask={:.2} spread={:.4}%",
+                                            symbol,
+                                            best_bid.price,
+                                            best_ask.price,
+                                            spread_pct
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
