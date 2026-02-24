@@ -20,17 +20,25 @@ type Publisher interface {
 
 // Ticker is the normalised AlephTX ticker format.
 type Ticker struct {
-	Exchange  string  `json:"exchange"`
-	Symbol    string  `json:"symbol"`
-	Bid       string  `json:"bid"`
-	Ask       string  `json:"ask"`
-	Last      string  `json:"last"`
-	Volume24h string  `json:"volume_24h"`
-	Ts        int64   `json:"ts"` // unix ms
+	Exchange  string `json:"exchange"`
+	Symbol    string `json:"symbol"`
+	Bid       string `json:"bid"`
+	Ask       string `json:"ask"`
+	Last      string `json:"last"`
+	Volume24h string `json:"volume_24h"`
+	Ts        int64  `json:"ts"`
 }
 
-// binanceTicker is the raw Binance bookTicker stream payload.
-// b=bestBid, a=bestAsk, s=symbol, u=updateId
+// DepthUpdate is a partial orderbook update (incremental diff).
+type DepthUpdate struct {
+	Exchange string     `json:"exchange"`
+	Symbol   string     `json:"symbol"`
+	Bids     [][]string `json:"bids"` // [price, qty] — qty "0" means remove
+	Asks     [][]string `json:"asks"`
+	Ts       int64      `json:"ts"`
+}
+
+// raw Binance bookTicker
 type binanceTicker struct {
 	UpdateID int64  `json:"u"`
 	Symbol   string `json:"s"`
@@ -40,7 +48,16 @@ type binanceTicker struct {
 	AskQty   string `json:"A"`
 }
 
-// Feeder subscribes to Binance combined stream and publishes normalised tickers.
+// raw Binance depth diff stream
+type binanceDepth struct {
+	EventType string     `json:"e"`
+	EventTime int64      `json:"E"`
+	Symbol    string     `json:"s"`
+	Bids      [][]string `json:"b"`
+	Asks      [][]string `json:"a"`
+}
+
+// Feeder subscribes to Binance combined stream and publishes normalised events.
 type Feeder struct {
 	symbols []string
 	pub     Publisher
@@ -51,9 +68,11 @@ func NewFeeder(symbols []string, pub Publisher) *Feeder {
 }
 
 func (f *Feeder) Run(ctx context.Context) error {
-	streams := make([]string, len(f.symbols))
-	for i, s := range f.symbols {
-		streams[i] = strings.ToLower(s) + "@bookTicker"
+	streams := make([]string, 0, len(f.symbols)*2)
+	for _, s := range f.symbols {
+		s = strings.ToLower(s)
+		streams = append(streams, s+"@bookTicker")
+		streams = append(streams, s+"@depth@100ms")
 	}
 	url := "wss://stream.binance.com:9443/stream?streams=" + strings.Join(streams, "/")
 
@@ -89,20 +108,31 @@ func (f *Feeder) connect(ctx context.Context, url string) error {
 			return err
 		}
 
-		var raw binanceTicker
-		if err := json.Unmarshal(envelope.Data, &raw); err != nil {
-			continue
+		if strings.HasSuffix(envelope.Stream, "@bookTicker") {
+			var raw binanceTicker
+			if err := json.Unmarshal(envelope.Data, &raw); err != nil {
+				continue
+			}
+			f.pub.Publish("ticker", Ticker{
+				Exchange: "binance",
+				Symbol:   raw.Symbol,
+				Bid:      raw.BidPrice,
+				Ask:      raw.AskPrice,
+				Last:     raw.BidPrice,
+				Ts:       time.Now().UnixMilli(),
+			})
+		} else if strings.Contains(envelope.Stream, "@depth") {
+			var raw binanceDepth
+			if err := json.Unmarshal(envelope.Data, &raw); err != nil {
+				continue
+			}
+			f.pub.Publish("depth", DepthUpdate{
+				Exchange: "binance",
+				Symbol:   raw.Symbol,
+				Bids:     raw.Bids,
+				Asks:     raw.Asks,
+				Ts:       raw.EventTime,
+			})
 		}
-
-		ticker := Ticker{
-			Exchange:  "binance",
-			Symbol:    raw.Symbol,
-			Bid:       raw.BidPrice,
-			Ask:       raw.AskPrice,
-			Last:      raw.BidPrice, // bookTicker has no last; use bid as proxy
-			Volume24h: "0",
-			Ts:        time.Now().UnixMilli(),
-		}
-		f.pub.Publish("ticker", ticker)
 	}
 }

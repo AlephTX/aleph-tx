@@ -5,9 +5,9 @@ use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 
-/// Raw ticker as received from the Go feeder over IPC.
 #[derive(Debug, Deserialize)]
 struct IpcTicker {
+    #[allow(dead_code)]
     exchange: String,
     symbol: String,
     bid: String,
@@ -18,14 +18,29 @@ struct IpcTicker {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IpcDepth {
+    #[allow(dead_code)]
+    pub exchange: String,
+    pub symbol: String,
+    pub bids: Vec<[String; 2]>,
+    pub asks: Vec<[String; 2]>,
+    pub ts: u64,
+}
+
+#[derive(Debug)]
+pub enum FeedEvent {
+    Ticker(Ticker),
+    Depth(IpcDepth),
+}
+
+#[derive(Debug, Deserialize)]
 struct IpcMessage {
     #[serde(rename = "type")]
     msg_type: String,
     payload: serde_json::Value,
 }
 
-/// Listen on a Unix socket and yield normalised Tickers.
-pub async fn listen(socket_path: String, tx: flume::Sender<Ticker>) -> anyhow::Result<()> {
+pub async fn listen(socket_path: String, tx: flume::Sender<FeedEvent>) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!("IPC listener: {}", socket_path);
@@ -36,8 +51,9 @@ pub async fn listen(socket_path: String, tx: flume::Sender<Ticker>) -> anyhow::R
             let reader = BufReader::new(stream);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(msg) = serde_json::from_str::<IpcMessage>(&line) {
-                    if msg.msg_type == "ticker" {
+                let Ok(msg) = serde_json::from_str::<IpcMessage>(&line) else { continue };
+                match msg.msg_type.as_str() {
+                    "ticker" => {
                         if let Ok(raw) = serde_json::from_value::<IpcTicker>(msg.payload) {
                             let ticker = Ticker {
                                 symbol: crate::types::Symbol::new(&raw.symbol),
@@ -47,9 +63,15 @@ pub async fn listen(socket_path: String, tx: flume::Sender<Ticker>) -> anyhow::R
                                 volume_24h: Decimal::from_str(&raw.volume_24h).unwrap_or(Decimal::ZERO),
                                 timestamp: raw.ts as u64,
                             };
-                            let _ = tx.try_send(ticker); // drop if full — latest data wins
+                            let _ = tx.try_send(FeedEvent::Ticker(ticker));
                         }
                     }
+                    "depth" => {
+                        if let Ok(depth) = serde_json::from_value::<IpcDepth>(msg.payload) {
+                            let _ = tx.try_send(FeedEvent::Depth(depth));
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
