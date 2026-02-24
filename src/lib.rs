@@ -1,8 +1,10 @@
 pub mod adapter;
+pub mod arbitrage;
 pub mod engine;
 pub mod ipc;
 pub mod orderbook;
 pub mod risk;
 pub mod shm;
+pub mod shm_reader;
 pub mod signer;
 pub mod types;
