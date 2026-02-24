@@ -29,15 +29,15 @@ type Ticker struct {
 	Ts        int64   `json:"ts"` // unix ms
 }
 
-// binanceTicker is the raw Binance 24hr mini-ticker stream payload.
+// binanceTicker is the raw Binance bookTicker stream payload.
+// b=bestBid, a=bestAsk, s=symbol, u=updateId
 type binanceTicker struct {
-	EventType string `json:"e"`
-	Symbol    string `json:"s"`
-	Close     string `json:"c"` // last price
-	BidPrice  string `json:"b"`
-	AskPrice  string `json:"a"`
-	Volume    string `json:"v"`
-	EventTime int64  `json:"E"`
+	UpdateID int64  `json:"u"`
+	Symbol   string `json:"s"`
+	BidPrice string `json:"b"`
+	BidQty   string `json:"B"`
+	AskPrice string `json:"a"`
+	AskQty   string `json:"A"`
 }
 
 // Feeder subscribes to Binance combined stream and publishes normalised tickers.
@@ -99,9 +99,9 @@ func (f *Feeder) connect(ctx context.Context, url string) error {
 			Symbol:    raw.Symbol,
 			Bid:       raw.BidPrice,
 			Ask:       raw.AskPrice,
-			Last:      raw.Close,
-			Volume24h: raw.Volume,
-			Ts:        raw.EventTime,
+			Last:      raw.BidPrice, // bookTicker has no last; use bid as proxy
+			Volume24h: "0",
+			Ts:        time.Now().UnixMilli(),
 		}
 		f.pub.Publish("ticker", ticker)
 	}
