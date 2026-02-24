@@ -1,70 +1,49 @@
-// Package binance connects to Binance WebSocket streams and normalises data.
+// Package binance connects to Binance WebSocket streams and writes to shared memory ring buffer.
 package binance
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
 
-// Publisher is the minimal interface the feeder needs.
-type Publisher interface {
-	Publish(msgType string, payload any)
+func packSymbol(s string) []byte {
+	b := make([]byte, 12)
+	copy(b, s)
+	return b
 }
 
-// Ticker is the normalised AlephTX ticker format.
-type Ticker struct {
-	Exchange  string `json:"exchange"`
-	Symbol    string `json:"symbol"`
-	Bid       string `json:"bid"`
-	Ask       string `json:"ask"`
-	Last      string `json:"last"`
-	Volume24h string `json:"volume_24h"`
-	Ts        int64  `json:"ts"`
+func packFixed(s string, n int) []byte {
+	b := make([]byte, n)
+	copy(b, s)
+	return b
 }
 
-// DepthUpdate is a partial orderbook update (incremental diff).
-type DepthUpdate struct {
-	Exchange string     `json:"exchange"`
-	Symbol   string     `json:"symbol"`
-	Bids     [][]string `json:"bids"` // [price, qty] — qty "0" means remove
-	Asks     [][]string `json:"asks"`
-	Ts       int64      `json:"ts"`
+// RingPublisher writes raw binary messages to shared memory ring.
+type RingPublisher struct {
+	ring *shm.RingBuffer
 }
 
-// raw Binance bookTicker
-type binanceTicker struct {
-	UpdateID int64  `json:"u"`
-	Symbol   string `json:"s"`
-	BidPrice string `json:"b"`
-	BidQty   string `json:"B"`
-	AskPrice string `json:"a"`
-	AskQty   string `json:"A"`
+func (p *RingPublisher) Publish(msgType byte, payload []byte) {
+	_ = p.ring.Write(msgType, payload)
 }
 
-// raw Binance depth diff stream
-type binanceDepth struct {
-	EventType string     `json:"e"`
-	EventTime int64      `json:"E"`
-	Symbol    string     `json:"s"`
-	Bids      [][]string `json:"b"`
-	Asks      [][]string `json:"a"`
-}
-
-// Feeder subscribes to Binance combined stream and publishes normalised events.
+// Feeder subscribes to Binance and writes binary to ring buffer.
 type Feeder struct {
 	symbols []string
-	pub     Publisher
+	pub     *RingPublisher
 }
 
-func NewFeeder(symbols []string, pub Publisher) *Feeder {
-	return &Feeder{symbols: symbols, pub: pub}
+func NewFeeder(symbols []string, ring *shm.RingBuffer) *Feeder {
+	return &Feeder{symbols: symbols, pub: &RingPublisher{ring: ring}}
 }
 
 func (f *Feeder) Run(ctx context.Context) error {
@@ -109,30 +88,57 @@ func (f *Feeder) connect(ctx context.Context, url string) error {
 		}
 
 		if strings.HasSuffix(envelope.Stream, "@bookTicker") {
-			var raw binanceTicker
-			if err := json.Unmarshal(envelope.Data, &raw); err != nil {
+			var raw struct {
+				Symbol   string `json:"s"`
+				BidPrice string `json:"b"`
+				AskPrice string `json:"a"`
+			}
+			if json.Unmarshal(envelope.Data, &raw) != nil {
 				continue
 			}
-			f.pub.Publish("ticker", Ticker{
-				Exchange: "binance",
-				Symbol:   raw.Symbol,
-				Bid:      raw.BidPrice,
-				Ask:      raw.AskPrice,
-				Last:     raw.BidPrice,
-				Ts:       time.Now().UnixMilli(),
-			})
+			// Binary: type(1) + symbol(12) + bid(16) + ask(16) + ts(8) = 53 bytes
+			var buf [53]byte
+			buf[0] = shm.MsgTypeTicker
+			copy(buf[1:13], packSymbol(raw.Symbol))
+			copy(buf[13:29], packFixed(raw.BidPrice, 16))
+			copy(buf[29:45], packFixed(raw.AskPrice, 16))
+			ts := time.Now().UnixMilli()
+			binary.LittleEndian.PutUint64(buf[45:53], uint64(ts))
+			f.pub.Publish(buf[0], buf[:])
 		} else if strings.Contains(envelope.Stream, "@depth") {
-			var raw binanceDepth
-			if err := json.Unmarshal(envelope.Data, &raw); err != nil {
+			var raw struct {
+				Symbol string     `json:"s"`
+				Bids   [][]string `json:"b"`
+				Asks   [][]string `json:"a"`
+			}
+			if json.Unmarshal(envelope.Data, &raw) != nil {
 				continue
 			}
-			f.pub.Publish("depth", DepthUpdate{
-				Exchange: "binance",
-				Symbol:   raw.Symbol,
-				Bids:     raw.Bids,
-				Asks:     raw.Asks,
-				Ts:       raw.EventTime,
-			})
+			// Fixed: type(1) + + 6 bids symbol(12)(96) + 6 asks(96) + ts(8) = 213 bytes
+			var buf [213]byte
+			buf[0] = shm.MsgTypeDepth
+			copy(buf[1:13], packSymbol(raw.Symbol))
+
+			off := 13
+			// 6 bids, each 16 bytes (price + qty)
+			for i := 0; i < 6; i++ {
+				if i < len(raw.Bids) && len(raw.Bids[i]) >= 2 {
+					copy(buf[off:], packFixed(raw.Bids[i][0], 8))
+					copy(buf[off+8:], packFixed(raw.Bids[i][1], 8))
+				}
+				off += 16
+			}
+			// 6 asks
+			for i := 0; i < 6; i++ {
+				if i < len(raw.Asks) && len(raw.Asks[i]) >= 2 {
+					copy(buf[off:], packFixed(raw.Asks[i][0], 8))
+					copy(buf[off+8:], packFixed(raw.Asks[i][1], 8))
+				}
+				off += 16
+			}
+			ts := time.Now().UnixMilli()
+			binary.LittleEndian.PutUint64(buf[205:213], uint64(ts))
+			f.pub.Publish(buf[0], buf[:])
 		}
 	}
 }

@@ -8,31 +8,31 @@ import (
 	"syscall"
 
 	"github.com/AlephTX/aleph-tx/feeder/binance"
-	"github.com/AlephTX/aleph-tx/feeder/ipc"
+	"github.com/AlephTX/aleph-tx/feeder/shm"
 )
 
 func main() {
 	log.Println("🐙 AlephTX Feeder starting...")
 
-	socketPath := "/tmp/aleph-feeder.sock"
-	if p := os.Getenv("ALEPH_SOCKET"); p != "" {
-		socketPath = p
+	ringName := "aleph-ring"
+	if r := os.Getenv("ALEPH_RING"); r != "" {
+		ringName = r
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// IPC publisher (Unix socket)
-	pub, err := ipc.NewPublisher(socketPath)
+	// Shared memory ring buffer
+	ring, err := shm.NewRingBuffer(ringName, 2*1024*1024) // 2MB
 	if err != nil {
-		log.Fatalf("ipc: %v", err)
+		log.Fatalf("shm: %v", err)
 	}
-	defer pub.Close()
-	log.Printf("📡 IPC socket: %s", socketPath)
+	defer ring.Close()
+	log.Printf("📡 Shared memory ring: /dev/shm/%s (2MB)", ringName)
 
 	// Binance WebSocket feeder
 	symbols := []string{"btcusdt", "ethusdt"}
-	feeder := binance.NewFeeder(symbols, pub)
+	feeder := binance.NewFeeder(symbols, ring)
 
 	log.Printf("🔌 Connecting to Binance WS (%v)...", symbols)
 	if err := feeder.Run(ctx); err != nil && err != context.Canceled {
