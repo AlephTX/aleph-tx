@@ -1,5 +1,10 @@
-use aleph_tx::{engine::StateMachine, ipc, types::Ticker};
-use std::sync::Arc;
+use aleph_tx::{
+    engine::StateMachine,
+    ipc::{self, FeedEvent},
+    orderbook::LocalOrderbook,
+    types::Symbol,
+};
+use std::{collections::HashMap, sync::Arc};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -10,26 +15,33 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "/tmp/aleph-feeder.sock".into());
 
     let state = Arc::new(StateMachine::new());
-    // Bounded channel: ticker data is stateless (latest supersedes old).
-    // try_send drops on full instead of blocking — prevents backpressure buildup.
-    let (tx, rx) = flume::bounded::<Ticker>(256);
+    let (tx, rx) = flume::bounded::<FeedEvent>(512);
+    let mut orderbooks: HashMap<String, LocalOrderbook> = HashMap::new();
 
-    // IPC listener task
-    let ipc_task = tokio::spawn(ipc::listen(socket_path.clone(), tx));
-
+    tokio::spawn(ipc::listen(socket_path.clone(), tx));
     tracing::info!("⏳ Waiting for feeder on {}...", socket_path);
 
-    // Main loop: consume tickers from Go feeder
-    while let Ok(ticker) = rx.recv_async().await {
-        tracing::info!(
-            "[{}] bid={} ask={}",
-            ticker.symbol,
-            ticker.bid,
-            ticker.ask
-        );
-        state.update_ticker(ticker);
+    while let Ok(event) = rx.recv_async().await {
+        match event {
+            FeedEvent::Ticker(ticker) => {
+                state.update_ticker(ticker);
+            }
+            FeedEvent::Depth(depth) => {
+                let ob = orderbooks
+                    .entry(depth.symbol.clone())
+                    .or_insert_with(|| LocalOrderbook::new(Symbol::new(&depth.symbol)));
+                ob.apply(&depth.bids, &depth.asks, depth.ts);
+                if let (Some(bid), Some(ask)) = (ob.best_bid(), ob.best_ask()) {
+                    tracing::info!(
+                        "[OB {}] best_bid={} best_ask={} spread={}",
+                        depth.symbol,
+                        bid.price,
+                        ask.price,
+                        ob.spread().unwrap_or_default()
+                    );
+                }
+            }
+        }
     }
-
-    ipc_task.await??;
     Ok(())
 }
