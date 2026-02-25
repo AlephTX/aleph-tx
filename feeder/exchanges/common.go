@@ -16,8 +16,20 @@ const (
 	SymbolETHPERP uint16 = 1002
 )
 
-// CoinToSymbolID maps Hyperliquid coin names to our symbol IDs.
-var CoinToSymbolID = map[string]uint16{
+
+// SymbolNameToID maps standard local ticker names to our global symbol IDs.
+var SymbolNameToID = map[string]uint16{
 	"BTC": SymbolBTCPERP,
 	"ETH": SymbolETHPERP,
+}
+
+// BuildReverseSymbolMap creates a map from the exchange's specific symbol string directly to our internal global symbol ID.
+func BuildReverseSymbolMap(symbols map[string]string) map[string]uint16 {
+	m := make(map[string]uint16)
+	for localSym, exchSym := range symbols {
+		if id, ok := SymbolNameToID[localSym]; ok {
+			m[exchSym] = id
+		}
+	}
+	return m
 }

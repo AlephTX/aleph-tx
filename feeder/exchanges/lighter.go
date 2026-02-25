@@ -8,23 +8,31 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 )
 
-// Lighter market indices → our symbol IDs.
-var lighterMarkets = map[int]uint16{
-	1: SymbolBTCPERP, // market 1 = BTC
-	0: SymbolETHPERP, // market 0 = ETH
-}
-
 // Lighter connects to the Lighter (zkLighter) orderbook WebSocket.
 type Lighter struct {
+	cfg    config.ExchangeConfig
 	matrix *shm.Matrix
+	mktMap map[int]uint16
 }
 
-func NewLighter(matrix *shm.Matrix) *Lighter {
-	return &Lighter{matrix: matrix}
+func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix) *Lighter {
+	mktMap := make(map[int]uint16)
+	for localSym, exchIdxStr := range cfg.Symbols {
+		if id, ok := SymbolNameToID[localSym]; ok {
+			idx, _ := strconv.Atoi(exchIdxStr)
+			mktMap[idx] = id
+		}
+	}
+	return &Lighter{
+		cfg:    cfg,
+		matrix: matrix,
+		mktMap: mktMap,
+	}
 }
 
 // lighterOB is the orderbook snapshot/update envelope.
@@ -46,37 +54,27 @@ type lighterLevel struct {
 }
 
 func (l *Lighter) Run(ctx context.Context) error {
-	for {
-		if err := l.connect(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			log.Printf("lighter: disconnected (%v), reconnecting in 3s...", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-		}
-	}
+	return RunConnectionLoop(ctx, "lighter", l.connect)
 }
 
 func (l *Lighter) connect(ctx context.Context) error {
-	c, _, err := websocket.Dial(ctx, "wss://mainnet.zklighter.elliot.ai/stream", nil)
+	c, _, err := websocket.Dial(ctx, l.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(1 << 20) // 1MB — initial snapshot is large
 
-	// Subscribe to BTC (market 1) and ETH (market 0)
-	for mktIdx := range lighterMarkets {
+	log.Printf("lighter: connected to %s", l.cfg.WSURL)
+
+	// Subscribe to configured markets
+	for mktIdx := range l.mktMap {
 		sub := fmt.Sprintf(`{"type":"subscribe","channel":"order_book/%d"}`, mktIdx)
 		if err := c.Write(ctx, websocket.MessageText, []byte(sub)); err != nil {
 			return fmt.Errorf("subscribe market %d: %w", mktIdx, err)
 		}
+		log.Printf("lighter: subscribed to market %d", mktIdx)
 	}
-	log.Println("lighter: connected, subscribed to BTC(1) + ETH(0)")
 
 	for {
 		_, data, err := c.Read(ctx)
@@ -101,7 +99,7 @@ func (l *Lighter) connect(ctx context.Context) error {
 		}
 
 		mktIdx := l.parseMarketIndex(env.Channel)
-		symID, ok := lighterMarkets[mktIdx]
+		symID, ok := l.mktMap[mktIdx]
 		if !ok {
 			continue
 		}

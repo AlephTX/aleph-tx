@@ -1,5 +1,5 @@
 pub mod adapter;
-pub mod arbitrage;
+pub mod strategy;
 pub mod engine;
 pub mod ipc;
 pub mod orderbook;

@@ -1,0 +1,35 @@
+[exchanges.hyperliquid]
+enabled = false
+testnet = false
+ws_url = "wss://api.hyperliquid.xyz/ws"
+
+[exchanges.hyperliquid.symbols]
+BTC = "BTC"
+ETH = "ETH"
+
+[exchanges.lighter]
+enabled = false
+testnet = false
+ws_url = "wss://api.lighter.xyz/ws"
+
+[exchanges.lighter.symbols]
+BTC = "3"
+ETH = "4"
+
+[exchanges.backpack]
+enabled = false
+testnet = false
+ws_url = "wss://ws.backpack.exchange"
+
+[exchanges.backpack.symbols]
+BTC = "BTC_USDC_PERP"
+ETH = "ETH_USDC_PERP"
+
+[exchanges.edgex]
+enabled = true
+testnet = false
+ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+rest_url = "https://pro.edgex.exchange"
+
+[exchanges.edgex.symbols]
+BTC = "10000001"
