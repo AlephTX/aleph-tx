@@ -16,7 +16,7 @@ pub const EXCHANGE_HYPERLIQUID: u8 = 1;
 pub const EXCHANGE_LIGHTER: u8 = 2;
 pub const EXCHANGE_EDGEX: u8 = 3;
 pub const EXCHANGE_01: u8 = 4;
-pub const NUM_EXCHANGES: usize = 5;
+pub const NUM_EXCHANGES: usize = 6;
 
 pub const MAX_SYMBOLS: usize = 2048;
 

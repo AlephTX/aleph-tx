@@ -7,6 +7,7 @@ const (
 	ExchangeLighter     uint8 = 2
 	ExchangeEdgeX       uint8 = 3
 	Exchange01          uint8 = 4
+	ExchangeBackpack    uint8 = 5
 )
 
 // Symbol IDs — global normalized IDs.

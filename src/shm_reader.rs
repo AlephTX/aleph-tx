@@ -3,7 +3,7 @@ use std::sync::atomic::{compiler_fence, Ordering};
 use std::ptr;
 
 const NUM_SYMBOLS: usize = 2048;
-const NUM_EXCHANGES: usize = 5;
+const NUM_EXCHANGES: usize = 6; // HL, Lighter, EdgeX, 01, Backpack
 const SLOT_SIZE: usize = 64;
 const VERSION_SIZE: usize = 8;
 
@@ -59,12 +59,12 @@ impl ShmReader {
 
     #[inline(always)]
     pub fn try_poll(&mut self) -> Option<u16> {
-        for sym in 0..self.max_symbols {
-            let version = self.load_version(sym as u16);
+        for sym in [1001u16, 1002] {
+            let version = self.load_version(sym);
             
-            if version > self.local_versions[sym] {
-                self.local_versions[sym] = version;
-                return Some(sym as u16);
+            if version > self.local_versions[sym as usize] {
+                self.local_versions[sym as usize] = version;
+                return Some(sym);
             }
         }
         None
