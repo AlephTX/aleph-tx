@@ -1,145 +1,75 @@
 use aleph_tx::{
-    engine::StateMachine,
-    orderbook::LocalOrderbook,
-    types::Symbol,
+    arbitrage::{self, GlobalMarketState, EXCHANGE_HYPERLIQUID, EXCHANGE_LIGHTER, EXCHANGE_EDGEX, EXCHANGE_01},
+    shm_reader::ShmRingReader,
 };
-use rust_decimal::Decimal;
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::time::Instant;
 
-const MSG_TYPE_TICKER: u8 = 1;
-const MSG_TYPE_DEPTH: u8 = 2;
+const SYMBOL_BTC: u16 = 1001;
+const SYMBOL_ETH: u16 = 1002;
+
+fn exchange_name(id: u8) -> &'static str {
+    match id {
+        1 => "Hyperliquid",
+        2 => "Lighter",
+        3 => "EdgeX",
+        4 => "01",
+        _ => "Unknown",
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("🦀 AlephTX Core starting...");
 
-    let ring_name = std::env::var("ALEPH_RING").unwrap_or_else(|_| "aleph-ring".into());
-    let path = format!("/dev/shm/{}", ring_name);
+    let ring_name = std::env::var("ALEPH_RING").unwrap_or_else(|_| "aleph-bbo".into());
 
-    let state = Arc::new(StateMachine::new());
-    let mut orderbooks: HashMap<String, LocalOrderbook> = HashMap::new();
-    
-    let mut pos = 0usize;
+    let mut reader = ShmRingReader::open(&ring_name, 1024)?;
+    tracing::info!("📡 Reading from /dev/shm/{} (1024 slots)", ring_name);
 
-    tracing::info!("⏳ Waiting for data from {}...", path);
+    let mut state = GlobalMarketState::new(3.0); // 3 bps min spread
+    let mut msg_count: u64 = 0;
+    let mut last_log = Instant::now();
+
+    tracing::info!("⏳ Waiting for data...");
 
     loop {
-        // Read entire file fresh each time (simple, avoids caching issues)
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
-            }
-        };
+        if let Some(msg) = reader.try_read() {
+            state.update(&msg);
+            msg_count += 1;
 
-        if data.len() <= pos {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            continue;
-        }
+            // Log every second
+            if last_log.elapsed().as_millis() >= 1000 {
+                last_log = Instant::now();
 
-        while pos + 3 <= data.len() {
-            let msg_type = data[pos];
-            let msg_len = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
-
-            if msg_len == 0 || pos + 3 + msg_len > data.len() {
-                break;
-            }
-
-            let payload = &data[pos + 3..pos + 3 + msg_len];
-            pos += 3 + msg_len;
-
-            // Parse as string
-            let payload_str = match std::str::from_utf8(payload) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            match msg_type {
-                MSG_TYPE_TICKER => {
-                    // Format: symbol|bid|ask
-                    let parts: Vec<&str> = payload_str.split('|').collect();
-                    if parts.len() >= 3 {
-                        let symbol = parts[0].trim();
-                        let bid = Decimal::from_str(parts[1].trim()).unwrap_or(Decimal::ZERO);
-                        let ask = Decimal::from_str(parts[2].trim()).unwrap_or(Decimal::ZERO);
-
-                        if !symbol.is_empty() && symbol.len() <= 12 && bid > Decimal::ZERO && ask > Decimal::ZERO {
-                            let ticker = aleph_tx::types::Ticker {
-                                symbol: Symbol::new(symbol),
-                                bid,
-                                ask,
-                                last: Decimal::ZERO,
-                                volume_24h: Decimal::ZERO,
-                                timestamp: 0,
-                            };
-                            state.update_ticker(ticker);
-                        }
-                    }
-                }
-                MSG_TYPE_DEPTH => {
-                    // Format: symbol|bids|asks (price,qty;price,qty)
-                    let parts: Vec<&str> = payload_str.split('|').collect();
-                    if parts.len() >= 3 {
-                        let symbol = parts[0].trim();
-                        
-                        // Validate symbol
-                        if symbol.is_empty() || symbol.len() > 12 || symbol.chars().any(|c| !c.is_alphanumeric()) {
-                            continue;
-                        }
-                        
-                        let mut bids = Vec::new();
-                        for b in parts[1].split(';') {
-                            let p: Vec<&str> = b.split(',').collect();
-                            if p.len() >= 2 {
-                                let price = Decimal::from_str(p[0].trim()).unwrap_or(Decimal::ZERO);
-                                let qty = Decimal::from_str(p[1].trim()).unwrap_or(Decimal::ZERO);
-                                if price > Decimal::ZERO && qty > Decimal::ZERO {
-                                    bids.push([price.to_string(), qty.to_string()]);
-                                }
-                            }
-                        }
-                        
-                        let mut asks = Vec::new();
-                        for a in parts[2].split(';') {
-                            let p: Vec<&str> = a.split(',').collect();
-                            if p.len() >= 2 {
-                                let price = Decimal::from_str(p[0].trim()).unwrap_or(Decimal::ZERO);
-                                let qty = Decimal::from_str(p[1].trim()).unwrap_or(Decimal::ZERO);
-                                if price > Decimal::ZERO && qty > Decimal::ZERO {
-                                    asks.push([price.to_string(), qty.to_string()]);
-                                }
-                            }
-                        }
-
-                        if !bids.is_empty() && !asks.is_empty() {
-                            let ob = orderbooks
-                                .entry(symbol.to_string())
-                                .or_insert_with(|| LocalOrderbook::new(Symbol::new(symbol)));
-                            ob.apply(&bids, &asks, 0);
-                            if let (Some(best_bid), Some(best_ask)) = (ob.best_bid(), ob.best_ask()) {
-                                let spread = ob.spread().unwrap_or(Decimal::ZERO);
-                                let mid = (best_bid.price + best_ask.price) / Decimal::from(2);
-                                let spread_pct = spread / mid * Decimal::from(100);
-                                if spread_pct < Decimal::from(2) && spread_pct > Decimal::ZERO {
-                                    tracing::info!(
-                                        "[OB {}] bid={:.2} ask={:.2} spread={:.4}%",
-                                        symbol,
-                                        best_bid.price,
-                                        best_ask.price,
-                                        spread_pct
-                                    );
-                                }
+                // Print BBO for all exchanges
+                for &sym in &[SYMBOL_BTC, SYMBOL_ETH] {
+                    let sym_name = if sym == SYMBOL_BTC { "BTC" } else { "ETH" };
+                    for &exch in &[EXCHANGE_HYPERLIQUID, EXCHANGE_LIGHTER, EXCHANGE_EDGEX, EXCHANGE_01] {
+                        if let Some(bbo) = state.get_bbo(sym, exch) {
+                            if bbo.is_valid() {
+                                tracing::info!(
+                                    "[{:>12}] {} bid={:.2} ask={:.2} spread={:.4}",
+                                    exchange_name(exch),
+                                    sym_name,
+                                    bbo.bid_price,
+                                    bbo.ask_price,
+                                    bbo.ask_price - bbo.bid_price,
+                                );
                             }
                         }
                     }
-                }
-                _ => {}
-            }
-        }
 
-        if data.len() == pos {
-            pos = 0;
+                    // Check arbitrage across all exchange pairs
+                    if let Some(signal) = state.check_arbitrage(sym) {
+                        arbitrage::execute_arbitrage(&signal);
+                    }
+                }
+
+                tracing::info!("--- msgs/s: {} total: {} ---", msg_count, reader.read_idx());
+                msg_count = 0;
+            }
+        } else {
+            std::hint::spin_loop();
         }
     }
 }
