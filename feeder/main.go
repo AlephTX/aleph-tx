@@ -13,23 +13,23 @@ import (
 )
 
 func main() {
-	log.Println("🐙 AlephTX Feeder starting...")
+	log.Println("🐙 AlephTX Feeder starting (Lock-free Shared Matrix)...")
 
-	ringName := "aleph-bbo"
-	if r := os.Getenv("ALEPH_RING"); r != "" {
-		ringName = r
+	shmName := "aleph-matrix"
+	if s := os.Getenv("ALEPH_SHM"); s != "" {
+		shmName = s
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// 1024 slots × 64 bytes = 64KB shared memory
-	ring, err := shm.NewRingBuffer(ringName, 1024)
+	// Create shared memory matrix (~656 KB)
+	matrix, err := shm.NewMatrix(shmName)
 	if err != nil {
 		log.Fatalf("shm: %v", err)
 	}
-	defer ring.Close()
-	log.Printf("📡 Shared memory: /dev/shm/%s (1024 slots × 64B)", ringName)
+	defer matrix.Close()
+	log.Printf("📡 Shared matrix: /dev/shm/%s (~656 KB)", shmName)
 
 	var wg sync.WaitGroup
 
@@ -37,7 +37,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		hl := exchanges.NewHyperliquid(ring)
+		hl := exchanges.NewHyperliquid(matrix)
 		log.Println("🔌 Hyperliquid: connecting...")
 		if err := hl.Run(ctx); err != nil && err != context.Canceled {
 			log.Printf("Hyperliquid: %v", err)
@@ -48,7 +48,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		lt := exchanges.NewLighter(ring)
+		lt := exchanges.NewLighter(matrix)
 		log.Println("🔌 Lighter: connecting...")
 		if err := lt.Run(ctx); err != nil && err != context.Canceled {
 			log.Printf("Lighter: %v", err)
@@ -59,7 +59,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mock := exchanges.NewMockFeeder(ring, exchanges.ExchangeEdgeX, "EdgeX")
+		mock := exchanges.NewMockFeeder(matrix, exchanges.ExchangeEdgeX, "EdgeX")
 		log.Println("🔌 EdgeX: mock feeder")
 		mock.Run(ctx)
 	}()
@@ -68,7 +68,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mock := exchanges.NewMockFeeder(ring, exchanges.Exchange01, "01")
+		mock := exchanges.NewMockFeeder(matrix, exchanges.Exchange01, "01")
 		log.Println("🔌 01 Exchange: mock feeder")
 		mock.Run(ctx)
 	}()

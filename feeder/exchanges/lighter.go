@@ -20,11 +20,11 @@ var lighterMarkets = map[int]uint16{
 
 // Lighter connects to the Lighter (zkLighter) orderbook WebSocket.
 type Lighter struct {
-	ring *shm.RingBuffer
+	matrix *shm.Matrix
 }
 
-func NewLighter(ring *shm.RingBuffer) *Lighter {
-	return &Lighter{ring: ring}
+func NewLighter(matrix *shm.Matrix) *Lighter {
+	return &Lighter{matrix: matrix}
 }
 
 // lighterOB is the orderbook snapshot/update envelope.
@@ -89,8 +89,6 @@ func (l *Lighter) connect(ctx context.Context) error {
 			continue
 		}
 
-		// Both snapshot ("subscribed/order_book") and update ("update/order_book")
-		// carry an order_book field with bids/asks.
 		isSnapshot := env.Type == "subscribed/order_book"
 		isUpdate := env.Type == "update/order_book"
 		if !isSnapshot && !isUpdate {
@@ -102,7 +100,6 @@ func (l *Lighter) connect(ctx context.Context) error {
 			continue
 		}
 
-		// Extract market index from channel: "order_book:0" or subscribe uses "order_book/0"
 		mktIdx := l.parseMarketIndex(env.Channel)
 		symID, ok := lighterMarkets[mktIdx]
 		if !ok {
@@ -123,14 +120,13 @@ func (l *Lighter) connect(ctx context.Context) error {
 			tsNs = uint64(time.Now().UnixNano())
 		}
 
-		l.ring.WriteBBO(ExchangeLighter, symID, tsNs,
+		// Write to shared matrix (triggers version increment)
+		l.matrix.WriteBBO(ExchangeLighter, symID, tsNs,
 			bidPx, bidSz, askPx, askSz)
 	}
 }
 
-// parseMarketIndex extracts the integer from "order_book:N" or "order_book/N".
 func (l *Lighter) parseMarketIndex(channel string) int {
-	// Channel format: "order_book:0" (in updates) or "order_book/0" (in subscribe)
 	for i := len(channel) - 1; i >= 0; i-- {
 		if channel[i] == ':' || channel[i] == '/' {
 			n, _ := strconv.Atoi(channel[i+1:])
