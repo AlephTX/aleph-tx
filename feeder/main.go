@@ -55,22 +55,33 @@ func main() {
 		}
 	}()
 
-	// EdgeX — mock feeder (network unreachable)
+	// EdgeX — API not accessible, use mock
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mock := exchanges.NewMockFeeder(matrix, exchanges.ExchangeEdgeX, "EdgeX")
-		log.Println("🔌 EdgeX: mock feeder")
-		mock.Run(ctx)
+		ex := exchanges.NewEdgeX(matrix)
+		log.Println("🔌 EdgeX: starting...")
+		ex.Run(ctx)
 	}()
 
-	// 01 Exchange — mock feeder (network unreachable)
+	// 01 Exchange — mock (network unreachable)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		mock := exchanges.NewMockFeeder(matrix, exchanges.Exchange01, "01")
 		log.Println("🔌 01 Exchange: mock feeder")
 		mock.Run(ctx)
+	}()
+
+	// Backpack — real WebSocket
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bp := exchanges.NewBackpack(matrix)
+		log.Println("🔌 Backpack: connecting...")
+		if err := bp.Run(ctx); err != nil && err != context.Canceled {
+			log.Printf("Backpack: %v", err)
+		}
 	}()
 
 	wg.Wait()

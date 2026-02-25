@@ -25,7 +25,7 @@ fn main() {
     let num_symbols = std::env::var("ALEPH_SYMBOLS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(2048);
 
     let mut reader = ShmReader::open(&shm_path, num_symbols)
         .expect("Failed to open shared memory");
@@ -41,7 +41,7 @@ fn main() {
 
     let mut loop_count: u64 = 0;
     loop {
-        loop_count += 1;
+        loop_count += 1; if loop_count % 1000000 == 0 { eprintln!("iterations: {}", loop_count); }
         
         if let Some(sym) = reader.try_poll() {
             poll_count += 1;
