@@ -41,7 +41,6 @@ fn main() {
 
     let mut loop_count: u64 = 0;
     loop {
-        loop_count += 1; if loop_count % 1000000 == 0 { eprintln!("iterations: {}", loop_count); }
         
         if let Some(sym) = reader.try_poll() {
             poll_count += 1;
