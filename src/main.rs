@@ -83,7 +83,7 @@ fn main() {
         }
         last_log = Instant::now();
         
-        if loop_count > 10_000_000 {
+        if loop_count > 1_000_000_000 {
             tracing::info!("Exiting after 10M iterations");
             break;
         }
