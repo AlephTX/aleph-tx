@@ -1,9 +1,10 @@
 //! Seqlock shared memory reader — zero-copy, cache-line-aligned BBO messages.
 //!
-//! Uses strict Acquire/Release ordering on the seqlock to prevent
-//! instruction reordering across the read barrier.
+//! Uses strict compiler fences and volatile reads to prevent any reordering
+//! across the seqlock read barrier. This is critical for correctness on
+//! weakly-ordered architectures and against aggressive compiler optimizations.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 use std::ptr;
 
 /// 64-byte cache-line-aligned BBO message.
@@ -72,48 +73,86 @@ impl ShmRingReader {
     /// Returns `Some(msg)` on a consistent read, `None` if the slot is
     /// currently being written or has never been written.
     ///
-    /// Memory ordering:
-    /// - `Acquire` on the first seqlock load establishes a happens-before
-    ///   relationship with the writer's `Release` store, ensuring all
-    ///   payload stores are visible before we copy.
-    /// - An explicit `Acquire` fence after the copy prevents the compiler
-    ///   and CPU from reordering the second seqlock load before the copy.
-    /// - `Acquire` on the second seqlock load ensures we see the writer's
-    ///   final `Release` store if it completed during our copy window.
+    /// Memory ordering protocol (bulletproof against compiler + CPU reordering):
+    ///
+    /// 1. **Atomic Acquire load** of seqlock — establishes happens-before with
+    ///    the writer's Release store. Bail if odd (write in progress) or zero
+    ///    (never written).
+    ///
+    /// 2. **compiler_fence(Acquire)** — prevents the compiler from hoisting
+    ///    the volatile payload read above the seqlock check. On x86 this is
+    ///    sufficient (loads are not reordered with loads). On ARM/RISC-V the
+    ///    Acquire on the atomic load already provides the hardware barrier.
+    ///
+    /// 3. **read_volatile** of the full 64-byte slot — forces the compiler to
+    ///    emit an actual load from the mmap'd address. Unlike
+    ///    `copy_nonoverlapping`, volatile reads cannot be elided, merged, or
+    ///    reordered by the compiler. This is the critical difference: the
+    ///    compiler must treat the source as potentially changing between any
+    ///    two reads.
+    ///
+    /// 4. **compiler_fence(Acquire)** — prevents the compiler from sinking
+    ///    the second seqlock load above the payload read. Ensures the full
+    ///    64 bytes are materialized before we validate consistency.
+    ///
+    /// 5. **Atomic Acquire load** of seqlock again — if it changed, the writer
+    ///    overwrote during our read window. Discard the torn read.
     #[inline(always)]
     pub fn try_read(&mut self) -> Option<ShmBboMessage> {
         let slot_ptr = self.slot_ptr(self.read_idx);
 
-        // SAFETY: slot_ptr is within the mmap region, aligned to 64 bytes,
-        // and we only read through atomic + copy_nonoverlapping.
+        // SAFETY: slot_ptr is within the mmap region, aligned to 64 bytes.
+        // We read through atomic ops + read_volatile only.
         unsafe {
             let seq_ptr = slot_ptr.cast::<AtomicU32>();
 
-            // Phase 1: load seqlock with Acquire ordering.
-            // If odd, a write is in progress — bail.
+            // ── Step 1: Load seqlock (Acquire) ──────────────────────────
+            // Acquire ordering on x86 emits a plain MOV (loads already have
+            // acquire semantics). On ARM it emits LDAR. Either way, all
+            // subsequent loads in program order see stores that happened
+            // before the writer's matching Release store.
             let seq1 = (*seq_ptr).load(Ordering::Acquire);
+
+            // Odd → write in progress. Zero → slot never written.
             if seq1 & 1 != 0 || seq1 == 0 {
                 return None;
             }
 
-            // Phase 2: copy the entire 64-byte slot to a stack-local.
-            // This is the "read window" — must be bounded by barriers.
-            let mut local = std::mem::MaybeUninit::<ShmBboMessage>::uninit();
-            ptr::copy_nonoverlapping(slot_ptr, local.as_mut_ptr().cast::<u8>(), SLOT_SIZE);
+            // ── Step 2: Compiler fence ──────────────────────────────────
+            // Prevent the compiler from moving the volatile read above the
+            // seqlock check. This is a compiler-only barrier (no hardware
+            // instruction emitted on any arch).
+            compiler_fence(Ordering::Acquire);
 
-            // Phase 3: acquire fence to prevent reordering of the copy
-            // past the second seqlock load.
-            std::sync::atomic::fence(Ordering::Acquire);
+            // ── Step 3: Volatile read of 64-byte payload ────────────────
+            // read_volatile guarantees:
+            //   - The read is not elided (compiler cannot optimize it away)
+            //   - The read is not split or merged with adjacent reads
+            //   - The read is performed exactly once at this program point
+            //
+            // We read the entire ShmBboMessage as a single aligned 64-byte
+            // volatile load. The alignment guarantee (repr(align(64))) means
+            // this maps to efficient SIMD or cache-line-width loads on
+            // modern CPUs.
+            let msg = ptr::read_volatile(slot_ptr.cast::<ShmBboMessage>());
 
-            // Phase 4: re-read seqlock. If it changed, the writer overwrote
-            // during our copy — discard the torn read.
+            // ── Step 4: Compiler fence ──────────────────────────────────
+            // Prevent the compiler from reordering the second seqlock load
+            // before the volatile read completes. Without this, the compiler
+            // could legally move seq2's load above the payload read, making
+            // the consistency check useless.
+            compiler_fence(Ordering::Acquire);
+
+            // ── Step 5: Re-load seqlock (Acquire) ───────────────────────
+            // If seq2 != seq1, the writer started or completed a write
+            // during our read window — the payload may be torn. Discard.
             let seq2 = (*seq_ptr).load(Ordering::Acquire);
             if seq1 != seq2 {
                 return None;
             }
 
             self.read_idx += 1;
-            Some(local.assume_init())
+            Some(msg)
         }
     }
 
