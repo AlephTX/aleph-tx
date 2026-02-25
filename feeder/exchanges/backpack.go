@@ -8,17 +8,24 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 )
 
 // Backpack connects to the Backpack (formerly Coral) exchange.
 type Backpack struct {
+	cfg    config.ExchangeConfig
 	matrix *shm.Matrix
+	symMap map[string]uint16
 }
 
-func NewBackpack(matrix *shm.Matrix) *Backpack {
-	return &Backpack{matrix: matrix}
+func NewBackpack(cfg config.ExchangeConfig, matrix *shm.Matrix) *Backpack {
+	return &Backpack{
+		cfg:    cfg,
+		matrix: matrix,
+		symMap: BuildReverseSymbolMap(cfg.Symbols),
+	}
 }
 
 // Backpack depth message
@@ -31,42 +38,35 @@ type backpackDepth struct {
 }
 
 func (b *Backpack) Run(ctx context.Context) error {
-	for {
-		if err := b.connect(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			log.Printf("backpack: disconnected (%v), reconnecting in 3s...", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-		}
-	}
+	return RunConnectionLoop(ctx, "backpack", b.connect)
 }
 
 func (b *Backpack) connect(ctx context.Context) error {
-	c, _, err := websocket.Dial(ctx, "wss://ws.backpack.exchange", nil)
+	c, _, err := websocket.Dial(ctx, b.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.CloseNow()
 
-	// Subscribe to BTC and ETH perpetual
-	symbols := []string{"BTC_USDC_PERP", "ETH_USDC_PERP"}
+	log.Printf("backpack: connected to %s", b.cfg.WSURL)
+
+	// Subscribe to configured symbols
+	var symbols []string
+	for _, rawSym := range b.cfg.Symbols {
+		symbols = append(symbols, rawSym)
+	}
 	for _, sym := range symbols {
 		channel := "depth." + sym
 		sub := map[string]any{
 			"method": "SUBSCRIBE",
 			"params": []string{channel},
-			"id":    1,
+			"id":     1,
 		}
 		if err := c.Write(ctx, websocket.MessageText, mustJSON(sub)); err != nil {
 			return fmt.Errorf("subscribe %s: %w", sym, err)
 		}
 	}
-	log.Printf("backpack: connected, subscribed to %v", symbols)
+	log.Printf("backpack: subscribed to %v", symbols)
 
 	// Read loop
 	for {
@@ -84,8 +84,8 @@ func (b *Backpack) connect(ctx context.Context) error {
 			continue
 		}
 
-		symID := backpackSymbolToID(depth.Symbol)
-		if symID == 0 {
+		symID, ok := b.symMap[depth.Symbol]
+		if !ok {
 			continue
 		}
 
@@ -108,39 +108,7 @@ func (b *Backpack) connect(ctx context.Context) error {
 	}
 }
 
-// Backpack symbol to our ID
-func backpackSymbolToID(symbol string) uint16 {
-	switch symbol {
-	case "BTC_USDC_PERP":
-		return SymbolBTCPERP
-	case "ETH_USDC_PERP":
-		return SymbolETHPERP
-	default:
-		return 0
-	}
-}
-
-// EdgeX placeholder - API not accessible from this environment
-type EdgeX struct {
-	matrix *shm.Matrix
-}
-
-func NewEdgeX(matrix *shm.Matrix) *EdgeX {
-	return &EdgeX{matrix: matrix}
-}
-
-func (e *EdgeX) Run(ctx context.Context) error {
-	log.Println("edgex: API not accessible, using mock data")
-	
-	// Fall back to mock for now
-	mock := NewMockFeeder(e.matrix, ExchangeEdgeX, "EdgeX")
-	mock.Run(ctx)
-	return nil
-}
-
-
 func mustJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
 }
-

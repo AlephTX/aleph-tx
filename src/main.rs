@@ -1,91 +1,81 @@
-use aleph_tx::{
-    arbitrage::{self, ArbitrageEngine},
-    shm_reader::ShmReader,
-};
-use std::time::Instant;
+use tracing_subscriber::{fmt, EnvFilter};
+use std::time::Duration;
 
-const SYMBOL_BTC: u16 = 1001;
-const SYMBOL_ETH: u16 = 1002;
+mod shm_reader;
+mod types;
+mod strategy;
 
-fn symbol_name(id: u16) -> &'static str {
-    match id {
-        1001 => "BTC",
-        1002 => "ETH",
-        _ => "UNK",
-    }
-}
+use shm_reader::ShmReader;
+use strategy::{Strategy, arbitrage::ArbitrageEngine, market_maker::MarketMakerStrategy};
 
-fn main() {
-    tracing_subscriber::fmt::init();
-    tracing::info!("🦀 AlephTX Core starting (Lock-free Shared Matrix)...");
+fn main() -> anyhow::Result<()> {
+    // 1. Initialize high-performance logger
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,aleph_tx=debug"));
 
-    let shm_path = std::env::var("ALEPH_SHM")
-        .unwrap_or_else(|_| "/dev/shm/aleph-matrix".to_string());
-    
-    let num_symbols = std::env::var("ALEPH_SYMBOLS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048);
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_level(true)
+        .init();
 
-    let mut reader = ShmReader::open(&shm_path, num_symbols)
-        .expect("Failed to open shared memory");
-    tracing::info!("📡 Opened {} (scanning {} symbols)", shm_path, num_symbols);
+    tracing::info!("🦀 AlephTX Core starting (Zero-copy IPC Strategy Engine)...");
 
-    let engine = ArbitrageEngine::new(3.0);
-    
-    let mut poll_count: u64 = 0;
-    let mut last_log = Instant::now();
-    let mut last_stats = Instant::now();
+    // 2. Open lock-free shared memory matrix
+    let shm_path = "/dev/shm/aleph-matrix";
+    let mut reader = match ShmReader::open(shm_path, 2048) {
+        Ok(r) => {
+            tracing::info!("📡 Opened {} (scanning 2048 symbols)", shm_path);
+            r
+        }
+        Err(e) => {
+            tracing::error!("Failed to open shared memory: {}", e);
+            tracing::error!("Make sure the Go feeder is running first.");
+            std::process::exit(1);
+        }
+    };
 
-    tracing::info!("⏳ Waiting for market data...");
+    // 3. Initialize Strategy Multiplexer
+    let mut strategies: Vec<Box<dyn Strategy>> = vec![
+        Box::new(ArbitrageEngine::new(5.0)), // > 5.0 bps trigger
+        Box::new(MarketMakerStrategy::new(1, 1001, 2.5)), // Exchange 1 (HL), Symbol 1001 (BTC)
+    ];
 
+    tracing::info!("⏳ Booted {} strategies. Waiting for market data...", strategies.len());
+
+    // 4. Main ultra-low latency spin loop
     let mut loop_count: u64 = 0;
+    
     loop {
-        
-        if let Some(sym) = reader.try_poll() {
-            poll_count += 1;
-
-            if let Some(signal) = engine.check(&mut reader, sym) {
-                arbitrage::execute_arbitrage(&signal);
-            }
-
-            if sym == SYMBOL_BTC || sym == SYMBOL_ETH {
-                if let Some(gb) = engine.find_global_best(&mut reader, sym) {
-                    if gb.has_arb() {
-                        tracing::info!(
-                            "📊 {} GBB={:.2}@x{} GBA={:.2}@x{} spread={:.2}bps",
-                            symbol_name(sym),
-                            gb.bid_price,
-                            gb.bid_exchange,
-                            gb.ask_price,
-                            gb.ask_exchange,
-                            (gb.spread() / gb.mid()) * 10_000.0
-                        );
+        match reader.try_poll() {
+            Some(symbol_id) => {
+                // Read all exchanges atomically for this symbol
+                let exchanges = reader.read_all_exchanges(symbol_id);
+                
+                // Multiplex the updates to all active strategies
+                for (exch_idx, bbo) in exchanges.iter() {
+                    // Only pass valid BBOs
+                    if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                        for strategy in strategies.iter_mut() {
+                            strategy.on_bbo_update(symbol_id, *exch_idx, bbo);
+                        }
                     }
                 }
             }
-        } else {
-            std::hint::spin_loop();
-        }
+            None => {
+                loop_count += 1;
+                
+                for strategy in strategies.iter_mut() {
+                    strategy.on_idle();
+                }
 
-        if last_log.elapsed().as_millis() >= 1000 {
-            let elapsed = last_stats.elapsed().as_secs_f64();
-            if poll_count > 0 {
-                tracing::info!(
-                    "📈 poll/s: {:.0}k | BTC v{} ETH v{}",
-                    poll_count as f64 / elapsed,
-                    reader.local_version(SYMBOL_BTC),
-                    reader.local_version(SYMBOL_ETH)
-                );
+                if loop_count % 1_000_000 == 0 {
+                    std::thread::sleep(Duration::from_micros(1));
+                } else {
+                    std::hint::spin_loop();
+                }
             }
-            poll_count = 0;
-            last_stats = Instant::now();
-        }
-        last_log = Instant::now();
-        
-        if loop_count > 1_000_000_000 {
-            tracing::info!("Exiting after 10M iterations");
-            break;
         }
     }
 }

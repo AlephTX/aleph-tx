@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 	"strconv"
-	"time"
 
+	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
@@ -15,12 +15,17 @@ import (
 
 // Hyperliquid connects to the Hyperliquid L2 book WebSocket.
 type Hyperliquid struct {
+	cfg    config.ExchangeConfig
 	matrix *shm.Matrix
-	coins  []string
+	symMap map[string]uint16
 }
 
-func NewHyperliquid(matrix *shm.Matrix) *Hyperliquid {
-	return &Hyperliquid{matrix: matrix, coins: []string{"BTC", "ETH"}}
+func NewHyperliquid(cfg config.ExchangeConfig, matrix *shm.Matrix) *Hyperliquid {
+	return &Hyperliquid{
+		cfg:    cfg,
+		matrix: matrix,
+		symMap: BuildReverseSymbolMap(cfg.Symbols),
+	}
 }
 
 type hlEnvelope struct {
@@ -40,42 +45,32 @@ type hlLevel struct {
 }
 
 func (h *Hyperliquid) Run(ctx context.Context) error {
-	for {
-		if err := h.connect(ctx); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			log.Printf("hyperliquid: disconnected (%v), reconnecting in 3s...", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-		}
-	}
+	return RunConnectionLoop(ctx, "hyperliquid", h.connect)
 }
 
 func (h *Hyperliquid) connect(ctx context.Context) error {
-	c, _, err := websocket.Dial(ctx, "wss://api.hyperliquid.xyz/ws", nil)
+	c, _, err := websocket.Dial(ctx, h.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.CloseNow()
 
-	// Subscribe to l2Book for each coin
-	for _, coin := range h.coins {
+	log.Printf("hyperliquid: connected to %s", h.cfg.WSURL)
+
+	// Subscribe to l2Book for each configured coin
+	for _, rawCoin := range h.cfg.Symbols {
 		sub := map[string]any{
 			"method": "subscribe",
 			"subscription": map[string]any{
 				"type": "l2Book",
-				"coin": coin,
+				"coin": rawCoin,
 			},
 		}
 		if err := wsjson.Write(ctx, c, sub); err != nil {
-			return fmt.Errorf("subscribe %s: %w", coin, err)
+			return fmt.Errorf("subscribe %s: %w", rawCoin, err)
 		}
+		log.Printf("hyperliquid: subscribed to %v", rawCoin)
 	}
-	log.Printf("hyperliquid: connected, subscribed to %v", h.coins)
 
 	for {
 		var raw json.RawMessage
@@ -93,7 +88,7 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 			continue
 		}
 
-		symID, ok := CoinToSymbolID[book.Coin]
+		symID, ok := h.symMap[book.Coin]
 		if !ok || len(book.Levels) < 2 {
 			continue
 		}

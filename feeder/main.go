@@ -8,12 +8,23 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/exchanges"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 )
 
 func main() {
-	log.Println("🐙 AlephTX Feeder starting (Lock-free Shared Matrix)...")
+	log.Println("🐙 AlephTX Feeder starting (Configuration Driven)...")
+
+	// Load configuration
+	cfgPath := "config.toml"
+	if p := os.Getenv("ALEPH_FEEDER_CONFIG"); p != "" {
+		cfgPath = p
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Fatalf("failed to load config %s: %v", cfgPath, err)
+	}
 
 	shmName := "aleph-matrix"
 	if s := os.Getenv("ALEPH_SHM"); s != "" {
@@ -33,56 +44,65 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Hyperliquid — real WebSocket
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		hl := exchanges.NewHyperliquid(matrix)
-		log.Println("🔌 Hyperliquid: connecting...")
-		if err := hl.Run(ctx); err != nil && err != context.Canceled {
-			log.Printf("Hyperliquid: %v", err)
-		}
-	}()
+	if hlCfg, ok := cfg.Exchanges["hyperliquid"]; ok && hlCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hl := exchanges.NewHyperliquid(hlCfg, matrix)
+			log.Println("🔌 Hyperliquid: starting...")
+			if err := hl.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Hyperliquid: %v", err)
+			}
+		}()
+	}
 
-	// Lighter — real WebSocket
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		lt := exchanges.NewLighter(matrix)
-		log.Println("🔌 Lighter: connecting...")
-		if err := lt.Run(ctx); err != nil && err != context.Canceled {
-			log.Printf("Lighter: %v", err)
-		}
-	}()
+	if ltCfg, ok := cfg.Exchanges["lighter"]; ok && ltCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lt := exchanges.NewLighter(ltCfg, matrix)
+			log.Println("🔌 Lighter: starting...")
+			if err := lt.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Lighter: %v", err)
+			}
+		}()
+	}
 
-	// EdgeX — API not accessible, use mock
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ex := exchanges.NewEdgeX(matrix)
-		log.Println("🔌 EdgeX: starting...")
-		ex.Run(ctx)
-	}()
+	if bpCfg, ok := cfg.Exchanges["backpack"]; ok && bpCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bp := exchanges.NewBackpack(bpCfg, matrix)
+			log.Println("🔌 Backpack: starting...")
+			if err := bp.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Backpack: %v", err)
+			}
+		}()
+	}
 
-	// 01 Exchange — mock (network unreachable)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mock := exchanges.NewMockFeeder(matrix, exchanges.Exchange01, "01")
-		log.Println("🔌 01 Exchange: mock feeder")
-		mock.Run(ctx)
-	}()
+	if edgexCfg, ok := cfg.Exchanges["edgex"]; ok && edgexCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ex := exchanges.NewEdgeX(edgexCfg, matrix)
+			log.Println("🔌 EdgeX: starting...")
+			if err := ex.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("EdgeX: %v", err)
+			}
+		}()
+	}
 
-	// Backpack — real WebSocket
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		bp := exchanges.NewBackpack(matrix)
-		log.Println("🔌 Backpack: connecting...")
-		if err := bp.Run(ctx); err != nil && err != context.Canceled {
-			log.Printf("Backpack: %v", err)
-		}
-	}()
+	if zeroOneCfg, ok := cfg.Exchanges["01"]; ok && zeroOneCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			z := exchanges.NewZeroOne(zeroOneCfg, matrix)
+			log.Println("🔌 01 Exchange: starting...")
+			if err := z.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("01: %v", err)
+			}
+		}()
+	}
 
 	wg.Wait()
 	log.Println("👋 Feeder stopped.")
