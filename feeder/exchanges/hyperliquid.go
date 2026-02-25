@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/shm"
@@ -16,12 +15,12 @@ import (
 
 // Hyperliquid connects to the Hyperliquid L2 book WebSocket.
 type Hyperliquid struct {
-	ring  *shm.RingBuffer
-	coins []string
+	matrix *shm.Matrix
+	coins  []string
 }
 
-func NewHyperliquid(ring *shm.RingBuffer) *Hyperliquid {
-	return &Hyperliquid{ring: ring, coins: []string{"BTC", "ETH"}}
+func NewHyperliquid(matrix *shm.Matrix) *Hyperliquid {
+	return &Hyperliquid{matrix: matrix, coins: []string{"BTC", "ETH"}}
 }
 
 type hlEnvelope struct {
@@ -110,11 +109,10 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 		askPx, _ := strconv.ParseFloat(asks[0].Px, 64)
 		askSz, _ := strconv.ParseFloat(asks[0].Sz, 64)
 
-		_ = strings.TrimSpace // keep import
-
 		tsNs := uint64(book.Time) * 1_000_000 // ms → ns
 
-		h.ring.WriteBBO(ExchangeHyperliquid, symID, tsNs,
+		// Write to shared matrix (triggers version increment)
+		h.matrix.WriteBBO(ExchangeHyperliquid, symID, tsNs,
 			bidPx, bidSz, askPx, askSz)
 	}
 }

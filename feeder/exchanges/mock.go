@@ -12,13 +12,13 @@ import (
 // MockFeeder generates realistic BBO data for exchanges we can't reach.
 // Prices track a random walk around a base price with realistic spreads.
 type MockFeeder struct {
-	ring       *shm.RingBuffer
+	matrix    *shm.Matrix
 	exchangeID uint8
-	name       string
+	name      string
 }
 
-func NewMockFeeder(ring *shm.RingBuffer, exchangeID uint8, name string) *MockFeeder {
-	return &MockFeeder{ring: ring, exchangeID: exchangeID, name: name}
+func NewMockFeeder(matrix *shm.Matrix, exchangeID uint8, name string) *MockFeeder {
+	return &MockFeeder{matrix: matrix, exchangeID: exchangeID, name: name}
 }
 
 func (m *MockFeeder) Run(ctx context.Context) {
@@ -57,9 +57,10 @@ func (m *MockFeeder) Run(ctx context.Context) {
 			ethBidSz := 1.0 + rng.Float64()*20.0
 			ethAskSz := 1.0 + rng.Float64()*20.0
 
-			m.ring.WriteBBO(m.exchangeID, SymbolBTCPERP, tsNs,
+			// Write to shared matrix (triggers version increment)
+			m.matrix.WriteBBO(m.exchangeID, SymbolBTCPERP, tsNs,
 				btcBid, btcBidSz, btcAsk, btcAskSz)
-			m.ring.WriteBBO(m.exchangeID, SymbolETHPERP, tsNs,
+			m.matrix.WriteBBO(m.exchangeID, SymbolETHPERP, tsNs,
 				ethBid, ethBidSz, ethAsk, ethAskSz)
 		}
 	}
