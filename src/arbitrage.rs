@@ -8,7 +8,9 @@ use crate::shm_reader::ShmBboMessage;
 /// Exchange IDs (must match Go feeder constants).
 pub const EXCHANGE_HYPERLIQUID: u8 = 1;
 pub const EXCHANGE_LIGHTER: u8 = 2;
-pub const NUM_EXCHANGES: usize = 3; // 0=unused, 1=HL, 2=Lighter
+pub const EXCHANGE_EDGEX: u8 = 3;
+pub const EXCHANGE_01: u8 = 4;
+pub const NUM_EXCHANGES: usize = 5; // 0=unused, 1=HL, 2=Lighter, 3=EdgeX, 4=01
 
 /// Maximum number of tracked symbols.
 pub const MAX_SYMBOLS: usize = 2048;
