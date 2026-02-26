@@ -33,3 +33,4 @@ rest_url = "https://pro.edgex.exchange"
 
 [exchanges.edgex.symbols]
 BTC = "10000001"
+ETH = "10000002"

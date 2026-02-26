@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod edgex_api;
 pub mod strategy;
 pub mod engine;
 pub mod ipc;
