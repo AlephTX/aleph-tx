@@ -1,12 +1,8 @@
 use tracing_subscriber::{fmt, EnvFilter};
 use std::time::Duration;
 
-mod shm_reader;
-mod types;
-mod strategy;
-
-use shm_reader::ShmReader;
-use strategy::{Strategy, arbitrage::ArbitrageEngine, market_maker::MarketMakerStrategy};
+use aleph_tx::shm_reader::ShmReader;
+use aleph_tx::strategy::{Strategy, arbitrage::ArbitrageEngine, market_maker::MarketMakerStrategy};
 
 fn main() -> anyhow::Result<()> {
     // 1. Initialize high-performance logger
@@ -21,6 +17,10 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("🦀 AlephTX Core starting (Zero-copy IPC Strategy Engine)...");
+
+    // Initialize async runtime for non-blocking HTTP APIs
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
 
     // 2. Open lock-free shared memory matrix
     let shm_path = "/dev/shm/aleph-matrix";
@@ -37,9 +37,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     // 3. Initialize Strategy Multiplexer
-    let mut strategies: Vec<Box<dyn Strategy>> = vec![
+    let mut strategies: Vec<Box<dyn Strategy>> =vec![
         Box::new(ArbitrageEngine::new(5.0)), // > 5.0 bps trigger
-        Box::new(MarketMakerStrategy::new(1, 1001, 2.5)), // Exchange 1 (HL), Symbol 1001 (BTC)
+        Box::new(MarketMakerStrategy::new(3, 1002, 2.5)), // Exchange 3 (EdgeX), Symbol 1002 (ETH)
     ];
 
     tracing::info!("⏳ Booted {} strategies. Waiting for market data...", strategies.len());
