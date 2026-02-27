@@ -36,9 +36,9 @@ impl BboSnapshot {
 }
 
 pub struct ArbitrageEngine {
-    min_spread_bps: f64,
+    _min_spread_bps: f64,
     min_spread_ratio: f64,
-    
+
     // symbol_id -> [ShmBboMessage; 5 exchanges]
     bbo_state: std::collections::HashMap<u16, [ShmBboMessage; NUM_EXCHANGES]>,
 }
@@ -46,12 +46,12 @@ pub struct ArbitrageEngine {
 impl ArbitrageEngine {
     pub fn new(min_spread_bps: f64) -> Self {
         Self {
-            min_spread_bps,
+            _min_spread_bps: min_spread_bps,
             min_spread_ratio: min_spread_bps / 10_000.0,
             bbo_state: std::collections::HashMap::new(),
         }
     }
-    
+
     fn sym_name(&self, symbol_id: u16) -> &'static str {
         match symbol_id {
             1001 => "BTC",
@@ -67,11 +67,14 @@ impl Strategy for ArbitrageEngine {
     }
 
     fn on_bbo_update(&mut self, symbol_id: u16, exchange_id: u8, bbo: &ShmBboMessage) {
-        let exchange_bbos = self.bbo_state.entry(symbol_id).or_insert_with(|| [ShmBboMessage::default(); NUM_EXCHANGES]);
-        
+        let exchange_bbos = self
+            .bbo_state
+            .entry(symbol_id)
+            .or_insert_with(|| [ShmBboMessage::default(); NUM_EXCHANGES]);
+
         if (exchange_id as usize) < NUM_EXCHANGES {
             exchange_bbos[exchange_id as usize] = *bbo;
-            
+
             // Re-evaluate global best
             let mut best_bid_price = 0.0_f64;
             let mut best_bid_size = 0.0_f64;
@@ -82,7 +85,9 @@ impl Strategy for ArbitrageEngine {
 
             for (exch_idx, msg) in exchange_bbos.iter().enumerate() {
                 let snap = BboSnapshot::from_shm(msg);
-                if !snap.is_valid() { continue; }
+                if !snap.is_valid() {
+                    continue;
+                }
 
                 if snap.bid_price > best_bid_price {
                     best_bid_price = snap.bid_price;
@@ -97,17 +102,23 @@ impl Strategy for ArbitrageEngine {
                 }
             }
 
-            if best_bid_price > 0.0 && best_ask_price < f64::MAX && best_bid_exchange != best_ask_exchange && best_bid_price > best_ask_price {
+            if best_bid_price > 0.0
+                && best_ask_price < f64::MAX
+                && best_bid_exchange != best_ask_exchange
+                && best_bid_price > best_ask_price
+            {
                 let spread = best_bid_price - best_ask_price;
                 let mid = (best_bid_price + best_ask_price) * 0.5;
 
                 let spread_bps = (spread / mid) * 10_000.0;
-                
+
                 tracing::info!(
                     "📊 {} GBB={:.2}@x{} GBA={:.2}@x{} spread={:.2}bps",
                     self.sym_name(symbol_id),
-                    best_bid_price, best_bid_exchange,
-                    best_ask_price, best_ask_exchange,
+                    best_bid_price,
+                    best_bid_exchange,
+                    best_ask_price,
+                    best_ask_exchange,
                     spread_bps
                 );
 
@@ -115,7 +126,13 @@ impl Strategy for ArbitrageEngine {
                     let exec_size = f64::min(best_bid_size, best_ask_size);
                     tracing::warn!(
                         "🚨 ARB sym={} buy_exch={} sell_exch={} buy@{:.2} sell@{:.2} size={:.4} spread={:.1}bps",
-                        symbol_id, best_ask_exchange, best_bid_exchange, best_ask_price, best_bid_price, exec_size, spread_bps
+                        symbol_id,
+                        best_ask_exchange,
+                        best_bid_exchange,
+                        best_ask_price,
+                        best_bid_price,
+                        exec_size,
+                        spread_bps
                     );
                 }
             }

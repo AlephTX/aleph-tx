@@ -22,7 +22,7 @@ pub trait ExchangeAdapter: Send + Sync {
 
 pub struct BinanceAdapter {
     name: String,
-    testnet: bool,
+    _testnet: bool,
     signer: Arc<dyn Signer>,
     rest_url: String,
     client: reqwest::Client,
@@ -35,24 +35,54 @@ impl BinanceAdapter {
         } else {
             "https://api.binance.com/api".into()
         };
-        Self { name: "binance".into(), testnet, signer, rest_url, client: reqwest::Client::new() }
+        Self {
+            name: "binance".into(),
+            _testnet: testnet,
+            signer,
+            rest_url,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
 #[async_trait]
 impl ExchangeAdapter for BinanceAdapter {
-    fn name(&self) -> &str { &self.name }
-    fn markets(&self) -> &[Market] { &[Market::Spot, Market::Futures] }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn markets(&self) -> &[Market] {
+        &[Market::Spot, Market::Futures]
+    }
 
     async fn fetch_orderbook(&self, symbol: &Symbol, depth: usize) -> Result<Orderbook, String> {
-        let url = format!("{}/v3/depth?symbol={}&limit={}", self.rest_url, symbol, depth);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?
-            .json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
+        let url = format!(
+            "{}/v3/depth?symbol={}&limit={}",
+            self.rest_url, symbol, depth
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
         let parse = |arr: &[serde_json::Value]| -> Vec<PriceLevel> {
-            arr.iter().map(|v| PriceLevel {
-                price: v[0].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
-                quantity: v[1].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
-            }).collect()
+            arr.iter()
+                .map(|v| PriceLevel {
+                    price: v[0]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(Decimal::ZERO),
+                    quantity: v[1]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(Decimal::ZERO),
+                })
+                .collect()
         };
         Ok(Orderbook {
             symbol: symbol.clone(),
@@ -64,14 +94,37 @@ impl ExchangeAdapter for BinanceAdapter {
 
     async fn fetch_ticker(&self, symbol: &Symbol) -> Result<Ticker, String> {
         let url = format!("{}/v3/ticker/24hr?symbol={}", self.rest_url, symbol);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?
-            .json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Ticker {
             symbol: symbol.clone(),
-            bid: resp["bidPrice"].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
-            ask: resp["askPrice"].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
-            last: resp["lastPrice"].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
-            volume_24h: resp["volume"].as_str().unwrap_or("0").parse().unwrap_or(Decimal::ZERO),
+            bid: resp["bidPrice"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(Decimal::ZERO),
+            ask: resp["askPrice"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(Decimal::ZERO),
+            last: resp["lastPrice"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(Decimal::ZERO),
+            volume_24h: resp["volume"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(Decimal::ZERO),
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         })
     }
@@ -86,11 +139,25 @@ impl ExchangeAdapter for BinanceAdapter {
         })
     }
 
-    async fn cancel_order(&self, _: &str) -> Result<(), String> { Ok(()) }
-    async fn get_order(&self, _: &str) -> Result<Order, String> { Err("Not implemented".into()) }
-    async fn get_open_orders(&self, _: Option<&Symbol>) -> Result<Vec<Order>, String> { Ok(vec![]) }
-    async fn get_positions(&self) -> Result<Vec<Position>, String> { Ok(vec![]) }
-    async fn get_balance(&self) -> Result<Vec<Balance>, String> { Ok(vec![]) }
-    async fn set_leverage(&self, _: &Symbol, _: u32) -> Result<(), String> { Ok(()) }
-    fn signer(&self) -> Arc<dyn Signer> { self.signer.clone() }
+    async fn cancel_order(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn get_order(&self, _: &str) -> Result<Order, String> {
+        Err("Not implemented".into())
+    }
+    async fn get_open_orders(&self, _: Option<&Symbol>) -> Result<Vec<Order>, String> {
+        Ok(vec![])
+    }
+    async fn get_positions(&self) -> Result<Vec<Position>, String> {
+        Ok(vec![])
+    }
+    async fn get_balance(&self) -> Result<Vec<Balance>, String> {
+        Ok(vec![])
+    }
+    async fn set_leverage(&self, _: &Symbol, _: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn signer(&self) -> Arc<dyn Signer> {
+        self.signer.clone()
+    }
 }

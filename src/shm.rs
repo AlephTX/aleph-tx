@@ -2,11 +2,10 @@
 
 use memmap2::Mmap;
 use std::fs::File;
-use std::path::Path;
 
 pub struct ShmReader {
+    _file: File,
     mmap: Mmap,
-    file: File,
 }
 
 impl ShmReader {
@@ -15,7 +14,7 @@ impl ShmReader {
         let file = File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         tracing::info!("shm: mapped {} bytes from {}", mmap.len(), path);
-        Ok(Self { mmap, file })
+        Ok(Self { mmap, _file: file })
     }
 
     /// Refresh mmap to see latest data (for files that grow)

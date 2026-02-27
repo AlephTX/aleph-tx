@@ -75,10 +75,14 @@ func (b *Backpack) connect(ctx context.Context) error {
 			return err
 		}
 
-		var depth backpackDepth
-		if err := json.Unmarshal(data, &depth); err != nil {
+		var msg struct {
+			Data backpackDepth `json:"data"`
+		}
+		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
 		}
+
+		depth := msg.Data
 
 		if depth.EventType != "depth" {
 			continue
@@ -98,7 +102,7 @@ func (b *Backpack) connect(ctx context.Context) error {
 		askPx, _ := strconv.ParseFloat(depth.Asks[0][0], 64)
 		askSz, _ := strconv.ParseFloat(depth.Asks[0][1], 64)
 
-		tsNs := uint64(depth.Timestamp) * 1_000_000 // ms → ns
+		tsNs := uint64(depth.Timestamp) * 1_000 // μs → ns
 		if tsNs == 0 {
 			tsNs = uint64(time.Now().UnixNano())
 		}

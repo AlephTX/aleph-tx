@@ -17,7 +17,7 @@ BTC = "3"
 ETH = "4"
 
 [exchanges.backpack]
-enabled = false
+enabled = true
 testnet = false
 ws_url = "wss://ws.backpack.exchange"
 

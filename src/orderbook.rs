@@ -13,7 +13,12 @@ pub struct LocalOrderbook {
 
 impl LocalOrderbook {
     pub fn new(symbol: Symbol) -> Self {
-        Self { symbol, bids: BTreeMap::new(), asks: BTreeMap::new(), ts: 0 }
+        Self {
+            symbol,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            ts: 0,
+        }
     }
 
     /// Apply an incremental depth update. qty == 0 means remove the level.
@@ -40,11 +45,17 @@ impl LocalOrderbook {
     }
 
     pub fn best_bid(&self) -> Option<PriceLevel> {
-        self.bids.iter().next_back().map(|(p, q)| PriceLevel { price: p.0, quantity: *q })
+        self.bids.iter().next_back().map(|(p, q)| PriceLevel {
+            price: p.0,
+            quantity: *q,
+        })
     }
 
     pub fn best_ask(&self) -> Option<PriceLevel> {
-        self.asks.iter().next().map(|(p, q)| PriceLevel { price: p.0, quantity: *q })
+        self.asks.iter().next().map(|(p, q)| PriceLevel {
+            price: p.0,
+            quantity: *q,
+        })
     }
 
     pub fn spread(&self) -> Option<Decimal> {
