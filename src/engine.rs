@@ -38,7 +38,15 @@ impl StateMachine {
             tickers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
 
+impl Default for StateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StateMachine {
     /// Update a ticker. Allocates on insert (String key + Ticker clone).
     /// Cold-path only — do NOT call from the spin-loop.
     pub fn update_ticker(&self, ticker: Ticker) {

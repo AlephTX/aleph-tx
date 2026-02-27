@@ -1,6 +1,5 @@
 // src/shm_reader.rs - Lock-free Shared Matrix for HFT
-use std::sync::atomic::{compiler_fence, Ordering};
-use std::ptr;
+use std::sync::atomic::{Ordering, compiler_fence};
 
 const NUM_SYMBOLS: usize = 2048;
 const NUM_EXCHANGES: usize = 5; // HL, Lighter, EdgeX, 01, Backpack
@@ -36,10 +35,9 @@ impl ShmReader {
     pub fn open(path: &str, num_symbols: usize) -> anyhow::Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        
-        
+
         let data = mmap.as_ptr();
-        
+
         Ok(Self {
             _mmap: mmap,
             data,
@@ -52,19 +50,20 @@ impl ShmReader {
     fn load_version(&self, symbol_id: u16) -> u64 {
         let offset = (symbol_id as usize) * VERSION_SIZE;
         unsafe {
-            let ptr = self.data.add(offset);
-            ptr::read_unaligned(ptr as *const u64)
+            let ptr = self.data.add(offset) as *const std::sync::atomic::AtomicU64;
+            (*ptr).load(Ordering::Acquire)
         }
     }
 
     #[inline(always)]
     pub fn try_poll(&mut self) -> Option<u16> {
-        for sym in [1001u16, 1002] {
-            let version = self.load_version(sym);
-            
-            if version > self.local_versions[sym as usize] {
-                self.local_versions[sym as usize] = version;
-                return Some(sym);
+        for sym in 0..self.max_symbols {
+            let sym_id = sym as u16;
+            let version = self.load_version(sym_id);
+
+            if version > self.local_versions[sym] {
+                self.local_versions[sym] = version;
+                return Some(sym_id);
             }
         }
         None
@@ -74,14 +73,39 @@ impl ShmReader {
     pub fn read_all_exchanges(&mut self, symbol_id: u16) -> [(u8, ShmBboMessage); NUM_EXCHANGES] {
         let version = self.load_version(symbol_id);
         self.local_versions[symbol_id as usize] = version;
-        
+
         let mut result = [(0u8, ShmBboMessage::default()); NUM_EXCHANGES];
-        for exch in 0..NUM_EXCHANGES {
+        for (exch, item) in result.iter_mut().enumerate().take(NUM_EXCHANGES) {
             let base = NUM_SYMBOLS * VERSION_SIZE;
             let offset = base + (symbol_id as usize * NUM_EXCHANGES + exch) * SLOT_SIZE;
             let ptr = unsafe { self.data.add(offset) };
-            let msg = unsafe { ptr::read_unaligned(ptr as *const ShmBboMessage) };
-            result[exch] = (exch as u8, msg);
+            let seq_ptr = ptr as *const std::sync::atomic::AtomicU32;
+
+            let mut msg;
+
+            loop {
+                // 1. Read Lock (Acquire)
+                let seq1 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
+                if seq1 & 1 != 0 {
+                    std::hint::spin_loop();
+                    continue; // Writer is active, wait
+                }
+
+                compiler_fence(Ordering::Acquire);
+
+                // 2. Copy payload
+                msg = unsafe { core::ptr::read_volatile(ptr as *const ShmBboMessage) };
+
+                compiler_fence(Ordering::Acquire);
+
+                // 3. Validate lock
+                let seq2 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
+                if seq1 == seq2 {
+                    break; // Data is clean, break spin loop
+                }
+            }
+
+            *item = (exch as u8, msg);
         }
         result
     }

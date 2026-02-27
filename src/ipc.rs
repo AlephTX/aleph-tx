@@ -51,7 +51,9 @@ pub async fn listen(socket_path: String, tx: flume::Sender<FeedEvent>) -> anyhow
             let reader = BufReader::new(stream);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<IpcMessage>(&line) else { continue };
+                let Ok(msg) = serde_json::from_str::<IpcMessage>(&line) else {
+                    continue;
+                };
                 match msg.msg_type.as_str() {
                     "ticker" => {
                         if let Ok(raw) = serde_json::from_value::<IpcTicker>(msg.payload) {
@@ -60,7 +62,8 @@ pub async fn listen(socket_path: String, tx: flume::Sender<FeedEvent>) -> anyhow
                                 bid: Decimal::from_str(&raw.bid).unwrap_or(Decimal::ZERO),
                                 ask: Decimal::from_str(&raw.ask).unwrap_or(Decimal::ZERO),
                                 last: Decimal::from_str(&raw.last).unwrap_or(Decimal::ZERO),
-                                volume_24h: Decimal::from_str(&raw.volume_24h).unwrap_or(Decimal::ZERO),
+                                volume_24h: Decimal::from_str(&raw.volume_24h)
+                                    .unwrap_or(Decimal::ZERO),
                                 timestamp: raw.ts as u64,
                             };
                             let _ = tx.try_send(FeedEvent::Ticker(ticker));

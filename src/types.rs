@@ -5,33 +5,64 @@ use serde::{Deserialize, Serialize};
 pub struct Symbol(pub String);
 
 impl Symbol {
-    pub fn new(s: impl Into<String>) -> Self { Self(s.into().to_uppercase()) }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into().to_uppercase())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for Symbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Side { Buy, Sell }
+pub enum Side {
+    Buy,
+    Sell,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum OrderType { Market, Limit, StopLoss, TakeProfit }
+pub enum OrderType {
+    Market,
+    Limit,
+    StopLoss,
+    TakeProfit,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum OrderStatus { Pending, Open, PartiallyFilled, Filled, Cancelled, Rejected, Expired }
+pub enum OrderStatus {
+    Pending,
+    Open,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+    Rejected,
+    Expired,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Market { Spot, Futures, Perp }
+pub enum Market {
+    Spot,
+    Futures,
+    Perp,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SignalType { EntryLong, EntryShort, ExitLong, ExitShort }
+pub enum SignalType {
+    EntryLong,
+    EntryShort,
+    ExitLong,
+    ExitShort,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
@@ -66,7 +97,9 @@ pub struct Balance {
 }
 
 impl Balance {
-    pub fn total(&self) -> Decimal { self.free + self.locked }
+    pub fn total(&self) -> Decimal {
+        self.free + self.locked
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

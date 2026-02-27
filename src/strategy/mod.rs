@@ -1,4 +1,5 @@
 pub mod arbitrage;
+pub mod backpack_mm;
 pub mod market_maker;
 
 use crate::shm_reader::ShmBboMessage;

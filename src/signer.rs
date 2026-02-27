@@ -5,7 +5,12 @@ pub trait Signer: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum SignerType { Hmac, Evm, StarkNet, EdDSA }
+pub enum SignerType {
+    Hmac,
+    Evm,
+    StarkNet,
+    EdDSA,
+}
 
 pub struct HmacSigner {
     api_key: String,
@@ -14,7 +19,10 @@ pub struct HmacSigner {
 
 impl HmacSigner {
     pub fn new(api_key: impl Into<String>, api_secret: impl Into<String>) -> Self {
-        Self { api_key: api_key.into(), api_secret: api_secret.into() }
+        Self {
+            api_key: api_key.into(),
+            api_secret: api_secret.into(),
+        }
     }
 }
 
@@ -25,6 +33,10 @@ impl Signer for HmacSigner {
         m.update(payload);
         m.finalize().into_bytes().to_vec()
     }
-    fn address(&self) -> String { self.api_key.clone() }
-    fn signer_type(&self) -> SignerType { SignerType::Hmac }
+    fn address(&self) -> String {
+        self.api_key.clone()
+    }
+    fn signer_type(&self) -> SignerType {
+        SignerType::Hmac
+    }
 }

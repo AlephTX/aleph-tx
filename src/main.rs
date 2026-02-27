@@ -1,13 +1,15 @@
-use tracing_subscriber::{fmt, EnvFilter};
-use std::time::Duration;
+use tracing_subscriber::{EnvFilter, fmt};
 
 use aleph_tx::shm_reader::ShmReader;
-use aleph_tx::strategy::{Strategy, arbitrage::ArbitrageEngine, market_maker::MarketMakerStrategy};
+use aleph_tx::strategy::{
+    Strategy, arbitrage::ArbitrageEngine, backpack_mm::BackpackMMStrategy,
+    market_maker::MarketMakerStrategy,
+};
 
 fn main() -> anyhow::Result<()> {
     // 1. Initialize high-performance logger
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,aleph_tx=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,aleph_tx=debug"));
 
     fmt()
         .with_env_filter(filter)
@@ -37,45 +39,54 @@ fn main() -> anyhow::Result<()> {
     };
 
     // 3. Initialize Strategy Multiplexer
-    let mut strategies: Vec<Box<dyn Strategy>> =vec![
+    let mut strategies: Vec<Box<dyn Strategy>> = vec![
         Box::new(ArbitrageEngine::new(5.0)), // > 5.0 bps trigger
         Box::new(MarketMakerStrategy::new(3, 1002, 2.5)), // Exchange 3 (EdgeX), Symbol 1002 (ETH)
+        Box::new(BackpackMMStrategy::new(5, 1002, 2.5)), // Exchange 5 (Backpack), Symbol 1002 (ETH)
     ];
 
-    tracing::info!("⏳ Booted {} strategies. Waiting for market data...", strategies.len());
+    tracing::info!(
+        "⏳ Booted {} strategies. Waiting for market data...",
+        strategies.len()
+    );
 
-    // 4. Main ultra-low latency spin loop
-    let mut loop_count: u64 = 0;
-    
-    loop {
-        match reader.try_poll() {
-            Some(symbol_id) => {
-                // Read all exchanges atomically for this symbol
-                let exchanges = reader.read_all_exchanges(symbol_id);
-                
-                // Multiplex the updates to all active strategies
-                for (exch_idx, bbo) in exchanges.iter() {
-                    // Only pass valid BBOs
-                    if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
-                        for strategy in strategies.iter_mut() {
-                            strategy.on_bbo_update(symbol_id, *exch_idx, bbo);
+    // Run the main loop blocking on the Tokio runtime to allow worker threads to progress
+    rt.block_on(async {
+        let mut loop_count: u64 = 0;
+        loop {
+            match reader.try_poll() {
+                Some(symbol_id) => {
+                    // Read all exchanges atomically for this symbol
+                    let exchanges = reader.read_all_exchanges(symbol_id);
+
+                    // Multiplex the updates to all active strategies
+                    for (exch_idx, bbo) in exchanges.iter() {
+                        // Only pass valid BBOs
+                        if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                            for strategy in strategies.iter_mut() {
+                                strategy.on_bbo_update(symbol_id, *exch_idx, bbo);
+                            }
                         }
                     }
                 }
-            }
-            None => {
-                loop_count += 1;
-                
-                for strategy in strategies.iter_mut() {
-                    strategy.on_idle();
-                }
+                None => {
+                    loop_count += 1;
 
-                if loop_count % 1_000_000 == 0 {
-                    std::thread::sleep(Duration::from_micros(1));
-                } else {
-                    std::hint::spin_loop();
+                    for strategy in strategies.iter_mut() {
+                        strategy.on_idle();
+                    }
+
+                    if loop_count.is_multiple_of(1_000) {
+                        // Yield to the Tokio runtime to process async tasks (REST API, signatures)
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Very short spin
+                        std::hint::spin_loop();
+                    }
                 }
             }
         }
-    }
+    });
+
+    Ok(())
 }
