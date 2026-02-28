@@ -176,25 +176,35 @@ impl Strategy for BackpackMMStrategy {
                         info!("🎒 Skewed Orders: NetPos={:.3} | Bid: {:.3}@{:.2} Ask: {:.3}@{:.2} (Shifted Mid: {:.2})",
                             live_pos, bid_size, bid_price, ask_size, ask_price, mid_price);
 
+                        let mut futures = Vec::new();
+
                         for &(is_buy, price, size) in &[(true, bid_price, bid_size), (false, ask_price, ask_size)] {
                             if size < 0.01 { continue; }
 
-                            let req = BackpackOrderRequest {
-                                symbol: symbol_name.clone(),
-                                side: if is_buy { "Bid".to_string() } else { "Ask".to_string() },
-                                order_type: "Limit".to_string(),
-                                price: format!("{:.2}", price),
-                                quantity: format!("{:.2}", size),
-                                client_id: None,
-                                post_only: Some(true),
-                                time_in_force: None, // Backpack handles PostOnly via the explicit struct boolean
-                            };
+                            let client_arc = client_arc.clone();
+                            let symbol_name = symbol_name.clone();
 
-                            match client_arc.create_order(&req).await {
-                                Ok(resp) => info!("✅ [Backpack MM] Order {:?} Submitted: ID {}", if is_buy { "Bid" } else { "Ask" }, resp.id),
-                                Err(e) => error!("❌ [Backpack MM] Order {:?} Failed: {:?}", if is_buy { "Bid" } else { "Ask" }, e),
-                            }
+                            let req_future = async move {
+                                let req = BackpackOrderRequest {
+                                    symbol: symbol_name,
+                                    side: if is_buy { "Bid".to_string() } else { "Ask".to_string() },
+                                    order_type: "Limit".to_string(),
+                                    price: format!("{:.2}", price),
+                                    quantity: format!("{:.2}", size),
+                                    client_id: None,
+                                    post_only: Some(true),
+                                    time_in_force: None, // Backpack handles PostOnly via the explicit struct boolean
+                                };
+
+                                match client_arc.create_order(&req).await {
+                                    Ok(resp) => info!("✅ [Backpack MM] Order {:?} Submitted: ID {}", if is_buy { "Bid" } else { "Ask" }, resp.id),
+                                    Err(e) => error!("❌ [Backpack MM] Order {:?} Failed: {:?}", if is_buy { "Bid" } else { "Ask" }, e),
+                                }
+                            };
+                            futures.push(req_future);
                         }
+                        
+                        futures::future::join_all(futures).await;
                     });
                 }
             }

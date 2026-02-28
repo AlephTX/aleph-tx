@@ -186,65 +186,72 @@ impl Strategy for MarketMakerStrategy {
                         tracing::info!("🚀 Skewed Orders: NetPos={:.3} | Bid: {:.3}@{:.2} Ask: {:.3}@{:.2} (Shifted Mid: {:.2})",
                             live_net_position, bid_size, bid_price, ask_size, ask_price, mid_price);
 
+                        let mut futures = Vec::new();
+
                         for &(is_buy, price, size_eth) in &[(true, bid_price, bid_size), (false, ask_price, ask_size)] {
                             if size_eth < 0.01 { continue; } // Skip zeroed sides
 
-                            // Round the price explicitly to 2 decimal places to match EdgeX's JSON string precision
-                            let price = (price * 100.0).round() / 100.0;
-                            let value_usd = price * size_eth;
+                            let client_arc = client_arc.clone();
+                            let req_future = async move {
+                                // Round the price explicitly to 2 decimal places to match EdgeX's JSON string precision
+                                let price = (price * 100.0).round() / 100.0;
+                                let value_usd = price * size_eth;
 
-                            let amount_synthetic = (size_eth * 1_000_000_000.0) as u64;
+                                let amount_synthetic = (size_eth * 1_000_000_000.0) as u64;
 
-                            // Amount collateral must cleanly match mathematical precise calculations
-                            let amount_collateral = (value_usd * 1_000_000.0).round() as u64;
+                                // Amount collateral must cleanly match mathematical precise calculations
+                                let amount_collateral = (value_usd * 1_000_000.0).round() as u64;
 
-                            // Calculate exact fee and then ceil the quantum units
-                            let exact_fee_usd = value_usd * fee_rate;
-                            let amount_fee_quantum = (exact_fee_usd * 1_000_000.0).ceil();
-                            let amount_fee_str = format!("{:.6}", amount_fee_quantum / 1_000_000.0);
-                            let amount_fee = amount_fee_quantum as u64;
-                            let initial_nonce = rand::random::<u32>() as u64;
-                            let client_order_id = format!("MM-{}", initial_nonce);
+                                // Calculate exact fee and then ceil the quantum units
+                                let exact_fee_usd = value_usd * fee_rate;
+                                let amount_fee_quantum = (exact_fee_usd * 1_000_000.0).ceil();
+                                let amount_fee_str = format!("{:.6}", amount_fee_quantum / 1_000_000.0);
+                                let amount_fee = amount_fee_quantum as u64;
+                                let initial_nonce = rand::random::<u32>() as u64;
+                                let client_order_id = format!("MM-{}", initial_nonce);
 
-                            use sha2::{Sha256, Digest};
-                            let mut hasher = Sha256::new();
-                            hasher.update(client_order_id.as_bytes());
-                            let l2_nonce_hex = hex::encode(hasher.finalize());
-                            let l2_nonce = u64::from_str_radix(&l2_nonce_hex[..8], 16).unwrap();
+                                use sha2::{Sha256, Digest};
+                                let mut hasher = Sha256::new();
+                                hasher.update(client_order_id.as_bytes());
+                                let l2_nonce_hex = hex::encode(hasher.finalize());
+                                let l2_nonce = u64::from_str_radix(&l2_nonce_hex[..8], 16).unwrap();
 
-                            let hash_result = client_arc.signature_manager.calc_limit_order_hash(
-                                synthetic_id, collateral_id, collateral_id,
-                                is_buy, amount_synthetic, amount_collateral, amount_fee,
-                                l2_nonce, account_id, expire_time_hours
-                            );
+                                let hash_result = client_arc.signature_manager.calc_limit_order_hash(
+                                    synthetic_id, collateral_id, collateral_id,
+                                    is_buy, amount_synthetic, amount_collateral, amount_fee,
+                                    l2_nonce, account_id, expire_time_hours
+                                );
 
-                            if let Ok(hash) = hash_result
-                                && let Ok(l2_sig) = client_arc.signature_manager.sign_l2_action(hash) {
-                                    let side = if is_buy { OrderSide::Buy } else { OrderSide::Sell };
-                                    let req = CreateOrderRequest {
-                                        price: format!("{:.2}", price),
-                                        size: format!("{:.3}", size_eth),
-                                        r#type: OrderType::Limit,
-                                        time_in_force: TimeInForce::PostOnly, // MUST BE POST-ONLY TO PREVENT TAKER FEES
-                                        account_id,
-                                        contract_id: 10000002,
-                                        side,
-                                        client_order_id,
-                                        expire_time: expire_time_ms - 864_000_000,
-                                        l2_nonce,
-                                        l2_value: format!("{:.4}", value_usd), // Unscaled size
-                                        l2_size: format!("{:.3}", size_eth),   // Unscaled size
-                                        l2_limit_fee: amount_fee_str,          // Whole unit fee string !
-                                        l2_expire_time: expire_time_ms,
-                                        l2_signature: l2_sig,
-                                    };
+                                if let Ok(hash) = hash_result
+                                    && let Ok(l2_sig) = client_arc.signature_manager.sign_l2_action(hash) {
+                                        let side = if is_buy { OrderSide::Buy } else { OrderSide::Sell };
+                                        let req = CreateOrderRequest {
+                                            price: format!("{:.2}", price),
+                                            size: format!("{:.3}", size_eth),
+                                            r#type: OrderType::Limit,
+                                            time_in_force: TimeInForce::PostOnly, // MUST BE POST-ONLY TO PREVENT TAKER FEES
+                                            account_id,
+                                            contract_id: 10000002,
+                                            side,
+                                            client_order_id,
+                                            expire_time: expire_time_ms - 864_000_000,
+                                            l2_nonce,
+                                            l2_value: format!("{:.4}", value_usd), // Unscaled size
+                                            l2_size: format!("{:.3}", size_eth),   // Unscaled size
+                                            l2_limit_fee: amount_fee_str,          // Whole unit fee string !
+                                            l2_expire_time: expire_time_ms,
+                                            l2_signature: l2_sig,
+                                        };
 
-                                    match client_arc.create_order(&req).await {
-                                        Ok(resp) => tracing::info!("✅ [EdgeX MM] Order {:?} Submitted: {}", if is_buy { "Bid" } else { "Ask" }, resp),
-                                        Err(e) => tracing::error!("❌ [EdgeX MM] Order {:?} Failed: {:?}", if is_buy { "Bid" } else { "Ask" }, e),
+                                        match client_arc.create_order(&req).await {
+                                            Ok(resp) => tracing::info!("✅ [EdgeX MM] Order {:?} Submitted: {}", if is_buy { "Bid" } else { "Ask" }, resp),
+                                            Err(e) => tracing::error!("❌ [EdgeX MM] Order {:?} Failed: {:?}", if is_buy { "Bid" } else { "Ask" }, e),
+                                        }
                                     }
-                                }
+                            };
+                            futures.push(req_future);
                         }
+                        futures::future::join_all(futures).await;
                     });
                 }
             }
