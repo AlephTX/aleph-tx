@@ -354,12 +354,17 @@ impl EdgeXClient {
 
         let json: Value = res.json().await?;
         if let Some(data) = json.get("data") {
-            let fills: Vec<crate::edgex_api::model::Fill> = serde_json::from_value(data.clone())
-                .map_err(|e| ClientError::ApiError(e.to_string()))?;
+            let target = data.get("transactionList").unwrap_or(data);
+            tracing::info!("EdgeX Fills JSON: {}", target);
+            let fills: Vec<crate::edgex_api::model::Fill> = serde_json::from_value(target.clone())
+                .unwrap_or_else(|e| {
+                    tracing::info!("EdgeX serde fail: {}", e);
+                    vec![]
+                });
             Ok(fills)
         } else {
             let fills: Vec<crate::edgex_api::model::Fill> =
-                serde_json::from_value(json).map_err(|e| ClientError::ApiError(e.to_string()))?;
+                serde_json::from_value(json).unwrap_or_default();
             Ok(fills)
         }
     }

@@ -2,7 +2,7 @@
 use std::sync::atomic::{Ordering, compiler_fence};
 
 const NUM_SYMBOLS: usize = 2048;
-const NUM_EXCHANGES: usize = 5; // HL, Lighter, EdgeX, 01, Backpack
+const NUM_EXCHANGES: usize = 6; // Padding, HL, Lighter, EdgeX, 01, Backpack
 const SLOT_SIZE: usize = 64;
 const VERSION_SIZE: usize = 8;
 

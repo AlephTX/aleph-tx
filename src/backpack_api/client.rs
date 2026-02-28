@@ -95,8 +95,16 @@ impl BackpackClient {
             return Err(anyhow!("Backpack get_open_positions error: {}", txt));
         }
 
-        let positions: Vec<BackpackPosition> = resp.json().await?;
-        Ok(positions)
+        let json: Value = resp.json().await?;
+        if let Some(arr) = json.as_array() {
+            let positions: Vec<BackpackPosition> = serde_json::from_value(json).unwrap_or_default();
+            Ok(positions)
+        } else if let Some(data) = json.get("data") {
+            let positions: Vec<BackpackPosition> = serde_json::from_value(data.clone()).unwrap_or_default();
+            Ok(positions)
+        } else {
+            Ok(vec![])
+        }
     }
 
     pub async fn create_order(
