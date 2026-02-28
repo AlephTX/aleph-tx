@@ -30,6 +30,7 @@ func NewBackpack(cfg config.ExchangeConfig, matrix *shm.Matrix) *Backpack {
 
 // Backpack depth message
 type backpackDepth struct {
+	EventTime int64            `json:"E"`
 	EventType string           `json:"e"`
 	Symbol    string           `json:"s"`
 	Timestamp int64            `json:"T"`
@@ -79,12 +80,14 @@ func (b *Backpack) connect(ctx context.Context) error {
 			Data backpackDepth `json:"data"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
+            log.Printf("backpack debug err unmarshal: %v | raw: %s", err, string(data))
 			continue
 		}
 
 		depth := msg.Data
 
 		if depth.EventType != "depth" {
+            log.Printf("backpack debug wrong event type: %s", depth.EventType)
 			continue
 		}
 

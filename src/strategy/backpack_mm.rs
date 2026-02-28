@@ -28,10 +28,10 @@ impl BackpackMMStrategy {
         let mut api_secret = String::new();
 
         for line in env_str.lines() {
-            if let Some(rest) = line.strip_prefix("BACKPACK_API_KEY=") {
+            if let Some(rest) = line.strip_prefix("BACKPACK_PUBLIC_KEY=") {
                 api_key = rest.trim().to_string();
             }
-            if let Some(rest) = line.strip_prefix("BACKPACK_API_SECRET=") {
+            if let Some(rest) = line.strip_prefix("BACKPACK_SECRET_KEY=") {
                 api_secret = rest.trim().to_string();
             }
         }
@@ -79,13 +79,12 @@ impl Strategy for BackpackMMStrategy {
     }
 
     fn on_bbo_update(&mut self, symbol_id: u16, exchange_id: u8, bbo: &ShmBboMessage) {
-        if symbol_id != self.symbol_id || exchange_id != self.exchange_id {
+        if exchange_id != self.exchange_id || symbol_id != self.symbol_id {
             return;
         }
 
         if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
-            let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
-            self.last_mid = mid_price;
+            self.last_mid = (bbo.bid_price + bbo.ask_price) / 2.0;
         }
     }
 

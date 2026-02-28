@@ -41,8 +41,8 @@ fn main() -> anyhow::Result<()> {
     // 3. Initialize Strategy Multiplexer
     let mut strategies: Vec<Box<dyn Strategy>> = vec![
         Box::new(ArbitrageEngine::new(5.0)), // > 5.0 bps trigger
-        Box::new(MarketMakerStrategy::new(3, 1002, 2.5)), // Exchange 3 (EdgeX), Symbol 1002 (ETH)
-        Box::new(BackpackMMStrategy::new(5, 1002, 2.5)), // Exchange 5 (Backpack), Symbol 1002 (ETH)
+        Box::new(MarketMakerStrategy::new(3, 1002, 5.0)), // Exchange 3 (EdgeX), Symbol 1002 (ETH)
+        Box::new(BackpackMMStrategy::new(5, 1002, 5.0)), // Exchange 5 (Backpack), Symbol 1002 (ETH)
     ];
 
     tracing::info!(

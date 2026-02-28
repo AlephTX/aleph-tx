@@ -22,7 +22,7 @@ import (
 
 const (
 	NumSymbols   = 2048
-	NumExchanges = 5
+	NumExchanges = 6
 	SlotSize     = 64 // sizeof(ShmBboMessage)
 )
 
