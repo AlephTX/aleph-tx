@@ -270,21 +270,21 @@ impl EdgeXClient {
             let text = res.text().await?;
             return Err(ClientError::ApiError(format!(
                 "Status: {}, Body: {}",
-                status,
-                text
+                status, text
             )));
         }
 
         let json: Value = res.json().await?;
         if let Some(data) = json.get("data")
-            && let Some(pos_list) = data.get("positionList") {
-                let positions: Vec<crate::edgex_api::model::Position> =
-                    serde_json::from_value(pos_list.clone()).unwrap_or_else(|e| {
-                        tracing::error!("Failed parsing positionList: {}", e);
-                        vec![]
-                    });
-                return Ok(positions);
-            }
+            && let Some(pos_list) = data.get("positionList")
+        {
+            let positions: Vec<crate::edgex_api::model::Position> =
+                serde_json::from_value(pos_list.clone()).unwrap_or_else(|e| {
+                    tracing::error!("Failed parsing positionList: {}", e);
+                    vec![]
+                });
+            return Ok(positions);
+        }
         Ok(vec![])
     }
 
