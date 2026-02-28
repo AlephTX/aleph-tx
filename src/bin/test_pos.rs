@@ -19,11 +19,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let sig_manager = SignatureManager::new(&key).unwrap();
-    let client = reqwest::Client::builder().build()?;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
 
     let paths = vec![
-        "/api/v1/private/order/getHistoryOrderFillTransactionPage",
-        "/api/v1/private/order/getActiveOrderPage",
+        "/api/v1/private/account/getAccountAsset",
+        "/api/v1/private/account/getPositionByContractId",
+        "/api/v1/private/account/getAccountPage",
     ];
 
     for path in paths {
@@ -57,10 +61,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .query(&[("accountId", account_id.to_string())])
             .headers(headers)
             .send()
-            .await?;
-        println!("GET {} -> status: {}", path, res.status());
-        println!("Body: {}", res.text().await?.get(..300).unwrap_or(""));
+            .await;
+            
+        match res {
+            Ok(response) => {
+                println!("GET {} -> status: {}", path, response.status());
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    println!("Body: {}", serde_json::to_string_pretty(&json).unwrap());
+                } else {
+                    println!("Failed to parse JSON");
+                }
+            },
+            Err(e) => {
+                println!("GET {} failed: {}", path, e);
+            }
+        }
         println!("---");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     Ok(())

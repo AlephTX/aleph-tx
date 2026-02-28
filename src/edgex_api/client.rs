@@ -231,6 +231,63 @@ impl EdgeXClient {
         Ok(json)
     }
 
+    pub async fn get_positions(
+        &self,
+        account_id: u64,
+    ) -> Result<Vec<crate::edgex_api::model::Position>, ClientError> {
+        let url = format!("{}/api/v1/private/account/getAccountAsset", self.base_url);
+        let path = "/api/v1/private/account/getAccountAsset";
+        let query_str = format!("accountId={}", account_id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+
+        let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
+        let header_signature = self.signature_manager.sign_message(&sign_payload)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-edgeX-Api-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+        headers.insert(
+            "X-edgeX-Api-Signature",
+            HeaderValue::from_str(header_signature.trim_start_matches("0x")).unwrap(),
+        );
+
+        let res = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&[("accountId", account_id.to_string())])
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await?;
+            return Err(ClientError::ApiError(format!(
+                "Status: {}, Body: {}",
+                status,
+                text
+            )));
+        }
+
+        let json: Value = res.json().await?;
+        if let Some(data) = json.get("data")
+            && let Some(pos_list) = data.get("positionList") {
+                let positions: Vec<crate::edgex_api::model::Position> =
+                    serde_json::from_value(pos_list.clone()).unwrap_or_else(|e| {
+                        tracing::error!("Failed parsing positionList: {}", e);
+                        vec![]
+                    });
+                return Ok(positions);
+            }
+        Ok(vec![])
+    }
+
     pub async fn get_open_orders(
         &self,
         account_id: u64,

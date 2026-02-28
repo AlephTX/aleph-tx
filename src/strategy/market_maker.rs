@@ -123,23 +123,19 @@ impl Strategy for MarketMakerStrategy {
 
                 if let Ok(handle) = Handle::try_current() {
                     handle.spawn(async move {
-                        // 1. Fetch live fills to calculate Net Position
+                        // 1. Fetch live absolute positions to calculate Net Position
                         let mut live_net_position = net_position_eth;
-                        match client_arc.get_fills(account_id).await {
-                            Ok(fills) => {
+                        match client_arc.get_positions(account_id).await {
+                            Ok(positions) => {
                                 let mut pos = 0.0;
-                                for f in fills {
-                                    if f.contract_id == 10000002 {
-                                        let size: f64 = f.size.parse().unwrap_or(0.0);
-                                        match f.side {
-                                            OrderSide::Buy => pos += size,
-                                            OrderSide::Sell => pos -= size,
-                                        }
+                                for p in positions {
+                                    if p.contract_id == "10000002" {
+                                        pos += p.open_size.parse::<f64>().unwrap_or(0.0);
                                     }
                                 }
                                 live_net_position = pos;
                             }
-                            Err(e) => tracing::warn!("⚠️ [EdgeX MM] Failed to fetch fills: {:?}", e),
+                            Err(e) => tracing::warn!("⚠️ [EdgeX MM] Failed to fetch positions: {:?}", e),
                         }
 
                         // 2. Cancel all existing quotes for ETHUSD (Contract 10000002)
