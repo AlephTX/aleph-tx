@@ -100,7 +100,8 @@ impl BackpackClient {
             let positions: Vec<BackpackPosition> = serde_json::from_value(json).unwrap_or_default();
             Ok(positions)
         } else if let Some(data) = json.get("data") {
-            let positions: Vec<BackpackPosition> = serde_json::from_value(data.clone()).unwrap_or_default();
+            let positions: Vec<BackpackPosition> =
+                serde_json::from_value(data.clone()).unwrap_or_default();
             Ok(positions)
         } else {
             Ok(vec![])

@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .headers(headers)
             .send()
             .await;
-            
+
         match res {
             Ok(response) => {
                 println!("GET {} -> status: {}", path, response.status());
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!("Failed to parse JSON");
                 }
-            },
+            }
             Err(e) => {
                 println!("GET {} failed: {}", path, e);
             }
