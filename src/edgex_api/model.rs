@@ -102,3 +102,10 @@ pub struct Fill {
     pub fee: String,
     pub fee_asset_id: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Position {
+    pub contract_id: String,
+    pub open_size: String,
+}

@@ -96,7 +96,7 @@ impl BackpackClient {
         }
 
         let json: Value = resp.json().await?;
-        if let Some(arr) = json.as_array() {
+        if json.as_array().is_some() {
             let positions: Vec<BackpackPosition> = serde_json::from_value(json).unwrap_or_default();
             Ok(positions)
         } else if let Some(data) = json.get("data") {
