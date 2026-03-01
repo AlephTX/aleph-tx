@@ -6,6 +6,24 @@
 use serde::Deserialize;
 use std::path::Path;
 
+/// Round value to nearest tick/step size
+#[inline]
+pub fn round_to_tick(val: f64, tick: f64) -> f64 {
+    (val / tick).round() * tick
+}
+
+/// Format price with dynamic precision based on tick size
+pub fn format_price(price: f64, tick_size: f64) -> String {
+    let decimals = (-tick_size.log10()).ceil().max(0.0) as usize;
+    format!("{:.prec$}", round_to_tick(price, tick_size), prec = decimals)
+}
+
+/// Format size with dynamic precision based on step size
+pub fn format_size(size: f64, step_size: f64) -> String {
+    let decimals = (-step_size.log10()).ceil().max(0.0) as usize;
+    format!("{:.prec$}", round_to_tick(size, step_size), prec = decimals)
+}
+
 /// Per-exchange strategy configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeConfig {
@@ -34,6 +52,21 @@ pub struct ExchangeConfig {
     /// Minimum order size (for exchanges with minimums like EdgeX)
     #[serde(default)]
     pub min_order_size: f64,
+    /// Price tick size (e.g. 0.01 for $0.01 increments)
+    #[serde(default = "default_tick_size")]
+    pub tick_size: f64,
+    /// Size step size (e.g. 0.01 for 0.01 unit increments)
+    #[serde(default = "default_step_size")]
+    pub step_size: f64,
+    /// Avellaneda-Stoikov risk aversion parameter
+    #[serde(default = "default_gamma")]
+    pub gamma: f64,
+    /// Avellaneda-Stoikov time horizon in seconds
+    #[serde(default = "default_time_horizon")]
+    pub time_horizon_sec: f64,
+    /// Minimum price deviation (bps) to trigger requote (Phase 2 incremental quoting)
+    #[serde(default = "default_requote_threshold")]
+    pub requote_threshold_bps: f64,
 }
 
 fn default_momentum_threshold() -> f64 {
@@ -47,6 +80,21 @@ fn default_vol_window() -> usize {
 }
 fn default_balance_refresh() -> u64 {
     60
+}
+fn default_tick_size() -> f64 {
+    0.01
+}
+fn default_step_size() -> f64 {
+    0.01
+}
+fn default_gamma() -> f64 {
+    0.1
+}
+fn default_time_horizon() -> f64 {
+    60.0
+}
+fn default_requote_threshold() -> f64 {
+    2.0  // 2 bps deviation threshold
 }
 
 /// Top-level config file structure.
@@ -98,6 +146,11 @@ impl Default for AppConfig {
                 vol_window: 120,
                 balance_refresh_secs: 60,
                 min_order_size: 0.0,
+                tick_size: 0.01,
+                step_size: 0.01,
+                gamma: 0.1,
+                time_horizon_sec: 60.0,
+                requote_threshold_bps: 2.0,
             },
             edgex: ExchangeConfig {
                 risk_fraction: 0.08,
@@ -110,7 +163,55 @@ impl Default for AppConfig {
                 vol_window: 120,
                 balance_refresh_secs: 60,
                 min_order_size: 0.1,
+                tick_size: 0.01,
+                step_size: 0.01,
+                gamma: 0.1,
+                time_horizon_sec: 60.0,
+                requote_threshold_bps: 2.0,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_round_to_tick() {
+        assert!((round_to_tick(100.123, 0.01) - 100.12).abs() < 1e-10);
+        assert!((round_to_tick(100.126, 0.01) - 100.13).abs() < 1e-10);
+        assert!((round_to_tick(100.5, 0.1) - 100.5).abs() < 1e-10);
+        assert!((round_to_tick(100.54, 0.1) - 100.5).abs() < 1e-10);
+        assert!((round_to_tick(100.56, 0.1) - 100.6).abs() < 1e-10);
+        assert!((round_to_tick(0.123456, 0.0001) - 0.1235).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_format_price() {
+        assert_eq!(format_price(100.123, 0.01), "100.12");
+        assert_eq!(format_price(100.126, 0.01), "100.13");
+        assert_eq!(format_price(0.123456, 0.0001), "0.1235");
+        assert_eq!(format_price(1234.5, 0.1), "1234.5");
+        assert_eq!(format_price(1234.56, 1.0), "1235");
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(1.234, 0.01), "1.23");
+        assert_eq!(format_size(1.236, 0.01), "1.24");
+        assert_eq!(format_size(0.123456, 0.001), "0.123");
+        assert_eq!(format_size(10.5, 0.1), "10.5");
+    }
+
+    #[test]
+    fn test_default_config_has_new_fields() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.backpack.tick_size, 0.01);
+        assert_eq!(cfg.backpack.step_size, 0.01);
+        assert_eq!(cfg.backpack.gamma, 0.1);
+        assert_eq!(cfg.backpack.time_horizon_sec, 60.0);
+        assert_eq!(cfg.edgex.tick_size, 0.01);
+        assert_eq!(cfg.edgex.gamma, 0.1);
     }
 }

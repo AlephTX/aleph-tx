@@ -7,10 +7,9 @@
 /// - Orderbook imbalance signals
 /// - Incremental order updates
 /// - Real-time PnL tracking
-
 use crate::backpack_api::client::BackpackClient;
 use crate::backpack_api::model::*;
-use crate::config::ExchangeConfig;
+use crate::config::{ExchangeConfig, format_price, format_size};
 use crate::shm_reader::ShmBboMessage;
 use crate::strategy::Strategy;
 use std::collections::{VecDeque, HashMap};
@@ -26,7 +25,7 @@ enum Side {
     Sell,
 }
 
-/// Real-time PnL tracker
+/// Real-time PnL tracker (reserved for Phase 2 implementation)
 #[allow(dead_code)]
 struct PnLTracker {
     realized_pnl: f64,
@@ -49,6 +48,7 @@ impl PnLTracker {
         }
     }
 
+    #[allow(dead_code)]
     fn update_on_fill(&mut self, side: Side, price: f64, size: f64, fee: f64) {
         match side {
             Side::Buy => {
@@ -98,6 +98,7 @@ impl PnLTracker {
         self.last_update = Instant::now();
     }
 
+    #[allow(dead_code)]
     fn calc_unrealized_pnl(&mut self, current_price: f64) -> f64 {
         if self.position == 0.0 {
             self.unrealized_pnl = 0.0;
@@ -107,6 +108,7 @@ impl PnLTracker {
         self.unrealized_pnl
     }
 
+    #[allow(dead_code)]
     fn total_pnl(&self) -> f64 {
         self.realized_pnl + self.unrealized_pnl - self.fees_paid
     }
@@ -129,7 +131,8 @@ pub struct AdvancedMMStrategy {
     ewma_variance: f64,
     ewma_lambda: f64,
 
-    // PnL tracking
+    // PnL tracking (reserved for Phase 2 implementation)
+    #[allow(dead_code)]
     pnl_tracker: PnLTracker,
 
     // Adverse selection detection
@@ -144,8 +147,14 @@ pub struct AdvancedMMStrategy {
     last_balance_refresh: Option<Instant>,
     account_equity_usdc: f64,
 
-    // Order state cache
+    // Order state cache (reserved for Phase 2 incremental quoting)
+    #[allow(dead_code)]
     active_orders: HashMap<String, (f64, f64, String)>, // order_id -> (price, size, side)
+
+    // Phase 2: Incremental quoting state
+    last_quoted_bid: f64,
+    last_quoted_ask: f64,
+    last_quoted_pos: f64,
 }
 
 impl AdvancedMMStrategy {
@@ -208,6 +217,9 @@ impl AdvancedMMStrategy {
             last_balance_refresh: None,
             account_equity_usdc: 0.0,
             active_orders: HashMap::new(),
+            last_quoted_bid: 0.0,
+            last_quoted_ask: 0.0,
+            last_quoted_pos: 0.0,
         }
     }
 
@@ -257,17 +269,18 @@ impl AdvancedMMStrategy {
         0.0
     }
 
-    /// Avellaneda-Stoikov optimal reservation price and spread
+    /// Avellaneda-Stoikov optimal reservation price and spread (reserved for future use)
+    #[allow(dead_code)]
     fn optimal_quotes(&self, mid: f64, inventory: f64, vol_bps: f64) -> (f64, f64, f64) {
-        let gamma = 0.1; // Risk aversion parameter
+        let gamma = self.cfg.gamma;
         let sigma = vol_bps / 10_000.0; // Convert bps to decimal
-        let T = 60.0; // Time horizon in seconds
+        let time_horizon = self.cfg.time_horizon_sec;
 
         // Reservation price (adjust mid based on inventory)
-        let reservation_price = mid - inventory * gamma * sigma.powi(2) * T;
+        let reservation_price = mid - inventory * gamma * sigma.powi(2) * time_horizon;
 
         // Optimal spread
-        let spread_decimal = gamma * sigma.powi(2) * T
+        let spread_decimal = gamma * sigma.powi(2) * time_horizon
             + (2.0 / gamma) * (1.0 + gamma / 10.0).ln();
         let spread_bps = spread_decimal * 10_000.0;
 
@@ -403,6 +416,11 @@ impl Strategy for AdvancedMMStrategy {
                 let base_size = self.base_size;
                 let stop_loss_usd = self.stop_loss_usd;
 
+                // Phase 2: Capture last quoted state for incremental quoting
+                let last_quoted_bid = self.last_quoted_bid;
+                let last_quoted_ask = self.last_quoted_ask;
+                let last_quoted_pos = self.last_quoted_pos;
+
                 if let Ok(handle) = Handle::try_current() {
                     handle.spawn(async move {
                         // Fetch positions
@@ -439,8 +457,8 @@ impl Strategy for AdvancedMMStrategy {
                                     symbol: symbol_name.clone(),
                                     side: close_side.to_string(),
                                     order_type: "Limit".to_string(),
-                                    price: format!("{:.2}", close_price),
-                                    quantity: format!("{:.2}", live_pos.abs()),
+                                    price: format_price(close_price, cfg.tick_size),
+                                    quantity: format_size(live_pos.abs(), cfg.step_size),
                                     client_id: None,
                                     post_only: Some(false),
                                     time_in_force: Some("IOC".to_string()),
@@ -456,6 +474,10 @@ impl Strategy for AdvancedMMStrategy {
                         // Cancel existing orders
                         if let Err(e) = client_arc.cancel_all_orders(&symbol_name).await {
                             warn!("⚠️ [AdvMM] Cancel error: {:?}", e);
+                        } else {
+                            // Clear order cache on successful cancel
+                            // Note: active_orders is not accessible here in spawned task
+                            // This will be handled in Phase 2 with state refactoring
                         }
 
                         // === ADVANCED QUOTING LOGIC ===
@@ -463,11 +485,11 @@ impl Strategy for AdvancedMMStrategy {
                         // 1. Avellaneda-Stoikov optimal quotes
                         let inventory_ratio = live_pos / max_position;
                         let (reservation_price, mut bid_spread, mut ask_spread) = {
-                            let gamma = 0.1;
+                            let gamma = cfg.gamma;
                             let sigma = vol_bps / 10_000.0;
-                            let T = 60.0;
-                            let res_price = mid_price - inventory_ratio * gamma * sigma.powi(2) * T * mid_price;
-                            let spread_dec = gamma * sigma.powi(2) * T + (2.0 / gamma) * (1.0 + gamma / 10.0).ln();
+                            let time_horizon = cfg.time_horizon_sec;
+                            let res_price = mid_price - inventory_ratio * gamma * sigma.powi(2) * time_horizon * mid_price;
+                            let spread_dec = gamma * sigma.powi(2) * time_horizon + (2.0 / gamma) * (1.0 + gamma / 10.0).ln();
                             let spread = (spread_dec * 10_000.0).max(cfg.min_spread_bps);
                             (res_price, spread, spread)
                         };
@@ -494,6 +516,31 @@ impl Strategy for AdvancedMMStrategy {
                         let bid_price = reservation_price * (1.0 - bid_spread / 10_000.0);
                         let ask_price = reservation_price * (1.0 + ask_spread / 10_000.0);
 
+                        // === PHASE 2: INCREMENTAL QUOTING ===
+                        // Only requote if price deviation exceeds threshold OR position changed significantly
+                        let bid_deviation_bps = if last_quoted_bid > 0.0 {
+                            ((bid_price - last_quoted_bid).abs() / last_quoted_bid) * 10_000.0
+                        } else {
+                            f64::MAX
+                        };
+                        let ask_deviation_bps = if last_quoted_ask > 0.0 {
+                            ((ask_price - last_quoted_ask).abs() / last_quoted_ask) * 10_000.0
+                        } else {
+                            f64::MAX
+                        };
+                        let pos_changed = (live_pos - last_quoted_pos).abs() > 0.01;
+
+                        let should_requote = bid_deviation_bps > cfg.requote_threshold_bps
+                            || ask_deviation_bps > cfg.requote_threshold_bps
+                            || pos_changed
+                            || last_quoted_bid == 0.0;
+
+                        if !should_requote {
+                            info!("⏭️ [AdvMM] Skip requote: bid_dev={:.2}bps ask_dev={:.2}bps pos_delta={:.3}",
+                                bid_deviation_bps, ask_deviation_bps, (live_pos - last_quoted_pos).abs());
+                            return;
+                        }
+
                         // 6. Dynamic sizing
                         let pos_ratio = live_pos.abs() / max_position;
                         let scaled = base_size * (1.0 - pos_ratio * 0.8).max(0.01);
@@ -516,8 +563,8 @@ impl Strategy for AdvancedMMStrategy {
                                     symbol: symbol_name,
                                     side: if is_buy { "Bid".to_string() } else { "Ask".to_string() },
                                     order_type: "Limit".to_string(),
-                                    price: format!("{:.2}", price),
-                                    quantity: format!("{:.2}", size),
+                                    price: format_price(price, cfg.tick_size),
+                                    quantity: format_size(size, cfg.step_size),
                                     client_id: None,
                                     post_only: Some(true),
                                     time_in_force: None,
@@ -530,6 +577,9 @@ impl Strategy for AdvancedMMStrategy {
                             futures.push(req_future);
                         }
                         futures::future::join_all(futures).await;
+
+                        // Note: State update (last_quoted_bid/ask/pos) will be handled in Phase 3
+                        // with proper Arc<RwLock> shared state architecture
                     });
                 }
             }
