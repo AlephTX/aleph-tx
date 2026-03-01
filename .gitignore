@@ -30,3 +30,10 @@ Thumbs.db
 
 # Keys directory
 keys/
+# Runtime files
+*.pid
+rust.log
+feeder/*.log
+config.toml
+.env.*
+target/

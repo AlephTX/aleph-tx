@@ -288,11 +288,73 @@ impl EdgeXClient {
         Ok(vec![])
     }
 
+    pub async fn get_balances(
+        &self,
+        account_id: u64,
+    ) -> Result<Vec<crate::edgex_api::model::Balance>, ClientError> {
+        let url = format!("{}/api/v1/private/account/getAccountAsset", self.base_url);
+        let path = "/api/v1/private/account/getAccountAsset";
+        let query_str = format!("accountId={}", account_id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+
+        let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
+        let header_signature = self.signature_manager.sign_message(&sign_payload)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-edgeX-Api-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+        headers.insert(
+            "X-edgeX-Api-Signature",
+            HeaderValue::from_str(header_signature.trim_start_matches("0x")).unwrap(),
+        );
+
+        let res = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&[("accountId", account_id.to_string())])
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await?;
+            return Err(ClientError::ApiError(format!(
+                "Status: {}, Body: {}",
+                status, text
+            )));
+        }
+
+        let json: Value = res.json().await?;
+        if let Some(code) = json.get("code") {
+            if code.as_str() != Some("SUCCESS") {
+                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
+            }
+        }
+        if let Some(data) = json.get("data")
+            && let Some(asset_list) = data.get("assetList")
+        {
+            let balances: Vec<crate::edgex_api::model::Balance> =
+                serde_json::from_value(asset_list.clone()).unwrap_or_else(|e| {
+                    tracing::error!("Failed parsing assetList: {}", e);
+                    vec![]
+                });
+            return Ok(balances);
+        }
+        Ok(vec![])
+    }
+
     pub async fn get_open_orders(
         &self,
         account_id: u64,
     ) -> Result<Vec<crate::edgex_api::model::OpenOrder>, ClientError> {
-        let url = format!("{}/api/v1/private/order/getOpenOrders", self.base_url);
+        let url = format!("{}/api/v1/private/order/getActiveOrderPage", self.base_url);
         let params = [("accountId", account_id.to_string())];
 
         // GET request with query params
@@ -304,13 +366,6 @@ impl EdgeXClient {
             .as_millis()
             .to_string();
 
-        let _sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
-        // Sometimes it expects ?accountId=..., wait edgeX python sdk says params logic:
-        // Actually earlier testing in test_pos.rs I used:
-        // let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
-        // Let's stick to the no-? query string just value or standard serialize.
-        // Wait, Python SDK says: "timestamp + method + path + queryString"
-        // Let's use standard query serialization (no '?')
         let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
         let header_signature = self.signature_manager.sign_message(&sign_payload)?;
 
@@ -344,18 +399,25 @@ impl EdgeXClient {
         // Response structure might be { "code": "...", "data": [...] }
         // We'll parse Value first then generic.
         let json: Value = res.json().await?;
-        // Assuming "data" field contains list, or root is list.
-        // Need to check docs for response format.
-        // Usually "data": [ ... ]
+        if let Some(code) = json.get("code") {
+            if code.as_str() != Some("SUCCESS") {
+                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
+            }
+        }
+
         if let Some(data) = json.get("data") {
+            if let Some(list) = data.get("dataList") {
+                let orders: Vec<crate::edgex_api::model::OpenOrder> =
+                    serde_json::from_value(list.clone())
+                        .map_err(|e| ClientError::ApiError(e.to_string()))?;
+                return Ok(orders);
+            }
             let orders: Vec<crate::edgex_api::model::OpenOrder> =
-                serde_json::from_value(data.clone())
-                    .map_err(|e| ClientError::ApiError(e.to_string()))?;
+                serde_json::from_value(data.clone()).unwrap_or_default();
             Ok(orders)
         } else {
-            // Fallback if root is array
             let orders: Vec<crate::edgex_api::model::OpenOrder> =
-                serde_json::from_value(json).map_err(|e| ClientError::ApiError(e.to_string()))?;
+                serde_json::from_value(json).unwrap_or_default();
             Ok(orders)
         }
     }
@@ -363,16 +425,22 @@ impl EdgeXClient {
     pub async fn get_fills(
         &self,
         account_id: u64,
+        page: u32,
+        size: u32,
     ) -> Result<Vec<crate::edgex_api::model::Fill>, ClientError> {
         let url = format!(
             "{}/api/v1/private/order/getHistoryOrderFillTransactionPage",
             self.base_url
         );
-        let params = [("accountId", account_id.to_string())];
+        let params = [
+            ("accountId", account_id.to_string()),
+            ("page", page.to_string()),
+            ("size", size.to_string()),
+        ];
 
         // Similar GET auth pattern
         let path = "/api/v1/private/order/getHistoryOrderFillTransactionPage";
-        let query_str = format!("accountId={}", account_id);
+        let query_str = format!("accountId={}&page={}&size={}", account_id, page, size);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -410,12 +478,18 @@ impl EdgeXClient {
         }
 
         let json: Value = res.json().await?;
+        if let Some(code) = json.get("code") {
+            if code.as_str() != Some("SUCCESS") {
+                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
+            }
+        }
+
         if let Some(data) = json.get("data") {
-            let target = data.get("transactionList").unwrap_or(data);
-            tracing::info!("EdgeX Fills JSON: {}", target);
+            let target = data.get("dataList").unwrap_or(data);
             let fills: Vec<crate::edgex_api::model::Fill> = serde_json::from_value(target.clone())
                 .unwrap_or_else(|e| {
-                    tracing::info!("EdgeX serde fail: {}", e);
+                    tracing::error!("EDGEX RAW: {}", target);
+                    tracing::error!("EdgeX serde error: {}", e);
                     vec![]
                 });
             Ok(fills)
