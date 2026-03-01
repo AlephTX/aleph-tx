@@ -21,12 +21,13 @@ vol_window = 120
 balance_refresh_secs = 60
 
 [edgex]
+# EdgeX has higher fees (~3.4bps maker), need wider spreads
 risk_fraction = 0.08
-min_spread_bps = 20.0
-vol_multiplier = 3.5
-stop_loss_pct = 0.003
-requote_interval_ms = 3000
-momentum_threshold_bps = 8.0
+min_spread_bps = 25.0
+vol_multiplier = 4.0
+stop_loss_pct = 0.005
+requote_interval_ms = 4000
+momentum_threshold_bps = 10.0
 momentum_spread_mult = 2.0
 vol_window = 120
 balance_refresh_secs = 60

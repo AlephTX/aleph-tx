@@ -248,19 +248,18 @@ impl Strategy for MarketMakerStrategy {
                             Err(e) => tracing::warn!("⚠️ [EX-v3] Position err: {:?}", e),
                         }
 
-                        // === STOP-LOSS (position-value based) ===
-                        if live_pos.abs() > 0.001 {
-                            let position_value = live_pos.abs() * mid_price;
-                            if position_value > stop_loss_usd * 5.0 {
-                                tracing::warn!("🛑 [EX-v3] STOP LOSS! Pos={:.4} Value=${:.2}",
-                                    live_pos, position_value);
-                                use crate::edgex_api::model::CancelAllOrderRequest;
-                                let cancel_req = CancelAllOrderRequest {
-                                    account_id, filter_contract_id_list: vec![10000002],
-                                };
-                                let _ = client_arc.cancel_all_orders(&cancel_req).await;
-                                return;
-                            }
+                        // === STOP-LOSS (over-exposure guard) ===
+                        // Trigger only if position is WAY beyond max_position (3x)
+                        // EdgeX doesn't return entry price, so we guard on exposure, not PnL
+                        if live_pos.abs() > max_position * 3.0 && max_position > 0.0 {
+                            tracing::warn!("🛑 [EX-v3] OVER-EXPOSED! Pos={:.4} MaxPos={:.4} — cancelling all orders",
+                                live_pos, max_position);
+                            use crate::edgex_api::model::CancelAllOrderRequest;
+                            let cancel_req = CancelAllOrderRequest {
+                                account_id, filter_contract_id_list: vec![10000002],
+                            };
+                            let _ = client_arc.cancel_all_orders(&cancel_req).await;
+                            return;
                         }
 
                         // 2. Cancel existing quotes

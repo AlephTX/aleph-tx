@@ -332,10 +332,10 @@ impl EdgeXClient {
         }
 
         let json: Value = res.json().await?;
-        if let Some(code) = json.get("code") {
-            if code.as_str() != Some("SUCCESS") {
-                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
-            }
+        if let Some(code) = json.get("code")
+            && code.as_str() != Some("SUCCESS")
+        {
+            return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
         }
         if let Some(data) = json.get("data")
             && let Some(asset_list) = data.get("assetList")
@@ -399,10 +399,10 @@ impl EdgeXClient {
         // Response structure might be { "code": "...", "data": [...] }
         // We'll parse Value first then generic.
         let json: Value = res.json().await?;
-        if let Some(code) = json.get("code") {
-            if code.as_str() != Some("SUCCESS") {
-                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
-            }
+        if let Some(code) = json.get("code")
+            && code.as_str() != Some("SUCCESS")
+        {
+            return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
         }
 
         if let Some(data) = json.get("data") {
@@ -478,10 +478,10 @@ impl EdgeXClient {
         }
 
         let json: Value = res.json().await?;
-        if let Some(code) = json.get("code") {
-            if code.as_str() != Some("SUCCESS") {
-                return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
-            }
+        if let Some(code) = json.get("code")
+            && code.as_str() != Some("SUCCESS")
+        {
+            return Err(ClientError::ApiError(format!("EdgeX API error: {}", json)));
         }
 
         if let Some(data) = json.get("data") {
