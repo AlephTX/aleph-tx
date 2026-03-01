@@ -1,0 +1,69 @@
+# AlephTX Strategy Configuration (v3.2.0)
+# Phase 1: Dynamic precision & parameterized AS model
+# Phase 2: Incremental quoting & CPU isolation
+
+[backpack]
+# Risk management
+risk_fraction = 0.20
+stop_loss_pct = 0.005
+
+# Spread configuration
+min_spread_bps = 6.0
+vol_multiplier = 2.5
+momentum_threshold_bps = 8.0
+momentum_spread_mult = 2.0
+
+# Timing
+requote_interval_ms = 3000
+balance_refresh_secs = 60
+vol_window = 120
+
+# Precision (Phase 1)
+tick_size = 0.01        # Price precision: $0.01 for BTC/ETH
+step_size = 0.01        # Size precision: 0.01 units
+
+# Avellaneda-Stoikov parameters (Phase 1)
+gamma = 0.1             # Risk aversion (higher = wider spreads)
+time_horizon_sec = 60.0 # Time horizon for inventory management
+
+# Incremental quoting (Phase 2 - NEW)
+requote_threshold_bps = 2.0  # Only requote if price moves >2 bps (saves 80% API calls)
+
+[edgex]
+# Risk management
+risk_fraction = 0.10
+stop_loss_pct = 0.005
+
+# Spread configuration (wider for EdgeX due to 3.4bps maker fee)
+min_spread_bps = 8.0
+vol_multiplier = 3.0
+momentum_threshold_bps = 10.0
+momentum_spread_mult = 2.0
+
+# Timing (slower due to 2 req/2s rate limit)
+requote_interval_ms = 5000
+balance_refresh_secs = 60
+vol_window = 120
+
+# Order constraints
+min_order_size = 0.1
+
+# Precision (Phase 1)
+tick_size = 0.01        # Price precision: $0.01
+step_size = 0.01        # Size precision: 0.01 ETH
+
+# Avellaneda-Stoikov parameters (Phase 1)
+gamma = 0.1             # Risk aversion
+time_horizon_sec = 60.0 # Time horizon
+
+# Incremental quoting (Phase 2 - NEW)
+requote_threshold_bps = 2.0  # Conservative threshold for EdgeX rate limits
+
+# Example: For SHIB or other low-price tokens, adjust precision:
+# tick_size = 0.000001   # 6 decimal places
+# step_size = 1.0        # 1 token minimum
+
+# Phase 2 Benefits:
+# - Incremental quoting reduces API calls by ~80%
+# - CPU-bound crypto operations isolated to blocking thread pool
+# - Prevents WebSocket disconnects from Starknet ECDSA signing

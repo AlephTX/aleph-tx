@@ -328,11 +328,11 @@ impl BackpackClient {
     /// Handles Backpack's unified cross-margin model where all spot assets = collateral.
     pub async fn get_total_equity(&self) -> Result<f64> {
         // First try to get collateral (margin account equity)
-        if let Ok(collateral_equity) = self.get_collateral().await {
-            if collateral_equity > 0.0 {
-                tracing::debug!("🔍 [BP] Using collateral equity: ${:.2}", collateral_equity);
-                return Ok(collateral_equity);
-            }
+        if let Ok(collateral_equity) = self.get_collateral().await
+            && collateral_equity > 0.0
+        {
+            tracing::debug!("🔍 [BP] Using collateral equity: ${:.2}", collateral_equity);
+            return Ok(collateral_equity);
         }
 
         // Fallback to spot balances calculation
@@ -361,20 +361,19 @@ impl BackpackClient {
             // Look up USD price via public ticker
             let ticker_symbol = format!("{}_USDC", symbol);
             let url = format!("{}/api/v1/ticker?symbol={}", self.base_url, ticker_symbol);
-            if let Ok(resp) = self.client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<Value>().await {
-                        let last_price = json.get("lastPrice")
-                            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            .unwrap_or(0.0);
-                        if last_price > 0.0 {
-                            let usd_value = qty * last_price;
-                            if usd_value > 0.01 {
-                                tracing::debug!("  [BP] {} {} × ${:.6} = ${:.2}", qty, symbol, last_price, usd_value);
-                            }
-                            total_usd += usd_value;
-                        }
+            if let Ok(resp) = self.client.get(&url).send().await
+                && resp.status().is_success()
+                && let Ok(json) = resp.json::<Value>().await
+            {
+                let last_price = json.get("lastPrice")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    .unwrap_or(0.0);
+                if last_price > 0.0 {
+                    let usd_value = qty * last_price;
+                    if usd_value > 0.01 {
+                        tracing::debug!("  [BP] {} {} × ${:.6} = ${:.2}", qty, symbol, last_price, usd_value);
                     }
+                    total_usd += usd_value;
                 }
             }
         }

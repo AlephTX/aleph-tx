@@ -1,4 +1,4 @@
-use crate::config::ExchangeConfig;
+use crate::config::{ExchangeConfig, format_price, format_size, round_to_tick};
 use crate::shm_reader::ShmBboMessage;
 use crate::strategy::Strategy;
 
@@ -231,7 +231,6 @@ impl Strategy for MarketMakerStrategy {
                 let momentum = self.momentum_bps();
                 let max_position = self.max_position;
                 let base_size = self.base_size;
-                let stop_loss_usd = self.stop_loss_usd;
 
                 if let Ok(handle) = Handle::try_current() {
                     handle.spawn(async move {
@@ -312,7 +311,8 @@ impl Strategy for MarketMakerStrategy {
                             let client_arc = client_arc.clone();
 
                             let req_future = async move {
-                                let price = (price * 100.0).round() / 100.0;
+                                let price = round_to_tick(price, cfg.tick_size);
+                                let size_eth = round_to_tick(size_eth, cfg.step_size);
                                 let value_usd = price * size_eth;
                                 let amount_synthetic = (size_eth * 1_000_000_000.0) as u64;
                                 let amount_collateral = (value_usd * 1_000_000.0).round() as u64;
@@ -329,23 +329,33 @@ impl Strategy for MarketMakerStrategy {
                                 let l2_nonce_hex = hex::encode(hasher.finalize());
                                 let l2_nonce = u64::from_str_radix(&l2_nonce_hex[..8], 16).unwrap();
 
-                                let hash_result = client_arc.signature_manager.calc_limit_order_hash(
-                                    synthetic_id, collateral_id, collateral_id,
-                                    is_buy, amount_synthetic, amount_collateral, amount_fee,
-                                    l2_nonce, account_id, expire_time_hours
-                                );
-                                if let Ok(hash) = hash_result
-                                    && let Ok(l2_sig) = client_arc.signature_manager.sign_l2_action(hash) {
+                                // === PHASE 2: CPU-BOUND CRYPTO ISOLATION ===
+                                // Move Starknet ECDSA signing to blocking thread pool to prevent
+                                // blocking Tokio worker threads and causing WebSocket disconnects
+                                let client_for_blocking = client_arc.clone();
+                                let crypto_result = tokio::task::spawn_blocking(move || {
+                                    let hash_result = client_for_blocking.signature_manager.calc_limit_order_hash(
+                                        synthetic_id, collateral_id, collateral_id,
+                                        is_buy, amount_synthetic, amount_collateral, amount_fee,
+                                        l2_nonce, account_id, expire_time_hours
+                                    );
+                                    match hash_result {
+                                        Ok(hash) => client_for_blocking.signature_manager.sign_l2_action(hash),
+                                        Err(e) => Err(e),
+                                    }
+                                }).await;
+
+                                if let Ok(Ok(l2_sig)) = crypto_result {
                                     let req = CreateOrderRequest {
-                                        price: format!("{:.2}", price),
-                                        size: format!("{:.3}", size_eth),
+                                        price: format_price(price, cfg.tick_size),
+                                        size: format_size(size_eth, cfg.step_size),
                                         r#type: OrderType::Limit,
                                         time_in_force: TimeInForce::PostOnly,
                                         account_id, contract_id: 10000002,
                                         side: if is_buy { OrderSide::Buy } else { OrderSide::Sell },
                                         client_order_id, expire_time: expire_time_ms - 864_000_000,
                                         l2_nonce, l2_value: format!("{:.4}", value_usd),
-                                        l2_size: format!("{:.3}", size_eth),
+                                        l2_size: format_size(size_eth, cfg.step_size),
                                         l2_limit_fee: amount_fee_str,
                                         l2_expire_time: expire_time_ms,
                                         l2_signature: l2_sig,
@@ -354,6 +364,8 @@ impl Strategy for MarketMakerStrategy {
                                         Ok(resp) => tracing::info!("✅ [EX-v3] {:?}: {}", if is_buy {"Bid"} else {"Ask"}, resp),
                                         Err(e) => tracing::error!("❌ [EX-v3] {:?}: {:?}", if is_buy {"Bid"} else {"Ask"}, e),
                                     }
+                                } else {
+                                    tracing::error!("❌ [EX-v3] Crypto signing failed for {:?}", if is_buy {"Bid"} else {"Ask"});
                                 }
                             };
                             futures.push(req_future);
