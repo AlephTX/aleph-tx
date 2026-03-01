@@ -192,4 +192,97 @@ impl BackpackClient {
 
         Ok(())
     }
+
+    pub async fn get_balances(&self) -> Result<std::collections::HashMap<String, BackpackBalance>> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let params = serde_json::Map::new();
+        let signature = self.generate_signature("balanceQuery", &params, timestamp, 5000);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-Key", HeaderValue::from_str(&self.api_key)?);
+        headers.insert(
+            "X-Timestamp",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
+        headers.insert("X-Window", HeaderValue::from_static("5000"));
+        headers.insert("X-Signature", HeaderValue::from_str(&signature)?);
+
+        let url = format!("{}/api/v1/capital", self.base_url);
+        let resp = self.client.get(&url).headers(headers).send().await?;
+
+        if !resp.status().is_success() {
+            let txt = resp.text().await?;
+            return Err(anyhow!("Backpack get_balances error: {}", txt));
+        }
+
+        let json: Value = resp.json().await?;
+        let mut balances = std::collections::HashMap::new();
+        if let Some(obj) = json.as_object() {
+            for (asset, data) in obj {
+                if let Ok(b) = serde_json::from_value::<BackpackBalance>(data.clone()) {
+                    balances.insert(asset.clone(), b);
+                } else {
+                    // Try parsing manually if nested different
+                    let available = data
+                        .get("available")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0");
+                    let locked = data.get("locked").and_then(|v| v.as_str()).unwrap_or("0");
+                    balances.insert(
+                        asset.clone(),
+                        BackpackBalance {
+                            symbol: asset.clone(),
+                            available: available.to_string(),
+                            locked: locked.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(balances)
+    }
+
+    pub async fn get_recent_fills(
+        &self,
+        symbol: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<BackpackFill>> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let mut params = serde_json::Map::new();
+        params.insert("symbol".to_string(), Value::String(symbol.to_string()));
+        params.insert(
+            "limit".to_string(),
+            Value::Number(serde_json::Number::from(limit)),
+        );
+        params.insert(
+            "offset".to_string(),
+            Value::Number(serde_json::Number::from(offset)),
+        );
+        let signature = self.generate_signature("fillHistoryQueryAll", &params, timestamp, 5000);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-Key", HeaderValue::from_str(&self.api_key)?);
+        headers.insert(
+            "X-Timestamp",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
+        headers.insert("X-Window", HeaderValue::from_static("5000"));
+        headers.insert("X-Signature", HeaderValue::from_str(&signature)?);
+
+        let url = format!(
+            "{}/wapi/v1/history/fills?symbol={}&limit={}&offset={}",
+            self.base_url, symbol, limit, offset
+        );
+        let resp = self.client.get(&url).headers(headers).send().await?;
+
+        if !resp.status().is_success() {
+            let txt = resp.text().await?;
+            return Err(anyhow!("Backpack get_recent_fills error: {}", txt));
+        }
+
+        let json: Value = resp.json().await?;
+        let fills: Vec<BackpackFill> = serde_json::from_value(json).unwrap_or_default();
+        Ok(fills)
+    }
 }

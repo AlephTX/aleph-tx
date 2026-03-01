@@ -42,4 +42,16 @@ pub struct BackpackFill {
     pub side: String,
     #[serde(rename = "isMaker")]
     pub is_maker: bool,
+    pub timestamp: Option<serde_json::Value>,
+    #[serde(default)]
+    pub fee: String,
+    #[serde(default, rename = "feeSymbol")]
+    pub fee_symbol: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackpackBalance {
+    pub symbol: String,
+    pub available: String,
+    pub locked: String,
 }

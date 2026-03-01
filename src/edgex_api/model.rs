@@ -92,15 +92,14 @@ pub struct OpenOrder {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Fill {
-    pub id: u64,
-    pub order_id: u64,
-    pub contract_id: u64,
-    pub price: String,
-    pub size: String,
-    pub side: OrderSide,
-    pub time: u64,
-    pub fee: String,
-    pub fee_asset_id: u64,
+    pub id: String,
+    pub order_id: String,
+    pub contract_id: String,
+    pub fill_price: String,
+    pub fill_size: String,
+    pub order_side: OrderSide,
+    pub match_time: String,
+    pub fill_fee: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -108,4 +107,12 @@ pub struct Fill {
 pub struct Position {
     pub contract_id: String,
     pub open_size: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Balance {
+    pub asset_id: String,
+    pub balance: String,
+    pub available_balance: String,
 }
