@@ -49,17 +49,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     // 5. Initialize strategies with config
+    // Symbol 1002 = ETH, Symbol 1001 = BTC (global IDs from Go feeder)
+    // Exchange 3 = EdgeX, Exchange 5 = Backpack
     let mut strategies: Vec<Box<dyn Strategy>> = vec![
         Box::new(ArbitrageEngine::new(25.0)),
         Box::new(MarketMakerStrategy::new(
-            3,
-            1002,
+            3,      // EdgeX exchange ID
+            1002,   // ETH global symbol ID
             25.0,
             config.edgex.clone(),
         )),
         Box::new(BackpackMMStrategy::new(
-            5,
-            1002,
+            5,      // Backpack exchange ID
+            1002,   // ETH global symbol ID
             25.0,
             config.backpack.clone(),
         )),

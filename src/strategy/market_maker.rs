@@ -271,6 +271,9 @@ impl Strategy for MarketMakerStrategy {
                             tracing::warn!("⚠️ [EX-v3] Cancel err: {:?}", e);
                         }
 
+                        // EdgeX 限流: 2 req/2s，在 cancel 后延迟 1.2 秒再提交新订单
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
+
                         // === DYNAMIC SPREAD ===
                         let base_spread = f64::max(cfg.min_spread_bps, vol_bps * cfg.vol_multiplier);
                         let mut bid_spread = base_spread;

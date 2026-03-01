@@ -80,6 +80,7 @@ pub struct OrderResponse {
 #[serde(rename_all = "camelCase")]
 pub struct OpenOrder {
     pub order_id: u64,
+    #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub contract_id: u64,
     pub price: String,
     pub size: String,
@@ -87,6 +88,14 @@ pub struct OpenOrder {
     pub status: String,
     pub filled_size: String,
     pub remaining_size: String,
+}
+
+fn deserialize_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    s.parse::<u64>().map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

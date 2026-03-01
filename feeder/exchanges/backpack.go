@@ -21,10 +21,12 @@ type Backpack struct {
 }
 
 func NewBackpack(cfg config.ExchangeConfig, matrix *shm.Matrix) *Backpack {
+	symMap := BuildReverseSymbolMap(cfg.Symbols)
+	log.Printf("backpack: symbol map created: %v", symMap)
 	return &Backpack{
 		cfg:    cfg,
 		matrix: matrix,
-		symMap: BuildReverseSymbolMap(cfg.Symbols),
+		symMap: symMap,
 	}
 }
 
@@ -76,6 +78,13 @@ func (b *Backpack) connect(ctx context.Context) error {
 			return err
 		}
 
+		// Debug: log first 200 chars or full message if shorter
+		debugMsg := string(data)
+		if len(debugMsg) > 200 {
+			debugMsg = debugMsg[:200]
+		}
+		log.Printf("backpack debug: received raw message: %s", debugMsg)
+
 		var msg struct {
 			Data backpackDepth `json:"data"`
 		}
@@ -93,6 +102,7 @@ func (b *Backpack) connect(ctx context.Context) error {
 
 		symID, ok := b.symMap[depth.Symbol]
 		if !ok {
+			log.Printf("backpack debug: symbol %s not in map, available: %v", depth.Symbol, b.symMap)
 			continue
 		}
 
@@ -109,6 +119,9 @@ func (b *Backpack) connect(ctx context.Context) error {
 		if tsNs == 0 {
 			tsNs = uint64(time.Now().UnixNano())
 		}
+
+		log.Printf("backpack debug: writing to shm - Exchange=%d, Symbol=%d, Bid=%.2f@%.3f, Ask=%.2f@%.3f",
+			ExchangeBackpack, symID, bidPx, bidSz, askPx, askSz)
 
 		// Write to shared matrix
 		b.matrix.WriteBBO(ExchangeBackpack, symID, tsNs, bidPx, bidSz, askPx, askSz)

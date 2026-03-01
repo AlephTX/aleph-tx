@@ -216,6 +216,7 @@ impl BackpackClient {
         }
 
         let json: Value = resp.json().await?;
+        tracing::debug!("🔍 [BP] Raw balance response: {}", json);
         let mut balances = std::collections::HashMap::new();
         if let Some(obj) = json.as_object() {
             for (asset, data) in obj {
@@ -284,5 +285,101 @@ impl BackpackClient {
         let json: Value = resp.json().await?;
         let fills: Vec<BackpackFill> = serde_json::from_value(json).unwrap_or_default();
         Ok(fills)
+    }
+
+    /// Get margin account collateral information (for perpetual trading)
+    /// This returns the actual trading account equity, not just spot balances
+    pub async fn get_collateral(&self) -> Result<f64> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let params = serde_json::Map::new();
+        let signature = self.generate_signature("collateralQuery", &params, timestamp, 5000);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-API-Key", HeaderValue::from_str(&self.api_key)?);
+        headers.insert(
+            "X-Timestamp",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
+        headers.insert("X-Window", HeaderValue::from_static("5000"));
+        headers.insert("X-Signature", HeaderValue::from_str(&signature)?);
+
+        let url = format!("{}/api/v1/capital/collateral", self.base_url);
+        let resp = self.client.get(&url).headers(headers).send().await?;
+
+        if !resp.status().is_success() {
+            let txt = resp.text().await?;
+            return Err(anyhow!("Backpack get_collateral error: {}", txt));
+        }
+
+        let json: Value = resp.json().await?;
+        tracing::debug!("🔍 [BP] Collateral response: {}", json);
+
+        // Extract netEquity from the response
+        let net_equity = json.get("netEquity")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        Ok(net_equity)
+    }
+
+    /// Compute total account equity in USD by summing all non-zero spot balances
+    /// and converting to USD using the public ticker API.
+    /// Handles Backpack's unified cross-margin model where all spot assets = collateral.
+    pub async fn get_total_equity(&self) -> Result<f64> {
+        // First try to get collateral (margin account equity)
+        if let Ok(collateral_equity) = self.get_collateral().await {
+            if collateral_equity > 0.0 {
+                tracing::debug!("🔍 [BP] Using collateral equity: ${:.2}", collateral_equity);
+                return Ok(collateral_equity);
+            }
+        }
+
+        // Fallback to spot balances calculation
+        let balances = self.get_balances().await?;
+        let mut total_usd = 0.0_f64;
+
+        for (symbol, bal) in &balances {
+            let available: f64 = bal.available.parse().unwrap_or(0.0);
+            let locked: f64 = bal.locked.parse().unwrap_or(0.0);
+            let qty = available + locked;
+            if qty < 0.001 {
+                continue;
+            }
+
+            // Stablecoins are 1:1 USD
+            if symbol == "USDC" || symbol == "USDT" {
+                total_usd += qty;
+                continue;
+            }
+
+            // Skip non-tradeable assets
+            if symbol == "POINTS" {
+                continue;
+            }
+
+            // Look up USD price via public ticker
+            let ticker_symbol = format!("{}_USDC", symbol);
+            let url = format!("{}/api/v1/ticker?symbol={}", self.base_url, ticker_symbol);
+            if let Ok(resp) = self.client.get(&url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<Value>().await {
+                        let last_price = json.get("lastPrice")
+                            .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            .unwrap_or(0.0);
+                        if last_price > 0.0 {
+                            let usd_value = qty * last_price;
+                            if usd_value > 0.01 {
+                                tracing::debug!("  [BP] {} {} × ${:.6} = ${:.2}", qty, symbol, last_price, usd_value);
+                            }
+                            total_usd += usd_value;
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("🔍 [BP] Total equity: ${:.2}", total_usd);
+        Ok(total_usd)
     }
 }

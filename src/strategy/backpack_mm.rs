@@ -140,29 +140,27 @@ impl BackpackMMStrategy {
             let stop_pct = self.cfg.stop_loss_pct;
 
             // Synchronous block_on for balance fetch (cold path, every 60s)
-            // Use block_in_place to safely do sync work inside async runtime
             if let Ok(handle) = Handle::try_current() {
                 let result = tokio::task::block_in_place(|| {
-                    handle.block_on(async { client_arc.get_balances().await })
+                    handle.block_on(async { client_arc.get_total_equity().await })
                 });
-                if let Ok(balances) = result {
-                    let usdc = balances.get("USDC").or_else(|| balances.get("usdc"));
-                    if let Some(b) = usdc {
-                        let available: f64 = b.available.parse().unwrap_or(0.0);
-                        let locked: f64 = b.locked.parse().unwrap_or(0.0);
-                        let equity = available + locked;
-
+                if let Ok(equity) = result {
+                    if equity > 0.0 {
                         self.account_equity_usdc = equity;
                         let risk_usd = equity * risk_fraction;
                         self.max_position = risk_usd / mid;
                         self.base_size = (self.max_position / 3.0).max(0.01);
-                        self.stop_loss_usd = equity * stop_pct * 10.0; // stop at ~3% of risk capital
+                        self.stop_loss_usd = equity * stop_pct * 10.0;
                         self.last_balance_refresh = Some(Instant::now());
 
                         info!(
                             "💰 [BP] Balance: ${:.2} | MaxPos: {:.4} ETH | BaseSize: {:.4} | StopLoss: ${:.2}",
                             equity, self.max_position, self.base_size, self.stop_loss_usd
                         );
+                    } else {
+                        // Even with $0, set the refresh time to avoid hammering the API
+                        self.last_balance_refresh = Some(Instant::now());
+                        info!("💰 [BP] Balance: $0.00 (no collateral or spot USDC found)");
                     }
                 }
             }
