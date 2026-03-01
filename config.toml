@@ -2,14 +2,14 @@
 
 [backpack]
 # What fraction of USDC balance to risk in total position
-risk_fraction = 0.10
-# Minimum half-spread in basis points (widened from 12 — fees ~6bps RT eats profits)
-min_spread_bps = 18.0
+risk_fraction = 0.20
+# Minimum half-spread in basis points (降低以提高成交率)
+min_spread_bps = 6.0
 # Spread = max(min_spread, realized_vol × vol_multiplier)
-vol_multiplier = 3.5
-# Stop-loss as fraction of account equity (widened to avoid premature exits)
+vol_multiplier = 2.5
+# Stop-loss as fraction of account equity
 stop_loss_pct = 0.005
-# Minimum milliseconds between re-quotes (increased to reduce churn)
+# Minimum milliseconds between re-quotes
 requote_interval_ms = 3000
 # Momentum detection threshold (bps)
 momentum_threshold_bps = 8.0
@@ -22,11 +22,13 @@ balance_refresh_secs = 60
 
 [edgex]
 # EdgeX has higher fees (~3.4bps maker), need wider spreads
-risk_fraction = 0.08
-min_spread_bps = 25.0
-vol_multiplier = 4.0
+# EdgeX 限流: 2 req/2s for orders, 50 req/10s total
+risk_fraction = 0.10
+min_spread_bps = 8.0
+vol_multiplier = 3.0
 stop_loss_pct = 0.005
-requote_interval_ms = 4000
+# 增加到 5 秒以符合 EdgeX 限流 (2 req/2s)
+requote_interval_ms = 5000
 momentum_threshold_bps = 10.0
 momentum_spread_mult = 2.0
 vol_window = 120
