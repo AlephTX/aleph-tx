@@ -26,8 +26,8 @@ async fn main() {
         Ok(balances) => {
             eprintln!("Total assets: {}", balances.len());
             for (k, v) in &balances {
-                let avail: f64 = v.available.parse().unwrap_or(0.0);
-                let locked: f64 = v.locked.parse().unwrap_or(0.0);
+                let _avail: f64 = v.available.parse().unwrap_or(0.0);
+                let _locked: f64 = v.locked.parse().unwrap_or(0.0);
                 eprintln!("  {} => available={}, locked={}", k, v.available, v.locked);
             }
         }

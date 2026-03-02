@@ -1,3 +1,10 @@
+//! Type definitions for AlephTX
+
+pub mod events;
+
+pub use events::{EventType, ShmPrivateEvent};
+
+// Re-export common types from the old types.rs
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -136,7 +143,6 @@ pub struct Signal {
     pub timestamp: u64,
 }
 
-/// Orderbook update event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderbookUpdate {
     pub symbol: Symbol,
@@ -145,7 +151,6 @@ pub struct OrderbookUpdate {
     pub timestamp: u64,
 }
 
-/// Order request
 #[derive(Debug, Clone)]
 pub struct OrderRequest {
     pub symbol: Symbol,
@@ -157,7 +162,6 @@ pub struct OrderRequest {
     pub post_only: bool,
 }
 
-/// Order response
 #[derive(Debug, Clone)]
 pub struct OrderResponse {
     pub order_id: String,
@@ -166,3 +170,4 @@ pub struct OrderResponse {
     pub filled_price: Option<Decimal>,
     pub created_at: u64,
 }
+

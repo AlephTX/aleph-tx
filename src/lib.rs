@@ -3,6 +3,8 @@ pub mod config;
 pub mod edgex_api;
 pub mod orderbook;
 pub mod risk;
+pub mod shadow_ledger;
+pub mod shm_event_reader;
 pub mod shm_reader;
 pub mod strategy;
 pub mod types;

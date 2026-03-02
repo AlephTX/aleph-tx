@@ -9,7 +9,7 @@ fn main() {
     let mut reader = ShmReader::open("/dev/shm/aleph-matrix", 2048)
         .expect("Failed to open shared memory");
 
-    let mut last_versions = vec![0u64; 2048];
+    let _last_versions = vec![0u64; 2048];
     let mut update_count = 0;
 
     loop {
