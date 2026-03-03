@@ -3,7 +3,7 @@ module github.com/AlephTX/aleph-tx/feeder
 go 1.25.0
 
 require (
-	github.com/elliottech/lighter-go v1.0.1
+	github.com/elliottech/lighter-go v1.0.2
 	github.com/elliottech/poseidon_crypto v0.0.15
 	github.com/ethereum/go-ethereum v1.17.0
 	github.com/joho/godotenv v1.5.1

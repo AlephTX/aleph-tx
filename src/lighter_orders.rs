@@ -1,103 +1,222 @@
-// Lighter order submission via WebSocket
+//! Lighter DEX HTTP Order Execution
+//!
+//! This module implements the "No Boomerang" execution philosophy:
+//! - Rust directly executes orders via HTTP Keep-Alive (reqwest)
+//! - Optimistic accounting: update in_flight_pos BEFORE API responds
+//! - Background WS events from Go reconcile the truth
+
+use crate::error::{Result, TradingError};
+use crate::shadow_ledger::{OrderSide, ShadowLedger};
+use parking_lot::RwLock;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LighterOrderRequest {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "create_order"
-    pub market_index: i16,
-    pub client_order_index: i64,
-    pub base_amount: i64,
-    pub price: u32,
-    pub is_ask: u8, // 0 = BUY, 1 = SELL
-    #[serde(rename = "type")]
-    pub order_type: u8, // 0 = LIMIT
-    pub time_in_force: u8, // 0 = GTC, 3 = IOC
-    pub reduce_only: u8,
-    pub trigger_price: u32,
-    pub order_expiry: i64,
-    pub account_index: i64,
-    pub api_key_index: u8,
-    pub expired_at: i64,
-    pub nonce: i64,
-    pub signature: String,
+/// Lighter REST API client with Keep-Alive connection pooling
+pub struct LighterHttpClient {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    private_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LighterCancelRequest {
-    #[serde(rename = "type")]
-    pub msg_type: String, // "cancel_order"
-    pub market_index: i16,
-    pub order_index: i64,
-    pub account_index: i64,
-    pub api_key_index: u8,
-    pub expired_at: i64,
-    pub nonce: i64,
-    pub signature: String,
-}
+impl LighterHttpClient {
+    /// Create a new Lighter HTTP client with Keep-Alive enabled
+    pub fn new(api_key: String, private_key: String) -> Result<Self> {
+        let client = Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
+            .timeout(Duration::from_secs(2)) // 2s timeout (increased from 500ms)
+            .build()
+            .map_err(TradingError::Network)?;
 
-// Simple market maker strategy
-pub struct SimpleMarketMaker {
-    market_index: i16,
-    symbol_id: u16,
-    spread_bps: u32, // Spread in basis points (e.g., 10 = 0.1%)
-    order_size: f64, // Order size in BTC
-    max_position: f64, // Max position in BTC
-}
+        Ok(Self {
+            client,
+            base_url: "https://mainnet.zklighter.elliot.ai/api/v1".to_string(),
+            api_key,
+            private_key,
+        })
+    }
 
-impl SimpleMarketMaker {
-    pub fn new(market_index: i16, symbol_id: u16) -> Self {
-        Self {
-            market_index,
-            symbol_id,
-            spread_bps: 10, // 0.1% spread
-            order_size: 0.001, // 0.001 BTC per order
-            max_position: 0.01, // Max 0.01 BTC position
+    /// Sign a request payload using HMAC-SHA256
+    fn sign_request(&self, payload: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.private_key.as_bytes())
+            .expect("HMAC can take key of any size");
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Place a limit order with optimistic accounting and retry logic
+    ///
+    /// CRITICAL: This function updates in_flight_pos BEFORE the API responds.
+    /// The background WS event consumer will reconcile the truth.
+    ///
+    /// Implements exponential backoff retry for transient network failures.
+    pub async fn place_order_optimistic(
+        &self,
+        ledger: Arc<RwLock<ShadowLedger>>,
+        market_id: u16,
+        _symbol_id: u16,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+    ) -> Result<u64> {
+        // Step 1: Optimistically update in_flight_pos (BEFORE API call)
+        let signed_size = side.sign() * size;
+
+        {
+            let mut ledger_guard = ledger.write();
+            ledger_guard.add_in_flight(signed_size);
+        } // Lock released immediately
+
+        // Step 2: Prepare order request
+        let order_req = CreateOrderRequest {
+            market_id,
+            side: side.to_string(),
+            order_type: "limit".to_string(),
+            price,
+            size,
+            time_in_force: "gtc".to_string(),
+        };
+
+        // Step 3: Retry logic with exponential backoff
+        const MAX_RETRIES: u32 = 3;
+        let mut retries = 0;
+
+        loop {
+            match self.send_order(&order_req).await {
+                Ok(order_id) => {
+                    // Step 4: Register order in shadow ledger
+                    {
+                        let mut ledger_guard = ledger.write();
+                        ledger_guard.register_order(
+                            order_id,
+                            market_id,
+                            side,
+                            price,
+                            size,
+                        );
+                    }
+
+                    tracing::info!(
+                        "✅ Order placed: id={} side={} price={} size={} (optimistic in_flight updated)",
+                        order_id,
+                        side,
+                        price,
+                        size
+                    );
+                    return Ok(order_id);
+                }
+                Err(e) if retries < MAX_RETRIES => {
+                    retries += 1;
+                    let backoff_ms = 100 * 2u64.pow(retries - 1); // 100ms, 200ms, 400ms
+                    tracing::warn!(
+                        "Order attempt {} failed: {}, retrying in {}ms...",
+                        retries,
+                        e,
+                        backoff_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+                Err(e) => {
+                    // All retries exhausted, rollback in_flight_pos
+                    let mut ledger_guard = ledger.write();
+                    ledger_guard.add_in_flight(-signed_size);
+
+                    tracing::error!(
+                        "❌ Order failed after {} retries, rolled back in_flight: {}",
+                        MAX_RETRIES,
+                        e
+                    );
+
+                    return Err(TradingError::OrderFailedAfterRetries {
+                        retries: MAX_RETRIES,
+                        reason: e.to_string(),
+                    });
+                }
+            }
         }
     }
 
-    pub fn calculate_quotes(&self, mid_price: f64, current_position: f64) -> Option<(f64, f64)> {
-        // Don't quote if position is too large
-        if current_position.abs() >= self.max_position {
-            return None;
+    /// Internal method to send order HTTP request
+    async fn send_order(&self, order_req: &CreateOrderRequest) -> Result<u64> {
+        // Serialize request for signing
+        let payload = serde_json::to_string(order_req)
+            .map_err(|e| TradingError::OrderFailed(format!("Serialization error: {}", e)))?;
+
+        // Sign the request
+        let signature = self.sign_request(&payload);
+
+        // Send HTTP request
+        let response = self
+            .client
+            .post(format!("{}/orders", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .header("X-Signature", signature)
+            .header("Content-Type", "application/json")
+            .body(payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read error body".to_string());
+            return Err(TradingError::OrderFailed(format!(
+                "HTTP {}: {}",
+                status, error_body
+            )));
         }
 
-        let spread = mid_price * (self.spread_bps as f64) / 10000.0;
-        let bid = mid_price - spread / 2.0;
-        let ask = mid_price + spread / 2.0;
-
-        Some((bid, ask))
+        let order_resp: CreateOrderResponse = response.json().await?;
+        Ok(order_resp.order_id)
     }
 
-    pub fn should_place_orders(&self, current_position: f64) -> bool {
-        current_position.abs() < self.max_position
-    }
-}
+    /// Cancel an order
+    pub async fn cancel_order(&self, order_id: u64) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!("{}/orders/{}", self.base_url, order_id))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read error body".to_string());
+            return Err(TradingError::OrderFailed(format!(
+                "Cancel failed HTTP {}: {}",
+                status, error_body
+            )));
+        }
 
-    #[test]
-    fn test_market_maker_quotes() {
-        let mm = SimpleMarketMaker::new(0, 1);
-        let mid_price = 95000.0;
-        let position = 0.0;
-
-        let quotes = mm.calculate_quotes(mid_price, position);
-        assert!(quotes.is_some());
-
-        let (bid, ask) = quotes.unwrap();
-        assert!(bid < mid_price);
-        assert!(ask > mid_price);
-        assert!((ask - bid) / mid_price > 0.0009); // At least 0.09% spread
-    }
-
-    #[test]
-    fn test_market_maker_max_position() {
-        let mm = SimpleMarketMaker::new(0, 1);
-        assert!(mm.should_place_orders(0.005));
-        assert!(!mm.should_place_orders(0.01));
-        assert!(!mm.should_place_orders(-0.01));
+        tracing::info!("🚫 Order canceled: id={}", order_id);
+        Ok(())
     }
 }
+
+#[derive(Debug, Serialize)]
+struct CreateOrderRequest {
+    market_id: u16,
+    side: String,
+    order_type: String,
+    price: f64,
+    size: f64,
+    time_in_force: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateOrderResponse {
+    order_id: u64,
+}
+

@@ -42,6 +42,14 @@ func main() {
 	defer matrix.Close()
 	log.Printf("📡 Shared matrix: /dev/shm/%s (~656 KB)", shmName)
 
+	// Create event ring buffer for private events (~64 KB)
+	eventBuffer, err := shm.NewEventRingBuffer()
+	if err != nil {
+		log.Fatalf("event ring buffer: %v", err)
+	}
+	defer eventBuffer.Close()
+	log.Printf("📡 Event ring buffer: /dev/shm/aleph-events (~64 KB)")
+
 	var wg sync.WaitGroup
 
 	if hlCfg, ok := cfg.Exchanges["hyperliquid"]; ok && hlCfg.Enabled {
@@ -60,7 +68,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lt := exchanges.NewLighter(ltCfg, matrix)
+			lt := exchanges.NewLighter(ltCfg, matrix, eventBuffer)
 			log.Println("🔌 Lighter: starting...")
 			if err := lt.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("Lighter: %v", err)

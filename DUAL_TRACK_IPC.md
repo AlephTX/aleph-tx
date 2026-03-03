@@ -2,10 +2,19 @@
 
 ## Overview
 
-AlephTX now implements a **Dual-Track IPC Architecture** for zero-latency HFT:
+AlephTX implements a **"No Boomerang" Dual-Track IPC Architecture** for Lighter DEX integration:
 
-- **Track 1 (Public)**: Lock-Free Shared Matrix (`/dev/shm/aleph-matrix`) - Market data (BBO)
-- **Track 2 (Private)**: Lock-Free Ring Buffer (`/dev/shm/aleph-events`) - Order flow events
+1. **Go Feeder**: Handles WebSocket streams (Public BBO Matrix + Private Event RingBuffer) using `lighter-go` v1.0.2 SDK
+2. **Rust Core**: Runs Shadow Ledger, makes trading decisions, executes orders via HTTP Keep-Alive
+3. **Optimistic Accounting**: Rust assumes orders succeed immediately, WS events reconcile truth
+
+**Key Principle**: Orders are NEVER routed back through Go. Rust owns HTTP execution.
+
+## Lighter Endpoints (Mainnet)
+
+- **REST API**: `https://mainnet.zklighter.elliot.ai/api/v1/`
+- **WebSocket**: `wss://mainnet.zklighter.elliot.ai/stream`
+- **SDK Version**: `lighter-go` v1.0.2 (latest)
 
 ## Architecture Components
 

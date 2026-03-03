@@ -10,17 +10,20 @@ import (
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	lightergo "github.com/elliottech/lighter-go"
 	"nhooyr.io/websocket"
 )
 
 // Lighter connects to the Lighter (zkLighter) orderbook WebSocket.
 type Lighter struct {
-	cfg    config.ExchangeConfig
-	matrix *shm.Matrix
-	mktMap map[int]uint16
+	cfg         config.ExchangeConfig
+	matrix      *shm.Matrix
+	eventBuffer *shm.EventRingBuffer
+	mktMap      map[int]uint16
+	client      *lightergo.Client
 }
 
-func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix) *Lighter {
+func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer) *Lighter {
 	mktMap := make(map[int]uint16)
 	for localSym, exchIdxStr := range cfg.Symbols {
 		if id, ok := SymbolNameToID[localSym]; ok {
@@ -28,10 +31,21 @@ func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix) *Lighter {
 			mktMap[idx] = id
 		}
 	}
+
+	// Initialize lighter-go client with mainnet endpoints
+	client := lightergo.NewClient(
+		"https://mainnet.zklighter.elliot.ai/api/v1/",
+		"wss://mainnet.zklighter.elliot.ai/stream",
+		cfg.APIKey,    // API key from config
+		cfg.APISecret, // Private key from config
+	)
+
 	return &Lighter{
-		cfg:    cfg,
-		matrix: matrix,
-		mktMap: mktMap,
+		cfg:         cfg,
+		matrix:      matrix,
+		eventBuffer: eventBuffer,
+		mktMap:      mktMap,
+		client:      client,
 	}
 }
 
@@ -54,10 +68,24 @@ type lighterLevel struct {
 }
 
 func (l *Lighter) Run(ctx context.Context) error {
-	return RunConnectionLoop(ctx, "lighter", l.connect)
+	// Start both public orderbook stream and private event stream
+	errChan := make(chan error, 2)
+
+	// Public orderbook stream (existing)
+	go func() {
+		errChan <- RunConnectionLoop(ctx, "lighter-public", l.connectPublic)
+	}()
+
+	// Private event stream (new)
+	go func() {
+		errChan <- RunConnectionLoop(ctx, "lighter-private", l.connectPrivate)
+	}()
+
+	// Return first error
+	return <-errChan
 }
 
-func (l *Lighter) connect(ctx context.Context) error {
+func (l *Lighter) connectPublic(ctx context.Context) error {
 	c, _, err := websocket.Dial(ctx, l.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -132,4 +160,81 @@ func (l *Lighter) parseMarketIndex(channel string) int {
 		}
 	}
 	return -1
+}
+
+// connectPrivate subscribes to private events using lighter-go SDK
+func (l *Lighter) connectPrivate(ctx context.Context) error {
+	log.Printf("lighter-private: connecting to private stream")
+
+	// Subscribe to private events (fills, cancels, etc.)
+	eventChan, err := l.client.SubscribePrivateEvents(ctx)
+	if err != nil {
+		return fmt.Errorf("subscribe private events: %w", err)
+	}
+
+	log.Printf("lighter-private: subscribed to private events")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case event := <-eventChan:
+			if event == nil {
+				continue
+			}
+
+			// Parse and push event to ring buffer
+			l.handlePrivateEvent(event)
+		}
+	}
+}
+
+// handlePrivateEvent processes a private event from lighter-go SDK
+func (l *Lighter) handlePrivateEvent(event *lightergo.PrivateEvent) {
+	// Map market ID to symbol ID
+	symID, ok := l.mktMap[event.MarketID]
+	if !ok {
+		return
+	}
+
+	switch event.Type {
+	case "order_created":
+		l.eventBuffer.PushOrderCreated(
+			shm.ExchangeLighter,
+			symID,
+			event.OrderID,
+			event.Size,
+		)
+		log.Printf("lighter-private: order_created id=%d size=%.4f", event.OrderID, event.Size)
+
+	case "order_filled":
+		l.eventBuffer.PushOrderFilled(
+			shm.ExchangeLighter,
+			symID,
+			event.OrderID,
+			event.FillPrice,
+			event.FillSize,
+			event.RemainingSize,
+			event.Fee,
+		)
+		log.Printf("lighter-private: order_filled id=%d price=%.2f size=%.4f remaining=%.4f",
+			event.OrderID, event.FillPrice, event.FillSize, event.RemainingSize)
+
+	case "order_canceled":
+		l.eventBuffer.PushOrderCanceled(
+			shm.ExchangeLighter,
+			symID,
+			event.OrderID,
+		)
+		log.Printf("lighter-private: order_canceled id=%d", event.OrderID)
+
+	case "order_rejected":
+		l.eventBuffer.PushOrderRejected(
+			shm.ExchangeLighter,
+			symID,
+			event.OrderID,
+		)
+		log.Printf("lighter-private: order_rejected id=%d", event.OrderID)
+	}
 }

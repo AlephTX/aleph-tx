@@ -1,7 +1,8 @@
+pub mod advanced_mm;
 pub mod arbitrage;
 pub mod backpack_mm;
+pub mod lighter_mm;
 pub mod market_maker;
-pub mod advanced_mm;
 
 use crate::shm_reader::ShmBboMessage;
 
