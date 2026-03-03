@@ -99,6 +99,7 @@ impl ShmPrivateEvent {
     }
 
     /// Create a new order filled event
+    #[allow(clippy::too_many_arguments)]
     pub fn order_filled(
         sequence: u64,
         exchange_id: u8,

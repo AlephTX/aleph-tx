@@ -2,10 +2,23 @@
 //!
 //! This module provides a non-blocking reader for the private event ring buffer.
 //! Events are written by the Go feeder and consumed by Rust strategies.
+//!
+//! # Safety
+//!
+//! This implementation uses volatile reads and compiler fences to ensure correct
+//! memory ordering in a lock-free SPSC (single producer, single consumer) model:
+//! - Only one writer (Go feeder) updates write_idx atomically
+//! - Only one reader (Rust strategy) reads events sequentially
+//! - Acquire fence ensures event data is visible before we read it
+//!
+//! The ring buffer can hold up to 1024 events. If the writer wraps around and
+//! overwrites unread events, a gap is detected and reported.
 
+use crate::error::{Result, TradingError};
 use crate::types::ShmPrivateEvent;
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::atomic::{compiler_fence, Ordering};
 
 const RING_BUFFER_SLOTS: u64 = 1024;
@@ -25,29 +38,38 @@ pub struct ShmEventReader {
 }
 
 impl ShmEventReader {
-    /// Open the event ring buffer at /dev/shm/aleph-events
+    /// Open the event ring buffer at the specified path
     ///
     /// # Errors
     /// Returns error if the shared memory file doesn't exist or cannot be mapped
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = "/dev/shm/aleph-events";
-
+    ///
+    /// # Default Path
+    /// Use `ShmEventReader::new_default()` to open `/dev/shm/aleph-events`
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         // Open the shared memory file
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(path.as_ref())
+            .map_err(|e| {
+                TradingError::SharedMemory(format!(
+                    "Failed to open {}: {}",
+                    path.as_ref().display(),
+                    e
+                ))
+            })?;
 
         // Memory-map the file
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(|e| {
+            TradingError::SharedMemory(format!("Failed to mmap: {}", e))
+        })?;
 
         if mmap.len() < TOTAL_SIZE {
-            return Err(format!(
+            return Err(TradingError::SharedMemory(format!(
                 "Shared memory too small: {} < {}",
                 mmap.len(),
                 TOTAL_SIZE
-            )
-            .into());
+            )));
         }
 
         Ok(Self {
@@ -56,7 +78,17 @@ impl ShmEventReader {
         })
     }
 
+    /// Open the event ring buffer at the default path `/dev/shm/aleph-events`
+    pub fn new_default() -> Result<Self> {
+        Self::new("/dev/shm/aleph-events")
+    }
+
     /// Read the current write index (atomic load)
+    ///
+    /// # Safety
+    ///
+    /// Uses volatile read to prevent compiler optimizations that could cause
+    /// torn reads. The Go writer updates this atomically.
     #[inline]
     fn read_write_idx(&self) -> u64 {
         let ptr = self.mmap.as_ptr() as *const u64;
@@ -64,6 +96,11 @@ impl ShmEventReader {
     }
 
     /// Read an event from a specific slot
+    ///
+    /// # Safety
+    ///
+    /// Uses volatile read to ensure we see the complete event write.
+    /// The acquire fence in `try_read()` ensures proper memory ordering.
     #[inline]
     fn read_slot(&self, slot: usize) -> ShmPrivateEvent {
         let offset = HEADER_SIZE + (slot * EVENT_SIZE);
@@ -76,7 +113,13 @@ impl ShmEventReader {
     /// Returns `None` if no new events are available.
     /// Returns `Some(event)` if a new event was read.
     ///
+    /// # Gap Detection
+    ///
+    /// If the writer has wrapped around and overwrote unread events, this method
+    /// detects the gap, logs an error, and skips to the oldest available event.
+    ///
     /// # Safety
+    ///
     /// Uses compiler_fence(Acquire) to ensure the event is fully written before reading.
     pub fn try_read(&mut self) -> Option<ShmPrivateEvent> {
         let write_idx = self.read_write_idx();
@@ -84,6 +127,19 @@ impl ShmEventReader {
         // No new events available
         if self.local_read_idx >= write_idx {
             return None;
+        }
+
+        // Detect gaps (writer wrapped around and overwrote unread events)
+        let unread = write_idx.saturating_sub(self.local_read_idx);
+        if unread > RING_BUFFER_SLOTS {
+            let gap_size = unread - RING_BUFFER_SLOTS;
+            tracing::error!(
+                "⚠️  Event gap detected: {} events lost (buffer overflow)",
+                gap_size
+            );
+
+            // Skip to the oldest available event
+            self.local_read_idx = write_idx.saturating_sub(RING_BUFFER_SLOTS);
         }
 
         // Acquire fence: ensure we see the complete event write
@@ -131,7 +187,7 @@ mod tests {
     fn test_reader_creation() {
         // This test requires the shared memory file to exist
         // In production, the Go feeder creates it
-        match ShmEventReader::new() {
+        match ShmEventReader::new_default() {
             Ok(reader) => {
                 assert_eq!(reader.local_read_idx(), 0);
                 println!("Reader created successfully");

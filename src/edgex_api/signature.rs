@@ -143,7 +143,7 @@ impl SignatureManager {
 
         let r_hex = format!("{:064x}", signature.r);
         let s_hex = format!("{:064x}", signature.s);
-        Ok(format!("{}{}", r_hex, s_hex))
+        Ok(format!("0x{}{}", r_hex, s_hex))
     }
 
     pub fn sign_message(&self, message: &str) -> Result<String, SignatureError> {
@@ -189,11 +189,12 @@ mod tests {
 
     #[test]
     fn test_signature_generation() {
-        // Dummy key (valid hex)
-        let key = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        // Valid Stark private key (must be < STARK_PRIME)
+        // Using a smaller valid key for testing
+        let key = "0x1234567890abcdef";
         let manager = SignatureManager::new(key).unwrap();
 
-        // Test limit order hash calculation
+        // Test limit order hash calculation with valid hex asset IDs
         let hash = manager
             .calc_limit_order_hash("0x1", "0x2", "0x3", true, 100, 200, 10, 123, 1, 999999)
             .unwrap();

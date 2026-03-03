@@ -122,9 +122,9 @@ func (rb *EventRingBuffer) Push(event ShmPrivateEvent) {
 }
 
 // PushOrderCreated is a convenience method for order created events
-func (rb *EventRingBuffer) PushOrderCreated(exchangeID, symbolID uint16, orderID uint64, size float64) {
+func (rb *EventRingBuffer) PushOrderCreated(exchangeID uint8, symbolID uint16, orderID uint64, size float64) {
 	rb.Push(ShmPrivateEvent{
-		ExchangeID:    uint8(exchangeID),
+		ExchangeID:    exchangeID,
 		EventType:     EventTypeOrderCreated,
 		SymbolID:      symbolID,
 		OrderID:       orderID,

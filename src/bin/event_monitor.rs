@@ -8,13 +8,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔍 AlephTX Event Buffer Monitor");
     println!("================================\n");
 
-    let mut reader = match ShmEventReader::new() {
+    let mut reader = match ShmEventReader::new_default() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ Failed to open event buffer: {}", e);
             eprintln!("   Make sure the Go feeder is running.");
             eprintln!("   Expected file: /dev/shm/aleph-events");
-            return Err(e);
+            return Err(Box::new(e));
         }
     };
 
