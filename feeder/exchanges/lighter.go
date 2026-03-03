@@ -24,11 +24,16 @@ type Lighter struct {
 func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer) *Lighter {
 	mktMap := make(map[int]uint16)
 	for localSym, exchIdxStr := range cfg.Symbols {
+		log.Printf("lighter: mapping symbol %s (exchIdx=%s)", localSym, exchIdxStr)
 		if id, ok := SymbolNameToID[localSym]; ok {
 			idx, _ := strconv.Atoi(exchIdxStr)
 			mktMap[idx] = id
+			log.Printf("lighter: mapped market %d -> symbol %d (%s)", idx, id, localSym)
+		} else {
+			log.Printf("lighter: WARNING: symbol %s not found in SymbolNameToID", localSym)
 		}
 	}
+	log.Printf("lighter: initialized with %d markets: %v", len(mktMap), mktMap)
 
 	return &Lighter{
 		cfg:         cfg,

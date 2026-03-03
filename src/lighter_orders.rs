@@ -6,49 +6,57 @@
 //! - Background WS events from Go reconcile the truth
 
 use crate::error::{Result, TradingError};
+use crate::lighter_ffi::LighterSigner;
 use crate::shadow_ledger::{OrderSide, ShadowLedger};
 use parking_lot::RwLock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Lighter REST API client with Keep-Alive connection pooling
 pub struct LighterHttpClient {
     client: Client,
     base_url: String,
-    api_key: String,
-    private_key: String,
+    signer: LighterSigner,
+    nonce: Arc<parking_lot::Mutex<i64>>,
+    client_order_counter: Arc<parking_lot::Mutex<i64>>,
 }
 
 impl LighterHttpClient {
     /// Create a new Lighter HTTP client with Keep-Alive enabled
-    pub fn new(api_key: String, private_key: String) -> Result<Self> {
+    pub fn new(
+        private_key: String,
+        api_key_index: i64,
+        account_index: i64,
+    ) -> Result<Self> {
         let client = Client::builder()
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
-            .timeout(Duration::from_secs(2)) // 2s timeout (increased from 500ms)
+            .timeout(Duration::from_secs(2))
             .build()
             .map_err(TradingError::Network)?;
 
+        let base_url = "https://mainnet.zklighter.elliot.ai".to_string();
+
+        // Initialize Go signer via FFI
+        let signer = LighterSigner::new(
+            &base_url,
+            &private_key,
+            1, // Mainnet chain_id
+            api_key_index,
+            account_index,
+        )
+        .map_err(|e| TradingError::OrderFailed(format!("Signer init failed: {}", e)))?;
+
         Ok(Self {
             client,
-            base_url: "https://mainnet.zklighter.elliot.ai/api/v1".to_string(),
-            api_key,
-            private_key,
+            base_url,
+            signer,
+            nonce: Arc::new(parking_lot::Mutex::new(1)), // Start from 1
+            client_order_counter: Arc::new(parking_lot::Mutex::new(1)), // Start from 1
         })
-    }
-
-    /// Sign a request payload using HMAC-SHA256
-    fn sign_request(&self, payload: &str) -> String {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.private_key.as_bytes())
-            .expect("HMAC can take key of any size");
-        mac.update(payload.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
     }
 
     /// Place a limit order with optimistic accounting and retry logic
@@ -65,7 +73,7 @@ impl LighterHttpClient {
         side: OrderSide,
         price: f64,
         size: f64,
-    ) -> Result<u64> {
+    ) -> Result<String> {
         // Step 1: Optimistically update in_flight_pos (BEFORE API call)
         let signed_size = side.sign() * size;
 
@@ -90,27 +98,15 @@ impl LighterHttpClient {
 
         loop {
             match self.send_order(&order_req).await {
-                Ok(order_id) => {
-                    // Step 4: Register order in shadow ledger
-                    {
-                        let mut ledger_guard = ledger.write();
-                        ledger_guard.register_order(
-                            order_id,
-                            market_id,
-                            side,
-                            price,
-                            size,
-                        );
-                    }
-
+                Ok(tx_hash) => {
                     tracing::info!(
-                        "✅ Order placed: id={} side={} price={} size={} (optimistic in_flight updated)",
-                        order_id,
+                        "✅ Order placed: tx_hash={} side={} price={} size={} (optimistic in_flight updated)",
+                        tx_hash,
                         side,
                         price,
                         size
                     );
-                    return Ok(order_id);
+                    return Ok(tx_hash);
                 }
                 Err(e) if retries < MAX_RETRIES => {
                     retries += 1;
@@ -144,22 +140,63 @@ impl LighterHttpClient {
     }
 
     /// Internal method to send order HTTP request
-    async fn send_order(&self, order_req: &CreateOrderRequest) -> Result<u64> {
-        // Serialize request for signing
-        let payload = serde_json::to_string(order_req)
-            .map_err(|e| TradingError::OrderFailed(format!("Serialization error: {}", e)))?;
+    async fn send_order(&self, order_req: &CreateOrderRequest) -> Result<String> {
+        // Get next nonce
+        let nonce = {
+            let mut n = self.nonce.lock();
+            let current = *n;
+            *n += 1;
+            current
+        };
 
-        // Sign the request
-        let signature = self.sign_request(&payload);
+        // Get next client_order_index (simple counter)
+        let client_order_index = {
+            let mut counter = self.client_order_counter.lock();
+            let current = *counter;
+            *counter += 1;
+            current
+        };
 
-        // Send HTTP request
+        // Convert price to Lighter format (price * 10^6)
+        let price_int = (order_req.price * 1_000_000.0) as u32;
+
+        // Convert size to base_amount (size * 10^6)
+        let base_amount = (order_req.size * 1_000_000.0) as i64;
+
+        // Sign transaction via FFI
+        let signed_tx = self
+            .signer
+            .sign_create_order(
+                order_req.market_id as u8,
+                client_order_index,
+                base_amount,
+                price_int,
+                order_req.side == "ask",
+                0, // order_type: 0 = Limit
+                1, // time_in_force: 1 = GTC
+                false,
+                0,
+                -1, // order_expiry: -1 = never expires
+                nonce,
+            )
+            .map_err(|e| TradingError::OrderFailed(format!("Signing failed: {}", e)))?;
+
+        tracing::info!(
+            "📝 Signed order: tx_type={} tx_hash={} nonce={}",
+            signed_tx.tx_type,
+            signed_tx.tx_hash,
+            nonce
+        );
+
+        // Send via HTTP multipart/form-data
+        let form = reqwest::multipart::Form::new()
+            .text("tx_type", signed_tx.tx_type.to_string())
+            .text("tx_info", signed_tx.tx_info.clone());
+
         let response = self
             .client
-            .post(format!("{}/orders", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .header("X-Signature", signature)
-            .header("Content-Type", "application/json")
-            .body(payload)
+            .post(format!("{}/api/v1/sendTx", self.base_url))
+            .multipart(form)
             .send()
             .await?;
 
@@ -175,32 +212,16 @@ impl LighterHttpClient {
             )));
         }
 
-        let order_resp: CreateOrderResponse = response.json().await?;
-        Ok(order_resp.order_id)
+        let resp_text = response.text().await?;
+        tracing::info!("✅ Order response: {}", resp_text);
+
+        Ok(signed_tx.tx_hash)
     }
 
     /// Cancel an order
-    pub async fn cancel_order(&self, order_id: u64) -> Result<()> {
-        let response = self
-            .client
-            .delete(format!("{}/orders/{}", self.base_url, order_id))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error body".to_string());
-            return Err(TradingError::OrderFailed(format!(
-                "Cancel failed HTTP {}: {}",
-                status, error_body
-            )));
-        }
-
-        tracing::info!("🚫 Order canceled: id={}", order_id);
+    pub async fn cancel_order(&self, _order_id: String) -> Result<()> {
+        // TODO: Implement cancel via FFI + HTTP
+        tracing::warn!("Cancel order not yet implemented");
         Ok(())
     }
 }
@@ -213,10 +234,5 @@ struct CreateOrderRequest {
     price: f64,
     size: f64,
     time_in_force: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateOrderResponse {
-    order_id: u64,
 }
 

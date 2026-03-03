@@ -39,6 +39,15 @@ pub enum TradingError {
 
     #[error("Market data unavailable for symbol {symbol_id} on exchange {exchange_id}")]
     MarketDataUnavailable { symbol_id: u16, exchange_id: u8 },
+
+    #[error("Signing error: {0}")]
+    Signing(String),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("API error (status {status}): {message}")]
+    ApiError { status: u16, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, TradingError>;
