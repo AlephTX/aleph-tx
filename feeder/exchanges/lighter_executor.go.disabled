@@ -1,0 +1,163 @@
+package exchanges
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/AlephTX/aleph-tx/feeder/shm"
+	lighterclient "github.com/elliottech/lighter-go/client"
+	lighterhttp "github.com/elliottech/lighter-go/client/http"
+	"github.com/elliottech/lighter-go/types"
+)
+
+// LighterOrderExecutor executes order requests from Rust using lighter-go SDK
+type LighterOrderExecutor struct {
+	requestBuffer *shm.OrderRequestBuffer
+	eventBuffer   *shm.EventRingBuffer
+	txClient      *lighterclient.TxClient
+	accountIndex  int64
+	apiKeyIndex   uint8
+}
+
+// NewLighterOrderExecutor creates a new order executor
+func NewLighterOrderExecutor(
+	requestBuffer *shm.OrderRequestBuffer,
+	eventBuffer *shm.EventRingBuffer,
+	apiKeyPrivateKey string,
+	accountIndex int64,
+	apiKeyIndex uint8,
+) (*LighterOrderExecutor, error) {
+	// Create HTTP client
+	httpClient := lighterhttp.NewClient("https://mainnet.zklighter.elliot.ai/api/v1")
+
+	// Create TxClient with Poseidon2 + Schnorr signing
+	txClient, err := lighterclient.NewTxClient(
+		httpClient,
+		apiKeyPrivateKey,
+		accountIndex,
+		apiKeyIndex,
+		1, // Chain ID: 1 = Mainnet
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TxClient: %w", err)
+	}
+
+	return &LighterOrderExecutor{
+		requestBuffer: requestBuffer,
+		eventBuffer:   eventBuffer,
+		txClient:      txClient,
+		accountIndex:  accountIndex,
+		apiKeyIndex:   apiKeyIndex,
+	}, nil
+}
+
+// Run starts the order executor loop
+func (e *LighterOrderExecutor) Run(ctx context.Context) error {
+	log.Printf("lighter-executor: started (account=%d, api_key=%d)", e.accountIndex, e.apiKeyIndex)
+
+	ticker := time.NewTicker(1 * time.Millisecond) // Check every 1ms
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-ticker.C:
+			// Process all pending requests
+			for {
+				request := e.requestBuffer.TryRead()
+				if request == nil {
+					break
+				}
+
+				e.handleRequest(request)
+			}
+		}
+	}
+}
+
+// handleRequest processes a single order request
+func (e *LighterOrderExecutor) handleRequest(request *shm.OrderRequest) {
+	switch shm.OrderRequestType(request.RequestType) {
+	case shm.OrderRequestPlaceLimit:
+		e.handlePlaceLimitOrder(request)
+
+	case shm.OrderRequestCancel:
+		e.handleCancelOrder(request)
+
+	default:
+		log.Printf("lighter-executor: unknown request type: %d", request.RequestType)
+	}
+}
+
+// handlePlaceLimitOrder places a limit order using lighter-go SDK
+func (e *LighterOrderExecutor) handlePlaceLimitOrder(request *shm.OrderRequest) {
+	// Convert side
+	var isAsk bool
+	if shm.OrderRequestSide(request.Side) == shm.OrderRequestSell {
+		isAsk = true
+	}
+
+	// Prepare transaction options
+	opts := &types.TransactOpts{
+		FromAccountIndex: &e.accountIndex,
+		ApiKeyIndex:      &e.apiKeyIndex,
+		ExpiredAt:        time.Now().Add(10 * time.Minute).UnixMilli(),
+	}
+
+	// Create limit order
+	log.Printf("lighter-executor: placing limit order market=%d side=%v price=%.2f size=%.4f",
+		request.MarketID, request.Side, request.Price, request.Size)
+
+	orderID, err := e.txClient.CreateLimitOrder(
+		int(request.MarketID),
+		isAsk,
+		request.Price,
+		request.Size,
+		opts,
+	)
+
+	if err != nil {
+		log.Printf("lighter-executor: ❌ order failed: %v", err)
+		// Push rejection event
+		e.eventBuffer.PushOrderRejected(
+			uint8(ExchangeLighter),
+			request.SymbolID,
+			0, // No order ID on rejection
+		)
+		return
+	}
+
+	log.Printf("lighter-executor: ✅ order placed: id=%d", orderID)
+
+	// Note: OrderCreated event will come from WebSocket, no need to push here
+}
+
+// handleCancelOrder cancels an order using lighter-go SDK
+func (e *LighterOrderExecutor) handleCancelOrder(request *shm.OrderRequest) {
+	log.Printf("lighter-executor: canceling order id=%d", request.OrderID)
+
+	opts := &types.TransactOpts{
+		FromAccountIndex: &e.accountIndex,
+		ApiKeyIndex:      &e.apiKeyIndex,
+		ExpiredAt:        time.Now().Add(10 * time.Minute).UnixMilli(),
+	}
+
+	err := e.txClient.CancelLimitOrder(
+		int(request.MarketID),
+		int64(request.OrderID),
+		opts,
+	)
+
+	if err != nil {
+		log.Printf("lighter-executor: ❌ cancel failed: %v", err)
+		return
+	}
+
+	log.Printf("lighter-executor: ✅ order canceled: id=%d", request.OrderID)
+
+	// Note: OrderCanceled event will come from WebSocket
+}
