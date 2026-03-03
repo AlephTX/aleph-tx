@@ -10,6 +10,7 @@
 //!
 //! - Quotes around mid price with configurable spread
 //! - Respects max exposure limits (real_pos + in_flight_pos)
+//! - Incremental quoting: only requotes if price moves > threshold
 //! - Cancels stale orders periodically
 //! - Supports graceful shutdown via tokio::sync::watch channel
 
@@ -18,9 +19,17 @@ use crate::lighter_orders::LighterHttpClient;
 use crate::shadow_ledger::{OrderSide, ShadowLedger};
 use crate::shm_reader::ShmReader;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+struct ActiveOrder {
+    order_id: u64,
+    side: OrderSide,
+    price: f64,
+    size: f64,
+    placed_at: Instant,
+}
 
 pub struct LighterMarketMaker {
     symbol_id: u16,
@@ -28,12 +37,14 @@ pub struct LighterMarketMaker {
     spread_bps: u32,
     order_size: f64,
     max_exposure: f64,
+    requote_threshold_bps: f64, // Only requote if price moves > this threshold
     http_client: LighterHttpClient,
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
     // Order management
-    our_orders: HashMap<u64, Instant>, // order_id -> placed_at
-    order_ttl: Duration,                // Time-to-live for orders
+    active_bid: Option<ActiveOrder>,
+    active_ask: Option<ActiveOrder>,
+    order_ttl: Duration, // Time-to-live for orders
 }
 
 impl LighterMarketMaker {
@@ -50,13 +61,15 @@ impl LighterMarketMaker {
         Ok(Self {
             symbol_id,
             market_id,
-            spread_bps: 10, // 0.1% spread
+            spread_bps: 10,              // 0.1% spread
             order_size: 0.001,
             max_exposure: 0.01,
+            requote_threshold_bps: 5.0,  // Only requote if price moves > 0.05%
             http_client,
             ledger,
             shm_reader,
-            our_orders: HashMap::new(),
+            active_bid: None,
+            active_ask: None,
             order_ttl: Duration::from_secs(30), // Cancel orders after 30s
         })
     }
@@ -76,23 +89,24 @@ impl LighterMarketMaker {
         mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
         tracing::info!(
-            "🎯 Lighter MM started: symbol={} market={} spread={}bps",
+            "🎯 Lighter MM started: symbol={} market={} spread={}bps requote_threshold={}bps",
             self.symbol_id,
             self.market_id,
-            self.spread_bps
+            self.spread_bps,
+            self.requote_threshold_bps
         );
 
         loop {
             // Check for shutdown signal
-            if let Some(ref mut rx) = shutdown
-                && *rx.borrow() {
+            if let Some(ref mut rx) = shutdown {
+                if *rx.borrow() {
                     tracing::info!("Shutdown signal received, canceling all orders...");
                     self.cancel_all_orders().await;
                     return Ok(());
                 }
+            }
 
             // Step 1: Read shadow ledger (instant, <1μs)
-            // Read once to avoid race conditions
             let (total_exposure, ledger_state) = {
                 let ledger = self.ledger.read();
                 let exposure = ledger.total_exposure();
@@ -134,9 +148,20 @@ impl LighterMarketMaker {
             // Step 5: Cancel stale orders
             self.cancel_stale_orders().await;
 
-            // Step 6: Fire orders with optimistic accounting
+            // Step 6: Check if we need to requote (incremental quoting)
+            let should_requote_bid = self.should_requote(&self.active_bid, our_bid);
+            let should_requote_ask = self.should_requote(&self.active_ask, our_ask);
+
+            // Step 7: Place/update orders only if needed
             // Place buy order
-            if total_exposure < self.max_exposure {
+            if should_requote_bid && total_exposure < self.max_exposure {
+                // Cancel existing bid if any
+                if let Some(ref order) = self.active_bid {
+                    let _ = self.http_client.cancel_order(order.order_id).await;
+                    self.active_bid = None;
+                }
+
+                // Place new bid
                 match self
                     .http_client
                     .place_order_optimistic(
@@ -151,7 +176,13 @@ impl LighterMarketMaker {
                 {
                     Ok(order_id) => {
                         tracing::info!("📈 Buy order placed: id={} price={:.2}", order_id, our_bid);
-                        self.our_orders.insert(order_id, Instant::now());
+                        self.active_bid = Some(ActiveOrder {
+                            order_id,
+                            side: OrderSide::Buy,
+                            price: our_bid,
+                            size: self.order_size,
+                            placed_at: Instant::now(),
+                        });
                     }
                     Err(e) => {
                         tracing::error!("❌ Buy order failed: {}", e);
@@ -160,7 +191,14 @@ impl LighterMarketMaker {
             }
 
             // Place sell order
-            if total_exposure > -self.max_exposure {
+            if should_requote_ask && total_exposure > -self.max_exposure {
+                // Cancel existing ask if any
+                if let Some(ref order) = self.active_ask {
+                    let _ = self.http_client.cancel_order(order.order_id).await;
+                    self.active_ask = None;
+                }
+
+                // Place new ask
                 match self
                     .http_client
                     .place_order_optimistic(
@@ -175,7 +213,13 @@ impl LighterMarketMaker {
                 {
                     Ok(order_id) => {
                         tracing::info!("📉 Sell order placed: id={} price={:.2}", order_id, our_ask);
-                        self.our_orders.insert(order_id, Instant::now());
+                        self.active_ask = Some(ActiveOrder {
+                            order_id,
+                            side: OrderSide::Sell,
+                            price: our_ask,
+                            size: self.order_size,
+                            placed_at: Instant::now(),
+                        });
                     }
                     Err(e) => {
                         tracing::error!("❌ Sell order failed: {}", e);
@@ -183,49 +227,70 @@ impl LighterMarketMaker {
                 }
             }
 
-            // Step 7: Sleep before next iteration
+            // Step 8: Sleep before next iteration
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    /// Cancel all stale orders (older than order_ttl)
+    /// Check if we should requote an order based on price deviation
+    fn should_requote(&self, active_order: &Option<ActiveOrder>, new_price: f64) -> bool {
+        match active_order {
+            None => true, // No active order, should place one
+            Some(order) => {
+                // Calculate price deviation in bps
+                let price_diff = (new_price - order.price).abs();
+                let deviation_bps = (price_diff / order.price) * 10000.0;
+
+                if deviation_bps > self.requote_threshold_bps {
+                    tracing::debug!(
+                        "Price moved {:.2}bps (threshold: {:.2}bps), requoting order",
+                        deviation_bps,
+                        self.requote_threshold_bps
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Cancel stale orders (older than order_ttl)
     async fn cancel_stale_orders(&mut self) {
         let now = Instant::now();
-        let stale_orders: Vec<u64> = self
-            .our_orders
-            .iter()
-            .filter(|(_, placed_at)| now.duration_since(**placed_at) > self.order_ttl)
-            .map(|(order_id, _)| *order_id)
-            .collect();
 
-        for order_id in stale_orders {
-            match self.http_client.cancel_order(order_id).await {
-                Ok(_) => {
-                    tracing::info!("🚫 Canceled stale order: id={}", order_id);
-                    self.our_orders.remove(&order_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to cancel order {}: {}", order_id, e);
-                }
+        // Check bid
+        if let Some(ref order) = self.active_bid {
+            if now.duration_since(order.placed_at) > self.order_ttl {
+                tracing::info!("🚫 Canceling stale bid: id={}", order.order_id);
+                let _ = self.http_client.cancel_order(order.order_id).await;
+                self.active_bid = None;
+            }
+        }
+
+        // Check ask
+        if let Some(ref order) = self.active_ask {
+            if now.duration_since(order.placed_at) > self.order_ttl {
+                tracing::info!("🚫 Canceling stale ask: id={}", order.order_id);
+                let _ = self.http_client.cancel_order(order.order_id).await;
+                self.active_ask = None;
             }
         }
     }
 
     /// Cancel all active orders (used during shutdown)
     async fn cancel_all_orders(&mut self) {
-        let order_ids: Vec<u64> = self.our_orders.keys().copied().collect();
-
-        for order_id in order_ids {
-            match self.http_client.cancel_order(order_id).await {
-                Ok(_) => {
-                    tracing::info!("🚫 Canceled order: id={}", order_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to cancel order {}: {}", order_id, e);
-                }
-            }
+        if let Some(ref order) = self.active_bid {
+            tracing::info!("🚫 Canceling bid: id={}", order.order_id);
+            let _ = self.http_client.cancel_order(order.order_id).await;
         }
 
-        self.our_orders.clear();
+        if let Some(ref order) = self.active_ask {
+            tracing::info!("🚫 Canceling ask: id={}", order.order_id);
+            let _ = self.http_client.cancel_order(order.order_id).await;
+        }
+
+        self.active_bid = None;
+        self.active_ask = None;
     }
 }
