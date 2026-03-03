@@ -1,6 +1,7 @@
 pub mod backpack_api;
 pub mod config;
 pub mod edgex_api;
+pub mod lighter_orders;
 pub mod orderbook;
 pub mod risk;
 pub mod shadow_ledger;
