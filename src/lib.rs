@@ -3,6 +3,7 @@ pub mod config;
 pub mod edgex_api;
 pub mod error;
 pub mod lighter_orders;
+pub mod order_request_buffer;
 pub mod orderbook;
 pub mod risk;
 pub mod shadow_ledger;
