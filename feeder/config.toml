@@ -8,16 +8,15 @@ BTC = "BTC"
 ETH = "ETH"
 
 [exchanges.lighter]
-enabled = false
+enabled = true
 testnet = false
-ws_url = "wss://api.lighter.xyz/ws"
+ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
 
 [exchanges.lighter.symbols]
-BTC = "3"
-ETH = "4"
+ETH = "0"
 
 [exchanges.backpack]
-enabled = true
+enabled = false
 testnet = false
 ws_url = "wss://ws.backpack.exchange"
 
@@ -26,7 +25,7 @@ BTC = "BTC_USDC_PERP"
 ETH = "ETH_USDC_PERP"
 
 [exchanges.edgex]
-enabled = true
+enabled = false
 testnet = false
 ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
 rest_url = "https://pro.edgex.exchange"

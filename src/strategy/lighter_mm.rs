@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 struct ActiveOrder {
-    order_id: u64,
+    order_id: String,
     side: OrderSide,
     price: f64,
     size: f64,
@@ -38,6 +38,8 @@ pub struct LighterMarketMaker {
     order_size: f64,
     max_exposure: f64,
     requote_threshold_bps: f64, // Only requote if price moves > this threshold
+    tick_size: f64,              // Price precision (e.g., 0.01 for WETH-USDC)
+    step_size: f64,              // Size precision (e.g., 0.0001 for WETH-USDC)
     http_client: LighterHttpClient,
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
@@ -51,12 +53,13 @@ impl LighterMarketMaker {
     pub fn new(
         symbol_id: u16,
         market_id: u16,
-        api_key: String,
         private_key: String,
+        account_index: i64,
+        api_key_index: u8,
         ledger: Arc<RwLock<ShadowLedger>>,
         shm_reader: ShmReader,
     ) -> Result<Self> {
-        let http_client = LighterHttpClient::new(api_key, private_key)?;
+        let http_client = LighterHttpClient::new(private_key, api_key_index as i64, account_index)?;
 
         Ok(Self {
             symbol_id,
@@ -65,6 +68,8 @@ impl LighterMarketMaker {
             order_size: 0.001,
             max_exposure: 0.01,
             requote_threshold_bps: 5.0,  // Only requote if price moves > 0.05%
+            tick_size: 0.01,             // WETH-USDC price precision
+            step_size: 0.0001,           // WETH-USDC size precision
             http_client,
             ledger,
             shm_reader,
@@ -157,7 +162,10 @@ impl LighterMarketMaker {
             if should_requote_bid && total_exposure < self.max_exposure {
                 // Cancel existing bid if any
                 if let Some(ref order) = self.active_bid {
-                    let _ = self.http_client.cancel_order(order.order_id).await;
+                    let _ = self
+                        .http_client
+                        .cancel_order(order.order_id.clone())
+                        .await;
                     self.active_bid = None;
                 }
 
@@ -174,10 +182,10 @@ impl LighterMarketMaker {
                     )
                     .await
                 {
-                    Ok(order_id) => {
-                        tracing::info!("📈 Buy order placed: id={} price={:.2}", order_id, our_bid);
+                    Ok(tx_hash) => {
+                        tracing::info!("📈 Buy order placed: tx_hash={} price={:.2}", tx_hash, our_bid);
                         self.active_bid = Some(ActiveOrder {
-                            order_id,
+                            order_id: tx_hash,
                             side: OrderSide::Buy,
                             price: our_bid,
                             size: self.order_size,
@@ -194,7 +202,7 @@ impl LighterMarketMaker {
             if should_requote_ask && total_exposure > -self.max_exposure {
                 // Cancel existing ask if any
                 if let Some(ref order) = self.active_ask {
-                    let _ = self.http_client.cancel_order(order.order_id).await;
+                    let _ = self.http_client.cancel_order(order.order_id.clone()).await;
                     self.active_ask = None;
                 }
 
@@ -211,10 +219,10 @@ impl LighterMarketMaker {
                     )
                     .await
                 {
-                    Ok(order_id) => {
-                        tracing::info!("📉 Sell order placed: id={} price={:.2}", order_id, our_ask);
+                    Ok(tx_hash) => {
+                        tracing::info!("📉 Sell order placed: tx_hash={} price={:.2}", tx_hash, our_ask);
                         self.active_ask = Some(ActiveOrder {
-                            order_id,
+                            order_id: tx_hash,
                             side: OrderSide::Sell,
                             price: our_ask,
                             size: self.order_size,
@@ -263,7 +271,7 @@ impl LighterMarketMaker {
         if let Some(ref order) = self.active_bid {
             if now.duration_since(order.placed_at) > self.order_ttl {
                 tracing::info!("🚫 Canceling stale bid: id={}", order.order_id);
-                let _ = self.http_client.cancel_order(order.order_id).await;
+                let _ = self.http_client.cancel_order(order.order_id.clone()).await;
                 self.active_bid = None;
             }
         }
@@ -272,7 +280,7 @@ impl LighterMarketMaker {
         if let Some(ref order) = self.active_ask {
             if now.duration_since(order.placed_at) > self.order_ttl {
                 tracing::info!("🚫 Canceling stale ask: id={}", order.order_id);
-                let _ = self.http_client.cancel_order(order.order_id).await;
+                let _ = self.http_client.cancel_order(order.order_id.clone()).await;
                 self.active_ask = None;
             }
         }
@@ -282,12 +290,12 @@ impl LighterMarketMaker {
     async fn cancel_all_orders(&mut self) {
         if let Some(ref order) = self.active_bid {
             tracing::info!("🚫 Canceling bid: id={}", order.order_id);
-            let _ = self.http_client.cancel_order(order.order_id).await;
+            let _ = self.http_client.cancel_order(order.order_id.clone()).await;
         }
 
         if let Some(ref order) = self.active_ask {
             tracing::info!("🚫 Canceling ask: id={}", order.order_id);
-            let _ = self.http_client.cancel_order(order.order_id).await;
+            let _ = self.http_client.cancel_order(order.order_id.clone()).await;
         }
 
         self.active_bid = None;

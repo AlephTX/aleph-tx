@@ -2,6 +2,7 @@ pub mod backpack_api;
 pub mod config;
 pub mod edgex_api;
 pub mod error;
+pub mod lighter_ffi;
 pub mod lighter_orders;
 pub mod order_request_buffer;
 pub mod orderbook;

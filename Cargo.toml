@@ -19,7 +19,7 @@ rust_decimal = { version = "1", features = ["serde-float"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 hex = "0.4"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 memmap2 = "0.9"
 starknet-crypto = "0.8.1"
 rand = "0.10.0"
