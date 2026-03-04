@@ -92,10 +92,15 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			return err
 		}
 
+		log.Printf("lighter: received message: %s", string(data[:min(200, len(data))]))
+
 		var env lighterOB
 		if json.Unmarshal(data, &env) != nil {
+			log.Printf("lighter: failed to unmarshal envelope")
 			continue
 		}
+
+		log.Printf("lighter: message type=%s channel=%s", env.Type, env.Channel)
 
 		isSnapshot := env.Type == "subscribed/order_book"
 		isUpdate := env.Type == "update/order_book"
@@ -105,16 +110,19 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 
 		var book lighterBook
 		if json.Unmarshal(env.OrderBook, &book) != nil {
+			log.Printf("lighter: failed to unmarshal order_book")
 			continue
 		}
 
 		mktIdx := l.parseMarketIndex(env.Channel)
 		symID, ok := l.mktMap[mktIdx]
 		if !ok {
+			log.Printf("lighter: market %d not in mktMap", mktIdx)
 			continue
 		}
 
 		if len(book.Bids) == 0 || len(book.Asks) == 0 {
+			log.Printf("lighter: empty bids or asks")
 			continue
 		}
 
@@ -122,6 +130,8 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		bidSz, _ := strconv.ParseFloat(book.Bids[0].Size, 64)
 		askPx, _ := strconv.ParseFloat(book.Asks[0].Price, 64)
 		askSz, _ := strconv.ParseFloat(book.Asks[0].Size, 64)
+
+		log.Printf("lighter: BBO for symbol %d: bid=%.2f@%.4f ask=%.2f@%.4f", symID, bidPx, bidSz, askPx, askSz)
 
 		tsNs := uint64(env.Timestamp) * 1_000_000 // ms → ns
 		if tsNs == 0 {
@@ -142,4 +152,11 @@ func (l *Lighter) parseMarketIndex(channel string) int {
 		}
 	}
 	return -1
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

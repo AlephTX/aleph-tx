@@ -41,16 +41,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 5: Initialize Strategy
     tracing::info!("🎯 Initializing Lighter Market Maker...");
-    let api_key = std::env::var("LIGHTER_API_KEY")
-        .expect("LIGHTER_API_KEY not set");
-    let private_key = std::env::var("LIGHTER_PRIVATE_KEY")
-        .expect("LIGHTER_PRIVATE_KEY not set");
+    let private_key = std::env::var("API_KEY_PRIVATE_KEY")
+        .expect("API_KEY_PRIVATE_KEY not set");
+    let account_index = std::env::var("LIGHTER_ACCOUNT_INDEX")
+        .expect("LIGHTER_ACCOUNT_INDEX not set")
+        .parse::<i64>()
+        .expect("LIGHTER_ACCOUNT_INDEX must be a valid i64");
+    let api_key_index = std::env::var("LIGHTER_API_KEY_INDEX")
+        .expect("LIGHTER_API_KEY_INDEX not set")
+        .parse::<u8>()
+        .expect("LIGHTER_API_KEY_INDEX must be a valid u8");
+
+    // For Lighter: symbol_id=1002 is ETH, market_id=0 is ETH-USDC
+    let symbol_id = 1002u16;  // ETH in shared memory
+    let market_id = 0u16;     // ETH-USDC on Lighter
 
     let mut strategy = LighterMarketMaker::new(
-        0,  // BTC symbol_id
-        0,  // BTC market_id on Lighter
-        api_key,
+        symbol_id,
+        market_id,
         private_key,
+        account_index,
+        api_key_index,
         ledger_state,
         shm_reader,
     )?;
