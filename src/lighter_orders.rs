@@ -44,7 +44,7 @@ impl LighterHttpClient {
         let signer = LighterSigner::new(
             &base_url,
             &private_key,
-            1, // Mainnet chain_id
+            304, // Mainnet chain_id (not 1!)
             api_key_index,
             account_index,
         )
@@ -149,6 +149,9 @@ impl LighterHttpClient {
             current
         };
 
+        // Order expiry: use -1 for default (28 days, handled by SDK)
+        let order_expiry = -1i64;
+
         // Get next client_order_index (simple counter)
         let client_order_index = {
             let mut counter = self.client_order_counter.lock();
@@ -157,8 +160,9 @@ impl LighterHttpClient {
             current
         };
 
-        // Convert price to Lighter format (price * 10^6)
-        let price_int = (order_req.price * 1_000_000.0) as u32;
+        // Convert price to Lighter format (price * 100, in cents)
+        // E.g., $2061.50 -> 206150
+        let price_int = (order_req.price * 100.0) as u32;
 
         // Convert size to base_amount (size * 10^6)
         let base_amount = (order_req.size * 1_000_000.0) as i64;
@@ -176,7 +180,7 @@ impl LighterHttpClient {
                 1, // time_in_force: 1 = GTC
                 false,
                 0,
-                -1, // order_expiry: -1 = never expires
+                order_expiry, // order_expiry: 30 days from now
                 nonce,
             )
             .map_err(|e| TradingError::OrderFailed(format!("Signing failed: {}", e)))?;
@@ -187,11 +191,20 @@ impl LighterHttpClient {
             signed_tx.tx_hash,
             nonce
         );
+        tracing::debug!("   Full tx_info: {}", signed_tx.tx_info);
 
-        // Send via HTTP multipart/form-data
+        // Send via HTTP multipart/form-data (as per Python SDK)
         let form = reqwest::multipart::Form::new()
             .text("tx_type", signed_tx.tx_type.to_string())
             .text("tx_info", signed_tx.tx_info.clone());
+
+        tracing::debug!(
+            "📤 HTTP Request: POST {}/api/v1/sendTx",
+            self.base_url
+        );
+        tracing::debug!("   Content-Type: multipart/form-data");
+        tracing::debug!("   tx_type: {}", signed_tx.tx_type);
+        tracing::debug!("   tx_info (first 200 chars): {}", &signed_tx.tx_info[..std::cmp::min(200, signed_tx.tx_info.len())]);
 
         let response = self
             .client

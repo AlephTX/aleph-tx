@@ -52,6 +52,11 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	log.Printf("📋 Loaded config with %d exchanges", len(cfg.Exchanges))
+	for name, exCfg := range cfg.Exchanges {
+		log.Printf("  - %s: enabled=%v", name, exCfg.Enabled)
+	}
+
 	if hlCfg, ok := cfg.Exchanges["hyperliquid"]; ok && hlCfg.Enabled {
 		wg.Add(1)
 		go func() {

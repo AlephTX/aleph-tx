@@ -8,6 +8,12 @@ help:
 	@echo ""
 	@echo "Build Commands:"
 	@echo "  make build          - Compile all binaries"
+	@echo "  make build-feeder   - Compile Go feeder only"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test-up        - Start test environment (feeder + example)"
+	@echo "  make test-down      - Stop test environment"
+	@echo "  make test-logs      - View test logs"
 	@echo ""
 	@echo "Strategy Management:"
 	@echo "  make up STRATEGY=lighter    - Start Lighter MM"
@@ -31,6 +37,38 @@ build:
 	@echo "🔨 Building AlephTX..."
 	cargo build --release
 	@echo "✅ Build complete"
+
+# Build feeder for testing
+build-feeder:
+	@echo "🔨 Building Go feeder..."
+	cd feeder && go build -o feeder-app
+	@echo "✅ Feeder build complete"
+
+# Start test environment (feeder + example)
+test-up: build-feeder
+	@echo "🧪 Starting test environment..."
+	@mkdir -p logs pids
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events
+	@(cd feeder && ./feeder-app) > logs/feeder-test.log 2>&1 & echo $$! > pids/feeder-test.pid
+	@sleep 2
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-test.pid))"
+	@export $$(cat .env.lighter | xargs) && \
+		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
+		cargo run --example lighter_trading > logs/lighter-test.log 2>&1 & echo $$! > pids/lighter-test.pid
+	@echo "✅ Lighter test started (PID: $$(cat pids/lighter-test.pid))"
+	@echo "📊 Logs: tail -f logs/feeder-test.log logs/lighter-test.log"
+
+# Stop test environment
+test-down:
+	@echo "🛑 Stopping test environment..."
+	@if [ -f pids/feeder-test.pid ]; then kill -9 $$(cat pids/feeder-test.pid) 2>/dev/null || true; rm -f pids/feeder-test.pid; echo "✅ Feeder stopped"; fi
+	@if [ -f pids/lighter-test.pid ]; then kill -9 $$(cat pids/lighter-test.pid) 2>/dev/null || true; rm -f pids/lighter-test.pid; echo "✅ Lighter test stopped"; fi
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events
+	@echo "✅ Shared memory cleaned"
+
+# View test logs
+test-logs:
+	@tail -f logs/feeder-test.log logs/lighter-test.log
 
 # Start feeder (prerequisite for all strategies)
 feeder:
