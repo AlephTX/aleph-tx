@@ -22,33 +22,47 @@ Welcome to AlephTX, a Tier-1 High-Frequency Trading (HFT) framework. You are an 
 - **Backpack**: REST `https://api.backpack.exchange`
 - **EdgeX**: REST `https://pro.edgex.exchange`
 
-## 🚀 3. Autonomous Testing & CI Pipeline
-When implementing a feature, YOU MUST autonomously test it:
+## 🚀 3. Build & Test Workflow (MANDATORY)
 
-### Quick Test Commands (Recommended)
+### CRITICAL RULE: Always Use Makefile
+**ALL build, test, and run operations MUST go through the Makefile.**
+- ❌ NEVER run `cargo build`, `cargo run`, `go build` directly
+- ❌ NEVER create custom shell scripts for building/running
+- ✅ ALWAYS use `make <target>` commands
+
+### Available Make Targets
 ```bash
-make test-up    # Start feeder + example (logs to logs/*.log)
-make test-down  # Stop all processes and clean shared memory
-make test-logs  # View logs in real-time
+# Build
+make build          # Build all binaries (Go feeder + Rust)
+make build-feeder   # Build Go feeder only
+
+# Integration Testing
+make test-up        # Start test environment (feeder + lighter_trading example)
+make test-down      # Stop test environment and clean shared memory
+make test-logs      # View test logs in real-time
+
+# Adaptive Market Maker (Production Strategy)
+make adaptive-up    # Start adaptive MM strategy (feeder + adaptive_mm)
+make adaptive-down  # Stop adaptive MM and clean up
+make adaptive-logs  # View adaptive MM logs
+
+# Strategy Management (Future)
+make up STRATEGY=lighter    # Start Lighter MM
+make down STRATEGY=lighter  # Stop Lighter MM
+make logs STRATEGY=lighter  # View strategy logs
+make status                 # Show all running strategies
+
+# Cleanup
+make clean          # Clean build artifacts
 ```
 
-### Build & Unit Test
-`cargo check --all-targets`
-`cargo clippy --all-targets -- -D warnings`
-`cargo test --lib`
-`cd feeder && go build -v ./...`
-
-### Manual Integration Test Spin-up
-`rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events`
-`cd feeder && go build -o feeder-app && ./feeder-app > /tmp/aleph-feeder.log 2>&1 & echo $! > /tmp/aleph-feeder.pid`
-`sleep 2`
-`cd .. && cargo run --example lighter_trading > /tmp/aleph-rust.log 2>&1 & echo $! > /tmp/aleph-rust.pid`
-
-### Teardown & Cleanup (MANDATORY)
-ALWAYS clean up after your test:
-`kill -9 $(cat /tmp/aleph-feeder.pid) || true`
-`kill -9 $(cat /tmp/aleph-rust.pid) || true`
-`rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events`
+### Testing Workflow
+When implementing a feature, YOU MUST autonomously test it:
+1. `make build` - Build everything
+2. `make test` - Run unit tests
+3. `make test-up` - Start integration test
+4. `make test-logs` - Monitor logs
+5. `make test-down` - Clean up (MANDATORY)
 
 ## ⚠️ 4. Global Hard Constraints
 - **C-ABI Alignment**: `ShmPrivateEvent` MUST be EXACTLY 64 bytes. Verify with `static_assertions::assert_eq_size!`.

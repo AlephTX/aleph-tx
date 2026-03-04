@@ -1,7 +1,7 @@
-use reqwest;
 use serde::{Deserialize, Serialize};
 use std::env;
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct CreateOrderRequest {
     market_index: i16,
@@ -22,6 +22,7 @@ struct CreateOrderRequest {
     signature: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OrderResponse {
     code: i32,
@@ -29,6 +30,7 @@ struct OrderResponse {
     data: Option<OrderData>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OrderData {
     order_id: String,
@@ -37,6 +39,7 @@ struct OrderData {
 
 #[derive(Debug, Deserialize)]
 struct TickerResponse {
+    #[allow(dead_code)]
     code: i32,
     data: Option<TickerData>,
 }
@@ -45,6 +48,7 @@ struct TickerResponse {
 struct TickerData {
     best_bid: String,
     best_ask: String,
+    #[allow(dead_code)]
     last_price: String,
 }
 

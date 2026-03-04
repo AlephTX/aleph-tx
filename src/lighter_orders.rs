@@ -10,16 +10,19 @@ use crate::lighter_ffi::LighterSigner;
 use crate::shadow_ledger::{OrderSide, ShadowLedger};
 use parking_lot::RwLock;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Lighter REST API client with Keep-Alive connection pooling
 pub struct LighterHttpClient {
     client: Client,
     base_url: String,
     signer: LighterSigner,
+    api_key_index: i64,
+    account_index: i64,
     nonce: Arc<parking_lot::Mutex<i64>>,
+    nonce_initialized: Arc<parking_lot::Mutex<bool>>,
     client_order_counter: Arc<parking_lot::Mutex<i64>>,
 }
 
@@ -54,9 +57,80 @@ impl LighterHttpClient {
             client,
             base_url,
             signer,
-            nonce: Arc::new(parking_lot::Mutex::new(1)), // Start from 1
-            client_order_counter: Arc::new(parking_lot::Mutex::new(1)), // Start from 1
+            api_key_index,
+            account_index,
+            nonce: Arc::new(parking_lot::Mutex::new(0)),
+            nonce_initialized: Arc::new(parking_lot::Mutex::new(false)),
+            client_order_counter: Arc::new(parking_lot::Mutex::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+            )),
         })
+    }
+
+    /// Query the next valid nonce from the server (only called once at startup or on error)
+    async fn get_next_nonce(&self) -> Result<i64> {
+        let url = format!(
+            "{}/api/v1/nextNonce?account_index={}&api_key_index={}",
+            self.base_url, self.account_index, self.api_key_index
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(TradingError::OrderFailed(format!(
+                "Failed to get nonce: HTTP {}",
+                response.status()
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NonceResponse {
+            nonce: i64,
+        }
+
+        let nonce_resp: NonceResponse = response.json().await?;
+        tracing::debug!("📡 Fetched nonce from server: {}", nonce_resp.nonce);
+        Ok(nonce_resp.nonce)
+    }
+
+    /// Get next nonce (lazy initialization + local increment)
+    async fn next_nonce(&self) -> Result<i64> {
+        // Check if nonce is initialized
+        let initialized = *self.nonce_initialized.lock();
+
+        if !initialized {
+            // First time: fetch from server
+            let server_nonce = self.get_next_nonce().await?;
+            let mut nonce = self.nonce.lock();
+            *nonce = server_nonce;
+            drop(nonce);
+
+            let mut init = self.nonce_initialized.lock();
+            *init = true;
+            drop(init);
+
+            tracing::info!("✅ Nonce initialized from server: {}", server_nonce);
+            return Ok(server_nonce);
+        }
+
+        // Subsequent calls: increment locally
+        let mut nonce = self.nonce.lock();
+        *nonce += 1;
+        let current = *nonce;
+        Ok(current)
+    }
+
+    /// Reset nonce (called when we get "invalid nonce" error)
+    async fn reset_nonce(&self) -> Result<()> {
+        tracing::warn!("🔄 Resetting nonce due to error...");
+        let server_nonce = self.get_next_nonce().await?;
+        let mut nonce = self.nonce.lock();
+        *nonce = server_nonce;
+        tracing::info!("✅ Nonce reset to: {}", server_nonce);
+        Ok(())
     }
 
     /// Place a limit order with optimistic accounting and retry logic
@@ -141,13 +215,8 @@ impl LighterHttpClient {
 
     /// Internal method to send order HTTP request
     async fn send_order(&self, order_req: &CreateOrderRequest) -> Result<String> {
-        // Get next nonce
-        let nonce = {
-            let mut n = self.nonce.lock();
-            let current = *n;
-            *n += 1;
-            current
-        };
+        // Get next nonce (lazy init + local increment)
+        let nonce = self.next_nonce().await?;
 
         // Order expiry: use -1 for default (28 days, handled by SDK)
         let order_expiry = -1i64;
@@ -219,6 +288,14 @@ impl LighterHttpClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
+
+            // Check if it's an invalid nonce error
+            if error_body.contains("invalid nonce") || error_body.contains("21104") {
+                tracing::warn!("⚠️  Invalid nonce detected, will reset on next request");
+                // Reset nonce for next time
+                let _ = self.reset_nonce().await;
+            }
+
             return Err(TradingError::OrderFailed(format!(
                 "HTTP {}: {}",
                 status, error_body
@@ -231,10 +308,184 @@ impl LighterHttpClient {
         Ok(signed_tx.tx_hash)
     }
 
+    /// Place a market order to close position (emergency exit)
+    pub async fn place_market_order(
+        &self,
+        market_id: u16,
+        side: OrderSide,
+        size: f64,
+    ) -> Result<String> {
+        // Get next nonce (lazy init + local increment)
+        let nonce = self.next_nonce().await?;
+
+        // Order expiry: use -1 for default
+        let order_expiry = -1i64;
+
+        // Get next client_order_index
+        let client_order_index = {
+            let mut counter = self.client_order_counter.lock();
+            let current = *counter;
+            *counter += 1;
+            current
+        };
+
+        // For market orders, use price=0 (will be filled at best available price)
+        let price_int = 0u32;
+
+        // Convert size to base_amount
+        let base_amount = (size * 1_000_000.0) as i64;
+
+        // Sign transaction via FFI
+        let signed_tx = self
+            .signer
+            .sign_create_order(
+                market_id as u8,
+                client_order_index,
+                base_amount,
+                price_int,
+                side == OrderSide::Sell,
+                2, // order_type: 2 = IOC (Immediate or Cancel, acts like market)
+                0, // time_in_force: 0 = IOC
+                false,
+                0,
+                order_expiry,
+                nonce,
+            )
+            .map_err(|e| TradingError::OrderFailed(format!("Market order signing failed: {}", e)))?;
+
+        tracing::info!(
+            "📝 Signed market order: tx_type={} tx_hash={} side={} size={} nonce={}",
+            signed_tx.tx_type,
+            signed_tx.tx_hash,
+            side,
+            size,
+            nonce
+        );
+
+        // Send via HTTP
+        let form = reqwest::multipart::Form::new()
+            .text("tx_type", signed_tx.tx_type.to_string())
+            .text("tx_info", signed_tx.tx_info.clone());
+
+        let response = self
+            .client
+            .post(format!("{}/api/v1/sendTx", self.base_url))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read error body".to_string());
+            return Err(TradingError::OrderFailed(format!(
+                "Market order HTTP {}: {}",
+                status, error_body
+            )));
+        }
+
+        let resp_text = response.text().await?;
+        tracing::info!("✅ Market order response: {}", resp_text);
+
+        Ok(signed_tx.tx_hash)
+    }
+
     /// Cancel an order
-    pub async fn cancel_order(&self, _order_id: String) -> Result<()> {
-        // TODO: Implement cancel via FFI + HTTP
-        tracing::warn!("Cancel order not yet implemented");
+    pub async fn cancel_order(&self, market_index: u8, order_index: i64) -> Result<()> {
+        // Get next nonce (lazy init + local increment)
+        let nonce = self.next_nonce().await?;
+
+        // Sign cancel order transaction via FFI
+        let signed_tx = self
+            .signer
+            .sign_cancel_order(market_index, order_index, nonce)
+            .map_err(|e| TradingError::OrderFailed(format!("Cancel signing failed: {}", e)))?;
+
+        tracing::info!(
+            "📝 Signed cancel: tx_type={} tx_hash={} order_index={} nonce={}",
+            signed_tx.tx_type,
+            signed_tx.tx_hash,
+            order_index,
+            nonce
+        );
+
+        // Send via HTTP
+        let form = reqwest::multipart::Form::new()
+            .text("tx_type", signed_tx.tx_type.to_string())
+            .text("tx_info", signed_tx.tx_info);
+
+        let response = self
+            .client
+            .post(format!("{}/api/v1/sendTx", self.base_url))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unable to read error body".to_string());
+            return Err(TradingError::OrderFailed(format!(
+                "Cancel failed HTTP {}: {}",
+                status, error_body
+            )));
+        }
+
+        let resp_text = response.text().await?;
+        tracing::info!("✅ Order cancelled: order_index={} response={}", order_index, resp_text);
+
+        Ok(())
+    }
+
+    /// Cancel all open orders for this account
+    pub async fn cancel_all_open_orders(&self, market_id: u8) -> Result<()> {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct OrderResponse {
+            #[serde(rename = "orderIndex")]
+            order_index: String,
+        }
+
+        #[derive(Deserialize)]
+        struct ApiResponse {
+            data: Vec<OrderResponse>,
+        }
+
+        // Query all open orders
+        let url = format!(
+            "{}/api/v1/accounts/{}/orders?status=open",
+            self.base_url, self.account_index
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(TradingError::OrderFailed(
+                "Failed to fetch open orders".to_string()
+            ));
+        }
+
+        let api_response: ApiResponse = response.json().await?;
+
+        tracing::info!("📋 Found {} open orders to cancel", api_response.data.len());
+
+        // Cancel each order
+        for order in api_response.data {
+            if let Ok(order_index) = order.order_index.parse::<i64>() {
+                match self.cancel_order(market_id, order_index).await {
+                    Ok(_) => tracing::info!("✅ Cancelled order {}", order_index),
+                    Err(e) => tracing::warn!("⚠️ Failed to cancel order {}: {:?}", order_index, e),
+                }
+                // Small delay to avoid rate limiting
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
         Ok(())
     }
 }

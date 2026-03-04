@@ -50,6 +50,14 @@ func main() {
 	defer eventBuffer.Close()
 	log.Printf("📡 Event ring buffer: /dev/shm/aleph-events (~64 KB)")
 
+	// Create account stats shared memory (~128 bytes)
+	accountStats, err := shm.NewAccountStatsWriter("aleph-account-stats")
+	if err != nil {
+		log.Fatalf("account stats: %v", err)
+	}
+	defer accountStats.Close()
+	log.Printf("📡 Account stats: /dev/shm/aleph-account-stats (~128 bytes)")
+
 	var wg sync.WaitGroup
 
 	log.Printf("📋 Loaded config with %d exchanges", len(cfg.Exchanges))
@@ -70,13 +78,44 @@ func main() {
 	}
 
 	if ltCfg, ok := cfg.Exchanges["lighter"]; ok && ltCfg.Enabled {
+		// Start public orderbook stream
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			lt := exchanges.NewLighter(ltCfg, matrix, eventBuffer)
-			log.Println("🔌 Lighter: starting...")
+			log.Println("🔌 Lighter (public): starting...")
 			if err := lt.Run(ctx); err != nil && err != context.Canceled {
-				log.Printf("Lighter: %v", err)
+				log.Printf("Lighter (public): %v", err)
+			}
+		}()
+
+		// Start private event stream
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer)
+			if err != nil {
+				log.Printf("Lighter (private): failed to initialize: %v", err)
+				return
+			}
+			log.Println("🔌 Lighter (private): starting...")
+			if err := ltPrivate.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Lighter (private): %v", err)
+			}
+		}()
+
+		// Start account stats stream
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ltStats, err := exchanges.NewLighterAccountStats(ltCfg, accountStats)
+			if err != nil {
+				log.Printf("Lighter (account-stats): failed to initialize: %v", err)
+				return
+			}
+			log.Println("🔌 Lighter (account-stats): starting...")
+			if err := ltStats.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Lighter (account-stats): %v", err)
 			}
 		}()
 	}
