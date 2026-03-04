@@ -48,8 +48,8 @@ build-feeder:
 test-up: build-feeder
 	@echo "🧪 Starting test environment..."
 	@mkdir -p logs pids
-	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events
-	@(cd feeder && ./feeder-app) > logs/feeder-test.log 2>&1 & echo $$! > pids/feeder-test.pid
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-test.log 2>&1 & echo $$! > pids/feeder-test.pid
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-test.pid))"
 	@export $$(cat .env.lighter | xargs) && \
@@ -63,12 +63,49 @@ test-down:
 	@echo "🛑 Stopping test environment..."
 	@if [ -f pids/feeder-test.pid ]; then kill -9 $$(cat pids/feeder-test.pid) 2>/dev/null || true; rm -f pids/feeder-test.pid; echo "✅ Feeder stopped"; fi
 	@if [ -f pids/lighter-test.pid ]; then kill -9 $$(cat pids/lighter-test.pid) 2>/dev/null || true; rm -f pids/lighter-test.pid; echo "✅ Lighter test stopped"; fi
-	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
 	@echo "✅ Shared memory cleaned"
 
 # View test logs
 test-logs:
 	@tail -f logs/feeder-test.log logs/lighter-test.log
+
+# Start adaptive market maker (production strategy)
+adaptive-up: build-feeder
+	@echo "🧪 Starting adaptive market maker..."
+	@mkdir -p logs pids
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-adaptive.log 2>&1 & echo $$! > pids/feeder-adaptive.pid
+	@sleep 5
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-adaptive.pid))"
+	@export $$(cat .env.lighter | xargs) && \
+		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
+		cargo run --example adaptive_mm > logs/adaptive-mm.log 2>&1 & echo $$! > pids/adaptive-mm.pid
+	@echo "✅ Adaptive MM started (PID: $$(cat pids/adaptive-mm.pid))"
+	@echo "📊 Logs: tail -f logs/feeder-adaptive.log logs/adaptive-mm.log"
+
+# Stop adaptive market maker
+adaptive-down:
+	@echo "🛑 Stopping adaptive market maker..."
+	@if [ -f pids/adaptive-mm.pid ]; then \
+		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
+		kill -2 $$(cat pids/adaptive-mm.pid) 2>/dev/null || true; \
+		echo "⏳ Waiting for graceful shutdown (10s)..."; \
+		sleep 10; \
+		if ps -p $$(cat pids/adaptive-mm.pid) > /dev/null 2>&1; then \
+			echo "⚠️  Process still running, forcing shutdown..."; \
+			kill -9 $$(cat pids/adaptive-mm.pid) 2>/dev/null || true; \
+		fi; \
+		rm -f pids/adaptive-mm.pid; \
+		echo "✅ Adaptive MM stopped"; \
+	fi
+	@if [ -f pids/feeder-adaptive.pid ]; then kill -9 $$(cat pids/feeder-adaptive.pid) 2>/dev/null || true; rm -f pids/feeder-adaptive.pid; echo "✅ Feeder stopped"; fi
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@echo "✅ Shared memory cleaned"
+
+# View adaptive MM logs
+adaptive-logs:
+	@tail -f logs/feeder-adaptive.log logs/adaptive-mm.log
 
 # Start feeder (prerequisite for all strategies)
 feeder:

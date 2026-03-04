@@ -107,6 +107,7 @@ impl OrderRequestWriter {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(path)?;
 
         let total_size = HEADER_SIZE + (RING_BUFFER_SLOTS as usize * REQUEST_SIZE);

@@ -1,6 +1,5 @@
 /// Performance monitoring tool for AlephTX
 /// Tracks latency, throughput, and strategy performance metrics
-
 use aleph_tx::backpack_api::client::BackpackClient;
 use aleph_tx::edgex_api::client::EdgeXClient;
 use std::time::{Duration, Instant};
@@ -169,7 +168,7 @@ async fn main() {
         }
 
         // Print report every minute
-        if start_time.elapsed().as_secs() % 60 == 0 {
+        if start_time.elapsed().as_secs().is_multiple_of(60) {
             metrics.print_report();
         }
 

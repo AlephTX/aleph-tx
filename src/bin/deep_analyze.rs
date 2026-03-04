@@ -98,7 +98,7 @@ async fn deep_analyze_backpack() {
         }
     }
 
-    all_fills.sort_by_key(|f| parse_bp_ts(f));
+    all_fills.sort_by_key(parse_bp_ts);
     println!("  Total fills (24h): {}\n", all_fills.len());
 
     // Track round-trips

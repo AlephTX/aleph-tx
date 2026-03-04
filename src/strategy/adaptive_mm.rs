@@ -200,10 +200,29 @@ impl AdaptiveMarketMaker {
             warn!("⚠️ Failed to cancel existing orders: {:?}", e);
         }
 
-        // Step 2: Initialize session balance from first stats read
-        let initial_stats = self.account_stats_reader.read();
-        self.account_stats = initial_stats.into();
-        self.session_start_balance = self.account_stats.available_balance;
+        // Step 2: Wait for account stats to be available (with timeout)
+        info!("⏳ Waiting for account stats from feeder...");
+        let mut retries = 0;
+        let max_retries = 10;
+        loop {
+            let stats = self.account_stats_reader.read();
+            if stats.collateral > 0.0 || stats.available_balance > 0.0 {
+                self.account_stats = stats.into();
+                self.session_start_balance = self.account_stats.available_balance;
+                info!("✅ Account stats loaded: ${:.2} available", self.account_stats.available_balance);
+                break;
+            }
+
+            retries += 1;
+            if retries >= max_retries {
+                error!("❌ Timeout waiting for account stats after {}s", max_retries);
+                return Err(crate::error::TradingError::OrderFailed(
+                    "Account stats not available from feeder".to_string()
+                ).into());
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
 
         // Step 3: Check for existing positions and close them
         info!("🔍 Checking for existing positions...");

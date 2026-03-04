@@ -108,6 +108,13 @@ pub struct SignedTransaction {
 
 impl SignedTxResponse {
     /// Convert C response to safe Rust struct
+    ///
+    /// # Safety
+    /// This function is unsafe because it dereferences raw pointers from C FFI.
+    /// The caller must ensure that:
+    /// - The `err` pointer (if not null) points to a valid null-terminated C string
+    /// - The `tx_info` and `tx_hash` strings are valid UTF-8
+    /// - The response was properly initialized by the C library
     pub unsafe fn to_rust(self) -> Result<SignedTransaction, String> {
         // Check for error first
         if !self.err.is_null() {
@@ -193,6 +200,7 @@ impl LighterSigner {
     }
 
     /// Sign a create order transaction
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_create_order(
         &self,
         market_index: u8,

@@ -116,7 +116,12 @@ fn main() -> anyhow::Result<()> {
         }
 
         // === GRACEFUL SHUTDOWN: Cancel all orders ===
-        tracing::info!("♻️ Cancelling all orders on both exchanges...");
+        tracing::info!("♻️ Cancelling all orders on all exchanges...");
+
+        // Cancel orders via strategy shutdown hooks
+        for strategy in strategies.iter_mut() {
+            strategy.on_shutdown().await;
+        }
 
         // Cancel Backpack orders
         let bp_env =
@@ -134,16 +139,16 @@ fn main() -> anyhow::Result<()> {
                 bp_secret = rest.trim().to_string();
             }
         }
-        if !bp_key.is_empty() {
-            if let Ok(client) = aleph_tx::backpack_api::client::BackpackClient::new(
+        if !bp_key.is_empty()
+            && let Ok(client) = aleph_tx::backpack_api::client::BackpackClient::new(
                 &bp_key,
                 &bp_secret,
                 "https://api.backpack.exchange",
-            ) {
-                match client.cancel_all_orders("ETH_USDC_PERP").await {
-                    Ok(_) => tracing::info!("✅ Cancelled all Backpack orders"),
-                    Err(e) => tracing::warn!("⚠️ Backpack cancel failed: {:?}", e),
-                }
+            )
+        {
+            match client.cancel_all_orders("ETH_USDC_PERP").await {
+                Ok(_) => tracing::info!("✅ Cancelled all Backpack orders"),
+                Err(e) => tracing::warn!("⚠️ Backpack cancel failed: {:?}", e),
             }
         }
 
@@ -163,17 +168,17 @@ fn main() -> anyhow::Result<()> {
                 ex_key = rest.trim().to_string();
             }
         }
-        if ex_account > 0 {
-            if let Ok(client) = aleph_tx::edgex_api::client::EdgeXClient::new(&ex_key, None) {
-                use aleph_tx::edgex_api::model::CancelAllOrderRequest;
-                let req = CancelAllOrderRequest {
-                    account_id: ex_account,
-                    filter_contract_id_list: vec![10000002],
-                };
-                match client.cancel_all_orders(&req).await {
-                    Ok(_) => tracing::info!("✅ Cancelled all EdgeX orders"),
-                    Err(e) => tracing::warn!("⚠️ EdgeX cancel failed: {:?}", e),
-                }
+        if ex_account > 0
+            && let Ok(client) = aleph_tx::edgex_api::client::EdgeXClient::new(&ex_key, None)
+        {
+            use aleph_tx::edgex_api::model::CancelAllOrderRequest;
+            let req = CancelAllOrderRequest {
+                account_id: ex_account,
+                filter_contract_id_list: vec![10000002],
+            };
+            match client.cancel_all_orders(&req).await {
+                Ok(_) => tracing::info!("✅ Cancelled all EdgeX orders"),
+                Err(e) => tracing::warn!("⚠️ EdgeX cancel failed: {:?}", e),
             }
         }
 
