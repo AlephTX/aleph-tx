@@ -9,7 +9,7 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;
-use crate::lighter_trading::{LighterTrading, OrderParams, OrderType, Side};
+use crate::lighter_trading::{BatchOrderParams, LighterTrading, Side};
 use crate::shadow_ledger::ShadowLedger;
 use crate::shm_reader::ShmReader;
 use parking_lot::RwLock;
@@ -456,100 +456,94 @@ impl AdaptiveMarketMaker {
             let our_ask = (our_ask / self.tick_size).ceil() * self.tick_size;
 
             debug!(
-                "📊 Mid={:.2} Spread={}bps Size={:.4} Exposure={:.4} Leverage={:.2}x",
+                "Mid={:.2} Spread={}bps Size={:.4} Pos={:.4} Lev={:.2}x",
                 mid, spread_bps, order_size, total_exposure, leverage
             );
 
-            // Step 6: Update quotes if needed (cancel stale orders inline)
+            // Step 6: Determine which sides to quote
             let should_requote_bid = self.should_requote(&self.active_bid, our_bid);
             let should_requote_ask = self.should_requote(&self.active_ask, our_ask);
 
-            // Place buy order - always place unless at max long position or leverage too high
-            if should_requote_bid {
-                // Check if we can add more long exposure (90% threshold)
-                let can_buy = total_exposure < self.max_position * 0.9 && !leverage_too_high;
+            let can_buy = total_exposure < self.max_position * 0.9 && !leverage_too_high;
+            let would_close_long = total_exposure > 0.0;
+            let can_sell = total_exposure > -self.max_position * 0.9
+                && (!leverage_too_high || would_close_long);
 
-                if !can_buy {
-                    if leverage_too_high {
-                        debug!("⏸️  Skipping buy order: leverage {:.2}x too high", leverage);
-                    } else {
-                        debug!("⏸️  Skipping buy order: position {:.4} >= 90% of max {:.4}",
-                               total_exposure, self.max_position);
-                    }
-                } else {
-                    if let Some(ref order) = self.active_bid {
-                        if let Ok(order_index) = order.order_id.parse::<i64>() {
-                            let _ = self.trading.cancel_order(order_index).await;
-                        }
-                        self.active_bid = None;
-                    }
+            let place_bid = should_requote_bid && can_buy;
+            let place_ask = should_requote_ask && can_sell;
 
-                    match self.trading.place_order(OrderParams {
-                        size: order_size,
-                        price: our_bid,
-                        side: Side::Buy,
-                        order_type: OrderType::Limit,
-                        reduce_only: false,
-                    }).await {
-                        Ok(result) => {
-                            info!("Buy: ${:.2} x {:.4} ETH", our_bid, order_size);
-                            self.active_bid = Some(ActiveOrder {
-                                order_id: result.tx_hash,
-                                side: Side::Buy,
-                                price: our_bid,
-                                size: order_size,
-                                placed_at: Instant::now(),
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Buy order failed: {}", e);
-                        }
+            // Step 7: Cancel stale orders before placing new ones
+            if place_bid {
+                if let Some(ref order) = self.active_bid {
+                    if let Ok(idx) = order.order_id.parse::<i64>() {
+                        let _ = self.trading.cancel_order(idx).await;
                     }
+                    self.active_bid = None;
+                }
+            }
+            if place_ask {
+                if let Some(ref order) = self.active_ask {
+                    if let Ok(idx) = order.order_id.parse::<i64>() {
+                        let _ = self.trading.cancel_order(idx).await;
+                    }
+                    self.active_ask = None;
                 }
             }
 
-            // Place sell order
-            if should_requote_ask {
-                let would_close_long = total_exposure > 0.0;
-                let can_sell = total_exposure > -self.max_position * 0.9
-                    && (!leverage_too_high || would_close_long);
-
-                if !can_sell {
-                    if leverage_too_high && !would_close_long {
-                        debug!("Skipping sell: leverage {:.2}x too high, no long to close", leverage);
-                    } else {
-                        debug!("Skipping sell: position {:.4} <= -90% of max {:.4}",
-                               total_exposure, self.max_position);
+            // Step 8: Place orders — use sendTxBatch when both sides, sendTx for single side
+            if place_bid && place_ask {
+                // Batch: one buy + one sell in a single API call (Premium: 0ms maker latency)
+                match self.trading.place_batch(BatchOrderParams {
+                    bid_price: our_bid,
+                    ask_price: our_ask,
+                    size: order_size,
+                }).await {
+                    Ok(result) => {
+                        info!("Batch: Bid ${:.2} / Ask ${:.2} x {:.4}", our_bid, our_ask, order_size);
+                        self.active_bid = Some(ActiveOrder {
+                            order_id: result.bid_client_order_index.to_string(),
+                            side: Side::Buy,
+                            price: our_bid,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
+                        self.active_ask = Some(ActiveOrder {
+                            order_id: result.ask_client_order_index.to_string(),
+                            side: Side::Sell,
+                            price: our_ask,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
                     }
-                } else {
-                    if let Some(ref order) = self.active_ask {
-                        if let Ok(order_index) = order.order_id.parse::<i64>() {
-                            let _ = self.trading.cancel_order(order_index).await;
-                        }
-                        self.active_ask = None;
+                    Err(e) => warn!("Batch order failed: {}", e),
+                }
+            } else if place_bid {
+                match self.trading.buy(order_size, our_bid).await {
+                    Ok(result) => {
+                        info!("Buy: ${:.2} x {:.4}", our_bid, order_size);
+                        self.active_bid = Some(ActiveOrder {
+                            order_id: result.tx_hash,
+                            side: Side::Buy,
+                            price: our_bid,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
                     }
-
-                    match self.trading.place_order(OrderParams {
-                        size: order_size,
-                        price: our_ask,
-                        side: Side::Sell,
-                        order_type: OrderType::Limit,
-                        reduce_only: false,
-                    }).await {
-                        Ok(result) => {
-                            info!("Sell: ${:.2} x {:.4} ETH", our_ask, order_size);
-                            self.active_ask = Some(ActiveOrder {
-                                order_id: result.tx_hash,
-                                side: Side::Sell,
-                                price: our_ask,
-                                size: order_size,
-                                placed_at: Instant::now(),
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Sell order failed: {}", e);
-                        }
+                    Err(e) => warn!("Buy failed: {}", e),
+                }
+            } else if place_ask {
+                match self.trading.sell(order_size, our_ask).await {
+                    Ok(result) => {
+                        info!("Sell: ${:.2} x {:.4}", our_ask, order_size);
+                        self.active_ask = Some(ActiveOrder {
+                            order_id: result.tx_hash,
+                            side: Side::Sell,
+                            price: our_ask,
+                            size: order_size,
+                            placed_at: Instant::now(),
+                        });
                     }
+                    Err(e) => warn!("Sell failed: {}", e),
                 }
             }
 
@@ -559,7 +553,10 @@ impl AdaptiveMarketMaker {
                 self.last_balance_check = Instant::now();
             }
 
-            tokio::time::sleep(Duration::from_millis(200)).await;  // 200ms = 5次/秒，高频
+            // Premium account: 6000 req/min = 100 req/s
+            // Batch quote = 1 req, cancel = 1 req each → ~3 req/cycle max
+            // 100ms interval = 10 cycles/s = ~30 req/s (well within limits)
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
