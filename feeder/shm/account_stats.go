@@ -20,7 +20,8 @@ type ShmAccountStats struct {
 	MarginUsage      float64 // 40..48 - Margin usage ratio (0-1)
 	BuyingPower      float64 // 48..56 - Buying power
 	UpdatedAt        uint64  // 56..64 - Unix timestamp in nanoseconds
-	_Reserved        [64]byte // 64..128 - Reserved for future use
+	Position         float64 // 64..72 - Net position (positive=long, negative=short)
+	_Reserved        [56]byte // 72..128 - Reserved for future use
 }
 
 const AccountStatsSize = 128
@@ -68,6 +69,14 @@ func (w *AccountStatsWriter) WriteStats(
 	collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower float64,
 	timestampNs uint64,
 ) {
+	w.WriteStatsWithPosition(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, 0.0, timestampNs)
+}
+
+// WriteStatsWithPosition writes account statistics including position to shared memory.
+func (w *AccountStatsWriter) WriteStatsWithPosition(
+	collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, position float64,
+	timestampNs uint64,
+) {
 	// Increment version first (acts as a write lock indicator)
 	version := atomic.LoadUint64(&w.stats.Version)
 	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
@@ -79,6 +88,7 @@ func (w *AccountStatsWriter) WriteStats(
 	w.stats.AvailableBalance = availableBalance
 	w.stats.MarginUsage = marginUsage
 	w.stats.BuyingPower = buyingPower
+	w.stats.Position = position
 	w.stats.UpdatedAt = timestampNs
 
 	// Increment version again to signal write complete

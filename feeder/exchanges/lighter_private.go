@@ -18,12 +18,14 @@ type LighterPrivate struct {
 	eventBuffer *shm.EventRingBuffer
 	auth        *LighterAuth
 	mktMap      map[int]uint16 // market_index -> symbol_id
+	accountStats *LighterAccountStats // For updating position
 }
 
 // NewLighterPrivate creates a new Lighter private stream client
 func NewLighterPrivate(
 	cfg config.ExchangeConfig,
 	eventBuffer *shm.EventRingBuffer,
+	accountStats *LighterAccountStats,
 ) (*LighterPrivate, error) {
 	// Load authentication from .env.lighter
 	auth, err := LoadLighterAuthFromEnv()
@@ -44,6 +46,7 @@ func NewLighterPrivate(
 		eventBuffer: eventBuffer,
 		auth:        auth,
 		mktMap:      mktMap,
+		accountStats: accountStats,
 	}, nil
 }
 
@@ -145,6 +148,12 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 				continue
 			}
 
+			// Log position data if present
+			if len(env.Position) > 0 && string(env.Position) != "null" {
+				log.Printf("lighter-private: position data: %s", string(env.Position))
+				lp.processPosition(env.Position)
+			}
+
 			// Process orders
 			for _, order := range env.Orders {
 				lp.processOrder(&order)
@@ -156,6 +165,27 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 			}
 		}
 		// websocket library handles ping/pong automatically
+	}
+}
+
+func (lp *LighterPrivate) processPosition(positionData json.RawMessage) {
+	var pos struct {
+		Sign     int    `json:"sign"`     // 1=long, -1=short
+		Position string `json:"position"` // Position size
+	}
+	if err := json.Unmarshal(positionData, &pos); err != nil {
+		log.Printf("lighter-private: failed to parse position: %v", err)
+		return
+	}
+
+	posSize, _ := strconv.ParseFloat(pos.Position, 64)
+	netPosition := float64(pos.Sign) * posSize
+
+	log.Printf("lighter-private: position updated: %.4f ETH", netPosition)
+
+	// Update account stats with new position
+	if lp.accountStats != nil {
+		lp.accountStats.SetPosition(netPosition)
 	}
 }
 

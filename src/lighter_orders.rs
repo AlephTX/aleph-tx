@@ -314,6 +314,7 @@ impl LighterHttpClient {
         market_id: u16,
         side: OrderSide,
         size: f64,
+        current_price: f64, // Use current market price for IOC orders
     ) -> Result<String> {
         // Get next nonce (lazy init + local increment)
         let nonce = self.next_nonce().await?;
@@ -329,8 +330,13 @@ impl LighterHttpClient {
             current
         };
 
-        // For market orders, use price=0 (will be filled at best available price)
-        let price_int = 0u32;
+        // For market orders, use current price with slippage tolerance
+        // Buy: use ask + 1% slippage, Sell: use bid - 1% slippage
+        let slippage_price = match side {
+            OrderSide::Buy => current_price * 1.01,  // Pay up to 1% more
+            OrderSide::Sell => current_price * 0.99, // Accept 1% less
+        };
+        let price_int = (slippage_price * 100.0) as u32;
 
         // Convert size to base_amount
         let base_amount = (size * 1_000_000.0) as i64;
