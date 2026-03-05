@@ -174,7 +174,7 @@ impl AdaptiveMarketMaker {
             max_spread_bps: 15,            // 0.15% maximum
             volatility_multiplier: 1.5,    // Moderate spread adjustment
             base_order_size: 0.001,        // 0.001 ETH base size (~$2, small orders)
-            max_position: 0.03,            // Max 0.03 ETH position (tight control)
+            max_position: 0.1,             // Max 0.1 ETH position (~$213 @ $2130)
             inventory_skew_factor: 0.05,   // 5% skew adjustment (minimal)
             max_leverage: 10.0,            // Max 10x leverage
             min_available_balance: 2.0,    // Keep $2 available
@@ -240,22 +240,32 @@ impl AdaptiveMarketMaker {
             );
 
             // Read current market price
-            let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
-            let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+            let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
+            let lighter_bbo = exchanges
+                .iter()
+                .find(|(exch_id, _)| *exch_id == 2)
+                .map(|(_, msg)| msg);
 
-            let close_side = if existing_position > 0.0 {
-                OrderSide::Sell
+            if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
+                warn!("⚠️ No valid BBO data, skipping position close");
             } else {
-                OrderSide::Buy
-            };
-            match self.http_client.place_market_order(
-                self.market_id,
-                close_side,
-                existing_position.abs(),
-                mid_price
-            ).await {
-                Ok(_) => info!("✅ Existing position closed successfully"),
-                Err(e) => warn!("⚠️ Failed to close existing position: {:?}", e),
+                let bbo = lighter_bbo.unwrap();
+                let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+
+                let close_side = if existing_position > 0.0 {
+                    OrderSide::Sell
+                } else {
+                    OrderSide::Buy
+                };
+                match self.http_client.place_market_order(
+                    self.market_id,
+                    close_side,
+                    existing_position.abs(),
+                    mid_price
+                ).await {
+                    Ok(_) => info!("✅ Existing position closed successfully"),
+                    Err(e) => warn!("⚠️ Failed to close existing position: {:?}", e),
+                }
             }
             // Wait for position to close
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -331,17 +341,27 @@ impl AdaptiveMarketMaker {
                     warn!("⚠️  Closing position with market order: {:.4} ETH", net_pos);
 
                     // Read current market price
-                    let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
-                    let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+                    let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
+                    let lighter_bbo = exchanges
+                        .iter()
+                        .find(|(exch_id, _)| *exch_id == 2)
+                        .map(|(_, msg)| msg);
 
-                    let close_side = if net_pos > 0.0 {
-                        OrderSide::Sell
+                    if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
+                        warn!("⚠️ No valid BBO data, cannot close position");
                     } else {
-                        OrderSide::Buy
-                    };
-                    match self.http_client.place_market_order(self.market_id, close_side, net_pos.abs(), mid_price).await {
-                        Ok(_) => info!("✅ Position closed successfully"),
-                        Err(e) => error!("❌ Failed to close position: {:?}", e),
+                        let bbo = lighter_bbo.unwrap();
+                        let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+
+                        let close_side = if net_pos > 0.0 {
+                            OrderSide::Sell
+                        } else {
+                            OrderSide::Buy
+                        };
+                        match self.http_client.place_market_order(self.market_id, close_side, net_pos.abs(), mid_price).await {
+                            Ok(_) => info!("✅ Position closed successfully"),
+                            Err(e) => error!("❌ Failed to close position: {:?}", e),
+                        }
                     }
                 } else {
                     info!("✅ No position to close");
@@ -418,7 +438,24 @@ impl AdaptiveMarketMaker {
                 self.cancel_all_orders().await;
 
                 // Read current market price
-                let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
+                let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
+                let lighter_bbo = exchanges
+                    .iter()
+                    .find(|(exch_id, _)| *exch_id == 2)
+                    .map(|(_, msg)| msg);
+
+                if lighter_bbo.is_none() {
+                    warn!("⚠️  No Lighter BBO data available, skipping close");
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+
+                let bbo = lighter_bbo.unwrap();
+                if bbo.bid_price <= 0.0 || bbo.ask_price <= 0.0 {
+                    warn!("⚠️  Invalid BBO prices: bid={:.2} ask={:.2}, skipping close", bbo.bid_price, bbo.ask_price);
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
                 let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
 
                 // Calculate excess position to close

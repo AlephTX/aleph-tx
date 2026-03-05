@@ -330,11 +330,11 @@ impl LighterHttpClient {
             current
         };
 
-        // For market orders, use current price with slippage tolerance
-        // Buy: use ask + 1% slippage, Sell: use bid - 1% slippage
+        // For market orders, use current price with aggressive slippage tolerance
+        // Buy: use ask + 5% slippage, Sell: use bid - 5% slippage (more aggressive for closing)
         let slippage_price = match side {
-            OrderSide::Buy => current_price * 1.01,  // Pay up to 1% more
-            OrderSide::Sell => current_price * 0.99, // Accept 1% less
+            OrderSide::Buy => current_price * 1.05,  // Pay up to 5% more
+            OrderSide::Sell => current_price * 0.95, // Accept 5% less
         };
         let price_int = (slippage_price * 100.0) as u32;
 
@@ -342,6 +342,7 @@ impl LighterHttpClient {
         let base_amount = (size * 1_000_000.0) as i64;
 
         // Sign transaction via FFI
+        // Use reduce_only to close position without requiring additional margin
         let signed_tx = self
             .signer
             .sign_create_order(
@@ -350,10 +351,10 @@ impl LighterHttpClient {
                 base_amount,
                 price_int,
                 side == OrderSide::Sell,
-                2, // order_type: 2 = IOC (Immediate or Cancel, acts like market)
-                0, // time_in_force: 0 = IOC
-                false,
-                0,
+                0, // order_type: 0 = Limit (more reliable than IOC)
+                1, // time_in_force: 1 = GTC
+                true, // reduce_only: true (only close existing position, no new margin needed)
+                0u32, // trigger_price: 0 (no trigger)
                 order_expiry,
                 nonce,
             )
