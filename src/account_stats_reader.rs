@@ -20,7 +20,8 @@ pub struct ShmAccountStats {
     pub margin_usage: f64,       // 40..48
     pub buying_power: f64,       // 48..56
     pub updated_at: u64,         // 56..64
-    _reserved: [u8; 64],         // 64..128
+    pub position: f64,           // 64..72 - Net position (positive=long, negative=short)
+    _reserved: [u8; 56],         // 72..128
 }
 
 const ACCOUNT_STATS_SIZE: usize = 128;
@@ -73,6 +74,7 @@ impl AccountStatsReader {
                 available_balance: self.stats.available_balance,
                 margin_usage: self.stats.margin_usage,
                 buying_power: self.stats.buying_power,
+                position: self.stats.position,
                 updated_at: self.stats.updated_at,
             };
 
@@ -105,6 +107,7 @@ impl AccountStatsReader {
                 available_balance: self.stats.available_balance,
                 margin_usage: self.stats.margin_usage,
                 buying_power: self.stats.buying_power,
+                position: self.stats.position,
                 updated_at: self.stats.updated_at,
             };
 
@@ -126,6 +129,7 @@ pub struct AccountStatsSnapshot {
     pub available_balance: f64,
     pub margin_usage: f64,
     pub buying_power: f64,
+    pub position: f64,
     pub updated_at: u64,
 }
 
@@ -138,6 +142,7 @@ impl Default for AccountStatsSnapshot {
             available_balance: 0.0,
             margin_usage: 0.0,
             buying_power: 0.0,
+            position: 0.0,
             updated_at: 0,
         }
     }

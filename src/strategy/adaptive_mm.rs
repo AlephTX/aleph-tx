@@ -27,6 +27,7 @@ pub struct AccountStats {
     pub available_balance: f64,    // Available balance for trading
     pub margin_usage: f64,         // Margin usage ratio (0-1)
     pub buying_power: f64,         // Buying power
+    pub position: f64,             // Net position (positive=long, negative=short)
     pub last_update: Instant,
 }
 
@@ -39,6 +40,7 @@ impl Default for AccountStats {
             available_balance: 0.0,
             margin_usage: 0.0,
             buying_power: 0.0,
+            position: 0.0,
             last_update: Instant::now(),
         }
     }
@@ -53,6 +55,7 @@ impl From<AccountStatsSnapshot> for AccountStats {
             available_balance: snapshot.available_balance,
             margin_usage: snapshot.margin_usage,
             buying_power: snapshot.buying_power,
+            position: snapshot.position,
             last_update: Instant::now(),
         }
     }
@@ -226,18 +229,20 @@ impl AdaptiveMarketMaker {
 
         // Step 3: Check for existing positions and close them
         info!("🔍 Checking for existing positions...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Wait for ledger to sync
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Wait for position data
 
-        let existing_position = {
-            let ledger = self.ledger.read();
-            ledger.position()
-        };
+        let existing_position = self.account_stats.position;
 
         if existing_position.abs() > 0.0001 {
             warn!(
                 "⚠️  Found existing position: {:.4} ETH, closing with market order...",
                 existing_position
             );
+
+            // Read current market price
+            let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
+            let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+
             let close_side = if existing_position > 0.0 {
                 OrderSide::Sell
             } else {
@@ -246,7 +251,8 @@ impl AdaptiveMarketMaker {
             match self.http_client.place_market_order(
                 self.market_id,
                 close_side,
-                existing_position.abs()
+                existing_position.abs(),
+                mid_price
             ).await {
                 Ok(_) => info!("✅ Existing position closed successfully"),
                 Err(e) => warn!("⚠️ Failed to close existing position: {:?}", e),
@@ -319,19 +325,21 @@ impl AdaptiveMarketMaker {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 // Step 3: Close any remaining position with market order
-                let net_pos = {
-                    let ledger = self.ledger.read();
-                    ledger.position()
-                };
+                let net_pos = self.account_stats.position;
 
                 if net_pos.abs() > 0.0001 {
                     warn!("⚠️  Closing position with market order: {:.4} ETH", net_pos);
+
+                    // Read current market price
+                    let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
+                    let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+
                     let close_side = if net_pos > 0.0 {
                         OrderSide::Sell
                     } else {
                         OrderSide::Buy
                     };
-                    match self.http_client.place_market_order(self.market_id, close_side, net_pos.abs()).await {
+                    match self.http_client.place_market_order(self.market_id, close_side, net_pos.abs(), mid_price).await {
                         Ok(_) => info!("✅ Position closed successfully"),
                         Err(e) => error!("❌ Failed to close position: {:?}", e),
                     }
@@ -380,12 +388,24 @@ impl AdaptiveMarketMaker {
                 continue;
             }
 
-            // Step 2: Read shadow ledger
-            let (total_exposure, ledger_state) = {
+            // Step 2: Read position from WebSocket (real) and Shadow Ledger (local tracking)
+            let (real_position, shadow_position, ledger_state): (f64, f64, _) = {
                 let ledger = self.ledger.read();
-                let exposure = ledger.total_exposure();
-                (exposure, Arc::clone(&self.ledger))
+                let shadow = ledger.total_exposure();
+                let real = self.account_stats.position;
+                (real, shadow, Arc::clone(&self.ledger))
             };
+
+            // Warn if Shadow Ledger disagrees with real position
+            if (real_position - shadow_position).abs() > 0.001 {
+                debug!(
+                    "⚠️  Position mismatch: Real={:.4} Shadow={:.4}",
+                    real_position, shadow_position
+                );
+            }
+
+            // ALWAYS use real position for risk management
+            let total_exposure: f64 = real_position;
 
             // Step 2.5: Check for trapped position (套牢检测)
             if total_exposure.abs() > self.max_position {
@@ -396,6 +416,10 @@ impl AdaptiveMarketMaker {
 
                 // Cancel all orders first
                 self.cancel_all_orders().await;
+
+                // Read current market price
+                let bbo = self.shm_reader.read_all_exchanges(self.symbol_id)[0].1;
+                let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
 
                 // Calculate excess position to close
                 let excess = total_exposure.abs() - self.max_position;
@@ -409,7 +433,8 @@ impl AdaptiveMarketMaker {
                 match self.http_client.place_market_order(
                     self.market_id,
                     close_side,
-                    excess
+                    excess,
+                    mid_price
                 ).await {
                     Ok(_) => info!("✅ Closed excess position: {:.4} ETH", excess),
                     Err(e) => error!("❌ Failed to close excess position: {:?}", e),

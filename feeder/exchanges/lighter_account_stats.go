@@ -17,9 +17,10 @@ import (
 
 // LighterAccountStats connects to Lighter WebSocket for account statistics
 type LighterAccountStats struct {
-	cfg        config.ExchangeConfig
-	auth       *LighterAuth
+	cfg         config.ExchangeConfig
+	auth        *LighterAuth
 	statsWriter *shm.AccountStatsWriter
+	position    float64 // Cached position from private stream
 }
 
 // NewLighterAccountStats creates a new account stats client
@@ -132,20 +133,26 @@ func (las *LighterAccountStats) processStats(stats *lighterUserStats) {
 	marginUsage, _ := strconv.ParseFloat(stats.Stats.MarginUsage, 64)
 	buyingPower, _ := strconv.ParseFloat(stats.Stats.BuyingPower, 64)
 
-	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f",
-		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower)
+	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f position=%.4f",
+		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower, las.position)
 
-	// Write to shared memory for Rust to read
+	// Write to shared memory for Rust to read (including position)
 	timestampNs := uint64(time.Now().UnixNano())
-	las.statsWriter.WriteStats(
+	las.statsWriter.WriteStatsWithPosition(
 		collateral,
 		portfolioValue,
 		leverage,
 		availableBalance,
 		marginUsage,
 		buyingPower,
+		las.position,
 		timestampNs,
 	)
+}
+
+// SetPosition updates the cached position (called from private stream)
+func (las *LighterAccountStats) SetPosition(position float64) {
+	las.position = position
 }
 
 func (las *LighterAccountStats) fetchInitialStats(ctx context.Context) {

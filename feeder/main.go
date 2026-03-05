@@ -78,6 +78,12 @@ func main() {
 	}
 
 	if ltCfg, ok := cfg.Exchanges["lighter"]; ok && ltCfg.Enabled {
+		// Create account stats first (needed by private stream)
+		ltStats, err := exchanges.NewLighterAccountStats(ltCfg, accountStats)
+		if err != nil {
+			log.Fatalf("Lighter (account-stats): failed to initialize: %v", err)
+		}
+
 		// Start public orderbook stream
 		wg.Add(1)
 		go func() {
@@ -89,11 +95,11 @@ func main() {
 			}
 		}()
 
-		// Start private event stream
+		// Start private event stream (with account stats reference)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer)
+			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer, ltStats)
 			if err != nil {
 				log.Printf("Lighter (private): failed to initialize: %v", err)
 				return
@@ -108,11 +114,6 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ltStats, err := exchanges.NewLighterAccountStats(ltCfg, accountStats)
-			if err != nil {
-				log.Printf("Lighter (account-stats): failed to initialize: %v", err)
-				return
-			}
 			log.Println("🔌 Lighter (account-stats): starting...")
 			if err := ltStats.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("Lighter (account-stats): %v", err)
