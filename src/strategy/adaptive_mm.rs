@@ -168,7 +168,7 @@ impl AdaptiveMarketMaker {
             min_spread_bps: 2,
             max_spread_bps: 15,
             volatility_multiplier: 1.5,
-            base_order_size: 0.001,
+            base_order_size: 0.005,        // 0.005 ETH (~$10.3 @ $2063)
             max_position: 0.1,
             inventory_skew_factor: 0.05,
             max_leverage: 10.0,
@@ -565,14 +565,18 @@ impl AdaptiveMarketMaker {
 
     /// Calculate order size based on available balance
     fn calculate_order_size(&self, available_balance: f64, mid_price: f64) -> f64 {
-        // High-frequency: use 1% of available balance per order (small orders)
+        // Use 1% of available balance per order
         let size_from_balance = (available_balance * 0.01) / mid_price;
 
         // Use base size as minimum
         let size = size_from_balance.max(self.base_order_size);
 
-        // Cap at 0.01 ETH (~$20) for high-frequency trading
-        let size = size.min(0.01);
+        // Enforce minimum quote amount ($11 to stay above Lighter's $10 min)
+        let min_size = 11.0 / mid_price;
+        let size = size.max(min_size);
+
+        // Cap at 0.05 ETH (~$100)
+        let size = size.min(0.05);
 
         // Round to step size
         (size / self.step_size).floor() * self.step_size
