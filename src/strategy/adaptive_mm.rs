@@ -497,8 +497,9 @@ impl AdaptiveMarketMaker {
                     "AS filter: score={:.2} momentum={:.1}bps vol={:.1}bps — pausing",
                     as_score, momentum, vol_bps
                 );
-                // Cancel existing orders to avoid getting picked off
-                self.cancel_all_orders().await;
+                // Don't cancel existing orders — they're already on the book at good prices.
+                // Just skip placing new ones this cycle. If price moves enough,
+                // the requote threshold will handle cancellation naturally.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -663,13 +664,15 @@ impl AdaptiveMarketMaker {
 
     fn should_requote(&self, active_order: &Option<ActiveOrder>, new_price: f64) -> bool {
         match active_order {
-            None => true,
+            None => true, // No order on this side → must place
             Some(order) => {
                 let deviation_bps = ((new_price - order.price).abs() / order.price) * 10000.0;
                 let age = order.placed_at.elapsed();
-                // Only requote if price moved significantly (>3bps) or order is stale (>5s)
-                // Let orders rest on the book to get filled
-                deviation_bps > 3.0 || age > Duration::from_secs(5)
+                // Requote only if:
+                // - Price moved significantly (>3bps) — our edge is gone
+                // - Order is very stale (>10s) — refresh to stay competitive
+                // This lets orders rest on the book and get filled
+                deviation_bps > 3.0 || age > Duration::from_secs(10)
             }
         }
     }
