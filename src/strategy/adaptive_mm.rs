@@ -1,11 +1,11 @@
-//! Adaptive Market Maker Strategy
+//! Adaptive Market Maker Strategy (Premium Account, Fee-Aware)
 //!
-//! A production-grade market making strategy with:
-//! - Dynamic position sizing based on account balance
-//! - Inventory skew to manage directional risk
-//! - Adaptive spreads based on volatility
-//! - PnL tracking and risk management
-//! - Real-time account stats from shared memory
+//! Profitable HFT market making on Lighter DEX:
+//! - Fee-aware spread: ensures spread > round-trip maker fee (0.76bps)
+//! - Adverse selection filter: pauses quoting during fast price moves
+//! - Aggressive inventory skew: linear skew on both sides to flatten position
+//! - Batch quoting: sendTxBatch for paired bid/ask (1 API call)
+//! - Premium account: 0ms maker latency, 6000 req/min, maker fee 0.0038%
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;
@@ -17,6 +17,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+// ─── Premium Account Fee Constants (3000 LIT staked) ─────────────────────────
+const MAKER_FEE_BPS: f64 = 0.38;   // 0.0038%
+#[allow(dead_code)]
+const TAKER_FEE_BPS: f64 = 2.66;   // 0.0266% (for reference, we aim for maker fills)
+const ROUND_TRIP_FEE_BPS: f64 = MAKER_FEE_BPS * 2.0; // 0.76bps both sides maker
 
 /// Account statistics from Lighter WebSocket
 #[derive(Debug, Clone)]
@@ -61,43 +67,98 @@ impl From<AccountStatsSnapshot> for AccountStats {
     }
 }
 
-/// Market volatility tracker
-struct VolatilityTracker {
+/// Market microstructure tracker: volatility, momentum, adverse selection
+struct MicrostructureTracker {
+    // Volatility (realized vol from returns)
     price_samples: VecDeque<f64>,
     max_samples: usize,
+
+    // EMA for momentum / adverse selection detection
+    ema_fast: f64,       // Fast EMA (5-tick)
+    ema_slow: f64,       // Slow EMA (20-tick)
+    ema_fast_alpha: f64,
+    ema_slow_alpha: f64,
+    ema_initialized: bool,
+
+    // Trade flow imbalance (orderbook pressure)
+    last_bid: f64,
+    last_ask: f64,
 }
 
-impl VolatilityTracker {
+impl MicrostructureTracker {
     fn new(max_samples: usize) -> Self {
         Self {
             price_samples: VecDeque::with_capacity(max_samples),
             max_samples,
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            ema_fast_alpha: 2.0 / 6.0,   // 5-tick EMA
+            ema_slow_alpha: 2.0 / 21.0,  // 20-tick EMA
+            ema_initialized: false,
+            last_bid: 0.0,
+            last_ask: 0.0,
         }
     }
 
-    fn add_sample(&mut self, price: f64) {
+    fn update(&mut self, mid: f64, bid: f64, ask: f64) {
+        // Update price samples for volatility
         if self.price_samples.len() >= self.max_samples {
             self.price_samples.pop_front();
         }
-        self.price_samples.push_back(price);
-    }
+        self.price_samples.push_back(mid);
 
-    /// Calculate realized volatility (standard deviation of returns)
-    fn calculate_volatility(&self) -> f64 {
-        if self.price_samples.len() < 2 {
-            return 0.0;
+        // Update EMAs
+        if !self.ema_initialized {
+            self.ema_fast = mid;
+            self.ema_slow = mid;
+            self.ema_initialized = true;
+        } else {
+            self.ema_fast += self.ema_fast_alpha * (mid - self.ema_fast);
+            self.ema_slow += self.ema_slow_alpha * (mid - self.ema_slow);
         }
 
-        let returns: Vec<f64> = self
-            .price_samples
+        self.last_bid = bid;
+        self.last_ask = ask;
+    }
+
+    /// Realized volatility (std dev of returns) in bps
+    fn volatility_bps(&self) -> f64 {
+        if self.price_samples.len() < 3 {
+            return 0.0;
+        }
+        let returns: Vec<f64> = self.price_samples
             .iter()
             .zip(self.price_samples.iter().skip(1))
-            .map(|(p1, p2)| (p2 / p1 - 1.0).abs())
+            .map(|(p1, p2)| ((p2 / p1) - 1.0) * 10000.0) // in bps
             .collect();
-
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
         let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         variance.sqrt()
+    }
+
+    /// Momentum signal: (fast_ema - slow_ema) / mid in bps
+    /// Positive = price trending up, negative = trending down
+    fn momentum_bps(&self) -> f64 {
+        if !self.ema_initialized || self.ema_slow == 0.0 {
+            return 0.0;
+        }
+        ((self.ema_fast - self.ema_slow) / self.ema_slow) * 10000.0
+    }
+
+    /// Adverse selection score: abs(momentum) relative to volatility
+    /// > 1.0 means directional move exceeds normal noise → toxic flow
+    fn adverse_selection_score(&self) -> f64 {
+        let vol = self.volatility_bps();
+        if vol < 0.1 { return 0.0; }
+        self.momentum_bps().abs() / vol
+    }
+
+    /// Orderbook imbalance: (bid_size - ask_size) / (bid_size + ask_size)
+    /// Range [-1, 1]: positive = more bids (bullish pressure)
+    fn book_imbalance(&self, bid_size: f64, ask_size: f64) -> f64 {
+        let total = bid_size + ask_size;
+        if total < 0.0001 { return 0.0; }
+        (bid_size - ask_size) / total
     }
 }
 
@@ -114,22 +175,24 @@ struct ActiveOrder {
 
 pub struct AdaptiveMarketMaker {
     symbol_id: u16,
+    #[allow(dead_code)]
     market_id: u16,
 
-    // Strategy parameters
-    base_spread_bps: u32,          // Base spread in basis points
-    min_spread_bps: u32,           // Minimum spread
-    max_spread_bps: u32,           // Maximum spread
-    volatility_multiplier: f64,    // Spread adjustment based on volatility
+    // Strategy parameters (fee-aware)
+    base_spread_bps: f64,          // Base spread in bps (must > ROUND_TRIP_FEE_BPS)
+    min_spread_bps: f64,           // Floor: never quote tighter than this
+    max_spread_bps: f64,           // Ceiling
+    volatility_scale: f64,         // How much vol widens spread
 
     // Position sizing
-    base_order_size: f64,          // Base order size in ETH
-    max_position: f64,             // Maximum position in ETH
-    inventory_skew_factor: f64,    // How much to skew quotes based on inventory
+    base_order_size: f64,
+    max_position: f64,
+    inventory_skew_bps: f64,       // Max skew in bps at full inventory
 
     // Risk management
-    max_leverage: f64,             // Maximum allowed leverage
-    min_available_balance: f64,    // Minimum balance to keep available
+    max_leverage: f64,
+    min_available_balance: f64,
+    adverse_selection_threshold: f64, // Pause quoting when AS score > this
 
     // Market precision
     tick_size: f64,
@@ -137,18 +200,21 @@ pub struct AdaptiveMarketMaker {
 
     // State
     trading: Arc<LighterTrading>,
+    #[allow(dead_code)]
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
     account_stats_reader: AccountStatsReader,
     account_stats: AccountStats,
-    volatility_tracker: VolatilityTracker,
+    micro: MicrostructureTracker,
 
     // Order management
     active_bid: Option<ActiveOrder>,
     active_ask: Option<ActiveOrder>,
 
-    // PnL tracking
+    // Fee-aware PnL tracking
     session_start_balance: f64,
+    total_orders_placed: u64,
+    total_batches: u64,
     last_balance_check: Instant,
 }
 
@@ -164,15 +230,17 @@ impl AdaptiveMarketMaker {
         Self {
             symbol_id,
             market_id,
-            base_spread_bps: 3,
-            min_spread_bps: 2,
-            max_spread_bps: 15,
-            volatility_multiplier: 1.5,
-            base_order_size: 0.005,        // 0.005 ETH (~$10.3 @ $2063)
+            // Spread: 5bps base, min 2bps (> 0.76bps round-trip fee), max 20bps
+            base_spread_bps: 5.0,
+            min_spread_bps: 2.0,
+            max_spread_bps: 20.0,
+            volatility_scale: 2.0,
+            base_order_size: 0.005,
             max_position: 0.1,
-            inventory_skew_factor: 0.05,
+            inventory_skew_bps: 3.0,       // ±3bps skew at max inventory
             max_leverage: 10.0,
             min_available_balance: 2.0,
+            adverse_selection_threshold: 1.5, // Pause when momentum > 1.5x vol
             tick_size: 0.01,
             step_size: 0.0001,
             trading,
@@ -180,10 +248,12 @@ impl AdaptiveMarketMaker {
             shm_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
-            volatility_tracker: VolatilityTracker::new(100),
+            micro: MicrostructureTracker::new(200),
             active_bid: None,
             active_ask: None,
             session_start_balance: 0.0,
+            total_orders_placed: 0,
+            total_batches: 0,
             last_balance_check: Instant::now(),
         }
     }
@@ -388,38 +458,12 @@ impl AdaptiveMarketMaker {
                 continue;
             }
 
-            // Step 2: Read position from WebSocket (real) and Shadow Ledger (local tracking)
-            let (real_position, shadow_position) = {
-                let ledger = self.ledger.read();
-                let shadow = ledger.total_exposure();
-                let real = self.account_stats.position;
-                (real, shadow)
-            };
+            // Step 2: Read position
+            let total_exposure = self.account_stats.position;
 
-            if (real_position - shadow_position).abs() > 0.001 {
-                debug!(
-                    "Position mismatch: Real={:.4} Shadow={:.4}",
-                    real_position, shadow_position
-                );
-            }
-
-            // ALWAYS use real position for risk management
-            let total_exposure: f64 = real_position;
-
-            // Step 2.5: Check for trapped position (套牢检测)
-            // When position exceeds max, cancel all orders but continue to normal quoting
-            // The position limits (can_buy/can_sell) will prevent adding more exposure
             if total_exposure.abs() > self.max_position {
-                warn!(
-                    "⚠️  Position trapped: {:.4} ETH > max {:.4} ETH, will only quote to reduce position",
-                    total_exposure, self.max_position
-                );
-
-                // Cancel all orders to start fresh
+                warn!("Position {:.4} > max {:.4}, reducing only", total_exposure, self.max_position);
                 self.cancel_all_orders().await;
-
-                // Don't use continue - let normal quoting logic handle it
-                // The can_buy/can_sell checks will prevent adding more exposure
             }
 
             // Step 3: Read market data
@@ -429,38 +473,80 @@ impl AdaptiveMarketMaker {
                 .find(|(exch_id, _)| *exch_id == 2)
                 .map(|(_, msg)| msg);
 
-            if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
-                debug!("No BBO data available, waiting...");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            let bbo = match lighter_bbo.filter(|b| b.bid_price > 0.0 && b.ask_price > 0.0) {
+                Some(b) => b,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
+
+            let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+            let market_spread_bps = ((bbo.ask_price - bbo.bid_price) / mid) * 10000.0;
+
+            // Step 4: Update microstructure tracker
+            self.micro.update(mid, bbo.bid_price, bbo.ask_price);
+            let vol_bps = self.micro.volatility_bps();
+            let momentum = self.micro.momentum_bps();
+            let as_score = self.micro.adverse_selection_score();
+            let book_imb = self.micro.book_imbalance(bbo.bid_size, bbo.ask_size);
+
+            // Step 5: Adverse selection filter — pause quoting during toxic flow
+            if as_score > self.adverse_selection_threshold {
+                debug!(
+                    "AS filter: score={:.2} momentum={:.1}bps vol={:.1}bps — pausing",
+                    as_score, momentum, vol_bps
+                );
+                // Cancel existing orders to avoid getting picked off
+                self.cancel_all_orders().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
 
-            let bbo = lighter_bbo.unwrap();
-            let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+            // Step 6: Calculate fee-aware adaptive spread
+            //   spread = max(min_spread, base + vol_component + fee_buffer)
+            let vol_component = vol_bps * self.volatility_scale;
+            let raw_spread_bps = self.base_spread_bps + vol_component;
+            let spread_bps = raw_spread_bps.clamp(self.min_spread_bps, self.max_spread_bps);
 
-            // Update volatility tracker
-            self.volatility_tracker.add_sample(mid);
+            // Step 7: Inventory skew — linear, applied to BOTH sides
+            //   Long position → lower bid (less eager to buy), lower ask (eager to sell)
+            //   Short position → higher bid (eager to buy), higher ask (less eager to sell)
+            let inv_ratio = (total_exposure / self.max_position).clamp(-1.0, 1.0);
+            let skew_bps = inv_ratio * self.inventory_skew_bps;
 
-            // Step 4: Calculate adaptive parameters
-            let order_size = self.calculate_order_size(available_balance, mid);
-            let spread_bps = self.calculate_adaptive_spread();
-            let (bid_skew, ask_skew) = self.calculate_inventory_skew(total_exposure);
+            // Orderbook imbalance micro-adjustment (±0.5bps)
+            // If more bids in book (bullish), slightly tighten ask
+            let imb_adj_bps = book_imb * 0.5;
 
-            // Step 5: Calculate quotes with skew
-            let spread = mid * (spread_bps as f64) / 10000.0;
-            let our_bid = mid - spread / 2.0 - bid_skew;
-            let our_ask = mid + spread / 2.0 + ask_skew;
+            // Step 8: Compute final quotes
+            let half_spread = mid * spread_bps / 20000.0;
+            let skew_dollars = mid * skew_bps / 10000.0;
+            let imb_dollars = mid * imb_adj_bps / 10000.0;
 
-            // Round to tick size
+            let our_bid = mid - half_spread - skew_dollars - imb_dollars;
+            let our_ask = mid + half_spread - skew_dollars - imb_dollars;
+
+            // Round to tick
             let our_bid = (our_bid / self.tick_size).floor() * self.tick_size;
             let our_ask = (our_ask / self.tick_size).ceil() * self.tick_size;
 
+            // Sanity: ensure spread is positive and covers fees
+            let actual_spread_bps = ((our_ask - our_bid) / mid) * 10000.0;
+            if actual_spread_bps < ROUND_TRIP_FEE_BPS {
+                debug!("Spread {:.1}bps < fee {:.1}bps, skipping", actual_spread_bps, ROUND_TRIP_FEE_BPS);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            let order_size = self.calculate_order_size(available_balance, mid);
+
             debug!(
-                "Mid={:.2} Spread={}bps Size={:.4} Pos={:.4} Lev={:.2}x",
-                mid, spread_bps, order_size, total_exposure, leverage
+                "Mid={:.2} Sprd={:.1}bps Mkt={:.1}bps Vol={:.1} Mom={:.1} AS={:.2} Imb={:.2} Pos={:.4}",
+                mid, actual_spread_bps, market_spread_bps, vol_bps, momentum, as_score, book_imb, total_exposure
             );
 
-            // Step 6: Determine which sides to quote
+            // Step 9: Determine which sides to quote
             let should_requote_bid = self.should_requote(&self.active_bid, our_bid);
             let should_requote_ask = self.should_requote(&self.active_ask, our_ask);
 
@@ -472,7 +558,7 @@ impl AdaptiveMarketMaker {
             let place_bid = should_requote_bid && can_buy;
             let place_ask = should_requote_ask && can_sell;
 
-            // Step 7: Cancel stale orders before placing new ones
+            // Step 10: Cancel stale orders before placing new ones
             if place_bid {
                 if let Some(ref order) = self.active_bid {
                     if let Ok(idx) = order.order_id.parse::<i64>() {
@@ -490,16 +576,18 @@ impl AdaptiveMarketMaker {
                 }
             }
 
-            // Step 8: Place orders — use sendTxBatch when both sides, sendTx for single side
+            // Step 11: Place orders — batch when both sides, single otherwise
             if place_bid && place_ask {
-                // Batch: one buy + one sell in a single API call (Premium: 0ms maker latency)
                 match self.trading.place_batch(BatchOrderParams {
                     bid_price: our_bid,
                     ask_price: our_ask,
                     size: order_size,
                 }).await {
                     Ok(result) => {
-                        info!("Batch: Bid ${:.2} / Ask ${:.2} x {:.4}", our_bid, our_ask, order_size);
+                        info!(
+                            "Batch: Bid ${:.2} / Ask ${:.2} x {:.4} sprd={:.1}bps",
+                            our_bid, our_ask, order_size, actual_spread_bps
+                        );
                         self.active_bid = Some(ActiveOrder {
                             order_id: result.bid_client_order_index.to_string(),
                             side: Side::Buy,
@@ -514,8 +602,10 @@ impl AdaptiveMarketMaker {
                             size: order_size,
                             placed_at: Instant::now(),
                         });
+                        self.total_batches += 1;
+                        self.total_orders_placed += 2;
                     }
-                    Err(e) => warn!("Batch order failed: {}", e),
+                    Err(e) => warn!("Batch failed: {}", e),
                 }
             } else if place_bid {
                 match self.trading.buy(order_size, our_bid).await {
@@ -528,6 +618,7 @@ impl AdaptiveMarketMaker {
                             size: order_size,
                             placed_at: Instant::now(),
                         });
+                        self.total_orders_placed += 1;
                     }
                     Err(e) => warn!("Buy failed: {}", e),
                 }
@@ -542,83 +633,41 @@ impl AdaptiveMarketMaker {
                             size: order_size,
                             placed_at: Instant::now(),
                         });
+                        self.total_orders_placed += 1;
                     }
                     Err(e) => warn!("Sell failed: {}", e),
                 }
             }
 
-            // Step 8: Periodic PnL reporting
-            if self.last_balance_check.elapsed() > Duration::from_secs(60) {
+            // Periodic PnL reporting (every 30s)
+            if self.last_balance_check.elapsed() > Duration::from_secs(30) {
                 self.print_pnl_update();
                 self.last_balance_check = Instant::now();
             }
 
-            // Premium account: 6000 req/min = 100 req/s
-            // Batch quote = 1 req, cancel = 1 req each → ~3 req/cycle max
-            // 100ms interval = 10 cycles/s = ~30 req/s (well within limits)
+            // Premium: 6000 req/min, batch=1 req, cancel=1 each → ~3 req/cycle
+            // 100ms = 10 cycles/s = ~30 req/s (well within limits)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// Calculate order size based on available balance
     fn calculate_order_size(&self, available_balance: f64, mid_price: f64) -> f64 {
-        // Use 1% of available balance per order
         let size_from_balance = (available_balance * 0.01) / mid_price;
-
-        // Use base size as minimum
         let size = size_from_balance.max(self.base_order_size);
-
-        // Enforce minimum quote amount ($11 to stay above Lighter's $10 min)
+        // Enforce Lighter min quote amount ($11 > $10 min)
         let min_size = 11.0 / mid_price;
         let size = size.max(min_size);
-
-        // Cap at 0.05 ETH (~$100)
         let size = size.min(0.05);
-
-        // Round to step size
         (size / self.step_size).floor() * self.step_size
-    }
-
-    /// Calculate adaptive spread based on volatility
-    fn calculate_adaptive_spread(&self) -> u32 {
-        let volatility = self.volatility_tracker.calculate_volatility();
-
-        // Increase spread in high volatility
-        let adjusted_spread = self.base_spread_bps as f64
-            * (1.0 + volatility * self.volatility_multiplier * 10000.0);
-
-        // Clamp to min/max
-        adjusted_spread
-            .max(self.min_spread_bps as f64)
-            .min(self.max_spread_bps as f64) as u32
-    }
-
-    /// Calculate inventory skew to manage directional risk
-    /// Returns (bid_skew, ask_skew) in dollars
-    fn calculate_inventory_skew(&self, position: f64) -> (f64, f64) {
-        // Normalize position to [-1, 1]
-        let normalized_pos = (position / self.max_position).clamp(-1.0, 1.0);
-
-        // Calculate skew: if long, widen bid and tighten ask
-        let skew_amount = normalized_pos * self.inventory_skew_factor;
-
-        let bid_skew = if normalized_pos > 0.0 { skew_amount } else { 0.0 };
-        let ask_skew = if normalized_pos < 0.0 { -skew_amount } else { 0.0 };
-
-        (bid_skew, ask_skew)
     }
 
     fn should_requote(&self, active_order: &Option<ActiveOrder>, new_price: f64) -> bool {
         match active_order {
             None => true,
             Some(order) => {
-                // 1. Price deviation check
-                let price_diff = (new_price - order.price).abs();
-                let deviation_bps = (price_diff / order.price) * 10000.0;
-
-                // 2. Time-based forced refresh (HFT: refresh every 1 second)
+                let deviation_bps = ((new_price - order.price).abs() / order.price) * 10000.0;
                 let age = order.placed_at.elapsed();
-
+                // Requote if price moved >1bps or order is >1s old
                 deviation_bps > 1.0 || age > Duration::from_secs(1)
             }
         }
@@ -626,19 +675,15 @@ impl AdaptiveMarketMaker {
 
     async fn cancel_all_orders(&mut self) {
         if let Some(ref order) = self.active_bid {
-            info!("Canceling bid");
-            if let Ok(order_index) = order.order_id.parse::<i64>() {
-                let _ = self.trading.cancel_order(order_index).await;
+            if let Ok(idx) = order.order_id.parse::<i64>() {
+                let _ = self.trading.cancel_order(idx).await;
             }
         }
-
         if let Some(ref order) = self.active_ask {
-            info!("Canceling ask");
-            if let Ok(order_index) = order.order_id.parse::<i64>() {
-                let _ = self.trading.cancel_order(order_index).await;
+            if let Ok(idx) = order.order_id.parse::<i64>() {
+                let _ = self.trading.cancel_order(idx).await;
             }
         }
-
         self.active_bid = None;
         self.active_ask = None;
     }
@@ -650,14 +695,14 @@ impl AdaptiveMarketMaker {
         } else {
             0.0
         };
-
         info!(
-            "💰 PnL: ${:.2} ({:+.2}%) | Balance: ${:.2} | Leverage: {:.2}x | Margin: {:.1}%",
-            pnl,
-            pnl_pct,
+            "PnL: ${:.2} ({:+.2}%) | Bal: ${:.2} | Lev: {:.2}x | Pos: {:.4} | Orders: {} Batches: {}",
+            pnl, pnl_pct,
             self.account_stats.available_balance,
             self.account_stats.leverage,
-            self.account_stats.margin_usage * 100.0
+            self.account_stats.position,
+            self.total_orders_placed,
+            self.total_batches,
         );
     }
 
@@ -668,10 +713,8 @@ impl AdaptiveMarketMaker {
         } else {
             0.0
         };
-
-        info!("📊 Session Summary:");
-        info!("   Start Balance: ${:.2}", self.session_start_balance);
-        info!("   End Balance:   ${:.2}", self.account_stats.available_balance);
-        info!("   PnL:           ${:.2} ({:+.2}%)", pnl, pnl_pct);
+        info!("Session: ${:.2} → ${:.2} | PnL: ${:.2} ({:+.2}%) | Orders: {} Batches: {}",
+            self.session_start_balance, self.account_stats.available_balance,
+            pnl, pnl_pct, self.total_orders_placed, self.total_batches);
     }
 }
