@@ -235,8 +235,8 @@ impl AdaptiveMarketMaker {
             min_spread_bps: 2.0,
             max_spread_bps: 20.0,
             volatility_scale: 2.0,
-            base_order_size: 0.005,
-            max_position: 0.1,
+            base_order_size: 0.01,
+            max_position: 0.2,
             inventory_skew_bps: 3.0,       // ±3bps skew at max inventory
             max_leverage: 10.0,
             min_available_balance: 2.0,
@@ -657,7 +657,7 @@ impl AdaptiveMarketMaker {
         // Enforce Lighter min quote amount ($11 > $10 min)
         let min_size = 11.0 / mid_price;
         let size = size.max(min_size);
-        let size = size.min(0.05);
+        let size = size.min(0.1);
         (size / self.step_size).floor() * self.step_size
     }
 
@@ -667,8 +667,9 @@ impl AdaptiveMarketMaker {
             Some(order) => {
                 let deviation_bps = ((new_price - order.price).abs() / order.price) * 10000.0;
                 let age = order.placed_at.elapsed();
-                // Requote if price moved >1bps or order is >1s old
-                deviation_bps > 1.0 || age > Duration::from_secs(1)
+                // Only requote if price moved significantly (>3bps) or order is stale (>5s)
+                // Let orders rest on the book to get filled
+                deviation_bps > 3.0 || age > Duration::from_secs(5)
             }
         }
     }
