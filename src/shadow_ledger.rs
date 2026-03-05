@@ -35,8 +35,8 @@ impl OrderSide {
 impl std::fmt::Display for OrderSide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OrderSide::Buy => write!(f, "buy"),
-            OrderSide::Sell => write!(f, "sell"),
+            OrderSide::Buy => write!(f, "bid"),
+            OrderSide::Sell => write!(f, "ask"),
         }
     }
 }
