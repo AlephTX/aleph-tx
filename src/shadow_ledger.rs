@@ -185,10 +185,9 @@ impl ShadowLedger {
                         event.remaining_size
                     );
                 } else {
-                    // This can happen if the order was placed before the shadow ledger started
-                    // We cannot track it properly without knowing the side
-                    tracing::warn!(
-                        "OrderCreated event for unknown order: {} (placed before shadow ledger started)",
+                    // Order not tracked — either placed before ledger started or from another account
+                    tracing::trace!(
+                        "OrderCreated for untracked order: {}",
                         event.order_id
                     );
                 }
@@ -248,8 +247,8 @@ impl ShadowLedger {
                         self.active_orders.remove(&event.order_id);
                     }
                 } else {
-                    tracing::warn!(
-                        "Fill event for unknown order: {} (may have been placed before shadow ledger started)",
+                    tracing::trace!(
+                        "Fill for untracked order: {}",
                         event.order_id
                     );
                 }
