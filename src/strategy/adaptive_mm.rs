@@ -9,8 +9,8 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;
-use crate::lighter_orders::LighterHttpClient;
-use crate::shadow_ledger::{OrderSide, ShadowLedger};
+use crate::lighter_trading::{LighterTrading, OrderParams, OrderType, Side};
+use crate::shadow_ledger::ShadowLedger;
 use crate::shm_reader::ShmReader;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -105,7 +105,7 @@ impl VolatilityTracker {
 struct ActiveOrder {
     order_id: String,
     #[allow(dead_code)]
-    side: OrderSide,
+    side: Side,
     price: f64,
     #[allow(dead_code)]
     size: f64,
@@ -136,7 +136,7 @@ pub struct AdaptiveMarketMaker {
     step_size: f64,
 
     // State
-    http_client: LighterHttpClient,
+    trading: Arc<LighterTrading>,
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
     account_stats_reader: AccountStatsReader,
@@ -153,44 +153,39 @@ pub struct AdaptiveMarketMaker {
 }
 
 impl AdaptiveMarketMaker {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         symbol_id: u16,
         market_id: u16,
-        private_key: String,
-        account_index: i64,
-        api_key_index: u8,
+        trading: Arc<LighterTrading>,
         ledger: Arc<RwLock<ShadowLedger>>,
         shm_reader: ShmReader,
         account_stats_reader: AccountStatsReader,
-    ) -> Result<Self> {
-        let http_client = LighterHttpClient::new(private_key, api_key_index as i64, account_index)?;
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             symbol_id,
             market_id,
-            base_spread_bps: 3,            // 0.03% base spread (ultra-tight for HFT)
-            min_spread_bps: 2,             // 0.02% minimum
-            max_spread_bps: 15,            // 0.15% maximum
-            volatility_multiplier: 1.5,    // Moderate spread adjustment
-            base_order_size: 0.001,        // 0.001 ETH base size (~$2, small orders)
-            max_position: 0.1,             // Max 0.1 ETH position (~$213 @ $2130)
-            inventory_skew_factor: 0.05,   // 5% skew adjustment (minimal)
-            max_leverage: 10.0,            // Max 10x leverage
-            min_available_balance: 2.0,    // Keep $2 available
+            base_spread_bps: 3,
+            min_spread_bps: 2,
+            max_spread_bps: 15,
+            volatility_multiplier: 1.5,
+            base_order_size: 0.001,
+            max_position: 0.1,
+            inventory_skew_factor: 0.05,
+            max_leverage: 10.0,
+            min_available_balance: 2.0,
             tick_size: 0.01,
             step_size: 0.0001,
-            http_client,
+            trading,
             ledger,
             shm_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
-            volatility_tracker: VolatilityTracker::new(100), // 100 samples
+            volatility_tracker: VolatilityTracker::new(100),
             active_bid: None,
             active_ask: None,
             session_start_balance: 0.0,
             last_balance_check: Instant::now(),
-        })
+        }
     }
 
     pub async fn run(
@@ -198,27 +193,40 @@ impl AdaptiveMarketMaker {
         mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
         // Step 1: Cancel all existing orders before starting
-        info!("🧹 Canceling all existing orders...");
-        if let Err(e) = self.http_client.cancel_all_open_orders(self.market_id as u8).await {
-            warn!("⚠️ Failed to cancel existing orders: {:?}", e);
+        info!("Canceling all existing orders...");
+        if let Err(e) = self.trading.cancel_all().await {
+            warn!("Failed to cancel existing orders: {:?}", e);
         }
 
         // Step 2: Wait for account stats to be available (with timeout)
         info!("⏳ Waiting for account stats from feeder...");
+        let start_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
         let mut retries = 0;
-        let max_retries = 10;
+        let max_retries = 15; // Increased from 10 to 15 seconds
         loop {
             let stats = self.account_stats_reader.read();
-            if stats.collateral > 0.0 || stats.available_balance > 0.0 {
+
+            // Check if data is fresh (updated within last 10 seconds)
+            let data_age_ns = start_time.saturating_sub(stats.updated_at);
+            let data_age_secs = data_age_ns / 1_000_000_000;
+
+            if (stats.collateral > 0.0 || stats.available_balance > 0.0) && data_age_secs < 10 {
                 self.account_stats = stats.into();
                 self.session_start_balance = self.account_stats.available_balance;
-                info!("✅ Account stats loaded: ${:.2} available", self.account_stats.available_balance);
+                info!("✅ Account stats loaded: ${:.2} available (data age: {}s)",
+                    self.account_stats.available_balance, data_age_secs);
                 break;
             }
 
             retries += 1;
             if retries >= max_retries {
                 error!("❌ Timeout waiting for account stats after {}s", max_retries);
+                error!("   Last stats: collateral=${:.2} balance=${:.2} age={}s",
+                    stats.collateral, stats.available_balance, data_age_secs);
                 return Err(crate::error::TradingError::OrderFailed(
                     "Account stats not available from feeder".to_string()
                 ).into());
@@ -235,39 +243,25 @@ impl AdaptiveMarketMaker {
 
         if existing_position.abs() > 0.0001 {
             warn!(
-                "⚠️  Found existing position: {:.4} ETH, closing with market order...",
+                "Found existing position: {:.4} ETH, closing...",
                 existing_position
             );
 
-            // Read current market price
             let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
             let lighter_bbo = exchanges
                 .iter()
                 .find(|(exch_id, _)| *exch_id == 2)
                 .map(|(_, msg)| msg);
 
-            if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
-                warn!("⚠️ No valid BBO data, skipping position close");
-            } else {
-                let bbo = lighter_bbo.unwrap();
+            if let Some(bbo) = lighter_bbo.filter(|b| b.bid_price > 0.0) {
                 let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
-
-                let close_side = if existing_position > 0.0 {
-                    OrderSide::Sell
-                } else {
-                    OrderSide::Buy
-                };
-                match self.http_client.place_market_order(
-                    self.market_id,
-                    close_side,
-                    existing_position.abs(),
-                    mid_price
-                ).await {
-                    Ok(_) => info!("✅ Existing position closed successfully"),
-                    Err(e) => warn!("⚠️ Failed to close existing position: {:?}", e),
+                match self.trading.close_all_positions(mid_price).await {
+                    Ok(_) => info!("Existing position closed successfully"),
+                    Err(e) => warn!("Failed to close existing position: {:?}", e),
                 }
+            } else {
+                warn!("No valid BBO data, skipping position close");
             }
-            // Wait for position to close
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         } else {
             info!("✅ No existing position found");
@@ -319,48 +313,38 @@ impl AdaptiveMarketMaker {
                 info!("Shutdown signal received, cleaning up...");
 
                 // Step 1: Cancel all orders (both tracked and untracked)
-                info!("🧹 Canceling all orders via API...");
-                if let Err(e) = self.http_client.cancel_all_open_orders(self.market_id as u8).await {
-                    warn!("⚠️ Failed to cancel orders via API: {:?}", e);
+                info!("Canceling all orders via API...");
+                if let Err(e) = self.trading.cancel_all().await {
+                    warn!("Failed to cancel orders via API: {:?}", e);
                 }
 
-                // Also cancel tracked orders
-                self.cancel_all_orders().await;
+                self.active_bid = None;
+                self.active_ask = None;
 
-                // Step 2: Wait for cancellations to process
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                // Step 3: Close any remaining position with market order
                 let net_pos = self.account_stats.position;
 
                 if net_pos.abs() > 0.0001 {
-                    warn!("⚠️  Closing position with market order: {:.4} ETH", net_pos);
+                    warn!("Closing position: {:.4} ETH", net_pos);
 
-                    // Read current market price
                     let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
                     let lighter_bbo = exchanges
                         .iter()
                         .find(|(exch_id, _)| *exch_id == 2)
                         .map(|(_, msg)| msg);
 
-                    if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
-                        warn!("⚠️ No valid BBO data, cannot close position");
-                    } else {
-                        let bbo = lighter_bbo.unwrap();
+                    if let Some(bbo) = lighter_bbo.filter(|b| b.bid_price > 0.0) {
                         let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
-
-                        let close_side = if net_pos > 0.0 {
-                            OrderSide::Sell
-                        } else {
-                            OrderSide::Buy
-                        };
-                        match self.http_client.place_market_order(self.market_id, close_side, net_pos.abs(), mid_price).await {
-                            Ok(_) => info!("✅ Position closed successfully"),
-                            Err(e) => error!("❌ Failed to close position: {:?}", e),
+                        match self.trading.close_all_positions(mid_price).await {
+                            Ok(_) => info!("Position closed successfully"),
+                            Err(e) => error!("Failed to close position: {:?}", e),
                         }
+                    } else {
+                        warn!("No valid BBO data, cannot close position");
                     }
                 } else {
-                    info!("✅ No position to close");
+                    info!("No position to close");
                 }
 
                 self.print_session_summary();
@@ -405,17 +389,16 @@ impl AdaptiveMarketMaker {
             }
 
             // Step 2: Read position from WebSocket (real) and Shadow Ledger (local tracking)
-            let (real_position, shadow_position, ledger_state): (f64, f64, _) = {
+            let (real_position, shadow_position) = {
                 let ledger = self.ledger.read();
                 let shadow = ledger.total_exposure();
                 let real = self.account_stats.position;
-                (real, shadow, Arc::clone(&self.ledger))
+                (real, shadow)
             };
 
-            // Warn if Shadow Ledger disagrees with real position
             if (real_position - shadow_position).abs() > 0.001 {
                 debug!(
-                    "⚠️  Position mismatch: Real={:.4} Shadow={:.4}",
+                    "Position mismatch: Real={:.4} Shadow={:.4}",
                     real_position, shadow_position
                 );
             }
@@ -496,87 +479,75 @@ impl AdaptiveMarketMaker {
                 } else {
                     if let Some(ref order) = self.active_bid {
                         if let Ok(order_index) = order.order_id.parse::<i64>() {
-                            let _ = self.http_client.cancel_order(self.market_id as u8, order_index).await;
+                            let _ = self.trading.cancel_order(order_index).await;
                         }
                         self.active_bid = None;
                     }
 
-                    match self
-                        .http_client
-                        .place_order_optimistic(
-                            Arc::clone(&ledger_state),
-                            self.market_id,
-                            self.symbol_id,
-                            OrderSide::Buy,
-                            our_bid,
-                            order_size,
-                        )
-                        .await
-                    {
-                        Ok(tx_hash) => {
-                            info!("📈 Buy: ${:.2} x {:.4} ETH", our_bid, order_size);
+                    match self.trading.place_order(OrderParams {
+                        size: order_size,
+                        price: our_bid,
+                        side: Side::Buy,
+                        order_type: OrderType::Limit,
+                        reduce_only: false,
+                    }).await {
+                        Ok(result) => {
+                            info!("Buy: ${:.2} x {:.4} ETH", our_bid, order_size);
                             self.active_bid = Some(ActiveOrder {
-                                order_id: tx_hash,
-                                side: OrderSide::Buy,
+                                order_id: result.tx_hash,
+                                side: Side::Buy,
                                 price: our_bid,
                                 size: order_size,
                                 placed_at: Instant::now(),
                             });
                         }
                         Err(e) => {
-                            warn!("❌ Buy order failed: {}", e);
+                            warn!("Buy order failed: {}", e);
                         }
                     }
                 }
             }
 
-            // Place sell order - always place unless at max short position or (leverage too high AND would increase exposure)
+            // Place sell order
             if should_requote_ask {
-                // Check if we can add more short exposure (90% threshold)
-                // If leverage is too high, only allow sell if we have long position (closing)
                 let would_close_long = total_exposure > 0.0;
                 let can_sell = total_exposure > -self.max_position * 0.9
                     && (!leverage_too_high || would_close_long);
 
                 if !can_sell {
                     if leverage_too_high && !would_close_long {
-                        debug!("⏸️  Skipping sell order: leverage {:.2}x too high and no long position to close", leverage);
+                        debug!("Skipping sell: leverage {:.2}x too high, no long to close", leverage);
                     } else {
-                        debug!("⏸️  Skipping sell order: position {:.4} <= -90% of max {:.4}",
+                        debug!("Skipping sell: position {:.4} <= -90% of max {:.4}",
                                total_exposure, self.max_position);
                     }
                 } else {
                     if let Some(ref order) = self.active_ask {
                         if let Ok(order_index) = order.order_id.parse::<i64>() {
-                            let _ = self.http_client.cancel_order(self.market_id as u8, order_index).await;
+                            let _ = self.trading.cancel_order(order_index).await;
                         }
                         self.active_ask = None;
                     }
 
-                    match self
-                        .http_client
-                        .place_order_optimistic(
-                            Arc::clone(&ledger_state),
-                            self.market_id,
-                            self.symbol_id,
-                            OrderSide::Sell,
-                            our_ask,
-                            order_size,
-                        )
-                        .await
-                    {
-                        Ok(tx_hash) => {
-                            info!("📉 Sell: ${:.2} x {:.4} ETH", our_ask, order_size);
+                    match self.trading.place_order(OrderParams {
+                        size: order_size,
+                        price: our_ask,
+                        side: Side::Sell,
+                        order_type: OrderType::Limit,
+                        reduce_only: false,
+                    }).await {
+                        Ok(result) => {
+                            info!("Sell: ${:.2} x {:.4} ETH", our_ask, order_size);
                             self.active_ask = Some(ActiveOrder {
-                                order_id: tx_hash,
-                                side: OrderSide::Sell,
+                                order_id: result.tx_hash,
+                                side: Side::Sell,
                                 price: our_ask,
                                 size: order_size,
                                 placed_at: Instant::now(),
                             });
                         }
                         Err(e) => {
-                            warn!("❌ Sell order failed: {}", e);
+                            warn!("Sell order failed: {}", e);
                         }
                     }
                 }
@@ -654,16 +625,16 @@ impl AdaptiveMarketMaker {
 
     async fn cancel_all_orders(&mut self) {
         if let Some(ref order) = self.active_bid {
-            info!("🚫 Canceling bid");
+            info!("Canceling bid");
             if let Ok(order_index) = order.order_id.parse::<i64>() {
-                let _ = self.http_client.cancel_order(self.market_id as u8, order_index).await;
+                let _ = self.trading.cancel_order(order_index).await;
             }
         }
 
         if let Some(ref order) = self.active_ask {
-            info!("🚫 Canceling ask");
+            info!("Canceling ask");
             if let Ok(order_index) = order.order_id.parse::<i64>() {
-                let _ = self.http_client.cancel_order(self.market_id as u8, order_index).await;
+                let _ = self.trading.cancel_order(order_index).await;
             }
         }
 

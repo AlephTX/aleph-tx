@@ -159,10 +159,17 @@ impl SignedTxResponse {
 }
 
 /// Lighter signer client
+///
+/// Safety: LighterSigner only holds integer indices. The underlying Go signer
+/// state is managed by the Go runtime (global, thread-safe). FFI calls are
+/// stateless lookups by (api_key_index, account_index).
 pub struct LighterSigner {
     api_key_index: i64,
     account_index: i64,
 }
+
+unsafe impl Send for LighterSigner {}
+unsafe impl Sync for LighterSigner {}
 
 impl LighterSigner {
     /// Create a new signer instance
