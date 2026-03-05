@@ -273,21 +273,17 @@ impl AdaptiveMarketMaker {
             info!("✅ No existing position found");
         }
 
-        // Step 4: Safety check - refuse to start if leverage is too high
+        // Step 4: Safety check - warn if leverage is too high but allow starting
+        // The strategy will automatically reduce leverage by only allowing closing orders
         if self.account_stats.leverage > 10.0 {
-            error!(
-                "❌ SAFETY CHECK FAILED: Leverage {:.2}x > 10.0x",
+            warn!(
+                "⚠️  WARNING: Leverage {:.2}x > 10.0x at startup",
                 self.account_stats.leverage
             );
-            error!("   Current account status:");
-            error!("   - Balance: ${:.2}", self.account_stats.available_balance);
-            error!("   - Leverage: {:.2}x", self.account_stats.leverage);
-            error!("   - Margin Usage: {:.1}%", self.account_stats.margin_usage * 100.0);
-            error!("   Please manually close positions before starting the strategy");
-            error!("   Or wait a few seconds for position updates to propagate");
-            return Err(crate::error::TradingError::OrderFailed(
-                "Leverage too high to start safely".to_string()
-            ).into());
+            warn!("   Strategy will only place orders to reduce leverage");
+            warn!("   - Balance: ${:.2}", self.account_stats.available_balance);
+            warn!("   - Leverage: {:.2}x", self.account_stats.leverage);
+            warn!("   - Margin Usage: {:.1}%", self.account_stats.margin_usage * 100.0);
         }
 
         // Step 5: Safety check - refuse to start if balance is too low
@@ -386,16 +382,16 @@ impl AdaptiveMarketMaker {
             let leverage = self.account_stats.leverage;
             let _margin_usage = self.account_stats.margin_usage;
 
-            // Risk check: leverage too high - skip trading
-            if leverage > self.max_leverage {
+            // Risk check: leverage too high - only allow closing orders
+            let leverage_too_high = leverage > self.max_leverage;
+            if leverage_too_high {
                 warn!(
-                    "⚠️  Leverage too high: {:.2}x > {:.2}x, skipping quotes",
+                    "⚠️  Leverage too high: {:.2}x > {:.2}x, will only quote to reduce leverage",
                     leverage, self.max_leverage
                 );
                 // Cancel existing orders to reduce risk
                 self.cancel_all_orders().await;
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-                continue;
+                // Don't continue - allow closing orders below
             }
 
             // Risk check: insufficient balance
@@ -428,57 +424,19 @@ impl AdaptiveMarketMaker {
             let total_exposure: f64 = real_position;
 
             // Step 2.5: Check for trapped position (套牢检测)
+            // When position exceeds max, cancel all orders but continue to normal quoting
+            // The position limits (can_buy/can_sell) will prevent adding more exposure
             if total_exposure.abs() > self.max_position {
                 warn!(
-                    "⚠️  Position trapped: {:.4} ETH > max {:.4} ETH, closing excess...",
+                    "⚠️  Position trapped: {:.4} ETH > max {:.4} ETH, will only quote to reduce position",
                     total_exposure, self.max_position
                 );
 
-                // Cancel all orders first
+                // Cancel all orders to start fresh
                 self.cancel_all_orders().await;
 
-                // Read current market price
-                let exchanges = self.shm_reader.read_all_exchanges(self.symbol_id);
-                let lighter_bbo = exchanges
-                    .iter()
-                    .find(|(exch_id, _)| *exch_id == 2)
-                    .map(|(_, msg)| msg);
-
-                if lighter_bbo.is_none() {
-                    warn!("⚠️  No Lighter BBO data available, skipping close");
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    continue;
-                }
-
-                let bbo = lighter_bbo.unwrap();
-                if bbo.bid_price <= 0.0 || bbo.ask_price <= 0.0 {
-                    warn!("⚠️  Invalid BBO prices: bid={:.2} ask={:.2}, skipping close", bbo.bid_price, bbo.ask_price);
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    continue;
-                }
-                let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
-
-                // Calculate excess position to close
-                let excess = total_exposure.abs() - self.max_position;
-                let close_side = if total_exposure > 0.0 {
-                    OrderSide::Sell
-                } else {
-                    OrderSide::Buy
-                };
-
-                // Close excess with market order
-                match self.http_client.place_market_order(
-                    self.market_id,
-                    close_side,
-                    excess,
-                    mid_price
-                ).await {
-                    Ok(_) => info!("✅ Closed excess position: {:.4} ETH", excess),
-                    Err(e) => error!("❌ Failed to close excess position: {:?}", e),
-                }
-
-                tokio::time::sleep(Duration::from_millis(2000)).await;
-                continue;
+                // Don't use continue - let normal quoting logic handle it
+                // The can_buy/can_sell checks will prevent adding more exposure
             }
 
             // Step 3: Read market data
@@ -523,14 +481,18 @@ impl AdaptiveMarketMaker {
             let should_requote_bid = self.should_requote(&self.active_bid, our_bid);
             let should_requote_ask = self.should_requote(&self.active_ask, our_ask);
 
-            // Place buy order - always place unless at max long position
+            // Place buy order - always place unless at max long position or leverage too high
             if should_requote_bid {
                 // Check if we can add more long exposure (90% threshold)
-                let can_buy = total_exposure < self.max_position * 0.9;
+                let can_buy = total_exposure < self.max_position * 0.9 && !leverage_too_high;
 
                 if !can_buy {
-                    debug!("⏸️  Skipping buy order: position {:.4} >= 90% of max {:.4}",
-                           total_exposure, self.max_position);
+                    if leverage_too_high {
+                        debug!("⏸️  Skipping buy order: leverage {:.2}x too high", leverage);
+                    } else {
+                        debug!("⏸️  Skipping buy order: position {:.4} >= 90% of max {:.4}",
+                               total_exposure, self.max_position);
+                    }
                 } else {
                     if let Some(ref order) = self.active_bid {
                         if let Ok(order_index) = order.order_id.parse::<i64>() {
@@ -568,14 +530,21 @@ impl AdaptiveMarketMaker {
                 }
             }
 
-            // Place sell order - always place unless at max short position
+            // Place sell order - always place unless at max short position or (leverage too high AND would increase exposure)
             if should_requote_ask {
                 // Check if we can add more short exposure (90% threshold)
-                let can_sell = total_exposure > -self.max_position * 0.9;
+                // If leverage is too high, only allow sell if we have long position (closing)
+                let would_close_long = total_exposure > 0.0;
+                let can_sell = total_exposure > -self.max_position * 0.9
+                    && (!leverage_too_high || would_close_long);
 
                 if !can_sell {
-                    debug!("⏸️  Skipping sell order: position {:.4} <= -90% of max {:.4}",
-                           total_exposure, self.max_position);
+                    if leverage_too_high && !would_close_long {
+                        debug!("⏸️  Skipping sell order: leverage {:.2}x too high and no long position to close", leverage);
+                    } else {
+                        debug!("⏸️  Skipping sell order: position {:.4} <= -90% of max {:.4}",
+                               total_exposure, self.max_position);
+                    }
                 } else {
                     if let Some(ref order) = self.active_ask {
                         if let Ok(order_index) = order.order_id.parse::<i64>() {
