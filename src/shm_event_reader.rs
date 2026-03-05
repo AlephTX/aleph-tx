@@ -87,12 +87,12 @@ impl ShmEventReader {
     ///
     /// # Safety
     ///
-    /// Uses volatile read to prevent compiler optimizations that could cause
-    /// torn reads. The Go writer updates this atomically.
+    /// Uses AtomicU64::load(Acquire) to pair with Go's atomic.StoreUint64(Release).
+    /// This ensures all event slot writes are visible before we read them.
     #[inline]
     fn read_write_idx(&self) -> u64 {
-        let ptr = self.mmap.as_ptr() as *const u64;
-        unsafe { std::ptr::read_volatile(ptr) }
+        let ptr = self.mmap.as_ptr() as *const std::sync::atomic::AtomicU64;
+        unsafe { (*ptr).load(Ordering::Acquire) }
     }
 
     /// Read an event from a specific slot

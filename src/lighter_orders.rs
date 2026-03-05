@@ -24,6 +24,14 @@ pub struct LighterHttpClient {
     nonce: Arc<parking_lot::Mutex<i64>>,
     nonce_initialized: Arc<parking_lot::Mutex<bool>>,
     client_order_counter: Arc<parking_lot::Mutex<i64>>,
+    /// size_decimals per market_id, lazily populated
+    market_decimals: Arc<parking_lot::Mutex<Option<MarketDecimals>>>,
+}
+
+/// Cached market decimal info
+#[derive(Debug, Clone)]
+struct MarketDecimals {
+    entries: Vec<(u8, u8, u8)>, // (market_id, size_decimals, price_decimals)
 }
 
 impl LighterHttpClient {
@@ -67,6 +75,7 @@ impl LighterHttpClient {
                     .unwrap()
                     .as_secs() as i64
             )),
+            market_decimals: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -131,6 +140,62 @@ impl LighterHttpClient {
         *nonce = server_nonce;
         tracing::info!("✅ Nonce reset to: {}", server_nonce);
         Ok(())
+    }
+
+    /// Fetch and cache market decimals from orderBookDetails
+    async fn get_market_decimals(&self, market_id: u8) -> Result<(u8, u8)> {
+        // Check cache first
+        {
+            let cache = self.market_decimals.lock();
+            if let Some(ref md) = *cache {
+                if let Some(&(_, sd, pd)) = md.entries.iter().find(|(mid, _, _)| *mid == market_id) {
+                    return Ok((sd, pd));
+                }
+            }
+        }
+
+        // Fetch from API
+        #[derive(serde::Deserialize)]
+        struct MarketDetail {
+            market_id: u8,
+            size_decimals: u8,
+            price_decimals: u8,
+        }
+        #[derive(serde::Deserialize)]
+        struct OBResp {
+            order_book_details: Vec<MarketDetail>,
+        }
+
+        let url = format!("{}/api/v1/orderBookDetails", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(TradingError::OrderFailed(format!(
+                "orderBookDetails HTTP {}", resp.status()
+            )));
+        }
+        let details: OBResp = resp.json().await
+            .map_err(|e| TradingError::OrderFailed(format!("Parse orderBookDetails: {}", e)))?;
+
+        let entries: Vec<(u8, u8, u8)> = details
+            .order_book_details
+            .iter()
+            .map(|m| (m.market_id, m.size_decimals, m.price_decimals))
+            .collect();
+
+        let result = entries
+            .iter()
+            .find(|(mid, _, _)| *mid == market_id)
+            .map(|&(_, sd, pd)| (sd, pd))
+            .ok_or_else(|| TradingError::OrderFailed(
+                format!("Market {} not found in orderBookDetails", market_id)
+            ))?;
+
+        // Cache
+        let mut cache = self.market_decimals.lock();
+        *cache = Some(MarketDecimals { entries });
+
+        tracing::info!("Market {} decimals: size={} price={}", market_id, result.0, result.1);
+        Ok(result)
     }
 
     /// Place a limit order with optimistic accounting and retry logic
@@ -229,12 +294,10 @@ impl LighterHttpClient {
             current
         };
 
-        // Convert price to Lighter format (price * 100, in cents)
-        // E.g., $2061.50 -> 206150
-        let price_int = (order_req.price * 100.0) as u32;
-
-        // Convert size to base_amount (size * 10^6)
-        let base_amount = (order_req.size * 1_000_000.0) as i64;
+        // Convert price/size using dynamic market decimals
+        let (size_dec, price_dec) = self.get_market_decimals(order_req.market_id as u8).await?;
+        let price_int = (order_req.price * 10f64.powi(price_dec as i32)) as u32;
+        let base_amount = (order_req.size * 10f64.powi(size_dec as i32)) as i64;
 
         // Sign transaction via FFI
         let signed_tx = self
@@ -336,10 +399,11 @@ impl LighterHttpClient {
             OrderSide::Buy => current_price * 1.05,  // Pay up to 5% more
             OrderSide::Sell => current_price * 0.95, // Accept 5% less
         };
-        let price_int = (slippage_price * 100.0) as u32;
+        let (size_dec, price_dec) = self.get_market_decimals(market_id as u8).await?;
+        let price_int = (slippage_price * 10f64.powi(price_dec as i32)) as u32;
 
         // Convert size to base_amount
-        let base_amount = (size * 1_000_000.0) as i64;
+        let base_amount = (size * 10f64.powi(size_dec as i32)) as i64;
 
         // Sign transaction via FFI
         // Use reduce_only to close position without requiring additional margin
