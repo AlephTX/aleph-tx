@@ -9,6 +9,9 @@
 //! - cancel_order / cancel_all — 撤单
 //! - get_order / get_active_orders / verify_order — 查询验证
 
+use crate::shadow_ledger::ShadowLedger;
+use parking_lot::RwLock;
+
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -178,6 +181,8 @@ pub struct LighterTrading {
     nonce: AtomicI64,
     nonce_init: TokioMutex<bool>,
     client_order_counter: AtomicI64,
+    /// Optional shadow ledger for optimistic position tracking
+    ledger: Option<Arc<RwLock<ShadowLedger>>>,
 }
 
 impl LighterTrading {
@@ -245,6 +250,7 @@ impl LighterTrading {
             nonce: AtomicI64::new(0),
             nonce_init: TokioMutex::new(false),
             client_order_counter: AtomicI64::new(counter_start),
+            ledger: None,
         })
     }
 
@@ -278,6 +284,11 @@ impl LighterTrading {
             .ok_or_else(|| anyhow::anyhow!("Market {} not found in orderBookDetails", market_id))?;
 
         Ok((market.size_decimals, market.price_decimals))
+    }
+
+    /// Attach a shadow ledger for optimistic position tracking
+    pub fn set_ledger(&mut self, ledger: Arc<RwLock<ShadowLedger>>) {
+        self.ledger = Some(ledger);
     }
 
     // ─── Nonce 管理 ────────────────────────────────────────────────────────
@@ -484,6 +495,15 @@ impl LighterTrading {
 
     /// 通用下单
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+        // Optimistic accounting: update in_flight before API call
+        let signed_size = match params.side {
+            Side::Buy => params.size,
+            Side::Sell => -params.size,
+        };
+        if let Some(ref ledger) = self.ledger {
+            ledger.write().add_in_flight(signed_size);
+        }
+
         let (tx_type, tx_info, tx_hash, client_order_index) = self
             .sign_order(params.side, params.price, params.size, params.order_type, params.reduce_only)
             .await?;
@@ -493,10 +513,19 @@ impl LighterTrading {
             params.side, params.price, params.size, tx_hash, client_order_index
         );
 
-        self.send_tx(tx_type, tx_info).await?;
-
-        tracing::info!("Order submitted: tx_hash={}", tx_hash);
-        Ok(OrderResult { tx_hash, client_order_index })
+        match self.send_tx(tx_type, tx_info).await {
+            Ok(_) => {
+                tracing::info!("Order submitted: tx_hash={}", tx_hash);
+                Ok(OrderResult { tx_hash, client_order_index })
+            }
+            Err(e) => {
+                // Rollback in_flight on failure
+                if let Some(ref ledger) = self.ledger {
+                    ledger.write().add_in_flight(-signed_size);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// 下买单（限价）

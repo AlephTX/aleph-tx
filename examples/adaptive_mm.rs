@@ -36,7 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_stats_reader = AccountStatsReader::open("/dev/shm/aleph-account-stats")?;
 
     // Initialize LighterTrading (market_id=0 = ETH perps)
-    let trading = Arc::new(LighterTrading::new(0).await?);
+    let mut trading = LighterTrading::new(0).await?;
+    trading.set_ledger(Arc::clone(&ledger_state));
+    let trading = Arc::new(trading);
 
     // symbol_id=1002 is ETH, market_id=0 is ETH-USDC
     let mut strategy = AdaptiveMarketMaker::new(

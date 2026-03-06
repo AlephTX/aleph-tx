@@ -208,7 +208,7 @@ func (lp *LighterPrivate) processOrder(order *lighterOrder) {
 	case "open":
 		// Order created
 		initialSize, _ := strconv.ParseFloat(order.InitialBaseAmount, 64)
-		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize)
+		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize, order.IsAsk)
 
 	case "canceled":
 		// Order canceled
@@ -262,6 +262,7 @@ func (lp *LighterPrivate) processTrade(trade *lighterTrade) {
 		fillSize,
 		remainingSize,
 		feePaid,
+		trade.IsMakerAsk,
 	)
 }
 

@@ -39,7 +39,8 @@ type ShmPrivateEvent struct {
 	FillSize      float64 // 8 bytes (offset 32)
 	RemainingSize float64 // 8 bytes (offset 40)
 	FeePaid       float64 // 8 bytes (offset 48)
-	_padding      [8]byte // 8 bytes (offset 56) - total = 64 bytes
+	IsAsk         uint8   // 1 byte  (offset 56) - 1=ask/sell, 0=bid/buy
+	_padding      [7]byte // 7 bytes (offset 57) - total = 64 bytes
 }
 
 // EventRingBuffer is a lock-free ring buffer for private events.
@@ -122,13 +123,18 @@ func (rb *EventRingBuffer) Push(event ShmPrivateEvent) {
 }
 
 // PushOrderCreated is a convenience method for order created events
-func (rb *EventRingBuffer) PushOrderCreated(exchangeID uint8, symbolID uint16, orderID uint64, size float64) {
+func (rb *EventRingBuffer) PushOrderCreated(exchangeID uint8, symbolID uint16, orderID uint64, size float64, isAsk bool) {
+	var isAskByte uint8
+	if isAsk {
+		isAskByte = 1
+	}
 	rb.Push(ShmPrivateEvent{
 		ExchangeID:    exchangeID,
 		EventType:     EventTypeOrderCreated,
 		SymbolID:      symbolID,
 		OrderID:       orderID,
 		RemainingSize: size,
+		IsAsk:         isAskByte,
 	})
 }
 
@@ -138,7 +144,12 @@ func (rb *EventRingBuffer) PushOrderFilled(
 	symbolID uint16,
 	orderID uint64,
 	fillPrice, fillSize, remainingSize, feePaid float64,
+	isAsk bool,
 ) {
+	var isAskByte uint8
+	if isAsk {
+		isAskByte = 1
+	}
 	rb.Push(ShmPrivateEvent{
 		ExchangeID:    exchangeID,
 		EventType:     EventTypeOrderFilled,
@@ -148,6 +159,7 @@ func (rb *EventRingBuffer) PushOrderFilled(
 		FillSize:      fillSize,
 		RemainingSize: remainingSize,
 		FeePaid:       feePaid,
+		IsAsk:         isAskByte,
 	})
 }
 
