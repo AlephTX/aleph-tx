@@ -155,11 +155,17 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 			}
 
 			// Process orders
+			if len(env.Orders) > 0 {
+				log.Printf("lighter-private: received %d order event(s)", len(env.Orders))
+			}
 			for _, order := range env.Orders {
 				lp.processOrder(&order)
 			}
 
 			// Process trades
+			if len(env.Trades) > 0 {
+				log.Printf("lighter-private: received %d trade event(s)", len(env.Trades))
+			}
 			for _, trade := range env.Trades {
 				lp.processTrade(&trade)
 			}
@@ -196,6 +202,7 @@ func (lp *LighterPrivate) processOrder(order *lighterOrder) {
 	}
 
 	orderID := uint64(order.OrderIndex)
+	log.Printf("lighter-private: order event: id=%d status=%s market=%d", orderID, order.Status, order.MarketIndex)
 
 	switch order.Status {
 	case "open":
@@ -218,6 +225,9 @@ func (lp *LighterPrivate) processTrade(trade *lighterTrade) {
 	if !ok {
 		return
 	}
+
+	log.Printf("lighter-private: trade event: id=%d market=%d price=%s size=%s maker_ask=%v",
+		trade.TradeID, trade.MarketID, trade.Price, trade.Size, trade.IsMakerAsk)
 
 	// Determine which order ID belongs to this account
 	// TODO: Need to track which orders are ours

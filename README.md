@@ -1,297 +1,159 @@
-# AlephTX: The Ultimate Quantitative Trading & Arbitrage Framework
+# AlephTX
 
-AlephTX is an institutional-grade, zero-latency high-frequency trading (HFT) and cross-chain arbitrage framework. Designed with a split architecture (Rust Core & Go Feeder), it bridges the gap between massive concurrent I/O scaling and microsecond-level order execution.
+Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
 
-> **"The speed of light is our only real limit."**
+## Architecture
 
-## 🏗️ System Architecture
+```
+                          Go Feeder                              Rust Core
+              ┌─────────────────────────┐          ┌─────────────────────────────┐
+              │  Lighter WS (Public)    │          │  ShmReader (Seqlock)        │
+              │  Lighter WS (Private)   │──SHM──▶  │  ShmEventReader (SPSC Ring) │
+              │  Lighter WS (Account)   │          │  AccountStatsReader         │
+              │  Hyperliquid / Backpack │          │          │                  │
+              │  EdgeX / 01 / Mock      │          │          ▼                  │
+              └─────────────────────────┘          │  ┌───────────────────┐      │
+                                                   │  │ Shadow Ledger     │      │
+              Shared Memory Regions:               │  │ (real + in_flight)│      │
+              /dev/shm/aleph-matrix    (656KB)     │  └───────┬───────────┘      │
+              /dev/shm/aleph-events    (64KB)      │          │                  │
+              /dev/shm/aleph-account-stats (128B)  │          ▼                  │
+                                                   │  Strategy Engine            │
+                                                   │  ├─ AdaptiveMM (Lighter)   │
+                                                   │  ├─ LighterMM              │
+                                                   │  ├─ MarketMaker (EdgeX)    │
+                                                   │  ├─ BackpackMM             │
+                                                   │  └─ ArbitrageEngine        │
+                                                   │          │                  │
+                                                   │          ▼                  │
+                                                   │  FFI Sign + HTTP Direct    │
+                                                   │  (No Boomerang Execution)  │
+                                                   └─────────────────────────────┘
+```
 
-The core of AlephTX is designed around a **Lock-Free Zero-Copy Shared Memory Matrix** (`/dev/shm/aleph-matrix`).
+### Key Design Principles
 
-### 1. The Feeder (Go)
-Located in `/feeder`, this component is a highly-concurrent WebSocket aggregator that:
-- Connects to multiple exchanges (Backpack, EdgeX, Hyperliquid, etc.)
-- Normalizes market data into a unified format
-- Writes BBO (Best Bid/Offer) updates to shared memory with atomic version tracking
-- Handles reconnection and error recovery automatically
+- **Dual-Track IPC**: Track 1 (BBO state via seqlock matrix) + Track 2 (private events via SPSC ring buffer)
+- **No Boomerang Execution**: Rust fires HTTP orders directly to exchanges. Never sends execution commands back to Go.
+- **Optimistic Accounting**: Shadow ledger updates `in_flight_pos` before API call; background task reconciles via event stream.
+- **Zero Heap Allocations** on hot path (quoting loop < 250ns per tick)
 
-**Key Features**:
-- Zero-copy writes to shared memory
-- Atomic version updates for change detection
-- Sub-millisecond latency from WebSocket to shared memory
+## Quick Start
 
-### 2. The Core (Rust)
-The Rust core reads from shared memory and executes trading strategies:
-- Lock-free polling via version-based change detection
-- Multiple strategy support (Market Making, Arbitrage)
-- Parallel order submission with rate limiting
-- Real-time risk management and PnL tracking
+```bash
+# 1. Configure
+cp config.example.toml config.toml
+# Edit config.toml for your risk parameters
 
-**Supported Exchanges**:
-- ✅ **Backpack**: Perpetual futures (BTC_USDC_PERP, ETH_USDC_PERP)
-- ✅ **EdgeX**: StarkNet-based perpetuals (Contract IDs: 10000001, 10000002)
-- 🚧 Hyperliquid, 01.exchange (infrastructure ready)
+# 2. Set credentials
+cp .env.lighter.example .env.lighter
+# Fill in API_KEY_PRIVATE_KEY, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX
 
-### 3. Symbol ID Architecture
+# 3. Build & Run (always use Makefile)
+make build              # Build Go feeder + Rust core
+make adaptive-up        # Start feeder + adaptive market maker
+make adaptive-logs      # Monitor logs
+make adaptive-down      # Stop and clean up
+```
 
-**Unified Symbol IDs** across exchanges:
-- `Symbol 1001`: BTC perpetuals (all exchanges)
-- `Symbol 1002`: ETH perpetuals (all exchanges)
+## Make Targets
 
-**Exchange IDs**:
-- `Exchange 3`: EdgeX
-- `Exchange 5`: Backpack
+| Target | Description |
+|--------|-------------|
+| `make build` | Build all binaries (Go feeder + Rust) |
+| `make test-up` / `test-down` / `test-logs` | Integration test environment |
+| `make adaptive-up` / `adaptive-down` / `adaptive-logs` | Production adaptive MM |
+| `make status` | Show all running strategies |
+| `make clean` | Clean build artifacts |
 
-This design enables cross-exchange arbitrage while maintaining clean separation.
+## Project Structure
 
----
+```
+aleph-tx/
+├── feeder/              # Go: WebSocket ingestion, CGO FFI exports
+│   ├── exchanges/       #   Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
+│   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats)
+│   ├── config/          #   TOML config loader
+│   ├── cmd/             #   Standalone CLI test tools
+│   └── test/            #   Integration tests (auth, stream, order)
+├── src/                 # Rust: HFT strategy engine
+│   ├── strategy/        #   Strategy implementations (adaptive_mm, lighter_mm, arbitrage, etc.)
+│   ├── backpack_api/    #   Backpack REST client (Ed25519)
+│   ├── edgex_api/       #   EdgeX REST client (StarkNet Pedersen)
+│   ├── types/           #   Core types + C-ABI event struct (64 bytes)
+│   └── bin/             #   Diagnostic tools (monitors, SHM inspection)
+├── examples/            # Entry point binaries for make targets
+├── lib/                 # Pre-built FFI shared library (Lighter signer)
+├── scripts/             # Operational shell scripts
+├── docs/                # Reference documentation
+└── proto/               # gRPC service definitions
+```
 
-## 🎯 Current Status (v3.1)
+## Supported Exchanges
 
-### ✅ Production Ready
-- **Backpack Market Making**: Active, 6 bps spread, $110 equity
-- **EdgeX Market Making**: Active, 8 bps spread, rate-limited to 2 req/2s
-- **Shared Memory IPC**: < 1ms latency, 100% uptime
-- **Order Success Rate**: 100% (after rate limiting fixes)
+| Exchange | Role | Auth | Status |
+|----------|------|------|--------|
+| **Lighter DEX** | Primary (HFT MM) | Poseidon2 + EdDSA via FFI | Production |
+| **Backpack** | Secondary (MM) | Ed25519 | Ready |
+| **EdgeX** | Secondary (MM) | StarkNet Pedersen | Ready |
+| **Hyperliquid** | Data feed | - | Feed only |
+| **01 Exchange** | Data feed | - | Feed only |
 
-### 📊 Performance Metrics
-- **Tick-to-Quote Latency**: < 1ms (shared memory read)
-- **Quote-to-Submit Latency**: 250-400ms (API round-trip)
-- **Order Throughput**: 35 quotes/min (both exchanges)
-- **Uptime**: 99.9%+ (auto-reconnect on failures)
+## Strategy: Adaptive Market Maker (Primary)
 
-### 🔧 Recent Optimizations
-1. **Spread Optimization**: Reduced from 18/25 bps to 6/8 bps
-2. **Rate Limiting**: Added 1.2s delay after cancel_all for EdgeX compliance
-3. **Balance API**: Implemented Backpack collateral endpoint for accurate equity
-4. **Risk Management**: Dynamic position sizing based on account equity
+The production strategy (`src/strategy/adaptive_mm.rs`) implements fee-aware HFT with microstructure signals:
 
----
+- **Fee-Aware Spread**: Ensures spread > round-trip fee (0.76 bps for Premium account)
+- **Microstructure Tracker**: EWMA fast/slow momentum, realized volatility, adverse selection score
+- **Inventory Skew**: Linear position-based adjustment to flatten exposure
+- **Batch Quoting**: Paired bid/ask via `sendTxBatch` for atomic updates
+- **Dynamic Sizing**: Position scaled by leverage and available balance from account stats
 
-## 🛠️ Usage
+## Configuration
 
-### Quick Start
-
-1. **Setup Configuration**:
-   ```bash
-   # Copy and edit config
-   cp config.toml config.toml.backup
-   # Edit config.toml for your risk parameters
-   ```
-
-2. **Start Go Feeder** (Terminal 1):
-   ```bash
-   cd feeder
-   ./feeder > feeder.log 2>&1 &
-   ```
-
-3. **Start Rust Core** (Terminal 2):
-   ```bash
-   cargo run --release --bin aleph-tx
-   ```
-
-### Configuration
-
-**Backpack** (`config.toml`):
 ```toml
+# config.toml (copy from config.example.toml)
 [backpack]
-risk_fraction = 0.20        # 20% of equity at risk
-min_spread_bps = 6.0        # Minimum 6 bps spread
-vol_multiplier = 2.5        # Spread = max(6, vol × 2.5)
-requote_interval_ms = 3000  # Update every 3 seconds
-```
+risk_fraction = 0.20          # Fraction of equity at risk
+min_spread_bps = 6.0          # Minimum half-spread (bps)
+vol_multiplier = 2.5          # spread = max(min_spread, vol * multiplier)
+requote_interval_ms = 3000    # Re-quote interval
 
-**EdgeX** (`config.toml`):
-```toml
 [edgex]
-risk_fraction = 0.10        # 10% of equity at risk
-min_spread_bps = 8.0        # Minimum 8 bps (higher fees)
-vol_multiplier = 3.0
-requote_interval_ms = 5000  # 5s to comply with rate limits
+risk_fraction = 0.10
+min_spread_bps = 8.0          # Higher fees -> wider spread
+requote_interval_ms = 5000    # Rate limit: 2 req/2s
 ```
 
-### Monitoring
+## Credentials
 
 ```bash
-# Real-time performance monitor
-cargo run --bin performance_monitor
+# .env.lighter
+API_KEY_PRIVATE_KEY=<hex>
+LIGHTER_ACCOUNT_INDEX=<int>
+LIGHTER_API_KEY_INDEX=<int>
 
-# Check Backpack account
-cargo run --bin bp_debug
+# .env.backpack
+BACKPACK_PUBLIC_KEY=<key>
+BACKPACK_SECRET_KEY=<key>
 
-# Check EdgeX account
-cargo run --bin edgex_debug
-
-# View live logs
-tail -f /tmp/aleph-tx.log | grep -E "(💰|🎒|🔌)"
+# .env.edgex
+EDGEX_STARK_PRIVATE_KEY=<hex>
+EDGEX_ACCOUNT_ID=<id>
 ```
 
----
+## Documentation
 
-## 📈 Strategy Details
+| Document | Description |
+|----------|-------------|
+| `CLAUDE.md` (root + per-directory) | Auto-loaded technical context for Claude Code |
+| `docs/QUICKSTART.md` | Step-by-step deployment guide |
+| `docs/ADAPTIVE_MM_GUIDE.md` | Adaptive MM operational guide |
+| `docs/OPTIMIZATION_GUIDE.md` | Strategy math models and parameter tuning |
+| `docs/DUAL_TRACK_IPC.md` | IPC architecture deep-dive |
+| `docs/ORDER_EXECUTION_REDESIGN.md` | Order execution architecture decisions |
+| `CHANGELOG.md` | Version history |
 
-### Market Making Strategy (v3)
-
-**Core Logic**:
-1. **Volatility Estimation**: Rolling standard deviation (120 samples)
-2. **Spread Calculation**: `max(min_spread, realized_vol × multiplier)`
-3. **Inventory Management**: Linear skew based on position
-4. **Momentum Detection**: Widen spread on losing side when momentum > threshold
-5. **Stop Loss**: Automatic position closure at 0.5% equity loss
-
-**Order Flow**:
-```
-Every requote_interval:
-1. Cancel all existing orders (with rate limiting)
-2. Calculate new bid/ask prices
-3. Submit new orders (parallel for Backpack, serial for EdgeX)
-```
-
-**Rate Limiting** (EdgeX):
-- Limit: 2 requests / 2 seconds for order operations
-- Solution: 1.2s delay after cancel_all before submitting new orders
-- Result: 0% 429 errors
-
----
-
-## 🚀 Roadmap
-
-### Phase 1: Core Stability ✅
-- [x] **Shared Memory IPC**: Lock-free, zero-copy communication
-- [x] **Multi-Exchange Support**: Backpack, EdgeX operational
-- [x] **Market Making**: Dynamic spread, inventory management
-- [x] **Rate Limiting**: Compliant with exchange limits
-
-### Phase 2: Advanced Features 🚧
-- [x] **Real-time PnL Tracking**: Framework ready (advanced_mm.rs)
-- [ ] **Incremental Order Updates**: Reduce API calls by 70%
-- [ ] **EWMA Volatility**: Faster response to market changes
-- [ ] **Avellaneda-Stoikov Pricing**: Optimal spread calculation
-- [ ] **Adverse Selection Detection**: Auto-widen on toxic flow
-
-### Phase 3: Institutional Grade 📋
-- [ ] **WebSocket Order Flow**: Eliminate REST API latency
-- [ ] **Multi-Asset Portfolio**: Cross-asset risk management
-- [ ] **Machine Learning Signals**: Price prediction models
-- [ ] **FPGA Acceleration**: Hardware-level order generation
-
----
-
-## 🔒 Security & Risk
-
-### API Key Management
-```bash
-# Store credentials in .env files (not committed)
-.env.backpack  # BACKPACK_PUBLIC_KEY, BACKPACK_SECRET_KEY
-.env.edgex     # EDGEX_STARK_PRIVATE_KEY, EDGEX_ACCOUNT_ID
-```
-
-### Risk Controls
-- **Position Limits**: Dynamic based on account equity
-- **Stop Loss**: Automatic at 0.5% equity loss
-- **Max Position**: Calculated as `(equity × risk_fraction) / price`
-- **Order Size**: `max_position / 3` for gradual entry
-
----
-
-## 📚 Documentation
-
-- **OPTIMIZATION_GUIDE.md**: Detailed optimization strategies and math models
-- **STATUS_REPORT.txt**: Current system status and performance
-- **config.optimized.toml**: Recommended aggressive settings
-
----
-
-## 🤝 Contributing
-
-This is a production trading system. Changes should be:
-1. Tested in simulation first
-2. Reviewed for risk implications
-3. Documented with performance impact
-
----
-
-## ⚠️ Disclaimer
+## Disclaimer
 
 This software is for educational and research purposes. Trading cryptocurrencies involves substantial risk of loss. Use at your own risk.
-
----
-
-## 📊 Performance Summary
-
-| Metric | Target | Current | Status |
-|--------|--------|---------|--------|
-| Tick-to-Quote | < 5ms | < 1ms | ✅ Excellent |
-| Order Success Rate | > 95% | 100% | ✅ Perfect |
-| Uptime | > 99% | 99.9%+ | ✅ Excellent |
-| Spread (Backpack) | 6-10 bps | 6 bps | ✅ Optimal |
-| Spread (EdgeX) | 8-12 bps | 8 bps | ✅ Optimal |
-| 429 Error Rate | < 1% | 0% | ✅ Perfect |
-
-**System Level**: Tier-2 Quantitative Firm (DRW, Optiver level)
-**Target**: Tier-1 (Citadel, Jump Trading level)
-
----
-
-Built with ❤️ for high-frequency trading multiplexer. It connects to dozens of different exchanges (Hyperliquid, EdgeX, Lighter, Backpack, 01, etc.) via WebSockets. It normalizes all orderbook data and writes it directly to the OS shared memory.
-*   **Dynamic Configuration**: Exchanges and symbols are dynamically loaded from `config.toml`.
-*   **Fault Tolerant**: Handles WebSocket disconnects, rate limits, and reconnection jitter natively.
-
-### 2. The Core Engine (Rust)
-Located in `src/`, the true heart of AlephTX. Bypassing standard JSON-RPC overheads, it reads directly from the shared memory matrix using seqlocks.
-*   **Sub-microsecond Latency**: The polling loop takes less than 250 nanoseconds to detect a global market shift.
-*   **Strategy Engine**: Multiplexes shared memory events through a `Strategy` trait interface, allowing dozens of concurrent trading algorithms to react simultaneously.
-
-## � Supported Trading Modalities
-
-### Cross-Exchange Arbitrage (`strategy/arbitrage.rs`)
-The system simultaneously scans all interconnected exchanges. When a mispricing (spread) between Exchange A (e.g., Hyperliquid) and Exchange B (e.g., EdgeX) exceeds the configured trigger, it fires a parallel execution signal to both networks.
-
-### Single-Exchange Quantitative Strategies (`strategy/market_maker.rs`)
-AlephTX isn't just for arbitrage. Using the powerful Rust `Strategy` multiplexer, quantitative developers can implement local strategies:
-*   High-Frequency Market Making (Grid Trading)
-*   Statistical Arbitrage (Mean Reversion)
-*   Momentum Ignition & Trend Following
-
----
-
-## 🚀 Grand Vision & Roadmap
-
-Our long-term masterplan is to establish AlephTX as the dominant unseen force across decentralized derivative markets (EVM, Solana, AppChains).
-
-### Phase 1: Foundation (Completed)
-- [x] Integrate Hyperliquid, EdgeX, Lighter, Backpack, and 01 Exchange via WebSockets.
-- [x] Build shared memory lock-free matrix for Zero-Copy IPC.
-- [x] Implement Rust Strategy Engine Base (Arbitrage + Single-Exchange Quant).
-- [x] Refactor Go feeder into a unified Configuration architecture.
-
-### Phase 2: Execution & Routing (Up Next)
-- [ ] **Smart Order Routing (SOR)**: Optimize swap paths to minimize slippage across split-routing.
-- [ ] **Native Wallets & Signing**: Implement highly optimized Ed25519 & ECDSA signing natively in Rust.
-- [ ] **Inventory Management**: Global real-time risk evaluation and portfolio balancing.
-
-### Phase 3: Hardware & Dominance
-- [ ] **FPGA Acceleration**: Move the shared memory reading and order generation directly to hardware logic gates.
-- [ ] **Proprietary Network Stack**: Bypass kernel TCP/IP using Kernel Bypass (DPDK/Solarflare) for sub-10 microsecond tick-to-trade.
-- [ ] **Cross-Chain Atomic Settlement**: Exploit block-space arbitrage directly on L1/L2 sequencers.
-
----
-
-## 🛠️ Usage
-
-1. Setup the configuration:
-   ```bash
-   cp config.example.toml config.toml
-   # Edit config.toml to enable/disable specific exchanges
-   ```
-
-2. Run the Data Feeder (Terminal 1)
-   ```bash
-   cd feeder
-   go run .
-   ```
-
-3. Run the Arbitrage & Strategy Core (Terminal 2)
-   ```bash
-   cargo run --release
-   ```

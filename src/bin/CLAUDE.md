@@ -24,7 +24,6 @@ alwaysApply: true
 | deep_analyze.rs | Advanced orderbook statistics |
 | bp_debug.rs | Backpack API debugging |
 | edgex_debug.rs | EdgeX API debugging |
-| direct_reader.rs | Direct SHM matrix reader test |
 
 ## Usage
 
