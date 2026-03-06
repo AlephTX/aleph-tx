@@ -1,19 +1,78 @@
-# AlephTX Go Feeder Guidelines (Network I/O & CGO)
+---
+description: Go feeder - WebSocket ingestion, CGO FFI exports, shared memory IPC writers
+alwaysApply: true
+---
 
-You are operating in the Go Feeder. Your job is network ingestion, WebSocket management, and CGO FFI exports.
+# feeder/
 
-## 🌉 1. CGO Export Constraints (CRITICAL)
-When writing exported functions (`//export MyFunc`) for Rust to call:
-- **String Allocation & Freeing**: When returning strings (like signatures) to Rust, use `C.CString`. You MUST provide a corresponding `//export FreeCString(s *C.char)` function using `C.free` so Rust can clean it up safely.
-- **No Go Pointers in C**: Never pass memory containing Go pointers (managed by Go GC) to C/Rust code.
-- **Error Handling**: CGO does not support multiple return values. Return structured C-structs or pass pre-allocated error buffer pointers from Rust.
+> Go-based market data feeder: multi-exchange WS ingestion -> shared memory BBO matrix + event ring buffer.
 
-## 🚀 2. Shared Memory Writers (IPC)
-- **C-ABI Memory Layout**: Structs shared with Rust (e.g., `ShmPrivateEvent` in `shm/events.go`) MUST match byte-for-byte. Check Go's implicit padding. Insert `_pad1 uint32` and `_padding [8]byte` explicitly to ensure the total size is EXACTLY 64 bytes. Assert size in `init()` using `unsafe.Sizeof`.
-- **Seqlock Protocol**: When writing to the BBO Matrix (`feeder/shm/matrix.go`), strictly follow: `Seq++ (Odd) -> Write Payload -> Seq++ (Even)`.
-- **Atomic Operations**: Only use `sync/atomic` (`atomic.StoreUint64`, `atomic.AddUint32`) for updating the event RingBuffer `write_idx` and Matrix versions.
+## Key Files
 
-## 📡 3. WebSocket Management
-- **No Blocking**: WebSocket read loops must not block on channel writes.
-- **Auto-Reconnect**: All exchange connections must use the `RunConnectionLoop` pattern for infinite reconnects and backoff.
-- **SDK Usage**: Always prefer using the official SDK (e.g., `lighter-go`) for authentication and stream parsing.
+| File | Description |
+|------|-------------|
+| main.go | Entry point - spawns goroutines per exchange, initializes 3 SHM regions |
+| config.toml | Exchange enable/disable, WS URLs, symbol mappings |
+
+## Subdirectories
+
+| Directory | Description |
+|-----------|-------------|
+| config/ | TOML config loader (`ExchangeConfig` struct) |
+| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01, Mock) |
+| shm/ | Shared memory writers - BBO matrix, event ring buffer, account stats |
+| cmd/ | Standalone CLI tools for testing (lighter_feeder, market_maker, etc.) |
+| ipc/ | Unix socket IPC (legacy, replaced by SHM) |
+| test/ | Integration tests (auth, stream, order) |
+| binance/ | Legacy Binance feeder (unused) |
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Go Feeder (main.go)"
+        CFG[config.toml] --> MAIN[main.go]
+        MAIN --> HL[Hyperliquid WS]
+        MAIN --> LT[Lighter WS Public]
+        MAIN --> LP[Lighter WS Private]
+        MAIN --> LA[Lighter Account Stats]
+        MAIN --> BP[Backpack WS]
+        MAIN --> EX[EdgeX WS]
+        MAIN --> O1[01 WS]
+    end
+
+    subgraph "Shared Memory"
+        HL & LT & BP & EX & O1 -->|Seqlock Write| MTX["/dev/shm/aleph-matrix (656KB)"]
+        LP -->|Ring Buffer Write| EVT["/dev/shm/aleph-events (64KB)"]
+        LA -->|Versioned Write| ACC["/dev/shm/aleph-account-stats (128B)"]
+    end
+
+    MTX & EVT & ACC -->|Lock-free Read| RUST[Rust Strategy Engine]
+```
+
+## CGO Export Constraints (CRITICAL)
+
+- **String Allocation**: When returning strings to Rust via `C.CString`, MUST provide `FreeCString()` for cleanup.
+- **No Go Pointers in C**: Never pass Go GC-managed memory to C/Rust.
+- **Error Handling**: CGO doesn't support multiple return values - use C-structs or error buffer pointers.
+
+## Shared Memory Writers (IPC)
+
+- **C-ABI Layout**: Structs shared with Rust MUST match byte-for-byte. Insert explicit padding to ensure exact sizes (64 bytes for events, 128 bytes for account stats).
+- **Seqlock Protocol**: `Seq++ (Odd) -> Write Payload -> Seq++ (Even)`.
+- **Atomic Operations**: Use `sync/atomic` for ring buffer `write_idx` and matrix versions.
+
+## WebSocket Management
+
+- **No Blocking**: WS read loops must not block on channel writes.
+- **Auto-Reconnect**: All connections use `RunConnectionLoop` pattern with backoff.
+- **SDK Usage**: Prefer official SDKs (e.g., `lighter-go`) for auth and stream parsing.
+
+## Testing
+
+```bash
+make build-feeder   # Build Go feeder
+make test-up        # Start feeder + test strategy
+make test-logs      # Monitor logs
+make test-down      # Stop and clean up
+```
