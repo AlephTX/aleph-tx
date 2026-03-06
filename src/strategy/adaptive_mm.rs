@@ -351,12 +351,11 @@ impl AdaptiveMarketMaker {
         }
 
         // Step 5: Safety check - refuse to start if balance is too low
-        if self.account_stats.available_balance < 10.0 {
+        if self.account_stats.available_balance < self.min_available_balance {
             error!(
-                "❌ SAFETY CHECK FAILED: Balance ${:.2} < $10.00",
-                self.account_stats.available_balance
+                "❌ SAFETY CHECK FAILED: Balance ${:.2} < ${:.2}",
+                self.account_stats.available_balance, self.min_available_balance
             );
-            error!("   Minimum balance required: $10.00");
             return Err(crate::error::TradingError::OrderFailed(
                 "Balance too low to start safely".to_string()
             ).into());

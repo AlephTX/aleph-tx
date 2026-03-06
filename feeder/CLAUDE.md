@@ -21,7 +21,6 @@ alwaysApply: true
 | config/ | TOML config loader (`ExchangeConfig` struct) |
 | exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01, Mock) |
 | shm/ | Shared memory writers - BBO matrix, event ring buffer, account stats |
-| cmd/ | Standalone CLI tools for testing (lighter_feeder, market_maker, etc.) |
 | test/ | Integration tests (auth, stream, order) |
 
 ## Architecture
