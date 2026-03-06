@@ -1,26 +1,33 @@
 ---
-description: Operational scripts - position closure, maintenance utilities
+description: Operational and utility shell scripts
 alwaysApply: true
 ---
 
 # scripts/
 
-> Shell scripts for operational tasks and maintenance.
+> Shell scripts for operations, monitoring, and testing.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| close_lighter_position.sh | Emergency position closure - queries Lighter API, executes market close if position != 0 |
+| close_lighter_position.sh | Emergency position closure via Lighter API |
+| dashboard.sh | Real-time monitoring dashboard (processes, SHM, logs) |
+| start.sh | Interactive startup script with strategy selection |
+| test_adaptive_mm.sh | Adaptive MM smoke test (account stats, SHM, feeder logs) |
+| monitor.sh | Dual-track IPC monitoring (Lighter stream, events, network) |
 
 ## Usage
 
 ```bash
-# Close all Lighter positions (loads .env.lighter automatically)
-./scripts/close_lighter_position.sh
+./scripts/close_lighter_position.sh   # Emergency close all positions
+./scripts/dashboard.sh                 # Real-time dashboard
+./scripts/start.sh                     # Interactive strategy launcher
+./scripts/test_adaptive_mm.sh          # Smoke test adaptive MM
+watch -n 2 ./scripts/monitor.sh        # Auto-refresh IPC monitor
 ```
 
 ## Gotchas
 
-- Requires `.env.lighter` with `API_KEY_PRIVATE_KEY`, `LIGHTER_ACCOUNT_INDEX`, `LIGHTER_API_KEY_INDEX`.
-- Sets `LD_LIBRARY_PATH` to include `lib/` for signer access.
+- All scripts expect `.env.lighter` (and optionally `.env.backpack`, `.env.edgex`) in the project root.
+- `start.sh` runs `cargo build --release` directly - prefer `make` targets for production.

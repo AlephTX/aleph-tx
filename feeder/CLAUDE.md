@@ -22,9 +22,7 @@ alwaysApply: true
 | exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01, Mock) |
 | shm/ | Shared memory writers - BBO matrix, event ring buffer, account stats |
 | cmd/ | Standalone CLI tools for testing (lighter_feeder, market_maker, etc.) |
-| ipc/ | Unix socket IPC (legacy, replaced by SHM) |
 | test/ | Integration tests (auth, stream, order) |
-| binance/ | Legacy Binance feeder (unused) |
 
 ## Architecture
 

@@ -14,7 +14,6 @@ alwaysApply: true
 | matrix.go | BBO matrix writer (656KB, seqlock protocol, 2048 symbols x 5 exchanges) |
 | events.go | Private event ring buffer writer (64KB, 1024 slots, SPSC) |
 | account_stats.go | Account statistics writer (128 bytes, versioned odd/even) |
-| order_requests.go | Order request ring buffer (Rust->Go, unused in v1) |
 
 ## Memory Layouts
 

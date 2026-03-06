@@ -283,11 +283,12 @@ CLAUDE.md (root)                    -> Project architecture, constraints, workfl
     src/bin/CLAUDE.md               -> Diagnostic binaries (monitors, SHM tools)
   examples/CLAUDE.md                -> Entry points for make targets
   lib/CLAUDE.md                     -> FFI shared library (Lighter signer)
-  scripts/CLAUDE.md                 -> Operational scripts
+  scripts/CLAUDE.md                 -> Operational and utility scripts
+  docs/CLAUDE.md                    -> Reference documentation (architecture, optimization)
   proto/CLAUDE.md                   -> gRPC service definitions
 ```
 
-Claude auto-loads all 14 CLAUDE.md files at session start = zero warm-up time, full project awareness.
+Claude auto-loads all 15 CLAUDE.md files at session start = zero warm-up time, full project awareness.
 
 ---
 

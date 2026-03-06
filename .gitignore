@@ -1,6 +1,11 @@
 # Build outputs
 /target/
 **/*.rs.bk
+feeder/feeder
+feeder/feeder-app
+feeder/lighter_feeder
+feeder/simple_mm
+feeder/market_maker
 
 # IDE
 .idea/
@@ -8,14 +13,17 @@
 *.swp
 *.swo
 
-# Environment
+# Environment (secrets)
 .env
-.env.local
 .env.*
 
 # Logs
 *.log
 logs/
+
+# Runtime
+*.pid
+pids/
 
 # OS
 .DS_Store
@@ -27,13 +35,13 @@ Thumbs.db
 *secret*
 *password*
 *.hex
-
-# Keys directory
 keys/
-# Runtime files
-*.pid
-rust.log
-feeder/*.log
+
+# Config (copy config.example.toml -> config.toml)
 config.toml
-.env.*
-target/
+feeder/config.toml
+
+# Backup files
+*.backup
+*.bak
+*.orig
