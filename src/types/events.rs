@@ -70,8 +70,11 @@ pub struct ShmPrivateEvent {
     /// Fee paid for this event (negative = rebate)
     pub fee_paid: f64,
 
+    /// Whether this is an ask/sell order (1=ask, 0=bid)
+    pub is_ask: u8,
+
     /// Padding to ensure 64-byte total size
-    _padding: [u8; 8],
+    _padding: [u8; 7],
 }
 
 impl ShmPrivateEvent {
@@ -82,6 +85,7 @@ impl ShmPrivateEvent {
         symbol_id: u16,
         order_id: u64,
         size: f64,
+        is_ask: bool,
     ) -> Self {
         Self {
             sequence,
@@ -94,7 +98,8 @@ impl ShmPrivateEvent {
             fill_size: 0.0,
             remaining_size: size,
             fee_paid: 0.0,
-            _padding: [0; 8],
+            is_ask: if is_ask { 1 } else { 0 },
+            _padding: [0; 7],
         }
     }
 
@@ -109,6 +114,7 @@ impl ShmPrivateEvent {
         fill_size: f64,
         remaining_size: f64,
         fee_paid: f64,
+        is_ask: bool,
     ) -> Self {
         Self {
             sequence,
@@ -121,7 +127,8 @@ impl ShmPrivateEvent {
             fill_size,
             remaining_size,
             fee_paid,
-            _padding: [0; 8],
+            is_ask: if is_ask { 1 } else { 0 },
+            _padding: [0; 7],
         }
     }
 
@@ -143,7 +150,8 @@ impl ShmPrivateEvent {
             fill_size: 0.0,
             remaining_size: 0.0,
             fee_paid: 0.0,
-            _padding: [0; 8],
+            is_ask: 0,
+            _padding: [0; 7],
         }
     }
 
@@ -165,7 +173,8 @@ impl ShmPrivateEvent {
             fill_size: 0.0,
             remaining_size: 0.0,
             fee_paid: 0.0,
-            _padding: [0; 8],
+            is_ask: 0,
+            _padding: [0; 7],
         }
     }
 
@@ -187,6 +196,7 @@ impl fmt::Debug for ShmPrivateEvent {
             .field("fill_size", &self.fill_size)
             .field("remaining_size", &self.remaining_size)
             .field("fee_paid", &self.fee_paid)
+            .field("is_ask", &(self.is_ask != 0))
             .finish()
     }
 }
@@ -204,7 +214,8 @@ impl Default for ShmPrivateEvent {
             fill_size: 0.0,
             remaining_size: 0.0,
             fee_paid: 0.0,
-            _padding: [0; 8],
+            is_ask: 0,
+            _padding: [0; 7],
         }
     }
 }
@@ -227,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_order_created() {
-        let event = ShmPrivateEvent::order_created(1, 2, 0, 12345, 1.5);
+        let event = ShmPrivateEvent::order_created(1, 2, 0, 12345, 1.5, false);
         assert_eq!(event.sequence, 1);
         assert_eq!(event.exchange_id, 2);
         assert_eq!(event.event_type().unwrap(), EventType::OrderCreated);
@@ -238,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_order_filled() {
-        let event = ShmPrivateEvent::order_filled(2, 2, 1, 67890, 3000.0, 0.5, 1.0, 0.15);
+        let event = ShmPrivateEvent::order_filled(2, 2, 1, 67890, 3000.0, 0.5, 1.0, 0.15, true);
         assert_eq!(event.sequence, 2);
         assert_eq!(event.event_type().unwrap(), EventType::OrderFilled);
         assert_eq!(event.fill_price, 3000.0);

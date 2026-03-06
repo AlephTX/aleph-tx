@@ -54,6 +54,8 @@ pub struct OrderState {
     pub total_fees: f64,
     pub created_at: Instant,
     pub last_update: Instant,
+    /// True if this order was pre-registered via add_in_flight (needs in_flight reconciliation)
+    pub tracked: bool,
 }
 
 /// Local account state (shadow ledger)
@@ -130,6 +132,7 @@ impl ShadowLedger {
                 total_fees: 0.0,
                 created_at: Instant::now(),
                 last_update: Instant::now(),
+                tracked: true,
             },
         );
         tracing::debug!(
@@ -142,6 +145,12 @@ impl ShadowLedger {
     }
     /// Apply an event to the shadow ledger with proper validation and reconciliation
     pub fn apply_event(&mut self, event: &ShmPrivateEvent) -> Result<()> {
+        tracing::info!(
+            "📨 Event received: seq={} type={} order_id={} fill_price={:.2} fill_size={:.4}",
+            event.sequence, event.event_type, event.order_id,
+            event.fill_price, event.fill_size
+        );
+
         // Detect out-of-order or duplicate events
         if event.sequence <= self.last_sequence && self.last_sequence > 0 {
             tracing::warn!(
@@ -172,8 +181,9 @@ impl ShadowLedger {
 
         match event.event_type() {
             Some(EventType::OrderCreated) => {
-                // OrderCreated events confirm that the order was accepted by the exchange
-                // We should already have this order in active_orders from place_order_optimistic
+                let is_ask = event.is_ask != 0;
+                let side = if is_ask { OrderSide::Sell } else { OrderSide::Buy };
+
                 if let Some(order) = self.active_orders.get_mut(&event.order_id) {
                     // Update the order state with confirmed data
                     order.remaining_size = event.remaining_size;
@@ -185,14 +195,34 @@ impl ShadowLedger {
                         event.remaining_size
                     );
                 } else {
-                    // Order not tracked — either placed before ledger started or from another account
-                    tracing::trace!(
-                        "OrderCreated for untracked order: {}",
-                        event.order_id
+                    // Auto-register untracked orders so fills can be reconciled
+                    self.active_orders.insert(
+                        event.order_id,
+                        OrderState {
+                            order_id: event.order_id,
+                            symbol_id: event.symbol_id,
+                            side,
+                            initial_size: event.remaining_size,
+                            filled_size: 0.0,
+                            remaining_size: event.remaining_size,
+                            avg_fill_price: 0.0,
+                            total_fees: 0.0,
+                            created_at: Instant::now(),
+                            last_update: Instant::now(),
+                            tracked: false,
+                        },
+                    );
+                    tracing::info!(
+                        "Auto-registered order: id={} side={} size={:.4}",
+                        event.order_id,
+                        side,
+                        event.remaining_size
                     );
                 }
             }
             Some(EventType::OrderFilled) => {
+                let is_ask = event.is_ask != 0;
+
                 if let Some(order) = self.active_orders.get_mut(&event.order_id) {
                     let prev_filled = order.filled_size;
                     order.filled_size += event.fill_size;
@@ -210,33 +240,34 @@ impl ShadowLedger {
                     // Calculate signed fill size based on order side
                     let signed_fill = order.side.sign() * event.fill_size;
                     let order_side = order.side;
+                    let order_tracked = order.tracked;
                     let should_remove = order.remaining_size <= 0.0;
 
-                    // CRITICAL: Reconcile in_flight → real_pos
-                    // Subtract from in_flight (order is now confirmed)
-                    self.in_flight_pos -= signed_fill;
-                    // Add to real position
+                    // Only reconcile in_flight for tracked orders (pre-registered via add_in_flight)
+                    if order_tracked {
+                        self.in_flight_pos -= signed_fill;
+                    }
+                    // Always update real position
                     self.real_pos += signed_fill;
 
                     // Update realized PnL correctly for both sides
                     match order_side {
                         OrderSide::Buy => {
-                            // Buying costs money (negative PnL)
                             self.realized_pnl -= event.fill_price * event.fill_size + event.fee_paid;
                         }
                         OrderSide::Sell => {
-                            // Selling generates revenue (positive PnL)
                             self.realized_pnl += event.fill_price * event.fill_size - event.fee_paid;
                         }
                     }
 
                     let total_exp = self.total_exposure();
 
-                    tracing::debug!(
-                        "Fill reconciled: order={} side={} size={:.4} real_pos={:.4} in_flight={:.4} total={:.4}",
+                    tracing::info!(
+                        "Fill reconciled: order={} side={} size={:.4} price={:.2} real_pos={:.4} in_flight={:.4} total={:.4}",
                         event.order_id,
                         order_side,
                         event.fill_size,
+                        event.fill_price,
                         self.real_pos,
                         self.in_flight_pos,
                         total_exp
@@ -247,37 +278,75 @@ impl ShadowLedger {
                         self.active_orders.remove(&event.order_id);
                     }
                 } else {
-                    tracing::trace!(
-                        "Fill for untracked order: {}",
-                        event.order_id
+                    // Untracked fill — use is_ask from event to determine side
+                    let side = if is_ask { OrderSide::Sell } else { OrderSide::Buy };
+                    let signed_fill = side.sign() * event.fill_size;
+
+                    // Update real_pos directly (no in_flight to reconcile)
+                    self.real_pos += signed_fill;
+
+                    match side {
+                        OrderSide::Buy => {
+                            self.realized_pnl -= event.fill_price * event.fill_size + event.fee_paid;
+                        }
+                        OrderSide::Sell => {
+                            self.realized_pnl += event.fill_price * event.fill_size - event.fee_paid;
+                        }
+                    }
+
+                    tracing::warn!(
+                        "Untracked fill: order={} side={} size={:.4} price={:.2} -> real_pos={:.4}",
+                        event.order_id,
+                        side,
+                        event.fill_size,
+                        event.fill_price,
+                        self.real_pos
                     );
                 }
             }
             Some(EventType::OrderCanceled) => {
-                // Rollback in_flight for canceled orders
+                // Rollback in_flight for tracked (pre-registered) canceled orders
                 if let Some(order) = self.active_orders.get(&event.order_id) {
-                    let signed_remaining = order.side.sign() * order.remaining_size;
-                    self.in_flight_pos -= signed_remaining;
-                    tracing::debug!(
-                        "Order canceled: id={} side={} remaining={:.4} rolled back in_flight",
-                        event.order_id,
-                        order.side,
-                        order.remaining_size
-                    );
+                    if order.tracked {
+                        let signed_remaining = order.side.sign() * order.remaining_size;
+                        self.in_flight_pos -= signed_remaining;
+                        tracing::debug!(
+                            "Order canceled (tracked): id={} side={} remaining={:.4} rolled back in_flight",
+                            event.order_id,
+                            order.side,
+                            order.remaining_size
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Order canceled (auto): id={} side={} remaining={:.4}",
+                            event.order_id,
+                            order.side,
+                            order.remaining_size
+                        );
+                    }
                 }
                 self.active_orders.remove(&event.order_id);
             }
             Some(EventType::OrderRejected) => {
-                // Rollback in_flight for rejected orders
+                // Rollback in_flight for tracked (pre-registered) rejected orders
                 if let Some(order) = self.active_orders.get(&event.order_id) {
-                    let signed_remaining = order.side.sign() * order.remaining_size;
-                    self.in_flight_pos -= signed_remaining;
-                    tracing::warn!(
-                        "Order rejected: id={} side={} size={:.4} rolled back in_flight",
-                        event.order_id,
-                        order.side,
-                        order.initial_size
-                    );
+                    if order.tracked {
+                        let signed_remaining = order.side.sign() * order.remaining_size;
+                        self.in_flight_pos -= signed_remaining;
+                        tracing::warn!(
+                            "Order rejected (tracked): id={} side={} size={:.4} rolled back in_flight",
+                            event.order_id,
+                            order.side,
+                            order.initial_size
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Order rejected (auto): id={} side={} size={:.4}",
+                            event.order_id,
+                            order.side,
+                            order.initial_size
+                        );
+                    }
                 }
                 self.active_orders.remove(&event.order_id);
             }
@@ -392,8 +461,8 @@ mod tests {
 
     #[test]
     fn test_order_side_display() {
-        assert_eq!(OrderSide::Buy.to_string(), "buy");
-        assert_eq!(OrderSide::Sell.to_string(), "sell");
+        assert_eq!(OrderSide::Buy.to_string(), "bid");
+        assert_eq!(OrderSide::Sell.to_string(), "ask");
     }
 
     #[test]
@@ -428,7 +497,7 @@ mod tests {
         assert_eq!(state.active_order_count(), 1);
 
         // Then receive the OrderCreated event (confirmation from exchange)
-        let event = ShmPrivateEvent::order_created(1, 2, 0, 12345, 1.5);
+        let event = ShmPrivateEvent::order_created(1, 2, 0, 12345, 1.5, false);
         let result = state.apply_event(&event);
         assert!(result.is_ok());
 
@@ -460,11 +529,12 @@ mod tests {
                 total_fees: 0.0,
                 created_at: Instant::now(),
                 last_update: Instant::now(),
+                tracked: true,
             },
         );
 
-        // Fill order (reconciles in_flight → real_pos)
-        let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12345, 3000.0, 0.5, 1.0, 0.15);
+        // Fill order (reconciles in_flight -> real_pos)
+        let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12345, 3000.0, 0.5, 1.0, 0.15, false);
         state.apply_event(&fill_event).unwrap();
 
         assert_eq!(state.real_pos, 0.5);
@@ -498,6 +568,7 @@ mod tests {
                 total_fees: 0.0,
                 created_at: Instant::now(),
                 last_update: Instant::now(),
+                tracked: true,
             },
         );
 
@@ -531,11 +602,12 @@ mod tests {
                 total_fees: 0.0,
                 created_at: Instant::now(),
                 last_update: Instant::now(),
+                tracked: true,
             },
         );
 
         // Fill sell order
-        let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12346, 51000.0, 1.0, 0.0, 3.0);
+        let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12346, 51000.0, 1.0, 0.0, 3.0, true);
         state.apply_event(&fill_event).unwrap();
 
         // Check reconciliation
@@ -553,17 +625,17 @@ mod tests {
         let mut ledger = ShadowLedger::default();
 
         // First event
-        let event1 = ShmPrivateEvent::order_created(1, 2, 0, 12349, 1.0);
+        let event1 = ShmPrivateEvent::order_created(1, 2, 0, 12349, 1.0, false);
         assert!(ledger.apply_event(&event1).is_ok());
         assert_eq!(ledger.last_sequence, 1);
 
         // Out of order event (should error)
-        let event_old = ShmPrivateEvent::order_created(1, 2, 0, 12350, 1.0);
+        let event_old = ShmPrivateEvent::order_created(1, 2, 0, 12350, 1.0, false);
         let result = ledger.apply_event(&event_old);
         assert!(result.is_err());
 
         // Gap in sequence (should log warning but continue)
-        let event_gap = ShmPrivateEvent::order_created(5, 2, 0, 12351, 1.0);
+        let event_gap = ShmPrivateEvent::order_created(5, 2, 0, 12351, 1.0, false);
         assert!(ledger.apply_event(&event_gap).is_ok());
         assert_eq!(ledger.last_sequence, 5);
     }

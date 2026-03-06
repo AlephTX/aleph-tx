@@ -276,15 +276,15 @@ impl AdaptiveMarketMaker {
             .as_nanos() as u64;
 
         let mut retries = 0;
-        let max_retries = 15; // Increased from 10 to 15 seconds
+        let max_retries = 30; // Wait up to 30s for feeder to connect and push stats
         loop {
             let stats = self.account_stats_reader.read();
 
-            // Check if data is fresh (updated within last 10 seconds)
+            // Check if data is fresh (updated within last 60 seconds at startup)
             let data_age_ns = start_time.saturating_sub(stats.updated_at);
             let data_age_secs = data_age_ns / 1_000_000_000;
 
-            if (stats.collateral > 0.0 || stats.available_balance > 0.0) && data_age_secs < 10 {
+            if (stats.collateral > 0.0 || stats.available_balance > 0.0) && data_age_secs < 60 {
                 self.account_stats = stats.into();
                 self.session_start_balance = self.account_stats.available_balance;
                 info!("✅ Account stats loaded: ${:.2} available (data age: {}s)",
@@ -457,7 +457,7 @@ impl AdaptiveMarketMaker {
                 continue;
             }
 
-            // Step 2: Read position
+            // Step 2: Read position from account stats (updated via WS position events, <200ms latency)
             let total_exposure = self.account_stats.position;
 
             if total_exposure.abs() > self.max_position {
