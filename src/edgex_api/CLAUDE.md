@@ -14,7 +14,6 @@ alwaysApply: true
 | client.rs | `EdgeXClient` - REST client with L2 auth, order/position methods |
 | model.rs | Data structures: `CreateOrderRequest`, `OpenOrder`, `Position`, enums (`OrderSide`, `TimeInForce`) |
 | signature.rs | `SignatureManager` - StarkNet Pedersen hash calculation for L2 order signing |
-| utils.rs | Reserved for utilities (empty) |
 
 ## API Methods
 

@@ -24,7 +24,6 @@ alwaysApply: true
 | lighter_trading.rs | High-level Lighter trading API wrapper |
 | risk.rs | Risk gate with hard limits (position, order size, spread) |
 | orderbook.rs | Local in-memory orderbook (BTreeMap) |
-| order_request_buffer.rs | Rust->Go order request ring buffer (unused in v1) |
 
 ## Subdirectories
 
