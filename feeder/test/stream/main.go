@@ -39,7 +39,7 @@ func main() {
 	}
 
 	// Create Lighter private stream
-	lighterPrivate, err := exchanges.NewLighterPrivate(cfg, eventBuffer)
+	lighterPrivate, err := exchanges.NewLighterPrivate(cfg, eventBuffer, nil, nil)
 	if err != nil {
 		log.Fatalf("Failed to create Lighter private stream: %v", err)
 	}

@@ -95,6 +95,19 @@ func (w *AccountStatsWriter) WriteStatsWithPosition(
 	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
 }
 
+// WritePosition updates only the position field and timestamp.
+// Uses the same version protocol (odd=writing, even=done).
+// This enables instant position updates from private WS without waiting for user_stats.
+func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64) {
+	version := atomic.LoadUint64(&w.stats.Version)
+	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
+
+	w.stats.Position = position
+	w.stats.UpdatedAt = timestampNs
+
+	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
+}
+
 // GetVersion returns the current version (for diagnostics).
 func (w *AccountStatsWriter) GetVersion() uint64 {
 	return atomic.LoadUint64(&w.stats.Version)

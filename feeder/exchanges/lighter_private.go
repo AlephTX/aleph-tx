@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
@@ -14,11 +15,12 @@ import (
 
 // LighterPrivate connects to Lighter private WebSocket for order/trade events
 type LighterPrivate struct {
-	cfg         config.ExchangeConfig
-	eventBuffer *shm.EventRingBuffer
-	auth        *LighterAuth
-	mktMap      map[int]uint16 // market_index -> symbol_id
+	cfg          config.ExchangeConfig
+	eventBuffer  *shm.EventRingBuffer
+	auth         *LighterAuth
+	mktMap       map[int]uint16 // market_index -> symbol_id
 	accountStats *LighterAccountStats // For updating position
+	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
 }
 
 // NewLighterPrivate creates a new Lighter private stream client
@@ -26,6 +28,7 @@ func NewLighterPrivate(
 	cfg config.ExchangeConfig,
 	eventBuffer *shm.EventRingBuffer,
 	accountStats *LighterAccountStats,
+	statsWriter *shm.AccountStatsWriter,
 ) (*LighterPrivate, error) {
 	// Load authentication from .env.lighter
 	auth, err := LoadLighterAuthFromEnv()
@@ -42,11 +45,12 @@ func NewLighterPrivate(
 	}
 
 	return &LighterPrivate{
-		cfg:         cfg,
-		eventBuffer: eventBuffer,
-		auth:        auth,
-		mktMap:      mktMap,
+		cfg:          cfg,
+		eventBuffer:  eventBuffer,
+		auth:         auth,
+		mktMap:       mktMap,
 		accountStats: accountStats,
+		statsWriter:  statsWriter,
 	}, nil
 }
 
@@ -189,9 +193,15 @@ func (lp *LighterPrivate) processPosition(positionData json.RawMessage) {
 
 	log.Printf("lighter-private: position updated: %.4f ETH", netPosition)
 
-	// Update account stats with new position
+	// Update account stats cache (for user_stats to include in full writes)
 	if lp.accountStats != nil {
 		lp.accountStats.SetPosition(netPosition)
+	}
+
+	// Write position directly to SHM for instant Rust visibility
+	if lp.statsWriter != nil {
+		timestampNs := uint64(time.Now().UnixNano())
+		lp.statsWriter.WritePosition(netPosition, timestampNs)
 	}
 }
 
