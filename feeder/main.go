@@ -99,7 +99,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer, ltStats)
+			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer, ltStats, accountStats)
 			if err != nil {
 				log.Printf("Lighter (private): failed to initialize: %v", err)
 				return
