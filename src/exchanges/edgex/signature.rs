@@ -1,5 +1,8 @@
-use starknet_crypto::{Felt, pedersen_hash, sign};
+use starknet_crypto::{Felt, sign};
 use thiserror::Error;
+use num_bigint::BigUint;
+
+use super::pedersen::PedersenHash;
 
 #[derive(Error, Debug)]
 pub enum SignatureError {
@@ -17,14 +20,48 @@ pub enum SignatureError {
 
 pub struct SignatureManager {
     private_key: Felt, // L2 Private Key (Stark Key)
-                       // We might also need L1 wallet for onboarding, but for L2 actions we need L2 key.
+    public_key: Felt,  // L2 Public Key (derived from private key)
+    pedersen: PedersenHash, // EdgeX-compatible Pedersen hash
 }
 
 impl SignatureManager {
     pub fn new(l2_private_key_hex: &str) -> Result<Self, SignatureError> {
         let key_str = l2_private_key_hex.trim_start_matches("0x");
         let private_key = Felt::from_hex(key_str).map_err(|_| SignatureError::FeltError)?;
-        Ok(Self { private_key })
+
+        // Derive public key from private key
+        let public_key = starknet_crypto::get_public_key(&private_key);
+
+        // Initialize EdgeX-compatible Pedersen hash
+        let pedersen = PedersenHash::new();
+
+        Ok(Self { private_key, public_key, pedersen })
+    }
+
+    // Helper function to convert Felt to BigUint
+    fn felt_to_biguint(felt: &Felt) -> BigUint {
+        let bytes = felt.to_bytes_be();
+        BigUint::from_bytes_be(&bytes)
+    }
+
+    // Helper function to convert BigUint to Felt
+    fn biguint_to_felt(biguint: &BigUint) -> Result<Felt, SignatureError> {
+        let bytes = biguint.to_bytes_be();
+        let mut padded = [0u8; 32];
+        if bytes.len() <= 32 {
+            padded[32 - bytes.len()..].copy_from_slice(&bytes);
+            Ok(Felt::from_bytes_be(&padded))
+        } else {
+            Err(SignatureError::FeltError)
+        }
+    }
+
+    // EdgeX-compatible Pedersen hash
+    fn pedersen_hash(&self, a: &Felt, b: &Felt) -> Result<Felt, SignatureError> {
+        let a_big = Self::felt_to_biguint(a);
+        let b_big = Self::felt_to_biguint(b);
+        let hash_big = self.pedersen.hash(&[a_big, b_big]);
+        Self::biguint_to_felt(&hash_big)
     }
 
     /// Calculates the Pedersen hash for a limit order (Order with fees).
@@ -57,47 +94,36 @@ impl SignatureManager {
             (syn_id, col_id, amount_synthetic, amount_collateral)
         };
 
+        tracing::debug!("asset_id_sell: 0x{:064x}", asset_id_sell);
+        tracing::debug!("asset_id_buy: 0x{:064x}", asset_id_buy);
+        tracing::debug!("amount_sell: {}", amount_sell);
+        tracing::debug!("amount_buy: {}", amount_buy);
+        tracing::debug!("amount_fee: {}", amount_fee);
+        tracing::debug!("nonce: {}", nonce);
+
         // First hash: hash(asset_id_sell, asset_id_buy)
-        let msg = pedersen_hash(&asset_id_sell, &asset_id_buy);
+        let msg = self.pedersen_hash(&asset_id_sell, &asset_id_buy)?;
+        tracing::debug!("hash1 (assets): 0x{:064x}", msg);
 
         // Second hash: hash(msg, asset_id_fee)
-        let msg = pedersen_hash(&msg, &fee_id);
-
-        // Pack message 0
-        // packed_message0 = amount_sell * 2^64 + amount_buy * 2^64 + max_amount_fee * 2^32 + nonce
-        // Note: Felt doesn't support '<<' directly for non-Felt inputs easily unless we convert.
-        // But we can construct BigUint or perform check.
-        // Since we are using Felt which is 252 bits, we can try to compose it.
-        // The python code does: val = (val << 64) + next_val.
+        let msg = self.pedersen_hash(&msg, &fee_id)?;
+        tracing::debug!("hash2 (+ fee_asset): 0x{:064x}", msg);
 
         // Helper to shift and add
         let shift_add = |acc: Felt, val: u64, shift: u32| -> Felt {
-            // acc * 2^shift + val
-            // Felt::pow takes u128.
             let shift_multiplier = Felt::from(2u64).pow(shift as u128);
             (acc * shift_multiplier) + Felt::from(val)
         };
-
-        // Wait, does Felt implement std::ops::Add etc? Yes usually.
 
         let pm0 = Felt::from(amount_sell);
         let pm0 = shift_add(pm0, amount_buy, 64);
         let pm0 = shift_add(pm0, amount_fee, 64);
         let pm0 = shift_add(pm0, nonce, 32);
-        // implicit modulo prime is handled by Felt arithmetic
+        tracing::debug!("packed_message0: 0x{:064x}", pm0);
 
         // Third hash: hash(msg, packed_message0)
-        let msg = pedersen_hash(&msg, &pm0);
-
-        // Pack message 1
-        // packed_message1 = LIMIT_ORDER_WITH_FEE_TYPE * 2^64 + account_id * 2^64 + account_id * 2^64 + account_id * 2^32 + expiration_timestamp * 2^17
-        // Python:
-        // packed_message1 = LIMIT_ORDER_WITH_FEE_TYPE  # 3
-        // packed_message1 = (packed_message1 << 64) + account_id
-        // packed_message1 = (packed_message1 << 64) + account_id
-        // packed_message1 = (packed_message1 << 64) + account_id
-        // packed_message1 = (packed_message1 << 32) + expire_time
-        // packed_message1 = packed_message1 << 17
+        let msg = self.pedersen_hash(&msg, &pm0)?;
+        tracing::debug!("hash3 (+ pm0): 0x{:064x}", msg);
 
         let limit_order_type = 3u64;
         let pm1 = Felt::from(limit_order_type);
@@ -109,48 +135,77 @@ impl SignatureManager {
         // Final shift by 17 (padding)
         let shift_17 = Felt::from(2u64).pow(17u128);
         let pm1 = pm1 * shift_17;
+        tracing::debug!("packed_message1: 0x{:064x}", pm1);
 
         // Final hash: hash(msg, packed_message1)
-        let msg = pedersen_hash(&msg, &pm1);
+        let msg = self.pedersen_hash(&msg, &pm1)?;
+        tracing::debug!("final hash: 0x{:064x}", msg);
 
         Ok(msg)
     }
 
     pub fn sign_l2_action(&self, hash: Felt) -> Result<String, SignatureError> {
-        // Sign with k value (randomness). API often expects standard ECDSA signature (r, s).
-        // starknet_crypto::sign usage: sign(private_key, message_hash, k)
-        // We need a random k.
+        tracing::debug!("L2 hash to sign: 0x{:064x}", hash);
 
-        // For deterministic signing (RFC6979 equivalent), we usually derive k from msg and key.
-        // But starknet_crypto might need explicit k.
-        // Let's use a simple RFC6979-like derivation or random if possible.
-        // Actually, for safety, using a secure random k is better.
+        // Convert Felt to bytes
+        let hash_bytes = hash.to_bytes_be();
 
-        let k = starknet_crypto::rfc6979_generate_k(&hash, &self.private_key, None);
+        // Convert to BigUint and reduce modulo EC_ORDER (not field prime!)
+        use num_bigint::BigUint;
+        use num_traits::Num;
+
+        let hash_int = BigUint::from_bytes_be(&hash_bytes);
+
+        // EC_ORDER (curve order, not field prime)
+        let ec_order = BigUint::from_str_radix(
+            "800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f",
+            16,
+        ).unwrap();
+
+        // Reduce modulo EC_ORDER
+        let hash_int = hash_int % &ec_order;
+
+        // Convert back to Felt
+        let mod_bytes = hash_int.to_bytes_be();
+        let mut padded = [0u8; 32];
+        if mod_bytes.len() <= 32 {
+            padded[32 - mod_bytes.len()..].copy_from_slice(&mod_bytes);
+        }
+        let hash_reduced = Felt::from_bytes_be(&padded);
+
+        tracing::debug!("L2 hash reduced mod EC_ORDER: 0x{:064x}", hash_reduced);
+
+        // Use RFC6979 for deterministic k generation
+        let k = starknet_crypto::rfc6979_generate_k(&hash_reduced, &self.private_key, None);
 
         let signature =
-            sign(&self.private_key, &hash, &k).map_err(|_| SignatureError::SigningError)?;
-
-        // Format: r, s. Usually hex strings.
-        // API expects... "l2Signature".
-        // Often formatted as `r` and `s` or concatenated.
-        // EdgeX docs say "l2Signature": "0x..."
-        // I will return r and s packed or check doc again.
-        // Docs usually want: r, s as hex strings, or packed 0x{r}{s}.
-        // Common Starknet format is often JSON `[r, s]`.
-        // Let's assume standard hex concatenation for now given "0x..." string type.
-        // 0x + r_hex + s_hex
+            sign(&self.private_key, &hash_reduced, &k).map_err(|_| SignatureError::SigningError)?;
 
         let r_hex = format!("{:064x}", signature.r);
         let s_hex = format!("{:064x}", signature.s);
-        Ok(format!("0x{}{}", r_hex, s_hex))
+
+        tracing::debug!("L2 signature r: {}", r_hex);
+        tracing::debug!("L2 signature s: {}", s_hex);
+
+        // Verify the signature locally
+        let is_valid = starknet_crypto::verify(&self.public_key, &hash_reduced, &signature.r, &signature.s)
+            .map_err(|_| SignatureError::SigningError)?;
+
+        if !is_valid {
+            tracing::error!("Local signature verification failed!");
+            return Err(SignatureError::SigningError);
+        }
+        tracing::debug!("Local signature verification: OK");
+
+        Ok(format!("{}{}", r_hex, s_hex))
     }
 
     pub fn sign_message(&self, message: &str) -> Result<String, SignatureError> {
+        use sha3::{Digest, Keccak256};
         use num_bigint::BigUint;
         use num_traits::Num;
-        use sha3::{Digest, Keccak256};
 
+        // Keccak256 hash the message
         let mut hasher = Keccak256::new();
         hasher.update(message.as_bytes());
         let hash_bytes = hasher.finalize();
@@ -158,14 +213,15 @@ impl SignatureManager {
         // Convert the 32 byte keccak hash to BigUint
         let msg_hash_int = BigUint::from_bytes_be(&hash_bytes);
 
-        // StarkEx Curve Order (N)
+        // StarkEx Curve Order (N) - NOT the field prime!
+        // This is the order of the elliptic curve group
         let ec_order = BigUint::from_str_radix(
             "800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f",
             16,
         )
         .unwrap();
 
-        // msg_hash_int = msg_hash_int % EC_ORDER
+        // Reduce hash modulo EC_ORDER (not field prime)
         let msg_hash_int = msg_hash_int % ec_order;
 
         // Convert back to 32 bytes for Felt
@@ -177,9 +233,15 @@ impl SignatureManager {
 
         let hash_felt = Felt::from_bytes_be(&padded);
 
-        // The python sdk does not prepend 0x or anything special, it just signs the digest.
-        // `sign_l2_action` wraps it in 0x.
-        self.sign_l2_action(hash_felt)
+        // Sign the hash
+        let signature = sign(&self.private_key, &hash_felt, &Felt::from_hex("0x1").unwrap())
+            .map_err(|_| SignatureError::SigningError)?;
+
+        // Format: r + s (each 64 hex chars)
+        let r_hex = format!("{:064x}", signature.r);
+        let s_hex = format!("{:064x}", signature.s);
+
+        Ok(format!("{}{}", r_hex, s_hex))
     }
 }
 

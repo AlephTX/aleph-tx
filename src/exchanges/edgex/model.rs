@@ -30,6 +30,7 @@ pub struct CreateOrderRequest {
     pub size: String,
     pub r#type: OrderType,
     pub time_in_force: TimeInForce,
+    pub reduce_only: bool,
     pub account_id: u64,
     pub contract_id: u64,
     pub side: OrderSide,
@@ -55,9 +56,6 @@ pub struct CancelOrderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_order_id: Option<String>,
     pub contract_id: u64,
-    // L2 Auth fields
-    pub l2_nonce: u64,
-    pub l2_signature: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
