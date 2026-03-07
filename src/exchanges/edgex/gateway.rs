@@ -23,6 +23,7 @@ pub struct EdgeXConfig {
     pub price_decimals: u32,
     pub size_decimals: u32,
     pub resolution: u64,
+    pub collateral_resolution: u64,
     pub fee_rate: f64,
 }
 
@@ -59,6 +60,9 @@ impl EdgeXConfig {
         let resolution = edgex_cfg.resolution
             .ok_or_else(|| anyhow!("resolution not set in config.toml [edgex]"))?;
 
+        let collateral_resolution = edgex_cfg.collateral_resolution
+            .ok_or_else(|| anyhow!("collateral_resolution not set in config.toml [edgex]"))?;
+
         let fee_rate = edgex_cfg.fee_rate
             .ok_or_else(|| anyhow!("fee_rate not set in config.toml [edgex]"))?;
 
@@ -71,6 +75,7 @@ impl EdgeXConfig {
             price_decimals,
             size_decimals,
             resolution,
+            collateral_resolution,
             fee_rate,
         })
     }
@@ -79,7 +84,6 @@ impl EdgeXConfig {
 pub struct EdgeXGateway {
     client: Arc<EdgeXClient>,
     config: EdgeXConfig,
-    nonce_counter: std::sync::atomic::AtomicU64,
 }
 
 impl EdgeXGateway {
@@ -87,7 +91,6 @@ impl EdgeXGateway {
         Self {
             client,
             config,
-            nonce_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -103,36 +106,6 @@ impl EdgeXGateway {
             Side::Buy => OrderSide::Buy,
             Side::Sell => OrderSide::Sell,
         }
-    }
-
-    /// Convert price to L2 format (price * 10^price_decimals)
-    fn price_to_l2(&self, price: f64) -> u64 {
-        (price * 10f64.powi(self.config.price_decimals as i32)) as u64
-    }
-
-    /// Convert size to L2 format (size * 10^size_decimals)
-    fn size_to_l2(&self, size: f64) -> u64 {
-        (size * 10f64.powi(self.config.size_decimals as i32)) as u64
-    }
-
-    /// Calculate fee amount
-    fn calculate_fee(&self, value: f64) -> u64 {
-        let fee = value * self.config.fee_rate;
-        (fee * 10f64.powi(self.config.price_decimals as i32)) as u64
-    }
-
-    /// Get next nonce
-    fn next_nonce(&self) -> u64 {
-        self.nonce_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Get expiration timestamp (1 hour from now)
-    fn get_expiration_timestamp(&self) -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        (now + 3600) / 3600 // Round to hours
     }
 
     async fn create_order_internal(
@@ -159,15 +132,15 @@ impl EdgeXGateway {
         // Calculate values for L2 signature
         let value_dm = price * size; // Decimal value (e.g., 1983.22 * 0.01 = 19.8322)
 
-        // For L2 signature: amount_collateral = int(value_dm * 1000000)
-        let amount_collateral = (value_dm * 1_000_000.0) as u64;
+        // For L2 signature: amount_collateral = int(value_dm * collateral_resolution)
+        let amount_collateral = (value_dm * self.config.collateral_resolution as f64) as u64;
 
         // For L2 signature: amount_synthetic = int(size * resolution)
         // Resolution comes from metadata (starkExResolution)
         let amount_synthetic = (size * self.config.resolution as f64) as u64;
 
-        // Calculate fee: amount_fee = ceil(value_dm * fee_rate) * 1000000
-        let amount_fee = ((value_dm * self.config.fee_rate).ceil() * 1_000_000.0) as u64;
+        // Calculate fee: amount_fee = ceil(value_dm * fee_rate * collateral_resolution)
+        let amount_fee = (value_dm * self.config.fee_rate * self.config.collateral_resolution as f64).ceil() as u64;
 
         // Generate expiration times
         // l2_expire_time: 60 days from now in milliseconds
@@ -175,11 +148,11 @@ impl EdgeXGateway {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let l2_expire_time = now_ms + (60 * 24 * 60 * 60 * 1000); // 60 days
-        let expire_time = l2_expire_time - 864_000_000; // 10 days earlier
+        let l2_expire_time_ms = now_ms + (60 * 24 * 60 * 60 * 1000); // 60 days in ms
+        let expire_time = l2_expire_time_ms - 864_000_000; // 10 days earlier
 
-        // Convert l2_expire_time to hours for signature
-        let l2_expire_time_hours = l2_expire_time / (60 * 60 * 1000);
+        // Convert l2_expire_time to hours for both signature AND request
+        let l2_expire_time_hours = l2_expire_time_ms / (60 * 60 * 1000);
 
         // Calculate L2 signature hash
         tracing::debug!(
@@ -218,6 +191,7 @@ impl EdgeXGateway {
             size: format!("{:.4}", size), // Round to 4 decimals
             r#type: OrderType::Limit,
             time_in_force: TimeInForce::PostOnly,
+            reduce_only: false, // Not a reduce-only order
             account_id: self.config.account_id,
             contract_id: self.config.contract_id,
             side: Self::side_to_edgex(side),
@@ -226,8 +200,8 @@ impl EdgeXGateway {
             l2_nonce,
             l2_value: format!("{:.6}", value_dm), // Decimal value with 6 decimals (USDC precision)
             l2_size: format!("{:.4}", size), // Decimal size with 4 decimals
-            l2_limit_fee: format!("{:.0}", (value_dm * self.config.fee_rate).ceil()), // Integer fee
-            l2_expire_time,
+            l2_limit_fee: format!("{:.6}", amount_fee as f64 / self.config.collateral_resolution as f64), // Convert back to decimal
+            l2_expire_time: l2_expire_time_ms, // Use milliseconds for the request
             l2_signature,
         };
 
@@ -288,17 +262,11 @@ impl Exchange for EdgeXGateway {
     }
 
     async fn cancel_order(&self, order_id: i64) -> Result<()> {
-        // TODO: Implement L2 signature for cancel order
-        // For now, use placeholder signature
-        let l2_nonce = self.next_nonce();
-
         let req = CancelOrderRequest {
             account_id: self.config.account_id,
             order_id: Some(order_id as u64),
             client_order_id: None,
             contract_id: self.config.contract_id,
-            l2_nonce,
-            l2_signature: "0x0".to_string(), // TODO: Implement cancel signature
         };
 
         self.client

@@ -351,6 +351,7 @@ impl Strategy for MarketMakerStrategy {
                                         size: format_size(size_eth, cfg.step_size),
                                         r#type: OrderType::Limit,
                                         time_in_force: TimeInForce::PostOnly,
+                                        reduce_only: false,
                                         account_id, contract_id: 10000002,
                                         side: if is_buy { OrderSide::Buy } else { OrderSide::Sell },
                                         client_order_id, expire_time: expire_time_ms - 864_000_000,

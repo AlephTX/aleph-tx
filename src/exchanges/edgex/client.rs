@@ -245,7 +245,9 @@ impl EdgeXClient {
             .to_string();
 
         let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
+        tracing::info!("GET Sign Payload: {}", sign_payload);
         let header_signature = self.signature_manager.sign_message(&sign_payload)?;
+        tracing::info!("GET Signature: {}", header_signature);
 
         let mut headers = HeaderMap::new();
         headers.insert(
