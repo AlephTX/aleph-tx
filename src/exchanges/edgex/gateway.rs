@@ -22,6 +22,7 @@ pub struct EdgeXConfig {
     pub fee_asset_id: String,
     pub price_decimals: u32,
     pub size_decimals: u32,
+    pub resolution: u64,
     pub fee_rate: f64,
 }
 
@@ -55,6 +56,9 @@ impl EdgeXConfig {
         let size_decimals = edgex_cfg.size_decimals
             .ok_or_else(|| anyhow!("size_decimals not set in config.toml [edgex]"))?;
 
+        let resolution = edgex_cfg.resolution
+            .ok_or_else(|| anyhow!("resolution not set in config.toml [edgex]"))?;
+
         let fee_rate = edgex_cfg.fee_rate
             .ok_or_else(|| anyhow!("fee_rate not set in config.toml [edgex]"))?;
 
@@ -66,6 +70,7 @@ impl EdgeXConfig {
             fee_asset_id,
             price_decimals,
             size_decimals,
+            resolution,
             fee_rate,
         })
     }
@@ -158,9 +163,8 @@ impl EdgeXGateway {
         let amount_collateral = (value_dm * 1_000_000.0) as u64;
 
         // For L2 signature: amount_synthetic = int(size * resolution)
-        // Resolution is typically 10^size_decimals for perpetuals
-        let resolution = 10u64.pow(self.config.size_decimals);
-        let amount_synthetic = (size * resolution as f64) as u64;
+        // Resolution comes from metadata (starkExResolution)
+        let amount_synthetic = (size * self.config.resolution as f64) as u64;
 
         // Calculate fee: amount_fee = ceil(value_dm * fee_rate) * 1000000
         let amount_fee = ((value_dm * self.config.fee_rate).ceil() * 1_000_000.0) as u64;

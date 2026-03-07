@@ -82,6 +82,8 @@ pub struct ExchangeConfig {
     #[serde(default)]
     pub size_decimals: Option<u32>,
     #[serde(default)]
+    pub resolution: Option<u64>,
+    #[serde(default)]
     pub fee_rate: Option<f64>,
 }
 
@@ -237,6 +239,7 @@ impl Default for AppConfig {
                 fee_asset_id: None,
                 price_decimals: None,
                 size_decimals: None,
+                resolution: None,
                 fee_rate: None,
             },
             edgex: ExchangeConfig {
@@ -261,6 +264,7 @@ impl Default for AppConfig {
                 fee_asset_id: Some("0x555344432d36000000000000000000".to_string()),
                 price_decimals: Some(2),
                 size_decimals: Some(4),
+                resolution: Some(1000000000),
                 fee_rate: Some(0.0005),
             },
             inventory_neutral_mm: Some(InventoryNeutralMMConfig::default()),
