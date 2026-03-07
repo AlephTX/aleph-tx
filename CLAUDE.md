@@ -104,6 +104,34 @@ When implementing a feature, YOU MUST autonomously test it:
 - **C-ABI Alignment**: `ShmPrivateEvent` MUST be EXACTLY 64 bytes. Verify with `static_assertions::assert_eq_size!`.
 - **Incremental Quoting Math**: Protect against divide-by-zero (e.g., if `last_price == 0.0` during incremental quoting calculations, return `true` to force initial quote).
 
+## Architecture Refactoring (2026-03-07)
+
+### Exchange Module Decoupling
+
+**Motivation**: Exchange-specific code was scattered in `src/` root. Needed clear module boundaries for config-driven hot-pluggable architecture.
+
+**Changes**:
+1. **Directory Reorganization**:
+   - Created `src/exchanges/` with subdirectories: `lighter/`, `backpack/`, `edgex/`
+   - Moved `lighter_ffi.rs` → `exchanges/lighter/ffi.rs`
+   - Moved `lighter_trading.rs` → `exchanges/lighter/trading.rs`
+   - Moved `backpack_api/*` → `exchanges/backpack/*`
+   - Moved `edgex_api/*` → `exchanges/edgex/*`
+   - Deleted `lighter_orders.rs` (legacy, unused)
+
+2. **Backward Compatibility**:
+   - `src/lib.rs` provides re-exports: `pub use exchanges::lighter::ffi as lighter_ffi;`
+   - Existing code using `crate::lighter_trading::*` continues to work
+
+3. **Exchange Trait Implementation**:
+   - Created `exchanges/backpack/gateway.rs` implementing `Exchange` trait
+   - Created `exchanges/edgex/gateway.rs` (simplified stub, needs L2 signature integration)
+   - Lighter already implements `Exchange` trait natively in `trading.rs`
+
+**Status**: Phase 1 & 2 complete. Phase 3 (config-driven factory in `main.rs`) and Phase 4 (dynamic Makefile) deferred for future work.
+
+**Documentation**: See `src/exchanges/CLAUDE.md` for detailed module structure.
+
 ## Lighter DEX Integration Debugging Notes
 
 ### Common Issues & Solutions
@@ -276,9 +304,10 @@ CLAUDE.md (root)                    -> Project architecture, constraints, workfl
     feeder/exchanges/CLAUDE.md      -> Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
     feeder/shm/CLAUDE.md            -> Shared memory layouts (BBO matrix, event ring, account stats)
   src/CLAUDE.md                     -> Rust core: HFT engine, FFI, shadow ledger
-    src/strategy/CLAUDE.md          -> Strategies (arbitrage, MM, adaptive MM)
-    src/backpack_api/CLAUDE.md      -> Backpack REST client (Ed25519)
-    src/edgex_api/CLAUDE.md         -> EdgeX REST client (StarkNet Pedersen)
+    src/strategy/CLAUDE.md          -> Strategies (arbitrage, MM, adaptive MM, inventory-neutral MM)
+    src/exchanges/CLAUDE.md         -> **Modular exchange integrations** (lighter/, backpack/, edgex/)
+      src/exchanges/backpack/CLAUDE.md -> Backpack REST client (Ed25519)
+      src/exchanges/edgex/CLAUDE.md    -> EdgeX REST client (StarkNet Pedersen)
     src/types/CLAUDE.md             -> Core types + C-ABI event struct
   examples/CLAUDE.md                -> Entry points for make targets
   lib/CLAUDE.md                     -> FFI shared library (Lighter signer)
@@ -286,7 +315,7 @@ CLAUDE.md (root)                    -> Project architecture, constraints, workfl
   proto/CLAUDE.md                   -> gRPC service definitions
 ```
 
-Claude auto-loads all 13 CLAUDE.md files at session start = zero warm-up time, full project awareness.
+Claude auto-loads all CLAUDE.md files at session start = zero warm-up time, full project awareness.
 
 ---
 

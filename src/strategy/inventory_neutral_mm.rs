@@ -252,6 +252,14 @@ impl InventoryNeutralMM {
             self.account_stats = stats.into();
             let position = self.account_stats.position;
 
+            // Periodic ledger sync: correct drift from missed events (every 30s)
+            if self.last_balance_check.elapsed() > Duration::from_secs(30) {
+                let delta = self.ledger.write().force_sync_position(position);
+                if delta.abs() > 0.001 {
+                    warn!("Ledger drift corrected: delta={:.6} ETH", delta);
+                }
+            }
+
             // Margin cooldown: skip quoting if recently rejected
             if Instant::now() < self.margin_cooldown_until {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -284,7 +292,8 @@ impl InventoryNeutralMM {
 
             // Adverse selection filter
             if as_score > self.config.adverse_selection_threshold {
-                debug!("AS filter triggered: score={:.2} (pausing)", as_score);
+                debug!("AS filter triggered: score={:.2} (canceling + pausing)", as_score);
+                self.cancel_all_orders().await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -480,7 +489,7 @@ impl InventoryNeutralMM {
                 self.last_balance_check = Instant::now();
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
     }
 

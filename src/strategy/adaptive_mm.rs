@@ -490,15 +490,13 @@ impl AdaptiveMarketMaker {
             let as_score = self.micro.adverse_selection_score();
             let book_imb = self.micro.book_imbalance(bbo.bid_size, bbo.ask_size);
 
-            // Step 5: Adverse selection filter — pause quoting during toxic flow
+            // Step 5: Adverse selection filter — cancel resting orders during toxic flow
             if as_score > self.adverse_selection_threshold {
                 debug!(
-                    "AS filter: score={:.2} momentum={:.1}bps vol={:.1}bps — pausing",
+                    "AS filter: score={:.2} momentum={:.1}bps vol={:.1}bps — canceling + pausing",
                     as_score, momentum, vol_bps
                 );
-                // Don't cancel existing orders — they're already on the book at good prices.
-                // Just skip placing new ones this cycle. If price moves enough,
-                // the requote threshold will handle cancellation naturally.
+                self.cancel_all_orders().await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
