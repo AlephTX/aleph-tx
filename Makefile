@@ -165,22 +165,23 @@ backpack-logs:
 # ============================================================================
 
 edgex-up: build-feeder
-	@echo "🚀 Starting EdgeX - Strategy: $(STRATEGY)"
+	@echo "🚀 Starting EdgeX - Strategy: edgex_mm"
 	@mkdir -p logs pids
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@# Start feeder
-	@export $$(cat .env.lighter | xargs) && \
-		(cd feeder && ./feeder-app) > logs/feeder-edgex.log 2>&1 & \
+	@# Build strategy first
+	@cargo build --release --example edgex_mm
+	@# Start feeder with EdgeX config
+	@(cd feeder && ALEPH_FEEDER_CONFIG=config.edgex.toml ./feeder-app) > logs/feeder-edgex.log 2>&1 & \
 		echo $$! > pids/feeder-edgex.pid
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-edgex.pid))"
 	@# Start strategy
 	@export $$(cat .env.edgex | xargs) && \
 		export EDGEX_ENV_PATH=.env.edgex && \
-		cargo run --release --example $(STRATEGY) > logs/edgex-$(STRATEGY).log 2>&1 & \
-		echo $$! > pids/edgex-$(STRATEGY).pid
-	@echo "✅ Strategy started (PID: $$(cat pids/edgex-$(STRATEGY).pid))"
-	@echo "📊 Logs: tail -f logs/feeder-edgex.log logs/edgex-$(STRATEGY).log"
+		./target/release/examples/edgex_mm > logs/edgex-mm.log 2>&1 & \
+		echo $$! > pids/edgex-mm.pid
+	@echo "✅ Strategy started (PID: $$(cat pids/edgex-mm.pid))"
+	@echo "📊 Logs: tail -f logs/feeder-edgex.log logs/edgex-mm.log"
 
 edgex-down:
 	@echo "🛑 Stopping EdgeX..."

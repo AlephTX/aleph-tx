@@ -1,0 +1,26 @@
+# EdgeX Feeder Configuration
+# Only EdgeX exchange enabled for single-exchange trading
+
+[exchanges.hyperliquid]
+enabled = false
+
+[exchanges.lighter]
+enabled = false
+
+[exchanges.backpack]
+enabled = false
+
+[exchanges.edgex]
+enabled = true
+testnet = false
+ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+rest_url = "https://pro.edgex.exchange"
+
+# EdgeX Contract IDs (WebSocket format)
+# BTC-USDC Perpetual = 10000001
+# ETH-USDC Perpetual = 10000002
+[exchanges.edgex.symbols]
+ETH = "10000002"
+
+[exchanges.01]
+enabled = false
