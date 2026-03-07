@@ -15,6 +15,15 @@ help:
 	@echo "  make live-down      - Stop live trading (closes positions & cancels orders)"
 	@echo "  make live-logs      - View live trading logs"
 	@echo ""
+	@echo "Strategy Examples:"
+	@echo "  make adaptive-up    - Start adaptive MM (Lighter DEX)"
+	@echo "  make adaptive-down  - Stop adaptive MM"
+	@echo "  make adaptive-logs  - View adaptive MM logs"
+	@echo ""
+	@echo "  make backpack-up    - Start Backpack MM (Exchange trait demo)"
+	@echo "  make backpack-down  - Stop Backpack MM"
+	@echo "  make backpack-logs  - View Backpack MM logs"
+	@echo ""
 	@echo "Strategy Management:"
 	@echo "  make up STRATEGY=lighter    - Start Lighter MM"
 	@echo "  make up STRATEGY=edgex      - Start EdgeX MM"
@@ -117,6 +126,43 @@ adaptive-down:
 # View adaptive MM logs
 adaptive-logs:
 	@tail -f logs/feeder-adaptive.log logs/adaptive-mm.log
+
+# Start Backpack market maker (Exchange trait demo)
+backpack-up: build-feeder
+	@echo "🧪 Starting Backpack market maker..."
+	@mkdir -p logs pids
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-backpack.log 2>&1 & echo $$! > pids/feeder-backpack.pid
+	@sleep 2
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-backpack.pid))"
+	@export $$(cat .env.backpack | xargs) && \
+		export BACKPACK_ENV_PATH=.env.backpack && \
+		cargo run --release --example backpack_mm > logs/backpack-mm.log 2>&1 & echo $$! > pids/backpack-mm.pid
+	@echo "✅ Backpack MM started (PID: $$(cat pids/backpack-mm.pid))"
+	@echo "📊 Logs: tail -f logs/feeder-backpack.log logs/backpack-mm.log"
+
+# Stop Backpack market maker
+backpack-down:
+	@echo "🛑 Stopping Backpack market maker..."
+	@if [ -f pids/backpack-mm.pid ]; then \
+		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
+		kill -2 $$(cat pids/backpack-mm.pid) 2>/dev/null || true; \
+		echo "⏳ Waiting for graceful shutdown (10s)..."; \
+		sleep 10; \
+		if ps -p $$(cat pids/backpack-mm.pid) > /dev/null 2>&1; then \
+			echo "⚠️  Process still running, forcing shutdown..."; \
+			kill -9 $$(cat pids/backpack-mm.pid) 2>/dev/null || true; \
+		fi; \
+		rm -f pids/backpack-mm.pid; \
+		echo "✅ Backpack MM stopped"; \
+	fi
+	@if [ -f pids/feeder-backpack.pid ]; then kill -9 $$(cat pids/feeder-backpack.pid) 2>/dev/null || true; rm -f pids/feeder-backpack.pid; echo "✅ Feeder stopped"; fi
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@echo "✅ Shared memory cleaned"
+
+# View Backpack MM logs
+backpack-logs:
+	@tail -f logs/feeder-backpack.log logs/backpack-mm.log
 
 # Start feeder (prerequisite for all strategies)
 feeder:
