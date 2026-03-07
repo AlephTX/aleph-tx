@@ -18,10 +18,37 @@ Welcome to AlephTX, a Tier-1 High-Frequency Trading (HFT) framework built with R
 
 ## Code Style Principles
 
+### General Principles
+
 1. **Minimal modifications** - never over-engineer. Change only what is necessary.
 2. **Keep code concise** - good software engineering solves problems in the most elegant, minimal way.
 3. **Diagrams over prose** - when writing documentation, use diagrams liberally (Mermaid, ASCII art). A picture is worth a thousand words.
-4. **Pythonic code** - Python code must follow Pythonic idioms and conventions.
+
+### Language-Specific Guidelines
+
+**Rust**:
+- Follow official Rust style guide (`rustfmt` defaults)
+- Use `Result<T, E>` for error handling, never `unwrap()` in production code
+- Prefer `&str` over `String` for function parameters
+- Use `Arc<T>` for shared ownership, `Rc<T>` for single-threaded
+- Hot path: zero heap allocations, use stack arrays or pre-allocated buffers
+- Async: wrap all FFI/blocking calls in `tokio::task::spawn_blocking()`
+- Memory safety: never use `unsafe` without detailed safety comments
+
+**Go**:
+- Follow official Go style guide (`gofmt`, `golint`)
+- Use `context.Context` for cancellation and timeouts
+- Error handling: always check errors, use `fmt.Errorf` with `%w` for wrapping
+- Concurrency: prefer channels over shared memory, use `sync.Mutex` when necessary
+- CGO: minimize CGO calls (expensive), batch operations when possible
+- Memory: be careful with C memory allocation, always free via Go's `C.free()`
+
+**Python**:
+- Follow PEP 8 and Pythonic idioms
+- Use type hints for function signatures
+- Prefer list comprehensions over `map()`/`filter()`
+- Use `with` statements for resource management
+- Error handling: specific exceptions over bare `except:`
 
 ## Important Notes
 

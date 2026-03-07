@@ -4,72 +4,76 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 
 ## Architecture
 
-```mermaid
-graph TB
-    subgraph "Go Feeder (Network I/O)"
-        WS1[Lighter WS<br/>Public/Private/Account]
-        WS2[Hyperliquid WS]
-        WS3[Backpack WS]
-        WS4[EdgeX WS]
-        WS5[01 Exchange WS]
-    end
+### System Overview
 
-    subgraph "Shared Memory IPC"
-        SHM1["/dev/shm/aleph-matrix<br/>(656KB BBO Matrix)"]
-        SHM2["/dev/shm/aleph-events<br/>(64KB Event Ring)"]
-        SHM3["/dev/shm/aleph-account-stats<br/>(128B Account Stats)"]
-    end
-
-    subgraph "Rust Core (Strategy Engine)"
-        SR[ShmReader<br/>Seqlock Protocol]
-        ER[ShmEventReader<br/>SPSC Ring Buffer]
-        AR[AccountStatsReader<br/>Versioned Read]
-
-        SL[Shadow Ledger<br/>real_pos + in_flight_pos]
-
-        ST1[InventoryNeutralMM]
-        ST2[AdaptiveMM]
-        ST3[MarketMaker EdgeX]
-        ST4[BackpackMM]
-        ST5[ArbitrageEngine]
-
-        EXEC[FFI Sign + HTTP Direct<br/>No Boomerang Execution]
-    end
-
-    subgraph "Exchanges (HTTP REST)"
-        EX1[Lighter DEX<br/>Poseidon2 + EdDSA]
-        EX2[Backpack<br/>Ed25519]
-        EX3[EdgeX<br/>StarkNet Pedersen]
-    end
-
-    WS1 & WS2 & WS3 & WS4 & WS5 --> SHM1
-    WS1 --> SHM2
-    WS1 --> SHM3
-
-    SHM1 --> SR
-    SHM2 --> ER
-    SHM3 --> AR
-
-    ER --> SL
-    SR --> ST1 & ST2 & ST3 & ST4 & ST5
-    AR --> ST2
-    SL --> ST1 & ST2 & ST3 & ST4 & ST5
-
-    ST1 & ST2 --> EXEC
-    ST3 --> EX3
-    ST4 --> EX2
-    ST5 --> EX1 & EX2 & EX3
-
-    EXEC --> EX1
-
-    EX1 & EX2 & EX3 -.Fill/Cancel Events.-> SHM2
-
-    style SHM1 fill:#e1f5ff
-    style SHM2 fill:#e1f5ff
-    style SHM3 fill:#e1f5ff
-    style SL fill:#fff4e6
-    style EXEC fill:#ffe6e6
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Go Feeder (Network I/O)                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │  Lighter WS  │  │ Hyperliquid  │  │   Backpack   │  │  EdgeX / 01  │   │
+│  │ Pub/Priv/Acc │  │      WS      │  │      WS      │  │      WS      │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+└─────────┼──────────────────┼──────────────────┼──────────────────┼──────────┘
+          │                  │                  │                  │
+          └──────────────────┴──────────────────┴──────────────────┘
+                                      │
+                                      ▼
+          ┌───────────────────────────────────────────────────────┐
+          │         Shared Memory IPC (Lock-Free)                 │
+          │  ┌─────────────────────────────────────────────────┐  │
+          │  │ /dev/shm/aleph-matrix        (656KB BBO Matrix) │  │
+          │  │ /dev/shm/aleph-events        (64KB Event Ring)  │  │
+          │  │ /dev/shm/aleph-account-stats (128B Stats)       │  │
+          │  └─────────────────────────────────────────────────┘  │
+          └───────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Rust Core (Strategy Engine)                         │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  IPC Readers: ShmReader (Seqlock) | ShmEventReader (SPSC Ring)      │   │
+│  │               AccountStatsReader (Versioned)                         │   │
+│  └────────────────────────────┬─────────────────────────────────────────┘   │
+│                               ▼                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Shadow Ledger: real_pos + in_flight_pos (Optimistic Accounting)    │   │
+│  └────────────────────────────┬─────────────────────────────────────────┘   │
+│                               ▼                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  Strategy Engine:                                                    │   │
+│  │    • InventoryNeutralMM  • AdaptiveMM  • MarketMaker (EdgeX)        │   │
+│  │    • BackpackMM          • ArbitrageEngine                           │   │
+│  └────────────────────────────┬─────────────────────────────────────────┘   │
+│                               ▼                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  FFI Sign + HTTP Direct Execution (No Boomerang)                    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+          ┌───────────────────────────────────────────────────────┐
+          │              Exchange REST APIs                       │
+          │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐│
+          │  │  Lighter DEX │  │   Backpack   │  │    EdgeX     ││
+          │  │ Poseidon2 +  │  │   Ed25519    │  │   StarkNet   ││
+          │  │    EdDSA     │  │              │  │   Pedersen   ││
+          │  └──────────────┘  └──────────────┘  └──────────────┘│
+          └───────────────────────────────────────────────────────┘
+                                      │
+                                      │ (Fill/Cancel Events)
+                                      ▼
+                          Back to /dev/shm/aleph-events
+```
+
+### Data Flow
+
+| Layer | Component | Protocol | Latency |
+|-------|-----------|----------|---------|
+| **Ingestion** | Go Feeder | WebSocket → SHM Write | ~50μs |
+| **IPC** | Shared Memory | Seqlock (BBO) + SPSC Ring (Events) | ~100ns read |
+| **Strategy** | Rust Engine | Lock-free polling loop | <250ns per tick |
+| **Execution** | HTTP REST | FFI Sign + Keep-Alive | ~5-20ms RTT |
+| **Reconciliation** | Shadow Ledger | Event stream background task | Async |
 
 ### Key Design Principles
 
