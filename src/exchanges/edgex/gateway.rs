@@ -138,40 +138,80 @@ impl EdgeXGateway {
     ) -> Result<OrderResult> {
         let is_buy = matches!(side, Side::Buy);
 
-        // Convert to L2 format
-        let l2_price = self.price_to_l2(price);
-        let l2_size = self.size_to_l2(size);
-        let l2_value = l2_price * l2_size / 10u64.pow(self.config.size_decimals);
-        let l2_limit_fee = self.calculate_fee(l2_value as f64);
+        // Generate client_order_id first (needed for nonce calculation)
+        let client_order_id = Uuid::new_v4().to_string();
 
-        // Generate nonce and expiration
-        let l2_nonce = self.next_nonce();
-        let l2_expire_time = self.get_expiration_timestamp();
+        // Calculate l2_nonce from client_order_id as per EdgeX requirement:
+        // l2Nonce = hexToLong(sha256(clientOrderId).substring(0,8))
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(client_order_id.as_bytes());
+        let hash_result = hasher.finalize();
+        let hex_str = format!("{:x}", hash_result);
+        let l2_nonce = u64::from_str_radix(&hex_str[0..8], 16)
+            .map_err(|e| anyhow!("Failed to parse nonce from hash: {}", e))?;
+
+        // Calculate values for L2 signature
+        let value_dm = price * size; // Decimal value (e.g., 1983.22 * 0.01 = 19.8322)
+
+        // For L2 signature: amount_collateral = int(value_dm * 1000000)
+        let amount_collateral = (value_dm * 1_000_000.0) as u64;
+
+        // For L2 signature: amount_synthetic = int(size * resolution)
+        // Resolution is typically 10^size_decimals for perpetuals
+        let resolution = 10u64.pow(self.config.size_decimals);
+        let amount_synthetic = (size * resolution as f64) as u64;
+
+        // Calculate fee: amount_fee = ceil(value_dm * fee_rate) * 1000000
+        let amount_fee = ((value_dm * self.config.fee_rate).ceil() * 1_000_000.0) as u64;
+
+        // Generate expiration times
+        // l2_expire_time: 60 days from now in milliseconds
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let l2_expire_time = now_ms + (60 * 24 * 60 * 60 * 1000); // 60 days
+        let expire_time = l2_expire_time - 864_000_000; // 10 days earlier
+
+        // Convert l2_expire_time to hours for signature
+        let l2_expire_time_hours = l2_expire_time / (60 * 60 * 1000);
 
         // Calculate L2 signature hash
+        tracing::debug!(
+            "L2 signature inputs: synthetic_asset={}, collateral_asset={}, fee_asset={}, is_buy={}, amount_synthetic={}, amount_collateral={}, amount_fee={}, nonce={}, account_id={}, expire_time_hours={}",
+            self.config.synthetic_asset_id,
+            self.config.collateral_asset_id,
+            self.config.fee_asset_id,
+            is_buy,
+            amount_synthetic,
+            amount_collateral,
+            amount_fee,
+            l2_nonce,
+            self.config.account_id,
+            l2_expire_time_hours
+        );
+
         let hash = self.client.signature_manager.calc_limit_order_hash(
             &self.config.synthetic_asset_id,
             &self.config.collateral_asset_id,
             &self.config.fee_asset_id,
             is_buy,
-            l2_size,
-            l2_value,
-            l2_limit_fee,
+            amount_synthetic,
+            amount_collateral,
+            amount_fee,
             l2_nonce,
             self.config.account_id,
-            l2_expire_time,
+            l2_expire_time_hours,
         )?;
 
         // Sign the hash
         let l2_signature = self.client.signature_manager.sign_l2_action(hash)?;
 
-        // Create order request
-        let client_order_id = Uuid::new_v4().to_string();
-        let expire_time = l2_expire_time * 3600 * 1000; // Convert to milliseconds
-
+        // Create order request with correct field formats
         let req = CreateOrderRequest {
-            price: price.to_string(),
-            size: size.to_string(),
+            price: format!("{:.2}", price), // Round to 2 decimals to avoid floating point issues
+            size: format!("{:.4}", size), // Round to 4 decimals
             r#type: OrderType::Limit,
             time_in_force: TimeInForce::PostOnly,
             account_id: self.config.account_id,
@@ -180,9 +220,9 @@ impl EdgeXGateway {
             client_order_id: client_order_id.clone(),
             expire_time,
             l2_nonce,
-            l2_value: l2_value.to_string(),
-            l2_size: l2_size.to_string(),
-            l2_limit_fee: l2_limit_fee.to_string(),
+            l2_value: format!("{:.6}", value_dm), // Decimal value with 6 decimals (USDC precision)
+            l2_size: format!("{:.4}", size), // Decimal size with 4 decimals
+            l2_limit_fee: format!("{:.0}", (value_dm * self.config.fee_rate).ceil()), // Integer fee
             l2_expire_time,
             l2_signature,
         };
@@ -193,10 +233,26 @@ impl EdgeXGateway {
             .await
             .map_err(|e| anyhow!("EdgeX create_order failed: {}", e))?;
 
-        // Extract order_id from response
-        let order_id = resp.get("order_id")
+        // Debug: Log the full response
+        tracing::debug!("EdgeX API Response: {}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| format!("{:?}", resp)));
+
+        // EdgeX uses a wrapper format: {"code": "...", "data": {...}, "errorParam": {...}}
+        // Check for error code
+        if let Some(code) = resp.get("code").and_then(|v| v.as_str()) {
+            if code != "SUCCESS" && code != "OK" {
+                let error_msg = resp.get("errorParam")
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .unwrap_or_else(|| code.to_string());
+                return Err(anyhow!("EdgeX API error: {} - {}", code, error_msg));
+            }
+        }
+
+        // Extract order_id from data field
+        let order_id = resp.get("data")
+            .and_then(|data| data.get("orderId"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Missing order_id in response"))?;
+            .or_else(|| resp.get("data").and_then(|data| data.get("order_id")).and_then(|v| v.as_str()))
+            .ok_or_else(|| anyhow!("Missing orderId in response data"))?;
 
         Ok(OrderResult {
             tx_hash: order_id.to_string(),
