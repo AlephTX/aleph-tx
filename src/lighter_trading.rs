@@ -364,17 +364,16 @@ impl LighterTrading {
 
     // ─── 签名 + 发送 ─────────────────────────────────────────────────────
 
-    /// 签名一笔订单，返回 (tx_type, tx_info, tx_hash, client_order_index)
-    /// FFI 调用通过 spawn_blocking 避免阻塞 tokio async 线程
-    async fn sign_order(
+    /// 签名一笔订单（使用指定的 nonce）
+    async fn sign_order_with_nonce(
         &self,
         side: Side,
         price: f64,
         size: f64,
         order_type: OrderType,
         reduce_only: bool,
+        nonce: i64,
     ) -> Result<(u8, String, String, i64)> {
-        let nonce = self.get_nonce().await?;
         let client_order_index = self.next_client_order_index();
 
         // 使用 round() 防止浮点截断: 2085.87 * 100 = 208587.0 而非 208586
@@ -406,6 +405,20 @@ impl LighterTrading {
         );
 
         Ok((signed.tx_type, signed.tx_info, signed.tx_hash, client_order_index))
+    }
+
+    /// 签名一笔订单，返回 (tx_type, tx_info, tx_hash, client_order_index)
+    /// FFI 调用通过 spawn_blocking 避免阻塞 tokio async 线程
+    async fn sign_order(
+        &self,
+        side: Side,
+        price: f64,
+        size: f64,
+        order_type: OrderType,
+        reduce_only: bool,
+    ) -> Result<(u8, String, String, i64)> {
+        let nonce = self.get_nonce().await?;
+        self.sign_order_with_nonce(side, price, size, order_type, reduce_only, nonce).await
     }
 
     /// 发送单笔交易到 sendTx
@@ -566,14 +579,17 @@ impl LighterTrading {
 
     /// 批量下单（一买一卖），使用 sendTxBatch 一次性提交
     pub async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
-        // 签名买单
+        // Get base nonce for batch
+        let base_nonce = self.get_nonce().await?;
+
+        // 签名买单 (nonce = base_nonce)
         let (bid_type, bid_info, _bid_hash, bid_coi) = self
-            .sign_order(Side::Buy, params.bid_price, params.bid_size, OrderType::Limit, false)
+            .sign_order_with_nonce(Side::Buy, params.bid_price, params.bid_size, OrderType::Limit, false, base_nonce)
             .await?;
 
-        // 签名卖单
+        // 签名卖单 (nonce = base_nonce + 1)
         let (ask_type, ask_info, _ask_hash, ask_coi) = self
-            .sign_order(Side::Sell, params.ask_price, params.ask_size, OrderType::Limit, false)
+            .sign_order_with_nonce(Side::Sell, params.ask_price, params.ask_size, OrderType::Limit, false, base_nonce + 1)
             .await?;
 
         tracing::info!(
