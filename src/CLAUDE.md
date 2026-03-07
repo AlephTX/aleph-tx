@@ -22,8 +22,6 @@ alwaysApply: true
 | lighter_ffi.rs | FFI bindings to Go signer (`lighter-signer-linux-amd64.so`) |
 | lighter_orders.rs | HTTP order execution with optimistic accounting |
 | lighter_trading.rs | High-level Lighter trading API wrapper |
-| risk.rs | Risk gate with hard limits (position, order size, spread) |
-| orderbook.rs | Local in-memory orderbook (BTreeMap) |
 
 ## Subdirectories
 
@@ -33,7 +31,6 @@ alwaysApply: true
 | backpack_api/ | Backpack exchange REST client (Ed25519 auth) |
 | edgex_api/ | EdgeX REST client (StarkNet L2 Pedersen hash auth) |
 | types/ | Core type definitions (events, orders, symbols) |
-| bin/ | Diagnostic and test binaries |
 
 ## Architecture
 

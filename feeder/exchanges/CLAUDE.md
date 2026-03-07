@@ -1,5 +1,5 @@
 ---
-description: Exchange WebSocket adapters - Lighter, Hyperliquid, Backpack, EdgeX, 01, Mock
+description: Exchange WebSocket adapters - Lighter, Hyperliquid, Backpack, EdgeX, 01
 alwaysApply: true
 ---
 
@@ -21,7 +21,6 @@ alwaysApply: true
 | backpack.go | Backpack depth WS (`depth.{symbol}` channel) |
 | edgex.go | EdgeX quote API WS (`depth.{contractId}.15`) |
 | 01.go | 01 Exchange orderbook WS |
-| mock.go | Synthetic data generator (BTC/ETH random walk, 100ms tick) |
 
 ## Exchange ID Constants
 
@@ -60,4 +59,3 @@ graph LR
 - All adapters use `RunConnectionLoop()` for infinite reconnect with 3s backoff.
 - Lighter private stream requires auth token from `lighter_auth.go` (Poseidon2 + Schnorr).
 - Timestamp formats vary: Lighter (ms), Hyperliquid (ms), Backpack (us), EdgeX (current time).
-- Mock data useful when exchanges are unavailable during development.

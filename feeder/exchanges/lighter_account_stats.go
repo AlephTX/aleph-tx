@@ -108,9 +108,6 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 			return err
 		}
 
-		// Log raw message for debugging
-		log.Printf("lighter-account-stats: received raw message: %s", string(data))
-
 		var stats lighterUserStats
 		if err := json.Unmarshal(data, &stats); err != nil {
 			log.Printf("lighter-account-stats: failed to parse message: %v", err)

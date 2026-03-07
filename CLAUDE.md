@@ -280,15 +280,13 @@ CLAUDE.md (root)                    -> Project architecture, constraints, workfl
     src/backpack_api/CLAUDE.md      -> Backpack REST client (Ed25519)
     src/edgex_api/CLAUDE.md         -> EdgeX REST client (StarkNet Pedersen)
     src/types/CLAUDE.md             -> Core types + C-ABI event struct
-    src/bin/CLAUDE.md               -> Diagnostic binaries (monitors, SHM tools)
   examples/CLAUDE.md                -> Entry points for make targets
   lib/CLAUDE.md                     -> FFI shared library (Lighter signer)
-  scripts/CLAUDE.md                 -> Operational and utility scripts
   docs/CLAUDE.md                    -> Reference documentation (architecture, optimization)
   proto/CLAUDE.md                   -> gRPC service definitions
 ```
 
-Claude auto-loads all 15 CLAUDE.md files at session start = zero warm-up time, full project awareness.
+Claude auto-loads all 13 CLAUDE.md files at session start = zero warm-up time, full project awareness.
 
 ---
 
