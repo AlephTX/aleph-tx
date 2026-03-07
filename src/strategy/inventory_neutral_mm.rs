@@ -334,11 +334,22 @@ impl InventoryNeutralMM {
             // ═══════════════════════════════════════════════════════════════════
             let (bid_size, ask_size) = self.calculate_asymmetric_sizes(position, mid);
 
-            // Skip if both sizes are zero (max position reached)
+            // Handle insufficient margin: cancel active orders to free up margin
             if bid_size < 0.001 && ask_size < 0.001 {
-                warn!("Position {:.4} at limit, skipping quotes", position);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+                if self.account_stats.available_balance < 20.0 {
+                    // Low margin: cancel all active orders to free up capital
+                    warn!(
+                        "Low margin (${:.2}), canceling active orders to free up capital",
+                        self.account_stats.available_balance
+                    );
+                    self.cancel_all_orders().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                } else {
+                    warn!("Position {:.4} at limit, skipping quotes", position);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             }
 
             debug!(
@@ -401,7 +412,15 @@ impl InventoryNeutralMM {
                         });
                         self.total_orders_placed += 2;
                     }
-                    Err(e) => warn!("Batch failed: {}", e),
+                    Err(e) => {
+                        warn!("Batch failed: {}", e);
+                        // Handle margin errors by canceling active orders
+                        if e.to_string().contains("not enough margin") {
+                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            self.cancel_all_orders().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
                 }
             } else if place_bid {
                 match self.trading.buy(bid_size, our_bid).await {
@@ -415,7 +434,14 @@ impl InventoryNeutralMM {
                         });
                         self.total_orders_placed += 1;
                     }
-                    Err(e) => warn!("Buy failed: {}", e),
+                    Err(e) => {
+                        warn!("Buy failed: {}", e);
+                        if e.to_string().contains("not enough margin") {
+                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            self.cancel_all_orders().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
                 }
             } else if place_ask {
                 match self.trading.sell(ask_size, our_ask).await {
@@ -429,7 +455,14 @@ impl InventoryNeutralMM {
                         });
                         self.total_orders_placed += 1;
                     }
-                    Err(e) => warn!("Sell failed: {}", e),
+                    Err(e) => {
+                        warn!("Sell failed: {}", e);
+                        if e.to_string().contains("not enough margin") {
+                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            self.cancel_all_orders().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
                 }
             }
 
@@ -494,6 +527,52 @@ impl InventoryNeutralMM {
             (position + self.config.max_position).max(0.0)
         } else {
             ask_size.max(min_size)
+        };
+
+        // ═══════════════════════════════════════════════════════════════════
+        // MARGIN MANAGEMENT: Adjust order sizes based on available balance
+        // ═══════════════════════════════════════════════════════════════════
+        let available = self.account_stats.available_balance;
+        let _leverage = self.account_stats.leverage;
+
+        // Estimate margin required per order (conservative: assume 10x leverage)
+        let margin_per_eth = mid / 10.0;
+        let bid_margin_required = bid_size * margin_per_eth;
+        let ask_margin_required = ask_size * margin_per_eth;
+        let total_margin_required = bid_margin_required + ask_margin_required;
+
+        // Reserve 20% buffer for safety
+        let usable_balance = available * 0.8;
+
+        let (bid_size, ask_size) = if total_margin_required > usable_balance {
+            // Insufficient margin: scale down proportionally
+            let scale_factor = (usable_balance / total_margin_required).min(1.0);
+
+            if scale_factor < 0.1 {
+                // Too little margin: cancel active orders and skip this cycle
+                warn!(
+                    "Insufficient margin: available=${:.2} required=${:.2} (scale={:.1}%), skipping quotes",
+                    available, total_margin_required, scale_factor * 100.0
+                );
+                (0.0, 0.0)
+            } else {
+                // Scale down order sizes
+                let scaled_bid = bid_size * scale_factor;
+                let scaled_ask = ask_size * scale_factor;
+                debug!(
+                    "Margin constraint: scaled orders by {:.1}% (available=${:.2})",
+                    scale_factor * 100.0, available
+                );
+
+                // Check if scaled sizes meet minimum requirements (Lighter DEX minimum ~0.01 ETH)
+                let min_order_size = 0.01;
+                let final_bid = if scaled_bid < min_order_size { 0.0 } else { scaled_bid };
+                let final_ask = if scaled_ask < min_order_size { 0.0 } else { scaled_ask };
+
+                (final_bid, final_ask)
+            }
+        } else {
+            (bid_size, ask_size)
         };
 
         // Round to step size
