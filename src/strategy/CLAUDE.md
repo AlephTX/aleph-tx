@@ -15,8 +15,9 @@ alwaysApply: true
 | arbitrage.rs | Cross-exchange statistical arbitrage scanner (25 bps threshold) |
 | market_maker.rs | EdgeX market maker (EWMA volatility, dynamic sizing) |
 | backpack_mm.rs | Backpack market maker (Ed25519 auth, momentum-based spread) |
-| lighter_mm.rs | Lighter DEX MM (No-Boomerang, incremental quoting, shadow ledger) |
+| lighter_mm.rs | *(deleted)* - Legacy Lighter MM, replaced by inventory_neutral_mm |
 | adaptive_mm.rs | Premium account fee-aware HFT with microstructure signals |
+| inventory_neutral_mm.rs | Inventory-Neutral MM - production HFT strategy (Exchange trait, config-driven) |
 
 ## Strategy Trait
 
@@ -36,7 +37,7 @@ graph TD
     TRAIT[Strategy Trait] --> ARB[ArbitrageEngine]
     TRAIT --> MM[MarketMaker - EdgeX]
     TRAIT --> BPM[BackpackMM]
-    TRAIT --> LMM[LighterMM]
+    TRAIT --> LMM[InventoryNeutralMM]
     TRAIT --> AMM[AdaptiveMM]
 
     SHM[SHM BBO Matrix] --> ARB & MM & BPM & LMM & AMM
@@ -57,6 +58,6 @@ graph TD
 
 ## Gotchas
 
-- `lighter_mm.rs`: If `last_price == 0.0` at boot, bypass deviation check to avoid NaN.
+- `lighter_mm.rs` has been deleted. `inventory_neutral_mm.rs` is the production replacement.
 - `adaptive_mm.rs`: Uses `MicrostructureTracker` (EWMA fast/slow, realized vol, adverse selection).
 - Order TTL: Stale orders canceled after 30s (lighter_mm) to prevent position drift.

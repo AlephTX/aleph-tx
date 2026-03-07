@@ -23,11 +23,13 @@ src/exchanges/
     model.rs                # Data structures (BackpackOrderRequest, BackpackPosition, etc.)
     CLAUDE.md               # Backpack-specific documentation
   edgex/
-    mod.rs                  # pub mod client; pub mod gateway; pub mod model; pub mod signature;
+    mod.rs                  # pub mod client; pub mod gateway; pub mod model; pub mod signature; pub mod pedersen;
     client.rs               # EdgeXClient - REST client with L2 auth
-    gateway.rs              # EdgeXGateway - Exchange trait implementation (simplified)
+    gateway.rs              # EdgeXGateway - Exchange trait implementation (buy/sell/cancel/batch)
     model.rs                # Data structures (CreateOrderRequest, OpenOrder, Position, etc.)
-    signature.rs            # SignatureManager - StarkNet Pedersen hash for L2 signing
+    signature.rs            # SignatureManager - StarkNet Pedersen hash + EC_ORDER reduction + local verify
+    pedersen/mod.rs         # EdgeX-compatible Pedersen hash implementation
+    pedersen/pedersen_points.rs  # Pre-computed constant points for Pedersen hash
     CLAUDE.md               # EdgeX-specific documentation
 ```
 
@@ -54,7 +56,7 @@ pub trait Exchange: Send + Sync {
 |----------|--------|---------|--------|
 | Lighter  | ✅ trading.rs | ✅ (native impl) | Production-ready |
 | Backpack | ✅ client.rs | ✅ gateway.rs | Functional (no batch API) |
-| EdgeX    | ✅ client.rs | ⚠️ gateway.rs | Stub (needs L2 signature integration) |
+| EdgeX    | ✅ client.rs | ✅ gateway.rs | Functional (L2 Pedersen signature complete) |
 
 ## Backward Compatibility
 
@@ -85,7 +87,7 @@ Existing code using `crate::lighter_trading::*` continues to work without change
 ### EdgeX
 - **L2 StarkNet auth**: Pedersen hash + Stark curve signing
 - **Complex signature**: Requires `calc_limit_order_hash` with asset IDs, nonce, expiry
-- **Gateway status**: Simplified stub - full implementation requires proper L2 signature integration
+- **Pedersen hash**: Uses EdgeX-specific constant points (not standard StarkNet), with EC_ORDER modular reduction
 
 ## Testing
 
@@ -97,7 +99,6 @@ make adaptive-up    # Production adaptive MM (Lighter DEX)
 
 ## Future Work
 
-1. **EdgeX Gateway**: Complete L2 signature integration in `gateway.rs`
-2. **Config-driven factory**: `main.rs` should instantiate exchanges based on `config.toml`
-3. **Dynamic Makefile**: `make run EXCHANGE=backpack STRATEGY=inventory_neutral_mm`
-4. **Cross-exchange strategies**: Arbitrage between Lighter/Backpack/EdgeX
+1. **Config-driven factory**: `main.rs` should instantiate exchanges based on `config.toml`
+2. **Dynamic Makefile**: `make run EXCHANGE=backpack STRATEGY=inventory_neutral_mm`
+3. **Cross-exchange strategies**: Arbitrage between Lighter/Backpack/EdgeX

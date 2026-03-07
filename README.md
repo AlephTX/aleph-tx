@@ -19,8 +19,8 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
               /dev/shm/aleph-events    (64KB)      │          │                  │
               /dev/shm/aleph-account-stats (128B)  │          ▼                  │
                                                    │  Strategy Engine            │
+                                                   │  ├─ InventoryNeutralMM     │
                                                    │  ├─ AdaptiveMM (Lighter)   │
-                                                   │  ├─ LighterMM              │
                                                    │  ├─ MarketMaker (EdgeX)    │
                                                    │  ├─ BackpackMM             │
                                                    │  └─ ArbitrageEngine        │
@@ -63,9 +63,14 @@ See [Configuration Guide](docs/CONFIGURATION.md) for detailed setup.
 | Target | Description |
 |--------|-------------|
 | `make build` | Build all binaries (Go feeder + Rust) |
+| `make lighter-up STRATEGY=<name>` | Start Lighter DEX strategy (default: inventory_neutral_mm) |
+| `make lighter-down` / `lighter-logs` | Stop / view logs for Lighter |
+| `make backpack-up STRATEGY=<name>` | Start Backpack strategy |
+| `make backpack-down` / `backpack-logs` | Stop / view logs for Backpack |
+| `make edgex-up STRATEGY=<name>` | Start EdgeX strategy |
+| `make edgex-down` / `edgex-logs` | Stop / view logs for EdgeX |
+| `make status` | Show all running strategies across exchanges |
 | `make test-up` / `test-down` / `test-logs` | Integration test environment |
-| `make adaptive-up` / `adaptive-down` / `adaptive-logs` | Production adaptive MM |
-| `make status` | Show all running strategies |
 | `make clean` | Clean build artifacts |
 
 ## Project Structure
@@ -81,11 +86,11 @@ aleph-tx/
 │   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats)
 │   └── config/          #   TOML config loader
 ├── src/                 # Rust: HFT strategy engine
-│   ├── strategy/        #   Strategy implementations (adaptive_mm, lighter_mm, arbitrage, etc.)
+│   ├── strategy/        #   Strategy implementations (inventory_neutral_mm, adaptive_mm, arbitrage, etc.)
 │   ├── exchanges/       #   Exchange integrations (Backpack, EdgeX, Lighter)
-│   ├── native/          #   Native libraries (Lighter Ed25519 signer .so)
+│   ├── native/          #   Native FFI libraries (Lighter Ed25519 signer .so)
 │   └── types/           #   Core types + C-ABI event struct (64 bytes)
-├── examples/            # Entry point binaries for make targets
+├── examples/            # Entry point binaries for make targets + debug/benchmark tools
 ├── docs/                # Reference documentation
 │   └── CONFIGURATION.md #   Configuration guide
 └── proto/               # gRPC service definitions
@@ -97,18 +102,29 @@ aleph-tx/
 |----------|------|------|--------|
 | **Lighter DEX** | Primary (HFT MM) | Poseidon2 + EdDSA via FFI | Production |
 | **Backpack** | Secondary (MM) | Ed25519 | Ready |
-| **EdgeX** | Secondary (MM) | StarkNet Pedersen | Ready |
+| **EdgeX** | Secondary (MM) | StarkNet Pedersen L2 | Production |
 | **Hyperliquid** | Data feed | - | Feed only |
 | **01 Exchange** | Data feed | - | Feed only |
 
-## Strategy: Adaptive Market Maker (Primary)
+## Strategies
 
-The production strategy (`src/strategy/adaptive_mm.rs`) implements fee-aware HFT with microstructure signals:
+### Inventory-Neutral MM (Primary)
+
+The production strategy (`src/strategy/inventory_neutral_mm.rs`) implements config-driven HFT market making via the `Exchange` trait:
+
+- **Inventory Neutral**: Maintains near-zero net position (98.4% neutral in live testing)
+- **Exchange Trait**: Works with any exchange implementing `Arc<dyn Exchange>`
+- **Config-Driven**: All parameters externalized to `config.toml` (no hardcoded constants)
+- **Shadow Ledger**: Optimistic `in_flight_pos` tracking with background reconciliation
+- **Batch Quoting**: Paired bid/ask via `place_batch` for atomic updates
+
+### Adaptive MM
+
+The adaptive strategy (`src/strategy/adaptive_mm.rs`) implements fee-aware HFT with microstructure signals:
 
 - **Fee-Aware Spread**: Ensures spread > round-trip fee (0.76 bps for Premium account)
 - **Microstructure Tracker**: EWMA fast/slow momentum, realized volatility, adverse selection score
 - **Inventory Skew**: Linear position-based adjustment to flatten exposure
-- **Batch Quoting**: Paired bid/ask via `sendTxBatch` for atomic updates
 - **Dynamic Sizing**: Position scaled by leverage and available balance from account stats
 
 ## Configuration
@@ -143,6 +159,16 @@ BACKPACK_SECRET_KEY=<key>
 EDGEX_STARK_PRIVATE_KEY=<hex>
 EDGEX_ACCOUNT_ID=<id>
 ```
+
+## Roadmap
+
+- **Risk Management**: Circuit breaker, max drawdown limit, kill switch
+- **Observability**: Prometheus metrics, Grafana dashboard, alerting
+- **Cross-Exchange Arbitrage**: Statistical arb between Lighter/Backpack/EdgeX
+- **WebSocket Execution**: Replace REST with WS for lower latency order placement
+- **Backtesting Framework**: Historical data replay with strategy simulation
+- **gRPC Control Plane**: Remote strategy management (proto/ definitions ready)
+- **Multi-Asset Support**: BTC-PERP, SOL-PERP, and other perpetual markets
 
 ## Documentation
 
