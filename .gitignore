@@ -45,3 +45,8 @@ feeder/config.toml
 *.backup
 *.bak
 *.orig
+
+# Claude Code (commit settings.json only)
+.claude/settings.local.json
+.claude/plans/
+.claude/worktrees/
