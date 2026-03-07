@@ -581,7 +581,8 @@ impl AdaptiveMarketMaker {
                 match self.trading.place_batch(BatchOrderParams {
                     bid_price: our_bid,
                     ask_price: our_ask,
-                    size: order_size,
+                    bid_size: order_size,
+                    ask_size: order_size,
                 }).await {
                     Ok(result) => {
                         info!(

@@ -59,7 +59,8 @@ pub struct OrderParams {
 pub struct BatchOrderParams {
     pub bid_price: f64,
     pub ask_price: f64,
-    pub size: f64,
+    pub bid_size: f64,
+    pub ask_size: f64,
 }
 
 /// 下单结果
@@ -556,17 +557,17 @@ impl LighterTrading {
     pub async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
         // 签名买单
         let (bid_type, bid_info, _bid_hash, bid_coi) = self
-            .sign_order(Side::Buy, params.bid_price, params.size, OrderType::Limit, false)
+            .sign_order(Side::Buy, params.bid_price, params.bid_size, OrderType::Limit, false)
             .await?;
 
         // 签名卖单
         let (ask_type, ask_info, _ask_hash, ask_coi) = self
-            .sign_order(Side::Sell, params.ask_price, params.size, OrderType::Limit, false)
+            .sign_order(Side::Sell, params.ask_price, params.ask_size, OrderType::Limit, false)
             .await?;
 
         tracing::info!(
-            "Signed batch: bid={} @ {} / ask={} @ {} size={}",
-            bid_coi, params.bid_price, ask_coi, params.ask_price, params.size
+            "Signed batch: bid={} @ {} x {} / ask={} @ {} x {}",
+            bid_coi, params.bid_price, params.bid_size, ask_coi, params.ask_price, params.ask_size
         );
 
         let batch_resp = self
@@ -763,5 +764,85 @@ impl LighterTrading {
 
         tracing::info!("Close position order submitted");
         Ok(())
+    }
+}
+
+// ─── Exchange Trait 实现 ─────────────────────────────────────────────────────
+
+use crate::exchange::{
+    Exchange, OrderInfo, OrderResult as ExchangeOrderResult,
+    BatchOrderParams as ExchangeBatchParams, BatchOrderResult as ExchangeBatchResult,
+    Side as ExchangeSide,
+};
+use async_trait::async_trait;
+
+#[async_trait]
+impl Exchange for LighterTrading {
+    async fn buy(&self, size: f64, price: f64) -> Result<ExchangeOrderResult> {
+        let result = self.buy(size, price).await?;
+        Ok(ExchangeOrderResult {
+            tx_hash: result.tx_hash,
+            client_order_index: result.client_order_index,
+        })
+    }
+
+    async fn sell(&self, size: f64, price: f64) -> Result<ExchangeOrderResult> {
+        let result = self.sell(size, price).await?;
+        Ok(ExchangeOrderResult {
+            tx_hash: result.tx_hash,
+            client_order_index: result.client_order_index,
+        })
+    }
+
+    async fn place_batch(&self, params: ExchangeBatchParams) -> Result<ExchangeBatchResult> {
+        let lighter_params = BatchOrderParams {
+            bid_price: params.bid_price,
+            ask_price: params.ask_price,
+            bid_size: params.bid_size,
+            ask_size: params.ask_size,
+        };
+        let result = self.place_batch(lighter_params).await?;
+        Ok(ExchangeBatchResult {
+            tx_hashes: result.tx_hashes,
+            bid_client_order_index: result.bid_client_order_index,
+            ask_client_order_index: result.ask_client_order_index,
+        })
+    }
+
+    async fn cancel_order(&self, order_id: i64) -> Result<()> {
+        self.cancel_order(order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<u32> {
+        self.cancel_all().await
+    }
+
+    async fn get_active_orders(&self) -> Result<Vec<OrderInfo>> {
+        let orders = self.get_active_orders().await?;
+        Ok(orders
+            .into_iter()
+            .map(|o| {
+                let side = if o.is_ask {
+                    ExchangeSide::Sell
+                } else {
+                    ExchangeSide::Buy
+                };
+                let price: f64 = o.price.parse().unwrap_or(0.0);
+                let size: f64 = o.initial_base_amount.parse().unwrap_or(0.0);
+                let filled: f64 = o.filled_base_amount.parse().unwrap_or(0.0);
+                OrderInfo {
+                    order_id: o.order_id,
+                    client_order_index: o.client_order_index,
+                    side,
+                    price,
+                    size,
+                    filled,
+                }
+            })
+            .collect())
+    }
+
+    async fn close_all_positions(&self, current_price: f64) -> Result<()> {
+        self.close_all_positions(current_price).await
     }
 }
