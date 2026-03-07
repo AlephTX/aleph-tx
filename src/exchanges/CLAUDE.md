@@ -92,9 +92,9 @@ Existing code using `crate::lighter_trading::*` continues to work without change
 ## Testing
 
 ```bash
-make build          # Build all exchanges
-make test-up        # Integration test (Lighter DEX)
-make adaptive-up    # Production adaptive MM (Lighter DEX)
+make build                              # Build all exchanges
+make test-up                            # Integration test (Lighter DEX)
+make lighter-up STRATEGY=adaptive_mm    # Production adaptive MM (Lighter DEX)
 ```
 
 ## Future Work

@@ -3,7 +3,7 @@ description: Backpack exchange REST API client - Ed25519 auth, order management,
 alwaysApply: true
 ---
 
-# src/backpack_api/
+# src/exchanges/backpack/
 
 > Backpack exchange REST API client with Ed25519 signature authentication.
 

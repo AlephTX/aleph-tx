@@ -55,7 +55,7 @@ graph TD
     subgraph "Strategies"
         SR --> ARB[ArbitrageEngine]
         SR --> MM[MarketMaker EdgeX]
-        SR --> LMM[LighterMM]
+        SR --> LMM[InventoryNeutralMM]
         SR --> AMM[AdaptiveMM]
         AR --> AMM
     end
@@ -91,7 +91,7 @@ graph TD
 ## Testing
 
 ```bash
-make build        # Build Rust + Go
-make test-up      # Integration test (feeder + lighter_trading example)
-make adaptive-up  # Production adaptive MM
+make build                              # Build Rust + Go
+make test-up                            # Integration test (feeder + lighter_trading example)
+make lighter-up STRATEGY=adaptive_mm    # Production adaptive MM
 ```
