@@ -1,5 +1,4 @@
 pub mod adaptive_mm;
-pub mod advanced_mm;
 pub mod arbitrage;
 pub mod backpack_mm;
 pub mod lighter_mm;

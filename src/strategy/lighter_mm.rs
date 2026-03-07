@@ -140,13 +140,14 @@ impl LighterMarketMaker {
                 .find(|(exch_id, _)| *exch_id == 2) // Exchange 2 = Lighter
                 .map(|(_, msg)| msg);
 
-            if lighter_bbo.is_none() || lighter_bbo.unwrap().bid_price == 0.0 {
-                tracing::debug!("No BBO data available for Lighter, waiting...");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-
-            let bbo = lighter_bbo.unwrap();
+            let bbo = match lighter_bbo {
+                Some(b) if b.bid_price > 0.0 => b,
+                _ => {
+                    tracing::debug!("No BBO data available for Lighter, waiting...");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
             let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
 
             // Step 4: Calculate quotes

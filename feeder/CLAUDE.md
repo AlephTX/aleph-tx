@@ -19,9 +19,8 @@ alwaysApply: true
 | Directory | Description |
 |-----------|-------------|
 | config/ | TOML config loader (`ExchangeConfig` struct) |
-| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01, Mock) |
+| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01) |
 | shm/ | Shared memory writers - BBO matrix, event ring buffer, account stats |
-| test/ | Integration tests (auth, stream, order) |
 
 ## Architecture
 

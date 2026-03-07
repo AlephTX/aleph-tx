@@ -11,7 +11,7 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
               │  Lighter WS (Private)   │──SHM──▶  │  ShmEventReader (SPSC Ring) │
               │  Lighter WS (Account)   │          │  AccountStatsReader         │
               │  Hyperliquid / Backpack │          │          │                  │
-              │  EdgeX / 01 / Mock      │          │          ▼                  │
+              │  EdgeX / 01            │          │          ▼                  │
               └─────────────────────────┘          │  ┌───────────────────┐      │
                                                    │  │ Shadow Ledger     │      │
               Shared Memory Regions:               │  │ (real + in_flight)│      │
@@ -73,18 +73,14 @@ aleph-tx/
 ├── feeder/              # Go: WebSocket ingestion, CGO FFI exports
 │   ├── exchanges/       #   Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
 │   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats)
-│   ├── config/          #   TOML config loader
-│   ├── cmd/             #   Standalone CLI test tools
-│   └── test/            #   Integration tests (auth, stream, order)
+│   └── config/          #   TOML config loader
 ├── src/                 # Rust: HFT strategy engine
 │   ├── strategy/        #   Strategy implementations (adaptive_mm, lighter_mm, arbitrage, etc.)
 │   ├── backpack_api/    #   Backpack REST client (Ed25519)
 │   ├── edgex_api/       #   EdgeX REST client (StarkNet Pedersen)
-│   ├── types/           #   Core types + C-ABI event struct (64 bytes)
-│   └── bin/             #   Diagnostic tools (monitors, SHM inspection)
+│   └── types/           #   Core types + C-ABI event struct (64 bytes)
 ├── examples/            # Entry point binaries for make targets
 ├── lib/                 # Pre-built FFI shared library (Lighter signer)
-├── scripts/             # Operational shell scripts
 ├── docs/                # Reference documentation
 └── proto/               # gRPC service definitions
 ```
@@ -149,7 +145,6 @@ EDGEX_ACCOUNT_ID=<id>
 | `CLAUDE.md` (root + per-directory) | Auto-loaded technical context for Claude Code |
 | `docs/QUICKSTART.md` | Step-by-step deployment guide |
 | `docs/ADAPTIVE_MM_GUIDE.md` | Adaptive MM operational guide |
-| `docs/OPTIMIZATION_GUIDE.md` | Strategy math models and parameter tuning |
 | `docs/DUAL_TRACK_IPC.md` | IPC architecture deep-dive |
 | `docs/ORDER_EXECUTION_REDESIGN.md` | Order execution architecture decisions |
 | `CHANGELOG.md` | Version history |

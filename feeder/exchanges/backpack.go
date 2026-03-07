@@ -78,18 +78,11 @@ func (b *Backpack) connect(ctx context.Context) error {
 			return err
 		}
 
-		// Debug: log first 200 chars or full message if shorter
-		debugMsg := string(data)
-		if len(debugMsg) > 200 {
-			debugMsg = debugMsg[:200]
-		}
-		log.Printf("backpack debug: received raw message: %s", debugMsg)
-
 		var msg struct {
 			Data backpackDepth `json:"data"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
-            log.Printf("backpack debug err unmarshal: %v | raw: %s", err, string(data))
+            log.Printf("backpack: unmarshal error: %v", err)
 			continue
 		}
 

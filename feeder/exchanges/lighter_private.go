@@ -21,6 +21,7 @@ type LighterPrivate struct {
 	mktMap       map[int]uint16 // market_index -> symbol_id
 	accountStats *LighterAccountStats // For updating position
 	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
+	orderSizes   map[uint64]float64 // order_id -> remaining_base_amount
 }
 
 // NewLighterPrivate creates a new Lighter private stream client
@@ -51,6 +52,7 @@ func NewLighterPrivate(
 		mktMap:       mktMap,
 		accountStats: accountStats,
 		statsWriter:  statsWriter,
+		orderSizes:   make(map[uint64]float64),
 	}, nil
 }
 
@@ -216,17 +218,19 @@ func (lp *LighterPrivate) processOrder(order *lighterOrder) {
 
 	switch order.Status {
 	case "open":
-		// Order created
+		// Order created — track remaining size
 		initialSize, _ := strconv.ParseFloat(order.InitialBaseAmount, 64)
+		lp.orderSizes[orderID] = initialSize
 		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize, order.IsAsk)
 
 	case "canceled":
-		// Order canceled
+		// Order canceled — clean up tracking
+		delete(lp.orderSizes, orderID)
 		lp.eventBuffer.PushOrderCanceled(uint8(ExchangeLighter), symID, orderID)
 
 	case "filled":
-		// Order fully filled (handled by trade events)
-		// No action needed here
+		// Order fully filled — clean up tracking (fills handled by trade events)
+		delete(lp.orderSizes, orderID)
 	}
 }
 
@@ -260,9 +264,19 @@ func (lp *LighterPrivate) processTrade(trade *lighterTrade) {
 		feePaid = float64(trade.TakerFee) / 10000.0 * fillPrice * fillSize
 	}
 
-	// TODO: Get remaining size from order state
-	// For now, assume 0 (fully filled)
+	// Calculate remaining size from order tracking
 	remainingSize := 0.0
+	if prev, ok := lp.orderSizes[orderID]; ok {
+		remainingSize = prev - fillSize
+		if remainingSize < 0 {
+			remainingSize = 0
+		}
+		if remainingSize == 0 {
+			delete(lp.orderSizes, orderID)
+		} else {
+			lp.orderSizes[orderID] = remainingSize
+		}
+	}
 
 	lp.eventBuffer.PushOrderFilled(
 		uint8(ExchangeLighter),

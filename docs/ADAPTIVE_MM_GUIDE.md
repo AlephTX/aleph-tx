@@ -107,9 +107,6 @@ grep -E "Buy:|Sell:" logs/adaptive-mm.log | tail -20
 ```bash
 # 停止策略（会自动平仓）
 make adaptive-down
-
-# 或使用脚本手动平仓
-./scripts/close_lighter_position.sh
 ```
 
 ## 性能指标

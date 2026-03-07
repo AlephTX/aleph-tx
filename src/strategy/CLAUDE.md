@@ -17,7 +17,6 @@ alwaysApply: true
 | backpack_mm.rs | Backpack market maker (Ed25519 auth, momentum-based spread) |
 | lighter_mm.rs | Lighter DEX MM (No-Boomerang, incremental quoting, shadow ledger) |
 | adaptive_mm.rs | Premium account fee-aware HFT with microstructure signals |
-| advanced_mm.rs | Avellaneda-Stoikov research implementation (Phase 2 reference) |
 
 ## Strategy Trait
 
@@ -39,7 +38,6 @@ graph TD
     TRAIT --> BPM[BackpackMM]
     TRAIT --> LMM[LighterMM]
     TRAIT --> AMM[AdaptiveMM]
-    TRAIT --> ADV[AdvancedMM - Research]
 
     SHM[SHM BBO Matrix] --> ARB & MM & BPM & LMM & AMM
     ACC[SHM Account Stats] --> AMM
@@ -61,5 +59,4 @@ graph TD
 
 - `lighter_mm.rs`: If `last_price == 0.0` at boot, bypass deviation check to avoid NaN.
 - `adaptive_mm.rs`: Uses `MicrostructureTracker` (EWMA fast/slow, realized vol, adverse selection).
-- `advanced_mm.rs`: Reference only - not production-ready.
 - Order TTL: Stale orders canceled after 30s (lighter_mm) to prevent position drift.
