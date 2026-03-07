@@ -97,11 +97,64 @@ fn default_requote_threshold() -> f64 {
     2.0  // 2 bps deviation threshold
 }
 
+/// Inventory Neutral Market Maker 策略配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct InventoryNeutralMMConfig {
+    // 交易所
+    pub exchange_id: u8,          // BBO 过滤用 (2=Lighter)
+    pub symbol_id: u16,           // SHM symbol ID
+    pub market_id: u8,            // 交易所 market ID
+    pub tick_size: f64,           // 价格精度
+    pub step_size: f64,           // 数量精度
+    // 费率
+    pub maker_fee_bps: f64,       // default: 0.38
+    pub min_profit_bps: f64,      // default: 1.0
+    // 报价
+    pub penny_ticks: f64,         // default: 1.0
+    pub inventory_skew_bps: f64,  // default: 3.0
+    // 仓位
+    pub base_order_size: f64,     // default: 0.05
+    pub max_position: f64,        // default: 0.15
+    pub inventory_urgency_threshold: f64, // default: 0.08
+    // 风控
+    pub adverse_selection_threshold: f64, // default: 2.0
+    pub requote_threshold_bps: f64,      // default: 1.5
+    pub order_ttl_secs: u64,             // default: 5
+    pub max_leverage: f64,               // default: 10.0
+    pub min_available_balance: f64,      // default: 2.0
+}
+
+impl Default for InventoryNeutralMMConfig {
+    fn default() -> Self {
+        Self {
+            exchange_id: 2,
+            symbol_id: 0,
+            market_id: 0,
+            tick_size: 0.01,
+            step_size: 0.0001,
+            maker_fee_bps: 0.38,
+            min_profit_bps: 1.0,
+            penny_ticks: 1.0,
+            inventory_skew_bps: 3.0,
+            base_order_size: 0.05,
+            max_position: 0.15,
+            inventory_urgency_threshold: 0.08,
+            adverse_selection_threshold: 2.0,
+            requote_threshold_bps: 1.5,
+            order_ttl_secs: 5,
+            max_leverage: 10.0,
+            min_available_balance: 2.0,
+        }
+    }
+}
+
 /// Top-level config file structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub backpack: ExchangeConfig,
     pub edgex: ExchangeConfig,
+    #[serde(default)]
+    pub inventory_neutral_mm: Option<InventoryNeutralMMConfig>,
 }
 
 impl AppConfig {
@@ -169,6 +222,7 @@ impl Default for AppConfig {
                 time_horizon_sec: 60.0,
                 requote_threshold_bps: 2.0,
             },
+            inventory_neutral_mm: Some(InventoryNeutralMMConfig::default()),
         }
     }
 }

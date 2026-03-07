@@ -10,10 +10,10 @@ help:
 	@echo "  make build          - Compile all binaries"
 	@echo "  make build-feeder   - Compile Go feeder only"
 	@echo ""
-	@echo "Testing:"
-	@echo "  make test-up        - Start test environment (feeder + example)"
-	@echo "  make test-down      - Stop test environment"
-	@echo "  make test-logs      - View test logs"
+	@echo "Live Trading:"
+	@echo "  make live-up        - Start live trading (feeder + inventory_neutral_mm)"
+	@echo "  make live-down      - Stop live trading (closes positions & cancels orders)"
+	@echo "  make live-logs      - View live trading logs"
 	@echo ""
 	@echo "Strategy Management:"
 	@echo "  make up STRATEGY=lighter    - Start Lighter MM"
@@ -44,31 +44,42 @@ build-feeder:
 	cd feeder && go build -o feeder-app
 	@echo "✅ Feeder build complete"
 
-# Start test environment (feeder + example)
-test-up: build-feeder
-	@echo "🧪 Starting test environment..."
+# Start live trading (feeder + inventory_neutral_mm)
+live-up: build-feeder
+	@echo "🚀 Starting live trading environment..."
 	@mkdir -p logs pids
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-test.log 2>&1 & echo $$! > pids/feeder-test.pid
+	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-live.log 2>&1 & echo $$! > pids/feeder-live.pid
 	@sleep 2
-	@echo "✅ Feeder started (PID: $$(cat pids/feeder-test.pid))"
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-live.pid))"
 	@export $$(cat .env.lighter | xargs) && \
 		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
-		cargo run --example lighter_trading > logs/lighter-test.log 2>&1 & echo $$! > pids/lighter-test.pid
-	@echo "✅ Lighter test started (PID: $$(cat pids/lighter-test.pid))"
-	@echo "📊 Logs: tail -f logs/feeder-test.log logs/lighter-test.log"
+		cargo run --release --example inventory_neutral_mm > logs/inventory-neutral-live.log 2>&1 & echo $$! > pids/inventory-neutral-live.pid
+	@echo "✅ Inventory Neutral MM started (PID: $$(cat pids/inventory-neutral-live.pid))"
+	@echo "📊 Logs: tail -f logs/feeder-live.log logs/inventory-neutral-live.log"
 
-# Stop test environment
-test-down:
-	@echo "🛑 Stopping test environment..."
-	@if [ -f pids/feeder-test.pid ]; then kill -9 $$(cat pids/feeder-test.pid) 2>/dev/null || true; rm -f pids/feeder-test.pid; echo "✅ Feeder stopped"; fi
-	@if [ -f pids/lighter-test.pid ]; then kill -9 $$(cat pids/lighter-test.pid) 2>/dev/null || true; rm -f pids/lighter-test.pid; echo "✅ Lighter test stopped"; fi
+# Stop live trading (graceful shutdown with position closing)
+live-down:
+	@echo "🛑 Stopping live trading environment..."
+	@if [ -f pids/inventory-neutral-live.pid ]; then \
+		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
+		kill -2 $$(cat pids/inventory-neutral-live.pid) 2>/dev/null || true; \
+		echo "⏳ Waiting for graceful shutdown (15s)..."; \
+		sleep 15; \
+		if ps -p $$(cat pids/inventory-neutral-live.pid) > /dev/null 2>&1; then \
+			echo "⚠️  Process still running, forcing shutdown..."; \
+			kill -9 $$(cat pids/inventory-neutral-live.pid) 2>/dev/null || true; \
+		fi; \
+		rm -f pids/inventory-neutral-live.pid; \
+		echo "✅ Inventory Neutral MM stopped"; \
+	fi
+	@if [ -f pids/feeder-live.pid ]; then kill -9 $$(cat pids/feeder-live.pid) 2>/dev/null || true; rm -f pids/feeder-live.pid; echo "✅ Feeder stopped"; fi
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
 	@echo "✅ Shared memory cleaned"
 
-# View test logs
-test-logs:
-	@tail -f logs/feeder-test.log logs/lighter-test.log
+# View live trading logs
+live-logs:
+	@tail -f logs/feeder-live.log logs/inventory-neutral-live.log
 
 # Start adaptive market maker (production strategy)
 adaptive-up: build-feeder
