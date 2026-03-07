@@ -6,8 +6,6 @@ pub mod error;
 pub mod lighter_ffi;
 pub mod lighter_orders;
 pub mod lighter_trading;
-pub mod orderbook;
-pub mod risk;
 pub mod shadow_ledger;
 pub mod shm_event_reader;
 pub mod shm_reader;
