@@ -67,6 +67,22 @@ pub struct ExchangeConfig {
     /// Minimum price deviation (bps) to trigger requote (Phase 2 incremental quoting)
     #[serde(default = "default_requote_threshold")]
     pub requote_threshold_bps: f64,
+
+    // EdgeX-specific L2 configuration
+    #[serde(default)]
+    pub contract_id: Option<u64>,
+    #[serde(default)]
+    pub synthetic_asset_id: Option<String>,
+    #[serde(default)]
+    pub collateral_asset_id: Option<String>,
+    #[serde(default)]
+    pub fee_asset_id: Option<String>,
+    #[serde(default)]
+    pub price_decimals: Option<u32>,
+    #[serde(default)]
+    pub size_decimals: Option<u32>,
+    #[serde(default)]
+    pub fee_rate: Option<f64>,
 }
 
 fn default_momentum_threshold() -> f64 {
@@ -215,6 +231,13 @@ impl Default for AppConfig {
                 gamma: 0.1,
                 time_horizon_sec: 60.0,
                 requote_threshold_bps: 2.0,
+                contract_id: None,
+                synthetic_asset_id: None,
+                collateral_asset_id: None,
+                fee_asset_id: None,
+                price_decimals: None,
+                size_decimals: None,
+                fee_rate: None,
             },
             edgex: ExchangeConfig {
                 risk_fraction: 0.08,
@@ -232,6 +255,13 @@ impl Default for AppConfig {
                 gamma: 0.1,
                 time_horizon_sec: 60.0,
                 requote_threshold_bps: 2.0,
+                contract_id: Some(1),
+                synthetic_asset_id: Some("0x4554482d3130000000000000000000".to_string()),
+                collateral_asset_id: Some("0x555344432d36000000000000000000".to_string()),
+                fee_asset_id: Some("0x555344432d36000000000000000000".to_string()),
+                price_decimals: Some(2),
+                size_decimals: Some(4),
+                fee_rate: Some(0.0005),
             },
             inventory_neutral_mm: Some(InventoryNeutralMMConfig::default()),
         }

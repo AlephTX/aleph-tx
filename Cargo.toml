@@ -32,6 +32,8 @@ base64 = "0.22.1"
 futures = "0.3.32"
 toml = "0.8"
 urlencoding = "2.1"
+uuid = { version = "1.11", features = ["v4"] }
+dotenv = "0.15"
 
 [lib]
 name = "aleph_tx"
