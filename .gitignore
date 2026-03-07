@@ -50,3 +50,6 @@ feeder/config.toml
 .claude/settings.local.json
 .claude/plans/
 .claude/worktrees/
+
+# Claude Code task files (local development only)
+@CLAUDECODE/
