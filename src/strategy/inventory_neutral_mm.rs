@@ -155,6 +155,7 @@ pub struct InventoryNeutralMM {
     session_start_balance: f64,
     total_orders_placed: u64,
     last_balance_check: Instant,
+    margin_cooldown_until: Instant,
 }
 
 impl InventoryNeutralMM {
@@ -178,6 +179,7 @@ impl InventoryNeutralMM {
             session_start_balance: 0.0,
             total_orders_placed: 0,
             last_balance_check: Instant::now(),
+            margin_cooldown_until: Instant::now(),
         }
     }
 
@@ -249,6 +251,12 @@ impl InventoryNeutralMM {
             let stats = self.account_stats_reader.read();
             self.account_stats = stats.into();
             let position = self.account_stats.position;
+
+            // Margin cooldown: skip quoting if recently rejected
+            if Instant::now() < self.margin_cooldown_until {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
 
             // Read market data
             let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
@@ -416,9 +424,9 @@ impl InventoryNeutralMM {
                         warn!("Batch failed: {}", e);
                         // Handle margin errors by canceling active orders
                         if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
                             self.cancel_all_orders().await;
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
                         }
                     }
                 }
@@ -437,9 +445,9 @@ impl InventoryNeutralMM {
                     Err(e) => {
                         warn!("Buy failed: {}", e);
                         if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
                             self.cancel_all_orders().await;
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
                         }
                     }
                 }
@@ -458,9 +466,9 @@ impl InventoryNeutralMM {
                     Err(e) => {
                         warn!("Sell failed: {}", e);
                         if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders to free up capital");
+                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
                             self.cancel_all_orders().await;
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
                         }
                     }
                 }
