@@ -16,3 +16,6 @@ alwaysApply: true
 | DUAL_TRACK_IPC.md | Detailed dual-track IPC architecture and integration guide |
 | ORDER_EXECUTION_REDESIGN.md | Architecture decision record for order execution approach |
 | QUICK_REFERENCE.md | Common code patterns, before/after examples, error handling |
+| WORKFLOW.md | Development workflow (Search→Plan→Action), task management rules |
+| CLAUDE_MD_CONVENTIONS.md | How to write effective CLAUDE.md files for new modules |
+| CHANGELOG.md | Historical record of major architectural refactors |

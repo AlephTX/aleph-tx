@@ -40,19 +40,22 @@ Welcome to AlephTX, a Tier-1 High-Frequency Trading (HFT) framework built with R
 - **No Boomerang Execution**: Go handles WS/Network I/O. Rust makes trading decisions and executes HTTP orders DIRECTLY via FFI + HTTP Keep-Alive. Rust NEVER sends execution commands back to Go via IPC.
 - **Optimistic Accounting**: Rust instantly updates `in_flight_pos` upon firing an order. It relies on the Shadow Ledger's background task to reconcile `real_pos` via the Event RingBuffer.
 
-## Environment & Endpoints Dictionary
+## Environment & Endpoints
 
-- **Lighter DEX (Arbitrum)**
-  - REST: `https://mainnet.zklighter.elliot.ai/api/v1/`
-  - WS: `wss://mainnet.zklighter.elliot.ai/stream`
-  - Auth: Uses `lighter-go` SDK (Poseidon2 + EdDSA). Rust calls Go signing via CGO/FFI.
-  - **Chain ID**: 304 (mainnet), 300 (testnet) - CRITICAL for signature validation
-  - **Price Format**: Price * 100 (in cents, e.g., $2061.50 -> 206150)
-  - **Order Expiry**: Use -1 for default (28 days, handled by SDK)
-  - **HTTP Content-Type**: `multipart/form-data` (NOT form-urlencoded despite OpenAPI spec)
-  - **FFI Library**: `src/native/lighter-signer-linux-amd64.so` (pre-built from lighter-go/sharedlib)
-- **Backpack**: REST `https://api.backpack.exchange`
-- **EdgeX**: REST `https://pro.edgex.exchange` (L2 Pedersen hash signature - fully integrated)
+| Exchange | REST API | WebSocket | Auth Method |
+|----------|----------|-----------|-------------|
+| **Lighter DEX** | `https://mainnet.zklighter.elliot.ai/api/v1/` | `wss://mainnet.zklighter.elliot.ai/stream` | Poseidon2 + EdDSA (via FFI to Go CGO) |
+| **Backpack** | `https://api.backpack.exchange` | - | Ed25519 (pure Rust) |
+| **EdgeX** | `https://pro.edgex.exchange` | - | StarkNet Pedersen + Stark curve |
+
+**Lighter DEX Critical Details**:
+- Chain ID: 304 (mainnet), 300 (testnet)
+- Price format: cents (multiply by 100)
+- Order expiry: -1 for default (28 days)
+- HTTP Content-Type: `multipart/form-data`
+- FFI library: `src/native/lighter-signer-linux-amd64.so`
+
+See `src/exchanges/lighter/CLAUDE.md` for debugging notes.
 
 ## Build & Test Workflow (MANDATORY)
 
@@ -114,220 +117,27 @@ When implementing a feature, YOU MUST autonomously test it:
 - **C-ABI Alignment**: `ShmPrivateEvent` MUST be EXACTLY 64 bytes. Verify with `static_assertions::assert_eq_size!`.
 - **Incremental Quoting Math**: Protect against divide-by-zero (e.g., if `last_price == 0.0` during incremental quoting calculations, return `true` to force initial quote).
 
-## Architecture Refactoring (2026-03-07)
-
-### Exchange Module Decoupling
-
-**Motivation**: Exchange-specific code was scattered in `src/` root. Needed clear module boundaries for config-driven hot-pluggable architecture.
-
-**Changes**:
-1. **Directory Reorganization**:
-   - Created `src/exchanges/` with subdirectories: `lighter/`, `backpack/`, `edgex/`
-   - Moved `lighter_ffi.rs` → `exchanges/lighter/ffi.rs`
-   - Moved `lighter_trading.rs` → `exchanges/lighter/trading.rs`
-   - Moved `backpack_api/*` → `exchanges/backpack/*`
-   - Moved `edgex_api/*` → `exchanges/edgex/*`
-   - Deleted `lighter_orders.rs` (legacy, unused)
-
-2. **Backward Compatibility**:
-   - `src/lib.rs` provides re-exports: `pub use exchanges::lighter::ffi as lighter_ffi;`
-   - Existing code using `crate::lighter_trading::*` continues to work
-
-3. **Exchange Trait Implementation**:
-   - Created `exchanges/backpack/gateway.rs` implementing `Exchange` trait
-   - Created `exchanges/edgex/gateway.rs` (simplified stub, needs L2 signature integration)
-   - Lighter already implements `Exchange` trait natively in `trading.rs`
-
-**Status**: Phase 1 & 2 complete. Phase 3 (config-driven factory in `main.rs`) and Phase 4 (dynamic Makefile) deferred for future work.
-
-**Documentation**: See `src/exchanges/CLAUDE.md` for detailed module structure.
-
-## Lighter DEX Integration Debugging Notes
-
-### Common Issues & Solutions
-
-1. **Invalid Signature (code 21120)**
-   - Check chain_id is 304 (not 1)
-   - Verify HTTP Content-Type is `multipart/form-data`
-   - Ensure price format is `price * 100` (cents)
-
-2. **Invalid Expiry (code 21711)**
-   - Use `order_expiry = -1` for default (28 days)
-   - Do NOT calculate timestamp manually
-
-3. **Price Format**
-   - Lighter uses cents: $2061.50 -> 206150
-   - Python example: `price=4050_00` means $4050.00
-   - Rust: `let price_int = (order_req.price * 100.0) as u32;`
-
-4. **Base Amount Format**
-   - Size in base units: 0.001 ETH -> 1000 (multiply by 1e6)
-   - Rust: `let base_amount = (order_req.size * 1_000_000.0) as i64;`
-
-### Reference Implementation
-
-Check `lighter-python` SDK for correct API usage:
-- Repository: `git@github.com:elliottech/lighter-python.git`
-- Key file: `lighter/api/transaction_api.py` (shows multipart/form-data)
-- Example: `examples/create_modify_cancel_order_http.py`
-
----
-
-## Development Workflow
-
-### Problem-Solving Process (Search -> Plan -> Action)
-
-We follow a structured **Search -> Plan -> Action** workflow. Each phase transition requires confirmation from the collaborator.
-
-1. **Search Phase**: Identify and read all relevant code and files. Summarize findings and build an index.
-2. **Plan Phase** (after collaborator confirmation): Create a high-level abstract design. Keep changes minimal, concise, and robust. Plans may be revised multiple times based on collaborator feedback.
-3. **Todo Discussion** (after collaborator confirmation): Discuss todo items - prioritize what to do and what to skip.
-4. **Action Phase**: Execute each todo item, review after completion, and summarize.
-
-### Code Summarization
-
-1. Before starting any task, identify all code files to read. Create concise but thorough index documents (e.g., `xxx.py` -> `xxx.py.md`).
-2. When reading code, create Mermaid diagrams for:
-   - Internal class interaction diagrams
-   - Inheritance hierarchies
-   - Module-level architecture diagrams
-
-### Task Execution Steps
-
-1. **Identify** all relevant code and files for the problem.
-2. **Deep-read** the code, trace call chains and dependencies.
-3. **Create** a detailed todolist based on analysis.
-4. **Execute** each todo item.
-5. **Review** each completed todo - ensure code is clean and robust.
-6. **Summarize** each completed todo.
-7. **Final summary** of the entire task, ending with a timestamp in `{YYYY.MM.DD.HH}` format. Create README files in each directory explaining purpose, features, usage, and testing.
-
----
-
-## Claude Code Project Management Rules
-
-### Directory Structure (MUST follow)
-
-`task_name` is provided by the user. If not provided, Claude Code derives a name from the task content.
+## Three-Layer Context Hierarchy
 
 ```
-@CLAUDECODE/tasks/{task_name}/          # Root directory for each task
-@CLAUDECODE/tasks/{task_name}/todos/    # Todolist files
-@CLAUDECODE/tasks/{task_name}/traces/   # Execution trace files for the task
-@CLAUDECODE/tasks/{task_name}/tests/    # Test files created during task execution
-@CLAUDECODE/tasks/{task_name}/docs/     # Summary documentation
-@CLAUDECODE/tasks/{task_name}/others/   # Uncategorized files
-```
-
-### File Naming Convention
-
-All filenames MUST use English names to avoid encoding issues in terminals that don't support CJK characters.
-
-### Trace Management
-
-1. Maintain trace files for task state tracking.
-2. Save trace content to the `traces/` directory under the task.
-3. All files within a single session are saved to the same directory.
-
-### Test Code Management
-
-1. You may write tests during problem-solving, but MUST clean up afterward.
-2. NEVER create test files in the project root - always use `@CLAUDECODE/tasks/{task_name}/tests/`.
-3. Before deleting test files, confirm with the user whether they can be removed.
-
----
-
-## Living Documentation System (MANDATORY)
-
-### Directory CLAUDE.md Convention
-
-Every source directory in the project MUST contain a `CLAUDE.md` that serves as a living module index. Claude Code **automatically discovers and loads** all `CLAUDE.md` files in the project tree at session start, so these files become instant context without any manual reading.
-
-Each directory `CLAUDE.md` includes:
-
-1. **Purpose** - What this directory/module does, its role in the system.
-2. **Key Files** - Brief description of each file and its responsibility.
-3. **Architecture** - Mermaid diagram showing internal structure, data flow, or class relationships.
-4. **Public API / Usage** - How other modules interact with this one, key entry points.
-5. **Testing** - How to test this module, what test targets apply.
-6. **Gotchas** - Non-obvious behaviors, known edge cases, or debugging tips specific to this module.
-
-Each directory `CLAUDE.md` MUST have the frontmatter:
-```yaml
----
-description: One-line summary of this module
-alwaysApply: true
----
-```
-
-Example (`feeder/CLAUDE.md`):
-```markdown
----
-description: Go-based market data feeder - WS ingestion to shared memory BBO matrix
-alwaysApply: true
----
-
-# feeder/
-
-## Key Files
-| File | Description |
-|------|-------------|
-| main.go | Entry point, WS connection lifecycle |
-| shm.go  | Shared memory writer (seqlock protocol) |
-
-## Architecture
-` ` `mermaid
-graph LR
-  WS[WebSocket] --> Parser --> SHM[/dev/shm/aleph-matrix]
-` ` `
-
-## Testing
-`make test-up` starts the feeder in integration mode.
-
-## Gotchas
-- Seqlock write must complete within one cache line to avoid torn reads on Rust side.
-```
-
-### Why CLAUDE.md Instead of README.md
-
-- Claude Code **auto-loads** all `CLAUDE.md` files in the project hierarchy at session start.
-- No need to manually read context files - they are injected automatically.
-- Each new session starts with full module-level awareness across the entire project.
-- `README.md` can still exist for human developers; `CLAUDE.md` is specifically optimized for Claude's context.
-
-### Documentation Sync Rule
-
-When code changes are made, Claude MUST update all affected `CLAUDE.md` files:
-
-1. **Directory `CLAUDE.md`** - Update if files are added/removed/renamed, or if the module's API or behavior changes.
-2. **Parent directory `CLAUDE.md`** - Update if the change affects cross-module relationships.
-3. **Root `CLAUDE.md`** - Update if the change introduces new architectural patterns, endpoints, constraints, or debugging knowledge that future sessions need.
-4. If no `CLAUDE.md` exists for the directory being touched, **create one** as part of the change.
-
-This ensures documentation never goes stale - every code change carries its documentation forward.
-
-### Three-Layer Context Hierarchy
-
-```
-CLAUDE.md (root)                    -> Project architecture, constraints, workflows
-  feeder/CLAUDE.md                  -> Go feeder: WS ingestion, CGO, SHM writers
-    feeder/exchanges/CLAUDE.md      -> Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
-    feeder/shm/CLAUDE.md            -> Shared memory layouts (BBO matrix, event ring, account stats)
-  src/CLAUDE.md                     -> Rust core: HFT engine, FFI, shadow ledger
-    src/strategy/CLAUDE.md          -> Strategies (arbitrage, MM, adaptive MM, inventory-neutral MM)
-    src/exchanges/CLAUDE.md         -> **Modular exchange integrations** (lighter/, backpack/, edgex/)
-      src/exchanges/backpack/CLAUDE.md -> Backpack REST client (Ed25519)
-      src/exchanges/edgex/CLAUDE.md    -> EdgeX REST client (StarkNet Pedersen)
-    src/types/CLAUDE.md             -> Core types + C-ABI event struct
-  examples/CLAUDE.md                -> Entry points for make targets
-  src/native/CLAUDE.md              -> Native FFI libraries (Lighter signer .so)
-  docs/CLAUDE.md                    -> Reference documentation (architecture, optimization)
-  proto/CLAUDE.md                   -> gRPC service definitions
+CLAUDE.md (root)                         -> Project architecture, constraints, workflows
+  feeder/CLAUDE.md                       -> Go feeder: WS ingestion, CGO, SHM writers
+    feeder/exchanges/CLAUDE.md           -> Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
+    feeder/shm/CLAUDE.md                 -> Shared memory layouts (BBO matrix, event ring, account stats)
+  src/CLAUDE.md                          -> Rust core: HFT engine, FFI, shadow ledger
+    src/strategy/CLAUDE.md               -> Strategies (arbitrage, MM, adaptive MM, inventory-neutral MM)
+    src/exchanges/CLAUDE.md              -> Modular exchange integrations (lighter/, backpack/, edgex/)
+      src/exchanges/lighter/CLAUDE.md    -> Lighter DEX client (Poseidon2 + EdDSA via FFI)
+      src/exchanges/backpack/CLAUDE.md   -> Backpack REST client (Ed25519)
+      src/exchanges/edgex/CLAUDE.md      -> EdgeX REST client (StarkNet Pedersen)
+    src/types/CLAUDE.md                  -> Core types + C-ABI event struct
+  examples/CLAUDE.md                     -> Entry points for make targets
+  src/native/CLAUDE.md                   -> Native FFI libraries (Lighter signer .so)
+  docs/CLAUDE.md                         -> Reference documentation (architecture, optimization)
+  proto/CLAUDE.md                        -> gRPC service definitions
 ```
 
 Claude auto-loads all CLAUDE.md files at session start = zero warm-up time, full project awareness.
-
----
 
 ## Git Commit Conventions
 
@@ -339,53 +149,10 @@ Claude auto-loads all CLAUDE.md files at session start = zero warm-up time, full
 
 ---
 
-## Refactor History
+## Reference Documentation
 
-### v3.3.0 - Unified Multi-Exchange Makefile (2025.01.XX)
+For detailed information on specific topics, see:
 
-**Objective**: Standardize Makefile commands across all exchanges with consistent `make <exchange>-up STRATEGY=<name>` pattern.
-
-**Changes**:
-- Unified command format: `lighter-up`, `backpack-up`, `edgex-up`
-- Strategy selection via `STRATEGY=` parameter (default: `inventory_neutral_mm`)
-- Per-exchange feeder + strategy PID tracking
-- Graceful shutdown with 10-15s timeout before force kill
-- Unified `make status` showing all exchanges
-
-**Migration**:
-```bash
-# Old (v3.2.0)
-make live-up              # Lighter inventory_neutral_mm
-make adaptive-up          # Lighter adaptive_mm
-make backpack-up          # Backpack (hardcoded strategy)
-
-# New (v3.3.0)
-make lighter-up                          # Default: inventory_neutral_mm
-make lighter-up STRATEGY=adaptive_mm     # Adaptive MM
-make backpack-up STRATEGY=simple_mm      # Backpack with strategy selection
-```
-
-### v3.2.0 - Exchange Decoupling Refactor (2025.01.XX)
-
-**Objective**: Modularize exchange-specific code into `src/exchanges/` with config-driven hot-swappable architecture.
-
-**Phase 1: Directory Restructure**
-- Created `src/exchanges/{lighter,backpack,edgex}/` modules
-- Moved `lighter_ffi.rs` → `exchanges/lighter/ffi.rs`
-- Moved `lighter_trading.rs` → `exchanges/lighter/trading.rs`
-- Deleted legacy `lighter_orders.rs` (unused)
-- Added re-exports in `src/lib.rs` for backward compatibility
-
-**Phase 2: Exchange Trait Implementation**
-- `BackpackGateway` - Full Exchange trait implementation
-- `EdgeXGateway` - Stub implementation (requires StarkNet L2 signing)
-- Both wrap existing REST clients
-
-**Phase 3: Examples & Documentation**
-- Created `examples/backpack_mm.rs` demonstrating BackpackGateway usage
-- Updated all CLAUDE.md files to reflect new structure
-- Added `@CLAUDECODE/tasks/exchange-decoupling-refactor/ARCHITECTURE_ANALYSIS.md`
-
-**Commit**: `751c621 refactor(exchanges): Modularize exchange integrations`
-- 28 files changed, 1009 insertions(+), 622 deletions(-)
-- Net reduction: 192 lines
+- **Development workflow rules**: `docs/WORKFLOW.md` (Search→Plan→Action, task management, @CLAUDECODE directory structure)
+- **CLAUDE.md writing conventions**: `docs/CLAUDE_MD_CONVENTIONS.md` (How to create effective module documentation)
+- **Version history**: `docs/CHANGELOG.md` (Major architectural refactors: v3.3.0 unified Makefile, v3.2.0 exchange decoupling)

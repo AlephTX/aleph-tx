@@ -4,31 +4,71 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 
 ## Architecture
 
-```
-                          Go Feeder                              Rust Core
-              ┌─────────────────────────┐          ┌─────────────────────────────┐
-              │  Lighter WS (Public)    │          │  ShmReader (Seqlock)        │
-              │  Lighter WS (Private)   │──SHM──▶  │  ShmEventReader (SPSC Ring) │
-              │  Lighter WS (Account)   │          │  AccountStatsReader         │
-              │  Hyperliquid / Backpack │          │          │                  │
-              │  EdgeX / 01            │          │          ▼                  │
-              └─────────────────────────┘          │  ┌───────────────────┐      │
-                                                   │  │ Shadow Ledger     │      │
-              Shared Memory Regions:               │  │ (real + in_flight)│      │
-              /dev/shm/aleph-matrix    (656KB)     │  └───────┬───────────┘      │
-              /dev/shm/aleph-events    (64KB)      │          │                  │
-              /dev/shm/aleph-account-stats (128B)  │          ▼                  │
-                                                   │  Strategy Engine            │
-                                                   │  ├─ InventoryNeutralMM     │
-                                                   │  ├─ AdaptiveMM (Lighter)   │
-                                                   │  ├─ MarketMaker (EdgeX)    │
-                                                   │  ├─ BackpackMM             │
-                                                   │  └─ ArbitrageEngine        │
-                                                   │          │                  │
-                                                   │          ▼                  │
-                                                   │  FFI Sign + HTTP Direct    │
-                                                   │  (No Boomerang Execution)  │
-                                                   └─────────────────────────────┘
+```mermaid
+graph TB
+    subgraph "Go Feeder (Network I/O)"
+        WS1[Lighter WS<br/>Public/Private/Account]
+        WS2[Hyperliquid WS]
+        WS3[Backpack WS]
+        WS4[EdgeX WS]
+        WS5[01 Exchange WS]
+    end
+
+    subgraph "Shared Memory IPC"
+        SHM1["/dev/shm/aleph-matrix<br/>(656KB BBO Matrix)"]
+        SHM2["/dev/shm/aleph-events<br/>(64KB Event Ring)"]
+        SHM3["/dev/shm/aleph-account-stats<br/>(128B Account Stats)"]
+    end
+
+    subgraph "Rust Core (Strategy Engine)"
+        SR[ShmReader<br/>Seqlock Protocol]
+        ER[ShmEventReader<br/>SPSC Ring Buffer]
+        AR[AccountStatsReader<br/>Versioned Read]
+
+        SL[Shadow Ledger<br/>real_pos + in_flight_pos]
+
+        ST1[InventoryNeutralMM]
+        ST2[AdaptiveMM]
+        ST3[MarketMaker EdgeX]
+        ST4[BackpackMM]
+        ST5[ArbitrageEngine]
+
+        EXEC[FFI Sign + HTTP Direct<br/>No Boomerang Execution]
+    end
+
+    subgraph "Exchanges (HTTP REST)"
+        EX1[Lighter DEX<br/>Poseidon2 + EdDSA]
+        EX2[Backpack<br/>Ed25519]
+        EX3[EdgeX<br/>StarkNet Pedersen]
+    end
+
+    WS1 & WS2 & WS3 & WS4 & WS5 --> SHM1
+    WS1 --> SHM2
+    WS1 --> SHM3
+
+    SHM1 --> SR
+    SHM2 --> ER
+    SHM3 --> AR
+
+    ER --> SL
+    SR --> ST1 & ST2 & ST3 & ST4 & ST5
+    AR --> ST2
+    SL --> ST1 & ST2 & ST3 & ST4 & ST5
+
+    ST1 & ST2 --> EXEC
+    ST3 --> EX3
+    ST4 --> EX2
+    ST5 --> EX1 & EX2 & EX3
+
+    EXEC --> EX1
+
+    EX1 & EX2 & EX3 -.Fill/Cancel Events.-> SHM2
+
+    style SHM1 fill:#e1f5ff
+    style SHM2 fill:#e1f5ff
+    style SHM3 fill:#e1f5ff
+    style SL fill:#fff4e6
+    style EXEC fill:#ffe6e6
 ```
 
 ### Key Design Principles
