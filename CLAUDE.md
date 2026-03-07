@@ -50,9 +50,9 @@ Welcome to AlephTX, a Tier-1 High-Frequency Trading (HFT) framework built with R
   - **Price Format**: Price * 100 (in cents, e.g., $2061.50 -> 206150)
   - **Order Expiry**: Use -1 for default (28 days, handled by SDK)
   - **HTTP Content-Type**: `multipart/form-data` (NOT form-urlencoded despite OpenAPI spec)
-  - **FFI Library**: `lib/lighter-signer-linux-amd64.so` (pre-built from lighter-go/sharedlib)
+  - **FFI Library**: `src/native/lighter-signer-linux-amd64.so` (pre-built from lighter-go/sharedlib)
 - **Backpack**: REST `https://api.backpack.exchange`
-- **EdgeX**: REST `https://pro.edgex.exchange`
+- **EdgeX**: REST `https://pro.edgex.exchange` (L2 Pedersen hash signature - fully integrated)
 
 ## Build & Test Workflow (MANDATORY)
 
@@ -320,7 +320,7 @@ CLAUDE.md (root)                    -> Project architecture, constraints, workfl
       src/exchanges/edgex/CLAUDE.md    -> EdgeX REST client (StarkNet Pedersen)
     src/types/CLAUDE.md             -> Core types + C-ABI event struct
   examples/CLAUDE.md                -> Entry points for make targets
-  lib/CLAUDE.md                     -> FFI shared library (Lighter signer)
+  src/native/CLAUDE.md              -> Native FFI libraries (Lighter signer .so)
   docs/CLAUDE.md                    -> Reference documentation (architecture, optimization)
   proto/CLAUDE.md                   -> gRPC service definitions
 ```

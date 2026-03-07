@@ -1,3 +1,8 @@
+---
+description: Native FFI shared libraries - Lighter DEX Ed25519 signer
+alwaysApply: true
+---
+
 # Native Libraries
 
 This directory contains native (C/C++) libraries used by Rust via FFI.
