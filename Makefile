@@ -1,44 +1,49 @@
-.PHONY: help build up down logs status clean
+.PHONY: help build build-feeder clean status
+.PHONY: lighter-up lighter-down lighter-logs
+.PHONY: backpack-up backpack-down backpack-logs
+.PHONY: edgex-up edgex-down edgex-logs
+
+# Default strategy for each exchange
+STRATEGY ?= inventory_neutral_mm
 
 # Default target
 help:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  AlephTX v3.2.0 - Tier-1 HFT Management"
+	@echo "  AlephTX v3.3.0 - Unified Multi-Exchange HFT"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo ""
 	@echo "Build Commands:"
 	@echo "  make build          - Compile all binaries"
 	@echo "  make build-feeder   - Compile Go feeder only"
 	@echo ""
-	@echo "Live Trading:"
-	@echo "  make live-up        - Start live trading (feeder + inventory_neutral_mm)"
-	@echo "  make live-down      - Stop live trading (closes positions & cancels orders)"
-	@echo "  make live-logs      - View live trading logs"
+	@echo "Unified Trading Commands:"
+	@echo "  make lighter-up STRATEGY=<name>   - Start Lighter DEX strategy"
+	@echo "  make lighter-down                 - Stop Lighter DEX"
+	@echo "  make lighter-logs                 - View Lighter logs"
 	@echo ""
-	@echo "Strategy Examples:"
-	@echo "  make adaptive-up    - Start adaptive MM (Lighter DEX)"
-	@echo "  make adaptive-down  - Stop adaptive MM"
-	@echo "  make adaptive-logs  - View adaptive MM logs"
+	@echo "  make backpack-up STRATEGY=<name>  - Start Backpack strategy"
+	@echo "  make backpack-down                - Stop Backpack"
+	@echo "  make backpack-logs                - View Backpack logs"
 	@echo ""
-	@echo "  make backpack-up    - Start Backpack MM (Exchange trait demo)"
-	@echo "  make backpack-down  - Stop Backpack MM"
-	@echo "  make backpack-logs  - View Backpack MM logs"
+	@echo "  make edgex-up STRATEGY=<name>     - Start EdgeX strategy"
+	@echo "  make edgex-down                   - Stop EdgeX"
+	@echo "  make edgex-logs                   - View EdgeX logs"
 	@echo ""
-	@echo "Strategy Management:"
-	@echo "  make up STRATEGY=lighter    - Start Lighter MM"
-	@echo "  make up STRATEGY=edgex      - Start EdgeX MM"
-	@echo "  make up STRATEGY=backpack   - Start Backpack MM"
-	@echo "  make up STRATEGY=all        - Start all strategies"
+	@echo "Available Strategies:"
+	@echo "  inventory_neutral_mm  - Inventory-neutral market maker (default)"
+	@echo "  adaptive_mm           - Adaptive market maker"
+	@echo "  simple_mm             - Simple market maker demo"
 	@echo ""
-	@echo "  make down STRATEGY=lighter  - Stop Lighter MM"
-	@echo "  make down STRATEGY=all      - Stop all strategies"
+	@echo "Examples:"
+	@echo "  make lighter-up                          # Default: inventory_neutral_mm"
+	@echo "  make lighter-up STRATEGY=adaptive_mm     # Adaptive MM on Lighter"
+	@echo "  make backpack-up STRATEGY=simple_mm      # Simple MM on Backpack"
 	@echo ""
 	@echo "Monitoring:"
-	@echo "  make logs STRATEGY=lighter  - View logs"
-	@echo "  make status                 - Show running strategies"
+	@echo "  make status         - Show all running strategies"
 	@echo ""
 	@echo "Utilities:"
-	@echo "  make clean                  - Clean build artifacts"
+	@echo "  make clean          - Clean build artifacts"
 	@echo ""
 
 # Build all binaries
@@ -47,256 +52,226 @@ build:
 	cargo build --release
 	@echo "✅ Build complete"
 
-# Build feeder for testing
+# Build feeder
 build-feeder:
 	@echo "🔨 Building Go feeder..."
 	cd feeder && go build -o feeder-app
 	@echo "✅ Feeder build complete"
 
-# Start live trading (feeder + inventory_neutral_mm)
-live-up: build-feeder
-	@echo "🚀 Starting live trading environment..."
+# ============================================================================
+# Lighter DEX
+# ============================================================================
+
+lighter-up: build-feeder
+	@echo "🚀 Starting Lighter DEX - Strategy: $(STRATEGY)"
 	@mkdir -p logs pids
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-live.log 2>&1 & echo $$! > pids/feeder-live.pid
+	@# Start feeder
+	@export $$(cat .env.lighter | xargs) && \
+		(cd feeder && ./feeder-app) > logs/feeder-lighter.log 2>&1 & \
+		echo $$! > pids/feeder-lighter.pid
 	@sleep 2
-	@echo "✅ Feeder started (PID: $$(cat pids/feeder-live.pid))"
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-lighter.pid))"
+	@# Start strategy
 	@export $$(cat .env.lighter | xargs) && \
 		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
-		cargo run --release --example inventory_neutral_mm > logs/inventory-neutral-live.log 2>&1 & echo $$! > pids/inventory-neutral-live.pid
-	@echo "✅ Inventory Neutral MM started (PID: $$(cat pids/inventory-neutral-live.pid))"
-	@echo "📊 Logs: tail -f logs/feeder-live.log logs/inventory-neutral-live.log"
+		cargo run --release --example $(STRATEGY) > logs/lighter-$(STRATEGY).log 2>&1 & \
+		echo $$! > pids/lighter-$(STRATEGY).pid
+	@echo "✅ Strategy started (PID: $$(cat pids/lighter-$(STRATEGY).pid))"
+	@echo "📊 Logs: tail -f logs/feeder-lighter.log logs/lighter-$(STRATEGY).log"
 
-# Stop live trading (graceful shutdown with position closing)
-live-down:
-	@echo "🛑 Stopping live trading environment..."
-	@if [ -f pids/inventory-neutral-live.pid ]; then \
-		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
-		kill -2 $$(cat pids/inventory-neutral-live.pid) 2>/dev/null || true; \
-		echo "⏳ Waiting for graceful shutdown (15s)..."; \
-		sleep 15; \
-		if ps -p $$(cat pids/inventory-neutral-live.pid) > /dev/null 2>&1; then \
-			echo "⚠️  Process still running, forcing shutdown..."; \
-			kill -9 $$(cat pids/inventory-neutral-live.pid) 2>/dev/null || true; \
+lighter-down:
+	@echo "🛑 Stopping Lighter DEX..."
+	@# Find and stop strategy
+	@for pid_file in pids/lighter-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			echo "📤 Sending graceful shutdown signal..."; \
+			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
+			echo "⏳ Waiting for graceful shutdown (15s)..."; \
+			sleep 15; \
+			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
+				echo "⚠️  Process still running, forcing shutdown..."; \
+				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
+			fi; \
+			rm -f $$pid_file; \
+			echo "✅ Strategy stopped"; \
 		fi; \
-		rm -f pids/inventory-neutral-live.pid; \
-		echo "✅ Inventory Neutral MM stopped"; \
+	done
+	@# Stop feeder
+	@if [ -f pids/feeder-lighter.pid ]; then \
+		kill -9 $$(cat pids/feeder-lighter.pid) 2>/dev/null || true; \
+		rm -f pids/feeder-lighter.pid; \
+		echo "✅ Feeder stopped"; \
 	fi
-	@if [ -f pids/feeder-live.pid ]; then kill -9 $$(cat pids/feeder-live.pid) 2>/dev/null || true; rm -f pids/feeder-live.pid; echo "✅ Feeder stopped"; fi
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
 	@echo "✅ Shared memory cleaned"
 
-# View live trading logs
-live-logs:
-	@tail -f logs/feeder-live.log logs/inventory-neutral-live.log
+lighter-logs:
+	@tail -f logs/feeder-lighter.log logs/lighter-*.log
 
-# Start adaptive market maker (production strategy)
-adaptive-up: build-feeder
-	@echo "🧪 Starting adaptive market maker..."
-	@mkdir -p logs pids
-	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-adaptive.log 2>&1 & echo $$! > pids/feeder-adaptive.pid
-	@sleep 5
-	@echo "✅ Feeder started (PID: $$(cat pids/feeder-adaptive.pid))"
-	@export $$(cat .env.lighter | xargs) && \
-		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
-		cargo run --example adaptive_mm > logs/adaptive-mm.log 2>&1 & echo $$! > pids/adaptive-mm.pid
-	@echo "✅ Adaptive MM started (PID: $$(cat pids/adaptive-mm.pid))"
-	@echo "📊 Logs: tail -f logs/feeder-adaptive.log logs/adaptive-mm.log"
+# ============================================================================
+# Backpack
+# ============================================================================
 
-# Stop adaptive market maker
-adaptive-down:
-	@echo "🛑 Stopping adaptive market maker..."
-	@if [ -f pids/adaptive-mm.pid ]; then \
-		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
-		kill -2 $$(cat pids/adaptive-mm.pid) 2>/dev/null || true; \
-		echo "⏳ Waiting for graceful shutdown (10s)..."; \
-		sleep 10; \
-		if ps -p $$(cat pids/adaptive-mm.pid) > /dev/null 2>&1; then \
-			echo "⚠️  Process still running, forcing shutdown..."; \
-			kill -9 $$(cat pids/adaptive-mm.pid) 2>/dev/null || true; \
-		fi; \
-		rm -f pids/adaptive-mm.pid; \
-		echo "✅ Adaptive MM stopped"; \
-	fi
-	@if [ -f pids/feeder-adaptive.pid ]; then kill -9 $$(cat pids/feeder-adaptive.pid) 2>/dev/null || true; rm -f pids/feeder-adaptive.pid; echo "✅ Feeder stopped"; fi
-	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@echo "✅ Shared memory cleaned"
-
-# View adaptive MM logs
-adaptive-logs:
-	@tail -f logs/feeder-adaptive.log logs/adaptive-mm.log
-
-# Start Backpack market maker (Exchange trait demo)
 backpack-up: build-feeder
-	@echo "🧪 Starting Backpack market maker..."
+	@echo "🚀 Starting Backpack - Strategy: $(STRATEGY)"
 	@mkdir -p logs pids
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@export $$(cat .env.lighter | xargs) && (cd feeder && ./feeder-app) > logs/feeder-backpack.log 2>&1 & echo $$! > pids/feeder-backpack.pid
+	@# Start feeder
+	@export $$(cat .env.lighter | xargs) && \
+		(cd feeder && ./feeder-app) > logs/feeder-backpack.log 2>&1 & \
+		echo $$! > pids/feeder-backpack.pid
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-backpack.pid))"
+	@# Start strategy
 	@export $$(cat .env.backpack | xargs) && \
 		export BACKPACK_ENV_PATH=.env.backpack && \
-		cargo run --release --example backpack_mm > logs/backpack-mm.log 2>&1 & echo $$! > pids/backpack-mm.pid
-	@echo "✅ Backpack MM started (PID: $$(cat pids/backpack-mm.pid))"
-	@echo "📊 Logs: tail -f logs/feeder-backpack.log logs/backpack-mm.log"
+		cargo run --release --example $(STRATEGY) > logs/backpack-$(STRATEGY).log 2>&1 & \
+		echo $$! > pids/backpack-$(STRATEGY).pid
+	@echo "✅ Strategy started (PID: $$(cat pids/backpack-$(STRATEGY).pid))"
+	@echo "📊 Logs: tail -f logs/feeder-backpack.log logs/backpack-$(STRATEGY).log"
 
-# Stop Backpack market maker
 backpack-down:
-	@echo "🛑 Stopping Backpack market maker..."
-	@if [ -f pids/backpack-mm.pid ]; then \
-		echo "📤 Sending graceful shutdown signal (SIGINT)..."; \
-		kill -2 $$(cat pids/backpack-mm.pid) 2>/dev/null || true; \
-		echo "⏳ Waiting for graceful shutdown (10s)..."; \
-		sleep 10; \
-		if ps -p $$(cat pids/backpack-mm.pid) > /dev/null 2>&1; then \
-			echo "⚠️  Process still running, forcing shutdown..."; \
-			kill -9 $$(cat pids/backpack-mm.pid) 2>/dev/null || true; \
+	@echo "🛑 Stopping Backpack..."
+	@# Find and stop strategy
+	@for pid_file in pids/backpack-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			echo "📤 Sending graceful shutdown signal..."; \
+			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
+			echo "⏳ Waiting for graceful shutdown (10s)..."; \
+			sleep 10; \
+			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
+				echo "⚠️  Process still running, forcing shutdown..."; \
+				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
+			fi; \
+			rm -f $$pid_file; \
+			echo "✅ Strategy stopped"; \
 		fi; \
-		rm -f pids/backpack-mm.pid; \
-		echo "✅ Backpack MM stopped"; \
+	done
+	@# Stop feeder
+	@if [ -f pids/feeder-backpack.pid ]; then \
+		kill -9 $$(cat pids/feeder-backpack.pid) 2>/dev/null || true; \
+		rm -f pids/feeder-backpack.pid; \
+		echo "✅ Feeder stopped"; \
 	fi
-	@if [ -f pids/feeder-backpack.pid ]; then kill -9 $$(cat pids/feeder-backpack.pid) 2>/dev/null || true; rm -f pids/feeder-backpack.pid; echo "✅ Feeder stopped"; fi
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
 	@echo "✅ Shared memory cleaned"
 
-# View Backpack MM logs
 backpack-logs:
-	@tail -f logs/feeder-backpack.log logs/backpack-mm.log
+	@tail -f logs/feeder-backpack.log logs/backpack-*.log
 
-# Start feeder (prerequisite for all strategies)
-feeder:
-	@if ! pgrep -f "feeder/feeder" > /dev/null; then \
-		echo "🚀 Starting Go feeder..."; \
-		cd feeder && nohup ./feeder > ../logs/feeder.log 2>&1 & \
-		echo $$! > ../pids/feeder.pid; \
-		sleep 2; \
-		echo "✅ Feeder started (PID: $$(cat ../pids/feeder.pid))"; \
-	else \
-		echo "✅ Feeder already running"; \
-	fi
+# ============================================================================
+# EdgeX
+# ============================================================================
 
-# Start strategy
-up:
+edgex-up: build-feeder
+	@echo "🚀 Starting EdgeX - Strategy: $(STRATEGY)"
 	@mkdir -p logs pids
-	@if [ "$(STRATEGY)" = "lighter" ]; then \
-		$(MAKE) feeder; \
-		echo "🚀 Starting Lighter MM..."; \
-		export $$(cat .env | xargs) && \
-		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
-		nohup ./target/release/lighter_mm > logs/lighter.log 2>&1 & \
-		echo $$! > pids/lighter.pid; \
-		echo "✅ Lighter MM started (PID: $$(cat pids/lighter.pid))"; \
-	elif [ "$(STRATEGY)" = "edgex" ]; then \
-		$(MAKE) feeder; \
-		echo "🚀 Starting EdgeX MM..."; \
-		export $$(cat .env.edgex | xargs) && nohup ./target/release/aleph-tx > logs/edgex.log 2>&1 & \
-		echo $$! > pids/edgex.pid; \
-		echo "✅ EdgeX MM started (PID: $$(cat pids/edgex.pid))"; \
-	elif [ "$(STRATEGY)" = "backpack" ]; then \
-		$(MAKE) feeder; \
-		echo "🚀 Starting Backpack MM..."; \
-		export $$(cat .env.backpack | xargs) && nohup ./target/release/aleph-tx > logs/backpack.log 2>&1 & \
-		echo $$! > pids/backpack.pid; \
-		echo "✅ Backpack MM started (PID: $$(cat pids/backpack.pid))"; \
-	elif [ "$(STRATEGY)" = "all" ]; then \
-		$(MAKE) up STRATEGY=lighter; \
-		$(MAKE) up STRATEGY=edgex; \
-		$(MAKE) up STRATEGY=backpack; \
-	else \
-		echo "❌ Unknown strategy: $(STRATEGY)"; \
-		echo "   Use: lighter, edgex, backpack, or all"; \
-		exit 1; \
-	fi
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@# Start feeder
+	@export $$(cat .env.lighter | xargs) && \
+		(cd feeder && ./feeder-app) > logs/feeder-edgex.log 2>&1 & \
+		echo $$! > pids/feeder-edgex.pid
+	@sleep 2
+	@echo "✅ Feeder started (PID: $$(cat pids/feeder-edgex.pid))"
+	@# Start strategy
+	@export $$(cat .env.edgex | xargs) && \
+		export EDGEX_ENV_PATH=.env.edgex && \
+		cargo run --release --example $(STRATEGY) > logs/edgex-$(STRATEGY).log 2>&1 & \
+		echo $$! > pids/edgex-$(STRATEGY).pid
+	@echo "✅ Strategy started (PID: $$(cat pids/edgex-$(STRATEGY).pid))"
+	@echo "📊 Logs: tail -f logs/feeder-edgex.log logs/edgex-$(STRATEGY).log"
 
-# Stop strategy
-down:
-	@if [ "$(STRATEGY)" = "lighter" ]; then \
-		if [ -f pids/lighter.pid ]; then \
-			echo "🛑 Stopping Lighter MM..."; \
-			kill $$(cat pids/lighter.pid) 2>/dev/null || true; \
-			rm -f pids/lighter.pid; \
-			echo "✅ Lighter MM stopped"; \
-		else \
-			echo "⚠️  Lighter MM not running"; \
-		fi \
-	elif [ "$(STRATEGY)" = "edgex" ]; then \
-		if [ -f pids/edgex.pid ]; then \
-			echo "🛑 Stopping EdgeX MM..."; \
-			kill $$(cat pids/edgex.pid) 2>/dev/null || true; \
-			rm -f pids/edgex.pid; \
-			echo "✅ EdgeX MM stopped"; \
-		else \
-			echo "⚠️  EdgeX MM not running"; \
-		fi \
-	elif [ "$(STRATEGY)" = "backpack" ]; then \
-		if [ -f pids/backpack.pid ]; then \
-			echo "🛑 Stopping Backpack MM..."; \
-			kill $$(cat pids/backpack.pid) 2>/dev/null || true; \
-			rm -f pids/backpack.pid; \
-			echo "✅ Backpack MM stopped"; \
-		else \
-			echo "⚠️  Backpack MM not running"; \
-		fi \
-	elif [ "$(STRATEGY)" = "all" ]; then \
-		$(MAKE) down STRATEGY=lighter; \
-		$(MAKE) down STRATEGY=edgex; \
-		$(MAKE) down STRATEGY=backpack; \
-		if [ -f pids/feeder.pid ]; then \
-			echo "🛑 Stopping feeder..."; \
-			kill $$(cat pids/feeder.pid) 2>/dev/null || true; \
-			rm -f pids/feeder.pid; \
-			echo "✅ Feeder stopped"; \
-		fi \
-	else \
-		echo "❌ Unknown strategy: $(STRATEGY)"; \
-		exit 1; \
+edgex-down:
+	@echo "🛑 Stopping EdgeX..."
+	@# Find and stop strategy
+	@for pid_file in pids/edgex-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			echo "📤 Sending graceful shutdown signal..."; \
+			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
+			echo "⏳ Waiting for graceful shutdown (10s)..."; \
+			sleep 10; \
+			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
+				echo "⚠️  Process still running, forcing shutdown..."; \
+				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
+			fi; \
+			rm -f $$pid_file; \
+			echo "✅ Strategy stopped"; \
+		fi; \
+	done
+	@# Stop feeder
+	@if [ -f pids/feeder-edgex.pid ]; then \
+		kill -9 $$(cat pids/feeder-edgex.pid) 2>/dev/null || true; \
+		rm -f pids/feeder-edgex.pid; \
+		echo "✅ Feeder stopped"; \
 	fi
+	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
+	@echo "✅ Shared memory cleaned"
 
-# View logs
-logs:
-	@if [ "$(STRATEGY)" = "lighter" ]; then \
-		tail -f logs/lighter.log; \
-	elif [ "$(STRATEGY)" = "edgex" ]; then \
-		tail -f logs/edgex.log; \
-	elif [ "$(STRATEGY)" = "backpack" ]; then \
-		tail -f logs/backpack.log; \
-	elif [ "$(STRATEGY)" = "feeder" ]; then \
-		tail -f logs/feeder.log; \
-	else \
-		echo "❌ Unknown strategy: $(STRATEGY)"; \
-		exit 1; \
-	fi
+edgex-logs:
+	@tail -f logs/feeder-edgex.log logs/edgex-*.log
 
-# Show status
+# ============================================================================
+# Monitoring & Utilities
+# ============================================================================
+
 status:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo "  AlephTX Status"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo ""
-	@if [ -f pids/feeder.pid ] && kill -0 $$(cat pids/feeder.pid) 2>/dev/null; then \
-		echo "✅ Feeder:   RUNNING (PID: $$(cat pids/feeder.pid))"; \
+	@echo "Lighter DEX:"
+	@if [ -f pids/feeder-lighter.pid ] && kill -0 $$(cat pids/feeder-lighter.pid) 2>/dev/null; then \
+		echo "  ✅ Feeder:   RUNNING (PID: $$(cat pids/feeder-lighter.pid))"; \
 	else \
-		echo "❌ Feeder:   STOPPED"; \
+		echo "  ❌ Feeder:   STOPPED"; \
 	fi
-	@if [ -f pids/lighter.pid ] && kill -0 $$(cat pids/lighter.pid) 2>/dev/null; then \
-		echo "✅ Lighter:  RUNNING (PID: $$(cat pids/lighter.pid))"; \
+	@for pid_file in pids/lighter-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			strategy=$$(basename $$pid_file .pid | sed 's/lighter-//'); \
+			if kill -0 $$(cat $$pid_file) 2>/dev/null; then \
+				echo "  ✅ $$strategy: RUNNING (PID: $$(cat $$pid_file))"; \
+			else \
+				echo "  ❌ $$strategy: STOPPED"; \
+			fi; \
+		fi; \
+	done
+	@echo ""
+	@echo "Backpack:"
+	@if [ -f pids/feeder-backpack.pid ] && kill -0 $$(cat pids/feeder-backpack.pid) 2>/dev/null; then \
+		echo "  ✅ Feeder:   RUNNING (PID: $$(cat pids/feeder-backpack.pid))"; \
 	else \
-		echo "❌ Lighter:  STOPPED"; \
+		echo "  ❌ Feeder:   STOPPED"; \
 	fi
-	@if [ -f pids/edgex.pid ] && kill -0 $$(cat pids/edgex.pid) 2>/dev/null; then \
-		echo "✅ EdgeX:    RUNNING (PID: $$(cat pids/edgex.pid))"; \
+	@for pid_file in pids/backpack-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			strategy=$$(basename $$pid_file .pid | sed 's/backpack-//'); \
+			if kill -0 $$(cat $$pid_file) 2>/dev/null; then \
+				echo "  ✅ $$strategy: RUNNING (PID: $$(cat $$pid_file))"; \
+			else \
+				echo "  ❌ $$strategy: STOPPED"; \
+			fi; \
+		fi; \
+	done
+	@echo ""
+	@echo "EdgeX:"
+	@if [ -f pids/feeder-edgex.pid ] && kill -0 $$(cat pids/feeder-edgex.pid) 2>/dev/null; then \
+		echo "  ✅ Feeder:   RUNNING (PID: $$(cat pids/feeder-edgex.pid))"; \
 	else \
-		echo "❌ EdgeX:    STOPPED"; \
+		echo "  ❌ Feeder:   STOPPED"; \
 	fi
-	@if [ -f pids/backpack.pid ] && kill -0 $$(cat pids/backpack.pid) 2>/dev/null; then \
-		echo "✅ Backpack: RUNNING (PID: $$(cat pids/backpack.pid))"; \
-	else \
-		echo "❌ Backpack: STOPPED"; \
-	fi
+	@for pid_file in pids/edgex-*.pid; do \
+		if [ -f "$$pid_file" ]; then \
+			strategy=$$(basename $$pid_file .pid | sed 's/edgex-//'); \
+			if kill -0 $$(cat $$pid_file) 2>/dev/null; then \
+				echo "  ✅ $$strategy: RUNNING (PID: $$(cat $$pid_file))"; \
+			else \
+				echo "  ❌ $$strategy: STOPPED"; \
+			fi; \
+		fi; \
+	done
 	@echo ""
 
-# Clean build artifacts
 clean:
 	@echo "🧹 Cleaning build artifacts..."
 	cargo clean

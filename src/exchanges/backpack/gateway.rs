@@ -5,7 +5,7 @@
 use super::client::BackpackClient;
 use super::model::BackpackOrderRequest;
 use crate::exchange::{
-    BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult, Side,
+    BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -19,13 +19,6 @@ pub struct BackpackGateway {
 impl BackpackGateway {
     pub fn new(client: Arc<BackpackClient>, symbol: String) -> Self {
         Self { client, symbol }
-    }
-
-    fn side_to_string(side: Side) -> &'static str {
-        match side {
-            Side::Buy => "Bid",
-            Side::Sell => "Ask",
-        }
     }
 }
 

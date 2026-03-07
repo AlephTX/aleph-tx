@@ -4,7 +4,7 @@
 //! NOTE: This is a simplified implementation. Full L2 signature logic needs proper integration.
 
 use super::client::EdgeXClient;
-use super::model::{CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide, OrderType, TimeInForce};
+use super::model::{CancelAllOrderRequest, CancelOrderRequest, OrderSide};
 use crate::exchange::{
     BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult, Side,
 };
@@ -25,13 +25,6 @@ impl EdgeXGateway {
             client,
             account_id,
             contract_id,
-        }
-    }
-
-    fn side_to_edgex(side: Side) -> OrderSide {
-        match side {
-            Side::Buy => OrderSide::Buy,
-            Side::Sell => OrderSide::Sell,
         }
     }
 

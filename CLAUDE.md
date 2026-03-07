@@ -70,21 +70,31 @@ Welcome to AlephTX, a Tier-1 High-Frequency Trading (HFT) framework built with R
 make build          # Build all binaries (Go feeder + Rust)
 make build-feeder   # Build Go feeder only
 
-# Integration Testing
-make test-up        # Start test environment (feeder + lighter_trading example)
-make test-down      # Stop test environment and clean shared memory
-make test-logs      # View test logs in real-time
+# Unified Multi-Exchange Commands (v3.3.0+)
+make lighter-up STRATEGY=<name>   # Start Lighter DEX strategy
+make lighter-down                 # Stop Lighter DEX
+make lighter-logs                 # View Lighter logs
 
-# Adaptive Market Maker (Production Strategy)
-make adaptive-up    # Start adaptive MM strategy (feeder + adaptive_mm)
-make adaptive-down  # Stop adaptive MM and clean up
-make adaptive-logs  # View adaptive MM logs
+make backpack-up STRATEGY=<name>  # Start Backpack strategy
+make backpack-down                # Stop Backpack
+make backpack-logs                # View Backpack logs
 
-# Strategy Management (Future)
-make up STRATEGY=lighter    # Start Lighter MM
-make down STRATEGY=lighter  # Stop Lighter MM
-make logs STRATEGY=lighter  # View strategy logs
-make status                 # Show all running strategies
+make edgex-up STRATEGY=<name>     # Start EdgeX strategy
+make edgex-down                   # Stop EdgeX
+make edgex-logs                   # View EdgeX logs
+
+# Available Strategies
+# - inventory_neutral_mm (default)
+# - adaptive_mm
+# - simple_mm
+
+# Examples
+make lighter-up                          # Default: inventory_neutral_mm
+make lighter-up STRATEGY=adaptive_mm     # Adaptive MM on Lighter
+make backpack-up STRATEGY=simple_mm      # Simple MM on Backpack
+
+# Monitoring
+make status         # Show all running strategies across exchanges
 
 # Cleanup
 make clean          # Clean build artifacts
@@ -326,3 +336,56 @@ Claude auto-loads all CLAUDE.md files at session start = zero warm-up time, full
 - Scope should be the module name (e.g., `feeder`, `strategy`, `shm`, `lighter`)
 - Keep the subject line under 72 characters
 - When documentation is updated alongside code, include both changes in the same commit rather than splitting them
+
+---
+
+## Refactor History
+
+### v3.3.0 - Unified Multi-Exchange Makefile (2025.01.XX)
+
+**Objective**: Standardize Makefile commands across all exchanges with consistent `make <exchange>-up STRATEGY=<name>` pattern.
+
+**Changes**:
+- Unified command format: `lighter-up`, `backpack-up`, `edgex-up`
+- Strategy selection via `STRATEGY=` parameter (default: `inventory_neutral_mm`)
+- Per-exchange feeder + strategy PID tracking
+- Graceful shutdown with 10-15s timeout before force kill
+- Unified `make status` showing all exchanges
+
+**Migration**:
+```bash
+# Old (v3.2.0)
+make live-up              # Lighter inventory_neutral_mm
+make adaptive-up          # Lighter adaptive_mm
+make backpack-up          # Backpack (hardcoded strategy)
+
+# New (v3.3.0)
+make lighter-up                          # Default: inventory_neutral_mm
+make lighter-up STRATEGY=adaptive_mm     # Adaptive MM
+make backpack-up STRATEGY=simple_mm      # Backpack with strategy selection
+```
+
+### v3.2.0 - Exchange Decoupling Refactor (2025.01.XX)
+
+**Objective**: Modularize exchange-specific code into `src/exchanges/` with config-driven hot-swappable architecture.
+
+**Phase 1: Directory Restructure**
+- Created `src/exchanges/{lighter,backpack,edgex}/` modules
+- Moved `lighter_ffi.rs` → `exchanges/lighter/ffi.rs`
+- Moved `lighter_trading.rs` → `exchanges/lighter/trading.rs`
+- Deleted legacy `lighter_orders.rs` (unused)
+- Added re-exports in `src/lib.rs` for backward compatibility
+
+**Phase 2: Exchange Trait Implementation**
+- `BackpackGateway` - Full Exchange trait implementation
+- `EdgeXGateway` - Stub implementation (requires StarkNet L2 signing)
+- Both wrap existing REST clients
+
+**Phase 3: Examples & Documentation**
+- Created `examples/backpack_mm.rs` demonstrating BackpackGateway usage
+- Updated all CLAUDE.md files to reflect new structure
+- Added `@CLAUDECODE/tasks/exchange-decoupling-refactor/ARCHITECTURE_ANALYSIS.md`
+
+**Commit**: `751c621 refactor(exchanges): Modularize exchange integrations`
+- 28 files changed, 1009 insertions(+), 622 deletions(-)
+- Net reduction: 192 lines

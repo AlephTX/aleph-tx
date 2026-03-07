@@ -11,10 +11,7 @@ alwaysApply: true
 
 | File | Description |
 |------|-------------|
-| inventory_neutral_mm.rs | Inventory-Neutral MM (Lighter DEX) - production HFT strategy (used by `make live-up`) |
-| adaptive_mm.rs | Adaptive MM (Lighter DEX) - fee-aware market maker (used by `make adaptive-up`) |
-| backpack_mm.rs | Backpack MM - Exchange trait demo with BackpackGateway (used by `make backpack-up`) |
-| test_account_stats.rs | Simple account stats SHM reader demo |
+| inventory_neutral_mm.rs | Inventory-Neutral MM (Lighter DEX) - production HFT strategy |\n| adaptive_mm.rs | Adaptive MM (Lighter DEX) - fee-aware market maker |\n| backpack_mm.rs | Backpack MM - Exchange trait demo with BackpackGateway |\n| edgex_mm.rs | EdgeX MM - Exchange trait demo with EdgeXGateway (stub - L2 signature pending) |\n| test_account_stats.rs | Simple account stats SHM reader demo |
 
 ## Architecture
 
@@ -35,23 +32,31 @@ graph TD
         BP_SHM --> BP_LOOP[Simple MM Loop]
         BP_CTRLC[Ctrl+C] -->|Watch Channel| BP_LOOP
     end
+
+    subgraph "Example: edgex_mm.rs"
+        EX_INIT[Load EdgeX Credentials] --> EX_CLIENT[EdgeXClient::new]
+        EX_CLIENT --> EX_GW[EdgeXGateway::new]
+        EX_GW --> EX_SHM[Open SHM Matrix]
+        EX_SHM --> EX_LOOP[Simple MM Loop]
+        EX_CTRLC[Ctrl+C] -->|Watch Channel| EX_LOOP
+    end
 ```
 
 ## Gotchas
 
 - These are the actual binaries started by Makefile targets.
 - All require the Go feeder to be running first (Makefile handles this).
-- Environment variables loaded from `.env.lighter`, `.env.backpack`, etc.
+- Environment variables loaded from `.env.lighter`, `.env.backpack`, `.env.edgex`, etc.
 - Graceful shutdown: Ctrl+C triggers watch channel, strategy cancels all orders before exit.
-- `backpack_mm.rs` is a demo of the Exchange trait abstraction - order execution is commented out by default.
+- `backpack_mm.rs` and `edgex_mm.rs` are demos of the Exchange trait abstraction.
+- `edgex_mm.rs` uses stub gateway - full L2 signature integration pending.
 
 ## Usage
 
 ```bash
-# Lighter DEX (production)
-make live-up        # Inventory-Neutral MM
-make adaptive-up    # Adaptive MM
-
-# Backpack (Exchange trait demo)
-make backpack-up    # Simple MM with BackpackGateway
+# Unified commands (v3.3.0+)
+make lighter-up                          # Default: inventory_neutral_mm
+make lighter-up STRATEGY=adaptive_mm     # Adaptive MM
+make backpack-up STRATEGY=simple_mm      # Backpack with strategy
+make edgex-up STRATEGY=simple_mm         # EdgeX with strategy (stub)
 ```
