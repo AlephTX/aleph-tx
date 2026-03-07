@@ -60,12 +60,15 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	log.Printf("📋 Loaded config with %d exchanges", len(cfg.Exchanges))
-	for name, exCfg := range cfg.Exchanges {
+	// Convert unified config to exchange map for backward compatibility
+	exchangeConfigs := cfg.ToExchangeMap()
+
+	log.Printf("📋 Loaded config with %d exchanges", len(exchangeConfigs))
+	for name, exCfg := range exchangeConfigs {
 		log.Printf("  - %s: enabled=%v", name, exCfg.Enabled)
 	}
 
-	if hlCfg, ok := cfg.Exchanges["hyperliquid"]; ok && hlCfg.Enabled {
+	if hlCfg, ok := exchangeConfigs["hyperliquid"]; ok && hlCfg.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -77,7 +80,7 @@ func main() {
 		}()
 	}
 
-	if ltCfg, ok := cfg.Exchanges["lighter"]; ok && ltCfg.Enabled {
+	if ltCfg, ok := exchangeConfigs["lighter"]; ok && ltCfg.Enabled {
 		// Create account stats first (needed by private stream)
 		ltStats, err := exchanges.NewLighterAccountStats(ltCfg, accountStats)
 		if err != nil {
@@ -121,7 +124,7 @@ func main() {
 		}()
 	}
 
-	if bpCfg, ok := cfg.Exchanges["backpack"]; ok && bpCfg.Enabled {
+	if bpCfg, ok := exchangeConfigs["backpack"]; ok && bpCfg.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -133,7 +136,7 @@ func main() {
 		}()
 	}
 
-	if edgexCfg, ok := cfg.Exchanges["edgex"]; ok && edgexCfg.Enabled {
+	if edgexCfg, ok := exchangeConfigs["edgex"]; ok && edgexCfg.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -141,18 +144,6 @@ func main() {
 			log.Println("🔌 EdgeX: starting...")
 			if err := ex.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("EdgeX: %v", err)
-			}
-		}()
-	}
-
-	if zeroOneCfg, ok := cfg.Exchanges["01"]; ok && zeroOneCfg.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			z := exchanges.NewZeroOne(zeroOneCfg, matrix)
-			log.Println("🔌 01 Exchange: starting...")
-			if err := z.Run(ctx); err != nil && err != context.Canceled {
-				log.Printf("01: %v", err)
 			}
 		}()
 	}

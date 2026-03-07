@@ -66,15 +66,15 @@ lighter-up: build-feeder
 	@echo "🚀 Starting Lighter DEX - Strategy: $(STRATEGY)"
 	@mkdir -p logs pids
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
-	@# Start feeder
+	@# Start feeder (uses unified config.toml from root)
 	@export $$(cat .env.lighter | xargs) && \
-		(cd feeder && ./feeder-app) > logs/feeder-lighter.log 2>&1 & \
+		./feeder/feeder-app config.toml > logs/feeder-lighter.log 2>&1 & \
 		echo $$! > pids/feeder-lighter.pid
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-lighter.pid))"
 	@# Start strategy
 	@export $$(cat .env.lighter | xargs) && \
-		export LD_LIBRARY_PATH=$$(pwd)/lib:$$LD_LIBRARY_PATH && \
+		export LD_LIBRARY_PATH=$$(pwd)/src/native:$$LD_LIBRARY_PATH && \
 		cargo run --release --example $(STRATEGY) > logs/lighter-$(STRATEGY).log 2>&1 & \
 		echo $$! > pids/lighter-$(STRATEGY).pid
 	@echo "✅ Strategy started (PID: $$(cat pids/lighter-$(STRATEGY).pid))"
@@ -170,8 +170,8 @@ edgex-up: build-feeder
 	@rm -f /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats
 	@# Build strategy first
 	@cargo build --release --example edgex_mm
-	@# Start feeder with EdgeX config
-	@(cd feeder && ALEPH_FEEDER_CONFIG=config.edgex.toml ./feeder-app) > logs/feeder-edgex.log 2>&1 & \
+	@# Start feeder (uses unified config.toml from root)
+	@./feeder/feeder-app config.toml > logs/feeder-edgex.log 2>&1 & \
 		echo $$! > pids/feeder-edgex.pid
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-edgex.pid))"
