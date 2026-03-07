@@ -308,9 +308,8 @@ impl LighterTrading {
         Ok(nonce_resp.nonce)
     }
 
-    /// 获取下一个 nonce（首次从服务器拉取，之后本地递增）
-    /// 使用 TokioMutex 防止并发初始化竞态
-    async fn next_nonce(&self) -> Result<i64> {
+    /// 获取当前 nonce（不递增）
+    async fn get_nonce(&self) -> Result<i64> {
         {
             let mut initialized = self.nonce_init.lock().await;
             if !*initialized {
@@ -321,17 +320,22 @@ impl LighterTrading {
                 return Ok(server_nonce);
             }
         }
-        Ok(self.nonce.fetch_add(1, Ordering::SeqCst) + 1)
+        Ok(self.nonce.load(Ordering::SeqCst))
+    }
+
+    /// 递增 nonce（仅在交易成功提交后调用）
+    fn increment_nonce(&self) {
+        self.nonce.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 重置 nonce（遇到 invalid nonce 错误时调用）
-    async fn reset_nonce(&self) -> Result<()> {
+    async fn reset_nonce(&self) -> Result<i64> {
         let mut initialized = self.nonce_init.lock().await;
         let server_nonce = self.fetch_nonce().await?;
         self.nonce.store(server_nonce, Ordering::Release);
         *initialized = true;
         tracing::warn!("Nonce reset to: {}", server_nonce);
-        Ok(())
+        Ok(server_nonce)
     }
 
     /// 生成唯一 client_order_index
@@ -370,7 +374,7 @@ impl LighterTrading {
         order_type: OrderType,
         reduce_only: bool,
     ) -> Result<(u8, String, String, i64)> {
-        let nonce = self.next_nonce().await?;
+        let nonce = self.get_nonce().await?;
         let client_order_index = self.next_client_order_index();
 
         // 使用 round() 防止浮点截断: 2085.87 * 100 = 208587.0 而非 208586
@@ -440,6 +444,9 @@ impl LighterTrading {
             );
         }
 
+        // Only increment nonce after successful submission
+        self.increment_nonce();
+
         Ok(parsed)
     }
 
@@ -488,6 +495,10 @@ impl LighterTrading {
                 parsed.message.as_deref().unwrap_or("unknown")
             );
         }
+
+        // Increment nonce twice for batch (2 orders)
+        self.increment_nonce();
+        self.increment_nonce();
 
         Ok(parsed)
     }
@@ -588,7 +599,7 @@ impl LighterTrading {
 
     /// 撤销单笔订单
     pub async fn cancel_order(&self, order_index: i64) -> Result<()> {
-        let nonce = self.next_nonce().await?;
+        let nonce = self.get_nonce().await?;
         let market_id = self.market_id;
         let signer = Arc::clone(&self.signer);
         let signed = tokio::task::spawn_blocking(move || {
