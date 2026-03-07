@@ -1,5 +1,5 @@
-use crate::edgex_api::model::CreateOrderRequest;
-use crate::edgex_api::signature::SignatureManager;
+use super::model::CreateOrderRequest;
+use super::signature::SignatureManager;
 use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
@@ -13,7 +13,7 @@ pub enum ClientError {
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
     #[error("Signature error: {0}")]
-    SignatureError(#[from] crate::edgex_api::signature::SignatureError),
+    SignatureError(#[from] super::signature::SignatureError),
     #[error("API error: {0}")]
     ApiError(String),
 }

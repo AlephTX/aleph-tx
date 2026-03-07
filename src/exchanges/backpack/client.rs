@@ -1,4 +1,4 @@
-use crate::backpack_api::model::*;
+use super::model::*;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};

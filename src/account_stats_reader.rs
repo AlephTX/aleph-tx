@@ -91,11 +91,22 @@ impl AccountStatsReader {
 
     /// Force read current stats (blocking until write completes)
     pub fn read(&mut self) -> AccountStatsSnapshot {
+        let mut spin_count: u32 = 0;
+        const MAX_SPINS: u32 = 10_000;
+
         loop {
             let version_before = self.stats.version.load(Ordering::Acquire);
 
             // Wait for even version (write complete)
             if !version_before.is_multiple_of(2) {
+                spin_count += 1;
+                if spin_count > MAX_SPINS {
+                    tracing::error!(
+                        "AccountStats seqlock stuck (writer dead?): version={} after {} spins",
+                        version_before, spin_count
+                    );
+                    return AccountStatsSnapshot::default();
+                }
                 std::hint::spin_loop();
                 continue;
             }
@@ -116,6 +127,15 @@ impl AccountStatsReader {
             if version_before == version_after {
                 self.local_version = version_after;
                 return snapshot;
+            }
+
+            spin_count += 1;
+            if spin_count > MAX_SPINS {
+                tracing::error!(
+                    "AccountStats torn read limit: version before={} after={} after {} spins",
+                    version_before, version_after, spin_count
+                );
+                return AccountStatsSnapshot::default();
             }
         }
     }

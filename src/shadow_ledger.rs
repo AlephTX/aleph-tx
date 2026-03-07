@@ -383,6 +383,22 @@ impl ShadowLedger {
     pub fn has_active_order(&self, order_id: u64) -> bool {
         self.active_orders.contains_key(&order_id)
     }
+
+    /// Force-sync real_pos from an authoritative source (e.g., REST API / AccountStats).
+    /// Call periodically to correct drift from missed events.
+    /// Returns the correction delta applied.
+    pub fn force_sync_position(&mut self, authoritative_pos: f64) -> f64 {
+        let delta = authoritative_pos - self.real_pos;
+        if delta.abs() > 1e-8 {
+            tracing::warn!(
+                "Ledger force_sync: real_pos {:.6} → {:.6} (delta={:.6}, in_flight={:.6})",
+                self.real_pos, authoritative_pos, delta, self.in_flight_pos
+            );
+            self.real_pos = authoritative_pos;
+            self.last_update = Instant::now();
+        }
+        delta
+    }
 }
 
 /// Shadow Ledger Manager

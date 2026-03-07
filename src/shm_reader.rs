@@ -82,11 +82,23 @@ impl ShmReader {
             let seq_ptr = ptr as *const std::sync::atomic::AtomicU32;
 
             let mut msg;
+            let mut spin_count: u32 = 0;
+            const MAX_SPINS: u32 = 10_000;
 
             loop {
                 // 1. Read Lock (Acquire)
                 let seq1 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
                 if seq1 & 1 != 0 {
+                    spin_count += 1;
+                    if spin_count > MAX_SPINS {
+                        tracing::error!(
+                            "Seqlock stuck (writer dead?): symbol={} exch={} seq={} after {} spins",
+                            symbol_id, exch, seq1, spin_count
+                        );
+                        // Return stale data rather than hang forever
+                        msg = ShmBboMessage::default();
+                        break;
+                    }
                     std::hint::spin_loop();
                     continue; // Writer is active, wait
                 }
@@ -102,6 +114,16 @@ impl ShmReader {
                 let seq2 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
                 if seq1 == seq2 {
                     break; // Data is clean, break spin loop
+                }
+
+                spin_count += 1;
+                if spin_count > MAX_SPINS {
+                    tracing::error!(
+                        "Seqlock torn read limit: symbol={} exch={} after {} spins",
+                        symbol_id, exch, spin_count
+                    );
+                    msg = ShmBboMessage::default();
+                    break;
                 }
             }
 

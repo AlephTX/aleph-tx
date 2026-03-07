@@ -11,26 +11,25 @@ alwaysApply: true
 
 | File | Description |
 |------|-------------|
-| lib.rs | Module declarations and library exports |
+| lib.rs | Module declarations and library exports (with backward-compatible re-exports) |
 | main.rs | Entry point - loads config, initializes strategies, main polling loop |
 | config.rs | `AppConfig` loader from config.toml, precision helpers (`round_to_tick`, `format_price`) |
 | error.rs | `TradingError` enum with all error variants |
+| exchange.rs | `Exchange` trait abstraction for unified trading interface |
 | shm_reader.rs | Lock-free BBO matrix reader (seqlock protocol) |
 | shm_event_reader.rs | Lock-free event ring buffer reader (SPSC) |
 | account_stats_reader.rs | Account stats SHM reader (128-byte versioned) |
 | shadow_ledger.rs | Optimistic position tracking (`real_pos` + `in_flight_pos`) |
-| lighter_ffi.rs | FFI bindings to Go signer (`lighter-signer-linux-amd64.so`) |
-| lighter_orders.rs | HTTP order execution with optimistic accounting |
-| lighter_trading.rs | High-level Lighter trading API wrapper |
 
 ## Subdirectories
 
 | Directory | Description |
 |-----------|-------------|
-| strategy/ | Strategy implementations (arbitrage, MM, adaptive MM) |
-| backpack_api/ | Backpack exchange REST client (Ed25519 auth) |
-| edgex_api/ | EdgeX REST client (StarkNet L2 Pedersen hash auth) |
+| strategy/ | Strategy implementations (arbitrage, MM, adaptive MM, inventory-neutral MM) |
+| exchanges/ | **Modular exchange integrations** (lighter/, backpack/, edgex/) - see `exchanges/CLAUDE.md` |
 | types/ | Core type definitions (events, orders, symbols) |
+
+**Note**: `lighter_ffi.rs` and `lighter_trading.rs` have been moved to `exchanges/lighter/`. Use `crate::lighter_ffi` and `crate::lighter_trading` (re-exported from `lib.rs`) for backward compatibility.
 
 ## Architecture
 
@@ -62,10 +61,10 @@ graph TD
     end
 
     subgraph "Order Execution (No Boomerang)"
-        LMM & AMM -->|FFI Sign + HTTP| LO[lighter_orders.rs]
-        MM -->|REST| EX[edgex_api/]
-        ARB -->|REST| BP[backpack_api/]
-        LO -->|Optimistic| SL
+        LMM & AMM -->|FFI Sign + HTTP| LT[exchanges/lighter/trading.rs]
+        MM -->|REST| EX[exchanges/edgex/]
+        ARB -->|REST| BP[exchanges/backpack/]
+        LT -->|Optimistic| SL
     end
 ```
 

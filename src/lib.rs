@@ -1,14 +1,16 @@
 pub mod account_stats_reader;
-pub mod backpack_api;
 pub mod config;
-pub mod edgex_api;
 pub mod error;
 pub mod exchange;
-pub mod lighter_ffi;
-pub mod lighter_orders;
-pub mod lighter_trading;
+pub mod exchanges;
 pub mod shadow_ledger;
 pub mod shm_event_reader;
 pub mod shm_reader;
 pub mod strategy;
 pub mod types;
+
+// Re-export for backward compatibility (callers can migrate incrementally)
+pub use exchanges::lighter::ffi as lighter_ffi;
+pub use exchanges::lighter::trading as lighter_trading;
+pub use exchanges::backpack as backpack_api;
+pub use exchanges::edgex as edgex_api;
