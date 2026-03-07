@@ -41,20 +41,22 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 ## Quick Start
 
 ```bash
-# 1. Configure
+# 1. Configure (unified config for all exchanges)
 cp config.example.toml config.toml
-# Edit config.toml for your risk parameters
+# Edit config.toml: set feeder_enabled=true for your exchange
 
-# 2. Set credentials
+# 2. Set credentials (only private keys/API keys)
 cp .env.lighter.example .env.lighter
-# Fill in API_KEY_PRIVATE_KEY, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_KEY_INDEX
+# Fill in your exchange credentials
 
 # 3. Build & Run (always use Makefile)
 make build              # Build Go feeder + Rust core
-make adaptive-up        # Start feeder + adaptive market maker
-make adaptive-logs      # Monitor logs
-make adaptive-down      # Stop and clean up
+make lighter-up         # Start Lighter DEX (or edgex-up, backpack-up)
+make lighter-logs       # Monitor logs
+make lighter-down       # Stop and clean up
 ```
+
+See [Configuration Guide](docs/CONFIGURATION.md) for detailed setup.
 
 ## Make Targets
 
@@ -70,18 +72,22 @@ make adaptive-down      # Stop and clean up
 
 ```
 aleph-tx/
+├── config.toml          # Unified configuration (feeder + strategy, all exchanges)
+├── .env.lighter         # Lighter DEX credentials (private keys only)
+├── .env.edgex           # EdgeX credentials (private keys only)
+├── .env.backpack        # Backpack credentials (private keys only)
 ├── feeder/              # Go: WebSocket ingestion, CGO FFI exports
 │   ├── exchanges/       #   Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
 │   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats)
 │   └── config/          #   TOML config loader
 ├── src/                 # Rust: HFT strategy engine
 │   ├── strategy/        #   Strategy implementations (adaptive_mm, lighter_mm, arbitrage, etc.)
-│   ├── backpack_api/    #   Backpack REST client (Ed25519)
-│   ├── edgex_api/       #   EdgeX REST client (StarkNet Pedersen)
+│   ├── exchanges/       #   Exchange integrations (Backpack, EdgeX, Lighter)
+│   ├── native/          #   Native libraries (Lighter Ed25519 signer .so)
 │   └── types/           #   Core types + C-ABI event struct (64 bytes)
 ├── examples/            # Entry point binaries for make targets
-├── lib/                 # Pre-built FFI shared library (Lighter signer)
 ├── docs/                # Reference documentation
+│   └── CONFIGURATION.md #   Configuration guide
 └── proto/               # gRPC service definitions
 ```
 
