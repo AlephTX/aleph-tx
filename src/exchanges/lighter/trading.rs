@@ -570,7 +570,7 @@ impl LighterTrading {
             Side::Sell => -params.size,
         };
         if let Some(ref ledger) = self.ledger {
-            ledger.write().add_in_flight(signed_size);
+            ledger.read().add_in_flight(signed_size);
         }
 
         let (tx_type, tx_info, tx_hash, client_order_index) = self
@@ -604,7 +604,7 @@ impl LighterTrading {
             Err(e) => {
                 // Rollback in_flight on failure
                 if let Some(ref ledger) = self.ledger {
-                    ledger.write().add_in_flight(-signed_size);
+                    ledger.read().add_in_flight(-signed_size);
                 }
                 Err(e)
             }
@@ -640,7 +640,7 @@ impl LighterTrading {
         // Optimistic accounting: net in-flight exposure before API call
         let net_in_flight = params.bid_size - params.ask_size;
         if let Some(ref ledger) = self.ledger {
-            ledger.write().add_in_flight(net_in_flight);
+            ledger.read().add_in_flight(net_in_flight);
         }
 
         // Get base nonce for batch
@@ -694,8 +694,8 @@ impl LighterTrading {
             Err(e) => {
                 // Rollback: undo in_flight and unregister orders
                 if let Some(ref ledger) = self.ledger {
+                    ledger.read().add_in_flight(-net_in_flight);
                     let mut l = ledger.write();
-                    l.add_in_flight(-net_in_flight);
                     l.active_orders.remove(&(bid_coi as u64));
                     l.active_orders.remove(&(ask_coi as u64));
                 }

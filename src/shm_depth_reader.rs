@@ -47,6 +47,7 @@ impl Default for ShmDepthSnapshot {
 pub struct ShmDepthReader {
     _mmap: memmap2::Mmap,
     data: *const u8,
+    #[allow(dead_code)]
     local_versions: [u64; NUM_SYMBOLS],
 }
 

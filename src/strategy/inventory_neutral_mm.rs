@@ -275,7 +275,7 @@ impl InventoryNeutralMM {
 
             // Periodic ledger sync: correct drift from missed events (every 30s)
             if self.last_balance_check.elapsed() > Duration::from_secs(30) {
-                let delta = self.ledger.write().force_sync_position(position);
+                let delta = self.ledger.read().force_sync_position(position);
                 if delta.abs() > 0.001 {
                     warn!("Ledger drift corrected: delta={:.6} ETH", delta);
                 }
