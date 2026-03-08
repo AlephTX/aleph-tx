@@ -206,13 +206,32 @@ EDGEX_ACCOUNT_ID=<id>
 
 ## Roadmap
 
-- **Risk Management**: Circuit breaker, max drawdown limit, kill switch
-- **Observability**: Prometheus metrics, Grafana dashboard, alerting
-- **Cross-Exchange Arbitrage**: Statistical arb between Lighter/Backpack/EdgeX
-- **WebSocket Execution**: Replace REST with WS for lower latency order placement
-- **Backtesting Framework**: Historical data replay with strategy simulation
-- **gRPC Control Plane**: Remote strategy management (proto/ definitions ready)
-- **Multi-Asset Support**: BTC-PERP, SOL-PERP, and other perpetual markets
+### Phase 1: Alpha Enhancement (Direct PnL Impact)
+
+| Priority | Item | Description | Complexity |
+|----------|------|-------------|------------|
+| P0 | **Sigmoid Inventory Skew** | Replace linear skew with sigmoid/logit curve — tight at low inventory, exponential near risk limit | Medium |
+| P0 | **Grid Laddering** | 3-5 level quoting per side (tight→wide, small→large). Harvest flash wicks from liquidation cascades | Medium |
+| P1 | **Micro-Price (OBI)** | Imbalance-weighted mid-price using L2-L5 depth instead of naive `(bid+ask)/2` | High (needs feeder SHM extension) |
+| P1 | **Cross-Exchange Arbitrage** | Statistical arb between Lighter/Backpack/EdgeX | High |
+
+### Phase 2: Latency Optimization (Systems Track)
+
+| Priority | Item | Description | Complexity |
+|----------|------|-------------|------------|
+| P0 | **Data/Control Plane Split** | Move SHM polling to dedicated `std::thread` + CPU pinning; Tokio only for I/O. Connect via lock-free queue | High |
+| P1 | **RwLock → Atomics** | Replace `Arc<RwLock<ShadowLedger>>` with cache-aligned `AtomicI64` on hot path | Low |
+| P1 | **WebSocket Execution** | Replace REST with WS for lower latency order placement | Medium |
+| P2 | **Multi-Asset Support** | BTC-PERP, SOL-PERP, and other perpetual markets | Medium |
+
+### Phase 3: Infrastructure & Ops
+
+| Priority | Item | Description | Complexity |
+|----------|------|-------------|------------|
+| P1 | **Risk Management** | Circuit breaker, max drawdown limit, kill switch | Medium |
+| P1 | **Observability** | Prometheus metrics, Grafana dashboard, alerting | Medium |
+| P2 | **Backtesting Framework** | Historical data replay with strategy simulation | High |
+| P2 | **gRPC Control Plane** | Remote strategy management (proto/ definitions ready) | Medium |
 
 ## Documentation
 
