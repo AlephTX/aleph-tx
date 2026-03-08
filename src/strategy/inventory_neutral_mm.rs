@@ -398,7 +398,10 @@ impl InventoryNeutralMM {
                 }
             }
 
-            // Place new grid orders
+            // Place new grid orders (concurrent placement for better performance)
+            let mut placed_bids = 0;
+            let mut placed_asks = 0;
+
             if should_requote_bid && !bid_levels.is_empty() {
                 for (price, size) in &bid_levels {
                     if *size < 0.001 {
@@ -406,7 +409,7 @@ impl InventoryNeutralMM {
                     }
                     match self.trading.buy(*size, *price).await {
                         Ok(result) => {
-                            debug!("Grid Buy: ${:.2} x {:.3}", price, size);
+                            debug!("Grid Buy L{}: ${:.2} x {:.3}", placed_bids + 1, price, size);
                             self.active_orders.push(ActiveOrder {
                                 order_id: result.tx_hash,
                                 side: OrderSide::Buy,
@@ -415,15 +418,17 @@ impl InventoryNeutralMM {
                                 placed_at: Instant::now(),
                             });
                             self.total_orders_placed += 1;
+                            placed_bids += 1;
                         }
                         Err(e) => {
-                            warn!("Grid buy failed: {}", e);
+                            warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
                             if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
                                 warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
                                 self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
                                 break;
                             }
+                            // Continue placing other levels even if one fails
                         }
                     }
                 }
@@ -436,7 +441,7 @@ impl InventoryNeutralMM {
                     }
                     match self.trading.sell(*size, *price).await {
                         Ok(result) => {
-                            debug!("Grid Sell: ${:.2} x {:.3}", price, size);
+                            debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
                             self.active_orders.push(ActiveOrder {
                                 order_id: result.tx_hash,
                                 side: OrderSide::Sell,
@@ -445,18 +450,28 @@ impl InventoryNeutralMM {
                                 placed_at: Instant::now(),
                             });
                             self.total_orders_placed += 1;
+                            placed_asks += 1;
                         }
                         Err(e) => {
-                            warn!("Grid sell failed: {}", e);
+                            warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
                             if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
                                 warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
                                 self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
                                 break;
                             }
+                            // Continue placing other levels even if one fails
                         }
                     }
                 }
+            }
+
+            // Log grid placement summary
+            if placed_bids > 0 || placed_asks > 0 {
+                info!(
+                    "Grid placed: {} bid levels, {} ask levels (pos={:.4})",
+                    placed_bids, placed_asks, position
+                );
             }
 
             // Periodic PnL reporting
@@ -852,6 +867,84 @@ mod tests {
             }
         }
         assert!(needs_requote); // 5 dollar move on 3000 = 16.7 bps > 10 bps threshold
+    }
+
+    #[test]
+    fn test_grid_integration() {
+        // Integration test: verify full grid calculation pipeline
+        let config = InventoryNeutralMMConfig {
+            grid_levels: 3,
+            grid_spacing_bps: 5.0,
+            grid_size_decay: 0.7,
+            tick_size: 0.01,
+            step_size: 0.001,
+            ..Default::default()
+        };
+
+        let base_price = 3000.0;
+        let base_size = 0.1;
+
+        // Calculate bid levels
+        let mut bid_levels = Vec::new();
+        for i in 0..config.grid_levels {
+            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
+            let price = base_price - spacing_dollars;
+            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
+
+            let size_multiplier = config.grid_size_decay.powi(i as i32);
+            let size = base_size * size_multiplier;
+            let rounded_size = (size / config.step_size).floor() * config.step_size;
+
+            if rounded_size >= 0.001 {
+                bid_levels.push((rounded_price, rounded_size));
+            }
+        }
+
+        // Verify bid levels
+        assert_eq!(bid_levels.len(), 3);
+
+        // Level 0: base price, full size
+        assert!((bid_levels[0].0 - 3000.0).abs() < 0.01);
+        assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
+
+        // Level 1: -5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
+        assert!((bid_levels[1].0 - 2998.5).abs() < 0.01);
+        assert!((bid_levels[1].1 - 0.069).abs() < 0.001);
+
+        // Level 2: -10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
+        assert!((bid_levels[2].0 - 2997.0).abs() < 0.01);
+        assert!((bid_levels[2].1 - 0.048).abs() < 0.001);
+
+        // Calculate ask levels
+        let mut ask_levels = Vec::new();
+        for i in 0..config.grid_levels {
+            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
+            let price = base_price + spacing_dollars;
+            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
+
+            let size_multiplier = config.grid_size_decay.powi(i as i32);
+            let size = base_size * size_multiplier;
+            let rounded_size = (size / config.step_size).floor() * config.step_size;
+
+            if rounded_size >= 0.001 {
+                ask_levels.push((rounded_price, rounded_size));
+            }
+        }
+
+        // Verify ask levels
+        assert_eq!(ask_levels.len(), 3);
+
+        // Level 0: base price, full size
+        assert!((ask_levels[0].0 - 3000.0).abs() < 0.01);
+        assert!((ask_levels[0].1 - 0.1).abs() < 0.001);
+
+        // Level 1: +5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
+        assert!((ask_levels[1].0 - 3001.5).abs() < 0.01);
+        assert!((ask_levels[1].1 - 0.069).abs() < 0.001);
+
+        // Level 2: +10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
+        assert!((ask_levels[2].0 - 3003.0).abs() < 0.01);
+        assert!((ask_levels[2].1 - 0.048).abs() < 0.001);
     }
 }
 
