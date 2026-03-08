@@ -5,14 +5,22 @@
 //! - <1μs state queries (vs 50-200ms REST API)
 //! - Real-time event-driven updates
 //! - Zero API calls for state queries
+//!
+//! v4.0.0: real_pos and in_flight_pos use AtomicI64 (scaled 1e8) with CachePadded
+//! to eliminate RwLock contention on the hot path.
 
 use crate::error::{Result, TradingError};
 use crate::shm_event_reader::ShmEventReader;
 use crate::types::{EventType, ShmPrivateEvent};
+use crossbeam::utils::CachePadded;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Scale factor for AtomicI64 position fields (1e8 = 8 decimal places)
+const POS_SCALE: f64 = 1e8;
 
 /// Order side (buy or sell)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,18 +67,21 @@ pub struct OrderState {
 }
 
 /// Local account state (shadow ledger)
-#[derive(Debug, Clone)]
+///
+/// v4.0.0: `real_pos` and `in_flight_pos` are lock-free AtomicI64 (scaled 1e8)
+/// to eliminate cache-coherency ping-pong on the hot path.
+/// Other fields are only accessed by the event consumer (single writer).
 pub struct ShadowLedger {
-    /// Confirmed position (reconciled from WS events)
-    pub real_pos: f64,
+    /// Confirmed position (reconciled from WS events) - LOCK-FREE
+    pub real_pos: CachePadded<AtomicI64>,
 
-    /// Optimistic in-flight position (orders sent but not yet confirmed)
-    pub in_flight_pos: f64,
+    /// Optimistic in-flight position (orders sent but not yet confirmed) - LOCK-FREE
+    pub in_flight_pos: CachePadded<AtomicI64>,
 
-    /// Realized PnL (USD)
+    /// Realized PnL (USD) - only written by event consumer
     pub realized_pnl: f64,
 
-    /// Active orders (order_id -> OrderState)
+    /// Active orders (order_id -> OrderState) - only written by event consumer
     pub active_orders: HashMap<u64, OrderState>,
 
     /// Last event sequence number processed
@@ -80,11 +91,36 @@ pub struct ShadowLedger {
     pub last_update: Instant,
 }
 
+impl std::fmt::Debug for ShadowLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowLedger")
+            .field("real_pos", &self.real_pos_f64())
+            .field("in_flight_pos", &self.in_flight_pos_f64())
+            .field("realized_pnl", &self.realized_pnl)
+            .field("active_orders", &self.active_orders.len())
+            .field("last_sequence", &self.last_sequence)
+            .finish()
+    }
+}
+
+impl Clone for ShadowLedger {
+    fn clone(&self) -> Self {
+        Self {
+            real_pos: CachePadded::new(AtomicI64::new(self.real_pos.load(Ordering::Acquire))),
+            in_flight_pos: CachePadded::new(AtomicI64::new(self.in_flight_pos.load(Ordering::Acquire))),
+            realized_pnl: self.realized_pnl,
+            active_orders: self.active_orders.clone(),
+            last_sequence: self.last_sequence,
+            last_update: self.last_update,
+        }
+    }
+}
+
 impl Default for ShadowLedger {
     fn default() -> Self {
         Self {
-            real_pos: 0.0,
-            in_flight_pos: 0.0,
+            real_pos: CachePadded::new(AtomicI64::new(0)),
+            in_flight_pos: CachePadded::new(AtomicI64::new(0)),
             realized_pnl: 0.0,
             active_orders: HashMap::new(),
             last_sequence: 0,
@@ -94,18 +130,32 @@ impl Default for ShadowLedger {
 }
 
 impl ShadowLedger {
-    /// Get total exposure (real + in_flight)
-    pub fn total_exposure(&self) -> f64 {
-        self.real_pos + self.in_flight_pos
+    /// Read real_pos as f64 (lock-free)
+    #[inline]
+    pub fn real_pos_f64(&self) -> f64 {
+        self.real_pos.load(Ordering::Acquire) as f64 / POS_SCALE
     }
 
-    /// Add to in_flight position (optimistic accounting)
-    pub fn add_in_flight(&mut self, delta: f64) {
-        self.in_flight_pos += delta;
+    /// Read in_flight_pos as f64 (lock-free)
+    #[inline]
+    pub fn in_flight_pos_f64(&self) -> f64 {
+        self.in_flight_pos.load(Ordering::Acquire) as f64 / POS_SCALE
+    }
+
+    /// Get total exposure (real + in_flight) - LOCK-FREE
+    #[inline]
+    pub fn total_exposure(&self) -> f64 {
+        self.real_pos_f64() + self.in_flight_pos_f64()
+    }
+
+    /// Add to in_flight position (optimistic accounting) - LOCK-FREE
+    pub fn add_in_flight(&self, delta: f64) {
+        let delta_scaled = (delta * POS_SCALE) as i64;
+        self.in_flight_pos.fetch_add(delta_scaled, Ordering::AcqRel);
         tracing::debug!(
             "In-flight updated: delta={:.4} new_in_flight={:.4} total_exposure={:.4}",
             delta,
-            self.in_flight_pos,
+            self.in_flight_pos_f64(),
             self.total_exposure()
         );
     }
@@ -245,10 +295,12 @@ impl ShadowLedger {
 
                     // Only reconcile in_flight for tracked orders (pre-registered via add_in_flight)
                     if order_tracked {
-                        self.in_flight_pos -= signed_fill;
+                        let delta_scaled = (signed_fill * POS_SCALE) as i64;
+                        self.in_flight_pos.fetch_sub(delta_scaled, Ordering::AcqRel);
                     }
                     // Always update real position
-                    self.real_pos += signed_fill;
+                    let delta_scaled = (signed_fill * POS_SCALE) as i64;
+                    self.real_pos.fetch_add(delta_scaled, Ordering::AcqRel);
 
                     // Update realized PnL correctly for both sides
                     match order_side {
@@ -268,8 +320,8 @@ impl ShadowLedger {
                         order_side,
                         event.fill_size,
                         event.fill_price,
-                        self.real_pos,
-                        self.in_flight_pos,
+                        self.real_pos_f64(),
+                        self.in_flight_pos_f64(),
                         total_exp
                     );
 
@@ -283,7 +335,8 @@ impl ShadowLedger {
                     let signed_fill = side.sign() * event.fill_size;
 
                     // Update real_pos directly (no in_flight to reconcile)
-                    self.real_pos += signed_fill;
+                    let delta_scaled = (signed_fill * POS_SCALE) as i64;
+                    self.real_pos.fetch_add(delta_scaled, Ordering::AcqRel);
 
                     match side {
                         OrderSide::Buy => {
@@ -300,7 +353,7 @@ impl ShadowLedger {
                         side,
                         event.fill_size,
                         event.fill_price,
-                        self.real_pos
+                        self.real_pos_f64()
                     );
                 }
             }
@@ -309,7 +362,8 @@ impl ShadowLedger {
                 if let Some(order) = self.active_orders.get(&event.order_id) {
                     if order.tracked {
                         let signed_remaining = order.side.sign() * order.remaining_size;
-                        self.in_flight_pos -= signed_remaining;
+                        let delta_scaled = (signed_remaining * POS_SCALE) as i64;
+                        self.in_flight_pos.fetch_sub(delta_scaled, Ordering::AcqRel);
                         tracing::debug!(
                             "Order canceled (tracked): id={} side={} remaining={:.4} rolled back in_flight",
                             event.order_id,
@@ -332,7 +386,8 @@ impl ShadowLedger {
                 if let Some(order) = self.active_orders.get(&event.order_id) {
                     if order.tracked {
                         let signed_remaining = order.side.sign() * order.remaining_size;
-                        self.in_flight_pos -= signed_remaining;
+                        let delta_scaled = (signed_remaining * POS_SCALE) as i64;
+                        self.in_flight_pos.fetch_sub(delta_scaled, Ordering::AcqRel);
                         tracing::warn!(
                             "Order rejected (tracked): id={} side={} size={:.4} rolled back in_flight",
                             event.order_id,
@@ -359,9 +414,9 @@ impl ShadowLedger {
         Ok(())
     }
 
-    /// Get current confirmed position
+    /// Get current confirmed position - LOCK-FREE
     pub fn position(&self) -> f64 {
-        self.real_pos
+        self.real_pos_f64()
     }
 
     /// Get total exposure (real + in_flight)
@@ -387,15 +442,16 @@ impl ShadowLedger {
     /// Force-sync real_pos from an authoritative source (e.g., REST API / AccountStats).
     /// Call periodically to correct drift from missed events.
     /// Returns the correction delta applied.
-    pub fn force_sync_position(&mut self, authoritative_pos: f64) -> f64 {
-        let delta = authoritative_pos - self.real_pos;
+    pub fn force_sync_position(&self, authoritative_pos: f64) -> f64 {
+        let current = self.real_pos_f64();
+        let delta = authoritative_pos - current;
         if delta.abs() > 1e-8 {
             tracing::warn!(
                 "Ledger force_sync: real_pos {:.6} → {:.6} (delta={:.6}, in_flight={:.6})",
-                self.real_pos, authoritative_pos, delta, self.in_flight_pos
+                current, authoritative_pos, delta, self.in_flight_pos_f64()
             );
-            self.real_pos = authoritative_pos;
-            self.last_update = Instant::now();
+            let new_scaled = (authoritative_pos * POS_SCALE) as i64;
+            self.real_pos.store(new_scaled, Ordering::Release);
         }
         delta
     }
@@ -484,8 +540,8 @@ mod tests {
     #[test]
     fn test_shadow_ledger_initial_state() {
         let ledger = ShadowLedger::default();
-        assert_eq!(ledger.real_pos, 0.0);
-        assert_eq!(ledger.in_flight_pos, 0.0);
+        assert_eq!(ledger.real_pos_f64(), 0.0);
+        assert_eq!(ledger.in_flight_pos_f64(), 0.0);
         assert_eq!(ledger.realized_pnl, 0.0);
         assert_eq!(ledger.total_exposure(), 0.0);
         assert_eq!(ledger.active_order_count(), 0);
@@ -493,15 +549,15 @@ mod tests {
 
     #[test]
     fn test_add_in_flight() {
-        let mut ledger = ShadowLedger::default();
+        let ledger = ShadowLedger::default();
 
         ledger.add_in_flight(1.5);
-        assert_eq!(ledger.in_flight_pos, 1.5);
-        assert_eq!(ledger.total_exposure(), 1.5);
+        assert!((ledger.in_flight_pos_f64() - 1.5).abs() < 1e-6);
+        assert!((ledger.total_exposure() - 1.5).abs() < 1e-6);
 
         ledger.add_in_flight(-0.5);
-        assert_eq!(ledger.in_flight_pos, 1.0);
-        assert_eq!(ledger.total_exposure(), 1.0);
+        assert!((ledger.in_flight_pos_f64() - 1.0).abs() < 1e-6);
+        assert!((ledger.total_exposure() - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -528,8 +584,8 @@ mod tests {
 
         // Optimistically add in_flight for a buy order
         state.add_in_flight(1.5);
-        assert_eq!(state.in_flight_pos, 1.5);
-        assert_eq!(state.total_exposure(), 1.5);
+        assert!((state.in_flight_pos_f64() - 1.5).abs() < 1e-6);
+        assert!((state.total_exposure() - 1.5).abs() < 1e-6);
 
         // Create order (with side)
         state.active_orders.insert(
@@ -553,9 +609,9 @@ mod tests {
         let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12345, 3000.0, 0.5, 1.0, 0.15, false);
         state.apply_event(&fill_event).unwrap();
 
-        assert_eq!(state.real_pos, 0.5);
-        assert_eq!(state.in_flight_pos, 1.0); // 1.5 - 0.5 = 1.0
-        assert_eq!(state.total_exposure(), 1.5);
+        assert!((state.real_pos_f64() - 0.5).abs() < 1e-6);
+        assert!((state.in_flight_pos_f64() - 1.0).abs() < 1e-6); // 1.5 - 0.5 = 1.0
+        assert!((state.total_exposure() - 1.5).abs() < 1e-6);
         assert_eq!(state.active_order_count(), 1); // Still active (partial fill)
 
         let order = state.active_orders.get(&12345).unwrap();
@@ -594,7 +650,7 @@ mod tests {
 
         assert_eq!(state.active_order_count(), 0);
         assert!(!state.has_active_order(12345));
-        assert_eq!(state.in_flight_pos, 0.0); // Rolled back
+        assert!((state.in_flight_pos_f64()).abs() < 1e-6); // Rolled back
     }
 
     #[test]
@@ -627,8 +683,8 @@ mod tests {
         state.apply_event(&fill_event).unwrap();
 
         // Check reconciliation
-        assert_eq!(state.real_pos, -1.0);
-        assert_eq!(state.in_flight_pos, 0.0);
+        assert!((state.real_pos_f64() - (-1.0)).abs() < 1e-6);
+        assert!((state.in_flight_pos_f64()).abs() < 1e-6);
 
         // PnL should be positive (revenue from selling)
         assert!(state.realized_pnl > 0.0);
