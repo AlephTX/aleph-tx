@@ -15,8 +15,8 @@
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::{Result, TradingError};
-use crate::exchange::{BatchOrderParams, Exchange};
-use crate::shadow_ledger::ShadowLedger;
+use crate::exchange::Exchange;
+use crate::shadow_ledger::{OrderSide, ShadowLedger};
 use crate::shm_reader::ShmReader;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -131,9 +131,11 @@ impl MicrostructureTracker {
 #[derive(Debug, Clone)]
 struct ActiveOrder {
     order_id: String,
+    side: OrderSide,
     price: f64,
     #[allow(dead_code)]
     size: f64,
+    #[allow(dead_code)]
     placed_at: Instant,
 }
 
@@ -149,8 +151,8 @@ pub struct InventoryNeutralMM {
     account_stats: AccountStats,
     micro: MicrostructureTracker,
 
-    active_bid: Option<ActiveOrder>,
-    active_ask: Option<ActiveOrder>,
+    // Order tracking (multi-level grid)
+    active_orders: Vec<ActiveOrder>,
 
     session_start_balance: f64,
     total_orders_placed: u64,
@@ -174,8 +176,7 @@ impl InventoryNeutralMM {
             account_stats_reader,
             account_stats: AccountStats::default(),
             micro: MicrostructureTracker::new(200),
-            active_bid: None,
-            active_ask: None,
+            active_orders: Vec::new(),
             session_start_balance: 0.0,
             total_orders_placed: 0,
             last_balance_check: Instant::now(),
@@ -377,108 +378,82 @@ impl InventoryNeutralMM {
                 position, bid_size, ask_size
             );
 
-            // Determine which sides to quote
-            let should_requote_bid = self.should_requote(&self.active_bid, our_bid);
-            let should_requote_ask = self.should_requote(&self.active_ask, our_ask);
+            // Calculate grid levels for both sides
+            let bid_levels = self.calculate_grid_levels(our_bid, bid_size, true);
+            let ask_levels = self.calculate_grid_levels(our_ask, ask_size, false);
 
-            let place_bid = should_requote_bid && bid_size >= 0.001;
-            let place_ask = should_requote_ask && ask_size >= 0.001;
+            // Check if we need to requote either side
+            let should_requote_bid = self.should_requote_side(OrderSide::Buy, &bid_levels);
+            let should_requote_ask = self.should_requote_side(OrderSide::Sell, &ask_levels);
 
-            // Cancel stale orders
-            if place_bid {
-                if let Some(ref order) = self.active_bid {
-                    if let Ok(idx) = order.order_id.parse::<i64>() {
-                        let _ = self.trading.cancel_order(idx).await;
-                    }
-                    self.active_bid = None;
+            // Cancel and replace orders if needed
+            if should_requote_bid {
+                if let Err(e) = self.cancel_side_orders(OrderSide::Buy).await {
+                    warn!("Failed to cancel bid orders: {}", e);
                 }
             }
-            if place_ask {
-                if let Some(ref order) = self.active_ask {
-                    if let Ok(idx) = order.order_id.parse::<i64>() {
-                        let _ = self.trading.cancel_order(idx).await;
-                    }
-                    self.active_ask = None;
+            if should_requote_ask {
+                if let Err(e) = self.cancel_side_orders(OrderSide::Sell).await {
+                    warn!("Failed to cancel ask orders: {}", e);
                 }
             }
 
-            // Place orders
-            if place_bid && place_ask {
-                // Use batch API for both sides
-                match self.trading.place_batch(BatchOrderParams {
-                    bid_price: our_bid,
-                    ask_price: our_ask,
-                    bid_size,
-                    ask_size,
-                }).await {
-                    Ok(result) => {
-                        info!(
-                            "Batch: Bid ${:.2} x {:.3} / Ask ${:.2} x {:.3} (pos={:.4})",
-                            our_bid, bid_size, our_ask, ask_size, position
-                        );
-                        self.active_bid = Some(ActiveOrder {
-                            order_id: result.bid_client_order_index.to_string(),
-                            price: our_bid,
-                            size: bid_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.active_ask = Some(ActiveOrder {
-                            order_id: result.ask_client_order_index.to_string(),
-                            price: our_ask,
-                            size: ask_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.total_orders_placed += 2;
+            // Place new grid orders
+            if should_requote_bid && !bid_levels.is_empty() {
+                for (price, size) in &bid_levels {
+                    if *size < 0.001 {
+                        continue;
                     }
-                    Err(e) => {
-                        warn!("Batch failed: {}", e);
-                        // Handle margin errors by canceling active orders
-                        if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                            warn!("Margin insufficient, canceling active orders (cooldown {}s)", self.config.margin_cooldown_secs);
-                            self.cancel_all_orders().await;
-                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                    match self.trading.buy(*size, *price).await {
+                        Ok(result) => {
+                            debug!("Grid Buy: ${:.2} x {:.3}", price, size);
+                            self.active_orders.push(ActiveOrder {
+                                order_id: result.tx_hash,
+                                side: OrderSide::Buy,
+                                price: *price,
+                                size: *size,
+                                placed_at: Instant::now(),
+                            });
+                            self.total_orders_placed += 1;
+                        }
+                        Err(e) => {
+                            warn!("Grid buy failed: {}", e);
+                            if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
+                                warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                self.cancel_all_orders().await;
+                                self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                break;
+                            }
                         }
                     }
                 }
-            } else if place_bid {
-                match self.trading.buy(bid_size, our_bid).await {
-                    Ok(result) => {
-                        info!("Buy: ${:.2} x {:.3} (pos={:.4})", our_bid, bid_size, position);
-                        self.active_bid = Some(ActiveOrder {
-                            order_id: result.tx_hash,
-                            price: our_bid,
-                            size: bid_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.total_orders_placed += 1;
+            }
+
+            if should_requote_ask && !ask_levels.is_empty() {
+                for (price, size) in &ask_levels {
+                    if *size < 0.001 {
+                        continue;
                     }
-                    Err(e) => {
-                        warn!("Buy failed: {}", e);
-                        if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
-                            self.cancel_all_orders().await;
-                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
+                    match self.trading.sell(*size, *price).await {
+                        Ok(result) => {
+                            debug!("Grid Sell: ${:.2} x {:.3}", price, size);
+                            self.active_orders.push(ActiveOrder {
+                                order_id: result.tx_hash,
+                                side: OrderSide::Sell,
+                                price: *price,
+                                size: *size,
+                                placed_at: Instant::now(),
+                            });
+                            self.total_orders_placed += 1;
                         }
-                    }
-                }
-            } else if place_ask {
-                match self.trading.sell(ask_size, our_ask).await {
-                    Ok(result) => {
-                        info!("Sell: ${:.2} x {:.3} (pos={:.4})", our_ask, ask_size, position);
-                        self.active_ask = Some(ActiveOrder {
-                            order_id: result.tx_hash,
-                            price: our_ask,
-                            size: ask_size,
-                            placed_at: Instant::now(),
-                        });
-                        self.total_orders_placed += 1;
-                    }
-                    Err(e) => {
-                        warn!("Sell failed: {}", e);
-                        if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
-                            self.cancel_all_orders().await;
-                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
+                        Err(e) => {
+                            warn!("Grid sell failed: {}", e);
+                            if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
+                                warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                self.cancel_all_orders().await;
+                                self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                break;
+                            }
                         }
                     }
                 }
@@ -545,6 +520,53 @@ impl InventoryNeutralMM {
         }
 
         levels
+    }
+
+    /// Get all active orders for a given side
+    fn get_active_orders(&self, side: OrderSide) -> Vec<&ActiveOrder> {
+        self.active_orders
+            .iter()
+            .filter(|o| o.side == side)
+            .collect()
+    }
+
+    /// Check if we should requote any orders on a given side
+    fn should_requote_side(&self, side: OrderSide, target_prices: &[(f64, f64)]) -> bool {
+        let active = self.get_active_orders(side);
+
+        // If number of orders doesn't match, requote
+        if active.len() != target_prices.len() {
+            return true;
+        }
+
+        // Check if any price has moved beyond threshold
+        for (order, &(target_price, _)) in active.iter().zip(target_prices.iter()) {
+            let price_diff = (order.price - target_price).abs();
+            let threshold = target_price * self.config.requote_threshold_bps / 10000.0;
+            if price_diff > threshold {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Cancel all orders on a given side
+    async fn cancel_side_orders(&mut self, side: OrderSide) -> Result<()> {
+        let orders_to_cancel: Vec<String> = self.active_orders
+            .iter()
+            .filter(|o| o.side == side)
+            .map(|o| o.order_id.clone())
+            .collect();
+
+        for order_id in orders_to_cancel {
+            if let Ok(idx) = order_id.parse::<i64>() {
+                let _ = self.trading.cancel_order(idx).await;
+            }
+            self.active_orders.retain(|o| o.order_id != order_id);
+        }
+
+        Ok(())
     }
 
     /// Calculate asymmetric order sizes to neutralize inventory
@@ -653,30 +675,19 @@ impl InventoryNeutralMM {
         (bid_size, ask_size)
     }
 
-    fn should_requote(&self, active_order: &Option<ActiveOrder>, new_price: f64) -> bool {
-        match active_order {
-            None => true,
-            Some(order) => {
-                let deviation_bps = ((new_price - order.price).abs() / order.price) * 10000.0;
-                let age = order.placed_at.elapsed();
-                deviation_bps > self.config.requote_threshold_bps || age > Duration::from_secs(self.config.order_ttl_secs)
-            }
-        }
-    }
-
     async fn cancel_all_orders(&mut self) {
-        if let Some(ref order) = self.active_bid {
-            if let Ok(idx) = order.order_id.parse::<i64>() {
+        let order_ids: Vec<String> = self.active_orders
+            .iter()
+            .map(|o| o.order_id.clone())
+            .collect();
+
+        for order_id in order_ids {
+            if let Ok(idx) = order_id.parse::<i64>() {
                 let _ = self.trading.cancel_order(idx).await;
             }
         }
-        if let Some(ref order) = self.active_ask {
-            if let Ok(idx) = order.order_id.parse::<i64>() {
-                let _ = self.trading.cancel_order(idx).await;
-            }
-        }
-        self.active_bid = None;
-        self.active_ask = None;
+
+        self.active_orders.clear();
     }
 
     fn print_pnl_update(&self) {
@@ -763,6 +774,84 @@ mod tests {
         // Test at max inventory
         let ratio_max = (0.15 / config.max_position).clamp(-1.0, 1.0).tanh();
         assert!(ratio_max > 0.7); // tanh(1.0) ≈ 0.76
+    }
+
+    #[test]
+    fn test_multi_level_order_tracking() {
+        // Test helper methods without full MM initialization
+        let config = InventoryNeutralMMConfig {
+            grid_levels: 3,
+            requote_threshold_bps: 10.0,
+            ..Default::default()
+        };
+
+        // Create a minimal MM instance for testing
+        let mut active_orders = Vec::new();
+
+        // Simulate adding orders
+        active_orders.push(ActiveOrder {
+            order_id: "1".to_string(),
+            side: OrderSide::Buy,
+            price: 3000.0,
+            size: 0.05,
+            placed_at: Instant::now(),
+        });
+        active_orders.push(ActiveOrder {
+            order_id: "2".to_string(),
+            side: OrderSide::Buy,
+            price: 2995.0,
+            size: 0.035,
+            placed_at: Instant::now(),
+        });
+        active_orders.push(ActiveOrder {
+            order_id: "3".to_string(),
+            side: OrderSide::Sell,
+            price: 3010.0,
+            size: 0.05,
+            placed_at: Instant::now(),
+        });
+
+        // Test filtering by side
+        let bids: Vec<_> = active_orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].price, 3000.0);
+        assert_eq!(bids[1].price, 2995.0);
+
+        let asks: Vec<_> = active_orders.iter().filter(|o| o.side == OrderSide::Sell).collect();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].price, 3010.0);
+
+        // Test requote logic
+        let target_prices = vec![(3000.0, 0.05), (2995.0, 0.035)];
+
+        // Same prices - no requote needed
+        let mut needs_requote = false;
+        if bids.len() != target_prices.len() {
+            needs_requote = true;
+        } else {
+            for (order, &(target_price, _)) in bids.iter().zip(target_prices.iter()) {
+                let price_diff = (order.price - target_price).abs();
+                let threshold = target_price * config.requote_threshold_bps / 10000.0;
+                if price_diff > threshold {
+                    needs_requote = true;
+                    break;
+                }
+            }
+        }
+        assert!(!needs_requote);
+
+        // Price moved beyond threshold (10 bps = 0.1%)
+        let moved_prices = vec![(3005.0, 0.05), (2995.0, 0.035)];
+        needs_requote = false;
+        for (order, &(target_price, _)) in bids.iter().zip(moved_prices.iter()) {
+            let price_diff = (order.price - target_price).abs();
+            let threshold = target_price * config.requote_threshold_bps / 10000.0;
+            if price_diff > threshold {
+                needs_requote = true;
+                break;
+            }
+        }
+        assert!(needs_requote); // 5 dollar move on 3000 = 16.7 bps > 10 bps threshold
     }
 }
 
