@@ -2,7 +2,6 @@ package exchanges
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
 )
 
@@ -43,24 +43,6 @@ func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.
 	}
 }
 
-// lighterOB is the orderbook snapshot/update envelope.
-type lighterOB struct {
-	Type      string          `json:"type"`
-	Channel   string          `json:"channel"`
-	OrderBook json.RawMessage `json:"order_book"`
-	Timestamp int64           `json:"timestamp"`
-}
-
-type lighterBook struct {
-	Bids []lighterLevel `json:"bids"`
-	Asks []lighterLevel `json:"asks"`
-}
-
-type lighterLevel struct {
-	Price string `json:"price"`
-	Size  string `json:"size"`
-}
-
 func (l *Lighter) Run(ctx context.Context) error {
 	// Only run public orderbook stream
 	// Private events are handled by LighterPrivate in lighter_private.go
@@ -92,48 +74,48 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			return err
 		}
 
-		log.Printf("lighter: received message: %s", string(data[:min(200, len(data))]))
+		// Zero-copy JSON parsing with gjson
+		result := gjson.ParseBytes(data)
+		msgType := result.Get("type").String()
+		channel := result.Get("channel").String()
 
-		var env lighterOB
-		if json.Unmarshal(data, &env) != nil {
-			log.Printf("lighter: failed to unmarshal envelope")
-			continue
-		}
-
-		log.Printf("lighter: message type=%s channel=%s", env.Type, env.Channel)
-
-		isSnapshot := env.Type == "subscribed/order_book"
-		isUpdate := env.Type == "update/order_book"
+		isSnapshot := msgType == "subscribed/order_book"
+		isUpdate := msgType == "update/order_book"
 		if !isSnapshot && !isUpdate {
 			continue
 		}
 
-		var book lighterBook
-		if json.Unmarshal(env.OrderBook, &book) != nil {
-			log.Printf("lighter: failed to unmarshal order_book")
+		// Extract BBO directly without intermediate structs
+		bids := result.Get("order_book.bids")
+		asks := result.Get("order_book.asks")
+
+		if !bids.Exists() || !asks.Exists() || !bids.IsArray() || !asks.IsArray() {
+			log.Printf("lighter: invalid order_book structure")
 			continue
 		}
 
-		mktIdx := l.parseMarketIndex(env.Channel)
+		bidArray := bids.Array()
+		askArray := asks.Array()
+
+		if len(bidArray) == 0 || len(askArray) == 0 {
+			log.Printf("lighter: empty bids or asks")
+			continue
+		}
+
+		mktIdx := l.parseMarketIndex(channel)
 		symID, ok := l.mktMap[mktIdx]
 		if !ok {
 			log.Printf("lighter: market %d not in mktMap", mktIdx)
 			continue
 		}
 
-		if len(book.Bids) == 0 || len(book.Asks) == 0 {
-			log.Printf("lighter: empty bids or asks")
-			continue
-		}
+		// Parse best bid/ask
+		bidPx, _ := strconv.ParseFloat(bidArray[0].Get("price").String(), 64)
+		bidSz, _ := strconv.ParseFloat(bidArray[0].Get("size").String(), 64)
+		askPx, _ := strconv.ParseFloat(askArray[0].Get("price").String(), 64)
+		askSz, _ := strconv.ParseFloat(askArray[0].Get("size").String(), 64)
 
-		bidPx, _ := strconv.ParseFloat(book.Bids[0].Price, 64)
-		bidSz, _ := strconv.ParseFloat(book.Bids[0].Size, 64)
-		askPx, _ := strconv.ParseFloat(book.Asks[0].Price, 64)
-		askSz, _ := strconv.ParseFloat(book.Asks[0].Size, 64)
-
-		log.Printf("lighter: BBO for symbol %d: bid=%.2f@%.4f ask=%.2f@%.4f", symID, bidPx, bidSz, askPx, askSz)
-
-		tsNs := uint64(env.Timestamp) * 1_000_000 // ms → ns
+		tsNs := uint64(result.Get("timestamp").Int()) * 1_000_000 // ms → ns
 		if tsNs == 0 {
 			tsNs = uint64(time.Now().UnixNano())
 		}

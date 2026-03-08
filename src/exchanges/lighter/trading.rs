@@ -9,6 +9,7 @@
 //! - cancel_order / cancel_all — 撤单
 //! - get_order / get_active_orders / verify_order — 查询验证
 
+use crate::error::TradingError;
 use crate::shadow_ledger::ShadowLedger;
 use parking_lot::RwLock;
 
@@ -457,6 +458,10 @@ impl LighterTrading {
         }
 
         if !status.is_success() {
+            // Check for specific error patterns
+            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21711") {
+                return Err(TradingError::InsufficientMargin.into());
+            }
             anyhow::bail!("sendTx HTTP {}: {}", status, body);
         }
 
@@ -509,6 +514,10 @@ impl LighterTrading {
         }
 
         if !status.is_success() {
+            // Check for specific error patterns
+            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21711") {
+                return Err(TradingError::InsufficientMargin.into());
+            }
             anyhow::bail!("sendTxBatch HTTP {}: {}", status, body);
         }
 

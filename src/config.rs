@@ -119,6 +119,9 @@ fn default_requote_threshold() -> f64 {
 fn default_poll_interval_ms() -> u64 {
     100
 }
+fn default_margin_cooldown_secs() -> u64 {
+    5
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +148,8 @@ pub struct InventoryNeutralMMConfig {
     pub order_ttl_secs: u64,             // default: 5
     pub max_leverage: f64,               // default: 10.0
     pub min_available_balance: f64,      // default: 2.0
+    #[serde(default = "default_margin_cooldown_secs")]
+    pub margin_cooldown_secs: u64,       // default: 5
     // Post-Only: use ALO (Add Liquidity Only) to guarantee maker fees
     #[serde(default)]
     pub use_post_only: bool,             // default: false (GTC), true = Post-Only
@@ -173,6 +178,7 @@ impl Default for InventoryNeutralMMConfig {
             order_ttl_secs: 5,
             max_leverage: 10.0,
             min_available_balance: 2.0,
+            margin_cooldown_secs: 5,
             use_post_only: false,
             poll_interval_ms: 100,
         }

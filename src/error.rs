@@ -48,6 +48,9 @@ pub enum TradingError {
 
     #[error("API error (status {status}): {message}")]
     ApiError { status: u16, message: String },
+
+    #[error("Insufficient margin to place order")]
+    InsufficientMargin,
 }
 
 pub type Result<T> = std::result::Result<T, TradingError>;

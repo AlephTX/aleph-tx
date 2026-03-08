@@ -145,7 +145,7 @@ impl ShadowLedger {
     }
     /// Apply an event to the shadow ledger with proper validation and reconciliation
     pub fn apply_event(&mut self, event: &ShmPrivateEvent) -> Result<()> {
-        tracing::info!(
+        tracing::debug!(
             "📨 Event received: seq={} type={} order_id={} fill_price={:.2} fill_size={:.4}",
             event.sequence, event.event_type, event.order_id,
             event.fill_price, event.fill_size
@@ -212,7 +212,7 @@ impl ShadowLedger {
                             tracked: false,
                         },
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         "Auto-registered order: id={} side={} size={:.4}",
                         event.order_id,
                         side,
@@ -262,7 +262,7 @@ impl ShadowLedger {
 
                     let total_exp = self.total_exposure();
 
-                    tracing::info!(
+                    tracing::debug!(
                         "Fill reconciled: order={} side={} size={:.4} price={:.2} real_pos={:.4} in_flight={:.4} total={:.4}",
                         event.order_id,
                         order_side,

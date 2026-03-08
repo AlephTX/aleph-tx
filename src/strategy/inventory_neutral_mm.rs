@@ -14,7 +14,7 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
-use crate::error::Result;
+use crate::error::{Result, TradingError};
 use crate::exchange::{BatchOrderParams, Exchange};
 use crate::shadow_ledger::ShadowLedger;
 use crate::shm_reader::ShmReader;
@@ -320,7 +320,8 @@ impl InventoryNeutralMM {
             // Inventory skew: shift both prices to encourage position flattening
             // Long → lower prices (eager to sell, reluctant to buy)
             // Short → higher prices (eager to buy, reluctant to sell)
-            let inv_ratio = (position / self.config.max_position).clamp(-1.0, 1.0);
+            // Use sigmoid for smooth non-linear response
+            let inv_ratio = self.sigmoid_inventory_ratio(position);
             let skew_dollars = mid * inv_ratio * self.config.inventory_skew_bps / 10000.0;
 
             let our_bid = ((raw_bid - skew_dollars) / self.config.tick_size).floor() * self.config.tick_size;
@@ -432,10 +433,10 @@ impl InventoryNeutralMM {
                     Err(e) => {
                         warn!("Batch failed: {}", e);
                         // Handle margin errors by canceling active orders
-                        if e.to_string().contains("not enough margin") {
-                            warn!("Margin insufficient, canceling active orders (cooldown 5s)");
+                        if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
+                            warn!("Margin insufficient, canceling active orders (cooldown {}s)", self.config.margin_cooldown_secs);
                             self.cancel_all_orders().await;
-                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(5);
+                            self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
                         }
                     }
                 }
@@ -491,6 +492,14 @@ impl InventoryNeutralMM {
 
             tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
+    }
+
+    /// Sigmoid inventory skew: smooth non-linear response to inventory deviation
+    /// Returns a value in [-1, 1] with steeper response near max_position
+    fn sigmoid_inventory_ratio(&self, position: f64) -> f64 {
+        let normalized = position / self.config.max_position;
+        // tanh provides smooth S-curve: gentle near 0, aggressive near ±1
+        normalized.clamp(-1.0, 1.0).tanh()
     }
 
     /// Calculate asymmetric order sizes to neutralize inventory
