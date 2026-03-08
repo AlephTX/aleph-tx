@@ -165,6 +165,20 @@ When implementing a feature, YOU MUST autonomously test it:
 5. **Single-Level Quoting**: One bid + one ask at BBO. Fully exposed to adverse selection, misses flash wick profits from liquidation cascades.
    - **Target**: Grid Laddering (3-5 levels per side). Level 1 tight/small, Level 2 +5bps/2x, Level 3 +15bps/4x. Captures wick bottoms during cascade events.
 
+### Go Feeder Anti-Patterns (Network I/O Track)
+
+6. **Naive Reconnect Logic** (`feeder/exchanges/base.go`): Hardcoded `3 * time.Second` sleep on disconnect. In volatile markets with 5,000 updates/sec, tight loop reconnects can trigger exchange IP bans.
+   - **Target**: Exponential backoff with jitter (1s → 2s → 4s → 8s, max 60s). Add circuit breaker after N consecutive failures. Report connection state to Rust via SHM telemetry.
+
+7. **JSON Reflection on Hot Path** (`feeder/exchanges/lighter_private.go`): `encoding/json` uses runtime reflection, allocating strings/slices on heap. At 5,000 msg/sec, creates GC pressure → 1-5ms Stop-The-World pauses.
+   - **Target**: Replace with `easyjson` or `ffjson` (code-gen, zero reflection). For extreme perf, use `fastjson` with zero-copy byte slicing to extract only `price`/`size` fields without heap allocation.
+
+8. **String-Based Error Matching** (`src/strategy/inventory_neutral_mm.rs`): `e.to_string().contains("not enough margin")` is fragile and slow. Exchange API error codes should be strongly typed.
+   - **Target**: Deserialize error responses into typed `ErrorCode` enum. Match on enum variants, not string search.
+
+9. **Telemetry Blackhole**: Strategy sets 5s margin cooldown silently. No metrics exported. Operator must tail logs to detect silent failures (e.g., 40% of day spent in cooldown).
+   - **Target**: Introduce `TelemetrySender` module. Push vital metrics (spread size, AS score, rejection counts, API latency histograms, cooldown events) via async UDP to Prometheus/Datadog.
+
 ## Three-Layer Context Hierarchy
 
 ```

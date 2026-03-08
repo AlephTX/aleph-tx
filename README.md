@@ -220,7 +220,9 @@ EDGEX_ACCOUNT_ID=<id>
 | Priority | Item | Description | Complexity |
 |----------|------|-------------|------------|
 | P0 | **Data/Control Plane Split** | Move SHM polling to dedicated `std::thread` + CPU pinning; Tokio only for I/O. Connect via lock-free queue | High |
+| P0 | **Zero-Alloc JSON Parsing** | Replace Go `encoding/json` with `easyjson`/`ffjson` on feeder hot path. Eliminate GC Stop-The-World pauses (1-5ms) | Medium |
 | P1 | **RwLock → Atomics** | Replace `Arc<RwLock<ShadowLedger>>` with cache-aligned `AtomicI64` on hot path | Low |
+| P1 | **Typed Error Codes** | Replace `contains("not enough margin")` string matching with typed `ErrorCode` enum | Low |
 | P1 | **WebSocket Execution** | Replace REST with WS for lower latency order placement | Medium |
 | P2 | **Multi-Asset Support** | BTC-PERP, SOL-PERP, and other perpetual markets | Medium |
 
@@ -228,8 +230,9 @@ EDGEX_ACCOUNT_ID=<id>
 
 | Priority | Item | Description | Complexity |
 |----------|------|-------------|------------|
+| P0 | **Telemetry / Observability** | Async UDP metrics export (spread, rejection count, API latency, cooldown events) → Prometheus/Grafana | Medium |
+| P1 | **Robust Reconnect** | Replace hardcoded 3s reconnect with exponential backoff + jitter + circuit breaker | Low |
 | P1 | **Risk Management** | Circuit breaker, max drawdown limit, kill switch | Medium |
-| P1 | **Observability** | Prometheus metrics, Grafana dashboard, alerting | Medium |
 | P2 | **Backtesting Framework** | Historical data replay with strategy simulation | High |
 | P2 | **gRPC Control Plane** | Remote strategy management (proto/ definitions ready) | Medium |
 
