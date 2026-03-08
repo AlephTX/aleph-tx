@@ -144,6 +144,27 @@ When implementing a feature, YOU MUST autonomously test it:
 - **C-ABI Alignment**: `ShmPrivateEvent` MUST be EXACTLY 64 bytes. Verify with `static_assertions::assert_eq_size!`.
 - **Incremental Quoting Math**: Protect against divide-by-zero (e.g., if `last_price == 0.0` during incremental quoting calculations, return `true` to force initial quote).
 
+## Known Anti-Patterns & Evolution Targets
+
+### Latency Anti-Patterns (Systems Track)
+
+1. **Async Spin-Loop in Tokio** (`src/main.rs`): SHM polling runs as busy-wait inside `tokio::runtime`, monopolizing worker threads and potentially starving HTTP execution tasks.
+   - **Target**: Decouple data plane (dedicated `std::thread` + CPU pinning) from control plane (Tokio I/O pool), connected via lock-free queue (`crossbeam` / `flume` spin-mode).
+
+2. **RwLock on Hot Path** (`src/shadow_ledger.rs`): `Arc<RwLock<ShadowLedger>>` causes cache-coherency ping-pong (~20-50ns, spikes to μs under contention).
+   - **Target**: Replace `in_flight_pos` with cache-aligned `AtomicI64` (scaled 1e8). Strategy thread owns ledger exclusively; I/O threads send fill events via atomic ring buffer.
+
+### Alpha Anti-Patterns (Quant Track)
+
+3. **Linear Inventory Skew**: Hardcoded `urgency = 2.0` + linear position ratio. Suboptimal at both low inventory (spread too wide, losing volume) and high inventory (not aggressive enough to mean-revert).
+   - **Target**: Sigmoid/Logit skew function — tight spread at low inventory, exponential widening at high, asymptotic near risk limit.
+
+4. **Naive Mid-Price** (`(bid + ask) / 2`): Ignores order book imbalance. With 1 ETH at bid and 100 ETH at ask, true fair value is heavily skewed toward bid.
+   - **Target**: Imbalance-Weighted Micro-Price using L2-L5 depth. Requires extending SHM BBO matrix to carry depth snapshots from feeder.
+
+5. **Single-Level Quoting**: One bid + one ask at BBO. Fully exposed to adverse selection, misses flash wick profits from liquidation cascades.
+   - **Target**: Grid Laddering (3-5 levels per side). Level 1 tight/small, Level 2 +5bps/2x, Level 3 +15bps/4x. Captures wick bottoms during cascade events.
+
 ## Three-Layer Context Hierarchy
 
 ```
