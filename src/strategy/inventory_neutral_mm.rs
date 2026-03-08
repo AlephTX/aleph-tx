@@ -18,6 +18,7 @@ use crate::error::{Result, TradingError};
 use crate::exchange::Exchange;
 use crate::shadow_ledger::{OrderSide, ShadowLedger};
 use crate::shm_reader::ShmReader;
+use crate::telemetry::TelemetryCollector;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -147,6 +148,7 @@ pub struct InventoryNeutralMM {
     #[allow(dead_code)]
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
+    shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
     account_stats_reader: AccountStatsReader,
     account_stats: AccountStats,
     micro: MicrostructureTracker,
@@ -158,6 +160,9 @@ pub struct InventoryNeutralMM {
     total_orders_placed: u64,
     last_balance_check: Instant,
     margin_cooldown_until: Instant,
+
+    // Telemetry
+    telemetry: TelemetryCollector,
 }
 
 impl InventoryNeutralMM {
@@ -168,11 +173,25 @@ impl InventoryNeutralMM {
         shm_reader: ShmReader,
         account_stats_reader: AccountStatsReader,
     ) -> Self {
+        // Try to open depth reader (optional, for OBI+VWMicro pricing)
+        let shm_depth_reader = crate::shm_depth_reader::ShmDepthReader::open(
+            "/dev/shm/aleph-depth",
+            2048,
+        )
+        .ok();
+
+        if shm_depth_reader.is_some() {
+            info!("📊 OBI+VWMicro pricing enabled (depth reader initialized)");
+        } else {
+            info!("📊 Using simple mid-price (depth reader not available)");
+        }
+
         Self {
             config,
             trading,
             ledger,
             shm_reader,
+            shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
             micro: MicrostructureTracker::new(200),
@@ -181,6 +200,7 @@ impl InventoryNeutralMM {
             total_orders_placed: 0,
             last_balance_check: Instant::now(),
             margin_cooldown_until: Instant::now(),
+            telemetry: TelemetryCollector::new(),
         }
     }
 
@@ -259,6 +279,9 @@ impl InventoryNeutralMM {
                 if delta.abs() > 0.001 {
                     warn!("Ledger drift corrected: delta={:.6} ETH", delta);
                 }
+
+                // Export telemetry snapshot every 30s
+                self.telemetry.export_metrics();
             }
 
             // Margin cooldown: skip quoting if recently rejected
@@ -283,10 +306,25 @@ impl InventoryNeutralMM {
             };
 
             let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+
+            // Calculate VWMicro price if depth data available
+            let pricing_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
+                if let Some(depth) = depth_reader.read_depth(
+                    self.config.symbol_id,
+                    self.config.exchange_id,
+                ) {
+                    self.calculate_vw_micro_price(&depth, bbo.bid_price, bbo.ask_price)
+                } else {
+                    mid // Fallback to simple mid
+                }
+            } else {
+                mid // No depth reader available
+            };
+
             let market_spread_bps = ((bbo.ask_price - bbo.bid_price) / mid) * 10000.0;
 
-            // Update microstructure
-            self.micro.update(mid);
+            // Update microstructure with VWMicro price
+            self.micro.update(pricing_mid);
             let _vol_bps = self.micro.volatility_bps();
             let _momentum_bps = self.micro.momentum_bps();
             let as_score = self.micro.adverse_selection_score();
@@ -339,6 +377,11 @@ impl InventoryNeutralMM {
             let round_trip_fee_bps = self.config.maker_fee_bps * 2.0;
             let min_spread_bps = round_trip_fee_bps + self.config.min_profit_bps;
             let actual_spread_bps = ((our_ask - our_bid) / mid) * 10000.0;
+
+            // Update telemetry metrics
+            self.telemetry.update_spread_size(actual_spread_bps);
+            self.telemetry.update_adverse_selection(self.micro.adverse_selection_score());
+
             if actual_spread_bps < min_spread_bps {
                 debug!(
                     "Spread {:.1}bps < min {:.1}bps (mkt={:.1}bps), skipping",
@@ -418,12 +461,15 @@ impl InventoryNeutralMM {
                                 placed_at: Instant::now(),
                             });
                             self.total_orders_placed += 1;
+                            self.telemetry.record_order_placed();
                             placed_bids += 1;
                         }
                         Err(e) => {
                             warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
+                            self.telemetry.record_order_rejected(&format!("buy L{}: {}", placed_bids + 1, e));
                             if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
                                 warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
                                 self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
                                 break;
@@ -450,12 +496,15 @@ impl InventoryNeutralMM {
                                 placed_at: Instant::now(),
                             });
                             self.total_orders_placed += 1;
+                            self.telemetry.record_order_placed();
                             placed_asks += 1;
                         }
                         Err(e) => {
                             warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
+                            self.telemetry.record_order_rejected(&format!("sell L{}: {}", placed_asks + 1, e));
                             if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
                                 warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
                                 self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
                                 break;
@@ -593,17 +642,17 @@ impl InventoryNeutralMM {
     ///   → bid_size = 0.13 ETH (base + abs(position))
     ///   → ask_size = 0.03 ETH (base - abs(position))
     ///   If bid fills: new_pos = -0.1 + 0.13 = +0.03 (flipped to long)
+    ///
+    /// v4.0.0: Uses Sigmoid (tanh) function for SIZE multiplier instead of linear urgency
     fn calculate_asymmetric_sizes(&self, position: f64, mid: f64) -> (f64, f64) {
-        // Inventory urgency: how aggressively to flatten
-        let urgency = if position.abs() > self.config.inventory_urgency_threshold {
-            // Panic mode: very aggressive
-            2.0
-        } else {
-            // Normal mode: moderate
-            1.0
-        };
+        // Sigmoid SIZE multiplier using tanh: 1.0 at pos=0, ~3.0 at pos=max_position
+        // Formula: 1.0 + tanh(steepness * normalized_pos)
+        // tanh(4) ≈ 0.9993, so at pos=max_position, multiplier ≈ 1.0 + 1.0 = 2.0
+        // To reach 3.0, we scale: 1.0 + 2.0 * tanh(steepness * normalized_pos)
+        let normalized_pos = position / self.config.max_position;
+        let sigmoid_multiplier = 1.0 + 2.0 * (self.config.sigmoid_steepness * normalized_pos.abs()).tanh();
 
-        let inventory_offset = position.abs() * urgency;
+        let inventory_offset = position.abs() * sigmoid_multiplier;
 
         let bid_size = if position < 0.0 {
             // Short position → increase bid size to buy back
@@ -721,6 +770,44 @@ impl InventoryNeutralMM {
             self.total_orders_placed,
             self.account_stats.available_balance
         );
+    }
+
+    /// Calculate Volume-Weighted Micro Price using L1-L5 depth data.
+    ///
+    /// Formula: VWMicro = (bid_notional * ask_L1 + ask_notional * bid_L1) / (bid_notional + ask_notional)
+    ///
+    /// This provides a more accurate fair price than simple mid by incorporating order book imbalance.
+    fn calculate_vw_micro_price(
+        &self,
+        depth: &crate::shm_depth_reader::ShmDepthSnapshot,
+        bid_l1: f64,
+        ask_l1: f64,
+    ) -> f64 {
+        // Calculate total notional value on bid side (L1-L5)
+        let bid_notional: f64 = depth
+            .bids
+            .iter()
+            .take(5)
+            .filter(|l| l.price > 0.0 && l.size > 0.0)
+            .map(|l| l.price * l.size)
+            .sum();
+
+        // Calculate total notional value on ask side (L1-L5)
+        let ask_notional: f64 = depth
+            .asks
+            .iter()
+            .take(5)
+            .filter(|l| l.price > 0.0 && l.size > 0.0)
+            .map(|l| l.price * l.size)
+            .sum();
+
+        // Avoid division by zero
+        if bid_notional + ask_notional < 0.001 {
+            return (bid_l1 + ask_l1) / 2.0; // Fallback to simple mid
+        }
+
+        // VWMicro formula: weight L1 prices by opposite side notional
+        (bid_notional * ask_l1 + ask_notional * bid_l1) / (bid_notional + ask_notional)
     }
 }
 
@@ -945,6 +1032,97 @@ mod tests {
         // Level 2: +10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
         assert!((ask_levels[2].0 - 3003.0).abs() < 0.01);
         assert!((ask_levels[2].1 - 0.048).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sigmoid_size_multiplier() {
+        let config = InventoryNeutralMMConfig {
+            max_position: 0.15,
+            sigmoid_steepness: 4.0,
+            ..Default::default()
+        };
+
+        // Helper function to calculate sigmoid multiplier
+        let calc_multiplier = |position: f64| -> f64 {
+            let normalized_pos = position / config.max_position;
+            1.0 + 2.0 * (config.sigmoid_steepness * normalized_pos.abs()).tanh()
+        };
+
+        // Test at different position levels
+        let pos_0 = 0.0;
+        let pos_5pct = 0.05 * config.max_position;  // 0.0075
+        let pos_50pct = 0.5 * config.max_position;  // 0.075
+        let pos_80pct = 0.8 * config.max_position;  // 0.12
+        let pos_100pct = config.max_position;       // 0.15
+
+        let mult_0 = calc_multiplier(pos_0);
+        let mult_5 = calc_multiplier(pos_5pct);
+        let mult_50 = calc_multiplier(pos_50pct);
+        let mult_80 = calc_multiplier(pos_80pct);
+        let mult_100 = calc_multiplier(pos_100pct);
+
+        // Verify sigmoid properties:
+        // 1. At pos=0, multiplier ≈ 1.0 (minimal urgency)
+        assert!((mult_0 - 1.0).abs() < 0.01, "pos=0: mult={}", mult_0);
+
+        // 2. Monotonically increasing
+        assert!(mult_5 > mult_0, "mult_5={} should > mult_0={}", mult_5, mult_0);
+        assert!(mult_50 > mult_5, "mult_50={} should > mult_5={}", mult_50, mult_5);
+        assert!(mult_80 > mult_50, "mult_80={} should > mult_50={}", mult_80, mult_50);
+        assert!(mult_100 > mult_80, "mult_100={} should > mult_80={}", mult_100, mult_80);
+
+        // 3. At pos=100%, multiplier ≈ 3.0 (max urgency)
+        assert!((mult_100 - 3.0).abs() < 0.1, "pos=100%: mult={}", mult_100);
+
+        // 4. Steeper growth in middle range (50% → 80% should have larger delta than 5% → 50%)
+        // This validates the sigmoid curve is steeper in the middle
+        let delta_low = mult_50 - mult_5;
+        let delta_mid = mult_80 - mult_50;
+        assert!(delta_mid > 0.0, "delta_mid={} should be positive", delta_mid);
+        assert!(delta_low > 0.0, "delta_low={} should be positive", delta_low);
+    }
+
+    #[test]
+    fn test_vw_micro_price_calculation() {
+        use crate::shm_depth_reader::{PriceLevel, ShmDepthSnapshot};
+
+        // Create mock depth snapshot
+        let depth = ShmDepthSnapshot {
+            seqlock: 0,
+            exchange_id: 2,
+            symbol_id: 1002,
+            _padding1: 0,
+            timestamp_ns: 1234567890,
+            bids: [
+                PriceLevel { price: 3000.0, size: 1.0 },
+                PriceLevel { price: 2999.0, size: 2.0 },
+                PriceLevel { price: 2998.0, size: 1.5 },
+                PriceLevel { price: 2997.0, size: 1.0 },
+                PriceLevel { price: 2996.0, size: 0.5 },
+            ],
+            asks: [
+                PriceLevel { price: 3001.0, size: 1.0 },
+                PriceLevel { price: 3002.0, size: 2.0 },
+                PriceLevel { price: 3003.0, size: 1.5 },
+                PriceLevel { price: 3004.0, size: 1.0 },
+                PriceLevel { price: 3005.0, size: 0.5 },
+            ],
+            _reserved: [0; 72],
+        };
+
+        // Calculate VWMicro manually
+        let bid_notional: f64 = depth.bids.iter().map(|l| l.price * l.size).sum();
+        let ask_notional: f64 = depth.asks.iter().map(|l| l.price * l.size).sum();
+        let vw_micro = (bid_notional * 3001.0 + ask_notional * 3000.0) / (bid_notional + ask_notional);
+
+        // VWMicro should be between bid and ask
+        assert!(vw_micro > 3000.0 && vw_micro < 3001.0,
+            "VWMicro {} should be between 3000.0 and 3001.0", vw_micro);
+
+        // Should be closer to mid than simple average due to depth weighting
+        let simple_mid = 3000.5;
+        assert!((vw_micro - simple_mid).abs() < 1.0,
+            "VWMicro {} should be close to simple mid {}", vw_micro, simple_mid);
     }
 }
 

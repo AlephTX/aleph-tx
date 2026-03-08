@@ -131,6 +131,9 @@ fn default_grid_spacing_bps() -> f64 {
 fn default_grid_size_decay() -> f64 {
     0.7
 }
+fn default_sigmoid_steepness() -> f64 {
+    4.0
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +161,9 @@ pub struct InventoryNeutralMMConfig {
     pub base_order_size: f64,     // default: 0.05
     pub max_position: f64,        // default: 0.15
     pub inventory_urgency_threshold: f64, // default: 0.08
+    // Sigmoid SIZE偏移 (v4.0.0)
+    #[serde(default = "default_sigmoid_steepness")]
+    pub sigmoid_steepness: f64,   // default: 4.0 (控制sigmoid曲线陡峭度)
     // 风控
     pub adverse_selection_threshold: f64, // default: 2.0
     pub requote_threshold_bps: f64,      // default: 1.5
@@ -189,6 +195,7 @@ impl Default for InventoryNeutralMMConfig {
             grid_levels: 3,
             grid_spacing_bps: 2.0,
             grid_size_decay: 0.7,
+            sigmoid_steepness: 4.0,
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,

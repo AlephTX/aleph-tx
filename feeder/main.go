@@ -58,6 +58,14 @@ func main() {
 	defer accountStats.Close()
 	log.Printf("📡 Account stats: /dev/shm/aleph-account-stats (~128 bytes)")
 
+	// Create depth writer for OBI+VWMicro pricing (~3 MB)
+	depthWriter, err := shm.NewDepthWriter("/dev/shm/aleph-depth", 2048)
+	if err != nil {
+		log.Fatalf("depth writer: %v", err)
+	}
+	defer depthWriter.Close()
+	log.Printf("📡 Depth writer: /dev/shm/aleph-depth (~3 MB)")
+
 	var wg sync.WaitGroup
 
 	// Convert unified config to exchange map for backward compatibility
@@ -91,7 +99,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lt := exchanges.NewLighter(ltCfg, matrix, eventBuffer)
+			lt := exchanges.NewLighter(ltCfg, matrix, eventBuffer, depthWriter)
 			log.Println("🔌 Lighter (public): starting...")
 			if err := lt.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("Lighter (public): %v", err)

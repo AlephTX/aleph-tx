@@ -1,7 +1,7 @@
 use tracing_subscriber::{EnvFilter, fmt};
 
 use aleph_tx::config::AppConfig;
-use aleph_tx::shm_reader::ShmReader;
+use aleph_tx::data_plane;
 use aleph_tx::strategy::{
     Strategy, arbitrage::ArbitrageEngine, backpack_mm::BackpackMMStrategy,
     market_maker::MarketMakerStrategy,
@@ -34,21 +34,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
 
-    // 4. Open shared memory matrix
-    let shm_path = "/dev/shm/aleph-matrix";
-    let mut reader = match ShmReader::open(shm_path, 2048) {
-        Ok(r) => {
-            tracing::info!("📡 Opened {} (scanning 2048 symbols)", shm_path);
-            r
-        }
-        Err(e) => {
-            tracing::error!("Failed to open shared memory: {}", e);
-            tracing::error!("Make sure the Go feeder is running first.");
-            std::process::exit(1);
-        }
-    };
-
-    // 5. Initialize strategies with config
+    // 4. Initialize strategies with config
     // Symbol 1002 = ETH, Symbol 1001 = BTC (global IDs from Go feeder)
     // Exchange 3 = EdgeX, Exchange 5 = Backpack
     let mut strategies: Vec<Box<dyn Strategy>> = vec![
@@ -72,10 +58,15 @@ fn main() -> anyhow::Result<()> {
         strategies.len()
     );
 
+    // 5. Spawn dedicated data plane thread (decoupled from Tokio)
+    let bbo_rx = data_plane::spawn_data_plane_thread(
+        "/dev/shm/aleph-matrix",
+        2048,
+        Some(2), // Pin to CPU core 2
+    );
+
     // 6. Main loop with graceful shutdown
     rt.block_on(async {
-        let mut loop_count: u64 = 0;
-
         // Shutdown flag set by signal handler
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -90,26 +81,20 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            match reader.try_poll() {
-                Some(symbol_id) => {
-                    let exchanges = reader.read_all_exchanges(symbol_id);
-                    for (exch_idx, bbo) in exchanges.iter() {
-                        if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
-                            for strategy in strategies.iter_mut() {
-                                strategy.on_bbo_update(symbol_id, *exch_idx, bbo);
-                            }
+            // Async select: receive BBO updates from data plane or idle timeout
+            tokio::select! {
+                Ok(update) = bbo_rx.recv_async() => {
+                    // Process BBO update from data plane thread
+                    if update.bbo.bid_price > 0.0 && update.bbo.ask_price > 0.0 {
+                        for strategy in strategies.iter_mut() {
+                            strategy.on_bbo_update(update.symbol_id, update.exchange_id, &update.bbo);
                         }
                     }
                 }
-                None => {
-                    loop_count += 1;
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1)) => {
+                    // Idle timeout - call on_idle() for all strategies
                     for strategy in strategies.iter_mut() {
                         strategy.on_idle();
-                    }
-                    if loop_count.is_multiple_of(1_000) {
-                        tokio::task::yield_now().await;
-                    } else {
-                        std::hint::spin_loop();
                     }
                 }
             }

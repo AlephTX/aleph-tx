@@ -11,6 +11,7 @@
 
 use crate::error::TradingError;
 use crate::shadow_ledger::ShadowLedger;
+use super::error::LighterErrorResponse;
 use parking_lot::RwLock;
 
 use anyhow::Result;
@@ -458,10 +459,30 @@ impl LighterTrading {
         }
 
         if !status.is_success() {
-            // Check for specific error patterns
-            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21711") {
+            // Try to parse as structured error response
+            if let Ok(error_resp) = serde_json::from_str::<LighterErrorResponse>(&body) {
+                let error_code = error_resp.error_code();
+
+                // Handle specific error codes
+                if error_code.requires_nonce_reset() {
+                    let _ = self.reset_nonce().await;
+                    anyhow::bail!("Lighter error {}: {} (nonce reset)", error_resp.code,
+                        error_resp.message.as_deref().unwrap_or("unknown"));
+                }
+
+                if error_code.is_margin_error() {
+                    return Err(TradingError::InsufficientMargin.into());
+                }
+
+                anyhow::bail!("Lighter error {}: {}", error_resp.code,
+                    error_resp.message.as_deref().unwrap_or("unknown"));
+            }
+
+            // Fallback: check for margin error in body text
+            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21301") {
                 return Err(TradingError::InsufficientMargin.into());
             }
+
             anyhow::bail!("sendTx HTTP {}: {}", status, body);
         }
 

@@ -34,6 +34,9 @@ toml = "0.8"
 urlencoding = "2.1"
 uuid = { version = "1.11", features = ["v4"] }
 dotenv = "0.15"
+flume = "0.11"
+core_affinity = "0.8"
+crossbeam = "0.8"
 
 [lib]
 name = "aleph_tx"
