@@ -502,6 +502,51 @@ impl InventoryNeutralMM {
         normalized.clamp(-1.0, 1.0).tanh()
     }
 
+    /// Calculate grid levels for multi-tier quoting
+    /// Returns Vec<(price, size)> for bid and ask sides
+    ///
+    /// Example with 3 levels, base_size=0.05, decay=0.7:
+    ///   Level 1: 100% size (0.050)
+    ///   Level 2:  70% size (0.035)
+    ///   Level 3:  49% size (0.025)
+    fn calculate_grid_levels(
+        &self,
+        base_price: f64,
+        base_size: f64,
+        is_bid: bool,
+    ) -> Vec<(f64, f64)> {
+        let mut levels = Vec::with_capacity(self.config.grid_levels as usize);
+
+        for i in 0..self.config.grid_levels {
+            // Calculate price offset for this level
+            let spacing_dollars = base_price * self.config.grid_spacing_bps * (i as f64) / 10000.0;
+            let price = if is_bid {
+                base_price - spacing_dollars
+            } else {
+                base_price + spacing_dollars
+            };
+
+            // Round to tick size
+            let rounded_price = (price / self.config.tick_size).floor() * self.config.tick_size;
+
+            // Calculate size with exponential decay
+            let size_multiplier = self.config.grid_size_decay.powi(i as i32);
+            let size = base_size * size_multiplier;
+
+            // Round to step size
+            let rounded_size = (size / self.config.step_size).floor() * self.config.step_size;
+
+            // Skip if size too small
+            if rounded_size < 0.001 {
+                break;
+            }
+
+            levels.push((rounded_price, rounded_size));
+        }
+
+        levels
+    }
+
     /// Calculate asymmetric order sizes to neutralize inventory
     ///
     /// Key principle: If short, bid size > ask size (eager to buy back)
@@ -652,3 +697,72 @@ impl InventoryNeutralMM {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_grid_level_calculation() {
+        let config = InventoryNeutralMMConfig {
+            tick_size: 0.01,
+            step_size: 0.0001,
+            grid_levels: 3,
+            grid_spacing_bps: 2.0,
+            grid_size_decay: 0.7,
+            ..Default::default()
+        };
+
+        // Test bid levels (prices should decrease)
+        let base_price = 2000.0;
+        let base_size = 0.1;
+
+        let mut bid_levels = Vec::new();
+        for i in 0..config.grid_levels {
+            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
+            let price = base_price - spacing_dollars;
+            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
+
+            let size_multiplier = config.grid_size_decay.powi(i as i32);
+            let size = base_size * size_multiplier;
+            let rounded_size = (size / config.step_size).floor() * config.step_size;
+
+            if rounded_size >= 0.001 {
+                bid_levels.push((rounded_price, rounded_size));
+            }
+        }
+
+        // Verify 3 levels generated
+        assert_eq!(bid_levels.len(), 3);
+
+        // Verify prices descend
+        assert!(bid_levels[0].0 >= bid_levels[1].0);
+        assert!(bid_levels[1].0 >= bid_levels[2].0);
+
+        // Verify size decay (0.7^0, 0.7^1, 0.7^2)
+        assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
+        assert!((bid_levels[1].1 - 0.07).abs() < 0.001);
+        assert!((bid_levels[2].1 - 0.049).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sigmoid_inventory_ratio() {
+        let config = InventoryNeutralMMConfig {
+            max_position: 0.15,
+            ..Default::default()
+        };
+
+        // Test at zero inventory
+        let ratio_zero = (0.0 / config.max_position).clamp(-1.0, 1.0).tanh();
+        assert!((ratio_zero - 0.0).abs() < 0.01);
+
+        // Test at 50% inventory
+        let ratio_half = (0.075 / config.max_position).clamp(-1.0, 1.0).tanh();
+        assert!(ratio_half > 0.0 && ratio_half < 0.5);
+
+        // Test at max inventory
+        let ratio_max = (0.15 / config.max_position).clamp(-1.0, 1.0).tanh();
+        assert!(ratio_max > 0.7); // tanh(1.0) ≈ 0.76
+    }
+}
+
