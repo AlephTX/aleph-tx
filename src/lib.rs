@@ -1,12 +1,15 @@
 pub mod account_stats_reader;
 pub mod config;
+pub mod data_plane;
 pub mod error;
 pub mod exchange;
 pub mod exchanges;
 pub mod shadow_ledger;
+pub mod shm_depth_reader;
 pub mod shm_event_reader;
 pub mod shm_reader;
 pub mod strategy;
+pub mod telemetry;
 pub mod types;
 
 // Re-export for backward compatibility (callers can migrate incrementally)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
 )
 
@@ -148,50 +149,46 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 
 		// Handle ping/pong automatically
 		if msgType == websocket.MessageBinary || msgType == websocket.MessageText {
-			var env lighterAccountMarket
-			if json.Unmarshal(data, &env) != nil {
-				// Not a valid JSON message, skip
-				continue
+			// Zero-copy JSON parsing with gjson
+			result := gjson.ParseBytes(data)
+
+			// Process position data
+			positionData := result.Get("position")
+			if positionData.Exists() && positionData.String() != "null" {
+				log.Printf("lighter-private: position data: %s", positionData.Raw)
+				lp.processPositionFast(positionData)
 			}
 
-			// Log position data if present
-			if len(env.Position) > 0 && string(env.Position) != "null" {
-				log.Printf("lighter-private: position data: %s", string(env.Position))
-				lp.processPosition(env.Position)
+			// Process orders array
+			ordersArray := result.Get("orders")
+			if ordersArray.Exists() && ordersArray.IsArray() {
+				log.Printf("lighter-private: received %d order event(s)", len(ordersArray.Array()))
+				ordersArray.ForEach(func(key, value gjson.Result) bool {
+					lp.processOrderFast(value)
+					return true // continue iteration
+				})
 			}
 
-			// Process orders
-			if len(env.Orders) > 0 {
-				log.Printf("lighter-private: received %d order event(s)", len(env.Orders))
-			}
-			for _, order := range env.Orders {
-				lp.processOrder(&order)
-			}
-
-			// Process trades
-			if len(env.Trades) > 0 {
-				log.Printf("lighter-private: received %d trade event(s)", len(env.Trades))
-			}
-			for _, trade := range env.Trades {
-				lp.processTrade(&trade)
+			// Process trades array
+			tradesArray := result.Get("trades")
+			if tradesArray.Exists() && tradesArray.IsArray() {
+				log.Printf("lighter-private: received %d trade event(s)", len(tradesArray.Array()))
+				tradesArray.ForEach(func(key, value gjson.Result) bool {
+					lp.processTradeFast(value)
+					return true // continue iteration
+				})
 			}
 		}
 		// websocket library handles ping/pong automatically
 	}
 }
 
-func (lp *LighterPrivate) processPosition(positionData json.RawMessage) {
-	var pos struct {
-		Sign     int    `json:"sign"`     // 1=long, -1=short
-		Position string `json:"position"` // Position size
-	}
-	if err := json.Unmarshal(positionData, &pos); err != nil {
-		log.Printf("lighter-private: failed to parse position: %v", err)
-		return
-	}
+func (lp *LighterPrivate) processPositionFast(positionData gjson.Result) {
+	sign := positionData.Get("sign").Int()
+	positionStr := positionData.Get("position").String()
 
-	posSize, _ := strconv.ParseFloat(pos.Position, 64)
-	netPosition := float64(pos.Sign) * posSize
+	posSize, _ := strconv.ParseFloat(positionStr, 64)
+	netPosition := float64(sign) * posSize
 
 	log.Printf("lighter-private: position updated: %.4f ETH", netPosition)
 
@@ -207,21 +204,25 @@ func (lp *LighterPrivate) processPosition(positionData json.RawMessage) {
 	}
 }
 
-func (lp *LighterPrivate) processOrder(order *lighterOrder) {
-	symID, ok := lp.mktMap[order.MarketIndex]
+func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
+	marketIndex := int(order.Get("market_index").Int())
+	symID, ok := lp.mktMap[marketIndex]
 	if !ok {
 		return
 	}
 
-	orderID := uint64(order.OrderIndex)
-	log.Printf("lighter-private: order event: id=%d status=%s market=%d", orderID, order.Status, order.MarketIndex)
+	orderID := uint64(order.Get("order_index").Int())
+	status := order.Get("status").String()
 
-	switch order.Status {
+	log.Printf("lighter-private: order event: id=%d status=%s market=%d", orderID, status, marketIndex)
+
+	switch status {
 	case "open":
 		// Order created — track remaining size
-		initialSize, _ := strconv.ParseFloat(order.InitialBaseAmount, 64)
+		initialSize := order.Get("initial_base_amount").Float()
+		isAsk := order.Get("is_ask").Bool()
 		lp.orderSizes[orderID] = initialSize
-		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize, order.IsAsk)
+		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize, isAsk)
 
 	case "canceled":
 		// Order canceled — clean up tracking
@@ -234,34 +235,38 @@ func (lp *LighterPrivate) processOrder(order *lighterOrder) {
 	}
 }
 
-func (lp *LighterPrivate) processTrade(trade *lighterTrade) {
-	symID, ok := lp.mktMap[trade.MarketID]
+func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
+	marketID := int(trade.Get("market_id").Int())
+	symID, ok := lp.mktMap[marketID]
 	if !ok {
 		return
 	}
 
+	tradeID := trade.Get("trade_id").Int()
+	price := trade.Get("price").String()
+	size := trade.Get("size").String()
+	isMakerAsk := trade.Get("is_maker_ask").Bool()
+
 	log.Printf("lighter-private: trade event: id=%d market=%d price=%s size=%s maker_ask=%v",
-		trade.TradeID, trade.MarketID, trade.Price, trade.Size, trade.IsMakerAsk)
+		tradeID, marketID, price, size, isMakerAsk)
 
 	// Determine which order ID belongs to this account
-	// TODO: Need to track which orders are ours
-	// For now, we'll process both ask and bid
 	var orderID uint64
-	if trade.IsMakerAsk {
-		orderID = uint64(trade.AskID)
+	if isMakerAsk {
+		orderID = uint64(trade.Get("ask_id").Int())
 	} else {
-		orderID = uint64(trade.BidID)
+		orderID = uint64(trade.Get("bid_id").Int())
 	}
 
-	fillPrice, _ := strconv.ParseFloat(trade.Price, 64)
-	fillSize, _ := strconv.ParseFloat(trade.Size, 64)
+	fillPrice, _ := strconv.ParseFloat(price, 64)
+	fillSize, _ := strconv.ParseFloat(size, 64)
 
 	// Calculate fee (Lighter uses basis points)
 	var feePaid float64
-	if trade.IsMakerAsk {
-		feePaid = float64(trade.MakerFee) / 10000.0 * fillPrice * fillSize
+	if isMakerAsk {
+		feePaid = trade.Get("maker_fee").Float() / 10000.0 * fillPrice * fillSize
 	} else {
-		feePaid = float64(trade.TakerFee) / 10000.0 * fillPrice * fillSize
+		feePaid = trade.Get("taker_fee").Float() / 10000.0 * fillPrice * fillSize
 	}
 
 	// Calculate remaining size from order tracking
@@ -286,7 +291,7 @@ func (lp *LighterPrivate) processTrade(trade *lighterTrade) {
 		fillSize,
 		remainingSize,
 		feePaid,
-		trade.IsMakerAsk,
+		isMakerAsk,
 	)
 }
 

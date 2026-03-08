@@ -17,11 +17,12 @@ import (
 type Lighter struct {
 	cfg         config.ExchangeConfig
 	matrix      *shm.Matrix
+	depthWriter *shm.DepthWriter
 	eventBuffer *shm.EventRingBuffer
 	mktMap      map[int]uint16
 }
 
-func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer) *Lighter {
+func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer, depthWriter *shm.DepthWriter) *Lighter {
 	mktMap := make(map[int]uint16)
 	for localSym, exchIdxStr := range cfg.Symbols {
 		log.Printf("lighter: mapping symbol %s (exchIdx=%s)", localSym, exchIdxStr)
@@ -38,6 +39,7 @@ func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.
 	return &Lighter{
 		cfg:         cfg,
 		matrix:      matrix,
+		depthWriter: depthWriter,
 		eventBuffer: eventBuffer,
 		mktMap:      mktMap,
 	}
@@ -123,6 +125,25 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		// Write to shared matrix (triggers version increment)
 		l.matrix.WriteBBO(ExchangeLighter, symID, tsNs,
 			bidPx, bidSz, askPx, askSz)
+
+		// Parse and write depth data (L1-L5)
+		if l.depthWriter != nil {
+			var bids, asks [shm.DepthLevels]shm.PriceLevel
+
+			for i := 0; i < shm.DepthLevels && i < len(bidArray); i++ {
+				px, _ := strconv.ParseFloat(bidArray[i].Get("price").String(), 64)
+				sz, _ := strconv.ParseFloat(bidArray[i].Get("size").String(), 64)
+				bids[i] = shm.PriceLevel{Price: px, Size: sz}
+			}
+
+			for i := 0; i < shm.DepthLevels && i < len(askArray); i++ {
+				px, _ := strconv.ParseFloat(askArray[i].Get("price").String(), 64)
+				sz, _ := strconv.ParseFloat(askArray[i].Get("size").String(), 64)
+				asks[i] = shm.PriceLevel{Price: px, Size: sz}
+			}
+
+			l.depthWriter.WriteDepth(symID, ExchangeLighter, tsNs, bids, asks)
+		}
 	}
 }
 
