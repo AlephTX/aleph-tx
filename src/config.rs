@@ -122,6 +122,15 @@ fn default_poll_interval_ms() -> u64 {
 fn default_margin_cooldown_secs() -> u64 {
     5
 }
+fn default_grid_levels() -> u8 {
+    3
+}
+fn default_grid_spacing_bps() -> f64 {
+    2.0
+}
+fn default_grid_size_decay() -> f64 {
+    0.7
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +147,13 @@ pub struct InventoryNeutralMMConfig {
     // 报价
     pub penny_ticks: f64,         // default: 1.0
     pub inventory_skew_bps: f64,  // default: 3.0
+    // Grid Quoting (Multi-Level Laddering)
+    #[serde(default = "default_grid_levels")]
+    pub grid_levels: u8,          // default: 3 (1-5 levels per side)
+    #[serde(default = "default_grid_spacing_bps")]
+    pub grid_spacing_bps: f64,    // default: 2.0 (spacing between levels)
+    #[serde(default = "default_grid_size_decay")]
+    pub grid_size_decay: f64,     // default: 0.7 (size multiplier per level)
     // 仓位
     pub base_order_size: f64,     // default: 0.05
     pub max_position: f64,        // default: 0.15
@@ -170,6 +186,9 @@ impl Default for InventoryNeutralMMConfig {
             min_profit_bps: 1.0,
             penny_ticks: 1.0,
             inventory_skew_bps: 3.0,
+            grid_levels: 3,
+            grid_spacing_bps: 2.0,
+            grid_size_decay: 0.7,
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,
