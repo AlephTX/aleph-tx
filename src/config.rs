@@ -9,6 +9,9 @@ use std::path::Path;
 /// Round value to nearest tick/step size
 #[inline]
 pub fn round_to_tick(val: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return val; // Protect against division by zero
+    }
     (val / tick).round() * tick
 }
 

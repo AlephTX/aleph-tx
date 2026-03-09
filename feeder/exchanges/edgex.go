@@ -104,10 +104,26 @@ func (e *EdgeX) connect(ctx context.Context) error {
 			continue
 		}
 
-		bidPx, _ := strconv.ParseFloat(depth.Bids[0].Price, 64)
-		bidSz, _ := strconv.ParseFloat(depth.Bids[0].Size, 64)
-		askPx, _ := strconv.ParseFloat(depth.Asks[0].Price, 64)
-		askSz, _ := strconv.ParseFloat(depth.Asks[0].Size, 64)
+		bidPx, err := strconv.ParseFloat(depth.Bids[0].Price, 64)
+		if err != nil {
+			log.Printf("edgex: failed to parse bid price: %v", err)
+			continue
+		}
+		bidSz, err := strconv.ParseFloat(depth.Bids[0].Size, 64)
+		if err != nil {
+			log.Printf("edgex: failed to parse bid size: %v", err)
+			continue
+		}
+		askPx, err := strconv.ParseFloat(depth.Asks[0].Price, 64)
+		if err != nil {
+			log.Printf("edgex: failed to parse ask price: %v", err)
+			continue
+		}
+		askSz, err := strconv.ParseFloat(depth.Asks[0].Size, 64)
+		if err != nil {
+			log.Printf("edgex: failed to parse ask size: %v", err)
+			continue
+		}
 
 		symID, ok := e.symMap[depth.ContractID]
 		if !ok {

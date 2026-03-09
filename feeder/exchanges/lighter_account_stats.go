@@ -90,10 +90,17 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 	// Start periodic polling as fallback (every 30 seconds)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+
+	// Create a done channel to signal goroutine cleanup
+	done := make(chan struct{})
+	defer close(done)
+
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-done:
 				return
 			case <-ticker.C:
 				las.fetchStatsREST(ctx)
@@ -123,12 +130,36 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 }
 
 func (las *LighterAccountStats) processStats(stats *lighterUserStats) {
-	collateral, _ := strconv.ParseFloat(stats.Stats.Collateral, 64)
-	portfolioValue, _ := strconv.ParseFloat(stats.Stats.PortfolioValue, 64)
-	leverage, _ := strconv.ParseFloat(stats.Stats.Leverage, 64)
-	availableBalance, _ := strconv.ParseFloat(stats.Stats.AvailableBalance, 64)
-	marginUsage, _ := strconv.ParseFloat(stats.Stats.MarginUsage, 64)
-	buyingPower, _ := strconv.ParseFloat(stats.Stats.BuyingPower, 64)
+	collateral, err := strconv.ParseFloat(stats.Stats.Collateral, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse collateral: %v", err)
+		return
+	}
+	portfolioValue, err := strconv.ParseFloat(stats.Stats.PortfolioValue, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse portfolio_value: %v", err)
+		return
+	}
+	leverage, err := strconv.ParseFloat(stats.Stats.Leverage, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse leverage: %v", err)
+		return
+	}
+	availableBalance, err := strconv.ParseFloat(stats.Stats.AvailableBalance, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse available_balance: %v", err)
+		return
+	}
+	marginUsage, err := strconv.ParseFloat(stats.Stats.MarginUsage, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse margin_usage: %v", err)
+		return
+	}
+	buyingPower, err := strconv.ParseFloat(stats.Stats.BuyingPower, 64)
+	if err != nil {
+		log.Printf("lighter-account-stats: failed to parse buying_power: %v", err)
+		return
+	}
 
 	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f position=%.4f",
 		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower, las.position)

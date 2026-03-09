@@ -103,18 +103,31 @@ func (b *Backpack) connect(ctx context.Context) error {
 			continue
 		}
 
-		bidPx, _ := strconv.ParseFloat(depth.Bids[0][0], 64)
-		bidSz, _ := strconv.ParseFloat(depth.Bids[0][1], 64)
-		askPx, _ := strconv.ParseFloat(depth.Asks[0][0], 64)
-		askSz, _ := strconv.ParseFloat(depth.Asks[0][1], 64)
+		bidPx, err := strconv.ParseFloat(depth.Bids[0][0], 64)
+		if err != nil {
+			log.Printf("backpack: failed to parse bid price: %v", err)
+			continue
+		}
+		bidSz, err := strconv.ParseFloat(depth.Bids[0][1], 64)
+		if err != nil {
+			log.Printf("backpack: failed to parse bid size: %v", err)
+			continue
+		}
+		askPx, err := strconv.ParseFloat(depth.Asks[0][0], 64)
+		if err != nil {
+			log.Printf("backpack: failed to parse ask price: %v", err)
+			continue
+		}
+		askSz, err := strconv.ParseFloat(depth.Asks[0][1], 64)
+		if err != nil {
+			log.Printf("backpack: failed to parse ask size: %v", err)
+			continue
+		}
 
 		tsNs := uint64(depth.Timestamp) * 1_000 // μs → ns
 		if tsNs == 0 {
 			tsNs = uint64(time.Now().UnixNano())
 		}
-
-		log.Printf("backpack debug: writing to shm - Exchange=%d, Symbol=%d, Bid=%.2f@%.3f, Ask=%.2f@%.3f",
-			ExchangeBackpack, symID, bidPx, bidSz, askPx, askSz)
 
 		// Write to shared matrix
 		b.matrix.WriteBBO(ExchangeBackpack, symID, tsNs, bidPx, bidSz, askPx, askSz)

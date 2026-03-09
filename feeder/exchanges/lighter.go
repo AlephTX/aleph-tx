@@ -112,10 +112,26 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		}
 
 		// Parse best bid/ask
-		bidPx, _ := strconv.ParseFloat(bidArray[0].Get("price").String(), 64)
-		bidSz, _ := strconv.ParseFloat(bidArray[0].Get("size").String(), 64)
-		askPx, _ := strconv.ParseFloat(askArray[0].Get("price").String(), 64)
-		askSz, _ := strconv.ParseFloat(askArray[0].Get("size").String(), 64)
+		bidPx, err := strconv.ParseFloat(bidArray[0].Get("price").String(), 64)
+		if err != nil {
+			log.Printf("lighter: failed to parse bid price for market %d: %v", mktIdx, err)
+			continue
+		}
+		bidSz, err := strconv.ParseFloat(bidArray[0].Get("size").String(), 64)
+		if err != nil {
+			log.Printf("lighter: failed to parse bid size for market %d: %v", mktIdx, err)
+			continue
+		}
+		askPx, err := strconv.ParseFloat(askArray[0].Get("price").String(), 64)
+		if err != nil {
+			log.Printf("lighter: failed to parse ask price for market %d: %v", mktIdx, err)
+			continue
+		}
+		askSz, err := strconv.ParseFloat(askArray[0].Get("size").String(), 64)
+		if err != nil {
+			log.Printf("lighter: failed to parse ask size for market %d: %v", mktIdx, err)
+			continue
+		}
 
 		tsNs := uint64(result.Get("timestamp").Int()) * 1_000_000 // ms → ns
 		if tsNs == 0 {

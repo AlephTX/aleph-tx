@@ -102,8 +102,8 @@ func (w *DepthWriter) WriteDepth(
 	slot := &w.data.DepthMatrix[symbolID][exchangeID]
 
 	// Seqlock write protocol: odd -> write -> even
-	seq := atomic.AddUint32(&slot.Seqlock, 1)
-	atomic.StoreUint32(&slot.Seqlock, seq)
+	seq := atomic.LoadUint32(&slot.Seqlock)
+	atomic.StoreUint32(&slot.Seqlock, seq+1) // now odd → write in progress
 
 	slot.ExchangeID = exchangeID
 	slot.SymbolID = symbolID
@@ -111,7 +111,7 @@ func (w *DepthWriter) WriteDepth(
 	slot.Bids = bids
 	slot.Asks = asks
 
-	atomic.StoreUint32(&slot.Seqlock, seq+1)
+	atomic.StoreUint32(&slot.Seqlock, seq+2) // now even → write complete
 
 	// Increment version counter for cache invalidation
 	atomic.AddUint64(&w.data.SymbolVersions[symbolID], 1)
