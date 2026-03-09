@@ -9,7 +9,7 @@ STRATEGY ?= inventory_neutral_mm
 # Default target
 help:
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  AlephTX v3.3.0 - Unified Multi-Exchange HFT"
+	@echo "  AlephTX v4.0.0 - Tier-1 HFT Framework"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@echo ""
 	@echo "Build Commands:"

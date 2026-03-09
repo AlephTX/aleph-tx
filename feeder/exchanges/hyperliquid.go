@@ -99,10 +99,26 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 			continue
 		}
 
-		bidPx, _ := strconv.ParseFloat(bids[0].Px, 64)
-		bidSz, _ := strconv.ParseFloat(bids[0].Sz, 64)
-		askPx, _ := strconv.ParseFloat(asks[0].Px, 64)
-		askSz, _ := strconv.ParseFloat(asks[0].Sz, 64)
+		bidPx, err := strconv.ParseFloat(bids[0].Px, 64)
+		if err != nil {
+			log.Printf("hyperliquid: failed to parse bid price: %v", err)
+			continue
+		}
+		bidSz, err := strconv.ParseFloat(bids[0].Sz, 64)
+		if err != nil {
+			log.Printf("hyperliquid: failed to parse bid size: %v", err)
+			continue
+		}
+		askPx, err := strconv.ParseFloat(asks[0].Px, 64)
+		if err != nil {
+			log.Printf("hyperliquid: failed to parse ask price: %v", err)
+			continue
+		}
+		askSz, err := strconv.ParseFloat(asks[0].Sz, 64)
+		if err != nil {
+			log.Printf("hyperliquid: failed to parse ask size: %v", err)
+			continue
+		}
 
 		tsNs := uint64(book.Time) * 1_000_000 // ms → ns
 

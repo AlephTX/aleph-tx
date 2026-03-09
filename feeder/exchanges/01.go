@@ -93,14 +93,26 @@ func (z *ZeroOne) connect(ctx context.Context) error {
 
 		// Parse the Best Bid and Best Ask
 		bidPx, err := strconv.ParseFloat(event.Data.Bids[0][0], 64)
-		if err != nil { continue }
+		if err != nil {
+			log.Printf("01: failed to parse bid price: %v", err)
+			continue
+		}
 		bidSz, err := strconv.ParseFloat(event.Data.Bids[0][1], 64)
-		if err != nil { continue }
-		
+		if err != nil {
+			log.Printf("01: failed to parse bid size: %v", err)
+			continue
+		}
+
 		askPx, err := strconv.ParseFloat(event.Data.Asks[0][0], 64)
-		if err != nil { continue }
+		if err != nil {
+			log.Printf("01: failed to parse ask price: %v", err)
+			continue
+		}
 		askSz, err := strconv.ParseFloat(event.Data.Asks[0][1], 64)
-		if err != nil { continue }
+		if err != nil {
+			log.Printf("01: failed to parse ask size: %v", err)
+			continue
+		}
 
 		symID, ok := z.symMap[event.Market]
 		if !ok {
