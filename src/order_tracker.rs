@@ -344,6 +344,21 @@ impl OrderTracker {
             .completed_orders
             .retain(|_, order| order.last_update > cutoff);
     }
+
+    /// Cancel all active orders in tracker (when exchange cancel_all is called)
+    /// Moves all active orders to completed with Canceled lifecycle
+    pub fn cancel_all_active(&self) -> usize {
+        let mut state = self.state.write();
+        let drained: Vec<_> = state.active_orders.drain().collect();
+        let count = drained.len();
+        let now = Instant::now();
+        for (coi, mut order) in drained {
+            order.lifecycle = OrderLifecycle::Canceled;
+            order.last_update = now;
+            state.completed_orders.insert(coi, order);
+        }
+        count
+    }
 }
 
 impl OrderTracker {

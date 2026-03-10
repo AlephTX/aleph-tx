@@ -17,6 +17,7 @@ use crate::config::InventoryNeutralMMConfig;
 use crate::error::{Result, TradingError};
 use crate::exchange::Exchange;
 use crate::order_tracker::{OrderTracker, OrderSide};
+use crate::shm_event_reader::ShmEventReaderV2;
 use crate::shm_reader::ShmReader;
 use crate::telemetry::TelemetryCollector;
 // parking_lot::RwLock no longer needed (OrderTracker uses internal RwLock)
@@ -148,6 +149,7 @@ pub struct InventoryNeutralMM {
     order_tracker: Arc<OrderTracker>,
     shm_reader: ShmReader,
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
+    event_reader: Option<ShmEventReaderV2>,
     account_stats_reader: AccountStatsReader,
     account_stats: AccountStats,
     micro: MicrostructureTracker,
@@ -185,6 +187,19 @@ impl InventoryNeutralMM {
             info!("📊 Using simple mid-price (depth reader not available)");
         }
 
+        // Open V2 event reader for OrderTracker state transitions
+        let event_reader = match ShmEventReaderV2::new_default() {
+            Ok(mut reader) => {
+                reader.skip_to_end();
+                info!("📡 V2 event reader initialized (skipped {} historical events)", reader.local_read_idx());
+                Some(reader)
+            }
+            Err(e) => {
+                warn!("⚠️  V2 event reader unavailable: {} (OrderTracker will rely on drift sync)", e);
+                None
+            }
+        };
+
         Self {
             micro: MicrostructureTracker::new(
                 config.micro_samples,
@@ -196,6 +211,7 @@ impl InventoryNeutralMM {
             order_tracker,
             shm_reader,
             shm_depth_reader,
+            event_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
             active_orders: Vec::new(),
@@ -254,6 +270,30 @@ impl InventoryNeutralMM {
         }
 
         info!("🚀 Starting main loop...");
+
+        // Spawn background V2 event consumer → OrderTracker state transitions
+        if let Some(mut event_reader) = self.event_reader.take() {
+            let tracker = Arc::clone(&self.order_tracker);
+            tokio::spawn(async move {
+                info!("📡 V2 event consumer started (read_idx={}, write_idx={})",
+                    event_reader.local_read_idx(), event_reader.write_idx());
+                loop {
+                    let mut batch = 0u32;
+                    while let Some(event) = event_reader.try_read() {
+                        if let Err(e) = tracker.apply_event(&event) {
+                            debug!("Event apply error: {}", e);
+                        }
+                        batch += 1;
+                        if batch >= 64 {
+                            break;
+                        }
+                    }
+                    if batch == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            });
+        }
 
         loop {
             // Check shutdown signal
@@ -866,6 +906,12 @@ impl InventoryNeutralMM {
         }
 
         self.active_orders.clear();
+
+        // Sync tracker: exchange doesn't always push cancel events via WS
+        let cleared = self.order_tracker.cancel_all_active();
+        if cleared > 0 {
+            debug!("Tracker: cleared {} active orders after cancel_all", cleared);
+        }
     }
 
     fn print_pnl_update(&self) {
