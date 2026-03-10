@@ -17,18 +17,28 @@ import (
 // LighterPrivate connects to Lighter private WebSocket for order/trade events
 type LighterPrivate struct {
 	cfg          config.ExchangeConfig
-	eventBuffer  *shm.EventRingBuffer
+	eventBuffer  *shm.EventRingBufferV2
 	auth         *LighterAuth
 	mktMap       map[int]uint16 // market_index -> symbol_id
 	accountStats *LighterAccountStats // For updating position
 	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
 	orderSizes   map[uint64]float64 // order_id -> remaining_base_amount
+	orderDetails map[uint64]orderDetail // order_id -> full order details
+}
+
+// orderDetail tracks order metadata for V2 events
+type orderDetail struct {
+	clientOrderIndex int64
+	orderIndex       int64
+	price            float64
+	initialSize      float64
+	isAsk            bool
 }
 
 // NewLighterPrivate creates a new Lighter private stream client
 func NewLighterPrivate(
 	cfg config.ExchangeConfig,
-	eventBuffer *shm.EventRingBuffer,
+	eventBuffer *shm.EventRingBufferV2,
 	accountStats *LighterAccountStats,
 	statsWriter *shm.AccountStatsWriter,
 ) (*LighterPrivate, error) {
@@ -54,6 +64,7 @@ func NewLighterPrivate(
 		accountStats: accountStats,
 		statsWriter:  statsWriter,
 		orderSizes:   make(map[uint64]float64),
+		orderDetails: make(map[uint64]orderDetail),
 	}, nil
 }
 
@@ -212,26 +223,68 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 	}
 
 	orderID := uint64(order.Get("order_index").Int())
+	clientOrderIndex := order.Get("client_order_index").Int()
+	orderIndex := order.Get("order_index").Int()
 	status := order.Get("status").String()
+	price := order.Get("price").Float()
+	initialSize := order.Get("initial_base_amount").Float()
+	isAsk := order.Get("is_ask").Bool()
+	timestampNs := uint64(time.Now().UnixNano())
 
-	log.Printf("lighter-private: order event: id=%d status=%s market=%d", orderID, status, marketIndex)
+	log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
+		orderID, clientOrderIndex, status, marketIndex)
 
 	switch status {
 	case "open":
-		// Order created — track remaining size
-		initialSize := order.Get("initial_base_amount").Float()
-		isAsk := order.Get("is_ask").Bool()
+		// Order created — track remaining size + details for V2
 		lp.orderSizes[orderID] = initialSize
-		lp.eventBuffer.PushOrderCreated(uint8(ExchangeLighter), symID, orderID, initialSize, isAsk)
+		lp.orderDetails[orderID] = orderDetail{
+			clientOrderIndex: clientOrderIndex,
+			orderIndex:       orderIndex,
+			price:            price,
+			initialSize:      initialSize,
+			isAsk:            isAsk,
+		}
+		lp.eventBuffer.PushOrderCreatedV2(
+			uint8(ExchangeLighter),
+			symID,
+			orderID,
+			clientOrderIndex,
+			orderIndex,
+			price,
+			initialSize,
+			isAsk,
+			timestampNs,
+		)
 
 	case "canceled":
 		// Order canceled — clean up tracking
+		remainingSize := 0.0
+		if prev, ok := lp.orderSizes[orderID]; ok {
+			remainingSize = prev
+		}
+		coi := int64(0)
+		oi := int64(0)
+		if detail, ok := lp.orderDetails[orderID]; ok {
+			coi = detail.clientOrderIndex
+			oi = detail.orderIndex
+		}
 		delete(lp.orderSizes, orderID)
-		lp.eventBuffer.PushOrderCanceled(uint8(ExchangeLighter), symID, orderID)
+		delete(lp.orderDetails, orderID)
+		lp.eventBuffer.PushOrderCanceledV2(
+			uint8(ExchangeLighter),
+			symID,
+			orderID,
+			coi,
+			oi,
+			remainingSize,
+			timestampNs,
+		)
 
 	case "filled":
 		// Order fully filled — clean up tracking (fills handled by trade events)
 		delete(lp.orderSizes, orderID)
+		delete(lp.orderDetails, orderID)
 	}
 }
 
@@ -283,15 +336,30 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		}
 	}
 
-	lp.eventBuffer.PushOrderFilled(
+	// Look up client_order_id and order_index from tracked details
+	coi := int64(0)
+	oi := int64(0)
+	if detail, ok := lp.orderDetails[orderID]; ok {
+		coi = detail.clientOrderIndex
+		oi = detail.orderIndex
+	}
+
+	tradeIDu64 := uint64(tradeID)
+	timestampNs := uint64(time.Now().UnixNano())
+
+	lp.eventBuffer.PushOrderFilledV2(
 		uint8(ExchangeLighter),
 		symID,
 		orderID,
+		coi,
+		oi,
 		fillPrice,
 		fillSize,
 		remainingSize,
 		feePaid,
 		isMakerAsk,
+		timestampNs,
+		tradeIDu64,
 	)
 }
 

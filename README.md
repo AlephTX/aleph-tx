@@ -1,8 +1,8 @@
-# AlephTX v4.0.0
+# AlephTX v5.0.0
 
 Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
 
-**v4.0.0 Highlights**: Lock-free shadow ledger, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
+**v5.0.0 Highlights**: Per-order state machine (OrderTracker), 128-byte V2 SHM events, worst-case bilateral risk control, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
           │         Shared Memory IPC (Lock-Free)                 │
           │  ┌─────────────────────────────────────────────────┐  │
           │  │ /dev/shm/aleph-matrix        (656KB BBO Matrix) │  │
-          │  │ /dev/shm/aleph-depth         (3MB Depth L1-L5)  │  │ ← v4.0.0
+          │  │ /dev/shm/aleph-depth         (3MB Depth L1-L5)  │  │ ← v5.0.0
           │  │ /dev/shm/aleph-events        (64KB Event Ring)  │  │
           │  │ /dev/shm/aleph-account-stats (128B Stats)       │  │
           │  └─────────────────────────────────────────────────┘  │
@@ -34,25 +34,25 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         Rust Core (Strategy Engine)                         │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  Data Plane Thread (CPU-pinned, dedicated OS thread)                │   │ ← v4.0.0
+│  │  Data Plane Thread (CPU-pinned, dedicated OS thread)                │   │ ← v5.0.0
 │  │    ShmReader (Seqlock) → flume channel → Tokio async recv           │   │
 │  └────────────────────────────┬─────────────────────────────────────────┘   │
 │                               ▼                                             │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  Shadow Ledger: CachePadded<AtomicI64> (lock-free hot path)         │   │ ← v4.0.0
-│  │    real_pos + in_flight_pos (scaled 1e8, ~50ns read latency)        │   │
+│  │  OrderTracker: Per-Order State Machine (RwLock<TrackerState>)      │   │ ← v5.0.0
+│  │    worst_case_long/short + confirmed_position (bilateral risk)     │   │
 │  └────────────────────────────┬─────────────────────────────────────────┘   │
 │                               ▼                                             │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │  Strategy Engine:                                                    │   │
-│  │    • InventoryNeutralMM (Sigmoid skew + OBI+VWMicro pricing)        │   │ ← v4.0.0
+│  │    • InventoryNeutralMM (Sigmoid skew + OBI+VWMicro pricing)        │   │ ← v5.0.0
 │  │    • AdaptiveMM  • MarketMaker (EdgeX)                               │   │
 │  │    • BackpackMM  • ArbitrageEngine                                   │   │
 │  └────────────────────────────┬─────────────────────────────────────────┘   │
 │                               ▼                                             │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │  FFI Sign + HTTP Direct Execution (No Boomerang)                    │   │
-│  │    Typed error codes + margin cooldown tracking                     │   │ ← v4.0.0
+│  │    Typed error codes + margin cooldown tracking                     │   │ ← v5.0.0
 │  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
@@ -75,9 +75,9 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 
 | Layer | Component | Protocol | Latency |
 |-------|-----------|----------|---------|
-| **Ingestion** | Go Feeder | WebSocket → SHM Write (gjson zero-copy) | ~30μs (v4.0.0: -40%) |
+| **Ingestion** | Go Feeder | WebSocket → SHM Write (gjson zero-copy) | ~30μs (v5.0.0: -40%) |
 | **IPC** | Shared Memory | Seqlock (BBO) + SPSC Ring (Events) | ~100ns read |
-| **Strategy** | Rust Engine | Lock-free polling loop (dedicated thread) | <200ns per tick (v4.0.0: -20%) |
+| **Strategy** | Rust Engine | Lock-free polling loop (dedicated thread) | <200ns per tick (v5.0.0: -20%) |
 | **Execution** | HTTP REST | FFI Sign + Keep-Alive | ~5-20ms RTT |
 | **Reconciliation** | Shadow Ledger | Event stream background task (lock-free atomics) | Async |
 
@@ -89,7 +89,7 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 - **Zero Heap Allocations** on hot path (quoting loop < 200ns per tick)
 - **Lock-Free Hot Path**: Position reads via CachePadded<AtomicI64>, eliminating RwLock contention
 
-## v4.0.0 Architecture Upgrade
+## v5.0.0 Architecture Upgrade
 
 ### Sprint 1: Quick Wins ✅
 - **Sigmoid SIZE Skew**: `tanh(pos/max_pos)` curve replacing linear urgency=2.0 for smoother inventory control
@@ -173,12 +173,12 @@ aleph-tx/
 │   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats, depth)
 │   └── config/          #   TOML config loader
 ├── src/                 # Rust: HFT strategy engine
-│   ├── data_plane.rs    #   Dedicated data plane thread (v4.0.0)
-│   ├── shm_depth_reader.rs  #   L1-L5 depth reader (v4.0.0)
-│   ├── telemetry.rs     #   Telemetry module (v4.0.0)
+│   ├── data_plane.rs    #   Dedicated data plane thread (v5.0.0)
+│   ├── shm_depth_reader.rs  #   L1-L5 depth reader (v5.0.0)
+│   ├── telemetry.rs     #   Telemetry module (v5.0.0)
 │   ├── strategy/        #   Strategy implementations (inventory_neutral_mm, adaptive_mm, arbitrage, etc.)
 │   ├── exchanges/       #   Exchange integrations (Backpack, EdgeX, Lighter)
-│   │   └── lighter/error.rs  #   Typed error codes (v4.0.0)
+│   │   └── lighter/error.rs  #   Typed error codes (v5.0.0)
 │   ├── native/          #   Native FFI libraries (Lighter Ed25519 signer .so)
 │   └── types/           #   Core types + C-ABI event struct (64 bytes)
 ├── examples/            # Entry point binaries for make targets + debug/benchmark tools
@@ -204,13 +204,13 @@ aleph-tx/
 The production strategy (`src/strategy/inventory_neutral_mm.rs`) implements config-driven HFT market making via the `Exchange` trait:
 
 - **Inventory Neutral**: Maintains near-zero net position (98.4% neutral in live testing)
-- **Sigmoid Skew** (v4.0.0): `tanh(pos/max_pos)` curve for smooth inventory control
-- **OBI+VWMicro Pricing** (v4.0.0): Volume-weighted micro price using L1-L5 depth
+- **Sigmoid Skew** (v5.0.0): `tanh(pos/max_pos)` curve for smooth inventory control
+- **OBI+VWMicro Pricing** (v5.0.0): Volume-weighted micro price using L1-L5 depth
 - **Exchange Trait**: Works with any exchange implementing `Arc<dyn Exchange>`
 - **Config-Driven**: All parameters externalized to `config.toml` (no hardcoded constants)
 - **Shadow Ledger**: Optimistic `in_flight_pos` tracking with background reconciliation (lock-free atomics)
 - **Batch Quoting**: Paired bid/ask via `place_batch` for atomic updates
-- **Telemetry** (v4.0.0): Structured metrics export (orders, margin cooldown, spread, adverse selection)
+- **Telemetry** (v5.0.0): Structured metrics export (orders, margin cooldown, spread, adverse selection)
 
 ### Adaptive MM
 
@@ -226,7 +226,7 @@ The adaptive strategy (`src/strategy/adaptive_mm.rs`) implements fee-aware HFT w
 ```toml
 # config.toml (copy from config.example.toml)
 [lighter]
-sigmoid_steepness = 4.0       # v4.0.0: Sigmoid curve steepness (default 4.0)
+sigmoid_steepness = 4.0       # v5.0.0: Sigmoid curve steepness (default 4.0)
 
 [backpack]
 risk_fraction = 0.20          # Fraction of equity at risk
@@ -263,19 +263,19 @@ EDGEX_ACCOUNT_ID=<id>
 
 | Priority | Item | Description | Status |
 |----------|------|-------------|--------|
-| P0 | **Sigmoid Inventory Skew** | Replace linear skew with sigmoid/logit curve | ✅ v4.0.0 |
+| P0 | **Sigmoid Inventory Skew** | Replace linear skew with sigmoid/logit curve | ✅ v5.0.0 |
 | P0 | **Grid Laddering** | 3-5 level quoting per side (tight→wide, small→large) | Planned |
-| P1 | **Micro-Price (OBI)** | Imbalance-weighted mid-price using L2-L5 depth | ✅ v4.0.0 |
+| P1 | **Micro-Price (OBI)** | Imbalance-weighted mid-price using L2-L5 depth | ✅ v5.0.0 |
 | P1 | **Cross-Exchange Arbitrage** | Statistical arb between Lighter/Backpack/EdgeX | Planned |
 
 ### Phase 2: Latency Optimization (Systems Track) - COMPLETED ✅
 
 | Priority | Item | Description | Status |
 |----------|------|-------------|--------|
-| P0 | **Data/Control Plane Split** | Move SHM polling to dedicated `std::thread` + CPU pinning | ✅ v4.0.0 |
-| P0 | **Zero-Alloc JSON Parsing** | Replace Go `encoding/json` with `gjson` on feeder hot path | ✅ v4.0.0 |
-| P1 | **RwLock → Atomics** | Replace `Arc<RwLock<ShadowLedger>>` with cache-aligned `AtomicI64` | ✅ v4.0.0 |
-| P1 | **Typed Error Codes** | Replace `contains("not enough margin")` string matching | ✅ v4.0.0 |
+| P0 | **Data/Control Plane Split** | Move SHM polling to dedicated `std::thread` + CPU pinning | ✅ v5.0.0 |
+| P0 | **Zero-Alloc JSON Parsing** | Replace Go `encoding/json` with `gjson` on feeder hot path | ✅ v5.0.0 |
+| P1 | **RwLock → Atomics** | Replace `Arc<RwLock<ShadowLedger>>` with cache-aligned `AtomicI64` | ✅ v5.0.0 |
+| P1 | **Typed Error Codes** | Replace `contains("not enough margin")` string matching | ✅ v5.0.0 |
 | P1 | **WebSocket Execution** | Replace REST with WS for lower latency order placement | Planned |
 | P2 | **Multi-Asset Support** | BTC-PERP, SOL-PERP, and other perpetual markets | Planned |
 
@@ -283,8 +283,8 @@ EDGEX_ACCOUNT_ID=<id>
 
 | Priority | Item | Description | Status |
 |----------|------|-------------|--------|
-| P0 | **Telemetry / Observability** | Async UDP metrics export → Prometheus/Grafana | ✅ v4.0.0 |
-| P1 | **Robust Reconnect** | Exponential backoff + jitter + circuit breaker | ✅ v4.0.0 |
+| P0 | **Telemetry / Observability** | Async UDP metrics export → Prometheus/Grafana | ✅ v5.0.0 |
+| P1 | **Robust Reconnect** | Exponential backoff + jitter + circuit breaker | ✅ v5.0.0 |
 | P1 | **Risk Management** | Circuit breaker, max drawdown limit, kill switch | Planned |
 | P2 | **Backtesting Framework** | Historical data replay with strategy simulation | Planned |
 | P2 | **gRPC Control Plane** | Remote strategy management (proto/ definitions ready) | Planned |

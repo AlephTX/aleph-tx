@@ -7,9 +7,9 @@ alwaysApply: true
 
 > Technical implementation document for Claude Code and developers working on AlephTX.
 
-Welcome to AlephTX v4.0.0, a Tier-1 High-Frequency Trading (HFT) framework built with Rust, Go, and Python for crypto markets.
+Welcome to AlephTX v5.0.0, a Tier-1 High-Frequency Trading (HFT) framework built with Rust, Go, and Python for crypto markets.
 
-**v4.0.0 Architecture Upgrade**: Lock-free shadow ledger, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
+**v5.0.0 Architecture Upgrade**: Per-order state machine (OrderTracker), 128-byte dual cache line SHM events (V2), worst-case bilateral risk control, proper memory barriers (AtomicU64 Acquire), NaN/divide-by-zero protection, TTL cache for late events. Replaces v4.0.0 dual-accumulator ShadowLedger.
 
 ## Role & Identity
 
@@ -65,10 +65,10 @@ Welcome to AlephTX v4.0.0, a Tier-1 High-Frequency Trading (HFT) framework built
 
 - **Dual-Track IPC**:
   - Track 1 (State): `/dev/shm/aleph-matrix` (Lock-free BBO snapshot matrix, updated by Go, read by Rust via Seqlock).
-  - Track 2 (Events): `/dev/shm/aleph-events` (Lock-free RingBuffer for private fills/cancels, 64-byte C-ABI `ShmPrivateEvent`).
+  - Track 2 (Events): `/dev/shm/aleph-events` (Lock-free RingBuffer for private fills/cancels). V1: 64-byte `ShmPrivateEvent`. **V2 (v5.0.0): 128-byte `ShmPrivateEventV2`** with `client_order_id`, `order_index`, `trade_id` for per-order tracking.
   - Track 3 (Depth): `/dev/shm/aleph-depth` (3MB L1-L5 depth data for OBI+VWMicro pricing, v4.0.0).
 - **No Boomerang Execution**: Go handles WS/Network I/O. Rust makes trading decisions and executes HTTP orders DIRECTLY via FFI + HTTP Keep-Alive. Rust NEVER sends execution commands back to Go via IPC.
-- **Optimistic Accounting**: Rust instantly updates `in_flight_pos` (lock-free AtomicI64, v4.0.0) upon firing an order. It relies on the Shadow Ledger's background task to reconcile `real_pos` via the Event RingBuffer.
+- **Optimistic Accounting (v5.0.0)**: Rust registers per-order state in `OrderTracker` (RwLock<TrackerState>) before API call. On failure, marks order as `Rejected`. On exchange event, transitions through `PendingCreate → Open → PartiallyFilled → Filled/Canceled`. Worst-case bilateral exposure checked before every order.
 - **Data Plane Decoupling** (v4.0.0): Dedicated OS thread for SHM polling (CPU-pinned), connected to Tokio via flume channel. Eliminates async starvation from spin-loop monopolizing Tokio workers.
 
 ## Environment & Endpoints
@@ -206,6 +206,7 @@ CLAUDE.md (root)                         -> Project architecture, constraints, w
     feeder/shm/CLAUDE.md                 -> Shared memory layouts (BBO matrix, depth, event ring, account stats)
       feeder/shm/depth.go                -> Depth writer (v4.0.0)
   src/CLAUDE.md                          -> Rust core: HFT engine, FFI, shadow ledger
+    src/order_tracker.rs                 -> Per-order state machine (v5.0.0, replaces shadow_ledger)
     src/data_plane.rs                    -> Dedicated data plane thread (v4.0.0)
     src/shm_depth_reader.rs              -> L1-L5 depth reader (v4.0.0)
     src/telemetry.rs                     -> Telemetry module (v4.0.0)

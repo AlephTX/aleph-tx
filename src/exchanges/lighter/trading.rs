@@ -10,9 +10,8 @@
 //! - get_order / get_active_orders / verify_order — 查询验证
 
 use crate::error::TradingError;
-use crate::shadow_ledger::ShadowLedger;
+use crate::order_tracker::{OrderTracker, OrderSide as TrackerSide};
 use super::error::{LighterErrorCode, LighterErrorResponse};
-use parking_lot::RwLock;
 
 use anyhow::Result;
 use reqwest::Client;
@@ -185,8 +184,8 @@ pub struct LighterTrading {
     nonce: AtomicI64,
     nonce_init: TokioMutex<bool>,
     client_order_counter: AtomicI64,
-    /// Optional shadow ledger for optimistic position tracking
-    ledger: Option<Arc<RwLock<ShadowLedger>>>,
+    /// Optional order tracker for per-order state machine (v5.0.0)
+    order_tracker: Option<Arc<OrderTracker>>,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
 }
@@ -234,7 +233,7 @@ impl LighterTrading {
 
         let counter_start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::from_secs(0))
             .as_secs() as i64;
 
         let send_tx_url = format!("{}/api/v1/sendTx", base_url);
@@ -256,7 +255,7 @@ impl LighterTrading {
             nonce: AtomicI64::new(0),
             nonce_init: TokioMutex::new(false),
             client_order_counter: AtomicI64::new(counter_start),
-            ledger: None,
+            order_tracker: None,
             limit_order_type: OrderType::Limit,
         })
     }
@@ -293,9 +292,9 @@ impl LighterTrading {
         Ok((market.size_decimals, market.price_decimals))
     }
 
-    /// Attach a shadow ledger for optimistic position tracking
-    pub fn set_ledger(&mut self, ledger: Arc<RwLock<ShadowLedger>>) {
-        self.ledger = Some(ledger);
+    /// Attach an order tracker for per-order state machine (v5.0.0)
+    pub fn set_order_tracker(&mut self, tracker: Arc<OrderTracker>) {
+        self.order_tracker = Some(tracker);
     }
 
     /// Enable Post-Only (ALO) mode for all limit orders
@@ -572,20 +571,20 @@ impl LighterTrading {
 
     // ─── 公开交易接口 ─────────────────────────────────────────────────────
 
-    /// 通用下单
+    /// 通用下单 (v5.0.0: per-order tracking)
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
-        // Optimistic accounting: update in_flight before API call
-        let signed_size = match params.side {
-            Side::Buy => params.size,
-            Side::Sell => -params.size,
-        };
-        if let Some(ref ledger) = self.ledger {
-            ledger.read().add_in_flight(signed_size);
-        }
-
         let (tx_type, tx_info, tx_hash, client_order_index) = self
             .sign_order(params.side, params.price, params.size, params.order_type, params.reduce_only)
             .await?;
+
+        // Optimistic accounting: register per-order BEFORE API call
+        let tracker_side = match params.side {
+            Side::Buy => TrackerSide::Buy,
+            Side::Sell => TrackerSide::Sell,
+        };
+        if let Some(ref tracker) = self.order_tracker {
+            tracker.start_tracking(client_order_index, tracker_side, params.price, params.size);
+        }
 
         tracing::info!(
             "Signed {} order: price={} size={} tx_hash={} coi={}",
@@ -594,27 +593,13 @@ impl LighterTrading {
 
         match self.send_tx(tx_type, tx_info).await {
             Ok(_) => {
-                // Register order in shadow ledger for fill reconciliation
-                if let Some(ref ledger) = self.ledger {
-                    let side = match params.side {
-                        Side::Buy => crate::shadow_ledger::OrderSide::Buy,
-                        Side::Sell => crate::shadow_ledger::OrderSide::Sell,
-                    };
-                    ledger.write().register_order(
-                        client_order_index as u64,
-                        self.market_id as u16,
-                        side,
-                        params.price,
-                        params.size,
-                    );
-                }
                 tracing::info!("Order submitted: tx_hash={}", tx_hash);
                 Ok(OrderResult { tx_hash, client_order_index })
             }
             Err(e) => {
-                // Rollback in_flight on failure
-                if let Some(ref ledger) = self.ledger {
-                    ledger.read().add_in_flight(-signed_size);
+                // Rollback: mark order as failed (pending_exposure → 0 automatically)
+                if let Some(ref tracker) = self.order_tracker {
+                    tracker.mark_failed(client_order_index);
                 }
                 Err(e)
             }
@@ -645,14 +630,8 @@ impl LighterTrading {
         .await
     }
 
-    /// 批量下单（一买一卖），使用 sendTxBatch 一次性提交
+    /// 批量下单（一买一卖），使用 sendTxBatch 一次性提交 (v5.0.0: per-order tracking)
     pub async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
-        // Optimistic accounting: net in-flight exposure before API call
-        let net_in_flight = params.bid_size - params.ask_size;
-        if let Some(ref ledger) = self.ledger {
-            ledger.read().add_in_flight(net_in_flight);
-        }
-
         // Get base nonce for batch
         let base_nonce = self.get_nonce().await?;
 
@@ -671,23 +650,10 @@ impl LighterTrading {
             bid_coi, params.bid_price, params.bid_size, ask_coi, params.ask_price, params.ask_size
         );
 
-        // Register both orders in shadow ledger before sending
-        if let Some(ref ledger) = self.ledger {
-            let mut l = ledger.write();
-            l.register_order(
-                bid_coi as u64,
-                self.market_id as u16,
-                crate::shadow_ledger::OrderSide::Buy,
-                params.bid_price,
-                params.bid_size,
-            );
-            l.register_order(
-                ask_coi as u64,
-                self.market_id as u16,
-                crate::shadow_ledger::OrderSide::Sell,
-                params.ask_price,
-                params.ask_size,
-            );
+        // Register BOTH orders independently (no net-value masking!)
+        if let Some(ref tracker) = self.order_tracker {
+            tracker.start_tracking(bid_coi, TrackerSide::Buy, params.bid_price, params.bid_size);
+            tracker.start_tracking(ask_coi, TrackerSide::Sell, params.ask_price, params.ask_size);
         }
 
         match self.send_tx_batch(&[(bid_type, bid_info), (ask_type, ask_info)]).await {
@@ -702,12 +668,10 @@ impl LighterTrading {
                 })
             }
             Err(e) => {
-                // Rollback: undo in_flight and unregister orders
-                if let Some(ref ledger) = self.ledger {
-                    ledger.read().add_in_flight(-net_in_flight);
-                    let mut l = ledger.write();
-                    l.active_orders.remove(&(bid_coi as u64));
-                    l.active_orders.remove(&(ask_coi as u64));
+                // Rollback: mark both orders as failed
+                if let Some(ref tracker) = self.order_tracker {
+                    tracker.mark_failed(bid_coi);
+                    tracker.mark_failed(ask_coi);
                 }
                 Err(e)
             }

@@ -42,13 +42,21 @@ func main() {
 	defer matrix.Close()
 	log.Printf("📡 Shared matrix: /dev/shm/%s (~656 KB)", shmName)
 
-	// Create event ring buffer for private events (~64 KB)
+	// Create V1 event ring buffer for backward compatibility (~64 KB)
 	eventBuffer, err := shm.NewEventRingBuffer()
 	if err != nil {
 		log.Fatalf("event ring buffer: %v", err)
 	}
 	defer eventBuffer.Close()
-	log.Printf("📡 Event ring buffer: /dev/shm/aleph-events (~64 KB)")
+	log.Printf("📡 Event ring buffer V1: /dev/shm/aleph-events (~64 KB)")
+
+	// Create V2 event ring buffer for per-order tracking (~128 KB)
+	eventBufferV2, err := shm.NewEventRingBufferV2()
+	if err != nil {
+		log.Fatalf("event ring buffer v2: %v", err)
+	}
+	defer eventBufferV2.Close()
+	log.Printf("📡 Event ring buffer V2: /dev/shm/aleph-events-v2 (~128 KB)")
 
 	// Create account stats shared memory (~128 bytes)
 	accountStats, err := shm.NewAccountStatsWriter("aleph-account-stats")
@@ -110,7 +118,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBuffer, ltStats, accountStats)
+			ltPrivate, err := exchanges.NewLighterPrivate(ltCfg, eventBufferV2, ltStats, accountStats)
 			if err != nil {
 				log.Printf("Lighter (private): failed to initialize: %v", err)
 				return

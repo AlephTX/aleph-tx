@@ -1,6 +1,5 @@
 use starknet_crypto::{pedersen_hash, Felt};
 use num_bigint::BigUint;
-use num_traits::Num;
 
 fn main() {
     // Test case from Go SDK

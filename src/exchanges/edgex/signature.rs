@@ -263,11 +263,11 @@ mod tests {
 
         println!("Hash: {:?}", hash);
 
-        // Test signing
+        // Test signing - output is r(64) + s(64) without 0x prefix
         let signature = manager.sign_l2_action(hash).unwrap();
         println!("Signature: {}", signature);
 
-        assert!(signature.starts_with("0x"));
-        assert_eq!(signature.len(), 2 + 64 + 64); // 0x + r(64) + s(64)
+        assert_eq!(signature.len(), 64 + 64); // r(64) + s(64)
+        assert!(signature.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
