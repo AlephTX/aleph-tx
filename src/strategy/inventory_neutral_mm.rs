@@ -496,6 +496,24 @@ impl InventoryNeutralMM {
                     "Spread {:.1}bps < min {:.1}bps (mkt={:.1}bps), skipping",
                     actual_spread_bps, min_spread_bps, market_spread_bps
                 );
+                // Still cancel stale orders that are far from current mid
+                if !self.active_orders.is_empty() {
+                    let stale_threshold = mid * self.config.requote_threshold_bps * 3.0 / 10000.0;
+                    let stale: Vec<String> = self.active_orders.iter()
+                        .filter(|o| (o.price - mid).abs() > stale_threshold)
+                        .map(|o| o.order_id.clone())
+                        .collect();
+                    if !stale.is_empty() {
+                        debug!("Canceling {} stale orders (mid={:.2}, threshold={:.2})", stale.len(), mid, stale_threshold);
+                        for oid in &stale {
+                            if let Ok(idx) = oid.parse::<i64>() {
+                                let _ = self.trading.cancel_order(idx).await;
+                            }
+                            self.active_orders.retain(|o| &o.order_id != oid);
+                        }
+                        self.order_tracker.cancel_all_active();
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -844,16 +862,17 @@ impl InventoryNeutralMM {
         // MARGIN MANAGEMENT: Adjust order sizes based on available balance
         // ═══════════════════════════════════════════════════════════════════
         let available = self.account_stats.available_balance;
-        let _leverage = self.account_stats.leverage;
 
-        // Estimate margin required per order (conservative: assume 10x leverage)
-        let margin_per_eth = mid / 10.0;
+        // Estimate margin required per order using configured max leverage
+        let margin_per_eth = mid / self.config.max_leverage;
+
+        // available_balance from exchange already deducts position margin,
+        // so just reserve 30% buffer for safety
+        let usable_balance = available * 0.7;
+
         let bid_margin_required = bid_size * margin_per_eth;
         let ask_margin_required = ask_size * margin_per_eth;
         let total_margin_required = bid_margin_required + ask_margin_required;
-
-        // Reserve 20% buffer for safety
-        let usable_balance = available * 0.8;
 
         let (bid_size, ask_size) = if total_margin_required > usable_balance {
             // Insufficient margin: scale down proportionally
