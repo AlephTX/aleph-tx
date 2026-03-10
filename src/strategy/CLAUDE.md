@@ -42,7 +42,8 @@ graph TD
 
     SHM[SHM BBO Matrix] --> ARB & MM & BPM & LMM & AMM
     ACC[SHM Account Stats] --> AMM
-    SL[Shadow Ledger] --> LMM & AMM
+    OT[OrderTracker v5.0.0] --> LMM & AMM
+    SL[Shadow Ledger - DEPRECATED] -.-> LMM
 
     LMM & AMM -->|FFI + HTTP| LIGHTER[Lighter API]
     MM -->|REST| EDGEX[EdgeX API]
@@ -52,7 +53,7 @@ graph TD
 ## Key Design Patterns
 
 - **No Boomerang**: Strategies fire HTTP orders directly, never send commands back to Go.
-- **Optimistic Accounting**: `in_flight_pos` updated before API call, reconciled via event ring buffer.
+- **Optimistic Accounting (v5.0.0)**: Per-order `start_tracking()` before API call. `mark_failed()` on error. Reconciled via `OrderTracker.apply_event()` from V2 event ring buffer.
 - **Incremental Quoting**: Only requote when price moves past threshold (reduces API load).
 - **Fee-Aware Spread** (adaptive_mm): Ensures spread > round-trip fee (0.76 bps for Premium).
 

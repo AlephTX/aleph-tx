@@ -2,7 +2,7 @@
 
 pub mod events;
 
-pub use events::{EventType, ShmPrivateEvent};
+pub use events::{EventType, ShmPrivateEvent, ShmPrivateEventV2};
 
 // Re-export common types from the old types.rs
 use rust_decimal::Decimal;

@@ -16,10 +16,10 @@ use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::{Result, TradingError};
 use crate::exchange::Exchange;
-use crate::shadow_ledger::{OrderSide, ShadowLedger};
+use crate::order_tracker::{OrderTracker, OrderSide};
 use crate::shm_reader::ShmReader;
 use crate::telemetry::TelemetryCollector;
-use parking_lot::RwLock;
+// parking_lot::RwLock no longer needed (OrderTracker uses internal RwLock)
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -145,7 +145,7 @@ pub struct InventoryNeutralMM {
     config: InventoryNeutralMMConfig,
 
     trading: Arc<dyn Exchange>,
-    ledger: Arc<RwLock<ShadowLedger>>,
+    order_tracker: Arc<OrderTracker>,
     shm_reader: ShmReader,
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
     account_stats_reader: AccountStatsReader,
@@ -168,7 +168,7 @@ impl InventoryNeutralMM {
     pub fn new(
         config: InventoryNeutralMMConfig,
         trading: Arc<dyn Exchange>,
-        ledger: Arc<RwLock<ShadowLedger>>,
+        order_tracker: Arc<OrderTracker>,
         shm_reader: ShmReader,
         account_stats_reader: AccountStatsReader,
     ) -> Self {
@@ -193,7 +193,7 @@ impl InventoryNeutralMM {
             ),
             config,
             trading,
-            ledger,
+            order_tracker,
             shm_reader,
             shm_depth_reader,
             account_stats_reader,
@@ -242,10 +242,10 @@ impl InventoryNeutralMM {
                 info!("✅ Account stats loaded: ${:.2} available, position={:.4}",
                     self.account_stats.available_balance, self.account_stats.position);
 
-                // Sync shadow ledger with authoritative position from exchange
-                let delta = self.ledger.read().force_sync_position(self.account_stats.position);
+                // Sync order tracker with authoritative position from exchange
+                let delta = self.order_tracker.force_sync_position(self.account_stats.position);
                 if delta.abs() > 1e-8 {
-                    info!("🔄 Ledger synced to exchange position: {:.4} (delta={:.4})",
+                    info!("🔄 Tracker synced to exchange position: {:.4} (delta={:.4})",
                         self.account_stats.position, delta);
                 }
                 break;
@@ -272,7 +272,9 @@ impl InventoryNeutralMM {
                         let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
                         if let Some((_, bbo)) = exchanges.iter().find(|(id, _)| *id == self.config.exchange_id) {
                             let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
-                            if let Err(e) = self.trading.close_all_positions(mid).await {
+                            if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
+                                warn!("⚠️  Invalid mid price during close: {:.4}", mid);
+                            } else if let Err(e) = self.trading.close_all_positions(mid).await {
                                 warn!("Failed to close positions: {}", e);
                             } else {
                                 info!("✅ Positions closed");
@@ -289,45 +291,49 @@ impl InventoryNeutralMM {
             let stats = self.account_stats_reader.read();
             self.account_stats = stats.into();
 
-            // Use shadow ledger's total_exposure (real_pos + in_flight_pos) for position tracking
-            // This ensures we account for pending orders when checking position limits
-            let ledger_pos = self.ledger.read().total_exposure();
+            // ═══════════════════════════════════════════════════════════════
+            // v5.0.0: Three-Layer Position Defense (Defense in Depth)
+            // ═══════════════════════════════════════════════════════════════
+
+            // Layer 1: OrderTracker effective position (fastest, <1μs)
+            let tracker_pos = self.order_tracker.effective_position();
             let acct_pos = self.account_stats.position;
 
-            // Trust account_stats position when ledger diverges significantly
-            // (ledger can accumulate errors from historical events in ring buffer)
+            // Layer 2: Drift detection + force sync
+            let drift = (tracker_pos - acct_pos).abs();
             let position = if self.total_orders_placed == 0 {
                 acct_pos  // Before any orders, use exchange position
-            } else if (ledger_pos - acct_pos).abs() > self.config.max_position * 0.5 && acct_pos.abs() > 1e-8 {
-                // Ledger drifted too far from exchange — force sync
-                let delta = self.ledger.read().force_sync_position(acct_pos);
+            } else if drift > self.config.max_position * 0.5 && acct_pos.abs() > 1e-8 {
+                // Tracker drifted too far — force sync to exchange
+                let delta = self.order_tracker.force_sync_position(acct_pos);
                 if delta.abs() > 0.001 {
-                    warn!("Ledger drift detected: ledger={:.4} exchange={:.4}, force synced (delta={:.4})",
-                        ledger_pos, acct_pos, delta);
+                    warn!("Tracker drift detected: tracker={:.4} exchange={:.4}, force synced (delta={:.4})",
+                        tracker_pos, acct_pos, delta);
                 }
                 acct_pos
-            } else if ledger_pos.abs() > 1e-8 || self.total_orders_placed > 0 {
-                ledger_pos  // Use ledger position after first order
+            } else if drift < self.config.max_position * 0.05 {
+                tracker_pos  // Drift < 5%, trust tracker (more responsive)
             } else {
-                acct_pos  // Fallback to account stats on first startup
+                acct_pos  // Drift 5-50%, use exchange position (safer)
             };
 
             // Log position for debugging
             if self.total_orders_placed % 10 == 0 {
                 debug!(
-                    "Position check: ledger={:.4} account={:.4} using={:.4} max={:.4}",
-                    ledger_pos, self.account_stats.position, position, self.config.max_position
+                    "Position: tracker={:.4} exchange={:.4} using={:.4} worst_long={:.4} worst_short={:.4}",
+                    tracker_pos, acct_pos, position,
+                    self.order_tracker.worst_case_long(),
+                    self.order_tracker.worst_case_short()
                 );
             }
 
-            // Periodic ledger sync: correct drift from missed events (every 30s)
+            // Periodic sync + GC (every 30s)
             if self.last_balance_check.elapsed() > Duration::from_secs(30) {
-                let delta = self.ledger.read().force_sync_position(position);
+                let delta = self.order_tracker.force_sync_position(acct_pos);
                 if delta.abs() > 0.001 {
-                    warn!("Ledger drift corrected: delta={:.6} ETH", delta);
+                    warn!("Periodic sync: drift={:.6} ETH", delta);
                 }
-
-                // Export telemetry snapshot every 30s
+                self.order_tracker.gc_completed_orders(Duration::from_secs(30));
                 self.telemetry.export_metrics();
             }
 
@@ -353,6 +359,13 @@ impl InventoryNeutralMM {
             };
 
             let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+
+            // Divide-by-zero / NaN protection: if mid is invalid, skip this cycle
+            if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
+                tracing::warn!("⚠️  Invalid mid price: {:.4}, skipping cycle", mid);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
 
             // Calculate VWMicro price if depth data available
             let pricing_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
@@ -508,13 +521,13 @@ impl InventoryNeutralMM {
                     if *size < 0.001 {
                         continue;
                     }
-                    // Re-read position before each order to account for fills during loop
-                    let current_pos = self.ledger.read().total_exposure();
+                    // v5.0.0: worst-case long check before placing bid
+                    let current_pos = self.order_tracker.worst_case_long();
 
                     // Check cumulative position limit before placing order
                     if current_pos + cumulative_bid_size + *size > self.config.max_position {
                         debug!(
-                            "Grid bid L{} would breach max_position (current={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                            "Grid bid L{} would breach max_position (worst_long={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
                             placed_bids + 1, current_pos, cumulative_bid_size, size, self.config.max_position
                         );
                         break;
@@ -555,13 +568,13 @@ impl InventoryNeutralMM {
                     if *size < 0.001 {
                         continue;
                     }
-                    // Re-read position before each order to account for fills during loop
-                    let current_pos = self.ledger.read().total_exposure();
+                    // v5.0.0: worst-case short check before placing ask
+                    let current_pos = self.order_tracker.worst_case_short();
 
                     // Check cumulative position limit before placing order
                     if current_pos - cumulative_ask_size - *size < -self.config.max_position {
                         debug!(
-                            "Grid ask L{} would breach max_position (current={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                            "Grid ask L{} would breach max_position (worst_short={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
                             placed_asks + 1, current_pos, cumulative_ask_size, size, self.config.max_position
                         );
                         break;
@@ -677,6 +690,9 @@ impl InventoryNeutralMM {
     }
 
     /// Check if we should requote any orders on a given side
+    ///
+    /// Safety: includes divide-by-zero protection for target_price == 0.0
+    /// to prevent NaN propagation that could crash the strategy.
     fn should_requote_side(&self, side: OrderSide, target_prices: &[(f64, f64)]) -> bool {
         let active = self.get_active_orders(side);
 
@@ -687,6 +703,10 @@ impl InventoryNeutralMM {
 
         // Check if any price has moved beyond threshold
         for (order, &(target_price, _)) in active.iter().zip(target_prices.iter()) {
+            // Divide-by-zero protection: if target_price is zero or NaN, force requote
+            if target_price == 0.0 || target_price.is_nan() {
+                return true;
+            }
             let price_diff = (order.price - target_price).abs();
             let threshold = target_price * self.config.requote_threshold_bps / 10000.0;
             if price_diff > threshold {

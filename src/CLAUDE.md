@@ -19,7 +19,8 @@ alwaysApply: true
 | shm_reader.rs | Lock-free BBO matrix reader (seqlock protocol) |
 | shm_event_reader.rs | Lock-free event ring buffer reader (SPSC) |
 | account_stats_reader.rs | Account stats SHM reader (128-byte versioned) |
-| shadow_ledger.rs | Optimistic position tracking (`real_pos` + `in_flight_pos`) |
+| order_tracker.rs | **v5.0.0** Per-order state machine (`RwLock<TrackerState>`, worst-case bilateral risk) |
+| shadow_ledger.rs | **DEPRECATED** Legacy dual-accumulator position tracking (`real_pos` + `in_flight_pos`) |
 
 ## Subdirectories
 
@@ -47,9 +48,11 @@ graph TD
         ACC -->|Versioned| AR[account_stats_reader.rs]
     end
 
-    subgraph "State Management"
-        ER --> SLM[ShadowLedgerManager]
-        SLM --> SL[ShadowLedger: real_pos + in_flight_pos]
+    subgraph "State Management (v5.0.0)"
+        ER --> OT[OrderTracker: Per-Order State Machine]
+        OT --> |confirmed_position| POS[Atomic Position]
+        OT --> |worst_case_long/short| RISK[Bilateral Risk Check]
+        SL[ShadowLedger - DEPRECATED, used by AdaptiveMM only]
     end
 
     subgraph "Strategies"
@@ -64,7 +67,7 @@ graph TD
         LMM & AMM -->|FFI Sign + HTTP| LT[exchanges/lighter/trading.rs]
         MM -->|REST| EX[exchanges/edgex/]
         ARB -->|REST| BP[exchanges/backpack/]
-        LT -->|Optimistic| SL
+        LT -->|Optimistic| OT
     end
 ```
 
@@ -76,11 +79,11 @@ graph TD
 ## Hot-Path Constraints (Quoting Loop)
 
 - **ZERO Heap Allocations** in `try_read`, `check_arbitrage`, `on_idle`. No `String`, `Vec::push`, `Box::new`.
-- **Rollback Discipline**: If order fails, MUST execute `ledger.add_in_flight(-signed_size)`. No ghost positions.
+- **Rollback Discipline (v5.0.0)**: If order fails, call `tracker.mark_failed(client_order_id)`. Order lifecycle transitions to `Rejected`, `pending_exposure()` returns 0 automatically. No manual accumulator rollback needed.
 
 ## Concurrency & Atomics
 
-- **Memory Barriers**: Use `AtomicU64::load(Ordering::Acquire)` for SHM reads. Do NOT use `read_volatile` for cross-process sync.
+- **Memory Barriers (v5.0.0)**: Use `AtomicU64::load(Ordering::Acquire)` + `compiler_fence(Ordering::Acquire)` for SHM reads. `read_volatile` does NOT provide hardware barriers on ARM/Apple Silicon.
 - **RwLock Hygiene**: Extract data, drop lock guard, THEN execute async HTTP calls.
 
 ## Math & Precision

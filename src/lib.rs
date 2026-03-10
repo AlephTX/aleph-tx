@@ -4,6 +4,7 @@ pub mod data_plane;
 pub mod error;
 pub mod exchange;
 pub mod exchanges;
+pub mod order_tracker;
 pub mod shadow_ledger;
 pub mod shm_depth_reader;
 pub mod shm_event_reader;

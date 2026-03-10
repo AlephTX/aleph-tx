@@ -1,35 +1,36 @@
+//! Simple EdgeX Order Test
+//!
+//! Tests basic order placement via EdgeXGateway.
+
+use aleph_tx::exchange::Exchange;
 use aleph_tx::exchanges::edgex::{
     client::EdgeXClient,
-    gateway::EdgeXGateway,
+    gateway::{EdgeXConfig, EdgeXGateway},
 };
 use std::sync::Arc;
-use tokio;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
     println!("Creating EdgeX client...");
-    let client = EdgeXClient::new()?;
-    let gateway = Arc::new(EdgeXGateway::new(client));
+    let private_key = std::env::var("EDGEX_L2_PRIVATE_KEY")
+        .expect("EDGEX_L2_PRIVATE_KEY not set");
+    let client = Arc::new(EdgeXClient::new(&private_key, None)?);
+    let config = EdgeXConfig::from_env()?;
+    let gateway = Arc::new(EdgeXGateway::new(client, config));
 
-    println!("Placing order...");
-    let result = gateway.place_order(
-        "buy",
-        1500.0,
-        0.01,
-    ).await;
+    println!("Placing buy order...");
+    let result = gateway.buy(0.01, 1500.0).await;
 
     match result {
-        Ok(order_id) => {
-            println!("✅ Order placed successfully!");
-            println!("Order ID: {}", order_id);
+        Ok(order) => {
+            println!("Order placed: tx_hash={}", order.tx_hash);
         }
         Err(e) => {
-            println!("❌ Order failed: {}", e);
+            println!("Order failed: {}", e);
         }
     }
 

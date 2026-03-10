@@ -22,13 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("AlephTX Adaptive Market Maker");
 
-    // Initialize Shadow Ledger
+    // Initialize Shadow Ledger (adaptive_mm still uses V1 ShadowLedger)
     let ledger_manager = ShadowLedgerManager::new();
     let ledger_state = ledger_manager.state();
 
     // Connect to Event Ring Buffer
     let event_reader = ShmEventReader::new_default()?;
-    tracing::info!("Event buffer: write_idx={} read_idx={}", event_reader.write_idx(), event_reader.local_read_idx());
     let _consumer_handle = ledger_manager.spawn_consumer(event_reader);
 
     // Connect to shared memory
@@ -36,9 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_stats_reader = AccountStatsReader::open("/dev/shm/aleph-account-stats")?;
 
     // Initialize LighterTrading (market_id=0 = ETH perps)
-    let mut trading = LighterTrading::new(0).await?;
-    trading.set_ledger(Arc::clone(&ledger_state));
-    let trading = Arc::new(trading);
+    let trading = Arc::new(LighterTrading::new(0).await?);
 
     // symbol_id=1002 is ETH, market_id=0 is ETH-USDC
     let mut strategy = AdaptiveMarketMaker::new(
