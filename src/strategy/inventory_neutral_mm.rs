@@ -239,7 +239,15 @@ impl InventoryNeutralMM {
             if stats.available_balance > 0.0 && data_age_secs < 60 {
                 self.account_stats = stats.into();
                 self.session_start_balance = self.account_stats.available_balance;
-                info!("✅ Account stats loaded: ${:.2} available", self.account_stats.available_balance);
+                info!("✅ Account stats loaded: ${:.2} available, position={:.4}",
+                    self.account_stats.available_balance, self.account_stats.position);
+
+                // Sync shadow ledger with authoritative position from exchange
+                let delta = self.ledger.read().force_sync_position(self.account_stats.position);
+                if delta.abs() > 1e-8 {
+                    info!("🔄 Ledger synced to exchange position: {:.4} (delta={:.4})",
+                        self.account_stats.position, delta);
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -284,10 +292,24 @@ impl InventoryNeutralMM {
             // Use shadow ledger's total_exposure (real_pos + in_flight_pos) for position tracking
             // This ensures we account for pending orders when checking position limits
             let ledger_pos = self.ledger.read().total_exposure();
-            let position = if ledger_pos.abs() > 1e-8 || self.total_orders_placed > 0 {
+            let acct_pos = self.account_stats.position;
+
+            // Trust account_stats position when ledger diverges significantly
+            // (ledger can accumulate errors from historical events in ring buffer)
+            let position = if self.total_orders_placed == 0 {
+                acct_pos  // Before any orders, use exchange position
+            } else if (ledger_pos - acct_pos).abs() > self.config.max_position * 0.5 && acct_pos.abs() > 1e-8 {
+                // Ledger drifted too far from exchange — force sync
+                let delta = self.ledger.read().force_sync_position(acct_pos);
+                if delta.abs() > 0.001 {
+                    warn!("Ledger drift detected: ledger={:.4} exchange={:.4}, force synced (delta={:.4})",
+                        ledger_pos, acct_pos, delta);
+                }
+                acct_pos
+            } else if ledger_pos.abs() > 1e-8 || self.total_orders_placed > 0 {
                 ledger_pos  // Use ledger position after first order
             } else {
-                self.account_stats.position  // Fallback to account stats on first startup
+                acct_pos  // Fallback to account stats on first startup
             };
 
             // Log position for debugging
