@@ -137,6 +137,24 @@ fn default_grid_size_decay() -> f64 {
 fn default_sigmoid_steepness() -> f64 {
     4.0
 }
+fn default_micro_samples() -> usize {
+    200
+}
+fn default_ema_fast_period() -> usize {
+    5
+}
+fn default_ema_slow_period() -> usize {
+    20
+}
+fn default_use_depth_pricing() -> bool {
+    true
+}
+fn default_vol_spread_scale() -> f64 {
+    0.5
+}
+fn default_momentum_skew_scale() -> f64 {
+    0.3
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -167,6 +185,19 @@ pub struct InventoryNeutralMMConfig {
     // Sigmoid SIZE偏移 (v4.0.0)
     #[serde(default = "default_sigmoid_steepness")]
     pub sigmoid_steepness: f64,   // default: 4.0 (控制sigmoid曲线陡峭度)
+    // 微观结构参数 (v4.0.0)
+    #[serde(default = "default_micro_samples")]
+    pub micro_samples: usize,     // default: 200 (价格样本数)
+    #[serde(default = "default_ema_fast_period")]
+    pub ema_fast_period: usize,   // default: 5 (快速EMA周期)
+    #[serde(default = "default_ema_slow_period")]
+    pub ema_slow_period: usize,   // default: 20 (慢速EMA周期)
+    #[serde(default = "default_use_depth_pricing")]
+    pub use_depth_pricing: bool,  // default: true (启用OBI+VWMicro定价)
+    #[serde(default = "default_vol_spread_scale")]
+    pub vol_spread_scale: f64,    // default: 0.5 (波动率价差缩放)
+    #[serde(default = "default_momentum_skew_scale")]
+    pub momentum_skew_scale: f64, // default: 0.3 (动量偏移缩放)
     // 风控
     pub adverse_selection_threshold: f64, // default: 2.0
     pub requote_threshold_bps: f64,      // default: 1.5
@@ -199,6 +230,12 @@ impl Default for InventoryNeutralMMConfig {
             grid_spacing_bps: 2.0,
             grid_size_decay: 0.7,
             sigmoid_steepness: 4.0,
+            micro_samples: 200,
+            ema_fast_period: 5,
+            ema_slow_period: 20,
+            use_depth_pricing: true,
+            vol_spread_scale: 0.5,
+            momentum_skew_scale: 0.3,
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,

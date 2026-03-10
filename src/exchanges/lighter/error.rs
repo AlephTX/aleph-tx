@@ -15,6 +15,10 @@ pub enum LighterErrorCode {
     InvalidSignature = 21120,
     /// 21301: Insufficient margin (not enough collateral)
     InsufficientMargin = 21301,
+    /// 21706: Invalid order base or quote amount
+    InvalidOrderAmount = 21706,
+    /// 21739: Not enough margin to create the order
+    NotEnoughMargin = 21739,
     /// Unknown error code
     Unknown,
 }
@@ -27,6 +31,8 @@ impl LighterErrorCode {
             21711 => Self::InvalidExpiry,
             21120 => Self::InvalidSignature,
             21301 => Self::InsufficientMargin,
+            21706 => Self::InvalidOrderAmount,
+            21739 => Self::NotEnoughMargin,
             _ => Self::Unknown,
         }
     }
@@ -38,7 +44,7 @@ impl LighterErrorCode {
 
     /// Check if this error is a margin issue
     pub fn is_margin_error(self) -> bool {
-        matches!(self, Self::InsufficientMargin)
+        matches!(self, Self::InsufficientMargin | Self::NotEnoughMargin)
     }
 }
 
