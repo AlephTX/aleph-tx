@@ -123,11 +123,14 @@ func NewEventRingBufferV2() (*EventRingBufferV2, error) {
 	writeIdx := (*uint64)(unsafe.Pointer(&data[0]))
 	slots := (*[V2RingBufferSlots]ShmPrivateEventV2)(unsafe.Pointer(&data[V2HeaderSize]))
 
+	// Resume from current write_idx to avoid index regression
+	currentIdx := atomic.LoadUint64(writeIdx)
+
 	return &EventRingBufferV2{
 		mmap:     data,
 		writeIdx: writeIdx,
 		slots:    slots[:],
-		localSeq: 0,
+		localSeq: currentIdx,
 	}, nil
 }
 
@@ -299,11 +302,14 @@ func NewEventRingBuffer() (*EventRingBuffer, error) {
 	writeIdx := (*uint64)(unsafe.Pointer(&data[0]))
 	slots := (*[RingBufferSlots]ShmPrivateEvent)(unsafe.Pointer(&data[HeaderSize]))
 
+	// Resume from current write_idx to avoid index regression
+	currentIdx := atomic.LoadUint64(writeIdx)
+
 	return &EventRingBuffer{
 		mmap:     data,
 		writeIdx: writeIdx,
 		slots:    slots[:],
-		localSeq: 0,
+		localSeq: currentIdx,
 	}, nil
 }
 

@@ -224,6 +224,11 @@ impl ShmEventReaderV2 {
         Self::new("/dev/shm/aleph-events-v2")
     }
 
+    /// Skip all existing events, only consume events written after this call
+    pub fn skip_to_end(&mut self) {
+        self.local_read_idx = self.read_write_idx();
+    }
+
     /// Read the current write index using proper atomic load (Acquire ordering)
     #[inline]
     fn read_write_idx(&self) -> u64 {
