@@ -133,6 +133,7 @@ impl MicrostructureTracker {
 #[derive(Debug, Clone)]
 struct ActiveOrder {
     order_id: String,
+    client_order_id: i64,
     side: OrderSide,
     price: f64,
     #[allow(dead_code)]
@@ -373,8 +374,25 @@ impl InventoryNeutralMM {
                 if delta.abs() > 0.001 {
                     warn!("Periodic sync: drift={:.6} ETH", delta);
                 }
+                // Reconcile tracker: mark stale entries that strategy no longer tracks
+                let strategy_cois: std::collections::HashSet<i64> = self.active_orders
+                    .iter().map(|o| o.client_order_id).collect();
+                let tracker_cois = self.order_tracker.active_cois();
+                let mut stale_count = 0;
+                for coi in tracker_cois {
+                    if !strategy_cois.contains(&coi) {
+                        self.order_tracker.mark_failed(coi);
+                        stale_count += 1;
+                    }
+                }
+                if stale_count > 0 {
+                    info!("Periodic reconcile: cleared {} stale tracker entries (strategy has {})",
+                        stale_count, self.active_orders.len());
+                }
                 self.order_tracker.gc_completed_orders(Duration::from_secs(30));
                 self.telemetry.export_metrics();
+                self.print_pnl_update();
+                self.last_balance_check = Instant::now();
             }
 
             // Margin cooldown: skip quoting if recently rejected
@@ -499,19 +517,19 @@ impl InventoryNeutralMM {
                 // Still cancel stale orders that are far from current mid
                 if !self.active_orders.is_empty() {
                     let stale_threshold = mid * self.config.requote_threshold_bps * 3.0 / 10000.0;
-                    let stale: Vec<String> = self.active_orders.iter()
+                    let stale: Vec<(String, i64)> = self.active_orders.iter()
                         .filter(|o| (o.price - mid).abs() > stale_threshold)
-                        .map(|o| o.order_id.clone())
+                        .map(|o| (o.order_id.clone(), o.client_order_id))
                         .collect();
                     if !stale.is_empty() {
                         debug!("Canceling {} stale orders (mid={:.2}, threshold={:.2})", stale.len(), mid, stale_threshold);
-                        for oid in &stale {
+                        for (oid, coi) in &stale {
                             if let Ok(idx) = oid.parse::<i64>() {
                                 let _ = self.trading.cancel_order(idx).await;
                             }
-                            self.active_orders.retain(|o| &o.order_id != oid);
+                            self.order_tracker.mark_failed(*coi);
                         }
-                        self.order_tracker.cancel_all_active();
+                        self.active_orders.retain(|o| stale.iter().all(|(sid, _)| sid != &o.order_id));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -595,6 +613,7 @@ impl InventoryNeutralMM {
                             debug!("Grid Buy L{}: ${:.2} x {:.3}", placed_bids + 1, price, size);
                             self.active_orders.push(ActiveOrder {
                                 order_id: result.tx_hash,
+                                client_order_id: result.client_order_index,
                                 side: OrderSide::Buy,
                                 price: *price,
                                 size: *size,
@@ -642,6 +661,7 @@ impl InventoryNeutralMM {
                             debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
                             self.active_orders.push(ActiveOrder {
                                 order_id: result.tx_hash,
+                                client_order_id: result.client_order_index,
                                 side: OrderSide::Sell,
                                 price: *price,
                                 size: *size,
@@ -674,12 +694,6 @@ impl InventoryNeutralMM {
                     "Grid placed: {} bid levels, {} ask levels (pos={:.4})",
                     placed_bids, placed_asks, position
                 );
-            }
-
-            // Periodic PnL reporting
-            if self.last_balance_check.elapsed() > Duration::from_secs(30) {
-                self.print_pnl_update();
-                self.last_balance_check = Instant::now();
             }
 
             tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
@@ -777,18 +791,20 @@ impl InventoryNeutralMM {
 
     /// Cancel all orders on a given side
     async fn cancel_side_orders(&mut self, side: OrderSide) -> Result<()> {
-        let orders_to_cancel: Vec<String> = self.active_orders
+        let orders_to_cancel: Vec<(String, i64)> = self.active_orders
             .iter()
             .filter(|o| o.side == side)
-            .map(|o| o.order_id.clone())
+            .map(|o| (o.order_id.clone(), o.client_order_id))
             .collect();
 
-        for order_id in orders_to_cancel {
+        for (order_id, coi) in &orders_to_cancel {
             if let Ok(idx) = order_id.parse::<i64>() {
                 let _ = self.trading.cancel_order(idx).await;
             }
-            self.active_orders.retain(|o| o.order_id != order_id);
+            // Sync tracker: mark this order as canceled
+            self.order_tracker.mark_failed(*coi);
         }
+        self.active_orders.retain(|o| o.side != side);
 
         Ok(())
     }
@@ -913,23 +929,19 @@ impl InventoryNeutralMM {
     }
 
     async fn cancel_all_orders(&mut self) {
-        let order_ids: Vec<String> = self.active_orders
-            .iter()
-            .map(|o| o.order_id.clone())
-            .collect();
-
-        for order_id in order_ids {
-            if let Ok(idx) = order_id.parse::<i64>() {
+        for order in &self.active_orders {
+            if let Ok(idx) = order.order_id.parse::<i64>() {
                 let _ = self.trading.cancel_order(idx).await;
             }
+            // Sync tracker per-order
+            self.order_tracker.mark_failed(order.client_order_id);
         }
 
+        let count = self.active_orders.len();
         self.active_orders.clear();
 
-        // Sync tracker: exchange doesn't always push cancel events via WS
-        let cleared = self.order_tracker.cancel_all_active();
-        if cleared > 0 {
-            debug!("Tracker: cleared {} active orders after cancel_all", cleared);
+        if count > 0 {
+            debug!("Canceled {} orders (tracker synced per-order)", count);
         }
     }
 
@@ -1072,6 +1084,7 @@ mod tests {
         // Simulate adding orders
         active_orders.push(ActiveOrder {
             order_id: "1".to_string(),
+            client_order_id: 1,
             side: OrderSide::Buy,
             price: 3000.0,
             size: 0.05,
@@ -1079,6 +1092,7 @@ mod tests {
         });
         active_orders.push(ActiveOrder {
             order_id: "2".to_string(),
+            client_order_id: 2,
             side: OrderSide::Buy,
             price: 2995.0,
             size: 0.035,
@@ -1086,6 +1100,7 @@ mod tests {
         });
         active_orders.push(ActiveOrder {
             order_id: "3".to_string(),
+            client_order_id: 3,
             side: OrderSide::Sell,
             price: 3010.0,
             size: 0.05,

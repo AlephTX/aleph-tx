@@ -251,6 +251,11 @@ impl OrderTracker {
         self.state.read().active_orders.len()
     }
 
+    /// Get all active order client_order_ids
+    pub fn active_cois(&self) -> Vec<i64> {
+        self.state.read().active_orders.keys().copied().collect()
+    }
+
     /// Get order_index for a tracked order (used for cancel API)
     pub fn get_order_index(&self, client_order_id: i64) -> Option<i64> {
         let state = self.state.read();
