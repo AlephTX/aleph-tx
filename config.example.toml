@@ -1,25 +1,132 @@
-# AlephTX Configuration
+# AlephTX Unified Configuration
 # Copy to config.toml and adjust values
+# Sensitive credentials (private keys, API keys) are stored in .env files
 
-[backpack]
-risk_fraction = 0.10          # Use 10% of USDC balance as max position
-min_spread_bps = 18.0         # Minimum half-spread floor (bps)
-vol_multiplier = 3.5          # spread = max(min_spread, vol × multiplier)
-stop_loss_pct = 0.005         # Stop-loss as fraction of account equity
-requote_interval_ms = 3000    # Min ms between re-quotes
-momentum_threshold_bps = 8.0  # Momentum detection threshold
-momentum_spread_mult = 2.0    # Widen losing side by this factor on momentum
-vol_window = 120              # Number of mid-price samples for vol calc
-balance_refresh_secs = 60     # How often to refresh balance
+# ============================================================================
+# Lighter DEX - Feeder
+# ============================================================================
+[lighter]
+feeder_enabled = true
+feeder_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+feeder_symbols = { ETH = "0" }
+exchange_id = 2
 
+# ============================================================================
+# EdgeX - Feeder + Strategy
+# ============================================================================
 [edgex]
-risk_fraction = 0.08
-min_spread_bps = 20.0
-vol_multiplier = 3.5
+# Feeder settings
+feeder_enabled = true
+feeder_ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+feeder_rest_url = "https://pro.edgex.exchange"
+feeder_symbols = { ETH = "10000002", BTC = "10000001" }
+
+# Strategy settings
+exchange_id = 3
+symbol_id = 1002
+
+# L2 Signature Configuration (ETH-USDC Perpetual)
+contract_id = 10000002
+synthetic_asset_id = "0x4554482d3900000000000000000000"
+collateral_asset_id = "0x555344432d36000000000000000000"
+fee_asset_id = "0x555344432d36000000000000000000"
+price_decimals = 2
+size_decimals = 4
+resolution = 1000000000
+collateral_resolution = 1000000
+fee_rate = 0.00038
+
+# Trading parameters (EdgeX: ~3.4bps maker, rate limit: 2 req/2s)
+risk_fraction = 0.10
+min_spread_bps = 8.0
+vol_multiplier = 3.0
+stop_loss_pct = 0.005
+requote_interval_ms = 5000
+momentum_threshold_bps = 10.0
+momentum_spread_mult = 2.0
+vol_window = 120
+balance_refresh_secs = 60
+min_order_size = 0.1
+
+# ============================================================================
+# Backpack - Feeder + Strategy
+# ============================================================================
+[backpack]
+feeder_enabled = false
+feeder_ws_url = "wss://ws.backpack.exchange"
+feeder_symbols = { ETH = "ETH_USDC_PERP", BTC = "BTC_USDC_PERP" }
+
+exchange_id = 4
+symbol_id = 1002
+
+risk_fraction = 0.20
+min_spread_bps = 6.0
+vol_multiplier = 2.5
 stop_loss_pct = 0.005
 requote_interval_ms = 3000
 momentum_threshold_bps = 8.0
 momentum_spread_mult = 2.0
 vol_window = 120
 balance_refresh_secs = 60
-min_order_size = 0.1          # EdgeX minimum order size
+
+# ============================================================================
+# Hyperliquid - Feeder + Strategy
+# ============================================================================
+[hyperliquid]
+feeder_enabled = false
+feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
+feeder_symbols = { ETH = "ETH", BTC = "BTC" }
+
+exchange_id = 5
+symbol_id = 1002
+
+risk_fraction = 0.20
+min_spread_bps = 5.0
+vol_multiplier = 2.5
+stop_loss_pct = 0.005
+requote_interval_ms = 2000
+momentum_threshold_bps = 8.0
+momentum_spread_mult = 2.0
+vol_window = 120
+balance_refresh_secs = 60
+
+# ============================================================================
+# Inventory-Neutral MM Strategy (Lighter DEX)
+# ============================================================================
+[inventory_neutral_mm]
+# Exchange identifiers
+exchange_id = 2          # Lighter
+symbol_id = 1002         # ETH-PERP
+market_id = 0
+tick_size = 0.01
+step_size = 0.0001
+
+# Fees
+maker_fee_bps = 0.38
+min_profit_bps = 1.0
+
+# Quoting
+penny_ticks = 1.0
+inventory_skew_bps = 3.0
+
+# Position management
+base_order_size = 0.02
+max_position = 0.20
+inventory_urgency_threshold = 0.08
+
+# Risk control
+adverse_selection_threshold = 2.0
+requote_threshold_bps = 1.5
+order_ttl_secs = 5
+max_leverage = 10.0
+min_available_balance = 2.0
+use_post_only = true
+poll_interval_ms = 100
+
+# Microstructure (v4.0.0)
+micro_samples = 200
+ema_fast_period = 5
+ema_slow_period = 20
+use_depth_pricing = true
+vol_spread_scale = 0.5
+momentum_skew_scale = 0.3
