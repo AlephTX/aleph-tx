@@ -68,14 +68,14 @@ struct MicrostructureTracker {
 }
 
 impl MicrostructureTracker {
-    fn new(max_samples: usize) -> Self {
+    fn new(max_samples: usize, ema_fast_period: usize, ema_slow_period: usize) -> Self {
         Self {
             price_samples: VecDeque::with_capacity(max_samples),
             max_samples,
             ema_fast: 0.0,
             ema_slow: 0.0,
-            ema_fast_alpha: 2.0 / 6.0,   // 5-period EMA
-            ema_slow_alpha: 2.0 / 21.0,  // 20-period EMA
+            ema_fast_alpha: 2.0 / (ema_fast_period as f64 + 1.0),
+            ema_slow_alpha: 2.0 / (ema_slow_period as f64 + 1.0),
             ema_initialized: false,
         }
     }
@@ -145,7 +145,6 @@ pub struct InventoryNeutralMM {
     config: InventoryNeutralMMConfig,
 
     trading: Arc<dyn Exchange>,
-    #[allow(dead_code)]
     ledger: Arc<RwLock<ShadowLedger>>,
     shm_reader: ShmReader,
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
@@ -187,6 +186,11 @@ impl InventoryNeutralMM {
         }
 
         Self {
+            micro: MicrostructureTracker::new(
+                config.micro_samples,
+                config.ema_fast_period,
+                config.ema_slow_period,
+            ),
             config,
             trading,
             ledger,
@@ -194,7 +198,6 @@ impl InventoryNeutralMM {
             shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
-            micro: MicrostructureTracker::new(200),
             active_orders: Vec::new(),
             session_start_balance: 0.0,
             total_orders_placed: 0,
@@ -210,10 +213,16 @@ impl InventoryNeutralMM {
     ) -> Result<()> {
         info!("🎯 Inventory-Neutral MM started");
 
-        // Cancel all existing orders
+        // Cancel all existing orders and wait for confirmation
+        info!("📤 Canceling all existing orders...");
         if let Err(e) = self.trading.cancel_all().await {
             warn!("Failed to cancel existing orders: {:?}", e);
+        } else {
+            info!("✅ All existing orders canceled");
         }
+
+        // Wait 2 seconds for cancellations to propagate
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Wait for account stats
         info!("⏳ Waiting for account stats...");
@@ -271,7 +280,23 @@ impl InventoryNeutralMM {
             // Update account stats
             let stats = self.account_stats_reader.read();
             self.account_stats = stats.into();
-            let position = self.account_stats.position;
+
+            // Use shadow ledger's total_exposure (real_pos + in_flight_pos) for position tracking
+            // This ensures we account for pending orders when checking position limits
+            let ledger_pos = self.ledger.read().total_exposure();
+            let position = if ledger_pos.abs() > 1e-8 || self.total_orders_placed > 0 {
+                ledger_pos  // Use ledger position after first order
+            } else {
+                self.account_stats.position  // Fallback to account stats on first startup
+            };
+
+            // Log position for debugging
+            if self.total_orders_placed % 10 == 0 {
+                debug!(
+                    "Position check: ledger={:.4} account={:.4} using={:.4} max={:.4}",
+                    ledger_pos, self.account_stats.position, position, self.config.max_position
+                );
+            }
 
             // Periodic ledger sync: correct drift from missed events (every 30s)
             if self.last_balance_check.elapsed() > Duration::from_secs(30) {
@@ -325,8 +350,8 @@ impl InventoryNeutralMM {
 
             // Update microstructure with VWMicro price
             self.micro.update(pricing_mid);
-            let _vol_bps = self.micro.volatility_bps();
-            let _momentum_bps = self.micro.momentum_bps();
+            let vol_bps = self.micro.volatility_bps();
+            let momentum_bps = self.micro.momentum_bps();
             let as_score = self.micro.adverse_selection_score();
 
             // Adverse selection filter
@@ -352,19 +377,28 @@ impl InventoryNeutralMM {
 
             let penny = self.config.tick_size * self.config.penny_ticks;
 
-            // Penny jump: improve BBO by 1 tick
-            let raw_bid = bbo.bid_price + penny;
-            let raw_ask = bbo.ask_price - penny;
+            // Volatility spread adjustment (high volatility → wider spread)
+            let vol_spread_adjustment = vol_bps * self.config.vol_spread_scale / 10000.0 * mid;
+
+            // Penny jump: improve BBO by 1 tick + volatility adjustment
+            let raw_bid = bbo.bid_price + penny - vol_spread_adjustment;
+            let raw_ask = bbo.ask_price - penny + vol_spread_adjustment;
+
+            // Momentum shift (trend direction → shift quotes)
+            // Uptrend: raise both bid and ask (more willing to buy)
+            // Downtrend: lower both bid and ask (more willing to sell)
+            let momentum_shift = momentum_bps * self.config.momentum_skew_scale / 10000.0 * mid;
 
             // Inventory skew: shift both prices to encourage position flattening
             // Long → lower prices (eager to sell, reluctant to buy)
             // Short → higher prices (eager to buy, reluctant to sell)
             // Use sigmoid for smooth non-linear response
             let inv_ratio = self.sigmoid_inventory_ratio(position);
-            let skew_dollars = mid * inv_ratio * self.config.inventory_skew_bps / 10000.0;
+            let effective_mid = if self.config.use_depth_pricing { pricing_mid } else { mid };
+            let skew_dollars = effective_mid * inv_ratio * self.config.inventory_skew_bps / 10000.0;
 
-            let our_bid = ((raw_bid - skew_dollars) / self.config.tick_size).floor() * self.config.tick_size;
-            let our_ask = ((raw_ask - skew_dollars) / self.config.tick_size).ceil() * self.config.tick_size;
+            let our_bid = ((raw_bid - skew_dollars + momentum_shift) / self.config.tick_size).floor() * self.config.tick_size;
+            let our_ask = ((raw_ask - skew_dollars + momentum_shift) / self.config.tick_size).ceil() * self.config.tick_size;
 
             // Safety: never cross the spread (bid must be < ask)
             if our_bid >= our_ask {
@@ -444,11 +478,24 @@ impl InventoryNeutralMM {
             // Place new grid orders (concurrent placement for better performance)
             let mut placed_bids = 0;
             let mut placed_asks = 0;
+            let mut cumulative_bid_size = 0.0;
+            let mut cumulative_ask_size = 0.0;
 
             if should_requote_bid && !bid_levels.is_empty() {
                 for (price, size) in &bid_levels {
                     if *size < 0.001 {
                         continue;
+                    }
+                    // Re-read position before each order to account for fills during loop
+                    let current_pos = self.ledger.read().total_exposure();
+
+                    // Check cumulative position limit before placing order
+                    if current_pos + cumulative_bid_size + *size > self.config.max_position {
+                        debug!(
+                            "Grid bid L{} would breach max_position (current={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                            placed_bids + 1, current_pos, cumulative_bid_size, size, self.config.max_position
+                        );
+                        break;
                     }
                     match self.trading.buy(*size, *price).await {
                         Ok(result) => {
@@ -463,6 +510,7 @@ impl InventoryNeutralMM {
                             self.total_orders_placed += 1;
                             self.telemetry.record_order_placed();
                             placed_bids += 1;
+                            cumulative_bid_size += *size;  // Accumulate after successful placement
                         }
                         Err(e) => {
                             warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
@@ -485,6 +533,17 @@ impl InventoryNeutralMM {
                     if *size < 0.001 {
                         continue;
                     }
+                    // Re-read position before each order to account for fills during loop
+                    let current_pos = self.ledger.read().total_exposure();
+
+                    // Check cumulative position limit before placing order
+                    if current_pos - cumulative_ask_size - *size < -self.config.max_position {
+                        debug!(
+                            "Grid ask L{} would breach max_position (current={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                            placed_asks + 1, current_pos, cumulative_ask_size, size, self.config.max_position
+                        );
+                        break;
+                    }
                     match self.trading.sell(*size, *price).await {
                         Ok(result) => {
                             debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
@@ -498,6 +557,7 @@ impl InventoryNeutralMM {
                             self.total_orders_placed += 1;
                             self.telemetry.record_order_placed();
                             placed_asks += 1;
+                            cumulative_ask_size += *size;  // Accumulate after successful placement
                         }
                         Err(e) => {
                             warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
@@ -645,6 +705,18 @@ impl InventoryNeutralMM {
     ///
     /// v4.0.0: Uses Sigmoid (tanh) function for SIZE multiplier instead of linear urgency
     fn calculate_asymmetric_sizes(&self, position: f64, mid: f64) -> (f64, f64) {
+        // Hard stop: if position at limit, only allow flattening orders
+        if position.abs() >= self.config.max_position {
+            let min_size = 11.0 / mid;
+            if position > 0.0 {
+                // Long at limit: only allow sells
+                return (0.0, min_size.max(self.config.base_order_size));
+            } else {
+                // Short at limit: only allow buys
+                return (min_size.max(self.config.base_order_size), 0.0);
+            }
+        }
+
         // Sigmoid SIZE multiplier using tanh: 1.0 at pos=0, ~3.0 at pos=max_position
         // Formula: 1.0 + tanh(steepness * normalized_pos)
         // tanh(4) ≈ 0.9993, so at pos=max_position, multiplier ≈ 1.0 + 1.0 = 2.0

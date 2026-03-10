@@ -11,7 +11,7 @@
 
 use crate::error::TradingError;
 use crate::shadow_ledger::ShadowLedger;
-use super::error::LighterErrorResponse;
+use super::error::{LighterErrorCode, LighterErrorResponse};
 use parking_lot::RwLock;
 
 use anyhow::Result;
@@ -490,6 +490,11 @@ impl LighterTrading {
             .map_err(|e| anyhow::anyhow!("Parse sendTx response: {} body={}", e, body))?;
 
         if parsed.code != 200 {
+            // Check if this is a margin error
+            let error_code = LighterErrorCode::from_code(parsed.code);
+            if error_code.is_margin_error() {
+                return Err(TradingError::InsufficientMargin.into());
+            }
             anyhow::bail!(
                 "sendTx code={}: {}",
                 parsed.code,
@@ -546,6 +551,11 @@ impl LighterTrading {
             .map_err(|e| anyhow::anyhow!("Parse sendTxBatch: {} body={}", e, body))?;
 
         if parsed.code != 200 {
+            // Check if this is a margin error
+            let error_code = LighterErrorCode::from_code(parsed.code);
+            if error_code.is_margin_error() {
+                return Err(TradingError::InsufficientMargin.into());
+            }
             anyhow::bail!(
                 "sendTxBatch code={}: {}",
                 parsed.code,
