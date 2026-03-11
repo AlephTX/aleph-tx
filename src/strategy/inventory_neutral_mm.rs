@@ -15,7 +15,7 @@
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::{Result, TradingError};
-use crate::exchange::Exchange;
+use crate::exchange::{Exchange, BatchOrderParams as ExchangeBatchParams};
 use crate::order_tracker::{OrderTracker, OrderSide};
 use crate::shm_event_reader::ShmEventReaderV2;
 use crate::shm_reader::ShmReader;
@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct AccountStats {
     pub available_balance: f64,
+    pub portfolio_value: f64,
     pub position: f64,
     pub leverage: f64,
     pub last_update: Instant,
@@ -39,6 +40,7 @@ impl Default for AccountStats {
     fn default() -> Self {
         Self {
             available_balance: 0.0,
+            portfolio_value: 0.0,
             position: 0.0,
             leverage: 0.0,
             last_update: Instant::now(),
@@ -50,6 +52,7 @@ impl From<AccountStatsSnapshot> for AccountStats {
     fn from(snapshot: AccountStatsSnapshot) -> Self {
         Self {
             available_balance: snapshot.available_balance,
+            portfolio_value: snapshot.portfolio_value,
             position: snapshot.position,
             leverage: snapshot.leverage,
             last_update: Instant::now(),
@@ -255,9 +258,9 @@ impl InventoryNeutralMM {
 
             if stats.available_balance > 0.0 && data_age_secs < 60 {
                 self.account_stats = stats.into();
-                self.session_start_balance = self.account_stats.available_balance;
-                info!("✅ Account stats loaded: ${:.2} available, position={:.4}",
-                    self.account_stats.available_balance, self.account_stats.position);
+                self.session_start_balance = self.account_stats.portfolio_value;
+                info!("✅ Account stats loaded: equity=${:.2} available=${:.2} position={:.4}",
+                    self.account_stats.portfolio_value, self.account_stats.available_balance, self.account_stats.position);
 
                 // Sync order tracker with authoritative position from exchange
                 let delta = self.order_tracker.force_sync_position(self.account_stats.position);
@@ -271,6 +274,13 @@ impl InventoryNeutralMM {
         }
 
         info!("🚀 Starting main loop...");
+
+        // P0: Validate post_only configuration is active
+        if self.config.use_post_only {
+            info!("🛡️  Post-Only (ALO) mode ENABLED — all limit orders will be maker-only");
+        } else {
+            warn!("⚠️  Post-Only mode DISABLED — orders may execute as taker!");
+        }
 
         // Spawn background V2 event consumer → OrderTracker state transitions
         if let Some(mut event_reader) = self.event_reader.take() {
@@ -500,6 +510,30 @@ impl InventoryNeutralMM {
                 continue;
             }
 
+            // ═══════════════════════════════════════════════════════════════════
+            // P0: Anti-Taker Clamp — last-hop price protection before sending
+            // ═══════════════════════════════════════════════════════════════════
+            // Ensure bid stays strictly inside best_bid and ask stays strictly
+            // inside best_ask by at least 1 tick, preventing taker fills even
+            // if BBO moved between our calculation and order submission.
+            let tick = self.config.tick_size;
+            let clamped_bid = our_bid.min(bbo.bid_price - tick);
+            let clamped_ask = our_ask.max(bbo.ask_price + tick);
+
+            // Round to tick grid after clamping
+            let our_bid = (clamped_bid / tick).floor() * tick;
+            let our_ask = (clamped_ask / tick).ceil() * tick;
+
+            // If market spread is too tight for safe maker placement, skip
+            if our_bid >= our_ask || our_bid <= 0.0 {
+                debug!(
+                    "Anti-taker clamp: spread too tight after clamp (bid={:.2} ask={:.2} bbo={:.2}/{:.2}), skipping",
+                    our_bid, our_ask, bbo.bid_price, bbo.ask_price
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
             // Safety: our spread must cover round-trip fees
             let round_trip_fee_bps = self.config.maker_fee_bps * 2.0;
             let min_spread_bps = round_trip_fee_bps + self.config.min_profit_bps;
@@ -560,10 +594,10 @@ impl InventoryNeutralMM {
             }
 
             debug!(
-                "BBO={:.2}/{:.2} Mkt={:.1}bps Our={:.2}/{:.2} Sprd={:.1}bps Pos={:.4} Bid={:.3} Ask={:.3}",
+                "BBO={:.2}/{:.2} Mkt={:.1}bps Our={:.2}/{:.2} Sprd={:.1}bps Pos={:.4} Bid={:.3} Ask={:.3} post_only={}",
                 bbo.bid_price, bbo.ask_price, market_spread_bps,
                 our_bid, our_ask, actual_spread_bps,
-                position, bid_size, ask_size
+                position, bid_size, ask_size, self.config.use_post_only
             );
 
             // Calculate grid levels for both sides
@@ -574,7 +608,7 @@ impl InventoryNeutralMM {
             let should_requote_bid = self.should_requote_side(OrderSide::Buy, &bid_levels);
             let should_requote_ask = self.should_requote_side(OrderSide::Sell, &ask_levels);
 
-            // Cancel and replace orders if needed
+            // Cancel stale orders on sides that need requoting
             if should_requote_bid {
                 if let Err(e) = self.cancel_side_orders(OrderSide::Buy).await {
                     warn!("Failed to cancel bid orders: {}", e);
@@ -586,103 +620,153 @@ impl InventoryNeutralMM {
                 }
             }
 
-            // Place new grid orders (concurrent placement for better performance)
+            // ═══════════════════════════════════════════════════════════════════
+            // P1: Batch-first order placement — reduce single-side exposure
+            // ═══════════════════════════════════════════════════════════════════
             let mut placed_bids = 0;
             let mut placed_asks = 0;
-            let mut cumulative_bid_size = 0.0;
-            let mut cumulative_ask_size = 0.0;
 
-            if should_requote_bid && !bid_levels.is_empty() {
-                for (price, size) in &bid_levels {
-                    if *size < 0.001 {
-                        continue;
-                    }
-                    // v5.0.0: worst-case long check before placing bid
-                    let current_pos = self.order_tracker.worst_case_long();
+            // Fast path: both sides need requoting with single level → use atomic batch
+            let use_batch = should_requote_bid && should_requote_ask
+                && bid_levels.len() == 1 && ask_levels.len() == 1
+                && bid_levels[0].1 >= 0.001 && ask_levels[0].1 >= 0.001;
 
-                    // Check cumulative position limit before placing order
-                    if current_pos + cumulative_bid_size + *size > self.config.max_position {
-                        debug!(
-                            "Grid bid L{} would breach max_position (worst_long={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
-                            placed_bids + 1, current_pos, cumulative_bid_size, size, self.config.max_position
-                        );
-                        break;
-                    }
-                    match self.trading.buy(*size, *price).await {
+            if use_batch {
+                let (bid_price, bid_sz) = bid_levels[0];
+                let (ask_price, ask_sz) = ask_levels[0];
+
+                // Worst-case bilateral check before batch
+                let worst_long = self.order_tracker.worst_case_long();
+                let worst_short = self.order_tracker.worst_case_short();
+                let bid_ok = worst_long + bid_sz <= self.config.max_position;
+                let ask_ok = worst_short - ask_sz >= -self.config.max_position;
+
+                if bid_ok && ask_ok {
+                    match self.trading.place_batch(ExchangeBatchParams {
+                        bid_price, ask_price, bid_size: bid_sz, ask_size: ask_sz,
+                    }).await {
                         Ok(result) => {
-                            debug!("Grid Buy L{}: ${:.2} x {:.3}", placed_bids + 1, price, size);
+                            let now = Instant::now();
+                            // Use first tx_hash for bid, second for ask (or same if single hash)
+                            let bid_hash = result.tx_hashes.first().cloned().unwrap_or_default();
+                            let ask_hash = result.tx_hashes.get(1).cloned().unwrap_or_else(|| bid_hash.clone());
                             self.active_orders.push(ActiveOrder {
-                                order_id: result.tx_hash,
-                                client_order_id: result.client_order_index,
-                                side: OrderSide::Buy,
-                                price: *price,
-                                size: *size,
-                                placed_at: Instant::now(),
+                                order_id: bid_hash, client_order_id: result.bid_client_order_index,
+                                side: OrderSide::Buy, price: bid_price, size: bid_sz, placed_at: now,
                             });
-                            self.total_orders_placed += 1;
+                            self.active_orders.push(ActiveOrder {
+                                order_id: ask_hash, client_order_id: result.ask_client_order_index,
+                                side: OrderSide::Sell, price: ask_price, size: ask_sz, placed_at: now,
+                            });
+                            self.total_orders_placed += 2;
                             self.telemetry.record_order_placed();
-                            placed_bids += 1;
-                            cumulative_bid_size += *size;  // Accumulate after successful placement
+                            self.telemetry.record_order_placed();
+                            placed_bids = 1;
+                            placed_asks = 1;
+                            debug!("Batch placed: bid={:.2}x{:.3} ask={:.2}x{:.3}", bid_price, bid_sz, ask_price, ask_sz);
                         }
                         Err(e) => {
-                            warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
-                            self.telemetry.record_order_rejected(&format!("buy L{}: {}", placed_bids + 1, e));
+                            warn!("Batch order failed: {}", e);
+                            self.telemetry.record_order_rejected(&format!("batch: {}", e));
                             if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                                warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
                                 self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
                                 self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
-                                break;
                             }
-                            // Continue placing other levels even if one fails
+                        }
+                    }
+                } else {
+                    debug!("Batch skipped: position limit (worst_long={:.4} worst_short={:.4})", worst_long, worst_short);
+                }
+            } else {
+                // Fallback: sequential per-side placement (multi-level grid or single-side requote)
+                let mut cumulative_bid_size = 0.0;
+                let mut cumulative_ask_size = 0.0;
+
+                if should_requote_bid && !bid_levels.is_empty() {
+                    for (price, size) in &bid_levels {
+                        if *size < 0.001 {
+                            continue;
+                        }
+                        let current_pos = self.order_tracker.worst_case_long();
+                        if current_pos + cumulative_bid_size + *size > self.config.max_position {
+                            debug!(
+                                "Grid bid L{} would breach max_position (worst_long={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                                placed_bids + 1, current_pos, cumulative_bid_size, size, self.config.max_position
+                            );
+                            break;
+                        }
+                        match self.trading.buy(*size, *price).await {
+                            Ok(result) => {
+                                debug!("Grid Buy L{}: ${:.2} x {:.3}", placed_bids + 1, price, size);
+                                self.active_orders.push(ActiveOrder {
+                                    order_id: result.tx_hash,
+                                    client_order_id: result.client_order_index,
+                                    side: OrderSide::Buy,
+                                    price: *price,
+                                    size: *size,
+                                    placed_at: Instant::now(),
+                                });
+                                self.total_orders_placed += 1;
+                                self.telemetry.record_order_placed();
+                                placed_bids += 1;
+                                cumulative_bid_size += *size;
+                            }
+                            Err(e) => {
+                                warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
+                                self.telemetry.record_order_rejected(&format!("buy L{}: {}", placed_bids + 1, e));
+                                if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
+                                    warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                    self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
+                                    self.cancel_all_orders().await;
+                                    self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
 
-            if should_requote_ask && !ask_levels.is_empty() {
-                for (price, size) in &ask_levels {
-                    if *size < 0.001 {
-                        continue;
-                    }
-                    // v5.0.0: worst-case short check before placing ask
-                    let current_pos = self.order_tracker.worst_case_short();
-
-                    // Check cumulative position limit before placing order
-                    if current_pos - cumulative_ask_size - *size < -self.config.max_position {
-                        debug!(
-                            "Grid ask L{} would breach max_position (worst_short={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
-                            placed_asks + 1, current_pos, cumulative_ask_size, size, self.config.max_position
-                        );
-                        break;
-                    }
-                    match self.trading.sell(*size, *price).await {
-                        Ok(result) => {
-                            debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
-                            self.active_orders.push(ActiveOrder {
-                                order_id: result.tx_hash,
-                                client_order_id: result.client_order_index,
-                                side: OrderSide::Sell,
-                                price: *price,
-                                size: *size,
-                                placed_at: Instant::now(),
-                            });
-                            self.total_orders_placed += 1;
-                            self.telemetry.record_order_placed();
-                            placed_asks += 1;
-                            cumulative_ask_size += *size;  // Accumulate after successful placement
+                if should_requote_ask && !ask_levels.is_empty() {
+                    for (price, size) in &ask_levels {
+                        if *size < 0.001 {
+                            continue;
                         }
-                        Err(e) => {
-                            warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
-                            self.telemetry.record_order_rejected(&format!("sell L{}: {}", placed_asks + 1, e));
-                            if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                                warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
-                                self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
-                                self.cancel_all_orders().await;
-                                self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
-                                break;
+                        let current_pos = self.order_tracker.worst_case_short();
+                        if current_pos - cumulative_ask_size - *size < -self.config.max_position {
+                            debug!(
+                                "Grid ask L{} would breach max_position (worst_short={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
+                                placed_asks + 1, current_pos, cumulative_ask_size, size, self.config.max_position
+                            );
+                            break;
+                        }
+                        match self.trading.sell(*size, *price).await {
+                            Ok(result) => {
+                                debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
+                                self.active_orders.push(ActiveOrder {
+                                    order_id: result.tx_hash,
+                                    client_order_id: result.client_order_index,
+                                    side: OrderSide::Sell,
+                                    price: *price,
+                                    size: *size,
+                                    placed_at: Instant::now(),
+                                });
+                                self.total_orders_placed += 1;
+                                self.telemetry.record_order_placed();
+                                placed_asks += 1;
+                                cumulative_ask_size += *size;
                             }
-                            // Continue placing other levels even if one fails
+                            Err(e) => {
+                                warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
+                                self.telemetry.record_order_rejected(&format!("sell L{}: {}", placed_asks + 1, e));
+                                if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
+                                    warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
+                                    self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
+                                    self.cancel_all_orders().await;
+                                    self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -691,8 +775,9 @@ impl InventoryNeutralMM {
             // Log grid placement summary
             if placed_bids > 0 || placed_asks > 0 {
                 info!(
-                    "Grid placed: {} bid levels, {} ask levels (pos={:.4})",
-                    placed_bids, placed_asks, position
+                    "Grid placed: {} bid levels, {} ask levels (pos={:.4}{})",
+                    placed_bids, placed_asks, position,
+                    if use_batch { " batch" } else { "" }
                 );
             }
 
@@ -840,7 +925,9 @@ impl InventoryNeutralMM {
         let normalized_pos = position / self.config.max_position;
         let sigmoid_multiplier = 1.0 + 2.0 * (self.config.sigmoid_steepness * normalized_pos.abs()).tanh();
 
-        let inventory_offset = position.abs() * sigmoid_multiplier;
+        // Cap inventory_offset to prevent whiplash: flattening order <= cap_mult * base_order_size
+        let max_offset = self.config.base_order_size * (self.config.flattening_cap_mult - 1.0).max(0.5);
+        let inventory_offset = (position.abs() * sigmoid_multiplier).min(max_offset);
 
         let bid_size = if position < 0.0 {
             // Short position → increase bid size to buy back
@@ -921,6 +1008,11 @@ impl InventoryNeutralMM {
             (bid_size, ask_size)
         };
 
+        // Hard cap: no single order exceeds base_order_size * flattening_cap_mult
+        let hard_cap = self.config.base_order_size * self.config.flattening_cap_mult;
+        let bid_size = bid_size.min(hard_cap);
+        let ask_size = ask_size.min(hard_cap);
+
         // Round to step size
         let bid_size = (bid_size / self.config.step_size).floor() * self.config.step_size;
         let ask_size = (ask_size / self.config.step_size).floor() * self.config.step_size;
@@ -946,7 +1038,9 @@ impl InventoryNeutralMM {
     }
 
     fn print_pnl_update(&self) {
-        let pnl = self.account_stats.available_balance - self.session_start_balance;
+        let equity = self.account_stats.portfolio_value;
+        let available = self.account_stats.available_balance;
+        let pnl = equity - self.session_start_balance;
         let pnl_pct = if self.session_start_balance > 0.0 {
             (pnl / self.session_start_balance) * 100.0
         } else {
@@ -954,12 +1048,13 @@ impl InventoryNeutralMM {
         };
 
         info!(
-            "📊 PnL: ${:.2} ({:+.2}%) | Pos: {:.4} ETH | Orders: {} | Balance: ${:.2}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {}",
             pnl,
             pnl_pct,
+            equity,
+            available,
             self.account_stats.position,
             self.total_orders_placed,
-            self.account_stats.available_balance
         );
     }
 

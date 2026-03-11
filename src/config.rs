@@ -137,6 +137,9 @@ fn default_grid_size_decay() -> f64 {
 fn default_sigmoid_steepness() -> f64 {
     4.0
 }
+fn default_flattening_cap_mult() -> f64 {
+    2.0
+}
 fn default_micro_samples() -> usize {
     200
 }
@@ -185,6 +188,9 @@ pub struct InventoryNeutralMMConfig {
     // Sigmoid SIZE偏移 (v4.0.0)
     #[serde(default = "default_sigmoid_steepness")]
     pub sigmoid_steepness: f64,   // default: 4.0 (控制sigmoid曲线陡峭度)
+    // Flattening hard cap: max single-order size = base_order_size * cap_mult (v5.0.0)
+    #[serde(default = "default_flattening_cap_mult")]
+    pub flattening_cap_mult: f64, // default: 2.0 (防止反向巨单鞭尾)
     // 微观结构参数 (v4.0.0)
     #[serde(default = "default_micro_samples")]
     pub micro_samples: usize,     // default: 200 (价格样本数)
@@ -230,6 +236,7 @@ impl Default for InventoryNeutralMMConfig {
             grid_spacing_bps: 2.0,
             grid_size_decay: 0.7,
             sigmoid_steepness: 4.0,
+            flattening_cap_mult: 2.0,
             micro_samples: 200,
             ema_fast_period: 5,
             ema_slow_period: 20,

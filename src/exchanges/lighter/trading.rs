@@ -587,8 +587,8 @@ impl LighterTrading {
         }
 
         tracing::info!(
-            "Signed {} order: price={} size={} tx_hash={} coi={}",
-            params.side, params.price, params.size, tx_hash, client_order_index
+            "Signed {} order: price={} size={} type={:?} tx_hash={} coi={}",
+            params.side, params.price, params.size, params.order_type, tx_hash, client_order_index
         );
 
         match self.send_tx(tx_type, tx_info).await {
