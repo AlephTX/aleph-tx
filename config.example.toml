@@ -116,12 +116,17 @@ inventory_urgency_threshold = 0.08
 
 # Risk control
 adverse_selection_threshold = 2.0
-requote_threshold_bps = 1.5
-order_ttl_secs = 5
+requote_threshold_bps = 2.0
+order_ttl_secs = 10
 max_leverage = 10.0
 min_available_balance = 2.0
 use_post_only = true
-poll_interval_ms = 100
+poll_interval_ms = 300
+
+# Grid & Sigmoid
+grid_levels = 1
+sigmoid_steepness = 1.5
+flattening_cap_mult = 2.0
 
 # Microstructure (v4.0.0)
 micro_samples = 200
