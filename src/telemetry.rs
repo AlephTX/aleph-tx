@@ -20,6 +20,12 @@ pub struct TelemetryCollector {
     pub adverse_selection_score: f64,
     /// Last margin cooldown timestamp
     last_margin_cooldown: Option<Instant>,
+    /// Total fills received
+    pub fill_count: u64,
+    /// Total fees paid in USD
+    pub total_fees_paid: f64,
+    /// Session start time for fill rate calculation
+    session_start: Instant,
 }
 
 impl Default for TelemetryCollector {
@@ -38,6 +44,9 @@ impl TelemetryCollector {
             spread_size_bps: 0.0,
             adverse_selection_score: 0.0,
             last_margin_cooldown: None,
+            fill_count: 0,
+            total_fees_paid: 0.0,
+            session_start: Instant::now(),
         }
     }
 
@@ -85,6 +94,21 @@ impl TelemetryCollector {
         self.adverse_selection_score = score;
     }
 
+    /// Record a fill event with fee
+    pub fn record_fill(&mut self, fee: f64) {
+        self.fill_count += 1;
+        self.total_fees_paid += fee;
+    }
+
+    /// Get fill rate (fills per minute)
+    pub fn fill_rate(&self) -> f64 {
+        let elapsed_min = self.session_start.elapsed().as_secs_f64() / 60.0;
+        if elapsed_min < 0.01 {
+            return 0.0;
+        }
+        self.fill_count as f64 / elapsed_min
+    }
+
     /// Export all metrics as structured log
     pub fn export_metrics(&self) {
         info!(
@@ -94,6 +118,9 @@ impl TelemetryCollector {
             margin_cooldown_events = self.margin_cooldown_events,
             spread_size_bps = self.spread_size_bps,
             adverse_selection_score = self.adverse_selection_score,
+            fill_count = self.fill_count,
+            total_fees_paid = format!("{:.4}", self.total_fees_paid).as_str(),
+            fill_rate = format!("{:.2}", self.fill_rate()).as_str(),
             "Telemetry snapshot"
         );
     }

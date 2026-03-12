@@ -251,6 +251,34 @@ impl OrderTracker {
         self.state.read().active_orders.len()
     }
 
+    /// Count of filled orders within a given duration (for fill rate estimation)
+    pub fn filled_count_since(&self, duration: Duration) -> usize {
+        let state = self.state.read();
+        state
+            .completed_orders
+            .values()
+            .filter(|o| {
+                o.lifecycle == OrderLifecycle::Filled && o.last_update.elapsed() < duration
+            })
+            .count()
+    }
+
+    /// Total fill count and fees from all completed orders (for telemetry sync)
+    pub fn total_fill_stats(&self) -> (u64, f64) {
+        let state = self.state.read();
+        let mut count = 0u64;
+        let mut fees = 0.0f64;
+        for order in state.completed_orders.values() {
+            count += order.fills.len() as u64;
+            fees += order.total_fee;
+        }
+        for order in state.active_orders.values() {
+            count += order.fills.len() as u64;
+            fees += order.total_fee;
+        }
+        (count, fees)
+    }
+
     /// Get all active order client_order_ids
     pub fn active_cois(&self) -> Vec<i64> {
         self.state.read().active_orders.keys().copied().collect()
