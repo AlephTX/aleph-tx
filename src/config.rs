@@ -165,10 +165,16 @@ fn default_cross_exchange_as_threshold() -> f64 {
     8.0
 }
 fn default_as_gamma() -> f64 {
-    0.1
+    5000.0
 }
 fn default_as_time_horizon_sec() -> f64 {
-    60.0
+    1.0
+}
+fn default_as_kappa() -> f64 {
+    1.5
+}
+fn default_max_spread_bps() -> f64 {
+    30.0
 }
 
 /// Inventory Neutral Market Maker 策略配置
@@ -223,9 +229,13 @@ pub struct InventoryNeutralMMConfig {
     pub cross_exchange_as_threshold: f64, // default: 8.0 bps (跨交易所AS阈值)
     // Avellaneda-Stoikov 定价参数 (v5.1.0)
     #[serde(default = "default_as_gamma")]
-    pub as_gamma: f64,                   // default: 0.1 (风险厌恶系数)
+    pub as_gamma: f64,                   // default: 5000.0 (风险厌恶系数，fractional σ 下需要大值)
     #[serde(default = "default_as_time_horizon_sec")]
-    pub as_time_horizon_sec: f64,        // default: 60.0 (时间窗口秒)
+    pub as_time_horizon_sec: f64,        // default: 1.0 (时间窗口秒，DEX 短周期)
+    #[serde(default = "default_as_kappa")]
+    pub as_kappa: f64,                   // default: 1.5 (订单到达强度，可配置)
+    #[serde(default = "default_max_spread_bps")]
+    pub max_spread_bps: f64,             // default: 30.0 (A-S spread 安全上限)
     // 风控
     pub adverse_selection_threshold: f64, // default: 2.0
     pub requote_threshold_bps: f64,      // default: 1.5
@@ -267,8 +277,10 @@ impl Default for InventoryNeutralMMConfig {
             momentum_skew_scale: 0.3,
             cross_exchange_scale: 0.5,
             cross_exchange_as_threshold: 8.0,
-            as_gamma: 0.1,
-            as_time_horizon_sec: 60.0,
+            as_gamma: 5000.0,
+            as_time_horizon_sec: 1.0,
+            as_kappa: 1.5,
+            max_spread_bps: 30.0,
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,

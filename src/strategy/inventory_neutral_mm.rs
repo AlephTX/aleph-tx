@@ -526,35 +526,36 @@ impl InventoryNeutralMM {
             // CORE: Avellaneda-Stoikov Optimal Market Making
             // ═══════════════════════════════════════════════════════════════════
             //
-            // reservation_price = mid * (1 - γ·σ²·q·T)
+            // reservation_price = mid × (1 - γ·σ²·q·T)
             // optimal_spread   = γ·σ²·T + (2/γ)·ln(1 + γ/κ)
-            // where: γ = risk aversion, σ = volatility, q = inventory, T = time horizon, κ = fill rate
             //
-            // Advantages over penny jump:
-            // - Theoretically optimal spread for inventory risk
-            // - Inventory skew embedded in reservation price (no separate skew param)
-            // - Spread widens naturally with volatility and inventory
+            // γ is large (~5000) because σ is fractional (10bps = 0.001).
+            // κ is configurable order arrival intensity (not estimated from fills).
+            // Spread is capped at max_spread_bps to prevent absurd values on low-liquidity DEX.
 
             let gamma = self.config.as_gamma;
             let time_horizon = self.config.as_time_horizon_sec;
             let sigma = vol_bps / 10000.0; // Convert bps to fraction
-            let q = position / self.config.max_position; // Normalized inventory [-1, 1]
+            let q = position; // Actual inventory in ETH (not normalized)
 
             // Reservation price: mid shifted by inventory risk
             let reservation_price = pricing_mid * (1.0 - gamma * sigma * sigma * q * time_horizon);
 
-            // Estimate fill rate κ from recent fills
-            let kappa = self.estimate_fill_rate();
+            // κ: configurable base + fill rate bonus (more fills → tighter spread)
+            let fill_rate_bonus = self.estimate_fill_rate(); // fills/sec
+            let kappa = self.config.as_kappa + fill_rate_bonus;
 
             // Optimal spread: wider with vol and inventory, tighter with fill rate
-            let gamma_safe = gamma.max(1e-6); // Prevent division by zero
+            let gamma_safe = gamma.max(1e-6);
             let optimal_spread = gamma * sigma * sigma * time_horizon
                 + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
             let half_spread_raw = optimal_spread / 2.0 * pricing_mid;
 
-            // Floor: half_spread must cover round-trip fees + min profit
+            // Cap: prevent absurd spreads on low-liquidity DEX
+            let max_half_spread = pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
+            // Floor: must cover round-trip fees + min profit
             let fee_floor = pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
-            let half_spread = half_spread_raw.max(fee_floor);
+            let half_spread = half_spread_raw.clamp(fee_floor, max_half_spread);
 
             // Apply cross-exchange shift to reservation price
             let shifted_res = reservation_price + cross_shift;
@@ -563,8 +564,9 @@ impl InventoryNeutralMM {
             let our_ask = ((shifted_res + half_spread) / self.config.tick_size).ceil() * self.config.tick_size;
 
             debug!(
-                "A-S: res={:.2} half_sprd={:.4} σ={:.4} q={:.2} κ={:.2} bid={:.2} ask={:.2}",
-                shifted_res, half_spread, sigma, q, kappa, our_bid, our_ask
+                "A-S: res={:.2} half_sprd={:.4} (raw={:.4} cap={:.4} floor={:.4}) σ={:.4} q={:.4} κ={:.2} bid={:.2} ask={:.2}",
+                shifted_res, half_spread, half_spread_raw, max_half_spread, fee_floor,
+                sigma, q, kappa, our_bid, our_ask
             );
 
             // Safety: never cross the spread (bid must be < ask)
@@ -828,11 +830,12 @@ impl InventoryNeutralMM {
     /// Estimate fill rate κ for A-S model from recent order fills
     /// Higher κ → tighter spread (fills are easy to get)
     /// Lower κ → wider spread (fills are scarce, need more edge)
+    /// Returns fills per second (matching T's time unit)
     fn estimate_fill_rate(&self) -> f64 {
         let recent_fills = self.order_tracker.filled_count_since(Duration::from_secs(300));
-        // κ = fills per minute, floored at 0.5 to prevent ln(1) = 0
-        let fills_per_min = recent_fills as f64 / 5.0;
-        fills_per_min.max(0.5)
+        // κ = fills per second, floored at 0.01 to prevent ln(1) = 0
+        let fills_per_sec = recent_fills as f64 / 300.0;
+        fills_per_sec.max(0.01)
     }
 
     /// Calculate grid levels for multi-tier quoting
