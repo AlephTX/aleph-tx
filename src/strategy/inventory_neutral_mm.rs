@@ -400,6 +400,10 @@ impl InventoryNeutralMM {
                         stale_count, self.active_orders.len());
                 }
                 self.order_tracker.gc_completed_orders(Duration::from_secs(30));
+                // Sync fill stats from OrderTracker → Telemetry
+                let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
+                self.telemetry.fill_count = fill_count;
+                self.telemetry.total_fees_paid = total_fees;
                 self.telemetry.export_metrics();
                 self.print_pnl_update();
                 self.last_balance_check = Instant::now();
@@ -425,6 +429,26 @@ impl InventoryNeutralMM {
                     continue;
                 }
             };
+
+            // ═══════════════════════════════════════════════════════════════════
+            // SHM Data Staleness Check
+            // ═══════════════════════════════════════════════════════════════════
+            if bbo.timestamp_ns > 0 {
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let data_age_ms = now_ns.saturating_sub(bbo.timestamp_ns) / 1_000_000;
+                if data_age_ms > 5000 {
+                    warn!(
+                        "Stale BBO: age={}ms (>5000ms), canceling all orders",
+                        data_age_ms
+                    );
+                    self.cancel_all_orders().await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
 
             let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
 
@@ -454,7 +478,6 @@ impl InventoryNeutralMM {
             // Update microstructure with VWMicro price
             self.micro.update(pricing_mid);
             let vol_bps = self.micro.volatility_bps();
-            let momentum_bps = self.micro.momentum_bps();
             let as_score = self.micro.adverse_selection_score();
 
             // Adverse selection filter
@@ -466,70 +489,87 @@ impl InventoryNeutralMM {
             }
 
             // ═══════════════════════════════════════════════════════════════════
-            // CORE: BBO-Following Penny Jump + Inventory Skew
+            // Cross-Exchange Signal: use external exchange mid prices for
+            // directional bias and adverse selection filtering
+            // ═══════════════════════════════════════════════════════════════════
+            let cross_shift = {
+                let external_mids: Vec<f64> = exchanges
+                    .iter()
+                    .filter(|(exch_id, _)| *exch_id != self.config.exchange_id)
+                    .filter(|(_, msg)| msg.bid_price > 0.0 && msg.ask_price > 0.0)
+                    .map(|(_, msg)| (msg.bid_price + msg.ask_price) / 2.0)
+                    .collect();
+
+                if !external_mids.is_empty() {
+                    let cross_mid = external_mids.iter().sum::<f64>() / external_mids.len() as f64;
+                    let cross_signal_bps = (cross_mid - mid) / mid * 10000.0;
+
+                    // Cross-exchange AS filter: if external price diverges too much, skip
+                    if cross_signal_bps.abs() > self.config.cross_exchange_as_threshold {
+                        debug!(
+                            "Cross-exchange AS: signal={:.1}bps (threshold={:.1}), canceling",
+                            cross_signal_bps, self.config.cross_exchange_as_threshold
+                        );
+                        self.cancel_all_orders().await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+
+                    // Directional shift: move quotes towards external consensus
+                    cross_signal_bps * self.config.cross_exchange_scale / 10000.0 * mid
+                } else {
+                    0.0
+                }
+            };
+
+            // ═══════════════════════════════════════════════════════════════════
+            // CORE: Avellaneda-Stoikov Optimal Market Making
             // ═══════════════════════════════════════════════════════════════════
             //
-            // Step 1: Start from market BBO, improve by 1 tick (penny jump)
-            // Step 2: Apply inventory skew to bias towards flattening position
-            // Step 3: Ensure our spread still covers round-trip fees
+            // reservation_price = mid * (1 - γ·σ²·q·T)
+            // optimal_spread   = γ·σ²·T + (2/γ)·ln(1 + γ/κ)
+            // where: γ = risk aversion, σ = volatility, q = inventory, T = time horizon, κ = fill rate
             //
-            // Example (market Bid=1968.00 / Ask=1970.00, pos=-0.1):
-            //   Raw:  our_bid = 1968.01, our_ask = 1969.99
-            //   Skew: our_bid = 1968.07 (more eager to buy), our_ask = 1970.05 (less eager to sell)
-            //   Spread: 1970.05 - 1968.07 = 1.98 = ~10bps >> 0.76bps fee ✅
+            // Advantages over penny jump:
+            // - Theoretically optimal spread for inventory risk
+            // - Inventory skew embedded in reservation price (no separate skew param)
+            // - Spread widens naturally with volatility and inventory
 
-            let penny = self.config.tick_size * self.config.penny_ticks;
+            let gamma = self.config.as_gamma;
+            let time_horizon = self.config.as_time_horizon_sec;
+            let sigma = vol_bps / 10000.0; // Convert bps to fraction
+            let q = position / self.config.max_position; // Normalized inventory [-1, 1]
 
-            // Volatility spread adjustment (high volatility → wider spread)
-            let vol_spread_adjustment = vol_bps * self.config.vol_spread_scale / 10000.0 * mid;
+            // Reservation price: mid shifted by inventory risk
+            let reservation_price = pricing_mid * (1.0 - gamma * sigma * sigma * q * time_horizon);
 
-            // Penny jump: improve BBO by 1 tick + volatility adjustment
-            let raw_bid = bbo.bid_price + penny - vol_spread_adjustment;
-            let raw_ask = bbo.ask_price - penny + vol_spread_adjustment;
+            // Estimate fill rate κ from recent fills
+            let kappa = self.estimate_fill_rate();
 
-            // Momentum shift (trend direction → shift quotes)
-            // Uptrend: raise both bid and ask (more willing to buy)
-            // Downtrend: lower both bid and ask (more willing to sell)
-            let momentum_shift = momentum_bps * self.config.momentum_skew_scale / 10000.0 * mid;
+            // Optimal spread: wider with vol and inventory, tighter with fill rate
+            let gamma_safe = gamma.max(1e-6); // Prevent division by zero
+            let optimal_spread = gamma * sigma * sigma * time_horizon
+                + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
+            let half_spread_raw = optimal_spread / 2.0 * pricing_mid;
 
-            // Inventory skew: shift both prices to encourage position flattening
-            // Long → lower prices (eager to sell, reluctant to buy)
-            // Short → higher prices (eager to buy, reluctant to sell)
-            // Use sigmoid for smooth non-linear response
-            let inv_ratio = self.sigmoid_inventory_ratio(position);
-            let effective_mid = if self.config.use_depth_pricing { pricing_mid } else { mid };
-            let skew_dollars = effective_mid * inv_ratio * self.config.inventory_skew_bps / 10000.0;
+            // Floor: half_spread must cover round-trip fees + min profit
+            let fee_floor = pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
+            let half_spread = half_spread_raw.max(fee_floor);
 
-            let our_bid = ((raw_bid - skew_dollars + momentum_shift) / self.config.tick_size).floor() * self.config.tick_size;
-            let our_ask = ((raw_ask - skew_dollars + momentum_shift) / self.config.tick_size).ceil() * self.config.tick_size;
+            // Apply cross-exchange shift to reservation price
+            let shifted_res = reservation_price + cross_shift;
+
+            let our_bid = ((shifted_res - half_spread) / self.config.tick_size).floor() * self.config.tick_size;
+            let our_ask = ((shifted_res + half_spread) / self.config.tick_size).ceil() * self.config.tick_size;
+
+            debug!(
+                "A-S: res={:.2} half_sprd={:.4} σ={:.4} q={:.2} κ={:.2} bid={:.2} ask={:.2}",
+                shifted_res, half_spread, sigma, q, kappa, our_bid, our_ask
+            );
 
             // Safety: never cross the spread (bid must be < ask)
             if our_bid >= our_ask {
                 debug!("Crossed spread: bid={:.2} >= ask={:.2}, skipping", our_bid, our_ask);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-
-            // ═══════════════════════════════════════════════════════════════════
-            // P0: Anti-Taker Clamp — last-hop price protection before sending
-            // ═══════════════════════════════════════════════════════════════════
-            // Ensure bid stays strictly inside best_bid and ask stays strictly
-            // inside best_ask by at least 1 tick, preventing taker fills even
-            // if BBO moved between our calculation and order submission.
-            let tick = self.config.tick_size;
-            let clamped_bid = our_bid.min(bbo.bid_price - tick);
-            let clamped_ask = our_ask.max(bbo.ask_price + tick);
-
-            // Round to tick grid after clamping
-            let our_bid = (clamped_bid / tick).floor() * tick;
-            let our_ask = (clamped_ask / tick).ceil() * tick;
-
-            // If market spread is too tight for safe maker placement, skip
-            if our_bid >= our_ask || our_bid <= 0.0 {
-                debug!(
-                    "Anti-taker clamp: spread too tight after clamp (bid={:.2} ask={:.2} bbo={:.2}/{:.2}), skipping",
-                    our_bid, our_ask, bbo.bid_price, bbo.ask_price
-                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -785,12 +825,14 @@ impl InventoryNeutralMM {
         }
     }
 
-    /// Sigmoid inventory skew: smooth non-linear response to inventory deviation
-    /// Returns a value in [-1, 1] with steeper response near max_position
-    fn sigmoid_inventory_ratio(&self, position: f64) -> f64 {
-        let normalized = position / self.config.max_position;
-        // tanh provides smooth S-curve: gentle near 0, aggressive near ±1
-        normalized.clamp(-1.0, 1.0).tanh()
+    /// Estimate fill rate κ for A-S model from recent order fills
+    /// Higher κ → tighter spread (fills are easy to get)
+    /// Lower κ → wider spread (fills are scarce, need more edge)
+    fn estimate_fill_rate(&self) -> f64 {
+        let recent_fills = self.order_tracker.filled_count_since(Duration::from_secs(300));
+        // κ = fills per minute, floored at 0.5 to prevent ln(1) = 0
+        let fills_per_min = recent_fills as f64 / 5.0;
+        fills_per_min.max(0.5)
     }
 
     /// Calculate grid levels for multi-tier quoting
@@ -1046,15 +1088,20 @@ impl InventoryNeutralMM {
         } else {
             0.0
         };
+        let tracker_pnl = self.order_tracker.realized_pnl();
 
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {}",
+            "📊 PnL: ${:.2} ({:+.3}%) | TrackerPnL: ${:.2} | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
             pnl,
             pnl_pct,
+            tracker_pnl,
             equity,
             available,
             self.account_stats.position,
             self.total_orders_placed,
+            self.telemetry.fill_count,
+            self.telemetry.fill_rate(),
+            self.telemetry.total_fees_paid,
         );
     }
 
@@ -1142,26 +1189,6 @@ mod tests {
         assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
         assert!((bid_levels[1].1 - 0.07).abs() < 0.001);
         assert!((bid_levels[2].1 - 0.049).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_sigmoid_inventory_ratio() {
-        let config = InventoryNeutralMMConfig {
-            max_position: 0.15,
-            ..Default::default()
-        };
-
-        // Test at zero inventory
-        let ratio_zero = (0.0 / config.max_position).clamp(-1.0, 1.0).tanh();
-        assert!((ratio_zero - 0.0).abs() < 0.01);
-
-        // Test at 50% inventory
-        let ratio_half = (0.075 / config.max_position).clamp(-1.0, 1.0).tanh();
-        assert!(ratio_half > 0.0 && ratio_half < 0.5);
-
-        // Test at max inventory
-        let ratio_max = (0.15 / config.max_position).clamp(-1.0, 1.0).tanh();
-        assert!(ratio_max > 0.7); // tanh(1.0) ≈ 0.76
     }
 
     #[test]
