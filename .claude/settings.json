@@ -24,30 +24,21 @@
       "Bash(git stash:*)",
       "Bash(ls:*)",
       "Bash(wc:*)",
-      "Bash(find:*)",
       "Bash(mkdir:*)",
       "Bash(rm:*)",
       "Bash(mv:*)",
-      "Bash(env:*)",
-      "Bash(which:*)",
-      "Bash(date:*)",
       "WebSearch"
     ],
     "deny": []
   },
   "enabledPlugins": {
-    // High-frequency (keep enabled)
     "rust-analyzer-lsp@claude-plugins-official": true,
     "gopls-lsp@claude-plugins-official": true,
     "commit-commands@claude-plugins-official": true,
     "claude-md-management@claude-plugins-official": true,
-
-    // Medium-frequency (evaluate per session)
     "code-review@claude-plugins-official": true,
     "feature-dev@claude-plugins-official": true,
     "code-simplifier@claude-plugins-official": true,
-
-    // Low-frequency (disable to save ~20K tokens, enable manually when needed)
     "security-guidance@claude-plugins-official": false,
     "github@claude-plugins-official": false,
     "semgrep@claude-plugins-official": false,
