@@ -399,7 +399,7 @@ impl InventoryNeutralMM {
                     info!("Periodic reconcile: cleared {} stale tracker entries (strategy has {})",
                         stale_count, self.active_orders.len());
                 }
-                self.order_tracker.gc_completed_orders(Duration::from_secs(30));
+                self.order_tracker.gc_completed_orders(Duration::from_secs(300));
                 // Sync fill stats from OrderTracker → Telemetry
                 let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
                 self.telemetry.fill_count = fill_count;
@@ -553,7 +553,7 @@ impl InventoryNeutralMM {
 
             // Cap: prevent absurd spreads on low-liquidity DEX
             let max_half_spread = pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
-            // Floor: must cover round-trip fees + min profit
+            // Floor: half of round-trip cost = (2×maker_fee + min_profit) / 2 per side
             let fee_floor = pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
             let half_spread = half_spread_raw.clamp(fee_floor, max_half_spread);
 

@@ -171,10 +171,10 @@ fn default_as_time_horizon_sec() -> f64 {
     1.0
 }
 fn default_as_kappa() -> f64 {
-    1.5
+    2000.0
 }
 fn default_max_spread_bps() -> f64 {
-    30.0
+    60.0
 }
 
 /// Inventory Neutral Market Maker 策略配置
@@ -279,8 +279,8 @@ impl Default for InventoryNeutralMMConfig {
             cross_exchange_as_threshold: 8.0,
             as_gamma: 5000.0,
             as_time_horizon_sec: 1.0,
-            as_kappa: 1.5,
-            max_spread_bps: 30.0,
+            as_kappa: 2000.0,
+            max_spread_bps: 60.0,
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,
