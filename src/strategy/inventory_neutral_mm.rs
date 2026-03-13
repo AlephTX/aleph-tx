@@ -312,9 +312,17 @@ impl InventoryNeutralMM {
                 if *rx.borrow() {
                     info!("🛑 Shutdown signal received");
 
-                    // Step 1: Cancel all active orders
+                    // Step 1: Cancel all active orders (use exchange cancel_all for speed)
                     info!("📤 Canceling all orders...");
-                    self.cancel_all_orders().await;
+                    match self.trading.cancel_all().await {
+                        Ok(count) => info!("✅ Canceled {} orders", count),
+                        Err(e) => warn!("Failed to cancel orders: {}", e),
+                    }
+                    // Sync tracker: mark all active orders as failed
+                    for order in &self.active_orders {
+                        self.order_tracker.mark_failed(order.client_order_id);
+                    }
+                    self.active_orders.clear();
 
                     // Step 2: Close all positions if any
                     let position = self.account_stats.position;
