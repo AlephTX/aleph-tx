@@ -87,8 +87,8 @@ lighter-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (15s)..."; \
-			sleep 15; \
+			echo "⏳ Waiting for graceful shutdown (30s)..."; \
+			sleep 30; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
@@ -138,8 +138,8 @@ backpack-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (10s)..."; \
-			sleep 10; \
+			echo "⏳ Waiting for graceful shutdown (30s)..."; \
+			sleep 30; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
@@ -190,8 +190,8 @@ edgex-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (10s)..."; \
-			sleep 10; \
+			echo "⏳ Waiting for graceful shutdown (30s)..."; \
+			sleep 30; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
