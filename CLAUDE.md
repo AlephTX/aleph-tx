@@ -9,7 +9,7 @@ alwaysApply: true
 
 ## Build & Test (MANDATORY)
 
-**ALL operations MUST use Makefile. NEVER run cargo/go commands directly.**
+**PREFER Makefile for all operations.** Direct cargo/go commands allowed for quick checks (cargo check, cargo clippy), but MUST use Makefile for build/test/run to ensure correct flags and dependencies.
 
 ```bash
 # Build
@@ -23,10 +23,8 @@ make lighter-logs                               # View logs
 # Available strategies: inventory_neutral_mm, adaptive_mm, simple_mm
 # Other exchanges: backpack-up, edgex-up
 
-# Test
-make test           # Unit tests
-make test-up        # Integration test
-make test-down      # Cleanup (MANDATORY)
+# Build verification
+make build          # Verify compilation
 
 # Monitor
 make status         # Show running strategies
@@ -42,6 +40,14 @@ make status         # Show running strategies
 **No Boomerang**: Rust executes HTTP orders DIRECTLY via FFI. Never sends commands back to Go.
 
 **Optimistic Accounting (v5.0.0)**: `OrderTracker` registers per-order state before API call. Worst-case bilateral exposure checked before every order.
+
+## Verification Protocol (MANDATORY)
+
+After ANY code changes:
+1. Run `make build` to verify compilation
+2. For Rust changes: `cargo check` and `cargo clippy` are acceptable for quick verification
+3. Never say "完成" or "Phase X 完成" without build verification
+4. For multi-phase work, verify each phase independently
 
 ## Code Style
 
@@ -104,6 +110,28 @@ Claude auto-loads all CLAUDE.md files = zero warm-up, full project awareness.
 - Format: `type(scope): description` ([Conventional Commits](https://www.conventionalcommits.org/))
 - Types: `feat`, `fix`, `refactor`, `docs`, `test`, `perf`, `chore`
 - Subject line < 72 chars
+
+## Git Workflow
+
+After completing a logical unit of work (phase/feature):
+1. Run `make build` to verify
+2. ASK user: "代码已验证通过。是否创建 commit？"
+3. If yes, use /commit skill
+4. Never auto-commit without asking
+
+## Documentation Policy
+
+- NEVER create CLAUDE.md files in subdirectories unless explicitly requested
+- Architecture documentation belongs in root CLAUDE.md or docs/
+- Subdirectory CLAUDE.md only for multi-team projects (not applicable to SIMPLE tier)
+
+## Rollback Procedure
+
+If production issues occur:
+1. `git revert <commit-hash>`
+2. `make build && make test`
+3. `git push`
+4. Restart strategies: `make lighter-down && make lighter-up`
 
 ## Reference
 
