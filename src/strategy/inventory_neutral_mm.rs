@@ -1091,13 +1091,11 @@ impl InventoryNeutralMM {
         } else {
             0.0
         };
-        let tracker_pnl = self.order_tracker.realized_pnl();
 
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | TrackerPnL: ${:.2} | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
             pnl,
             pnl_pct,
-            tracker_pnl,
             equity,
             available,
             self.account_stats.position,
