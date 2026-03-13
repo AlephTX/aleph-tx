@@ -50,6 +50,15 @@ feeder/config.toml
 .claude/settings.local.json
 .claude/plans/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
 
 # Claude Code task files (local development only)
 @CLAUDECODE/
+
+# Claude Code agents and skills (local cache)
+.agents/
+skills-lock.json
+
+# Temporary review/prompt files
+claude_prompt.md
+deep_review_*.md
