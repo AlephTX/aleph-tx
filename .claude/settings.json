@@ -36,18 +36,23 @@
     "deny": []
   },
   "enabledPlugins": {
+    // High-frequency (keep enabled)
     "rust-analyzer-lsp@claude-plugins-official": true,
     "gopls-lsp@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+
+    // Medium-frequency (evaluate per session)
     "code-review@claude-plugins-official": true,
     "feature-dev@claude-plugins-official": true,
     "code-simplifier@claude-plugins-official": true,
-    "commit-commands@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true,
-    "github@claude-plugins-official": true,
-    "semgrep@claude-plugins-official": true,
-    "context7@claude-plugins-official": true,
-    "claude-md-management@claude-plugins-official": true,
-    "ralph-loop@claude-plugins-official": true
+
+    // Low-frequency (disable to save ~20K tokens, enable manually when needed)
+    "security-guidance@claude-plugins-official": false,
+    "github@claude-plugins-official": false,
+    "semgrep@claude-plugins-official": false,
+    "context7@claude-plugins-official": false,
+    "ralph-loop@claude-plugins-official": false
   },
   "ignoredPaths": [
     "target/",
@@ -56,5 +61,31 @@
     ".claude/",
     "feeder/feeder-app",
     "lib/*.so"
-  ]
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "pattern": "*.rs",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo check 2>&1 | head -30",
+            "statusMessage": "Running cargo check..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "pattern": "*.go",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd feeder && go vet ./... 2>&1 | head -20",
+            "statusMessage": "Vetting Go code..."
+          }
+        ]
+      }
+    ]
+  }
 }
