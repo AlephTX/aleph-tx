@@ -364,16 +364,12 @@ impl LighterTrading {
     async fn create_auth_token(&self) -> Result<String> {
         let deadline_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| anyhow::anyhow!("System clock error: {}", e))?
             .as_secs() as i64
             + 600;
-        let signer = Arc::clone(&self.signer);
-        tokio::task::spawn_blocking(move || {
-            signer.create_auth_token(deadline_secs)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {}", e))?
-        .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))
+        // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
+        self.signer.create_auth_token(deadline_secs)
+            .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))
     }
 
     // ─── 签名 + 发送 ─────────────────────────────────────────────────────
@@ -402,16 +398,12 @@ impl LighterTrading {
 
         let market_id = self.market_id;
         let is_ask = side == Side::Sell;
-        let signer = Arc::clone(&self.signer);
 
-        let signed = tokio::task::spawn_blocking(move || {
-            signer.sign_create_order(
-                market_id, client_order_index, base_amount, price_int,
-                is_ask, ot, tif, reduce_only, 0u32, -1i64, nonce,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {}", e))?
+        // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
+        let signed = self.signer.sign_create_order(
+            market_id, client_order_index, base_amount, price_int,
+            is_ask, ot, tif, reduce_only, 0u32, -1i64, nonce,
+        )
         .map_err(|e| anyhow::anyhow!("Sign failed: {}", e))?;
 
         tracing::debug!(
@@ -423,7 +415,7 @@ impl LighterTrading {
     }
 
     /// 签名一笔订单，返回 (tx_type, tx_info, tx_hash, client_order_index)
-    /// FFI 调用通过 spawn_blocking 避免阻塞 tokio async 线程
+    /// Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
     async fn sign_order(
         &self,
         side: Side,
@@ -684,13 +676,9 @@ impl LighterTrading {
     pub async fn cancel_order(&self, order_index: i64) -> Result<()> {
         let nonce = self.get_nonce().await?;
         let market_id = self.market_id;
-        let signer = Arc::clone(&self.signer);
-        let signed = tokio::task::spawn_blocking(move || {
-            signer.sign_cancel_order(market_id, order_index, nonce)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {}", e))?
-        .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
+        // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
+        let signed = self.signer.sign_cancel_order(market_id, order_index, nonce)
+            .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
 
         self.send_tx(signed.tx_type, signed.tx_info).await?;
         tracing::info!("Cancelled order: order_index={}", order_index);
