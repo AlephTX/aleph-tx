@@ -14,6 +14,14 @@ pub enum Side {
     Sell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OrderType {
+    Limit,
+    Market,
+    PostOnly,
+    Ioc,
+}
+
 impl std::fmt::Display for Side {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -45,6 +53,35 @@ pub struct BatchOrderResult {
     pub tx_hashes: Vec<String>,
     pub bid_client_order_index: i64,
     pub ask_client_order_index: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderParams {
+    pub side: Side,
+    pub size: f64,
+    pub price: f64,
+    pub order_type: OrderType,
+    pub reduce_only: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum BatchAction {
+    Place(OrderParams),
+    Cancel(i64),
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaceResult {
+    pub client_order_index: i64,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchResult {
+    pub tx_hashes: Vec<String>,
+    pub place_results: Vec<PlaceResult>,
 }
 
 /// 订单信息（查询用）
@@ -83,4 +120,10 @@ pub trait Exchange: Send + Sync {
 
     /// 平仓（紧急风控用）
     async fn close_all_positions(&self, current_price: f64) -> Result<()>;
+
+    /// 通用批量执行（支持混合 挂单/撤单）
+    async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult>;
+
+    /// 获取限价单类型（PostOnly 或 Limit）
+    fn limit_order_type(&self) -> OrderType;
 }

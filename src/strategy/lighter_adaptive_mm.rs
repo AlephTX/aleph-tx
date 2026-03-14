@@ -11,7 +11,8 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;
-use crate::lighter_trading::{BatchOrderParams, LighterTrading, Side};
+use crate::exchange::{BatchOrderParams, Side};
+use crate::exchanges::lighter::trading::LighterTrading;
 use crate::shadow_ledger::ShadowLedger;
 use crate::shm_reader::ShmReader;
 use parking_lot::RwLock;

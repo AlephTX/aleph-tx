@@ -23,62 +23,11 @@ use tokio::sync::Mutex as TokioMutex;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-/// 订单方向
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-impl std::fmt::Display for Side {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Side::Buy => write!(f, "buy"),
-            Side::Sell => write!(f, "sell"),
-        }
-    }
-}
-
-/// 订单类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderType {
-    Limit,
-    LimitPostOnly,
-    Market,
-}
-
-/// 单笔订单参数
-#[derive(Debug, Clone)]
-pub struct OrderParams {
-    pub size: f64,
-    pub price: f64,
-    pub side: Side,
-    pub order_type: OrderType,
-    pub reduce_only: bool,
-}
-/// 批量订单参数（一买一卖）
-#[derive(Debug, Clone)]
-pub struct BatchOrderParams {
-    pub bid_price: f64,
-    pub ask_price: f64,
-    pub bid_size: f64,
-    pub ask_size: f64,
-}
-
-/// 下单结果
-#[derive(Debug, Clone)]
-pub struct OrderResult {
-    pub tx_hash: String,
-    pub client_order_index: i64,
-}
-
-/// 批量下单结果
-#[derive(Debug, Clone)]
-pub struct BatchOrderResult {
-    pub tx_hashes: Vec<String>,
-    pub bid_client_order_index: i64,
-    pub ask_client_order_index: i64,
-}
+use crate::exchange::{
+    BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, Exchange, OrderInfo, OrderParams,
+    OrderResult, OrderType, PlaceResult, Side,
+};
+use async_trait::async_trait;
 
 /// 订单详情（匹配 Lighter API 实际返回格式）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +137,56 @@ pub struct LighterTrading {
     order_tracker: Option<Arc<OrderTracker>>,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
+}
+
+#[async_trait]
+impl Exchange for LighterTrading {
+    async fn buy(&self, size: f64, price: f64) -> Result<OrderResult> {
+        self.buy(size, price).await
+    }
+
+    async fn sell(&self, size: f64, price: f64) -> Result<OrderResult> {
+        self.sell(size, price).await
+    }
+
+    async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
+        self.place_batch(params).await
+    }
+
+    async fn cancel_order(&self, order_id: i64) -> Result<()> {
+        self.cancel_order(order_id).await
+    }
+
+    async fn cancel_all(&self) -> Result<u32> {
+        self.cancel_all().await
+    }
+
+    async fn get_active_orders(&self) -> Result<Vec<OrderInfo>> {
+        let orders = self.get_active_orders().await?;
+        Ok(orders
+            .into_iter()
+            .map(|o| OrderInfo {
+                order_id: o.order_index.to_string(),
+                client_order_index: o.client_order_index,
+                side: if o.is_ask { Side::Sell } else { Side::Buy },
+                price: o.price.parse().unwrap_or(0.0),
+                size: o.initial_base_amount.parse().unwrap_or(0.0),
+                filled: o.filled_base_amount.parse().unwrap_or(0.0), // Corrected from executed_base_amount
+            })
+            .collect())
+    }
+
+    async fn close_all_positions(&self, current_price: f64) -> Result<()> {
+        self.close_all_positions(current_price).await
+    }
+
+    async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+        self.execute_batch(actions).await
+    }
+
+    fn limit_order_type(&self) -> OrderType {
+        self.limit_order_type
+    }
 }
 
 impl LighterTrading {
@@ -308,7 +307,7 @@ impl LighterTrading {
     /// Enable Post-Only (ALO) mode for all limit orders
     pub fn set_post_only(&mut self, enabled: bool) {
         self.limit_order_type = if enabled {
-            OrderType::LimitPostOnly
+            OrderType::PostOnly
         } else {
             OrderType::Limit
         };
@@ -401,8 +400,9 @@ impl LighterTrading {
 
         let (ot, tif) = match order_type {
             OrderType::Limit => (0u8, 1u8),         // Limit + GTC
-            OrderType::LimitPostOnly => (0u8, 2u8), // Limit + ALO (Add Liquidity Only / Post-Only)
+            OrderType::PostOnly => (0u8, 2u8),      // Limit + ALO (Add Liquidity Only / Post-Only)
             OrderType::Market => (1u8, 3u8),        // Market + IOC
+            OrderType::Ioc => (0u8, 3u8),           // Limit + IOC
         };
 
         let market_id = self.market_id;
@@ -677,7 +677,7 @@ impl LighterTrading {
     }
 
     /// 批量下单（一买一卖），使用 sendTxBatch 一次性提交 (v5.0.0: per-order tracking)
-    pub async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
+    pub async fn place_batch(&self, params: BatchOrderParams) -> Result<crate::exchange::BatchOrderResult> {
         // Get base nonce for batch
         let base_nonce = self.get_nonce().await?;
 
@@ -734,7 +734,7 @@ impl LighterTrading {
                 let tx_hashes = batch_resp.tx_hash.unwrap_or_default();
                 tracing::info!("Batch submitted: tx_hashes={:?}", tx_hashes);
 
-                Ok(BatchOrderResult {
+                Ok(crate::exchange::BatchOrderResult {
                     tx_hashes,
                     bid_client_order_index: bid_coi,
                     ask_client_order_index: ask_coi,
@@ -745,6 +745,86 @@ impl LighterTrading {
                 if let Some(ref tracker) = self.order_tracker {
                     tracker.mark_failed(bid_coi);
                     tracker.mark_failed(ask_coi);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 核心：通用批量执行（支持混合 挂单/撤单），并在单一 RTT 内提交
+    pub async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+        if actions.is_empty() {
+            return Ok(BatchResult {
+                tx_hashes: vec![],
+                place_results: vec![],
+            });
+        }
+
+        let mut txs = Vec::with_capacity(actions.len());
+        let mut place_results = Vec::new();
+        let market_id = self.market_id;
+
+        // 获取起始 Nonce
+        let base_nonce = self.get_nonce().await?;
+
+        for (i, action) in actions.into_iter().enumerate() {
+            let nonce = base_nonce + (i as i64);
+            match action {
+                BatchAction::Place(params) => {
+                    let (tx_type, tx_info, _hash, coi) = self
+                        .sign_order_with_nonce(
+                            params.side,
+                            params.price,
+                            params.size,
+                            params.order_type,
+                            params.reduce_only,
+                            nonce,
+                        )
+                        .await?;
+
+                    // 预注册订单追踪
+                    if let Some(ref tracker) = self.order_tracker {
+                        let tracker_side = match params.side {
+                            Side::Buy => TrackerSide::Buy,
+                            Side::Sell => TrackerSide::Sell,
+                        };
+                        tracker.start_tracking(coi, tracker_side, params.price, params.size);
+                    }
+
+                    txs.push((tx_type, tx_info));
+                    place_results.push(PlaceResult {
+                        client_order_index: coi,
+                        side: params.side,
+                        price: params.price,
+                        size: params.size,
+                    });
+                }
+                BatchAction::Cancel(order_index) => {
+                    let signed = self
+                        .signer
+                        .sign_cancel_order(market_id, order_index, nonce)
+                        .map_err(|e| anyhow::anyhow!("Sign batch cancel failed: {}", e))?;
+                    txs.push((signed.tx_type, signed.tx_info));
+                }
+            }
+        }
+
+        tracing::info!("Submitting batch of {} mixed actions", txs.len());
+
+        match self.send_tx_batch(&txs).await {
+            Ok(resp) => {
+                let hashes = resp.tx_hash.unwrap_or_default();
+                Ok(BatchResult {
+                    tx_hashes: hashes,
+                    place_results,
+                })
+            }
+            Err(e) => {
+                // 回滚：所有在该批次中的 Place 订单标记为失败
+                if let Some(ref tracker) = self.order_tracker {
+                    for res in place_results {
+                        tracker.mark_failed(res.client_order_index);
+                    }
                 }
                 Err(e)
             }
@@ -975,84 +1055,5 @@ impl LighterTrading {
 
         tracing::info!("Close position order submitted");
         Ok(())
-    }
-}
-
-// ─── Exchange Trait 实现 ─────────────────────────────────────────────────────
-
-use crate::exchange::{
-    BatchOrderParams as ExchangeBatchParams, BatchOrderResult as ExchangeBatchResult, Exchange,
-    OrderInfo, OrderResult as ExchangeOrderResult, Side as ExchangeSide,
-};
-use async_trait::async_trait;
-
-#[async_trait]
-impl Exchange for LighterTrading {
-    async fn buy(&self, size: f64, price: f64) -> Result<ExchangeOrderResult> {
-        let result = self.buy(size, price).await?;
-        Ok(ExchangeOrderResult {
-            tx_hash: result.tx_hash,
-            client_order_index: result.client_order_index,
-        })
-    }
-
-    async fn sell(&self, size: f64, price: f64) -> Result<ExchangeOrderResult> {
-        let result = self.sell(size, price).await?;
-        Ok(ExchangeOrderResult {
-            tx_hash: result.tx_hash,
-            client_order_index: result.client_order_index,
-        })
-    }
-
-    async fn place_batch(&self, params: ExchangeBatchParams) -> Result<ExchangeBatchResult> {
-        let lighter_params = BatchOrderParams {
-            bid_price: params.bid_price,
-            ask_price: params.ask_price,
-            bid_size: params.bid_size,
-            ask_size: params.ask_size,
-        };
-        let result = self.place_batch(lighter_params).await?;
-        Ok(ExchangeBatchResult {
-            tx_hashes: result.tx_hashes,
-            bid_client_order_index: result.bid_client_order_index,
-            ask_client_order_index: result.ask_client_order_index,
-        })
-    }
-
-    async fn cancel_order(&self, order_id: i64) -> Result<()> {
-        self.cancel_order(order_id).await
-    }
-
-    async fn cancel_all(&self) -> Result<u32> {
-        self.cancel_all().await
-    }
-
-    async fn get_active_orders(&self) -> Result<Vec<OrderInfo>> {
-        let orders = self.get_active_orders().await?;
-        Ok(orders
-            .into_iter()
-            .map(|o| {
-                let side = if o.is_ask {
-                    ExchangeSide::Sell
-                } else {
-                    ExchangeSide::Buy
-                };
-                let price: f64 = o.price.parse().unwrap_or(0.0);
-                let size: f64 = o.initial_base_amount.parse().unwrap_or(0.0);
-                let filled: f64 = o.filled_base_amount.parse().unwrap_or(0.0);
-                OrderInfo {
-                    order_id: o.order_id,
-                    client_order_index: o.client_order_index,
-                    side,
-                    price,
-                    size,
-                    filled,
-                }
-            })
-            .collect())
-    }
-
-    async fn close_all_positions(&self, current_price: f64) -> Result<()> {
-        self.close_all_positions(current_price).await
     }
 }

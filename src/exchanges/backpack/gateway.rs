@@ -4,7 +4,10 @@
 
 use super::client::BackpackClient;
 use super::model::BackpackOrderRequest;
-use crate::exchange::{BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult};
+use crate::exchange::{
+    BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, Exchange, OrderInfo, OrderParams,
+    OrderResult, OrderType, PlaceResult,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -17,6 +20,29 @@ pub struct BackpackGateway {
 impl BackpackGateway {
     pub fn new(client: Arc<BackpackClient>, symbol: String) -> Self {
         Self { client, symbol }
+    }
+
+    pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+        let side = match params.side {
+            crate::exchange::Side::Buy => "Bid",
+            crate::exchange::Side::Sell => "Ask",
+        };
+        let order = BackpackOrderRequest {
+            symbol: self.symbol.clone(),
+            side: side.to_string(),
+            order_type: "Limit".to_string(),
+            price: params.price.to_string(),
+            quantity: params.size.to_string(),
+            client_id: None,
+            post_only: Some(true),
+            time_in_force: None,
+        };
+
+        let resp = self.client.create_order(&order).await?;
+        Ok(OrderResult {
+            tx_hash: resp.id.clone(),
+            client_order_index: 0,
+        })
     }
 }
 
@@ -118,5 +144,40 @@ impl Exchange for BackpackGateway {
         }
 
         Ok(())
+    }
+
+    async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+        let mut tx_hashes = Vec::new();
+        let mut place_results = Vec::new();
+
+        for action in actions {
+            match action {
+                BatchAction::Cancel(id) => {
+                    self.cancel_order(id).await?;
+                }
+                BatchAction::Place(params) => {
+                    let side = params.side;
+                    let price = params.price;
+                    let size = params.size;
+                    let res = self.place_order(params).await?;
+                    tx_hashes.push(res.tx_hash);
+                    place_results.push(PlaceResult {
+                        client_order_index: res.client_order_index,
+                        side,
+                        price,
+                        size,
+                    });
+                }
+            }
+        }
+
+        Ok(BatchResult {
+            tx_hashes,
+            place_results,
+        })
+    }
+
+    fn limit_order_type(&self) -> OrderType {
+        OrderType::PostOnly
     }
 }
