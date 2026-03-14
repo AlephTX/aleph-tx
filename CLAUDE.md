@@ -5,7 +5,7 @@ alwaysApply: true
 
 # CLAUDE.md
 
-> Rust + Go + Python HFT framework for crypto markets. v5.0.0: Per-order state machine, worst-case bilateral risk, lock-free SHM.
+> Rust + Go + Python HFT framework for crypto markets. v5.0.0: per-order state machine, worst-case bilateral risk, lock-free SHM.
 
 ## Build & Test (MANDATORY)
 
@@ -40,6 +40,8 @@ make status         # Show running strategies
 **No Boomerang**: Rust executes HTTP orders DIRECTLY via FFI. Never sends commands back to Go.
 
 **Optimistic Accounting (v5.0.0)**: `OrderTracker` registers per-order state before API call. Worst-case bilateral exposure checked before every order.
+
+**Strategy Execution**: Market making is powered by the `InventoryNeutralMM` strategy using A-S pricing, cross-exchange Alpha signals, and multi-tier grid quoting. Production binaries live in `src/bin/` and run via `cargo run --release --bin inventory_neutral_mm` (NOT `src/main.rs`).
 
 ## Verification Protocol (MANDATORY)
 
@@ -98,6 +100,7 @@ When compressing context, preserve in priority order:
 CLAUDE.md (root)                    -> Project contract
   feeder/CLAUDE.md                  -> Go WS ingestion, SHM writers
   src/CLAUDE.md                     -> Rust HFT engine
+    src/bin/                        -> Production strategy binaries
     src/order_tracker.rs            -> Per-order state machine (v5.0.0)
     src/strategy/CLAUDE.md          -> Strategies
     src/exchanges/CLAUDE.md         -> Exchange integrations

@@ -141,8 +141,8 @@ cargo test --lib
 # 运行特定测试
 cargo test shadow_ledger::tests
 
-# 运行示例
-cargo run --example lighter_trading
+# 运行策略
+cargo run --release --bin inventory_neutral_mm
 ```
 
 ## 下一步

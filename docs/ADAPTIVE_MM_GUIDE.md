@@ -161,7 +161,7 @@ min_available_balance: 2.0,    // 最小余额
 
 修改后重新编译：
 ```bash
-cargo build --release --example adaptive_mm
+cargo build --release --bin adaptive_mm
 ```
 
 ## 日志文件
