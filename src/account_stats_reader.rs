@@ -12,16 +12,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Layout must match Go's ShmAccountStats exactly
 #[repr(C, align(128))]
 pub struct ShmAccountStats {
-    pub version: AtomicU64,      // 0..8
-    pub collateral: f64,         // 8..16
-    pub portfolio_value: f64,    // 16..24
-    pub leverage: f64,           // 24..32
-    pub available_balance: f64,  // 32..40
-    pub margin_usage: f64,       // 40..48
-    pub buying_power: f64,       // 48..56
-    pub updated_at: u64,         // 56..64
-    pub position: f64,           // 64..72 - Net position (positive=long, negative=short)
-    _reserved: [u8; 56],         // 72..128
+    pub version: AtomicU64,     // 0..8
+    pub collateral: f64,        // 8..16
+    pub portfolio_value: f64,   // 16..24
+    pub leverage: f64,          // 24..32
+    pub available_balance: f64, // 32..40
+    pub margin_usage: f64,      // 40..48
+    pub buying_power: f64,      // 48..56
+    pub updated_at: u64,        // 56..64
+    pub position: f64,          // 64..72 - Net position (positive=long, negative=short)
+    _reserved: [u8; 56],        // 72..128
 }
 
 const ACCOUNT_STATS_SIZE: usize = 128;
@@ -34,10 +34,7 @@ pub struct AccountStatsReader {
 
 impl AccountStatsReader {
     pub fn open(path: &str) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         file.set_len(ACCOUNT_STATS_SIZE as u64)?;
 
@@ -103,7 +100,8 @@ impl AccountStatsReader {
                 if spin_count > MAX_SPINS {
                     tracing::error!(
                         "AccountStats seqlock stuck (writer dead?): version={} after {} spins",
-                        version_before, spin_count
+                        version_before,
+                        spin_count
                     );
                     return AccountStatsSnapshot::default();
                 }
@@ -133,7 +131,9 @@ impl AccountStatsReader {
             if spin_count > MAX_SPINS {
                 tracing::error!(
                     "AccountStats torn read limit: version before={} after={} after {} spins",
-                    version_before, version_after, spin_count
+                    version_before,
+                    version_after,
+                    spin_count
                 );
                 return AccountStatsSnapshot::default();
             }

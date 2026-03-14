@@ -23,13 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("📋 Loading configuration...");
     let config = AppConfig::load_default();
     let edgex_config = config.edgex;
-    tracing::info!("   Risk fraction: {:.1}%", edgex_config.risk_fraction * 100.0);
+    tracing::info!(
+        "   Risk fraction: {:.1}%",
+        edgex_config.risk_fraction * 100.0
+    );
     tracing::info!("   Min spread: {} bps", edgex_config.min_spread_bps);
 
     // Step 2: Load EdgeX credentials from .env.edgex
     tracing::info!("🔑 Loading EdgeX credentials...");
-    let env_path = std::env::var("EDGEX_ENV_PATH")
-        .unwrap_or_else(|_| ".env.edgex".to_string());
+    let env_path = std::env::var("EDGEX_ENV_PATH").unwrap_or_else(|_| ".env.edgex".to_string());
 
     // Load environment variables
     dotenv::from_filename(&env_path).ok();
@@ -53,10 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 5: Create EdgeXGateway (Exchange trait implementation)
     tracing::info!("🌉 Creating EdgeX gateway...");
-    let gateway = Arc::new(EdgeXGateway::new(
-        client.clone(),
-        gateway_config,
-    ));
+    let gateway = Arc::new(EdgeXGateway::new(client.clone(), gateway_config));
     tracing::info!("✅ EdgeX gateway initialized with L2 signature support");
 
     // Step 6: Connect to BBO Matrix
@@ -91,8 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let exchanges = shm_reader.read_all_exchanges(symbol_id);
 
                 // Find EdgeX exchange (exchange_id = 3)
-                if let Some((_, bbo)) = exchanges.iter().find(|(exch_id, _)| *exch_id == 3) {
-                    if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                if let Some((_, bbo)) = exchanges.iter().find(|(exch_id, _)| *exch_id == 3)
+                    && bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
                         let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
                         let spread_bps = ((bbo.ask_price - bbo.bid_price) / mid * 10000.0) as u32;
 
@@ -133,7 +132,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             tracing::debug!("⏸️  Spread {}bps < min {}bps, skipping", spread_bps, min_spread_bps);
                         }
-                    }
                 }
             }
         }

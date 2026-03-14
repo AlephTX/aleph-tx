@@ -1,12 +1,13 @@
-use starknet_crypto::{sign, Felt};
 use sha3::{Digest, Keccak256};
+use starknet_crypto::{Felt, sign};
 
 fn main() {
     let private_key_hex = "REDACTED_PRIVATE_KEY";
     let private_key = Felt::from_hex(private_key_hex).expect("Invalid private key");
 
     // Test message
-    let message = "1772894985474GET/api/v1/private/account/getAccountAssetaccountId=0";
+    let message =
+        "1772894985474GET/api/v1/private/account/getAccountAssetaccountId=0";
 
     // Hash with Keccak256
     let mut hasher = Keccak256::new();
@@ -18,7 +19,7 @@ fn main() {
     let hash_felt = Felt::from_bytes_be(&bytes_32);
 
     println!("Message: {}", message);
-    println!("Keccak256 Hash (hex): {}", hex::encode(&bytes_32));
+    println!("Keccak256 Hash (hex): {}", hex::encode(bytes_32));
     println!("Keccak256 Hash (bytes): {:?}", &bytes_32[..8]);
     println!("Hash as Felt: 0x{:064x}", hash_felt);
     println!("Felt as bytes: {:?}", &hash_felt.to_bytes_be()[..8]);

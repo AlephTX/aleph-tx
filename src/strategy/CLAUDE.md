@@ -17,7 +17,7 @@ alwaysApply: true
 | backpack_mm.rs | Backpack market maker (Ed25519 auth, momentum-based spread) |
 | lighter_mm.rs | *(deleted)* - Legacy Lighter MM, replaced by inventory_neutral_mm |
 | adaptive_mm.rs | Premium account fee-aware HFT with microstructure signals |
-| inventory_neutral_mm.rs | Inventory-Neutral MM - production HFT strategy (Exchange trait, config-driven) |
+| inventory_neutral_mm.rs | Inventory-Neutral MM - production HFT strategy (Avellaneda-Stoikov pricing, Exchange trait) |
 
 ## Strategy Trait
 

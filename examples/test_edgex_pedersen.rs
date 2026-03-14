@@ -16,7 +16,11 @@ fn main() {
 
     // Expected from Python SDK:
     // 0x04d55362f72cd6560c053d8d39ffd5f0e7776c1f5fecfdcbf1d6027020acf7b9
-    let expected = BigUint::from_str_radix("04d55362f72cd6560c053d8d39ffd5f0e7776c1f5fecfdcbf1d6027020acf7b9", 16).unwrap();
+    let expected = BigUint::from_str_radix(
+        "04d55362f72cd6560c053d8d39ffd5f0e7776c1f5fecfdcbf1d6027020acf7b9",
+        16,
+    )
+    .unwrap();
 
     if hash1 == expected {
         println!("✅ Hash matches Python SDK!");

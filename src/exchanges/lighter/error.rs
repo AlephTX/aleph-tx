@@ -68,11 +68,26 @@ mod tests {
 
     #[test]
     fn test_error_code_parsing() {
-        assert_eq!(LighterErrorCode::from_code(21104), LighterErrorCode::InvalidNonce);
-        assert_eq!(LighterErrorCode::from_code(21711), LighterErrorCode::InvalidExpiry);
-        assert_eq!(LighterErrorCode::from_code(21120), LighterErrorCode::InvalidSignature);
-        assert_eq!(LighterErrorCode::from_code(21301), LighterErrorCode::InsufficientMargin);
-        assert_eq!(LighterErrorCode::from_code(99999), LighterErrorCode::Unknown);
+        assert_eq!(
+            LighterErrorCode::from_code(21104),
+            LighterErrorCode::InvalidNonce
+        );
+        assert_eq!(
+            LighterErrorCode::from_code(21711),
+            LighterErrorCode::InvalidExpiry
+        );
+        assert_eq!(
+            LighterErrorCode::from_code(21120),
+            LighterErrorCode::InvalidSignature
+        );
+        assert_eq!(
+            LighterErrorCode::from_code(21301),
+            LighterErrorCode::InsufficientMargin
+        );
+        assert_eq!(
+            LighterErrorCode::from_code(99999),
+            LighterErrorCode::Unknown
+        );
     }
 
     #[test]

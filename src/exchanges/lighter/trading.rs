@@ -9,15 +9,15 @@
 //! - cancel_order / cancel_all — 撤单
 //! - get_order / get_active_orders / verify_order — 查询验证
 
-use crate::error::TradingError;
-use crate::order_tracker::{OrderTracker, OrderSide as TrackerSide};
 use super::error::{LighterErrorCode, LighterErrorResponse};
+use crate::error::TradingError;
+use crate::order_tracker::{OrderSide as TrackerSide, OrderTracker};
 
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -211,10 +211,16 @@ impl LighterTrading {
             .map_err(|_| anyhow::anyhow!("LIGHTER_ACCOUNT_INDEX not set"))?
             .parse()?;
 
-        let signer = Arc::new(super::ffi::LighterSigner::new(
-            &base_url, &private_key, chain_id, api_key_index, account_index,
-        )
-        .map_err(|e| anyhow::anyhow!("Signer init failed: {}", e))?);
+        let signer = Arc::new(
+            super::ffi::LighterSigner::new(
+                &base_url,
+                &private_key,
+                chain_id,
+                api_key_index,
+                account_index,
+            )
+            .map_err(|e| anyhow::anyhow!("Signer init failed: {}", e))?,
+        );
 
         let client = Client::builder()
             .pool_max_idle_per_host(10)
@@ -228,7 +234,9 @@ impl LighterTrading {
             Self::fetch_market_decimals(&client, &base_url, market_id).await?;
         tracing::info!(
             "Market {} decimals: size={} price={}",
-            market_id, size_decimals, price_decimals
+            market_id,
+            size_decimals,
+            price_decimals
         );
 
         let counter_start = SystemTime::now()
@@ -368,7 +376,8 @@ impl LighterTrading {
             .as_secs() as i64
             + 600;
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        self.signer.create_auth_token(deadline_secs)
+        self.signer
+            .create_auth_token(deadline_secs)
             .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))
     }
 
@@ -391,27 +400,47 @@ impl LighterTrading {
         let base_amount = (size * self.size_multiplier).round() as i64;
 
         let (ot, tif) = match order_type {
-            OrderType::Limit => (0u8, 1u8),          // Limit + GTC
-            OrderType::LimitPostOnly => (0u8, 2u8),  // Limit + ALO (Add Liquidity Only / Post-Only)
-            OrderType::Market => (1u8, 3u8),          // Market + IOC
+            OrderType::Limit => (0u8, 1u8),         // Limit + GTC
+            OrderType::LimitPostOnly => (0u8, 2u8), // Limit + ALO (Add Liquidity Only / Post-Only)
+            OrderType::Market => (1u8, 3u8),        // Market + IOC
         };
 
         let market_id = self.market_id;
         let is_ask = side == Side::Sell;
 
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        let signed = self.signer.sign_create_order(
-            market_id, client_order_index, base_amount, price_int,
-            is_ask, ot, tif, reduce_only, 0u32, -1i64, nonce,
-        )
-        .map_err(|e| anyhow::anyhow!("Sign failed: {}", e))?;
+        let signed = self
+            .signer
+            .sign_create_order(
+                market_id,
+                client_order_index,
+                base_amount,
+                price_int,
+                is_ask,
+                ot,
+                tif,
+                reduce_only,
+                0u32,
+                -1i64,
+                nonce,
+            )
+            .map_err(|e| anyhow::anyhow!("Sign failed: {}", e))?;
 
         tracing::debug!(
             "Signed: tx_type={} price_int={} base_amount={} is_ask={} nonce={}",
-            signed.tx_type, price_int, base_amount, is_ask, nonce
+            signed.tx_type,
+            price_int,
+            base_amount,
+            is_ask,
+            nonce
         );
 
-        Ok((signed.tx_type, signed.tx_info, signed.tx_hash, client_order_index))
+        Ok((
+            signed.tx_type,
+            signed.tx_info,
+            signed.tx_hash,
+            client_order_index,
+        ))
     }
 
     /// 签名一笔订单，返回 (tx_type, tx_info, tx_hash, client_order_index)
@@ -425,7 +454,8 @@ impl LighterTrading {
         reduce_only: bool,
     ) -> Result<(u8, String, String, i64)> {
         let nonce = self.get_nonce().await?;
-        self.sign_order_with_nonce(side, price, size, order_type, reduce_only, nonce).await
+        self.sign_order_with_nonce(side, price, size, order_type, reduce_only, nonce)
+            .await
     }
 
     /// 发送单笔交易到 sendTx
@@ -457,20 +487,29 @@ impl LighterTrading {
                 // Handle specific error codes
                 if error_code.requires_nonce_reset() {
                     let _ = self.reset_nonce().await;
-                    anyhow::bail!("Lighter error {}: {} (nonce reset)", error_resp.code,
-                        error_resp.message.as_deref().unwrap_or("unknown"));
+                    anyhow::bail!(
+                        "Lighter error {}: {} (nonce reset)",
+                        error_resp.code,
+                        error_resp.message.as_deref().unwrap_or("unknown")
+                    );
                 }
 
                 if error_code.is_margin_error() {
                     return Err(TradingError::InsufficientMargin.into());
                 }
 
-                anyhow::bail!("Lighter error {}: {}", error_resp.code,
-                    error_resp.message.as_deref().unwrap_or("unknown"));
+                anyhow::bail!(
+                    "Lighter error {}: {}",
+                    error_resp.code,
+                    error_resp.message.as_deref().unwrap_or("unknown")
+                );
             }
 
             // Fallback: check for margin error in body text
-            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21301") {
+            if body.contains("not enough margin")
+                || body.contains("insufficient margin")
+                || body.contains("21301")
+            {
                 return Err(TradingError::InsufficientMargin.into());
             }
 
@@ -500,10 +539,7 @@ impl LighterTrading {
     }
 
     /// 发送批量交易到 sendTxBatch
-    async fn send_tx_batch(
-        &self,
-        txs: &[(u8, String)],
-    ) -> Result<SendTxBatchResponse> {
+    async fn send_tx_batch(&self, txs: &[(u8, String)]) -> Result<SendTxBatchResponse> {
         // Python SDK: json.dumps([14, 14]) and json.dumps(["{...}", "{...}"])
         let tx_types_vec: Vec<u8> = txs.iter().map(|(t, _)| *t).collect();
         let tx_infos_vec: Vec<&str> = txs.iter().map(|(_, info)| info.as_str()).collect();
@@ -532,7 +568,10 @@ impl LighterTrading {
 
         if !status.is_success() {
             // Check for specific error patterns
-            if body.contains("not enough margin") || body.contains("insufficient margin") || body.contains("21711") {
+            if body.contains("not enough margin")
+                || body.contains("insufficient margin")
+                || body.contains("21711")
+            {
                 return Err(TradingError::InsufficientMargin.into());
             }
             anyhow::bail!("sendTxBatch HTTP {}: {}", status, body);
@@ -566,7 +605,13 @@ impl LighterTrading {
     /// 通用下单 (v5.0.0: per-order tracking)
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
         let (tx_type, tx_info, tx_hash, client_order_index) = self
-            .sign_order(params.side, params.price, params.size, params.order_type, params.reduce_only)
+            .sign_order(
+                params.side,
+                params.price,
+                params.size,
+                params.order_type,
+                params.reduce_only,
+            )
             .await?;
 
         // Optimistic accounting: register per-order BEFORE API call
@@ -580,13 +625,21 @@ impl LighterTrading {
 
         tracing::info!(
             "Signed {} order: price={} size={} type={:?} tx_hash={} coi={}",
-            params.side, params.price, params.size, params.order_type, tx_hash, client_order_index
+            params.side,
+            params.price,
+            params.size,
+            params.order_type,
+            tx_hash,
+            client_order_index
         );
 
         match self.send_tx(tx_type, tx_info).await {
             Ok(_) => {
                 tracing::info!("Order submitted: tx_hash={}", tx_hash);
-                Ok(OrderResult { tx_hash, client_order_index })
+                Ok(OrderResult {
+                    tx_hash,
+                    client_order_index,
+                })
             }
             Err(e) => {
                 // Rollback: mark order as failed (pending_exposure → 0 automatically)
@@ -629,26 +682,53 @@ impl LighterTrading {
 
         // 签名买单 (nonce = base_nonce)
         let (bid_type, bid_info, _bid_hash, bid_coi) = self
-            .sign_order_with_nonce(Side::Buy, params.bid_price, params.bid_size, self.limit_order_type, false, base_nonce)
+            .sign_order_with_nonce(
+                Side::Buy,
+                params.bid_price,
+                params.bid_size,
+                self.limit_order_type,
+                false,
+                base_nonce,
+            )
             .await?;
 
         // 签名卖单 (nonce = base_nonce + 1)
         let (ask_type, ask_info, _ask_hash, ask_coi) = self
-            .sign_order_with_nonce(Side::Sell, params.ask_price, params.ask_size, self.limit_order_type, false, base_nonce + 1)
+            .sign_order_with_nonce(
+                Side::Sell,
+                params.ask_price,
+                params.ask_size,
+                self.limit_order_type,
+                false,
+                base_nonce + 1,
+            )
             .await?;
 
         tracing::info!(
             "Signed batch: bid={} @ {} x {} / ask={} @ {} x {}",
-            bid_coi, params.bid_price, params.bid_size, ask_coi, params.ask_price, params.ask_size
+            bid_coi,
+            params.bid_price,
+            params.bid_size,
+            ask_coi,
+            params.ask_price,
+            params.ask_size
         );
 
         // Register BOTH orders independently (no net-value masking!)
         if let Some(ref tracker) = self.order_tracker {
             tracker.start_tracking(bid_coi, TrackerSide::Buy, params.bid_price, params.bid_size);
-            tracker.start_tracking(ask_coi, TrackerSide::Sell, params.ask_price, params.ask_size);
+            tracker.start_tracking(
+                ask_coi,
+                TrackerSide::Sell,
+                params.ask_price,
+                params.ask_size,
+            );
         }
 
-        match self.send_tx_batch(&[(bid_type, bid_info), (ask_type, ask_info)]).await {
+        match self
+            .send_tx_batch(&[(bid_type, bid_info), (ask_type, ask_info)])
+            .await
+        {
             Ok(batch_resp) => {
                 let tx_hashes = batch_resp.tx_hash.unwrap_or_default();
                 tracing::info!("Batch submitted: tx_hashes={:?}", tx_hashes);
@@ -677,7 +757,9 @@ impl LighterTrading {
         let nonce = self.get_nonce().await?;
         let market_id = self.market_id;
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        let signed = self.signer.sign_cancel_order(market_id, order_index, nonce)
+        let signed = self
+            .signer
+            .sign_cancel_order(market_id, order_index, nonce)
             .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
 
         self.send_tx(signed.tx_type, signed.tx_info).await?;
@@ -707,7 +789,10 @@ impl LighterTrading {
     /// 查询活跃订单
     pub async fn get_active_orders(&self) -> Result<Vec<OrderDetail>> {
         let auth = self.create_auth_token().await?;
-        tracing::debug!("Auth token (first 40 chars): {}", &auth[..std::cmp::min(40, auth.len())]);
+        tracing::debug!(
+            "Auth token (first 40 chars): {}",
+            &auth[..std::cmp::min(40, auth.len())]
+        );
 
         let url = format!(
             "{}/api/v1/accountActiveOrders?account_index={}&market_id={}",
@@ -831,7 +916,9 @@ impl LighterTrading {
 
         tracing::info!(
             "Closing position: {} {} @ ~${:.2} (reduce_only)",
-            side, size.abs(), close_price
+            side,
+            size.abs(),
+            close_price
         );
 
         // 4. 下 reduce_only 限价单平仓
@@ -852,9 +939,8 @@ impl LighterTrading {
 // ─── Exchange Trait 实现 ─────────────────────────────────────────────────────
 
 use crate::exchange::{
-    Exchange, OrderInfo, OrderResult as ExchangeOrderResult,
-    BatchOrderParams as ExchangeBatchParams, BatchOrderResult as ExchangeBatchResult,
-    Side as ExchangeSide,
+    BatchOrderParams as ExchangeBatchParams, BatchOrderResult as ExchangeBatchResult, Exchange,
+    OrderInfo, OrderResult as ExchangeOrderResult, Side as ExchangeSide,
 };
 use async_trait::async_trait;
 

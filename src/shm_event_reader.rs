@@ -22,7 +22,7 @@ use crate::types::{ShmPrivateEvent, ShmPrivateEventV2};
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 
 // ─── V1 Constants (64-byte events) ──────────────────────────────────────────
 
@@ -68,9 +68,8 @@ impl ShmEventReader {
                 ))
             })?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(|e| {
-            TradingError::SharedMemory(format!("Failed to mmap: {}", e))
-        })?;
+        let mmap = unsafe { MmapMut::map_mut(&file) }
+            .map_err(|e| TradingError::SharedMemory(format!("Failed to mmap: {}", e)))?;
 
         if mmap.len() < V1_TOTAL_SIZE {
             return Err(TradingError::SharedMemory(format!(
@@ -201,9 +200,8 @@ impl ShmEventReaderV2 {
                 ))
             })?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(|e| {
-            TradingError::SharedMemory(format!("Failed to mmap: {}", e))
-        })?;
+        let mmap = unsafe { MmapMut::map_mut(&file) }
+            .map_err(|e| TradingError::SharedMemory(format!("Failed to mmap: {}", e)))?;
 
         if mmap.len() < V2_TOTAL_SIZE {
             return Err(TradingError::SharedMemory(format!(
@@ -303,7 +301,10 @@ mod tests {
                 println!("V1 Reader created successfully");
             }
             Err(e) => {
-                println!("Expected: shared memory not yet created by Go feeder: {}", e);
+                println!(
+                    "Expected: shared memory not yet created by Go feeder: {}",
+                    e
+                );
             }
         }
     }
@@ -316,7 +317,10 @@ mod tests {
                 println!("V2 Reader created successfully");
             }
             Err(e) => {
-                println!("Expected: V2 shared memory not yet created by Go feeder: {}", e);
+                println!(
+                    "Expected: V2 shared memory not yet created by Go feeder: {}",
+                    e
+                );
             }
         }
     }

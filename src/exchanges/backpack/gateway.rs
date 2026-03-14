@@ -4,10 +4,8 @@
 
 use super::client::BackpackClient;
 use super::model::BackpackOrderRequest;
-use crate::exchange::{
-    BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult,
-};
-use anyhow::{anyhow, Result};
+use crate::exchange::{BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -122,4 +120,3 @@ impl Exchange for BackpackGateway {
         Ok(())
     }
 }
-

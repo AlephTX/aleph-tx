@@ -75,14 +75,6 @@ impl EdgeXClient {
     pub async fn create_order(&self, req: &CreateOrderRequest) -> Result<Value, ClientError> {
         let url = format!("{}/api/v1/private/order/createOrder", self.base_url);
 
-        // TODO: The request object 'req' should already have l2Signature populated,
-        // OR we should sign it here.
-        // For now, assuming caller or a builder helper handles signing before passing here,
-        // or we clone and sign here.
-
-        // Let's assume we implement a helper to sign and create the request.
-        // But for this raw method, we take the request as is.
-
         let body = serde_json::to_string(req).map_err(|e| ClientError::ApiError(e.to_string()))?;
         let body_val: Value = serde_json::to_value(req).unwrap();
         let timestamp = SystemTime::now()

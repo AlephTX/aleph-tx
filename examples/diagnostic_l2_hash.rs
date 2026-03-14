@@ -100,7 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pm1 = pm1 * shift_17;
 
     println!("Step 5 - Pack Message 1:");
-    println!("  (((3 << 64 + account_id) << 64 + account_id) << 64 + account_id) << 32 + expire_time) << 17");
+    println!(
+        "  (((3 << 64 + account_id) << 64 + account_id) << 64 + account_id) << 32 + expire_time) << 17"
+    );
     println!("  = 0x{:064x}\n", pm1);
 
     // Step 6: Final hash

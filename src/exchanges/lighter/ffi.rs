@@ -266,11 +266,8 @@ impl LighterSigner {
     /// Create authentication token for WebSocket
     pub fn create_auth_token(&self, deadline_ms: i64) -> Result<String, String> {
         unsafe {
-            let response = CreateAuthToken(
-                deadline_ms,
-                self.api_key_index as c_int,
-                self.account_index,
-            );
+            let response =
+                CreateAuthToken(deadline_ms, self.api_key_index as c_int, self.account_index);
 
             if !response.err.is_null() {
                 let err_cstr = CStr::from_ptr(response.err);

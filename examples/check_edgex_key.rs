@@ -1,4 +1,4 @@
-use starknet_crypto::{get_public_key, Felt};
+use starknet_crypto::{Felt, get_public_key};
 
 fn main() {
     let private_key_hex = "REDACTED_PRIVATE_KEY";
