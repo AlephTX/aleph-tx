@@ -11,7 +11,7 @@ use aleph_tx::lighter_trading::LighterTrading;
 use aleph_tx::shadow_ledger::ShadowLedgerManager;
 use aleph_tx::shm_event_reader::ShmEventReader;
 use aleph_tx::shm_reader::ShmReader;
-use aleph_tx::strategy::adaptive_mm::AdaptiveMarketMaker;
+use aleph_tx::strategy::lighter_adaptive_mm::AdaptiveMarketMaker;
 use std::sync::Arc;
 
 #[tokio::main]

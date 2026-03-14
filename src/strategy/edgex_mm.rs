@@ -1,7 +1,11 @@
+//! EdgeX Market Maker Strategy (V3 — Legacy Direct API)
+//!
+//! This strategy uses the low-level EdgeXClient API directly.
+//! TODO: Migrate to EdgeXGateway (unified Exchange trait) for consistency.
+
 use crate::config::{ExchangeConfig, format_price, format_size, round_to_tick};
 use crate::shm_reader::ShmBboMessage;
 use crate::strategy::Strategy;
-
 use crate::edgex_api::client::EdgeXClient;
 use crate::edgex_api::model::{CreateOrderRequest, OrderSide, OrderType, TimeInForce};
 use std::collections::VecDeque;

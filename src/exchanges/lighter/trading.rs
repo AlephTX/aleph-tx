@@ -593,9 +593,10 @@ impl LighterTrading {
             );
         }
 
-        // Increment nonce twice for batch (2 orders)
-        self.increment_nonce();
-        self.increment_nonce();
+        // Increment nonce dynamically for the batch size
+        for _ in 0..txs.len() {
+            self.increment_nonce();
+        }
 
         Ok(parsed)
     }
@@ -767,20 +768,61 @@ impl LighterTrading {
         Ok(())
     }
 
-    /// 撤销所有活跃订单
+    /// 撤销所有活跃订单 (Batched for speed)
     pub async fn cancel_all(&self) -> Result<u32> {
         let orders = self.get_active_orders().await?;
         let count = orders.len() as u32;
 
-        for order in &orders {
-            if let Err(e) = self.cancel_order(order.order_index).await {
-                tracing::warn!("Failed to cancel order {}: {}", order.order_index, e);
-            }
-            // 避免触发限流
-            tokio::time::sleep(Duration::from_millis(80)).await;
+        if count == 0 {
+            tracing::info!("No active orders to cancel");
+            return Ok(0);
         }
 
-        tracing::info!("Cancelled {} orders", count);
+        let market_id = self.market_id;
+        let mut success_batches = 0;
+        let mut total_chunks = 0;
+
+        // 1. Process in chunks of 50 to avoid rate limits and sequence issues
+        for chunk_orders in orders.chunks(50) {
+            total_chunks += 1;
+            let mut txs = Vec::with_capacity(chunk_orders.len());
+            
+            // Get fresh nonce for each chunk. If a previous batch failed and triggered a reset, this handles it.
+            let base_nonce = self.get_nonce().await?;
+
+            for (i, order) in chunk_orders.iter().enumerate() {
+                let nonce = base_nonce + (i as i64);
+                match self.signer.sign_cancel_order(market_id, order.order_index, nonce) {
+                    Ok(signed) => txs.push((signed.tx_type, signed.tx_info)),
+                    Err(e) => tracing::warn!("Failed to sign cancel for order {}: {}", order.order_index, e),
+                }
+            }
+
+            if txs.is_empty() {
+                continue;
+            }
+
+            // 2. Dispatch the chunk
+            match self.send_tx_batch(&txs).await {
+                Ok(resp) => {
+                    let hashes = resp.tx_hash.unwrap_or_default();
+                    tracing::info!("Batch cancel submitted ({} orders): {:?}", txs.len(), hashes);
+                    success_batches += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Batch cancel failed: {}", e);
+                }
+            }
+            
+            // 3. Small sleep to ensure sequence order and avoid rate limits
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        tracing::info!(
+            "Cancelled {} orders (dispatched {}/{} batches successfully)",
+            count, success_batches, total_chunks
+        );
+
         Ok(count)
     }
 

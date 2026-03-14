@@ -16,7 +16,6 @@ const (
 	SymbolETHPERP uint16 = 1002
 )
 
-
 // SymbolNameToID maps standard local ticker names to our global symbol IDs.
 var SymbolNameToID = map[string]uint16{
 	"BTC": SymbolBTCPERP,

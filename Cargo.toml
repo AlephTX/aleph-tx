@@ -50,12 +50,12 @@ name = "aleph-tx"
 path = "src/main.rs"
 
 [[bin]]
-name = "inventory_neutral_mm"
-path = "src/bin/inventory_neutral_mm.rs"
+name = "lighter_inventory_mm"
+path = "src/bin/lighter_inventory_mm.rs"
 
 [[bin]]
-name = "adaptive_mm"
-path = "src/bin/adaptive_mm.rs"
+name = "lighter_adaptive_mm"
+path = "src/bin/lighter_adaptive_mm.rs"
 
 [[bin]]
 name = "backpack_mm"

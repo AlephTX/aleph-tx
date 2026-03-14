@@ -4,7 +4,7 @@
 .PHONY: edgex-up edgex-down edgex-logs
 
 # Default strategy for each exchange
-STRATEGY ?= inventory_neutral_mm
+STRATEGY ?= lighter_inventory_mm
 
 # Default target
 help:
@@ -30,13 +30,13 @@ help:
 	@echo "  make edgex-logs                   - View EdgeX logs"
 	@echo ""
 	@echo "Available Strategies:"
-	@echo "  inventory_neutral_mm  - Inventory-neutral market maker (default)"
-	@echo "  adaptive_mm           - Adaptive market maker"
+	@echo "  lighter_inventory_mm  - Inventory-neutral market maker (default)"
+	@echo "  lighter_adaptive_mm   - Adaptive market maker"
 	@echo "  simple_mm             - Simple market maker demo"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make lighter-up                          # Default: inventory_neutral_mm"
-	@echo "  make lighter-up STRATEGY=adaptive_mm     # Adaptive MM on Lighter"
+	@echo "  make lighter-up                                      # Default: lighter_inventory_mm"
+	@echo "  make lighter-up STRATEGY=lighter_adaptive_mm         # Adaptive MM on Lighter"
 	@echo "  make backpack-up STRATEGY=simple_mm      # Simple MM on Backpack"
 	@echo ""
 	@echo "Monitoring:"
@@ -73,9 +73,10 @@ lighter-up: build-feeder
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-lighter.pid))"
 	@# Start strategy
+	@cargo build --release --bin $(STRATEGY)
 	@export $$(cat .env.lighter | xargs) && \
 		export LD_LIBRARY_PATH=$$(pwd)/src/native:$$LD_LIBRARY_PATH && \
-		cargo run --release --bin $(STRATEGY) > logs/lighter-$(STRATEGY).log 2>&1 & \
+		./target/release/$(STRATEGY) > logs/lighter-$(STRATEGY).log 2>&1 & \
 		echo $$! > pids/lighter-$(STRATEGY).pid
 	@echo "✅ Strategy started (PID: $$(cat pids/lighter-$(STRATEGY).pid))"
 	@echo "📊 Logs: tail -f logs/feeder-lighter.log logs/lighter-$(STRATEGY).log"
@@ -87,8 +88,11 @@ lighter-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (30s)..."; \
-			sleep 30; \
+			echo "⏳ Waiting for graceful shutdown (up to 60s)..."; \
+			for i in $$(seq 1 60); do \
+				if ! ps -p $$(cat $$pid_file) > /dev/null 2>&1; then break; fi; \
+				sleep 1; \
+			done; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
@@ -124,9 +128,10 @@ backpack-up: build-feeder
 	@sleep 2
 	@echo "✅ Feeder started (PID: $$(cat pids/feeder-backpack.pid))"
 	@# Start strategy
+	@cargo build --release --bin $(STRATEGY)
 	@export $$(cat .env.backpack | xargs) && \
 		export BACKPACK_ENV_PATH=.env.backpack && \
-		cargo run --release --bin $(STRATEGY) > logs/backpack-$(STRATEGY).log 2>&1 & \
+		./target/release/$(STRATEGY) > logs/backpack-$(STRATEGY).log 2>&1 & \
 		echo $$! > pids/backpack-$(STRATEGY).pid
 	@echo "✅ Strategy started (PID: $$(cat pids/backpack-$(STRATEGY).pid))"
 	@echo "📊 Logs: tail -f logs/feeder-backpack.log logs/backpack-$(STRATEGY).log"
@@ -138,8 +143,11 @@ backpack-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (30s)..."; \
-			sleep 30; \
+			echo "⏳ Waiting for graceful shutdown (up to 60s)..."; \
+			for i in $$(seq 1 60); do \
+				if ! ps -p $$(cat $$pid_file) > /dev/null 2>&1; then break; fi; \
+				sleep 1; \
+			done; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
@@ -190,8 +198,11 @@ edgex-down:
 		if [ -f "$$pid_file" ]; then \
 			echo "📤 Sending graceful shutdown signal..."; \
 			kill -2 $$(cat $$pid_file) 2>/dev/null || true; \
-			echo "⏳ Waiting for graceful shutdown (30s)..."; \
-			sleep 30; \
+			echo "⏳ Waiting for graceful shutdown (up to 60s)..."; \
+			for i in $$(seq 1 60); do \
+				if ! ps -p $$(cat $$pid_file) > /dev/null 2>&1; then break; fi; \
+				sleep 1; \
+			done; \
 			if ps -p $$(cat $$pid_file) > /dev/null 2>&1; then \
 				echo "⚠️  Process still running, forcing shutdown..."; \
 				kill -9 $$(cat $$pid_file) 2>/dev/null || true; \
