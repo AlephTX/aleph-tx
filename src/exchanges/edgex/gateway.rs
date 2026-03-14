@@ -4,10 +4,13 @@
 
 use super::client::EdgeXClient;
 use super::model::{
-    CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide, OrderType,
-    TimeInForce,
+    CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide,
+    OrderType as EdgeXOrderType, TimeInForce,
 };
-use crate::exchange::{BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult, Side};
+use crate::exchange::{
+    BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, Exchange, OrderInfo, OrderParams,
+    OrderResult, OrderType, PlaceResult, Side,
+};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -201,7 +204,7 @@ impl EdgeXGateway {
         let req = CreateOrderRequest {
             price: format!("{:.2}", price), // Round to 2 decimals to avoid floating point issues
             size: format!("{:.4}", size),   // Round to 4 decimals
-            r#type: OrderType::Limit,
+            r#type: EdgeXOrderType::Limit,
             time_in_force: TimeInForce::PostOnly,
             reduce_only: false, // Not a reduce-only order
             account_id: self.config.account_id,
@@ -262,6 +265,11 @@ impl EdgeXGateway {
             tx_hash: order_id.to_string(),
             client_order_index: l2_nonce as i64,
         })
+    }
+
+    pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+        self.create_order_internal(params.side, params.size, params.price)
+            .await
     }
 }
 
@@ -338,8 +346,7 @@ impl Exchange for EdgeXGateway {
     }
 
     async fn close_all_positions(&self, current_price: f64) -> Result<()> {
-        let positions = self
-            .client
+        let positions = self.client
             .get_positions(self.config.account_id)
             .await
             .map_err(|e| anyhow!("EdgeX get_positions failed: {}", e))?;
@@ -362,5 +369,40 @@ impl Exchange for EdgeXGateway {
         }
 
         Ok(())
+    }
+
+    async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+        let mut tx_hashes = Vec::new();
+        let mut place_results = Vec::new();
+
+        for action in actions {
+            match action {
+                BatchAction::Cancel(id) => {
+                    self.cancel_order(id).await?;
+                }
+                BatchAction::Place(params) => {
+                    let side = params.side;
+                    let price = params.price;
+                    let size = params.size;
+                    let res = self.place_order(params).await?;
+                    tx_hashes.push(res.tx_hash);
+                    place_results.push(PlaceResult {
+                        client_order_index: res.client_order_index,
+                        side,
+                        price,
+                        size,
+                    });
+                }
+            }
+        }
+
+        Ok(BatchResult {
+            tx_hashes,
+            place_results,
+        })
+    }
+
+    fn limit_order_type(&self) -> OrderType {
+        OrderType::PostOnly
     }
 }
