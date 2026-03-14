@@ -17,7 +17,7 @@ alwaysApply: true
 | error.rs | `TradingError` enum with all error variants |
 | exchange.rs | `Exchange` trait abstraction for unified trading interface |
 | shm_reader.rs | Lock-free BBO matrix reader (seqlock protocol) |
-| shm_event_reader.rs | Lock-free event ring buffer reader (SPSC) |
+| shm_event_reader.rs | Lock-free V2 event ring buffer reader (SPSC 128-byte) |
 | account_stats_reader.rs | Account stats SHM reader (128-byte versioned) |
 | order_tracker.rs | **v5.0.0** Per-order state machine (`RwLock<TrackerState>`, worst-case bilateral risk) |
 | shadow_ledger.rs | **DEPRECATED** Legacy dual-accumulator position tracking (`real_pos` + `in_flight_pos`) |

@@ -1,5 +1,5 @@
 // src/shm_depth_reader.rs - Order Book Depth Reader for OBI+VWMicro Pricing
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 const NUM_SYMBOLS: usize = 2048;
 const NUM_EXCHANGES: usize = 6;
@@ -16,14 +16,14 @@ pub struct PriceLevel {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShmDepthSnapshot {
-    pub seqlock: u32,        // 4 bytes
-    pub exchange_id: u8,     // 1 byte
-    pub symbol_id: u16,      // 2 bytes
-    pub _padding1: u8,       // 1 byte
-    pub timestamp_ns: u64,   // 8 bytes (total: 16 bytes)
+    pub seqlock: u32,                     // 4 bytes
+    pub exchange_id: u8,                  // 1 byte
+    pub symbol_id: u16,                   // 2 bytes
+    pub _padding1: u8,                    // 1 byte
+    pub timestamp_ns: u64,                // 8 bytes (total: 16 bytes)
     pub bids: [PriceLevel; DEPTH_LEVELS], // 5 * 16 = 80 bytes (total: 96 bytes)
     pub asks: [PriceLevel; DEPTH_LEVELS], // 5 * 16 = 80 bytes (total: 176 bytes)
-    pub _reserved: [u8; 72], // 72 bytes padding (total: 248 bytes + 8 alignment = 256)
+    pub _reserved: [u8; 72],              // 72 bytes padding (total: 248 bytes + 8 alignment = 256)
 }
 
 impl Default for ShmDepthSnapshot {
@@ -53,9 +53,7 @@ pub struct ShmDepthReader {
 
 impl ShmDepthReader {
     pub fn open(path: &str, num_symbols: usize) -> Result<Self, std::io::Error> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
 
         let expected_size = 8 + num_symbols * NUM_EXCHANGES * SLOT_SIZE;
 
@@ -133,10 +131,16 @@ mod tests {
     fn test_depth_snapshot_size() {
         let actual_size = std::mem::size_of::<ShmDepthSnapshot>();
         println!("ShmDepthSnapshot size: {} bytes", actual_size);
-        println!("PriceLevel size: {} bytes", std::mem::size_of::<PriceLevel>());
+        println!(
+            "PriceLevel size: {} bytes",
+            std::mem::size_of::<PriceLevel>()
+        );
 
         // With align(256), the struct will be padded to 256 bytes
-        assert_eq!(actual_size, 256, "ShmDepthSnapshot must be exactly 256 bytes");
+        assert_eq!(
+            actual_size, 256,
+            "ShmDepthSnapshot must be exactly 256 bytes"
+        );
         assert_eq!(std::mem::size_of::<PriceLevel>(), 16);
     }
 

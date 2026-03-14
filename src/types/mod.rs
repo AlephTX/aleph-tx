@@ -170,4 +170,3 @@ pub struct OrderResponse {
     pub filled_price: Option<Decimal>,
     pub created_at: u64,
 }
-

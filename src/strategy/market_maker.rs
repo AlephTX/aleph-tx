@@ -105,8 +105,12 @@ impl MarketMakerStrategy {
         if self.mid_history.len() < 5 {
             return 0.0;
         }
-        let Some(recent) = self.mid_history.back() else { return 0.0 };
-        let Some(lookback) = self.mid_history.iter().rev().nth(4) else { return 0.0 };
+        let Some(recent) = self.mid_history.back() else {
+            return 0.0;
+        };
+        let Some(lookback) = self.mid_history.iter().rev().nth(4) else {
+            return 0.0;
+        };
         (recent - lookback) / lookback * 10_000.0
     }
 

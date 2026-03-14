@@ -93,7 +93,10 @@ impl ShmReader {
                     if spin_count > MAX_SPINS {
                         tracing::error!(
                             "Seqlock stuck (writer dead?): symbol={} exch={} seq={} after {} spins",
-                            symbol_id, exch, seq1, spin_count
+                            symbol_id,
+                            exch,
+                            seq1,
+                            spin_count
                         );
                         // Return stale data rather than hang forever
                         msg = ShmBboMessage::default();
@@ -120,7 +123,9 @@ impl ShmReader {
                 if spin_count > MAX_SPINS {
                     tracing::error!(
                         "Seqlock torn read limit: symbol={} exch={} after {} spins",
-                        symbol_id, exch, spin_count
+                        symbol_id,
+                        exch,
+                        spin_count
                     );
                     msg = ShmBboMessage::default();
                     break;

@@ -12,12 +12,12 @@ fn main() {
     let mut hasher = Keccak256::new();
     hasher.update(sign_content.as_bytes());
     let hash_bytes = hasher.finalize();
-    println!("Keccak256 Hash: {}", hex::encode(&hash_bytes));
+    println!("Keccak256 Hash: {}", hex::encode(hash_bytes));
 
     // Load private key from env
     dotenv::from_filename(".env.edgex").ok();
-    let private_key = std::env::var("EDGEX_STARK_PRIVATE_KEY")
-        .expect("EDGEX_STARK_PRIVATE_KEY not set");
+    let private_key =
+        std::env::var("EDGEX_STARK_PRIVATE_KEY").expect("EDGEX_STARK_PRIVATE_KEY not set");
 
     println!("Private Key: {}", private_key);
 
@@ -26,5 +26,7 @@ fn main() {
     let signature = sig_manager.sign_message(sign_content).unwrap();
 
     println!("Signature: {}", signature);
-    println!("Expected:  014cef0a08746e2ea9e347dd31cd41070e83c881f655f946977871b7f52f45d5018b2d08897654cc8957d11b1edaad6d405174e5648ee39e47a06e4e4a725970");
+    println!(
+        "Expected:  014cef0a08746e2ea9e347dd31cd41070e83c881f655f946977871b7f52f45d5018b2d08897654cc8957d11b1edaad6d405174e5648ee39e47a06e4e4a725970"
+    );
 }

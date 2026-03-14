@@ -1,8 +1,8 @@
-use aleph_tx::exchanges::edgex::client::EdgeXClient;
-use aleph_tx::exchanges::edgex::gateway::{EdgeXGateway, EdgeXConfig};
 use aleph_tx::exchange::Exchange;
-use std::sync::Arc;
+use aleph_tx::exchanges::edgex::client::EdgeXClient;
+use aleph_tx::exchanges::edgex::gateway::{EdgeXConfig, EdgeXGateway};
 use std::env;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,10 +36,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing order placement...\n");
 
     // Place a buy order
-    let result = gateway.buy(
-        0.01,  // size: 0.01 ETH
-        1500.0, // price: $1500
-    ).await;
+    let result = gateway
+        .buy(
+            0.01,   // size: 0.01 ETH
+            1500.0, // price: $1500
+        )
+        .await;
 
     match result {
         Ok(order_result) => {

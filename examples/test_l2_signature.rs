@@ -3,8 +3,7 @@ use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load private key from env
-    let private_key = env::var("EDGEX_STARK_PRIVATE_KEY")
-        .expect("EDGEX_STARK_PRIVATE_KEY not set");
+    let private_key = env::var("EDGEX_STARK_PRIVATE_KEY").expect("EDGEX_STARK_PRIVATE_KEY not set");
 
     let sig_mgr = SignatureManager::new(&private_key)?;
 

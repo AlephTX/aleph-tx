@@ -15,8 +15,8 @@
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::{Result, TradingError};
-use crate::exchange::{Exchange, BatchOrderParams as ExchangeBatchParams};
-use crate::order_tracker::{OrderTracker, OrderSide};
+use crate::exchange::{BatchOrderParams as ExchangeBatchParams, Exchange};
+use crate::order_tracker::{OrderSide, OrderTracker};
 use crate::shm_event_reader::ShmEventReaderV2;
 use crate::shm_reader::ShmReader;
 use crate::telemetry::TelemetryCollector;
@@ -105,14 +105,16 @@ impl MicrostructureTracker {
             return 10.0; // Default
         }
 
-        let returns: Vec<f64> = self.price_samples
+        let returns: Vec<f64> = self
+            .price_samples
             .iter()
             .zip(self.price_samples.iter().skip(1))
             .map(|(p1, p2)| (p2 / p1 - 1.0) * 10000.0)
             .collect();
 
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let variance =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         variance.sqrt().max(1.0)
     }
 
@@ -179,11 +181,8 @@ impl InventoryNeutralMM {
         account_stats_reader: AccountStatsReader,
     ) -> Self {
         // Try to open depth reader (optional, for OBI+VWMicro pricing)
-        let shm_depth_reader = crate::shm_depth_reader::ShmDepthReader::open(
-            "/dev/shm/aleph-depth",
-            2048,
-        )
-        .ok();
+        let shm_depth_reader =
+            crate::shm_depth_reader::ShmDepthReader::open("/dev/shm/aleph-depth", 2048).ok();
 
         if shm_depth_reader.is_some() {
             info!("📊 OBI+VWMicro pricing enabled (depth reader initialized)");
@@ -195,11 +194,17 @@ impl InventoryNeutralMM {
         let event_reader = match ShmEventReaderV2::new_default() {
             Ok(mut reader) => {
                 reader.skip_to_end();
-                info!("📡 V2 event reader initialized (skipped {} historical events)", reader.local_read_idx());
+                info!(
+                    "📡 V2 event reader initialized (skipped {} historical events)",
+                    reader.local_read_idx()
+                );
                 Some(reader)
             }
             Err(e) => {
-                warn!("⚠️  V2 event reader unavailable: {} (OrderTracker will rely on drift sync)", e);
+                warn!(
+                    "⚠️  V2 event reader unavailable: {} (OrderTracker will rely on drift sync)",
+                    e
+                );
                 None
             }
         };
@@ -259,14 +264,22 @@ impl InventoryNeutralMM {
             if stats.available_balance > 0.0 && data_age_secs < 60 {
                 self.account_stats = stats.into();
                 self.session_start_balance = self.account_stats.portfolio_value;
-                info!("✅ Account stats loaded: equity=${:.2} available=${:.2} position={:.4}",
-                    self.account_stats.portfolio_value, self.account_stats.available_balance, self.account_stats.position);
+                info!(
+                    "✅ Account stats loaded: equity=${:.2} available=${:.2} position={:.4}",
+                    self.account_stats.portfolio_value,
+                    self.account_stats.available_balance,
+                    self.account_stats.position
+                );
 
                 // Sync order tracker with authoritative position from exchange
-                let delta = self.order_tracker.force_sync_position(self.account_stats.position);
+                let delta = self
+                    .order_tracker
+                    .force_sync_position(self.account_stats.position);
                 if delta.abs() > 1e-8 {
-                    info!("🔄 Tracker synced to exchange position: {:.4} (delta={:.4})",
-                        self.account_stats.position, delta);
+                    info!(
+                        "🔄 Tracker synced to exchange position: {:.4} (delta={:.4})",
+                        self.account_stats.position, delta
+                    );
                 }
                 break;
             }
@@ -293,8 +306,11 @@ impl InventoryNeutralMM {
             std::thread::Builder::new()
                 .name("event-consumer".into())
                 .spawn(move || {
-                    info!("📡 V2 event consumer started (OS thread, read_idx={}, write_idx={})",
-                        event_reader.local_read_idx(), event_reader.write_idx());
+                    info!(
+                        "📡 V2 event consumer started (OS thread, read_idx={}, write_idx={})",
+                        event_reader.local_read_idx(),
+                        event_reader.write_idx()
+                    );
                     loop {
                         let mut batch = 0u32;
                         while let Some(event) = event_reader.try_read() {
@@ -316,42 +332,45 @@ impl InventoryNeutralMM {
 
         loop {
             // Check shutdown signal
-            if let Some(ref mut rx) = shutdown {
-                if *rx.borrow() {
-                    info!("🛑 Shutdown signal received");
+            if let Some(ref mut rx) = shutdown
+                && *rx.borrow()
+            {
+                info!("🛑 Shutdown signal received");
 
-                    // Step 1: Cancel all active orders (use exchange cancel_all for speed)
-                    info!("📤 Canceling all orders...");
-                    match self.trading.cancel_all().await {
-                        Ok(count) => info!("✅ Canceled {} orders", count),
-                        Err(e) => warn!("Failed to cancel orders: {}", e),
-                    }
-                    // Sync tracker: mark all active orders as failed
-                    for order in &self.active_orders {
-                        self.order_tracker.mark_failed(order.client_order_id);
-                    }
-                    self.active_orders.clear();
+                // Step 1: Cancel all active orders (use exchange cancel_all for speed)
+                info!("📤 Canceling all orders...");
+                match self.trading.cancel_all().await {
+                    Ok(count) => info!("✅ Canceled {} orders", count),
+                    Err(e) => warn!("Failed to cancel orders: {}", e),
+                }
+                // Sync tracker: mark all active orders as failed
+                for order in &self.active_orders {
+                    self.order_tracker.mark_failed(order.client_order_id);
+                }
+                self.active_orders.clear();
 
-                    // Step 2: Close all positions if any
-                    let position = self.account_stats.position;
-                    if position.abs() > 0.0001 {
-                        info!("📉 Closing position: {:.4} ETH", position);
-                        let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
-                        if let Some((_, bbo)) = exchanges.iter().find(|(id, _)| *id == self.config.exchange_id) {
-                            let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
-                            if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
-                                warn!("⚠️  Invalid mid price during close: {:.4}", mid);
-                            } else if let Err(e) = self.trading.close_all_positions(mid).await {
-                                warn!("Failed to close positions: {}", e);
-                            } else {
-                                info!("✅ Positions closed");
-                            }
+                // Step 2: Close all positions if any
+                let position = self.account_stats.position;
+                if position.abs() > 0.0001 {
+                    info!("📉 Closing position: {:.4} ETH", position);
+                    let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
+                    if let Some((_, bbo)) = exchanges
+                        .iter()
+                        .find(|(id, _)| *id == self.config.exchange_id)
+                    {
+                        let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+                        if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
+                            warn!("⚠️  Invalid mid price during close: {:.4}", mid);
+                        } else if let Err(e) = self.trading.close_all_positions(mid).await {
+                            warn!("Failed to close positions: {}", e);
+                        } else {
+                            info!("✅ Positions closed");
                         }
                     }
-
-                    info!("✅ Graceful shutdown complete");
-                    return Ok(());
                 }
+
+                info!("✅ Graceful shutdown complete");
+                return Ok(());
             }
 
             // Update account stats
@@ -369,26 +388,30 @@ impl InventoryNeutralMM {
             // Layer 2: Drift detection + force sync
             let drift = (tracker_pos - acct_pos).abs();
             let position = if self.total_orders_placed == 0 {
-                acct_pos  // Before any orders, use exchange position
+                acct_pos // Before any orders, use exchange position
             } else if drift > self.config.max_position * 0.5 && acct_pos.abs() > 1e-8 {
                 // Tracker drifted too far — force sync to exchange
                 let delta = self.order_tracker.force_sync_position(acct_pos);
                 if delta.abs() > 0.001 {
-                    warn!("Tracker drift detected: tracker={:.4} exchange={:.4}, force synced (delta={:.4})",
-                        tracker_pos, acct_pos, delta);
+                    warn!(
+                        "Tracker drift detected: tracker={:.4} exchange={:.4}, force synced (delta={:.4})",
+                        tracker_pos, acct_pos, delta
+                    );
                 }
                 acct_pos
             } else if drift < self.config.max_position * 0.05 {
-                tracker_pos  // Drift < 5%, trust tracker (more responsive)
+                tracker_pos // Drift < 5%, trust tracker (more responsive)
             } else {
-                acct_pos  // Drift 5-50%, use exchange position (safer)
+                acct_pos // Drift 5-50%, use exchange position (safer)
             };
 
             // Log position for debugging
-            if self.total_orders_placed % 10 == 0 {
+            if self.total_orders_placed.is_multiple_of(10) {
                 debug!(
                     "Position: tracker={:.4} exchange={:.4} using={:.4} worst_long={:.4} worst_short={:.4}",
-                    tracker_pos, acct_pos, position,
+                    tracker_pos,
+                    acct_pos,
+                    position,
                     self.order_tracker.worst_case_long(),
                     self.order_tracker.worst_case_short()
                 );
@@ -401,8 +424,11 @@ impl InventoryNeutralMM {
                     warn!("Periodic sync: drift={:.6} ETH", delta);
                 }
                 // Reconcile tracker: mark stale entries that strategy no longer tracks
-                let strategy_cois: std::collections::HashSet<i64> = self.active_orders
-                    .iter().map(|o| o.client_order_id).collect();
+                let strategy_cois: std::collections::HashSet<i64> = self
+                    .active_orders
+                    .iter()
+                    .map(|o| o.client_order_id)
+                    .collect();
                 let tracker_cois = self.order_tracker.active_cois();
                 let mut stale_count = 0;
                 for coi in tracker_cois {
@@ -412,10 +438,14 @@ impl InventoryNeutralMM {
                     }
                 }
                 if stale_count > 0 {
-                    info!("Periodic reconcile: cleared {} stale tracker entries (strategy has {})",
-                        stale_count, self.active_orders.len());
+                    info!(
+                        "Periodic reconcile: cleared {} stale tracker entries (strategy has {})",
+                        stale_count,
+                        self.active_orders.len()
+                    );
                 }
-                self.order_tracker.gc_completed_orders(Duration::from_secs(300));
+                self.order_tracker
+                    .gc_completed_orders(Duration::from_secs(300));
                 // Phase 2: Verify atomic exposure matches locked traversal
                 self.order_tracker.debug_verify_exposure();
                 // Sync fill stats from OrderTracker → Telemetry
@@ -479,10 +509,9 @@ impl InventoryNeutralMM {
 
             // Calculate VWMicro price if depth data available
             let pricing_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
-                if let Some(depth) = depth_reader.read_depth(
-                    self.config.symbol_id,
-                    self.config.exchange_id,
-                ) {
+                if let Some(depth) =
+                    depth_reader.read_depth(self.config.symbol_id, self.config.exchange_id)
+                {
                     self.calculate_vw_micro_price(&depth, bbo.bid_price, bbo.ask_price)
                 } else {
                     mid // Fallback to simple mid
@@ -500,7 +529,10 @@ impl InventoryNeutralMM {
 
             // Adverse selection filter
             if as_score > self.config.adverse_selection_threshold {
-                debug!("AS filter triggered: score={:.2} (canceling + pausing)", as_score);
+                debug!(
+                    "AS filter triggered: score={:.2} (canceling + pausing)",
+                    as_score
+                );
                 self.cancel_all_orders().await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -572,24 +604,40 @@ impl InventoryNeutralMM {
             // Cap: prevent absurd spreads on low-liquidity DEX
             let max_half_spread = pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
             // Floor: half of round-trip cost = (2×maker_fee + min_profit) / 2 per side
-            let fee_floor = pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
+            let fee_floor = pricing_mid
+                * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps)
+                / 10000.0
+                / 2.0;
             let half_spread = half_spread_raw.clamp(fee_floor, max_half_spread);
 
             // Apply cross-exchange shift to reservation price
             let shifted_res = reservation_price + cross_shift;
 
-            let our_bid = ((shifted_res - half_spread) / self.config.tick_size).floor() * self.config.tick_size;
-            let our_ask = ((shifted_res + half_spread) / self.config.tick_size).ceil() * self.config.tick_size;
+            let our_bid = ((shifted_res - half_spread) / self.config.tick_size).floor()
+                * self.config.tick_size;
+            let our_ask = ((shifted_res + half_spread) / self.config.tick_size).ceil()
+                * self.config.tick_size;
 
             debug!(
                 "A-S: res={:.2} half_sprd={:.4} (raw={:.4} cap={:.4} floor={:.4}) σ={:.4} q={:.4} κ={:.2} bid={:.2} ask={:.2}",
-                shifted_res, half_spread, half_spread_raw, max_half_spread, fee_floor,
-                sigma, q, kappa, our_bid, our_ask
+                shifted_res,
+                half_spread,
+                half_spread_raw,
+                max_half_spread,
+                fee_floor,
+                sigma,
+                q,
+                kappa,
+                our_bid,
+                our_ask
             );
 
             // Safety: never cross the spread (bid must be < ask)
             if our_bid >= our_ask {
-                debug!("Crossed spread: bid={:.2} >= ask={:.2}, skipping", our_bid, our_ask);
+                debug!(
+                    "Crossed spread: bid={:.2} >= ask={:.2}, skipping",
+                    our_bid, our_ask
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -601,7 +649,8 @@ impl InventoryNeutralMM {
 
             // Update telemetry metrics
             self.telemetry.update_spread_size(actual_spread_bps);
-            self.telemetry.update_adverse_selection(self.micro.adverse_selection_score());
+            self.telemetry
+                .update_adverse_selection(self.micro.adverse_selection_score());
 
             if actual_spread_bps < min_spread_bps {
                 debug!(
@@ -611,19 +660,27 @@ impl InventoryNeutralMM {
                 // Still cancel stale orders that are far from current mid
                 if !self.active_orders.is_empty() {
                     let stale_threshold = mid * self.config.requote_threshold_bps * 3.0 / 10000.0;
-                    let stale: Vec<(String, i64)> = self.active_orders.iter()
+                    let stale: Vec<(String, i64)> = self
+                        .active_orders
+                        .iter()
                         .filter(|o| (o.price - mid).abs() > stale_threshold)
                         .map(|o| (o.order_id.clone(), o.client_order_id))
                         .collect();
                     if !stale.is_empty() {
-                        debug!("Canceling {} stale orders (mid={:.2}, threshold={:.2})", stale.len(), mid, stale_threshold);
+                        debug!(
+                            "Canceling {} stale orders (mid={:.2}, threshold={:.2})",
+                            stale.len(),
+                            mid,
+                            stale_threshold
+                        );
                         for (oid, coi) in &stale {
                             if let Ok(idx) = oid.parse::<i64>() {
                                 let _ = self.trading.cancel_order(idx).await;
                             }
                             self.order_tracker.mark_failed(*coi);
                         }
-                        self.active_orders.retain(|o| stale.iter().all(|(sid, _)| sid != &o.order_id));
+                        self.active_orders
+                            .retain(|o| stale.iter().all(|(sid, _)| sid != &o.order_id));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -655,9 +712,16 @@ impl InventoryNeutralMM {
 
             debug!(
                 "BBO={:.2}/{:.2} Mkt={:.1}bps Our={:.2}/{:.2} Sprd={:.1}bps Pos={:.4} Bid={:.3} Ask={:.3} post_only={}",
-                bbo.bid_price, bbo.ask_price, market_spread_bps,
-                our_bid, our_ask, actual_spread_bps,
-                position, bid_size, ask_size, self.config.use_post_only
+                bbo.bid_price,
+                bbo.ask_price,
+                market_spread_bps,
+                our_bid,
+                our_ask,
+                actual_spread_bps,
+                position,
+                bid_size,
+                ask_size,
+                self.config.use_post_only
             );
 
             // Calculate grid levels for both sides
@@ -669,15 +733,11 @@ impl InventoryNeutralMM {
             let should_requote_ask = self.should_requote_side(OrderSide::Sell, &ask_levels);
 
             // Cancel stale orders on sides that need requoting
-            if should_requote_bid {
-                if let Err(e) = self.cancel_side_orders(OrderSide::Buy).await {
-                    warn!("Failed to cancel bid orders: {}", e);
-                }
+            if should_requote_bid && let Err(e) = self.cancel_side_orders(OrderSide::Buy).await {
+                warn!("Failed to cancel bid orders: {}", e);
             }
-            if should_requote_ask {
-                if let Err(e) = self.cancel_side_orders(OrderSide::Sell).await {
-                    warn!("Failed to cancel ask orders: {}", e);
-                }
+            if should_requote_ask && let Err(e) = self.cancel_side_orders(OrderSide::Sell).await {
+                warn!("Failed to cancel ask orders: {}", e);
             }
 
             // ═══════════════════════════════════════════════════════════════════
@@ -687,9 +747,12 @@ impl InventoryNeutralMM {
             let mut placed_asks = 0;
 
             // Fast path: both sides need requoting with single level → use atomic batch
-            let use_batch = should_requote_bid && should_requote_ask
-                && bid_levels.len() == 1 && ask_levels.len() == 1
-                && bid_levels[0].1 >= 0.001 && ask_levels[0].1 >= 0.001;
+            let use_batch = should_requote_bid
+                && should_requote_ask
+                && bid_levels.len() == 1
+                && ask_levels.len() == 1
+                && bid_levels[0].1 >= 0.001
+                && ask_levels[0].1 >= 0.001;
 
             if use_batch {
                 let (bid_price, bid_sz) = bid_levels[0];
@@ -702,41 +765,72 @@ impl InventoryNeutralMM {
                 let ask_ok = worst_short - ask_sz >= -self.config.max_position;
 
                 if bid_ok && ask_ok {
-                    match self.trading.place_batch(ExchangeBatchParams {
-                        bid_price, ask_price, bid_size: bid_sz, ask_size: ask_sz,
-                    }).await {
+                    match self
+                        .trading
+                        .place_batch(ExchangeBatchParams {
+                            bid_price,
+                            ask_price,
+                            bid_size: bid_sz,
+                            ask_size: ask_sz,
+                        })
+                        .await
+                    {
                         Ok(result) => {
                             let now = Instant::now();
                             // Use first tx_hash for bid, second for ask (or same if single hash)
                             let bid_hash = result.tx_hashes.first().cloned().unwrap_or_default();
-                            let ask_hash = result.tx_hashes.get(1).cloned().unwrap_or_else(|| bid_hash.clone());
+                            let ask_hash = result
+                                .tx_hashes
+                                .get(1)
+                                .cloned()
+                                .unwrap_or_else(|| bid_hash.clone());
                             self.active_orders.push(ActiveOrder {
-                                order_id: bid_hash, client_order_id: result.bid_client_order_index,
-                                side: OrderSide::Buy, price: bid_price, size: bid_sz, placed_at: now,
+                                order_id: bid_hash,
+                                client_order_id: result.bid_client_order_index,
+                                side: OrderSide::Buy,
+                                price: bid_price,
+                                size: bid_sz,
+                                placed_at: now,
                             });
                             self.active_orders.push(ActiveOrder {
-                                order_id: ask_hash, client_order_id: result.ask_client_order_index,
-                                side: OrderSide::Sell, price: ask_price, size: ask_sz, placed_at: now,
+                                order_id: ask_hash,
+                                client_order_id: result.ask_client_order_index,
+                                side: OrderSide::Sell,
+                                price: ask_price,
+                                size: ask_sz,
+                                placed_at: now,
                             });
                             self.total_orders_placed += 2;
                             self.telemetry.record_order_placed();
                             self.telemetry.record_order_placed();
                             placed_bids = 1;
                             placed_asks = 1;
-                            debug!("Batch placed: bid={:.2}x{:.3} ask={:.2}x{:.3}", bid_price, bid_sz, ask_price, ask_sz);
+                            debug!(
+                                "Batch placed: bid={:.2}x{:.3} ask={:.2}x{:.3}",
+                                bid_price, bid_sz, ask_price, ask_sz
+                            );
                         }
                         Err(e) => {
                             warn!("Batch order failed: {}", e);
-                            self.telemetry.record_order_rejected(&format!("batch: {}", e));
-                            if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                                self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
+                            self.telemetry
+                                .record_order_rejected(&format!("batch: {}", e));
+                            if matches!(
+                                e.downcast_ref::<TradingError>(),
+                                Some(TradingError::InsufficientMargin)
+                            ) {
+                                self.telemetry
+                                    .record_margin_cooldown(self.config.margin_cooldown_secs);
                                 self.cancel_all_orders().await;
-                                self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                self.margin_cooldown_until = Instant::now()
+                                    + Duration::from_secs(self.config.margin_cooldown_secs);
                             }
                         }
                     }
                 } else {
-                    debug!("Batch skipped: position limit (worst_long={:.4} worst_short={:.4})", worst_long, worst_short);
+                    debug!(
+                        "Batch skipped: position limit (worst_long={:.4} worst_short={:.4})",
+                        worst_long, worst_short
+                    );
                 }
             } else {
                 // Fallback: sequential per-side placement (multi-level grid or single-side requote)
@@ -752,13 +846,22 @@ impl InventoryNeutralMM {
                         if current_pos + cumulative_bid_size + *size > self.config.max_position {
                             debug!(
                                 "Grid bid L{} would breach max_position (worst_long={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
-                                placed_bids + 1, current_pos, cumulative_bid_size, size, self.config.max_position
+                                placed_bids + 1,
+                                current_pos,
+                                cumulative_bid_size,
+                                size,
+                                self.config.max_position
                             );
                             break;
                         }
                         match self.trading.buy(*size, *price).await {
                             Ok(result) => {
-                                debug!("Grid Buy L{}: ${:.2} x {:.3}", placed_bids + 1, price, size);
+                                debug!(
+                                    "Grid Buy L{}: ${:.2} x {:.3}",
+                                    placed_bids + 1,
+                                    price,
+                                    size
+                                );
                                 self.active_orders.push(ActiveOrder {
                                     order_id: result.tx_hash,
                                     client_order_id: result.client_order_index,
@@ -774,12 +877,24 @@ impl InventoryNeutralMM {
                             }
                             Err(e) => {
                                 warn!("Grid buy L{} failed: {}", placed_bids + 1, e);
-                                self.telemetry.record_order_rejected(&format!("buy L{}: {}", placed_bids + 1, e));
-                                if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                                    warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
-                                    self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
+                                self.telemetry.record_order_rejected(&format!(
+                                    "buy L{}: {}",
+                                    placed_bids + 1,
+                                    e
+                                ));
+                                if matches!(
+                                    e.downcast_ref::<TradingError>(),
+                                    Some(TradingError::InsufficientMargin)
+                                ) {
+                                    warn!(
+                                        "Margin insufficient, canceling all orders (cooldown {}s)",
+                                        self.config.margin_cooldown_secs
+                                    );
+                                    self.telemetry
+                                        .record_margin_cooldown(self.config.margin_cooldown_secs);
                                     self.cancel_all_orders().await;
-                                    self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                    self.margin_cooldown_until = Instant::now()
+                                        + Duration::from_secs(self.config.margin_cooldown_secs);
                                     break;
                                 }
                             }
@@ -796,13 +911,22 @@ impl InventoryNeutralMM {
                         if current_pos - cumulative_ask_size - *size < -self.config.max_position {
                             debug!(
                                 "Grid ask L{} would breach max_position (worst_short={:.4} cumulative={:.4} size={:.4} max={:.4}), skipping",
-                                placed_asks + 1, current_pos, cumulative_ask_size, size, self.config.max_position
+                                placed_asks + 1,
+                                current_pos,
+                                cumulative_ask_size,
+                                size,
+                                self.config.max_position
                             );
                             break;
                         }
                         match self.trading.sell(*size, *price).await {
                             Ok(result) => {
-                                debug!("Grid Sell L{}: ${:.2} x {:.3}", placed_asks + 1, price, size);
+                                debug!(
+                                    "Grid Sell L{}: ${:.2} x {:.3}",
+                                    placed_asks + 1,
+                                    price,
+                                    size
+                                );
                                 self.active_orders.push(ActiveOrder {
                                     order_id: result.tx_hash,
                                     client_order_id: result.client_order_index,
@@ -818,12 +942,24 @@ impl InventoryNeutralMM {
                             }
                             Err(e) => {
                                 warn!("Grid sell L{} failed: {}", placed_asks + 1, e);
-                                self.telemetry.record_order_rejected(&format!("sell L{}: {}", placed_asks + 1, e));
-                                if matches!(e.downcast_ref::<TradingError>(), Some(TradingError::InsufficientMargin)) {
-                                    warn!("Margin insufficient, canceling all orders (cooldown {}s)", self.config.margin_cooldown_secs);
-                                    self.telemetry.record_margin_cooldown(self.config.margin_cooldown_secs);
+                                self.telemetry.record_order_rejected(&format!(
+                                    "sell L{}: {}",
+                                    placed_asks + 1,
+                                    e
+                                ));
+                                if matches!(
+                                    e.downcast_ref::<TradingError>(),
+                                    Some(TradingError::InsufficientMargin)
+                                ) {
+                                    warn!(
+                                        "Margin insufficient, canceling all orders (cooldown {}s)",
+                                        self.config.margin_cooldown_secs
+                                    );
+                                    self.telemetry
+                                        .record_margin_cooldown(self.config.margin_cooldown_secs);
                                     self.cancel_all_orders().await;
-                                    self.margin_cooldown_until = Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
+                                    self.margin_cooldown_until = Instant::now()
+                                        + Duration::from_secs(self.config.margin_cooldown_secs);
                                     break;
                                 }
                             }
@@ -836,7 +972,9 @@ impl InventoryNeutralMM {
             if placed_bids > 0 || placed_asks > 0 {
                 info!(
                     "Grid placed: {} bid levels, {} ask levels (pos={:.4}{})",
-                    placed_bids, placed_asks, position,
+                    placed_bids,
+                    placed_asks,
+                    position,
                     if use_batch { " batch" } else { "" }
                 );
             }
@@ -850,7 +988,9 @@ impl InventoryNeutralMM {
     /// Lower κ → wider spread (fills are scarce, need more edge)
     /// Returns fills per second (matching T's time unit)
     fn estimate_fill_rate(&self) -> f64 {
-        let recent_fills = self.order_tracker.filled_count_since(Duration::from_secs(300));
+        let recent_fills = self
+            .order_tracker
+            .filled_count_since(Duration::from_secs(300));
         // κ = fills per second, floored at 0.01 to prevent ln(1) = 0
         let fills_per_sec = recent_fills as f64 / 300.0;
         fills_per_sec.max(0.01)
@@ -939,7 +1079,8 @@ impl InventoryNeutralMM {
 
     /// Cancel all orders on a given side
     async fn cancel_side_orders(&mut self, side: OrderSide) -> Result<()> {
-        let orders_to_cancel: Vec<(String, i64)> = self.active_orders
+        let orders_to_cancel: Vec<(String, i64)> = self
+            .active_orders
             .iter()
             .filter(|o| o.side == side)
             .map(|o| (o.order_id.clone(), o.client_order_id))
@@ -986,10 +1127,12 @@ impl InventoryNeutralMM {
         // tanh(4) ≈ 0.9993, so at pos=max_position, multiplier ≈ 1.0 + 1.0 = 2.0
         // To reach 3.0, we scale: 1.0 + 2.0 * tanh(steepness * normalized_pos)
         let normalized_pos = position / self.config.max_position;
-        let sigmoid_multiplier = 1.0 + 2.0 * (self.config.sigmoid_steepness * normalized_pos.abs()).tanh();
+        let sigmoid_multiplier =
+            1.0 + 2.0 * (self.config.sigmoid_steepness * normalized_pos.abs()).tanh();
 
         // Cap inventory_offset to prevent whiplash: flattening order <= cap_mult * base_order_size
-        let max_offset = self.config.base_order_size * (self.config.flattening_cap_mult - 1.0).max(0.5);
+        let max_offset =
+            self.config.base_order_size * (self.config.flattening_cap_mult - 1.0).max(0.5);
         let inventory_offset = (position.abs() * sigmoid_multiplier).min(max_offset);
 
         let bid_size = if position < 0.0 {
@@ -1048,7 +1191,9 @@ impl InventoryNeutralMM {
                 // Too little margin: cancel active orders and skip this cycle
                 warn!(
                     "Insufficient margin: available=${:.2} required=${:.2} (scale={:.1}%), skipping quotes",
-                    available, total_margin_required, scale_factor * 100.0
+                    available,
+                    total_margin_required,
+                    scale_factor * 100.0
                 );
                 (0.0, 0.0)
             } else {
@@ -1057,13 +1202,22 @@ impl InventoryNeutralMM {
                 let scaled_ask = ask_size * scale_factor;
                 debug!(
                     "Margin constraint: scaled orders by {:.1}% (available=${:.2})",
-                    scale_factor * 100.0, available
+                    scale_factor * 100.0,
+                    available
                 );
 
                 // Check if scaled sizes meet minimum requirements (Lighter DEX minimum ~0.01 ETH)
                 let min_order_size = 0.01;
-                let final_bid = if scaled_bid < min_order_size { 0.0 } else { scaled_bid };
-                let final_ask = if scaled_ask < min_order_size { 0.0 } else { scaled_ask };
+                let final_bid = if scaled_bid < min_order_size {
+                    0.0
+                } else {
+                    scaled_bid
+                };
+                let final_ask = if scaled_ask < min_order_size {
+                    0.0
+                } else {
+                    scaled_ask
+                };
 
                 (final_bid, final_ask)
             }
@@ -1163,301 +1317,6 @@ impl InventoryNeutralMM {
     }
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_grid_level_calculation() {
-        let config = InventoryNeutralMMConfig {
-            tick_size: 0.01,
-            step_size: 0.0001,
-            grid_levels: 3,
-            grid_spacing_bps: 2.0,
-            grid_size_decay: 0.7,
-            ..Default::default()
-        };
-
-        // Test bid levels (prices should decrease)
-        let base_price = 2000.0;
-        let base_size = 0.1;
-
-        let mut bid_levels = Vec::new();
-        for i in 0..config.grid_levels {
-            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-            let price = base_price - spacing_dollars;
-            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
-
-            let size_multiplier = config.grid_size_decay.powi(i as i32);
-            let size = base_size * size_multiplier;
-            let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-            if rounded_size >= 0.001 {
-                bid_levels.push((rounded_price, rounded_size));
-            }
-        }
-
-        // Verify 3 levels generated
-        assert_eq!(bid_levels.len(), 3);
-
-        // Verify prices descend
-        assert!(bid_levels[0].0 >= bid_levels[1].0);
-        assert!(bid_levels[1].0 >= bid_levels[2].0);
-
-        // Verify size decay (0.7^0, 0.7^1, 0.7^2)
-        assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
-        assert!((bid_levels[1].1 - 0.07).abs() < 0.001);
-        assert!((bid_levels[2].1 - 0.049).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_multi_level_order_tracking() {
-        // Test helper methods without full MM initialization
-        let config = InventoryNeutralMMConfig {
-            grid_levels: 3,
-            requote_threshold_bps: 10.0,
-            ..Default::default()
-        };
-
-        // Create a minimal MM instance for testing
-        let mut active_orders = Vec::new();
-
-        // Simulate adding orders
-        active_orders.push(ActiveOrder {
-            order_id: "1".to_string(),
-            client_order_id: 1,
-            side: OrderSide::Buy,
-            price: 3000.0,
-            size: 0.05,
-            placed_at: Instant::now(),
-        });
-        active_orders.push(ActiveOrder {
-            order_id: "2".to_string(),
-            client_order_id: 2,
-            side: OrderSide::Buy,
-            price: 2995.0,
-            size: 0.035,
-            placed_at: Instant::now(),
-        });
-        active_orders.push(ActiveOrder {
-            order_id: "3".to_string(),
-            client_order_id: 3,
-            side: OrderSide::Sell,
-            price: 3010.0,
-            size: 0.05,
-            placed_at: Instant::now(),
-        });
-
-        // Test filtering by side
-        let bids: Vec<_> = active_orders.iter().filter(|o| o.side == OrderSide::Buy).collect();
-        assert_eq!(bids.len(), 2);
-        assert_eq!(bids[0].price, 3000.0);
-        assert_eq!(bids[1].price, 2995.0);
-
-        let asks: Vec<_> = active_orders.iter().filter(|o| o.side == OrderSide::Sell).collect();
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].price, 3010.0);
-
-        // Test requote logic
-        let target_prices = vec![(3000.0, 0.05), (2995.0, 0.035)];
-
-        // Same prices - no requote needed
-        let mut needs_requote = false;
-        if bids.len() != target_prices.len() {
-            needs_requote = true;
-        } else {
-            for (order, &(target_price, _)) in bids.iter().zip(target_prices.iter()) {
-                let price_diff = (order.price - target_price).abs();
-                let threshold = target_price * config.requote_threshold_bps / 10000.0;
-                if price_diff > threshold {
-                    needs_requote = true;
-                    break;
-                }
-            }
-        }
-        assert!(!needs_requote);
-
-        // Price moved beyond threshold (10 bps = 0.1%)
-        let moved_prices = vec![(3005.0, 0.05), (2995.0, 0.035)];
-        needs_requote = false;
-        for (order, &(target_price, _)) in bids.iter().zip(moved_prices.iter()) {
-            let price_diff = (order.price - target_price).abs();
-            let threshold = target_price * config.requote_threshold_bps / 10000.0;
-            if price_diff > threshold {
-                needs_requote = true;
-                break;
-            }
-        }
-        assert!(needs_requote); // 5 dollar move on 3000 = 16.7 bps > 10 bps threshold
-    }
-
-    #[test]
-    fn test_grid_integration() {
-        // Integration test: verify full grid calculation pipeline
-        let config = InventoryNeutralMMConfig {
-            grid_levels: 3,
-            grid_spacing_bps: 5.0,
-            grid_size_decay: 0.7,
-            tick_size: 0.01,
-            step_size: 0.001,
-            ..Default::default()
-        };
-
-        let base_price = 3000.0;
-        let base_size = 0.1;
-
-        // Calculate bid levels
-        let mut bid_levels = Vec::new();
-        for i in 0..config.grid_levels {
-            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-            let price = base_price - spacing_dollars;
-            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
-
-            let size_multiplier = config.grid_size_decay.powi(i as i32);
-            let size = base_size * size_multiplier;
-            let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-            if rounded_size >= 0.001 {
-                bid_levels.push((rounded_price, rounded_size));
-            }
-        }
-
-        // Verify bid levels
-        assert_eq!(bid_levels.len(), 3);
-
-        // Level 0: base price, full size
-        assert!((bid_levels[0].0 - 3000.0).abs() < 0.01);
-        assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
-
-        // Level 1: -5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
-        assert!((bid_levels[1].0 - 2998.5).abs() < 0.01);
-        assert!((bid_levels[1].1 - 0.069).abs() < 0.001);
-
-        // Level 2: -10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
-        assert!((bid_levels[2].0 - 2997.0).abs() < 0.01);
-        assert!((bid_levels[2].1 - 0.048).abs() < 0.001);
-
-        // Calculate ask levels
-        let mut ask_levels = Vec::new();
-        for i in 0..config.grid_levels {
-            let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-            let price = base_price + spacing_dollars;
-            let rounded_price = (price / config.tick_size).floor() * config.tick_size;
-
-            let size_multiplier = config.grid_size_decay.powi(i as i32);
-            let size = base_size * size_multiplier;
-            let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-            if rounded_size >= 0.001 {
-                ask_levels.push((rounded_price, rounded_size));
-            }
-        }
-
-        // Verify ask levels
-        assert_eq!(ask_levels.len(), 3);
-
-        // Level 0: base price, full size
-        assert!((ask_levels[0].0 - 3000.0).abs() < 0.01);
-        assert!((ask_levels[0].1 - 0.1).abs() < 0.001);
-
-        // Level 1: +5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
-        assert!((ask_levels[1].0 - 3001.5).abs() < 0.01);
-        assert!((ask_levels[1].1 - 0.069).abs() < 0.001);
-
-        // Level 2: +10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
-        assert!((ask_levels[2].0 - 3003.0).abs() < 0.01);
-        assert!((ask_levels[2].1 - 0.048).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_sigmoid_size_multiplier() {
-        let config = InventoryNeutralMMConfig {
-            max_position: 0.15,
-            sigmoid_steepness: 4.0,
-            ..Default::default()
-        };
-
-        // Helper function to calculate sigmoid multiplier
-        let calc_multiplier = |position: f64| -> f64 {
-            let normalized_pos = position / config.max_position;
-            1.0 + 2.0 * (config.sigmoid_steepness * normalized_pos.abs()).tanh()
-        };
-
-        // Test at different position levels
-        let pos_0 = 0.0;
-        let pos_5pct = 0.05 * config.max_position;  // 0.0075
-        let pos_50pct = 0.5 * config.max_position;  // 0.075
-        let pos_80pct = 0.8 * config.max_position;  // 0.12
-        let pos_100pct = config.max_position;       // 0.15
-
-        let mult_0 = calc_multiplier(pos_0);
-        let mult_5 = calc_multiplier(pos_5pct);
-        let mult_50 = calc_multiplier(pos_50pct);
-        let mult_80 = calc_multiplier(pos_80pct);
-        let mult_100 = calc_multiplier(pos_100pct);
-
-        // Verify sigmoid properties:
-        // 1. At pos=0, multiplier ≈ 1.0 (minimal urgency)
-        assert!((mult_0 - 1.0).abs() < 0.01, "pos=0: mult={}", mult_0);
-
-        // 2. Monotonically increasing
-        assert!(mult_5 > mult_0, "mult_5={} should > mult_0={}", mult_5, mult_0);
-        assert!(mult_50 > mult_5, "mult_50={} should > mult_5={}", mult_50, mult_5);
-        assert!(mult_80 > mult_50, "mult_80={} should > mult_50={}", mult_80, mult_50);
-        assert!(mult_100 > mult_80, "mult_100={} should > mult_80={}", mult_100, mult_80);
-
-        // 3. At pos=100%, multiplier ≈ 3.0 (max urgency)
-        assert!((mult_100 - 3.0).abs() < 0.1, "pos=100%: mult={}", mult_100);
-
-        // 4. Steeper growth in middle range (50% → 80% should have larger delta than 5% → 50%)
-        // This validates the sigmoid curve is steeper in the middle
-        let delta_low = mult_50 - mult_5;
-        let delta_mid = mult_80 - mult_50;
-        assert!(delta_mid > 0.0, "delta_mid={} should be positive", delta_mid);
-        assert!(delta_low > 0.0, "delta_low={} should be positive", delta_low);
-    }
-
-    #[test]
-    fn test_vw_micro_price_calculation() {
-        use crate::shm_depth_reader::{PriceLevel, ShmDepthSnapshot};
-
-        // Create mock depth snapshot
-        let depth = ShmDepthSnapshot {
-            seqlock: 0,
-            exchange_id: 2,
-            symbol_id: 1002,
-            _padding1: 0,
-            timestamp_ns: 1234567890,
-            bids: [
-                PriceLevel { price: 3000.0, size: 1.0 },
-                PriceLevel { price: 2999.0, size: 2.0 },
-                PriceLevel { price: 2998.0, size: 1.5 },
-                PriceLevel { price: 2997.0, size: 1.0 },
-                PriceLevel { price: 2996.0, size: 0.5 },
-            ],
-            asks: [
-                PriceLevel { price: 3001.0, size: 1.0 },
-                PriceLevel { price: 3002.0, size: 2.0 },
-                PriceLevel { price: 3003.0, size: 1.5 },
-                PriceLevel { price: 3004.0, size: 1.0 },
-                PriceLevel { price: 3005.0, size: 0.5 },
-            ],
-            _reserved: [0; 72],
-        };
-
-        // Calculate VWMicro manually
-        let bid_notional: f64 = depth.bids.iter().map(|l| l.price * l.size).sum();
-        let ask_notional: f64 = depth.asks.iter().map(|l| l.price * l.size).sum();
-        let vw_micro = (bid_notional * 3001.0 + ask_notional * 3000.0) / (bid_notional + ask_notional);
-
-        // VWMicro should be between bid and ask
-        assert!(vw_micro > 3000.0 && vw_micro < 3001.0,
-            "VWMicro {} should be between 3000.0 and 3001.0", vw_micro);
-
-        // Should be closer to mid than simple average due to depth weighting
-        let simple_mid = 3000.5;
-        assert!((vw_micro - simple_mid).abs() < 1.0,
-            "VWMicro {} should be close to simple mid {}", vw_micro, simple_mid);
-    }
-}
-
+mod tests;

@@ -3,11 +3,12 @@
 //! Wraps EdgeXClient to implement the unified Exchange trait with full L2 signature support.
 
 use super::client::EdgeXClient;
-use super::model::{CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide, OrderType, TimeInForce};
-use crate::exchange::{
-    BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult, Side,
+use super::model::{
+    CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide, OrderType,
+    TimeInForce,
 };
-use anyhow::{anyhow, Result};
+use crate::exchange::{BatchOrderParams, BatchOrderResult, Exchange, OrderInfo, OrderResult, Side};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,31 +40,43 @@ impl EdgeXConfig {
         let app_config = crate::config::AppConfig::load_default();
         let edgex_cfg = &app_config.edgex;
 
-        let contract_id = edgex_cfg.contract_id
+        let contract_id = edgex_cfg
+            .contract_id
             .ok_or_else(|| anyhow!("contract_id not set in config.toml [edgex]"))?;
 
-        let synthetic_asset_id = edgex_cfg.synthetic_asset_id.clone()
+        let synthetic_asset_id = edgex_cfg
+            .synthetic_asset_id
+            .clone()
             .ok_or_else(|| anyhow!("synthetic_asset_id not set in config.toml [edgex]"))?;
 
-        let collateral_asset_id = edgex_cfg.collateral_asset_id.clone()
+        let collateral_asset_id = edgex_cfg
+            .collateral_asset_id
+            .clone()
             .ok_or_else(|| anyhow!("collateral_asset_id not set in config.toml [edgex]"))?;
 
-        let fee_asset_id = edgex_cfg.fee_asset_id.clone()
+        let fee_asset_id = edgex_cfg
+            .fee_asset_id
+            .clone()
             .ok_or_else(|| anyhow!("fee_asset_id not set in config.toml [edgex]"))?;
 
-        let price_decimals = edgex_cfg.price_decimals
+        let price_decimals = edgex_cfg
+            .price_decimals
             .ok_or_else(|| anyhow!("price_decimals not set in config.toml [edgex]"))?;
 
-        let size_decimals = edgex_cfg.size_decimals
+        let size_decimals = edgex_cfg
+            .size_decimals
             .ok_or_else(|| anyhow!("size_decimals not set in config.toml [edgex]"))?;
 
-        let resolution = edgex_cfg.resolution
+        let resolution = edgex_cfg
+            .resolution
             .ok_or_else(|| anyhow!("resolution not set in config.toml [edgex]"))?;
 
-        let collateral_resolution = edgex_cfg.collateral_resolution
+        let collateral_resolution = edgex_cfg
+            .collateral_resolution
             .ok_or_else(|| anyhow!("collateral_resolution not set in config.toml [edgex]"))?;
 
-        let fee_rate = edgex_cfg.fee_rate
+        let fee_rate = edgex_cfg
+            .fee_rate
             .ok_or_else(|| anyhow!("fee_rate not set in config.toml [edgex]"))?;
 
         Ok(Self {
@@ -88,10 +101,7 @@ pub struct EdgeXGateway {
 
 impl EdgeXGateway {
     pub fn new(client: Arc<EdgeXClient>, config: EdgeXConfig) -> Self {
-        Self {
-            client,
-            config,
-        }
+        Self { client, config }
     }
 
     fn edgex_to_side(side: &OrderSide) -> Side {
@@ -121,7 +131,7 @@ impl EdgeXGateway {
 
         // Calculate l2_nonce from client_order_id as per EdgeX requirement:
         // l2Nonce = hexToLong(sha256(clientOrderId).substring(0,8))
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(client_order_id.as_bytes());
         let hash_result = hasher.finalize();
@@ -140,7 +150,9 @@ impl EdgeXGateway {
         let amount_synthetic = (size * self.config.resolution as f64) as u64;
 
         // Calculate fee: amount_fee = ceil(value_dm * fee_rate * collateral_resolution)
-        let amount_fee = (value_dm * self.config.fee_rate * self.config.collateral_resolution as f64).ceil() as u64;
+        let amount_fee =
+            (value_dm * self.config.fee_rate * self.config.collateral_resolution as f64).ceil()
+                as u64;
 
         // Generate expiration times
         // l2_expire_time: 60 days from now in milliseconds
@@ -188,7 +200,7 @@ impl EdgeXGateway {
         // Create order request with correct field formats
         let req = CreateOrderRequest {
             price: format!("{:.2}", price), // Round to 2 decimals to avoid floating point issues
-            size: format!("{:.4}", size), // Round to 4 decimals
+            size: format!("{:.4}", size),   // Round to 4 decimals
             r#type: OrderType::Limit,
             time_in_force: TimeInForce::PostOnly,
             reduce_only: false, // Not a reduce-only order
@@ -199,37 +211,51 @@ impl EdgeXGateway {
             expire_time,
             l2_nonce,
             l2_value: format!("{:.6}", value_dm), // Decimal value with 6 decimals (USDC precision)
-            l2_size: format!("{:.4}", size), // Decimal size with 4 decimals
-            l2_limit_fee: format!("{:.6}", amount_fee as f64 / self.config.collateral_resolution as f64), // Convert back to decimal
-            l2_expire_time: l2_expire_time_ms, // Use milliseconds for the request
+            l2_size: format!("{:.4}", size),      // Decimal size with 4 decimals
+            l2_limit_fee: format!(
+                "{:.6}",
+                amount_fee as f64 / self.config.collateral_resolution as f64
+            ), // Convert back to decimal
+            l2_expire_time: l2_expire_time_ms,    // Use milliseconds for the request
             l2_signature,
         };
 
         // Submit order
-        let resp = self.client
+        let resp = self
+            .client
             .create_order(&req)
             .await
             .map_err(|e| anyhow!("EdgeX create_order failed: {}", e))?;
 
         // Debug: Log the full response
-        tracing::debug!("EdgeX API Response: {}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| format!("{:?}", resp)));
+        tracing::debug!(
+            "EdgeX API Response: {}",
+            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| format!("{:?}", resp))
+        );
 
         // EdgeX uses a wrapper format: {"code": "...", "data": {...}, "errorParam": {...}}
         // Check for error code
-        if let Some(code) = resp.get("code").and_then(|v| v.as_str()) {
-            if code != "SUCCESS" && code != "OK" {
-                let error_msg = resp.get("errorParam")
-                    .and_then(|v| serde_json::to_string(v).ok())
-                    .unwrap_or_else(|| code.to_string());
-                return Err(anyhow!("EdgeX API error: {} - {}", code, error_msg));
-            }
+        if let Some(code) = resp.get("code").and_then(|v| v.as_str())
+            && code != "SUCCESS"
+            && code != "OK"
+        {
+            let error_msg = resp
+                .get("errorParam")
+                .and_then(|v| serde_json::to_string(v).ok())
+                .unwrap_or_else(|| code.to_string());
+            return Err(anyhow!("EdgeX API error: {} - {}", code, error_msg));
         }
 
         // Extract order_id from data field
-        let order_id = resp.get("data")
+        let order_id = resp
+            .get("data")
             .and_then(|data| data.get("orderId"))
             .and_then(|v| v.as_str())
-            .or_else(|| resp.get("data").and_then(|data| data.get("order_id")).and_then(|v| v.as_str()))
+            .or_else(|| {
+                resp.get("data")
+                    .and_then(|data| data.get("order_id"))
+                    .and_then(|v| v.as_str())
+            })
             .ok_or_else(|| anyhow!("Missing orderId in response data"))?;
 
         Ok(OrderResult {
@@ -331,7 +357,8 @@ impl Exchange for EdgeXGateway {
 
             // Close position with market order
             let side = if size > 0.0 { Side::Sell } else { Side::Buy };
-            self.create_order_internal(side, size.abs(), current_price).await?;
+            self.create_order_internal(side, size.abs(), current_price)
+                .await?;
         }
 
         Ok(())

@@ -23,18 +23,20 @@ fn main() {
 
     println!("\nCalculating order hash...");
     let start = Instant::now();
-    let hash = sig_mgr.calc_limit_order_hash(
-        synthetic_asset_id,
-        collateral_asset_id,
-        fee_asset_id,
-        is_buy,
-        amount_synthetic,
-        amount_collateral,
-        amount_fee,
-        nonce,
-        account_id,
-        expire_time_hours,
-    ).unwrap();
+    let hash = sig_mgr
+        .calc_limit_order_hash(
+            synthetic_asset_id,
+            collateral_asset_id,
+            fee_asset_id,
+            is_buy,
+            amount_synthetic,
+            amount_collateral,
+            amount_fee,
+            nonce,
+            account_id,
+            expire_time_hours,
+        )
+        .unwrap();
     println!("Hash calculation took: {:?}", start.elapsed());
     println!("Hash: 0x{:064x}", hash);
 

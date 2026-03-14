@@ -1,4 +1,4 @@
-use starknet_crypto::{get_public_key, Felt};
+use starknet_crypto::{Felt, get_public_key};
 
 fn main() {
     let private_key_hex = "023421824d933e7e9ed0159ec5902b183eee87fd1ea2dd32807a2d69e247ef57";

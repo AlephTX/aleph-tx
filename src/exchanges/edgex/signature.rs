@@ -1,6 +1,6 @@
+use num_bigint::BigUint;
 use starknet_crypto::{Felt, sign};
 use thiserror::Error;
-use num_bigint::BigUint;
 
 use super::pedersen::PedersenHash;
 
@@ -19,8 +19,8 @@ pub enum SignatureError {
 // which matches the Stark curve prime.
 
 pub struct SignatureManager {
-    private_key: Felt, // L2 Private Key (Stark Key)
-    public_key: Felt,  // L2 Public Key (derived from private key)
+    private_key: Felt,      // L2 Private Key (Stark Key)
+    public_key: Felt,       // L2 Public Key (derived from private key)
     pedersen: PedersenHash, // EdgeX-compatible Pedersen hash
 }
 
@@ -35,7 +35,11 @@ impl SignatureManager {
         // Initialize EdgeX-compatible Pedersen hash
         let pedersen = PedersenHash::new();
 
-        Ok(Self { private_key, public_key, pedersen })
+        Ok(Self {
+            private_key,
+            public_key,
+            pedersen,
+        })
     }
 
     // Helper function to convert Felt to BigUint
@@ -160,7 +164,8 @@ impl SignatureManager {
         let ec_order = BigUint::from_str_radix(
             "800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f",
             16,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Reduce modulo EC_ORDER
         let hash_int = hash_int % &ec_order;
@@ -188,8 +193,9 @@ impl SignatureManager {
         tracing::debug!("L2 signature s: {}", s_hex);
 
         // Verify the signature locally
-        let is_valid = starknet_crypto::verify(&self.public_key, &hash_reduced, &signature.r, &signature.s)
-            .map_err(|_| SignatureError::SigningError)?;
+        let is_valid =
+            starknet_crypto::verify(&self.public_key, &hash_reduced, &signature.r, &signature.s)
+                .map_err(|_| SignatureError::SigningError)?;
 
         if !is_valid {
             tracing::error!("Local signature verification failed!");
@@ -201,9 +207,9 @@ impl SignatureManager {
     }
 
     pub fn sign_message(&self, message: &str) -> Result<String, SignatureError> {
-        use sha3::{Digest, Keccak256};
         use num_bigint::BigUint;
         use num_traits::Num;
+        use sha3::{Digest, Keccak256};
 
         // Keccak256 hash the message
         let mut hasher = Keccak256::new();
@@ -234,8 +240,12 @@ impl SignatureManager {
         let hash_felt = Felt::from_bytes_be(&padded);
 
         // Sign the hash
-        let signature = sign(&self.private_key, &hash_felt, &Felt::from_hex("0x1").unwrap())
-            .map_err(|_| SignatureError::SigningError)?;
+        let signature = sign(
+            &self.private_key,
+            &hash_felt,
+            &Felt::from_hex("0x1").unwrap(),
+        )
+        .map_err(|_| SignatureError::SigningError)?;
 
         // Format: r + s (each 64 hex chars)
         let r_hex = format!("{:064x}", signature.r);

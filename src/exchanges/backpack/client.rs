@@ -315,7 +315,8 @@ impl BackpackClient {
         tracing::debug!("🔍 [BP] Collateral response: {}", json);
 
         // Extract netEquity from the response
-        let net_equity = json.get("netEquity")
+        let net_equity = json
+            .get("netEquity")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -365,13 +366,20 @@ impl BackpackClient {
                 && resp.status().is_success()
                 && let Ok(json) = resp.json::<Value>().await
             {
-                let last_price = json.get("lastPrice")
+                let last_price = json
+                    .get("lastPrice")
                     .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                     .unwrap_or(0.0);
                 if last_price > 0.0 {
                     let usd_value = qty * last_price;
                     if usd_value > 0.01 {
-                        tracing::debug!("  [BP] {} {} × ${:.6} = ${:.2}", qty, symbol, last_price, usd_value);
+                        tracing::debug!(
+                            "  [BP] {} {} × ${:.6} = ${:.2}",
+                            qty,
+                            symbol,
+                            last_price,
+                            usd_value
+                        );
                     }
                     total_usd += usd_value;
                 }

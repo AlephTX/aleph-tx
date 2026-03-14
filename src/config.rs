@@ -18,7 +18,11 @@ pub fn round_to_tick(val: f64, tick: f64) -> f64 {
 /// Format price with dynamic precision based on tick size
 pub fn format_price(price: f64, tick_size: f64) -> String {
     let decimals = (-tick_size.log10()).ceil().max(0.0) as usize;
-    format!("{:.prec$}", round_to_tick(price, tick_size), prec = decimals)
+    format!(
+        "{:.prec$}",
+        round_to_tick(price, tick_size),
+        prec = decimals
+    )
 }
 
 /// Format size with dynamic precision based on step size
@@ -117,7 +121,7 @@ fn default_time_horizon() -> f64 {
     60.0
 }
 fn default_requote_threshold() -> f64 {
-    2.0  // 2 bps deviation threshold
+    2.0 // 2 bps deviation threshold
 }
 fn default_poll_interval_ms() -> u64 {
     100
@@ -181,45 +185,45 @@ fn default_max_spread_bps() -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct InventoryNeutralMMConfig {
     // 交易所
-    pub exchange_id: u8,          // BBO 过滤用 (2=Lighter)
-    pub symbol_id: u16,           // SHM symbol ID
-    pub market_id: u8,            // 交易所 market ID
-    pub tick_size: f64,           // 价格精度
-    pub step_size: f64,           // 数量精度
+    pub exchange_id: u8, // BBO 过滤用 (2=Lighter)
+    pub symbol_id: u16,  // SHM symbol ID
+    pub market_id: u8,   // 交易所 market ID
+    pub tick_size: f64,  // 价格精度
+    pub step_size: f64,  // 数量精度
     // 费率
-    pub maker_fee_bps: f64,       // default: 0.38
-    pub min_profit_bps: f64,      // default: 1.0
+    pub maker_fee_bps: f64,  // default: 0.38
+    pub min_profit_bps: f64, // default: 1.0
     // 报价
-    pub penny_ticks: f64,         // default: 1.0
-    pub inventory_skew_bps: f64,  // default: 3.0
+    pub penny_ticks: f64,        // default: 1.0
+    pub inventory_skew_bps: f64, // default: 3.0
     // Grid Quoting (Multi-Level Laddering)
     #[serde(default = "default_grid_levels")]
-    pub grid_levels: u8,          // default: 3 (1-5 levels per side)
+    pub grid_levels: u8, // default: 3 (1-5 levels per side)
     #[serde(default = "default_grid_spacing_bps")]
-    pub grid_spacing_bps: f64,    // default: 2.0 (spacing between levels)
+    pub grid_spacing_bps: f64, // default: 2.0 (spacing between levels)
     #[serde(default = "default_grid_size_decay")]
-    pub grid_size_decay: f64,     // default: 0.7 (size multiplier per level)
+    pub grid_size_decay: f64, // default: 0.7 (size multiplier per level)
     // 仓位
-    pub base_order_size: f64,     // default: 0.05
-    pub max_position: f64,        // default: 0.15
+    pub base_order_size: f64,             // default: 0.05
+    pub max_position: f64,                // default: 0.15
     pub inventory_urgency_threshold: f64, // default: 0.08
     // Sigmoid SIZE偏移 (v4.0.0)
     #[serde(default = "default_sigmoid_steepness")]
-    pub sigmoid_steepness: f64,   // default: 4.0 (控制sigmoid曲线陡峭度)
+    pub sigmoid_steepness: f64, // default: 4.0 (控制sigmoid曲线陡峭度)
     // Flattening hard cap: max single-order size = base_order_size * cap_mult (v5.0.0)
     #[serde(default = "default_flattening_cap_mult")]
     pub flattening_cap_mult: f64, // default: 2.0 (防止反向巨单鞭尾)
     // 微观结构参数 (v4.0.0)
     #[serde(default = "default_micro_samples")]
-    pub micro_samples: usize,     // default: 200 (价格样本数)
+    pub micro_samples: usize, // default: 200 (价格样本数)
     #[serde(default = "default_ema_fast_period")]
-    pub ema_fast_period: usize,   // default: 5 (快速EMA周期)
+    pub ema_fast_period: usize, // default: 5 (快速EMA周期)
     #[serde(default = "default_ema_slow_period")]
-    pub ema_slow_period: usize,   // default: 20 (慢速EMA周期)
+    pub ema_slow_period: usize, // default: 20 (慢速EMA周期)
     #[serde(default = "default_use_depth_pricing")]
-    pub use_depth_pricing: bool,  // default: true (启用OBI+VWMicro定价)
+    pub use_depth_pricing: bool, // default: true (启用OBI+VWMicro定价)
     #[serde(default = "default_vol_spread_scale")]
-    pub vol_spread_scale: f64,    // default: 0.5 (波动率价差缩放)
+    pub vol_spread_scale: f64, // default: 0.5 (波动率价差缩放)
     #[serde(default = "default_momentum_skew_scale")]
     pub momentum_skew_scale: f64, // default: 0.3 (动量偏移缩放)
     // 跨交易所信号 (v5.1.0)
@@ -229,27 +233,27 @@ pub struct InventoryNeutralMMConfig {
     pub cross_exchange_as_threshold: f64, // default: 8.0 bps (跨交易所AS阈值)
     // Avellaneda-Stoikov 定价参数 (v5.1.0)
     #[serde(default = "default_as_gamma")]
-    pub as_gamma: f64,                   // default: 5000.0 (风险厌恶系数，fractional σ 下需要大值)
+    pub as_gamma: f64, // default: 5000.0 (风险厌恶系数，fractional σ 下需要大值)
     #[serde(default = "default_as_time_horizon_sec")]
-    pub as_time_horizon_sec: f64,        // default: 1.0 (时间窗口秒，DEX 短周期)
+    pub as_time_horizon_sec: f64, // default: 1.0 (时间窗口秒，DEX 短周期)
     #[serde(default = "default_as_kappa")]
-    pub as_kappa: f64,                   // default: 1.5 (订单到达强度，可配置)
+    pub as_kappa: f64, // default: 1.5 (订单到达强度，可配置)
     #[serde(default = "default_max_spread_bps")]
-    pub max_spread_bps: f64,             // default: 30.0 (A-S spread 安全上限)
+    pub max_spread_bps: f64, // default: 30.0 (A-S spread 安全上限)
     // 风控
     pub adverse_selection_threshold: f64, // default: 2.0
-    pub requote_threshold_bps: f64,      // default: 1.5
-    pub order_ttl_secs: u64,             // default: 5
-    pub max_leverage: f64,               // default: 10.0
-    pub min_available_balance: f64,      // default: 2.0
+    pub requote_threshold_bps: f64,       // default: 1.5
+    pub order_ttl_secs: u64,              // default: 5
+    pub max_leverage: f64,                // default: 10.0
+    pub min_available_balance: f64,       // default: 2.0
     #[serde(default = "default_margin_cooldown_secs")]
-    pub margin_cooldown_secs: u64,       // default: 5
+    pub margin_cooldown_secs: u64, // default: 5
     // Post-Only: use ALO (Add Liquidity Only) to guarantee maker fees
     #[serde(default)]
-    pub use_post_only: bool,             // default: false (GTC), true = Post-Only
+    pub use_post_only: bool, // default: false (GTC), true = Post-Only
     // Poll interval for main loop (ms)
     #[serde(default = "default_poll_interval_ms")]
-    pub poll_interval_ms: u64,           // default: 100
+    pub poll_interval_ms: u64, // default: 100
 }
 
 impl Default for InventoryNeutralMMConfig {

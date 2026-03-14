@@ -40,14 +40,14 @@ fn main() -> anyhow::Result<()> {
     let mut strategies: Vec<Box<dyn Strategy>> = vec![
         Box::new(ArbitrageEngine::new(25.0)),
         Box::new(MarketMakerStrategy::new(
-            3,      // EdgeX exchange ID
-            1002,   // ETH global symbol ID
+            3,    // EdgeX exchange ID
+            1002, // ETH global symbol ID
             25.0,
             config.edgex.clone(),
         )),
         Box::new(BackpackMMStrategy::new(
-            5,      // Backpack exchange ID
-            1002,   // ETH global symbol ID
+            5,    // Backpack exchange ID
+            1002, // ETH global symbol ID
             25.0,
             config.backpack.clone(),
         )),

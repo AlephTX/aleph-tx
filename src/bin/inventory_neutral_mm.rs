@@ -25,8 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let strategy_config = config
         .inventory_neutral_mm
         .ok_or("inventory_neutral_mm config not found in config.toml")?;
-    tracing::info!("Exchange ID: {}, Symbol ID: {}, Market ID: {}",
-        strategy_config.exchange_id, strategy_config.symbol_id, strategy_config.market_id);
+    tracing::info!(
+        "Exchange ID: {}, Symbol ID: {}, Market ID: {}",
+        strategy_config.exchange_id,
+        strategy_config.symbol_id,
+        strategy_config.market_id
+    );
 
     // Initialize OrderTracker (v5.0.0 per-order state machine)
     let order_tracker = Arc::new(OrderTracker::new());

@@ -4,7 +4,7 @@
 //! Uses a dedicated OS thread with optional CPU pinning + flume channel for async bridge.
 
 use crate::shm_reader::{ShmBboMessage, ShmReader};
-use flume::{bounded, Receiver, Sender};
+use flume::{Receiver, Sender, bounded};
 use std::thread;
 use tracing::{error, info};
 
@@ -51,13 +51,13 @@ fn data_plane_loop(
     tx: Sender<BboUpdate>,
 ) {
     // Pin to CPU core if specified
-    if let Some(core) = cpu_core {
-        if let Some(core_id) = (core_affinity::CoreId { id: core }).into() {
-            if core_affinity::set_for_current(core_id) {
-                info!("📌 Data plane pinned to CPU core {}", core);
-            } else {
-                error!("⚠️ Failed to pin data plane to CPU core {}", core);
-            }
+    if let Some(core) = cpu_core
+        && let Some(core_id) = (core_affinity::CoreId { id: core }).into()
+    {
+        if core_affinity::set_for_current(core_id) {
+            info!("📌 Data plane pinned to CPU core {}", core);
+        } else {
+            error!("⚠️ Failed to pin data plane to CPU core {}", core);
         }
     }
 
@@ -124,7 +124,7 @@ mod tests {
         let update = BboUpdate {
             symbol_id: 1002,
             exchange_id: 2,
-            bbo: bbo.clone(),
+            bbo,
         };
 
         let cloned = update.clone();

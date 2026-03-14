@@ -1,20 +1,21 @@
-use starknet_crypto::Felt;
 use num_bigint::BigUint;
 use num_traits::Num;
+use starknet_crypto::Felt;
 
 fn main() {
     // Stark prime
     let stark_prime = BigUint::from_str_radix(
         "800000000000011000000000000000000000000000000000000000000000001",
         16,
-    ).unwrap();
+    )
+    .unwrap();
 
     println!("Stark Prime: 0x{:x}", stark_prime);
     println!("Stark Prime bits: {}", stark_prime.bits());
 
     // Test packed_message0
     let amount_sell = 15000000u64; // 15 USDC
-    let amount_buy = 10000000u64;  // 0.01 ETH
+    let amount_buy = 10000000u64; // 0.01 ETH
     let amount_fee = 5700u64;
     let nonce = 1234567890u64;
 

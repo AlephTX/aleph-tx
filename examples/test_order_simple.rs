@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     println!("Creating EdgeX client...");
-    let private_key = std::env::var("EDGEX_L2_PRIVATE_KEY")
-        .expect("EDGEX_L2_PRIVATE_KEY not set");
+    let private_key = std::env::var("EDGEX_L2_PRIVATE_KEY").expect("EDGEX_L2_PRIVATE_KEY not set");
     let client = Arc::new(EdgeXClient::new(&private_key, None)?);
     let config = EdgeXConfig::from_env()?;
     let gateway = Arc::new(EdgeXGateway::new(client, config));

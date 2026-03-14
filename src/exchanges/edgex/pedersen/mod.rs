@@ -1,5 +1,5 @@
 use num_bigint::BigUint;
-use num_traits::{Zero, One, Num};
+use num_traits::{Num, One, Zero};
 
 mod pedersen_points;
 use pedersen_points::CONSTANT_POINTS;
@@ -12,6 +12,12 @@ pub struct PedersenHash {
     field_prime: BigUint,
     shift_point: (BigUint, BigUint),
     constant_points: Vec<(BigUint, BigUint)>,
+}
+
+impl Default for PedersenHash {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PedersenHash {
@@ -40,7 +46,10 @@ impl PedersenHash {
 
     fn div_mod(&self, n: &BigUint, m: &BigUint) -> BigUint {
         // Calculate (n / m) mod p using modular inverse
-        let m_inv = m.modpow(&(&self.field_prime - BigUint::from(2u32)), &self.field_prime);
+        let m_inv = m.modpow(
+            &(&self.field_prime - BigUint::from(2u32)),
+            &self.field_prime,
+        );
         (n * m_inv) % &self.field_prime
     }
 
@@ -58,21 +67,31 @@ impl PedersenHash {
         let slope = self.div_mod(&dy, &dx);
 
         // Calculate new point
-        let x3 = (&slope * &slope + &self.field_prime + &self.field_prime - &p1.0 - &p2.0) % &self.field_prime;
-        let y3 = (&slope * ((&p1.0 + &self.field_prime - &x3) % &self.field_prime) + &self.field_prime - &p1.1) % &self.field_prime;
+        let x3 = (&slope * &slope + &self.field_prime + &self.field_prime - &p1.0 - &p2.0)
+            % &self.field_prime;
+        let y3 = (&slope * ((&p1.0 + &self.field_prime - &x3) % &self.field_prime)
+            + &self.field_prime
+            - &p1.1)
+            % &self.field_prime;
 
         (x3, y3)
     }
 
     fn ec_double(&self, p: &(BigUint, BigUint)) -> (BigUint, BigUint) {
         // Calculate slope: (3 * x^2 + ALPHA) / (2 * y)
-        let numerator = (BigUint::from(3u32) * &p.0 * &p.0 + BigUint::from(ALPHA)) % &self.field_prime;
+        let numerator =
+            (BigUint::from(3u32) * &p.0 * &p.0 + BigUint::from(ALPHA)) % &self.field_prime;
         let denominator = (BigUint::from(2u32) * &p.1) % &self.field_prime;
         let slope = self.div_mod(&numerator, &denominator);
 
         // Calculate new point
-        let x3 = (&slope * &slope + &self.field_prime + &self.field_prime - BigUint::from(2u32) * &p.0) % &self.field_prime;
-        let y3 = (&slope * ((&p.0 + &self.field_prime - &x3) % &self.field_prime) + &self.field_prime - &p.1) % &self.field_prime;
+        let x3 = (&slope * &slope + &self.field_prime + &self.field_prime
+            - BigUint::from(2u32) * &p.0)
+            % &self.field_prime;
+        let y3 = (&slope * ((&p.0 + &self.field_prime - &x3) % &self.field_prime)
+            + &self.field_prime
+            - &p.1)
+            % &self.field_prime;
 
         (x3, y3)
     }
