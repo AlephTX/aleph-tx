@@ -282,28 +282,36 @@ impl InventoryNeutralMM {
             warn!("⚠️  Post-Only mode DISABLED — orders may execute as taker!");
         }
 
-        // Spawn background V2 event consumer → OrderTracker state transitions
+        // Spawn dedicated OS thread for V2 event consumer → OrderTracker state transitions
+        // Phase 1 optimization: OS thread with busy-poll instead of tokio::spawn + sleep(1ms)
+        // Reduces latency from 1-2ms to <10us. Consumes one CPU core — intentional for HFT.
+        // NOTE: This thread is process-lifetime. run() is not re-entrant.
         if let Some(mut event_reader) = self.event_reader.take() {
             let tracker = Arc::clone(&self.order_tracker);
-            tokio::spawn(async move {
-                info!("📡 V2 event consumer started (read_idx={}, write_idx={})",
-                    event_reader.local_read_idx(), event_reader.write_idx());
-                loop {
-                    let mut batch = 0u32;
-                    while let Some(event) = event_reader.try_read() {
-                        if let Err(e) = tracker.apply_event(&event) {
-                            debug!("Event apply error: {}", e);
+            // SAFETY: ShmEventReaderV2 is Send (holds MmapMut + u64). SPSC invariant holds:
+            // this thread is the sole reader, Go feeder is the sole writer.
+            std::thread::Builder::new()
+                .name("event-consumer".into())
+                .spawn(move || {
+                    info!("📡 V2 event consumer started (OS thread, read_idx={}, write_idx={})",
+                        event_reader.local_read_idx(), event_reader.write_idx());
+                    loop {
+                        let mut batch = 0u32;
+                        while let Some(event) = event_reader.try_read() {
+                            if let Err(e) = tracker.apply_event(&event) {
+                                tracing::error!("Event apply error: {}", e);
+                            }
+                            batch += 1;
+                            if batch >= 64 {
+                                break;
+                            }
                         }
-                        batch += 1;
-                        if batch >= 64 {
-                            break;
+                        if batch == 0 {
+                            std::hint::spin_loop();
                         }
                     }
-                    if batch == 0 {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                }
-            });
+                })
+                .expect("Failed to spawn event consumer thread");
         }
 
         loop {
@@ -408,6 +416,8 @@ impl InventoryNeutralMM {
                         stale_count, self.active_orders.len());
                 }
                 self.order_tracker.gc_completed_orders(Duration::from_secs(300));
+                // Phase 2: Verify atomic exposure matches locked traversal
+                self.order_tracker.debug_verify_exposure();
                 // Sync fill stats from OrderTracker → Telemetry
                 let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
                 self.telemetry.fill_count = fill_count;

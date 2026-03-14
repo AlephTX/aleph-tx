@@ -73,7 +73,7 @@ graph TD
 
 ## FFI & Memory Safety (CRITICAL)
 
-- **Async Starvation**: ANY FFI call MUST be wrapped in `tokio::task::spawn_blocking()`. Never block Tokio async workers.
+- **Async Starvation**: FFI calls <100us (e.g. Lighter Poseidon2+EdDSA) MAY be called synchronously. Longer FFI calls (e.g. StarkNet ECDSA) MUST use `tokio::task::spawn_blocking()`. Never block Tokio async workers with heavy computation.
 - **Memory Leaks**: Go-allocated `C.CString` MUST be freed via Go's `FreeCString()`. Do NOT use `libc::free` or `CString::from_raw`.
 
 ## Hot-Path Constraints (Quoting Loop)

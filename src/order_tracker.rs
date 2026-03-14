@@ -178,6 +178,12 @@ pub struct OrderTracker {
     pub realized_pnl: CachePadded<AtomicI64>,
     /// Last processed event sequence number
     pub last_sequence: AtomicI64,
+    /// Phase 2 optimization: Incremental pending buy exposure (×POS_SCALE)
+    /// Sum of all active buy orders' remaining_size
+    pub pending_buy_exposure: CachePadded<AtomicI64>,
+    /// Phase 2 optimization: Incremental pending sell exposure (×POS_SCALE)
+    /// Sum of all active sell orders' remaining_size
+    pub pending_sell_exposure: CachePadded<AtomicI64>,
 }
 
 impl OrderTracker {
@@ -187,6 +193,8 @@ impl OrderTracker {
             confirmed_position: CachePadded::new(AtomicI64::new(0)),
             realized_pnl: CachePadded::new(AtomicI64::new(0)),
             last_sequence: AtomicI64::new(0),
+            pending_buy_exposure: CachePadded::new(AtomicI64::new(0)),
+            pending_sell_exposure: CachePadded::new(AtomicI64::new(0)),
         }
     }
 
@@ -198,8 +206,25 @@ impl OrderTracker {
         self.confirmed_position.load(Ordering::Acquire) as f64 / POS_SCALE
     }
 
-    /// Net pending exposure from all active orders (requires read lock)
+    /// Phase 2: Lock-free pending buy exposure
+    #[inline]
+    fn pending_buy_exposure(&self) -> f64 {
+        self.pending_buy_exposure.load(Ordering::Acquire) as f64 / POS_SCALE
+    }
+
+    /// Phase 2: Lock-free pending sell exposure
+    #[inline]
+    fn pending_sell_exposure(&self) -> f64 {
+        self.pending_sell_exposure.load(Ordering::Acquire) as f64 / POS_SCALE
+    }
+
+    /// Net pending exposure from all active orders (lock-free via atomics)
     pub fn net_pending_exposure(&self) -> f64 {
+        self.pending_buy_exposure() - self.pending_sell_exposure()
+    }
+
+    /// Debug: Net pending exposure via read lock (for verification)
+    pub fn net_pending_exposure_locked(&self) -> f64 {
         let state = self.state.read();
         state
             .active_orders
@@ -214,9 +239,14 @@ impl OrderTracker {
         self.confirmed_position() + self.net_pending_exposure()
     }
 
-    /// Worst-case long exposure: confirmed + all active buy remaining
+    /// Worst-case long exposure: confirmed + all active buy remaining (lock-free)
     /// Used for pre-trade risk check before placing bids
     pub fn worst_case_long(&self) -> f64 {
+        self.confirmed_position() + self.pending_buy_exposure()
+    }
+
+    /// Debug: Worst-case long via read lock (for verification)
+    pub fn worst_case_long_locked(&self) -> f64 {
         let state = self.state.read();
         self.confirmed_position()
             + state
@@ -227,9 +257,14 @@ impl OrderTracker {
                 .sum::<f64>()
     }
 
-    /// Worst-case short exposure: confirmed - all active sell remaining
+    /// Worst-case short exposure: confirmed - all active sell remaining (lock-free)
     /// Used for pre-trade risk check before placing asks
     pub fn worst_case_short(&self) -> f64 {
+        self.confirmed_position() - self.pending_sell_exposure()
+    }
+
+    /// Debug: Worst-case short via read lock (for verification)
+    pub fn worst_case_short_locked(&self) -> f64 {
         let state = self.state.read();
         self.confirmed_position()
             - state
@@ -238,6 +273,28 @@ impl OrderTracker {
                 .filter(|o| o.side == OrderSide::Sell && o.lifecycle.has_pending_exposure())
                 .map(|o| o.remaining_size())
                 .sum::<f64>()
+    }
+
+    /// Debug: Verify atomic exposure matches locked traversal.
+    /// NOTE: Not linearizable — TOCTOU window between locked and atomic reads.
+    /// False positives possible under concurrent mutation. Use only for diagnostics.
+    pub fn debug_verify_exposure(&self) {
+        let locked_long = self.worst_case_long_locked();
+        let atomic_long = self.worst_case_long();
+        if (locked_long - atomic_long).abs() > 1e-6 {
+            tracing::error!(
+                "EXPOSURE DRIFT long: locked={:.8} atomic={:.8}",
+                locked_long, atomic_long
+            );
+        }
+        let locked_short = self.worst_case_short_locked();
+        let atomic_short = self.worst_case_short();
+        if (locked_short - atomic_short).abs() > 1e-6 {
+            tracing::error!(
+                "EXPOSURE DRIFT short: locked={:.8} atomic={:.8}",
+                locked_short, atomic_short
+            );
+        }
     }
 
     /// Realized PnL in USD
@@ -321,6 +378,17 @@ impl OrderTracker {
         let mut state = self.state.write();
         state.active_orders.insert(client_order_id, order);
 
+        // Phase 2: Increment atomic exposure
+        let size_scaled = (size * POS_SCALE) as i64;
+        match side {
+            OrderSide::Buy => {
+                self.pending_buy_exposure.fetch_add(size_scaled, Ordering::AcqRel);
+            }
+            OrderSide::Sell => {
+                self.pending_sell_exposure.fetch_add(size_scaled, Ordering::AcqRel);
+            }
+        }
+
         tracing::debug!(
             "📝 Order tracking started: coi={} side={} price={:.2} size={:.4}",
             client_order_id,
@@ -334,6 +402,17 @@ impl OrderTracker {
     pub fn mark_failed(&self, client_order_id: i64) {
         let mut state = self.state.write();
         if let Some(mut order) = state.active_orders.remove(&client_order_id) {
+            // Phase 2: Decrement atomic exposure
+            let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+            match order.side {
+                OrderSide::Buy => {
+                    self.pending_buy_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                }
+                OrderSide::Sell => {
+                    self.pending_sell_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                }
+            }
+
             order.lifecycle = OrderLifecycle::Rejected;
             order.last_update = Instant::now();
             state.completed_orders.insert(client_order_id, order);
@@ -386,6 +465,18 @@ impl OrderTracker {
         let count = drained.len();
         let now = Instant::now();
         for (coi, mut order) in drained {
+            // Phase 2: Decrement atomic exposure
+            if order.lifecycle.has_pending_exposure() {
+                let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+                match order.side {
+                    OrderSide::Buy => {
+                        self.pending_buy_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                    }
+                    OrderSide::Sell => {
+                        self.pending_sell_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                    }
+                }
+            }
             order.lifecycle = OrderLifecycle::Canceled;
             order.last_update = now;
             state.completed_orders.insert(coi, order);
@@ -481,6 +572,17 @@ impl OrderTracker {
                 .insert(event.exchange_order_id, client_id);
             state.active_orders.insert(client_id, order);
 
+            // Phase 2: Auto-registered order needs atomic exposure
+            let size_scaled = (event.original_size * POS_SCALE) as i64;
+            match side {
+                OrderSide::Buy => {
+                    self.pending_buy_exposure.fetch_add(size_scaled, Ordering::AcqRel);
+                }
+                OrderSide::Sell => {
+                    self.pending_sell_exposure.fetch_add(size_scaled, Ordering::AcqRel);
+                }
+            }
+
             tracing::warn!(
                 "⚠️  Auto-registered untracked order: coi={} exch_id={}",
                 client_id,
@@ -514,6 +616,9 @@ impl OrderTracker {
                     return Ok(());
                 }
 
+                // Capture remaining before updating filled_size (for atomic exposure fix)
+                let pre_fill_remaining = order.remaining_size();
+
                 order.filled_size += event.fill_size;
                 order.total_fee += event.fee_paid;
                 order.last_update = Instant::now();
@@ -521,7 +626,25 @@ impl OrderTracker {
                     .fills
                     .push((event.trade_id, event.fill_size, event.fill_price));
 
-                if event.remaining_size < 1e-12 {
+                let is_final_fill = event.remaining_size < 1e-12;
+
+                // Phase 2: Decrement atomic exposure
+                // On final fill, drain full pre-fill remaining to avoid f64 accumulation drift
+                let exposure_reduction = if is_final_fill {
+                    (pre_fill_remaining * POS_SCALE) as i64
+                } else {
+                    (event.fill_size * POS_SCALE) as i64
+                };
+                match order.side {
+                    OrderSide::Buy => {
+                        self.pending_buy_exposure.fetch_sub(exposure_reduction, Ordering::AcqRel);
+                    }
+                    OrderSide::Sell => {
+                        self.pending_sell_exposure.fetch_sub(exposure_reduction, Ordering::AcqRel);
+                    }
+                }
+
+                if is_final_fill {
                     order.lifecycle = OrderLifecycle::Filled;
                 } else {
                     order.lifecycle = OrderLifecycle::PartiallyFilled;
@@ -618,6 +741,19 @@ impl OrderTracker {
 
         if let Some(cid) = client_id {
             if let Some(order) = state.active_orders.get_mut(&cid) {
+                // Phase 2: Decrement atomic exposure by remaining_size
+                if order.lifecycle.has_pending_exposure() {
+                    let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+                    match order.side {
+                        OrderSide::Buy => {
+                            self.pending_buy_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                        }
+                        OrderSide::Sell => {
+                            self.pending_sell_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                        }
+                    }
+                }
+
                 tracing::info!(
                     "🚫 Order canceled: coi={} side={} remaining={:.4}",
                     cid,
@@ -643,6 +779,19 @@ impl OrderTracker {
         let mut state = self.state.write();
 
         if let Some(order) = state.active_orders.get_mut(&client_id) {
+            // Phase 2: Decrement atomic exposure by remaining_size
+            if order.lifecycle.has_pending_exposure() {
+                let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+                match order.side {
+                    OrderSide::Buy => {
+                        self.pending_buy_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                    }
+                    OrderSide::Sell => {
+                        self.pending_sell_exposure.fetch_sub(remaining_scaled, Ordering::AcqRel);
+                    }
+                }
+            }
+
             tracing::warn!(
                 "🚫 Order rejected: coi={} side={} size={:.4}",
                 client_id,
