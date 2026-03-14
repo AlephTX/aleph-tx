@@ -13,10 +13,9 @@ alwaysApply: true
 |------|-------------|
 | mod.rs | `Strategy` trait definition (`on_bbo_update`, `on_idle`, `on_shutdown`) |
 | arbitrage.rs | Cross-exchange statistical arbitrage scanner (25 bps threshold) |
-| market_maker.rs | EdgeX market maker (EWMA volatility, dynamic sizing) |
+| edgex_mm.rs | EdgeX market maker V3 (EWMA volatility, dynamic sizing, legacy direct API) |
 | backpack_mm.rs | Backpack market maker (Ed25519 auth, momentum-based spread) |
-| lighter_mm.rs | *(deleted)* - Legacy Lighter MM, replaced by inventory_neutral_mm |
-| adaptive_mm.rs | Premium account fee-aware HFT with microstructure signals |
+| lighter_adaptive_mm.rs | Lighter DEX adaptive MM (premium account, fee-aware, microstructure signals) |
 | inventory_neutral_mm.rs | Inventory-Neutral MM - production HFT strategy (Avellaneda-Stoikov pricing, Exchange trait) |
 
 ## Strategy Trait

@@ -96,5 +96,5 @@ graph TD
 ```bash
 make build                              # Build Rust + Go
 make test-up                            # Integration test (feeder + lighter_trading example)
-make lighter-up STRATEGY=adaptive_mm    # Production adaptive MM
+make lighter-up STRATEGY=lighter_adaptive_mm    # Production adaptive MM
 ```

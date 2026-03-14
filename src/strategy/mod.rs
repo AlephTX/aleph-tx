@@ -1,8 +1,8 @@
-pub mod adaptive_mm;
+pub mod lighter_adaptive_mm;
 pub mod arbitrage;
 pub mod backpack_mm;
 pub mod inventory_neutral_mm;
-pub mod market_maker;
+pub mod edgex_mm;
 
 use crate::shm_reader::ShmBboMessage;
 use std::future::Future;

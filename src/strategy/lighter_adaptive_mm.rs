@@ -6,6 +6,8 @@
 //! - Aggressive inventory skew: linear skew on both sides to flatten position
 //! - Batch quoting: sendTxBatch for paired bid/ask (1 API call)
 //! - Premium account: 0ms maker latency, 6000 req/min, maker fee 0.0038%
+//!
+//! TODO: Migrate from V1 ShadowLedger to OrderTracker v5.0 for per-order state tracking.
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;

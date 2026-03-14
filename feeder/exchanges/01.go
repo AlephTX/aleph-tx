@@ -14,6 +14,7 @@ import (
 )
 
 // ZeroOne Exchange (01.xyz) WebSocket Adapter
+// TODO: Not yet launched from main.go — add to feeder/main.go when ready to enable.
 type ZeroOne struct {
 	cfg    config.ExchangeConfig
 	matrix *shm.Matrix

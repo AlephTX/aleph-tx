@@ -4,7 +4,7 @@ use aleph_tx::config::AppConfig;
 use aleph_tx::data_plane;
 use aleph_tx::strategy::{
     Strategy, arbitrage::ArbitrageEngine, backpack_mm::BackpackMMStrategy,
-    market_maker::MarketMakerStrategy,
+    edgex_mm::MarketMakerStrategy,
 };
 
 fn main() -> anyhow::Result<()> {
