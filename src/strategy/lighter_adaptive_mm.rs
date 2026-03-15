@@ -11,7 +11,7 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::error::Result;
-use crate::exchange::{BatchOrderParams, Side};
+use crate::exchange::{BatchOrderParams, Exchange, Side};
 use crate::exchanges::lighter::trading::LighterTrading;
 use crate::shadow_ledger::ShadowLedger;
 use crate::shm_reader::ShmReader;

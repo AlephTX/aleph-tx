@@ -24,6 +24,10 @@ pub struct TelemetryCollector {
     pub fill_count: u64,
     /// Total fees paid in USD
     pub total_fees_paid: f64,
+    /// Current available balance
+    pub available_balance: f64,
+    /// Current portfolio value (equity)
+    pub portfolio_value: f64,
     /// Session start time for fill rate calculation
     session_start: Instant,
 }
@@ -46,6 +50,8 @@ impl TelemetryCollector {
             last_margin_cooldown: None,
             fill_count: 0,
             total_fees_paid: 0.0,
+            available_balance: 0.0,
+            portfolio_value: 0.0,
             session_start: Instant::now(),
         }
     }
@@ -121,6 +127,8 @@ impl TelemetryCollector {
             fill_count = self.fill_count,
             total_fees_paid = format!("{:.4}", self.total_fees_paid).as_str(),
             fill_rate = format!("{:.2}", self.fill_rate()).as_str(),
+            available_balance = format!("{:.2}", self.available_balance).as_str(),
+            portfolio_value = format!("{:.2}", self.portfolio_value).as_str(),
             "Telemetry snapshot"
         );
     }

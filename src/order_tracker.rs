@@ -19,6 +19,7 @@
 //! 3. Defense in Depth: tracker + exchange WS + drift detection
 //! 4. Worst-Case Risk: check max exposure per side, not net
 
+use crate::exchange::Exchange;
 use crossbeam::utils::CachePadded;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -480,6 +481,61 @@ impl OrderTracker {
             order.lifecycle = OrderLifecycle::Canceled;
             order.last_update = now;
             state.completed_orders.insert(coi, order);
+        }
+        count
+    }
+
+    /// Reconcile active orders with exchange actual open orders
+    pub async fn reconcile_with_exchange(&self, exchange: &dyn Exchange) -> usize {
+        let open_orders = match exchange.get_active_orders().await {
+            Ok(orders) => orders,
+            Err(e) => {
+                tracing::error!("Reconcile: failed to fetch active orders: {}", e);
+                return 0;
+            }
+        };
+
+        let mut state = self.state.write();
+        let mut stale_ids = Vec::new();
+
+        // 1. Identify tracker orders not present on exchange
+        for (coi, order) in &state.active_orders {
+            if order.lifecycle == OrderLifecycle::Open {
+                let found = open_orders.iter().any(|oo| {
+                    if let Some(exch_id) = order.exchange_order_id {
+                        oo.order_id == exch_id.to_string()
+                    } else {
+                        false
+                    }
+                });
+
+                if !found {
+                    stale_ids.push(*coi);
+                }
+            }
+        }
+
+        let count = stale_ids.len();
+        for coi in stale_ids {
+            if let Some(mut order) = state.active_orders.remove(&coi) {
+                // Phase 2: Decrement atomic exposure
+                if order.lifecycle.has_pending_exposure() {
+                    let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+                    match order.side {
+                        OrderSide::Buy => {
+                            self.pending_buy_exposure
+                                .fetch_sub(remaining_scaled, Ordering::AcqRel);
+                        }
+                        OrderSide::Sell => {
+                            self.pending_sell_exposure
+                                .fetch_sub(remaining_scaled, Ordering::AcqRel);
+                        }
+                    }
+                }
+                order.lifecycle = OrderLifecycle::Canceled; // Assumed canceled else we'd have a fill
+                order.last_update = Instant::now();
+                state.completed_orders.insert(coi, order);
+            }
         }
         count
     }

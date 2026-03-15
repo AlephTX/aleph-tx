@@ -85,12 +85,20 @@ impl ShmDepthReader {
         unsafe {
             let snapshot = &*slot_ptr;
 
+            let mut spin_count: u32 = 0;
+            const MAX_SPINS: u32 = 10_000;
+
             // Seqlock read protocol
             loop {
                 let seq_before = snapshot.seqlock;
                 compiler_fence(Ordering::Acquire);
 
                 if seq_before & 1 != 0 {
+                    spin_count += 1;
+                    if spin_count > MAX_SPINS {
+                        tracing::error!("Seqlock stuck in depth_reader: seq={} after {} spins", seq_before, spin_count);
+                        return None;
+                    }
                     std::hint::spin_loop();
                     continue;
                 }
@@ -105,6 +113,12 @@ impl ShmDepthReader {
                     } else {
                         None
                     };
+                }
+
+                spin_count += 1;
+                if spin_count > MAX_SPINS {
+                    tracing::error!("Seqlock torn read in depth_reader: before={} after={} after {} spins", seq_before, seq_after, spin_count);
+                    return None;
                 }
             }
         }

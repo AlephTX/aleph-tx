@@ -53,4 +53,10 @@ pub enum TradingError {
     InsufficientMargin,
 }
 
+impl From<anyhow::Error> for TradingError {
+    fn from(err: anyhow::Error) -> Self {
+        TradingError::OrderFailed(err.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, TradingError>;

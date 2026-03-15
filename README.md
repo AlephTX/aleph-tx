@@ -176,9 +176,9 @@ aleph-tx/
 │   ├── data_plane.rs    #   Dedicated data plane thread (v5.0.0)
 │   ├── shm_depth_reader.rs  #   L1-L5 depth reader (v5.0.0)
 │   ├── telemetry.rs     #   Telemetry module (v5.0.0)
-│   ├── strategy/        #   Strategy implementations (inventory_neutral_mm, adaptive_mm, arbitrage, etc.)
-│   ├── exchanges/       #   Exchange integrations (Backpack, EdgeX, Lighter)
-│   │   └── lighter/error.rs  #   Typed error codes (v5.0.0)
+│   ├── strategy/        #   Strategy implementations (inventory_neutral_mm, lighter_adaptive_mm, etc.)
+│   ├── exchanges/       #   Exchange integrations (backpack, edgex, lighter)
+│   │   └── lighter/     #     Lighter-specific logic and errors
 │   ├── native/          #   Native FFI libraries (Lighter Ed25519 signer .so)
 │   └── types/           #   Core types + C-ABI event struct (64 bytes)
 ├── examples/            # Entry point binaries for make targets + debug/benchmark tools

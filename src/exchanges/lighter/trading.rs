@@ -142,11 +142,11 @@ pub struct LighterTrading {
 #[async_trait]
 impl Exchange for LighterTrading {
     async fn buy(&self, size: f64, price: f64) -> Result<OrderResult> {
-        self.buy(size, price).await
+        self.buy_internal(size, price).await
     }
 
     async fn sell(&self, size: f64, price: f64) -> Result<OrderResult> {
-        self.sell(size, price).await
+        self.sell_internal(size, price).await
     }
 
     async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
@@ -186,6 +186,26 @@ impl Exchange for LighterTrading {
 
     fn limit_order_type(&self) -> OrderType {
         self.limit_order_type
+    }
+
+    async fn get_account_stats(&self) -> Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+        // Lighter-specific: Account equity is primarily the value in the account plus unrealized PNL
+        let pos = self.get_position().await?;
+        let mut main_pos = 0.0;
+        if let Some(ref p) = pos {
+            main_pos = p.position.parse().unwrap_or(0.0);
+        }
+
+        // For Lighter, we might need a separate endpoint for full account equity if not in 'Position'
+        // Simplification: use portfolio_value placeholder or fetch from appropriate source
+        Ok(crate::strategy::inventory_neutral_mm::AccountStats {
+            available_balance: 0.0, // Should be fetched from balance API
+            portfolio_value: 0.0,
+            position: main_pos,
+            leverage: 0.0,
+            margin_usage: 0.0,
+            last_update: std::time::Instant::now(),
+        })
     }
 }
 
@@ -654,7 +674,7 @@ impl LighterTrading {
     }
 
     /// 下买单（限价）
-    pub async fn buy(&self, size: f64, price: f64) -> Result<OrderResult> {
+    pub async fn buy_internal(&self, size: f64, price: f64) -> Result<OrderResult> {
         self.place_order(OrderParams {
             size,
             price,
@@ -666,7 +686,7 @@ impl LighterTrading {
     }
 
     /// 下卖单（限价）
-    pub async fn sell(&self, size: f64, price: f64) -> Result<OrderResult> {
+    pub async fn sell_internal(&self, size: f64, price: f64) -> Result<OrderResult> {
         self.place_order(OrderParams {
             size,
             price,
