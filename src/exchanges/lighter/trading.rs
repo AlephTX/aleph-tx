@@ -226,6 +226,7 @@ impl LighterTrading {
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
             .timeout(Duration::from_secs(15))
+            .user_agent("AlephTX/5.0")
             .build()?;
 
         // 从 orderBookDetails 获取精度

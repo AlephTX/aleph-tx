@@ -198,6 +198,8 @@ func (las *LighterAccountStats) fetchStatsREST(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	req.Header.Set("User-Agent", "AlephTX/5.0")
+	req.Header.Set("Accept", "application/json")
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
