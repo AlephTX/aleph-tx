@@ -38,15 +38,18 @@ alwaysApply: true
 graph TD
     subgraph "Shared Memory (from Go)"
         MTX["/dev/shm/aleph-matrix"]
-        EVT["/dev/shm/aleph-events"]
+        EVT["/dev/shm/aleph-events-v2"]
         ACC["/dev/shm/aleph-account-stats"]
     end
 
     subgraph "IPC Readers"
         MTX -->|Seqlock| SR[shm_reader.rs]
-        EVT -->|SPSC Ring| ER[shm_event_reader.rs]
+        EVT -->|SPSC Ring (V2)| ER[shm_event_reader.rs]
         ACC -->|Versioned| AR[account_stats_reader.rs]
     end
+
+`lighter_inventory_mm` is expected to consume the V2 event ring directly; without it, `OrderTracker`
+cannot bind `client_order_id -> order_index` and cancel/reconcile logic will degrade.
 
     subgraph "State Management (v5.0.0)"
         ER --> OT[OrderTracker: Per-Order State Machine]

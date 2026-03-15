@@ -5,13 +5,13 @@ alwaysApply: true
 
 # feeder/
 
-> Go-based market data feeder: multi-exchange WS ingestion -> shared memory BBO matrix + event ring buffer.
+> Go-based market data feeder: multi-exchange WS ingestion -> shared memory BBO matrix + V2 private event ring + account stats.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| main.go | Entry point - spawns goroutines per exchange, initializes 3 SHM regions |
+| main.go | Entry point - spawns goroutines per exchange, initializes matrix + V1/V2 events + account stats + depth |
 | config.toml | Exchange enable/disable, WS URLs, symbol mappings |
 
 ## Subdirectories
@@ -20,7 +20,7 @@ alwaysApply: true
 |-----------|-------------|
 | config/ | TOML config loader (`ExchangeConfig` struct) |
 | exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01) |
-| shm/ | Shared memory writers - BBO matrix, event ring buffer, account stats |
+| shm/ | Shared memory writers - BBO matrix, V1/V2 event rings, account stats, depth |
 
 ## Architecture
 

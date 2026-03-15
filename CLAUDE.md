@@ -34,14 +34,19 @@ make status         # Show running strategies
 
 **Dual-Track IPC**:
 - Track 1: `/dev/shm/aleph-matrix` (Lock-free BBO, Seqlock)
-- Track 2: `/dev/shm/aleph-events` (128-byte V2 events, per-order tracking)
+- Track 2: `/dev/shm/aleph-events-v2` (128-byte V2 private event ring, per-order tracking)
 - Track 3: `/dev/shm/aleph-depth` (L1-L5 depth for OBI+VWMicro pricing)
+
+`lighter_inventory_mm` now consumes the V2 event ring directly at startup so `OrderTracker`
+receives authoritative `created / filled / canceled` transitions and real `order_index` bindings.
+Lighter account stats should be treated as websocket-sourced; the previous REST fallback endpoint was invalid.
 
 **No Boomerang**: Rust executes HTTP orders DIRECTLY via FFI. Never sends commands back to Go.
 
 **Optimistic Accounting (v5.0.0)**: `OrderTracker` registers per-order state before API call. Worst-case bilateral exposure checked before every order.
 
-**Strategy Execution**: Market making is powered by the `InventoryNeutralMM` strategy using A-S pricing, cross-exchange Alpha signals, and multi-tier grid quoting. Production binaries live in `src/bin/` and run via `cargo run --release --bin inventory_neutral_mm` (NOT `src/main.rs`).
+**Strategy Execution**: Market making is powered by the `InventoryNeutralMM` strategy using local-book A-S pricing, event-driven order tracking, and multi-tier grid quoting. Production binaries live in `src/bin/` and run via `cargo run --release --bin inventory_neutral_mm` (NOT `src/main.rs`).
+`InventoryNeutralMM` sizing is now equity-aware: prefer USD-notional knobs (`base_order_notional_usd`, `max_position_notional_usd`, `inventory_urgency_notional_usd`) over hardcoded base-unit sizes so the same profile scales across account sizes and symbols.
 
 ## Verification Protocol (MANDATORY)
 

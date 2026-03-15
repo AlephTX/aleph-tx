@@ -249,9 +249,10 @@ impl LighterTrading {
             .user_agent("AlephTX/5.0")
             .build()?;
 
-        // 从 orderBookDetails 获取精度
+        // orderBookDetails occasionally returns transient transport errors at
+        // startup; retry a few times instead of aborting the whole strategy.
         let (size_decimals, price_decimals) =
-            Self::fetch_market_decimals(&client, &base_url, market_id).await?;
+            Self::fetch_market_decimals_with_retry(&client, &base_url, market_id).await?;
         tracing::info!(
             "Market {} decimals: size={} price={}",
             market_id,
@@ -286,6 +287,33 @@ impl LighterTrading {
             order_tracker: None,
             limit_order_type: OrderType::Limit,
         })
+    }
+
+    /// 从 orderBookDetails 获取市场精度
+    async fn fetch_market_decimals_with_retry(
+        client: &Client,
+        base_url: &str,
+        market_id: u8,
+    ) -> Result<(u8, u8)> {
+        let mut last_err = None;
+
+        for attempt in 1..=5 {
+            match Self::fetch_market_decimals(client, base_url, market_id).await {
+                Ok(decimals) => return Ok(decimals),
+                Err(err) => {
+                    tracing::warn!(
+                        "orderBookDetails attempt {}/5 failed for market {}: {}",
+                        attempt,
+                        market_id,
+                        err
+                    );
+                    last_err = Some(err);
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("orderBookDetails retry exhausted")))
     }
 
     /// 从 orderBookDetails 获取市场精度
@@ -1056,6 +1084,17 @@ impl LighterTrading {
             // 空头 → 买入平仓
             (Side::Buy, current_price * 1.02)
         };
+
+        let min_close_size = 11.0 / close_price.max(1.0);
+        if size.abs() + 1e-9 < min_close_size {
+            tracing::warn!(
+                "Position {:.4} below Lighter min close size {:.4} @ ${:.2}, skipping reduce_only close",
+                size.abs(),
+                min_close_size,
+                close_price
+            );
+            return Ok(());
+        }
 
         tracing::info!(
             "Closing position: {} {} @ ~${:.2} (reduce_only)",

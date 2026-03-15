@@ -4,6 +4,12 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
 
 **v5.0.0 Highlights**: Per-order state machine (OrderTracker), 128-byte V2 SHM events, worst-case bilateral risk control, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
 
+Current Lighter production path:
+- `lighter_inventory_mm` reads `/dev/shm/aleph-events-v2` directly for authoritative private order events.
+- Lighter account stats are sourced from the authenticated websocket `user_stats` stream; the previous REST fallback endpoint is intentionally disabled because it returned persistent `403`.
+- `inventory_neutral_mm` now supports equity-aware sizing. `base_order_notional_usd`, `max_position_notional_usd`, and `inventory_urgency_notional_usd` let one strategy profile scale cleanly from small accounts to larger accounts without rewriting absolute ETH sizes.
+- `symbol_id` + `market_id` are runtime-configured. The same strategy path can be retargeted to other Lighter markets as long as the feeder symbol mapping and exchange metadata are configured.
+
 ## Architecture
 
 ### System Overview
@@ -25,7 +31,7 @@ Institutional-grade High-Frequency Trading framework for crypto perpetual market
           │  ┌─────────────────────────────────────────────────┐  │
           │  │ /dev/shm/aleph-matrix        (656KB BBO Matrix) │  │
           │  │ /dev/shm/aleph-depth         (3MB Depth L1-L5)  │  │ ← v5.0.0
-          │  │ /dev/shm/aleph-events        (64KB Event Ring)  │  │
+          │  │ /dev/shm/aleph-events-v2     (128KB V2 Events)  │  │
           │  │ /dev/shm/aleph-account-stats (128B Stats)       │  │
           │  └─────────────────────────────────────────────────┘  │
           └───────────────────────────────────────────────────────┘
@@ -208,6 +214,7 @@ The production strategy (`src/strategy/inventory_neutral_mm.rs`) implements conf
 - **OBI+VWMicro Pricing** (v5.0.0): Volume-weighted micro price using L1-L5 depth
 - **Exchange Trait**: Works with any exchange implementing `Arc<dyn Exchange>`
 - **Config-Driven**: All parameters externalized to `config.toml` (no hardcoded constants)
+- **Equity-Aware Risk Sizing**: Supports both legacy base-unit knobs and preferred USD-notional sizing
 - **Shadow Ledger**: Optimistic `in_flight_pos` tracking with background reconciliation (lock-free atomics)
 - **Batch Quoting**: Paired bid/ask via `place_batch` for atomic updates
 - **Telemetry** (v5.0.0): Structured metrics export (orders, margin cooldown, spread, adverse selection)

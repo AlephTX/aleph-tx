@@ -64,15 +64,38 @@ define exchange_up
 	@mkdir -p $(LOG_DIR) $(PID_DIR)
 	@make clean-shm
 	@# Start Feeder
-	@export $$(cat $(2) | xargs) && \
-		$(FEEDER_BIN) config.toml > $(LOG_DIR)/feeder-$(1).log 2>&1 & \
-		echo $$! > $(PID_DIR)/feeder-$(1).pid
-	@sleep 2
+	@set -a; . ./$(2); set +a; \
+		: > $(LOG_DIR)/feeder-$(1).log; \
+		setsid $(FEEDER_BIN) config.toml >> $(LOG_DIR)/feeder-$(1).log 2>&1 < /dev/null & \
+		feeder_pid=$$!; \
+		echo $$feeder_pid > $(PID_DIR)/feeder-$(1).pid; \
+		ready=0; \
+		for i in $$(seq 1 75); do \
+			if [ -e /dev/shm/aleph-matrix ] && [ -e /dev/shm/aleph-account-stats ] && [ -e /dev/shm/aleph-depth ]; then \
+				ready=1; \
+				break; \
+			fi; \
+			if ! kill -0 $$feeder_pid 2>/dev/null; then \
+				echo "$(RED)❌ feeder-$(1) exited before SHM was ready$(NC)"; \
+				tail -n 80 $(LOG_DIR)/feeder-$(1).log; \
+				rm -f $(PID_DIR)/feeder-$(1).pid; \
+				exit 1; \
+			fi; \
+			sleep 0.2; \
+		done; \
+		if [ $$ready -ne 1 ]; then \
+			echo "$(RED)❌ feeder-$(1) did not initialize SHM in time$(NC)"; \
+			tail -n 80 $(LOG_DIR)/feeder-$(1).log; \
+			kill -9 $$feeder_pid 2>/dev/null || true; \
+			rm -f $(PID_DIR)/feeder-$(1).pid; \
+			exit 1; \
+		fi
 	@# Start Strategy
 	@cargo build --release --bin $(STRATEGY)
-	@export $$(cat $(2) | xargs) && \
-		export LD_LIBRARY_PATH=$$(pwd)/src/native:$$LD_LIBRARY_PATH && \
-		$(BIN_DIR)/$(STRATEGY) > $(LOG_DIR)/$(1)-$(STRATEGY).log 2>&1 & \
+	@set -a; . ./$(2); set +a; \
+		: > $(LOG_DIR)/$(1)-$(STRATEGY).log; \
+		export LD_LIBRARY_PATH=$$(pwd)/src/native:$$LD_LIBRARY_PATH; \
+		setsid $(BIN_DIR)/$(STRATEGY) >> $(LOG_DIR)/$(1)-$(STRATEGY).log 2>&1 < /dev/null & \
 		echo $$! > $(PID_DIR)/$(1)-$(STRATEGY).pid
 	@echo "$(GREEN)✅ $(1) components started$(NC)"
 endef
@@ -95,6 +118,9 @@ define exchange_down
 		kill -9 $$(cat $(PID_DIR)/feeder-$(1).pid) 2>/dev/null || true; \
 		rm -f $(PID_DIR)/feeder-$(1).pid; \
 	fi
+	@# Kill orphaned processes left behind by failed starts or stale pid files
+	@pgrep -x $(STRATEGY) >/dev/null 2>&1 && pkill -9 -x $(STRATEGY) || true
+	@pgrep -x feeder-app >/dev/null 2>&1 && pkill -9 -x feeder-app || true
 	@make clean-shm
 	@echo "$(GREEN)✅ $(1) clean stop complete$(NC)"
 endef
