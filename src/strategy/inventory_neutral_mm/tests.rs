@@ -2,7 +2,7 @@ use super::*;
 use super::components::{
     build_execution_plan, decide_quote_cycle, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
     safe_available_balance, scaled_base_order_size, scaled_inventory_urgency_threshold,
-    scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier,
+    scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier, utilization_floor_base_order_size,
     usable_balance_fraction, QuoteCycleDecision,
 };
 use super::pricing::{anchor_quotes_to_touch, cleanup_reference_mid, fallback_bbo_prices, local_reference_mid};
@@ -14,12 +14,20 @@ fn test_config() -> InventoryNeutralMMConfig {
         tick_size: 0.01,
         step_size: 0.0001,
         base_order_size: 0.015,
+        base_order_notional_usd: 32.0,
+        max_position_notional_usd: 425.0,
+        inventory_urgency_notional_usd: 170.0,
+        min_inventory_notional_usd: 10.0,
         grid_levels: 10,
         grid_spacing_bps: 5.0,
         grid_size_decay: 0.8,
         order_ttl_secs: 10,
         ..Default::default()
     }
+}
+
+fn size_for_notional(notional_usd: f64, mid: f64) -> f64 {
+    notional_usd / mid
 }
 
 fn active_order(
@@ -180,6 +188,35 @@ fn fresh_mismatched_orders_do_not_allow_side_order_count_to_balloon() {
 
     assert!(to_cancel.is_empty());
     assert_eq!(to_place.len(), desired.len().saturating_sub(existing.len()));
+}
+
+#[test]
+fn modest_size_drift_within_tolerance_does_not_force_requote() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        0.0190,
+    );
+
+    let existing = vec![
+        active_order(1, 101, OrderSide::Buy, desired[0].price, 0.0189, 30),
+        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
+        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
+    ];
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
+    );
+
+    assert!(to_cancel.is_empty());
+    assert!(to_place.len() < desired.len().saturating_sub(2));
 }
 
 #[test]
@@ -362,9 +399,10 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_short() {
 #[test]
 fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
     let config = test_config();
+    let mid = 2100.0;
     let risk = RiskSnapshot {
         raw_available_balance: 100.0,
-        position_for_quoting: config.base_order_size * 0.8,
+        position_for_quoting: size_for_notional(8.0, mid),
         worst_case_long: 0.0,
         worst_case_short: 0.0,
         base_order_size: config.base_order_size,
@@ -378,7 +416,7 @@ fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
     };
 
     let (bid_size, ask_size) =
-        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, mid);
 
     assert!(ask_size > bid_size);
     assert!(bid_size > 0.0);
@@ -390,9 +428,10 @@ fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
 #[test]
 fn inventory_outside_deadband_starts_directional_skew() {
     let config = test_config();
+    let mid = 2100.0;
     let risk = RiskSnapshot {
         raw_available_balance: 100.0,
-        position_for_quoting: config.base_order_size * 1.5,
+        position_for_quoting: size_for_notional(14.0, mid),
         worst_case_long: 0.0,
         worst_case_short: 0.0,
         base_order_size: config.base_order_size,
@@ -406,7 +445,7 @@ fn inventory_outside_deadband_starts_directional_skew() {
     };
 
     let (bid_size, ask_size) =
-        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, mid);
 
     assert!(ask_size > bid_size);
 }
@@ -414,9 +453,10 @@ fn inventory_outside_deadband_starts_directional_skew() {
 #[test]
 fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
     let config = test_config();
+    let mid = 2100.0;
     let risk = RiskSnapshot {
         raw_available_balance: 100.0,
-        position_for_quoting: -(config.base_order_size * 1.02),
+        position_for_quoting: -size_for_notional(12.0, mid),
         worst_case_long: 0.0,
         worst_case_short: 0.0,
         base_order_size: config.base_order_size,
@@ -430,7 +470,7 @@ fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
     };
 
     let (bid_size, ask_size) =
-        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, mid);
 
     assert!(bid_size >= config.base_order_size - config.step_size);
     assert!(ask_size >= config.base_order_size * 0.5);
@@ -650,7 +690,10 @@ fn position_for_quoting_uses_tracker_when_exchange_is_flat_and_drift_is_small() 
 
 #[test]
 fn scaled_sizes_grow_with_portfolio_value_when_using_legacy_base_units() {
-    let config = test_config();
+    let mut config = test_config();
+    config.base_order_notional_usd = 0.0;
+    config.max_position_notional_usd = 0.0;
+    config.inventory_urgency_notional_usd = 0.0;
     let mid = 2000.0;
 
     let small = scaled_base_order_size(&config, 100.0, mid);
@@ -670,9 +713,30 @@ fn scaled_sizes_prefer_usd_notional_when_configured() {
 
     let mid = 2000.0;
 
-    assert!((scaled_base_order_size(&config, 50.0, mid) - 0.02).abs() < 1e-9);
-    assert!((scaled_max_position(&config, 50.0, mid) - 0.2).abs() < 1e-9);
-    assert!((scaled_inventory_urgency_threshold(&config, 50.0, mid, 0.2) - 0.08).abs() < 1e-9);
+    assert!((scaled_base_order_size(&config, 100.0, mid) - 0.02).abs() < 1e-9);
+    assert!((scaled_max_position(&config, 100.0, mid) - 0.2).abs() < 1e-9);
+    assert!((scaled_inventory_urgency_threshold(&config, 100.0, mid, 0.2) - 0.08).abs() < 1e-9);
+}
+
+#[test]
+fn usd_notional_scales_up_with_portfolio_value() {
+    let config = test_config();
+    let mid = 2000.0;
+
+    let small = scaled_base_order_size(&config, 100.0, mid);
+    let large = scaled_base_order_size(&config, 1000.0, mid);
+    let max_pos_large = scaled_max_position(&config, 1000.0, mid);
+
+    assert!(large > small);
+    assert!(max_pos_large > scaled_max_position(&config, 100.0, mid));
+}
+
+#[test]
+fn utilization_floor_increases_top_level_size_when_budget_is_underused() {
+    let config = test_config();
+    let floored = utilization_floor_base_order_size(&config, 0.015, 90.0, 4.46, 2100.0);
+
+    assert!(floored > 0.015);
 }
 
 #[test]

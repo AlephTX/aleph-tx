@@ -6,6 +6,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
+const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
 
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
@@ -67,8 +68,21 @@ pub(super) fn residual_exposure_abs(exchange_position: f64, effective_position: 
     exchange_position.abs().max(effective_position.abs())
 }
 
-pub(super) fn inventory_deadband_size(base_order_size: f64, step_size: f64) -> f64 {
-    base_order_size.max(step_size)
+pub(super) fn inventory_deadband_size(
+    config: &InventoryNeutralMMConfig,
+    base_order_size: f64,
+    urgency_threshold: f64,
+    mid: f64,
+) -> f64 {
+    let min_deadband_from_notional = if mid > 0.0 && config.min_inventory_notional_usd > 0.0 {
+        config.min_inventory_notional_usd / mid
+    } else {
+        0.0
+    };
+    min_deadband_from_notional
+        .max(config.step_size)
+        .max(base_order_size * 0.35)
+        .min(urgency_threshold * 0.5)
 }
 
 pub(super) fn portfolio_scale(config: &InventoryNeutralMMConfig, portfolio_value: f64) -> f64 {
@@ -93,7 +107,7 @@ pub(super) fn scaled_base_order_size(
         return config.base_order_size;
     }
     if config.base_order_notional_usd > 0.0 {
-        return config.base_order_notional_usd / mid;
+        return (config.base_order_notional_usd * portfolio_scale(config, portfolio_value)) / mid;
     }
     config.base_order_size * portfolio_scale(config, portfolio_value)
 }
@@ -107,7 +121,7 @@ pub(super) fn scaled_max_position(
         return config.max_position;
     }
     if config.max_position_notional_usd > 0.0 {
-        return config.max_position_notional_usd / mid;
+        return (config.max_position_notional_usd * portfolio_scale(config, portfolio_value)) / mid;
     }
     config.max_position * portfolio_scale(config, portfolio_value)
 }
@@ -119,7 +133,7 @@ pub(super) fn scaled_inventory_urgency_threshold(
     max_position: f64,
 ) -> f64 {
     if mid > 0.0 && config.inventory_urgency_notional_usd > 0.0 {
-        return (config.inventory_urgency_notional_usd / mid)
+        return ((config.inventory_urgency_notional_usd * portfolio_scale(config, portfolio_value)) / mid)
             .min(max_position)
             .max(config.step_size);
     }
@@ -134,6 +148,24 @@ pub(super) fn scaled_min_available_balance(
     portfolio_value: f64,
 ) -> f64 {
     config.min_available_balance * portfolio_scale(config, portfolio_value)
+}
+
+pub(super) fn utilization_floor_base_order_size(
+    config: &InventoryNeutralMMConfig,
+    base_order_size: f64,
+    usable_balance: f64,
+    grid_multiplier: f64,
+    mid: f64,
+) -> f64 {
+    if usable_balance <= 0.0 || mid <= 0.0 || config.max_leverage <= 0.0 {
+        return base_order_size;
+    }
+
+    let top_level_notional_floor = usable_balance
+        * config.max_leverage
+        * TARGET_RESTING_MARGIN_UTILIZATION
+        / (2.0 * grid_multiplier.max(1.0));
+    base_order_size.max(top_level_notional_floor / mid)
 }
 
 pub(super) fn usable_balance_fraction(position_ratio: f64, margin_usage: f64) -> f64 {
@@ -259,8 +291,9 @@ pub(super) fn reconcile_side_plan(
             .enumerate()
             .filter(|(idx, _)| !matched_existing[*idx])
             .find(|(_, order)| {
+                let size_tolerance = (desired.size * 0.08).max(step_size);
                 (order.price - desired.price).abs() <= threshold
-                    && (order.size - desired.size).abs() <= step_size
+                    && (order.size - desired.size).abs() <= size_tolerance
             })
         {
             matched_existing[idx] = true;
@@ -336,7 +369,12 @@ pub(super) fn apply_risk_limits(
     let mut bid_size = bid_size.min(hard_cap);
     let mut ask_size = ask_size.min(hard_cap);
 
-    let inventory_deadband = inventory_deadband_size(risk.base_order_size, config.step_size);
+    let inventory_deadband = inventory_deadband_size(
+        config,
+        risk.base_order_size,
+        risk.inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
     let urgency_threshold = risk.inventory_urgency_threshold.max(config.step_size);
     let urgency_ratio = (risk.position_for_quoting / urgency_threshold).clamp(-1.0, 1.0);
     let bias_progress = if risk.position_for_quoting.abs() <= inventory_deadband {
@@ -353,7 +391,7 @@ pub(super) fn apply_risk_limits(
         config.step_size,
     );
     let hard_keepalive_size = round_down_to_step(
-        (risk.base_order_size * (0.25 * (1.0 - urgency_ratio.abs()) + 0.10))
+        (risk.base_order_size * (0.15 * (1.0 - urgency_ratio.abs()) + 0.05))
             .max(config.step_size)
             .max(min_size + config.step_size),
         config.step_size,

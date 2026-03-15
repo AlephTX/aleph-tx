@@ -14,14 +14,15 @@ pub(super) fn sync_telemetry_snapshot(
     risk: &RiskSnapshot,
     fill_count: u64,
     total_fees: f64,
-    effective_position: f64,
+    tracker_effective_position: f64,
 ) {
     telemetry.fill_count = fill_count;
     telemetry.total_fees_paid = total_fees;
     telemetry.raw_available_balance = risk.raw_available_balance;
     telemetry.available_balance = risk.available_balance;
     telemetry.portfolio_value = account_stats.portfolio_value;
-    telemetry.effective_position = effective_position;
+    telemetry.quote_position = risk.position_for_quoting;
+    telemetry.tracker_effective_position = tracker_effective_position;
     telemetry.worst_case_long = risk.worst_case_long;
     telemetry.worst_case_short = risk.worst_case_short;
     telemetry.usable_balance = risk.usable_balance;
@@ -73,7 +74,8 @@ mod tests {
         assert_eq!(telemetry.raw_available_balance, 90.0);
         assert_eq!(telemetry.available_balance, 70.0);
         assert_eq!(telemetry.portfolio_value, 120.0);
-        assert_eq!(telemetry.effective_position, -0.02);
+        assert_eq!(telemetry.quote_position, 0.0);
+        assert_eq!(telemetry.tracker_effective_position, -0.02);
         assert_eq!(telemetry.worst_case_long, 0.15);
         assert_eq!(telemetry.worst_case_short, -0.14);
         assert_eq!(telemetry.usable_balance, 49.0);

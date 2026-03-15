@@ -30,8 +30,10 @@ pub struct TelemetryCollector {
     pub raw_available_balance: f64,
     /// Current portfolio value (equity)
     pub portfolio_value: f64,
-    /// Effective position including pending exposure
-    pub effective_position: f64,
+    /// Position used by the strategy for quoting decisions
+    pub quote_position: f64,
+    /// Tracker effective position including pending exposure
+    pub tracker_effective_position: f64,
     /// Worst-case long exposure
     pub worst_case_long: f64,
     /// Worst-case short exposure
@@ -63,7 +65,8 @@ impl TelemetryCollector {
             available_balance: 0.0,
             raw_available_balance: 0.0,
             portfolio_value: 0.0,
-            effective_position: 0.0,
+            quote_position: 0.0,
+            tracker_effective_position: 0.0,
             worst_case_long: 0.0,
             worst_case_short: 0.0,
             usable_balance: 0.0,
@@ -145,7 +148,8 @@ impl TelemetryCollector {
             available_balance = format!("{:.2}", self.available_balance).as_str(),
             raw_available_balance = format!("{:.2}", self.raw_available_balance).as_str(),
             portfolio_value = format!("{:.2}", self.portfolio_value).as_str(),
-            effective_position = format!("{:.4}", self.effective_position).as_str(),
+            quote_position = format!("{:.4}", self.quote_position).as_str(),
+            tracker_effective_position = format!("{:.4}", self.tracker_effective_position).as_str(),
             worst_case_long = format!("{:.4}", self.worst_case_long).as_str(),
             worst_case_short = format!("{:.4}", self.worst_case_short).as_str(),
             usable_balance = format!("{:.2}", self.usable_balance).as_str(),
