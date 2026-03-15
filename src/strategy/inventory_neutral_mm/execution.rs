@@ -122,13 +122,21 @@ pub(super) fn resolve_cancel_client_order_ids(
 }
 
 pub(super) fn should_defer_one_sided_requote(
+    config: &InventoryNeutralMMConfig,
     position_for_quoting: f64,
     base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
 ) -> bool {
-    let symmetric_mode =
-        position_for_quoting.abs() <= inventory_deadband_size(base_order_size, 0.0);
+    let symmetric_mode = position_for_quoting.abs()
+        <= inventory_deadband_size(
+            config,
+            base_order_size,
+            inventory_urgency_threshold.max(config.step_size),
+            mid,
+        );
     if !symmetric_mode {
         return false;
     }
@@ -145,12 +153,21 @@ pub(super) fn should_defer_one_sided_requote(
 }
 
 pub(super) fn should_defer_cancel_only_refresh(
+    config: &InventoryNeutralMMConfig,
     position_for_quoting: f64,
     base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
 ) -> bool {
-    let symmetric_mode = position_for_quoting.abs() <= inventory_deadband_size(base_order_size, 0.0);
+    let symmetric_mode = position_for_quoting.abs()
+        <= inventory_deadband_size(
+            config,
+            base_order_size,
+            inventory_urgency_threshold.max(config.step_size),
+            mid,
+        );
     if !symmetric_mode {
         return false;
     }
@@ -171,6 +188,10 @@ mod tests {
             tick_size: 0.01,
             step_size: 0.0001,
             base_order_size: 0.015,
+            base_order_notional_usd: 32.0,
+            max_position_notional_usd: 425.0,
+            inventory_urgency_notional_usd: 170.0,
+            min_inventory_notional_usd: 10.0,
             grid_levels: 10,
             grid_spacing_bps: 5.0,
             grid_size_decay: 0.8,
@@ -358,6 +379,7 @@ mod tests {
 
     #[test]
     fn defer_one_sided_requote_in_symmetric_mode_when_only_one_side_cancels() {
+        let config = config();
         let bid_plan = SideExecutionPlan {
             to_cancel: vec![101],
             to_place: Vec::new(),
@@ -367,11 +389,14 @@ mod tests {
             to_place: Vec::new(),
         };
 
-        assert!(should_defer_one_sided_requote(0.005, 0.015, &bid_plan, &ask_plan));
+        assert!(should_defer_one_sided_requote(
+            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
     }
 
     #[test]
     fn defer_one_sided_requote_for_small_residual_inventory_up_to_top_level_size() {
+        let config = config();
         let bid_plan = SideExecutionPlan {
             to_cancel: Vec::new(),
             to_place: Vec::new(),
@@ -381,11 +406,14 @@ mod tests {
             to_place: Vec::new(),
         };
 
-        assert!(should_defer_one_sided_requote(0.012, 0.015, &bid_plan, &ask_plan));
+        assert!(should_defer_one_sided_requote(
+            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
     }
 
     #[test]
     fn do_not_defer_one_sided_replenishment_in_symmetric_mode() {
+        let config = config();
         let bid_plan = SideExecutionPlan {
             to_cancel: Vec::new(),
             to_place: vec![OrderParams {
@@ -401,11 +429,14 @@ mod tests {
             to_place: Vec::new(),
         };
 
-        assert!(!should_defer_one_sided_requote(0.005, 0.015, &bid_plan, &ask_plan));
+        assert!(!should_defer_one_sided_requote(
+            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
     }
 
     #[test]
     fn defer_cancel_only_refresh_in_symmetric_mode() {
+        let config = config();
         let bid_plan = SideExecutionPlan {
             to_cancel: vec![101],
             to_place: Vec::new(),
@@ -415,11 +446,14 @@ mod tests {
             to_place: Vec::new(),
         };
 
-        assert!(should_defer_cancel_only_refresh(0.0, 0.015, &bid_plan, &ask_plan));
+        assert!(should_defer_cancel_only_refresh(
+            &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
     }
 
     #[test]
     fn do_not_defer_cancel_only_refresh_when_replenishment_needed() {
+        let config = config();
         let bid_plan = SideExecutionPlan {
             to_cancel: vec![101],
             to_place: vec![OrderParams {
@@ -435,6 +469,8 @@ mod tests {
             to_place: Vec::new(),
         };
 
-        assert!(!should_defer_cancel_only_refresh(0.0, 0.015, &bid_plan, &ask_plan));
+        assert!(!should_defer_cancel_only_refresh(
+            &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
     }
 }

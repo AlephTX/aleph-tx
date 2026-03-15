@@ -205,6 +205,9 @@ fn default_as_kappa() -> f64 {
 fn default_max_spread_bps() -> f64 {
     60.0
 }
+fn default_min_inventory_notional_usd() -> f64 {
+    10.0
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +241,8 @@ pub struct InventoryNeutralMMConfig {
     pub max_position_notional_usd: f64, // optional: max inventory in USD notional
     #[serde(default)]
     pub inventory_urgency_notional_usd: f64, // optional: urgency threshold in USD notional
+    #[serde(default = "default_min_inventory_notional_usd")]
+    pub min_inventory_notional_usd: f64, // default: 10.0 (minimum meaningful inventory deadband)
     #[serde(default = "default_reference_portfolio_value")]
     pub reference_portfolio_value: f64, // scaling anchor for legacy base-unit configs
     #[serde(default = "default_min_portfolio_scale")]
@@ -328,6 +333,7 @@ impl Default for InventoryNeutralMMConfig {
             base_order_notional_usd: 0.0,
             max_position_notional_usd: 0.0,
             inventory_urgency_notional_usd: 0.0,
+            min_inventory_notional_usd: default_min_inventory_notional_usd(),
             reference_portfolio_value: 100.0,
             min_portfolio_scale: 0.5,
             max_portfolio_scale: 20.0,

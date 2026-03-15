@@ -35,6 +35,7 @@ use components::{
     residual_exposure_abs, safe_available_balance, scaled_base_order_size,
     scaled_inventory_urgency_threshold, scaled_max_position, scaled_min_available_balance,
     toxicity_size_scale, toxicity_spread_multiplier, usable_balance_fraction,
+    utilization_floor_base_order_size,
     QuoteCycleDecision, QuoteTarget, RiskSnapshot,
 };
 use execution::{
@@ -413,7 +414,7 @@ impl InventoryNeutralMM {
         // Quote direction should follow confirmed inventory, not pending-order imbalance.
         // Pending buy/sell exposure is still enforced via worst_case_long/short in risk limits.
         let tracker_confirmed = self.order_tracker.confirmed_position();
-        let base_order_size = components::round_down_to_step(
+        let mut base_order_size = components::round_down_to_step(
             scaled_base_order_size(&self.config, self.account_stats.portfolio_value, mid)
                 .max(self.config.step_size),
             self.config.step_size,
@@ -445,7 +446,7 @@ impl InventoryNeutralMM {
             self.config.max_leverage,
         );
         let position_ratio = (position_for_quoting / max_position.max(self.config.step_size)).abs();
-        let usable_balance =
+        let mut usable_balance =
             available_balance * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
         let margin_per_eth = mid / self.config.max_leverage;
         let r = self.config.grid_size_decay;
@@ -455,6 +456,21 @@ impl InventoryNeutralMM {
         } else {
             (1.0 - r.powi(n)) / (1.0 - r)
         };
+        base_order_size = components::round_down_to_step(
+            utilization_floor_base_order_size(
+                &self.config,
+                base_order_size,
+                usable_balance,
+                grid_multiplier,
+                mid,
+            )
+            .max(self.config.step_size),
+            self.config.step_size,
+        )
+        .max(self.config.step_size);
+        let max_position = max_position.max(base_order_size);
+        usable_balance =
+            available_balance * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
 
         RiskSnapshot {
             raw_available_balance,
@@ -530,7 +546,12 @@ impl InventoryNeutralMM {
         mid: f64,
     ) -> (f64, f64) {
         let position = risk.position_for_quoting;
-        let inventory_deadband = inventory_deadband_size(risk.base_order_size, config.step_size);
+        let inventory_deadband = inventory_deadband_size(
+            config,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold.max(config.step_size),
+            mid,
+        );
         // Hard stop: if position at limit, only allow flattening orders
         if position.abs() >= risk.max_position {
             let min_size = 11.0 / mid;
@@ -776,18 +797,26 @@ impl InventoryNeutralMM {
         let equity = self.account_stats.portfolio_value;
         let raw_available = self.account_stats.available_balance;
         let margin_usage = self.account_stats.margin_usage;
+        let mid = self
+            .micro
+            .price_samples
+            .back()
+            .copied()
+            .unwrap_or(1.0)
+            .max(self.config.tick_size);
+        let risk = self.build_risk_snapshot(mid);
         let safe_avail = safe_available_balance(
             raw_available,
             equity,
             margin_usage,
             self.config.max_leverage,
         );
-        let effective_position = self.order_tracker.effective_position();
+        let tracker_effective_position = self.order_tracker.effective_position();
+        let quote_position = risk.position_for_quoting;
         let worst_case_long = self.order_tracker.worst_case_long();
         let worst_case_short = self.order_tracker.worst_case_short();
-        let position_ratio = (effective_position
-            / scaled_max_position(&self.config, equity, self.micro.price_samples.back().copied().unwrap_or(1.0)
-                .max(self.config.tick_size)))
+        let position_ratio = (quote_position
+            / scaled_max_position(&self.config, equity, mid))
             .abs();
         let usable_balance = safe_avail * usable_balance_fraction(position_ratio, margin_usage);
 
@@ -799,7 +828,7 @@ impl InventoryNeutralMM {
         };
 
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Eff): {:.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Quote/Tracker): {:.4}/{:.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
             pnl,
             pnl_pct,
             equity,
@@ -808,7 +837,8 @@ impl InventoryNeutralMM {
             usable_balance,
             margin_usage * 100.0,
             self.account_stats.position,
-            effective_position,
+            quote_position,
+            tracker_effective_position,
             worst_case_long,
             worst_case_short,
             self.total_orders_placed,
@@ -1232,8 +1262,11 @@ impl InventoryNeutralMM {
         );
 
         if should_defer_one_sided_requote(
+            &self.config,
             risk.position_for_quoting,
             risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
             &bid_plan,
             &ask_plan,
         ) {
@@ -1248,8 +1281,11 @@ impl InventoryNeutralMM {
         }
 
         if should_defer_cancel_only_refresh(
+            &self.config,
             risk.position_for_quoting,
             risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
             &bid_plan,
             &ask_plan,
         ) {
