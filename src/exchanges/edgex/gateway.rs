@@ -7,11 +7,12 @@ use super::model::{
     CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide,
     OrderType as EdgeXOrderType, TimeInForce,
 };
+use crate::error::{TradingError};
 use crate::exchange::{
     BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, Exchange, OrderInfo, OrderParams,
     OrderResult, OrderType, PlaceResult, Side,
 };
-use anyhow::{Result, anyhow};
+use anyhow::anyhow;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,7 +34,7 @@ pub struct EdgeXConfig {
 
 impl EdgeXConfig {
     /// Load configuration from environment variables and config.toml
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env() -> anyhow::Result<Self> {
         // Load account_id from .env.edgex (sensitive)
         let account_id = std::env::var("EDGEX_ACCOUNT_ID")
             .map_err(|_| anyhow!("EDGEX_ACCOUNT_ID not set in .env.edgex"))?
@@ -126,7 +127,7 @@ impl EdgeXGateway {
         side: Side,
         size: f64,
         price: f64,
-    ) -> Result<OrderResult> {
+    ) -> anyhow::Result<OrderResult> {
         let is_buy = matches!(side, Side::Buy);
 
         // Generate client_order_id first (needed for nonce calculation)
@@ -246,6 +247,11 @@ impl EdgeXGateway {
                 .get("errorParam")
                 .and_then(|v| serde_json::to_string(v).ok())
                 .unwrap_or_else(|| code.to_string());
+            
+            if code == "INSUFFICIENT_MARGIN" || error_msg.contains("insufficient margin") {
+                return Err(TradingError::InsufficientMargin.into());
+            }
+            
             return Err(anyhow!("EdgeX API error: {} - {}", code, error_msg));
         }
 
@@ -267,7 +273,7 @@ impl EdgeXGateway {
         })
     }
 
-    pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+    pub async fn place_order(&self, params: OrderParams) -> anyhow::Result<OrderResult> {
         self.create_order_internal(params.side, params.size, params.price)
             .await
     }
@@ -275,15 +281,15 @@ impl EdgeXGateway {
 
 #[async_trait]
 impl Exchange for EdgeXGateway {
-    async fn buy(&self, size: f64, price: f64) -> Result<OrderResult> {
+    async fn buy(&self, size: f64, price: f64) -> anyhow::Result<OrderResult> {
         self.create_order_internal(Side::Buy, size, price).await
     }
 
-    async fn sell(&self, size: f64, price: f64) -> Result<OrderResult> {
+    async fn sell(&self, size: f64, price: f64) -> anyhow::Result<OrderResult> {
         self.create_order_internal(Side::Sell, size, price).await
     }
 
-    async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult> {
+    async fn place_batch(&self, params: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
         // EdgeX doesn't have native batch API, execute sequentially
         let bid_result = self.buy(params.bid_size, params.bid_price).await?;
         let ask_result = self.sell(params.ask_size, params.ask_price).await?;
@@ -295,7 +301,7 @@ impl Exchange for EdgeXGateway {
         })
     }
 
-    async fn cancel_order(&self, order_id: i64) -> Result<()> {
+    async fn cancel_order(&self, order_id: i64) -> anyhow::Result<()> {
         let req = CancelOrderRequest {
             account_id: self.config.account_id,
             order_id: Some(order_id as u64),
@@ -310,7 +316,7 @@ impl Exchange for EdgeXGateway {
         Ok(())
     }
 
-    async fn cancel_all(&self) -> Result<u32> {
+    async fn cancel_all(&self) -> anyhow::Result<u32> {
         let req = CancelAllOrderRequest {
             account_id: self.config.account_id,
             filter_contract_id_list: vec![self.config.contract_id],
@@ -323,7 +329,7 @@ impl Exchange for EdgeXGateway {
         Ok(0) // EdgeX doesn't return count
     }
 
-    async fn get_active_orders(&self) -> Result<Vec<OrderInfo>> {
+    async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
         let orders = self
             .client
             .get_open_orders(self.config.account_id)
@@ -345,7 +351,7 @@ impl Exchange for EdgeXGateway {
             .collect())
     }
 
-    async fn close_all_positions(&self, current_price: f64) -> Result<()> {
+    async fn close_all_positions(&self, current_price: f64) -> anyhow::Result<()> {
         let positions = self.client
             .get_positions(self.config.account_id)
             .await
@@ -371,7 +377,7 @@ impl Exchange for EdgeXGateway {
         Ok(())
     }
 
-    async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+    async fn execute_batch(&self, actions: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
         let mut tx_hashes = Vec::new();
         let mut place_results = Vec::new();
 
@@ -399,6 +405,18 @@ impl Exchange for EdgeXGateway {
         Ok(BatchResult {
             tx_hashes,
             place_results,
+        })
+    }
+
+    async fn get_account_stats(&self) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+        let stats = self.client.get_account_stats(self.config.account_id).await?;
+        Ok(crate::strategy::inventory_neutral_mm::AccountStats {
+            available_balance: stats.available_balance,
+            portfolio_value: stats.portfolio_value,
+            position: stats.position,
+            leverage: stats.leverage,
+            margin_usage: stats.margin_usage,
+            last_update: std::time::Instant::now(),
         })
     }
 

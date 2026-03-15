@@ -11,6 +11,7 @@ use crate::edgex_api::model::{CreateOrderRequest, OrderSide, OrderType, TimeInFo
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::pin::Pin;
 use tokio::runtime::Handle;
 
 pub struct MarketMakerStrategy {
@@ -384,5 +385,21 @@ impl Strategy for MarketMakerStrategy {
                 }
             }
         }
+    }
+
+    fn on_shutdown(&mut self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let client_opt = self.edgex_client.clone();
+        let account_id = self.account_id;
+        Box::pin(async move {
+            if let Some(client) = client_opt {
+                tracing::info!("♻️ [EX-v3] Shutting down: Canceling all orders...");
+                use crate::edgex_api::model::CancelAllOrderRequest;
+                let req = CancelAllOrderRequest {
+                    account_id,
+                    filter_contract_id_list: vec![10000002],
+                };
+                let _ = client.cancel_all_orders(&req).await;
+            }
+        })
     }
 }

@@ -6,6 +6,7 @@ use crate::strategy::Strategy;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::pin::Pin;
 use tokio::runtime::Handle;
 use tracing::{error, info, warn};
 
@@ -341,5 +342,16 @@ impl Strategy for BackpackMMStrategy {
                 }
             }
         }
+    }
+
+    fn on_shutdown(&mut self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let client_opt = self.api_client.clone();
+        let sym = self.symbol_name().to_string();
+        Box::pin(async move {
+            if let Some(client) = client_opt {
+                info!("♻️ [BP-v3] Shutting down: Canceling all orders...");
+                let _ = client.cancel_all_orders(&sym).await;
+            }
+        })
     }
 }

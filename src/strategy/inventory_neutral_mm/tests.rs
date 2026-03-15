@@ -57,6 +57,7 @@ fn test_multi_level_order_tracking() {
         ActiveOrder {
             order_id: "1".to_string(),
             client_order_id: 1,
+            order_index: None,
             side: OrderSide::Buy,
             price: 3000.0,
             size: 0.05,
@@ -65,6 +66,7 @@ fn test_multi_level_order_tracking() {
         ActiveOrder {
             order_id: "2".to_string(),
             client_order_id: 2,
+            order_index: None,
             side: OrderSide::Buy,
             price: 2995.0,
             size: 0.035,
@@ -73,6 +75,7 @@ fn test_multi_level_order_tracking() {
         ActiveOrder {
             order_id: "3".to_string(),
             client_order_id: 3,
+            order_index: None,
             side: OrderSide::Sell,
             price: 3010.0,
             size: 0.05,

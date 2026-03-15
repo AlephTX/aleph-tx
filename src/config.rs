@@ -2,6 +2,14 @@
 //!
 //! Loads from `config.toml` at the project root.
 //! All trading parameters are runtime-configurable — no recompilation needed.
+ 
+pub const EXCH_LIGHTER: u8 = 2;
+pub const EXCH_EDGEX: u8 = 3;
+pub const EXCH_HYPERLIQUID: u8 = 4;
+pub const EXCH_BACKPACK: u8 = 5;
+
+pub const SYM_BTC: u16 = 1001;
+pub const SYM_ETH: u16 = 1002;
 
 use serde::Deserialize;
 use std::path::Path;

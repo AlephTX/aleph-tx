@@ -20,7 +20,7 @@ make lighter-up STRATEGY=inventory_neutral_mm   # Start Lighter DEX
 make lighter-down                               # Stop & cleanup
 make lighter-logs                               # View logs
 
-# Available strategies: lighter_inventory_mm, lighter_adaptive_mm, simple_mm
+# Available strategies: lighter_inventory_mm, lighter_adaptive_mm, backpack_mm, edgex_mm
 # Other exchanges: backpack-up, edgex-up
 
 # Build verification

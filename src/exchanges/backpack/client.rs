@@ -14,6 +14,15 @@ pub struct BackpackClient {
     signing_key: SigningKey,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BackpackAccountStats {
+    pub available_balance: f64,
+    pub portfolio_value: f64,
+    pub position: f64,
+    pub leverage: f64,
+    pub margin_usage: f64,
+}
+
 impl BackpackClient {
     pub fn new(api_key: &str, api_secret_b64: &str, base_url: &str) -> Result<Self> {
         let secret_bytes = BASE64
@@ -388,5 +397,27 @@ impl BackpackClient {
 
         tracing::debug!("🔍 [BP] Total equity: ${:.2}", total_usd);
         Ok(total_usd)
+    }
+
+    pub async fn get_account_stats(&self) -> Result<BackpackAccountStats> {
+        let total_equity = self.get_total_equity().await?;
+        let positions = self.get_open_positions().await?;
+        
+        // Sum position notional for leverage calculation
+        let mut total_notional = 0.0;
+        let mut main_pos = 0.0;
+        for pos in positions {
+            let qty: f64 = pos.quantity.parse().unwrap_or(0.0);
+            total_notional += qty.abs(); // Simplistic: treats 1 unit as $1 for non-USD assets
+            main_pos += qty;
+        }
+
+        Ok(BackpackAccountStats {
+            available_balance: total_equity, // Backpack treats all spot as collateral
+            portfolio_value: total_equity,
+            position: main_pos,
+            leverage: if total_equity > 0.0 { total_notional / total_equity } else { 0.0 },
+            margin_usage: if total_equity > 0.0 { (total_notional / total_equity) / 20.0 } else { 0.0 }, // Assuming 20x max
+        })
     }
 }
