@@ -34,6 +34,7 @@ pub struct AccountStats {
     pub portfolio_value: f64,
     pub position: f64,
     pub leverage: f64,
+    pub margin_usage: f64,
     pub last_update: Instant,
 }
 
@@ -44,6 +45,7 @@ impl Default for AccountStats {
             portfolio_value: 0.0,
             position: 0.0,
             leverage: 0.0,
+            margin_usage: 0.0,
             last_update: Instant::now(),
         }
     }
@@ -56,6 +58,7 @@ impl From<AccountStatsSnapshot> for AccountStats {
             portfolio_value: snapshot.portfolio_value,
             position: snapshot.position,
             leverage: snapshot.leverage,
+            margin_usage: snapshot.margin_usage,
             last_update: Instant::now(),
         }
     }
@@ -287,6 +290,47 @@ impl InventoryNeutralMM {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // P-1: Startup Flattening (Zero Position Enforcement)
+        // ═══════════════════════════════════════════════════════════════
+        let startup_pos = self.account_stats.position;
+        if startup_pos.abs() > 0.0001 {
+            info!("📉 Startup Flattening: Closing residual position {:.4} ETH", startup_pos);
+            
+            // Try to find a fair price for closing
+            let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
+            let external_mids: Vec<f64> = exchanges
+                .iter()
+                .filter(|(exch_id, _)| *exch_id != self.config.exchange_id)
+                .filter(|(_, msg)| msg.bid_price > 0.0 && msg.ask_price > 0.0)
+                .map(|(_, msg)| (msg.bid_price + msg.ask_price) / 2.0)
+                .collect();
+            
+            let local_bbo = exchanges.iter().find(|(id, _)| *id == self.config.exchange_id).map(|(_, bbo)| bbo);
+            
+            let close_mid = if let Some(bbo) = local_bbo && bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                (bbo.bid_price + bbo.ask_price) / 2.0
+            } else if !external_mids.is_empty() {
+                external_mids.iter().sum::<f64>() / external_mids.len() as f64
+            } else {
+                0.0
+            };
+
+            if close_mid > 0.0 {
+                if let Err(e) = self.trading.close_all_positions(close_mid).await {
+                    warn!("Failed startup flattening: {}", e);
+                } else {
+                    info!("✅ Startup flattening successful, waiting for sync...");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    // Refresh stats one last time
+                    let stats = self.account_stats_reader.read();
+                    self.account_stats = stats.into();
+                }
+            } else {
+                warn!("⚠️ Could not perform startup flattening: No valid price found");
+            }
+        }
+
         info!("🚀 Starting main loop...");
 
         // P0: Validate post_only configuration is active
@@ -355,18 +399,31 @@ impl InventoryNeutralMM {
                 if position.abs() > 0.0001 {
                     info!("📉 Closing position: {:.4} ETH", position);
                     let exchanges = self.shm_reader.read_all_exchanges(self.config.symbol_id);
-                    if let Some((_, bbo)) = exchanges
+                    
+                    // Robust pricing for shutdown
+                    let external_mids: Vec<f64> = exchanges
                         .iter()
-                        .find(|(id, _)| *id == self.config.exchange_id)
-                    {
-                        let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
-                        if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
-                            warn!("⚠️  Invalid mid price during close: {:.4}", mid);
-                        } else if let Err(e) = self.trading.close_all_positions(mid).await {
-                            warn!("Failed to close positions: {}", e);
-                        } else {
-                            info!("✅ Positions closed");
-                        }
+                        .filter(|(exch_id, _)| *exch_id != self.config.exchange_id)
+                        .filter(|(_, msg)| msg.bid_price > 0.0 && msg.ask_price > 0.0)
+                        .map(|(_, msg)| (msg.bid_price + msg.ask_price) / 2.0)
+                        .collect();
+                    
+                    let local_bbo = exchanges.iter().find(|(id, _)| *id == self.config.exchange_id).map(|(_, bbo)| bbo);
+                    
+                    let close_mid = if let Some(bbo) = local_bbo && bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                        (bbo.bid_price + bbo.ask_price) / 2.0
+                    } else if !external_mids.is_empty() {
+                        external_mids.iter().sum::<f64>() / external_mids.len() as f64
+                    } else {
+                        0.0
+                    };
+
+                    if close_mid == 0.0 || close_mid.is_nan() || close_mid.is_infinite() {
+                        warn!("⚠️  Invalid mid price during close: {:.4}", close_mid);
+                    } else if let Err(e) = self.trading.close_all_positions(close_mid).await {
+                        warn!("Failed to close positions: {}", e);
+                    } else {
+                        info!("✅ Positions closed");
                     }
                 }
 
@@ -471,7 +528,7 @@ impl InventoryNeutralMM {
                 .find(|(exch_id, _)| *exch_id == self.config.exchange_id)
                 .map(|(_, msg)| msg);
 
-            let bbo = match lighter_bbo.filter(|b| b.bid_price > 0.0 && b.ask_price > 0.0) {
+            let bbo = match lighter_bbo.filter(|b| b.bid_price > 0.0 || b.ask_price > 0.0) {
                 Some(b) => b,
                 None => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -499,7 +556,36 @@ impl InventoryNeutralMM {
                 }
             }
 
-            let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+            // ═══════════════════════════════════════════════════════════════════
+            // Mid Price & Cross-Exchange Signal
+            // ═══════════════════════════════════════════════════════════════════
+            
+            // Calculate external consensus mid first (shifted up in loop)
+            let external_mids: Vec<f64> = exchanges
+                .iter()
+                .filter(|(exch_id, _)| *exch_id != self.config.exchange_id)
+                .filter(|(_, msg)| msg.bid_price > 0.0 && msg.ask_price > 0.0)
+                .map(|(_, msg)| (msg.bid_price + msg.ask_price) / 2.0)
+                .collect();
+            
+            let consensus_mid = if !external_mids.is_empty() {
+                Some(external_mids.iter().sum::<f64>() / external_mids.len() as f64)
+            } else {
+                None
+            };
+
+            // Calculate local mid with illiquidity fallback
+            let mid = if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                (bbo.bid_price + bbo.ask_price) / 2.0
+            } else if let Some(ext_mid) = consensus_mid {
+                ext_mid // Fallback to external consensus
+            } else if bbo.bid_price > 0.0 {
+                bbo.bid_price + (self.config.tick_size * 2.0)
+            } else if bbo.ask_price > 0.0 {
+                bbo.ask_price - (self.config.tick_size * 2.0)
+            } else {
+                0.0
+            };
 
             // Divide-by-zero / NaN protection: if mid is invalid, skip this cycle
             if mid == 0.0 || mid.is_nan() || mid.is_infinite() {
@@ -513,7 +599,10 @@ impl InventoryNeutralMM {
                 if let Some(depth) =
                     depth_reader.read_depth(self.config.symbol_id, self.config.exchange_id)
                 {
-                    self.calculate_vw_micro_price(&depth, bbo.bid_price, bbo.ask_price)
+                    // If one side is empty in BBO, we use the fallback mid for that side in VWAP
+                    let bid_p = if bbo.bid_price > 0.0 { bbo.bid_price } else { mid - self.config.tick_size };
+                    let ask_p = if bbo.ask_price > 0.0 { bbo.ask_price } else { mid + self.config.tick_size };
+                    self.calculate_vw_micro_price(&depth, bid_p, ask_p)
                 } else {
                     mid // Fallback to simple mid
                 }
@@ -521,7 +610,11 @@ impl InventoryNeutralMM {
                 mid // No depth reader available
             };
 
-            let market_spread_bps = ((bbo.ask_price - bbo.bid_price) / mid) * 10000.0;
+            let market_spread_bps = if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                ((bbo.ask_price - bbo.bid_price) / mid) * 10000.0
+            } else {
+                100.0 // Placeholder large spread if illiquid
+            };
 
             // Update microstructure with VWMicro price
             self.micro.update(pricing_mid);
@@ -543,34 +636,24 @@ impl InventoryNeutralMM {
             // Cross-Exchange Signal: use external exchange mid prices for
             // directional bias and adverse selection filtering
             // ═══════════════════════════════════════════════════════════════════
-            let cross_shift = {
-                let external_mids: Vec<f64> = exchanges
-                    .iter()
-                    .filter(|(exch_id, _)| *exch_id != self.config.exchange_id)
-                    .filter(|(_, msg)| msg.bid_price > 0.0 && msg.ask_price > 0.0)
-                    .map(|(_, msg)| (msg.bid_price + msg.ask_price) / 2.0)
-                    .collect();
+            let cross_shift = if let Some(cross_mid) = consensus_mid {
+                let cross_signal_bps = (cross_mid - mid) / mid * 10000.0;
 
-                if !external_mids.is_empty() {
-                    let cross_mid = external_mids.iter().sum::<f64>() / external_mids.len() as f64;
-                    let cross_signal_bps = (cross_mid - mid) / mid * 10000.0;
-
-                    // Cross-exchange AS filter: if external price diverges too much, skip
-                    if cross_signal_bps.abs() > self.config.cross_exchange_as_threshold {
-                        debug!(
-                            "Cross-exchange AS: signal={:.1}bps (threshold={:.1}), canceling",
-                            cross_signal_bps, self.config.cross_exchange_as_threshold
-                        );
-                        self.cancel_all_orders().await;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue;
-                    }
-
-                    // Directional shift: move quotes towards external consensus
-                    cross_signal_bps * self.config.cross_exchange_scale / 10000.0 * mid
-                } else {
-                    0.0
+                // Cross-exchange AS filter: if external price diverges too much, skip
+                if cross_signal_bps.abs() > self.config.cross_exchange_as_threshold {
+                    debug!(
+                        "Cross-exchange AS: signal={:.1}bps (threshold={:.1}), canceling",
+                        cross_signal_bps, self.config.cross_exchange_as_threshold
+                    );
+                    self.cancel_all_orders().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
+
+                // Directional shift: move quotes towards external consensus
+                cross_signal_bps * self.config.cross_exchange_scale / 10000.0 * mid
+            } else {
+                0.0
             };
 
             // ═══════════════════════════════════════════════════════════════════
@@ -1029,20 +1112,39 @@ impl InventoryNeutralMM {
             ask_size.max(min_size)
         };
 
-        // ═══════════════════════════════════════════════════════════════════
         // MARGIN MANAGEMENT: Adjust order sizes based on available balance
         // ═══════════════════════════════════════════════════════════════════
         let available = self.account_stats.available_balance;
+        let equity = self.account_stats.portfolio_value;
+        let margin_usage = self.account_stats.margin_usage;
+
+        // Lighter DEX specific: if available balance is misleadingly high (missing order locks),
+        // we derive the true free margin from Equity & MarginUsage
+        let safe_available = if margin_usage > 0.01 && equity > 0.0 {
+            // MarginUsage is (Notional / Equity). True Free = Equity * (1 - Notional / (Equity * MaxLev))
+            let true_free = equity * (1.0 - margin_usage / self.config.max_leverage);
+            available.min(true_free).max(0.0)
+        } else {
+            available
+        };
 
         // Estimate margin required per order using configured max leverage
         let margin_per_eth = mid / self.config.max_leverage;
 
-        // available_balance from exchange already deducts position margin,
-        // so just reserve 30% buffer for safety
-        let usable_balance = available * 0.7;
+        // Factor in the entire grid's margin (geometric series sum)
+        let r = self.config.grid_size_decay;
+        let n = self.config.grid_levels as i32;
+        let grid_multiplier = if (1.0 - r).abs() < 1e-4 {
+            n as f64
+        } else {
+            (1.0 - r.powi(n)) / (1.0 - r)
+        };
 
-        let bid_margin_required = bid_size * margin_per_eth;
-        let ask_margin_required = ask_size * margin_per_eth;
+        // Use safe_available for scaling
+        let usable_balance = safe_available * 0.7;
+
+        let bid_margin_required = bid_size * margin_per_eth * grid_multiplier;
+        let ask_margin_required = ask_size * margin_per_eth * grid_multiplier;
         let total_margin_required = bid_margin_required + ask_margin_required;
 
         let (bid_size, ask_size) = if total_margin_required > usable_balance {
@@ -1068,14 +1170,14 @@ impl InventoryNeutralMM {
                     available
                 );
 
-                // Check if scaled sizes meet minimum requirements (Lighter DEX minimum ~0.01 ETH)
-                let min_order_size = 0.01;
-                let final_bid = if scaled_bid < min_order_size {
+                // Check if scaled sizes meet minimum requirements (Lighter DEX minimum ~$11)
+                let min_size = 11.0 / mid;
+                let final_bid = if scaled_bid < min_size {
                     0.0
                 } else {
                     scaled_bid
                 };
-                let final_ask = if scaled_ask < min_order_size {
+                let final_ask = if scaled_ask < min_size {
                     0.0
                 } else {
                     scaled_ask
@@ -1123,6 +1225,16 @@ impl InventoryNeutralMM {
     fn print_pnl_update(&self) {
         let equity = self.account_stats.portfolio_value;
         let available = self.account_stats.available_balance;
+        let margin_usage = self.account_stats.margin_usage;
+
+        // Calculate SafeAvail for logging
+        let safe_avail = if margin_usage > 0.01 && equity > 0.0 {
+            let true_free = equity * (1.0 - margin_usage / self.config.max_leverage);
+            available.min(true_free).max(0.0)
+        } else {
+            available
+        };
+
         let pnl = equity - self.session_start_balance;
         let pnl_pct = if self.session_start_balance > 0.0 {
             (pnl / self.session_start_balance) * 100.0
@@ -1131,11 +1243,13 @@ impl InventoryNeutralMM {
         };
 
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail: ${:.2} | Pos: {:.4} ETH | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw): ${:.2}/${:.2} | Margin: {:.1}% | Pos: {:.4} ETH | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
             pnl,
             pnl_pct,
             equity,
+            safe_avail,
             available,
+            margin_usage * 100.0,
             self.account_stats.position,
             self.total_orders_placed,
             self.telemetry.fill_count,
