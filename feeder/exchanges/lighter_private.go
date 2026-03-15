@@ -19,11 +19,12 @@ type LighterPrivate struct {
 	cfg          config.ExchangeConfig
 	eventBuffer  *shm.EventRingBufferV2
 	auth         *LighterAuth
-	mktMap       map[int]uint16 // market_index -> symbol_id
-	accountStats *LighterAccountStats // For updating position
+	mktMap       map[int]uint16          // market_index -> symbol_id
+	accountStats *LighterAccountStats    // For updating position
 	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
-	orderSizes   map[uint64]float64 // order_id -> remaining_base_amount
-	orderDetails map[uint64]orderDetail // order_id -> full order details
+	orderSizes   map[uint64]float64      // order_id -> remaining_base_amount
+	orderDetails map[uint64]orderDetail  // order_id -> full order details
+	seenTradeIDs map[uint64]struct{}     // trade_id -> seen (dedupe duplicate WS payloads)
 }
 
 // orderDetail tracks order metadata for V2 events
@@ -65,33 +66,34 @@ func NewLighterPrivate(
 		statsWriter:  statsWriter,
 		orderSizes:   make(map[uint64]float64),
 		orderDetails: make(map[uint64]orderDetail),
+		seenTradeIDs: make(map[uint64]struct{}),
 	}, nil
 }
 
 // lighterAccountMarket is the account_market channel response
 type lighterAccountMarket struct {
-	Type     string              `json:"type"`
-	Channel  string              `json:"channel"`
-	Account  int                 `json:"account"`
-	Orders   []lighterOrder      `json:"orders"`
-	Trades   []lighterTrade      `json:"trades"`
-	Position json.RawMessage     `json:"position"`
+	Type     string          `json:"type"`
+	Channel  string          `json:"channel"`
+	Account  int             `json:"account"`
+	Orders   []lighterOrder  `json:"orders"`
+	Trades   []lighterTrade  `json:"trades"`
+	Position json.RawMessage `json:"position"`
 }
 
 // lighterOrder matches the Order JSON from Lighter docs
 type lighterOrder struct {
-	OrderIndex        int64   `json:"order_index"`
-	ClientOrderIndex  int64   `json:"client_order_index"`
-	OrderID           string  `json:"order_id"`
-	MarketIndex       int     `json:"market_index"`
-	InitialBaseAmount string  `json:"initial_base_amount"`
-	Price             string  `json:"price"`
+	OrderIndex          int64  `json:"order_index"`
+	ClientOrderIndex    int64  `json:"client_order_index"`
+	OrderID             string `json:"order_id"`
+	MarketIndex         int    `json:"market_index"`
+	InitialBaseAmount   string `json:"initial_base_amount"`
+	Price               string `json:"price"`
 	RemainingBaseAmount string `json:"remaining_base_amount"`
-	FilledBaseAmount  string  `json:"filled_base_amount"`
-	FilledQuoteAmount string  `json:"filled_quote_amount"`
-	IsAsk             bool    `json:"is_ask"`
-	Status            string  `json:"status"` // "open", "canceled", "filled"
-	Timestamp         int64   `json:"timestamp"`
+	FilledBaseAmount    string `json:"filled_base_amount"`
+	FilledQuoteAmount   string `json:"filled_quote_amount"`
+	IsAsk               bool   `json:"is_ask"`
+	Status              string `json:"status"` // "open", "canceled", "filled"
+	Timestamp           int64  `json:"timestamp"`
 }
 
 // lighterTrade matches the Trade JSON from Lighter docs
@@ -151,6 +153,9 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 		log.Printf("lighter-private: subscribed to account_market/%d/%d", mktIdx, accountID)
 	}
 
+	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-private", c, 15*time.Second)
+	defer stopKeepalive()
+
 	// Read loop with automatic pong responses
 	for {
 		msgType, data, err := c.Read(ctx)
@@ -162,12 +167,24 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 		if msgType == websocket.MessageBinary || msgType == websocket.MessageText {
 			// Zero-copy JSON parsing with gjson
 			result := gjson.ParseBytes(data)
+			if result.Get("type").String() == "ping" {
+				if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`)); err != nil {
+					return fmt.Errorf("write app pong: %w", err)
+				}
+				continue
+			}
 
-			// Process position data
+			// Process position data. Lighter sometimes sends `"position": null`
+			// between real updates; that must not overwrite the last known
+			// position with 0.
 			positionData := result.Get("position")
-			if positionData.Exists() && positionData.String() != "null" {
-				log.Printf("lighter-private: position data: %s", positionData.Raw)
-				lp.processPositionFast(positionData)
+			if positionData.Exists() {
+				if positionData.Type == gjson.Null || positionData.Raw == "null" {
+					log.Printf("lighter-private: position data is null, keeping last known position")
+				} else {
+					log.Printf("lighter-private: position data: %s", positionData.Raw)
+					lp.processPositionFast(positionData)
+				}
 			}
 
 			// Process orders array
@@ -201,7 +218,11 @@ func (lp *LighterPrivate) processPositionFast(positionData gjson.Result) {
 	posSize, _ := strconv.ParseFloat(positionStr, 64)
 	netPosition := float64(sign) * posSize
 
-	log.Printf("lighter-private: position updated: %.4f ETH", netPosition)
+	symbol := positionData.Get("symbol").String()
+	if symbol == "" {
+		symbol = "BASE"
+	}
+	log.Printf("lighter-private: position updated: %.4f %s", netPosition, symbol)
 
 	// Update account stats cache (for user_stats to include in full writes)
 	if lp.accountStats != nil {
@@ -257,14 +278,14 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 			timestampNs,
 		)
 
-	case "canceled":
+	case "canceled", "canceled-post-only":
 		// Order canceled — clean up tracking
 		remainingSize := 0.0
 		if prev, ok := lp.orderSizes[orderID]; ok {
 			remainingSize = prev
 		}
-		coi := int64(0)
-		oi := int64(0)
+		coi := clientOrderIndex
+		oi := int64(orderIndex)
 		if detail, ok := lp.orderDetails[orderID]; ok {
 			coi = detail.clientOrderIndex
 			oi = detail.orderIndex
@@ -282,9 +303,21 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 		)
 
 	case "filled":
-		// Order fully filled — clean up tracking (fills handled by trade events)
-		delete(lp.orderSizes, orderID)
-		delete(lp.orderDetails, orderID)
+		// Some immediate fills arrive without a prior "open" event. Seed local
+		// tracking from the filled order payload so the following trade event can
+		// still bind to the correct client_order_index.
+		if _, ok := lp.orderDetails[orderID]; !ok {
+			lp.orderDetails[orderID] = orderDetail{
+				clientOrderIndex: clientOrderIndex,
+				orderIndex:       orderIndex,
+				price:            price,
+				initialSize:      initialSize,
+				isAsk:            isAsk,
+			}
+		}
+		if _, ok := lp.orderSizes[orderID]; !ok {
+			lp.orderSizes[orderID] = initialSize
+		}
 	}
 }
 
@@ -296,20 +329,44 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	}
 
 	tradeID := trade.Get("trade_id").Int()
+	tradeIDu64 := uint64(tradeID)
+	if _, seen := lp.seenTradeIDs[tradeIDu64]; seen {
+		return
+	}
+	lp.seenTradeIDs[tradeIDu64] = struct{}{}
+
 	price := trade.Get("price").String()
 	size := trade.Get("size").String()
 	isMakerAsk := trade.Get("is_maker_ask").Bool()
 
-	log.Printf("lighter-private: trade event: id=%d market=%d price=%s size=%s maker_ask=%v",
-		tradeID, marketID, price, size, isMakerAsk)
+	askID := uint64(trade.Get("ask_id").Int())
+	bidID := uint64(trade.Get("bid_id").Int())
+	askTracked := lp.isTrackedOrderID(askID)
+	bidTracked := lp.isTrackedOrderID(bidID)
 
-	// Determine which order ID belongs to this account
+	// Private trade payloads include both sides. The reliable way to identify
+	// our order is to see which order ID we are already tracking locally,
+	// rather than inferring from maker_ask.
 	var orderID uint64
-	if isMakerAsk {
-		orderID = uint64(trade.Get("ask_id").Int())
-	} else {
-		orderID = uint64(trade.Get("bid_id").Int())
+	switch {
+	case askTracked && !bidTracked:
+		orderID = askID
+	case bidTracked && !askTracked:
+		orderID = bidID
+	case askTracked:
+		orderID = askID
+	case bidTracked:
+		orderID = bidID
+	case isMakerAsk:
+		orderID = askID
+	default:
+		orderID = bidID
 	}
+
+	log.Printf(
+		"lighter-private: trade event: id=%d market=%d price=%s size=%s maker_ask=%v ask_id=%d bid_id=%d ask_tracked=%v bid_tracked=%v selected=%d",
+		tradeID, marketID, price, size, isMakerAsk, askID, bidID, askTracked, bidTracked, orderID,
+	)
 
 	fillPrice, _ := strconv.ParseFloat(price, 64)
 	fillSize, _ := strconv.ParseFloat(size, 64)
@@ -339,12 +396,13 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	// Look up client_order_id and order_index from tracked details
 	coi := int64(0)
 	oi := int64(0)
+	orderIsAsk := isMakerAsk
 	if detail, ok := lp.orderDetails[orderID]; ok {
 		coi = detail.clientOrderIndex
 		oi = detail.orderIndex
+		orderIsAsk = detail.isAsk
 	}
 
-	tradeIDu64 := uint64(tradeID)
 	timestampNs := uint64(time.Now().UnixNano())
 
 	lp.eventBuffer.PushOrderFilledV2(
@@ -357,10 +415,21 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		fillSize,
 		remainingSize,
 		feePaid,
-		isMakerAsk,
+		orderIsAsk,
 		timestampNs,
 		tradeIDu64,
 	)
+}
+
+func (lp *LighterPrivate) isTrackedOrderID(orderID uint64) bool {
+	if orderID == 0 {
+		return false
+	}
+	if _, ok := lp.orderDetails[orderID]; ok {
+		return true
+	}
+	_, ok := lp.orderSizes[orderID]
+	return ok
 }
 
 // GetAccountIndex returns the account index for testing

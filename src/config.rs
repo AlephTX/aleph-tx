@@ -39,6 +39,14 @@ pub fn format_size(size: f64, step_size: f64) -> String {
     format!("{:.prec$}", round_to_tick(size, step_size), prec = decimals)
 }
 
+pub fn symbol_name(symbol_id: u16) -> &'static str {
+    match symbol_id {
+        SYM_BTC => "BTC",
+        SYM_ETH => "ETH",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Per-exchange strategy configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeConfig {
@@ -176,6 +184,15 @@ fn default_cross_exchange_scale() -> f64 {
 fn default_cross_exchange_as_threshold() -> f64 {
     8.0
 }
+fn default_reference_portfolio_value() -> f64 {
+    100.0
+}
+fn default_min_portfolio_scale() -> f64 {
+    0.5
+}
+fn default_max_portfolio_scale() -> f64 {
+    20.0
+}
 fn default_as_gamma() -> f64 {
     5000.0
 }
@@ -215,6 +232,18 @@ pub struct InventoryNeutralMMConfig {
     pub base_order_size: f64,             // default: 0.05
     pub max_position: f64,                // default: 0.15
     pub inventory_urgency_threshold: f64, // default: 0.08
+    #[serde(default)]
+    pub base_order_notional_usd: f64, // optional: quote in USD notional instead of base units
+    #[serde(default)]
+    pub max_position_notional_usd: f64, // optional: max inventory in USD notional
+    #[serde(default)]
+    pub inventory_urgency_notional_usd: f64, // optional: urgency threshold in USD notional
+    #[serde(default = "default_reference_portfolio_value")]
+    pub reference_portfolio_value: f64, // scaling anchor for legacy base-unit configs
+    #[serde(default = "default_min_portfolio_scale")]
+    pub min_portfolio_scale: f64, // lower clamp for equity-aware scaling
+    #[serde(default = "default_max_portfolio_scale")]
+    pub max_portfolio_scale: f64, // upper clamp for equity-aware scaling
     // Sigmoid SIZE偏移 (v4.0.0)
     #[serde(default = "default_sigmoid_steepness")]
     pub sigmoid_steepness: f64, // default: 4.0 (控制sigmoid曲线陡峭度)
@@ -296,6 +325,12 @@ impl Default for InventoryNeutralMMConfig {
             base_order_size: 0.05,
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,
+            base_order_notional_usd: 0.0,
+            max_position_notional_usd: 0.0,
+            inventory_urgency_notional_usd: 0.0,
+            reference_portfolio_value: 100.0,
+            min_portfolio_scale: 0.5,
+            max_portfolio_scale: 20.0,
             adverse_selection_threshold: 2.0,
             requote_threshold_bps: 1.5,
             order_ttl_secs: 5,

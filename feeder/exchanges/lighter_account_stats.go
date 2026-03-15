@@ -31,8 +31,8 @@ func NewLighterAccountStats(cfg config.ExchangeConfig, statsWriter *shm.AccountS
 	}
 
 	return &LighterAccountStats{
-		cfg:        cfg,
-		auth:       auth,
+		cfg:         cfg,
+		auth:        auth,
 		statsWriter: statsWriter,
 	}, nil
 }
@@ -84,35 +84,26 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 	}
 	log.Printf("lighter-account-stats: subscribed to user_stats/%d with auth", accountID)
 
-	// Fetch initial stats via REST API (as fallback)
-	go las.fetchInitialStats(ctx)
+	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-account-stats", c, 15*time.Second)
+	defer stopKeepalive()
 
-	// Start periodic polling as fallback (every 30 seconds)
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	// Create a done channel to signal goroutine cleanup
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-done:
-				return
-			case <-ticker.C:
-				las.fetchStatsREST(ctx)
-			}
-		}
-	}()
+	// The previous REST fallback used an invalid account endpoint and produced
+	// persistent 403s. For Lighter, the authenticated user_stats stream is the
+	// authoritative source here, so keep the path websocket-only until a valid
+	// REST account endpoint is implemented.
 
 	// Read loop
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
 			return err
+		}
+
+		if string(data) == `{"type":"ping"}` {
+			if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`)); err != nil {
+				return fmt.Errorf("write app pong: %w", err)
+			}
+			continue
 		}
 
 		var stats lighterUserStats
@@ -181,11 +172,6 @@ func (las *LighterAccountStats) processStats(stats *lighterUserStats) {
 // SetPosition updates the cached position (called from private stream)
 func (las *LighterAccountStats) SetPosition(position float64) {
 	las.position = position
-}
-
-func (las *LighterAccountStats) fetchInitialStats(ctx context.Context) {
-	time.Sleep(1 * time.Second) // Wait for subscription to settle
-	las.fetchStatsREST(ctx)
 }
 
 func (las *LighterAccountStats) fetchStatsREST(ctx context.Context) {

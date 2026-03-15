@@ -1,368 +1,754 @@
 use super::*;
+use super::components::{
+    build_execution_plan, decide_quote_cycle, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
+    safe_available_balance, scaled_base_order_size, scaled_inventory_urgency_threshold,
+    scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier,
+    usable_balance_fraction, QuoteCycleDecision,
+};
+use super::pricing::{anchor_quotes_to_touch, cleanup_reference_mid, fallback_bbo_prices, local_reference_mid};
+use crate::exchange::{OrderType, Side};
+use crate::order_tracker::OrderLifecycle;
 
-#[test]
-fn test_grid_level_calculation() {
-    let config = InventoryNeutralMMConfig {
+fn test_config() -> InventoryNeutralMMConfig {
+    InventoryNeutralMMConfig {
         tick_size: 0.01,
         step_size: 0.0001,
-        grid_levels: 3,
-        grid_spacing_bps: 2.0,
-        grid_size_decay: 0.7,
+        base_order_size: 0.015,
+        grid_levels: 10,
+        grid_spacing_bps: 5.0,
+        grid_size_decay: 0.8,
+        order_ttl_secs: 10,
         ..Default::default()
-    };
-
-    // Test bid levels (prices should decrease)
-    let base_price = 2000.0;
-    let base_size = 0.1;
-
-    let mut bid_levels = Vec::new();
-    for i in 0..config.grid_levels {
-        let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-        let price = base_price - spacing_dollars;
-        let rounded_price = (price / config.tick_size).floor() * config.tick_size;
-
-        let size_multiplier = config.grid_size_decay.powi(i as i32);
-        let size = base_size * size_multiplier;
-        let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-        if rounded_size >= 0.001 {
-            bid_levels.push((rounded_price, rounded_size));
-        }
     }
+}
 
-    // Verify 3 levels generated
-    assert_eq!(bid_levels.len(), 3);
-
-    // Verify prices descend
-    assert!(bid_levels[0].0 >= bid_levels[1].0);
-    assert!(bid_levels[1].0 >= bid_levels[2].0);
-
-    // Verify size decay (0.7^0, 0.7^1, 0.7^2)
-    assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
-    assert!((bid_levels[1].1 - 0.07).abs() < 0.001);
-    assert!((bid_levels[2].1 - 0.049).abs() < 0.001);
+fn active_order(
+    client_order_id: i64,
+    order_index: i64,
+    side: OrderSide,
+    price: f64,
+    size: f64,
+    age_secs: u64,
+) -> ActiveOrder {
+    ActiveOrder {
+        client_order_id,
+        order_index: Some(order_index),
+        lifecycle: OrderLifecycle::Open,
+        side,
+        price,
+        size,
+        placed_at: Instant::now() - Duration::from_secs(age_secs),
+    }
 }
 
 #[test]
-fn test_multi_level_order_tracking() {
-    // Test helper methods without full MM initialization
-    let config = InventoryNeutralMMConfig {
-        grid_levels: 3,
-        requote_threshold_bps: 10.0,
-        ..Default::default()
-    };
+fn builds_multiple_grid_levels_when_inventory_budget_allows() {
+    let config = test_config();
 
-    // Create a minimal MM instance for testing
-    let active_orders = [
-        ActiveOrder {
-            order_id: "1".to_string(),
-            client_order_id: 1,
-            order_index: None,
-            side: OrderSide::Buy,
-            price: 3000.0,
-            size: 0.05,
-            placed_at: Instant::now(),
-        },
-        ActiveOrder {
-            order_id: "2".to_string(),
-            client_order_id: 2,
-            order_index: None,
-            side: OrderSide::Buy,
-            price: 2995.0,
-            size: 0.035,
-            placed_at: Instant::now(),
-        },
-        ActiveOrder {
-            order_id: "3".to_string(),
-            client_order_id: 3,
-            order_index: None,
-            side: OrderSide::Sell,
-            price: 3010.0,
-            size: 0.05,
-            placed_at: Instant::now(),
-        },
+    let quotes = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    assert!(quotes.len() >= 4);
+    assert_eq!(quotes[0].price, 2100.0);
+    assert!(quotes[1].price < quotes[0].price);
+    assert!(quotes[2].price < quotes[1].price);
+    assert!(quotes[0].size >= quotes[1].size);
+    assert!(quotes[1].size >= quotes[2].size);
+}
+
+#[test]
+fn keeps_existing_levels_that_already_match_grid() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    let existing = vec![
+        active_order(1, 101, OrderSide::Buy, desired[0].price, desired[0].size, 30),
+        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
+        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
+        active_order(4, 104, OrderSide::Buy, desired[3].price, desired[3].size, 30),
+        active_order(5, 105, OrderSide::Buy, desired[4].price, desired[4].size, 30),
     ];
 
-    // Test filtering by side
-    let bids: Vec<_> = active_orders
-        .iter()
-        .filter(|o| o.side == OrderSide::Buy)
-        .collect();
-    assert_eq!(bids.len(), 2);
-    assert_eq!(bids[0].price, 3000.0);
-    assert_eq!(bids[1].price, 2995.0);
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
+    );
 
-    let asks: Vec<_> = active_orders
-        .iter()
-        .filter(|o| o.side == OrderSide::Sell)
-        .collect();
-    assert_eq!(asks.len(), 1);
-    assert_eq!(asks[0].price, 3010.0);
-
-    // Test requote logic
-    let target_prices = [(3000.0, 0.05), (2995.0, 0.035)];
-
-    // Same prices - no requote needed
-    let mut needs_requote = false;
-    if bids.len() != target_prices.len() {
-        needs_requote = true;
-    } else {
-        for (order, &(target_price, _)) in bids.iter().zip(target_prices.iter()) {
-            let price_diff = (order.price - target_price).abs();
-            let threshold = target_price * config.requote_threshold_bps / 10000.0;
-            if price_diff > threshold {
-                needs_requote = true;
-                break;
-            }
-        }
-    }
-    assert!(!needs_requote);
-
-    // Price moved beyond threshold (10 bps = 0.1%)
-    let moved_prices = [(3005.0, 0.05), (2995.0, 0.035)];
-    needs_requote = false;
-    for (order, &(target_price, _)) in bids.iter().zip(moved_prices.iter()) {
-        let price_diff = (order.price - target_price).abs();
-        let threshold = target_price * config.requote_threshold_bps / 10000.0;
-        if price_diff > threshold {
-            needs_requote = true;
-            break;
-        }
-    }
-    assert!(needs_requote); // 5 dollar move on 3000 = 16.7 bps > 10 bps threshold
+    assert!(to_cancel.is_empty());
+    assert!(to_place.is_empty());
 }
 
 #[test]
-fn test_grid_integration() {
-    // Integration test: verify full grid calculation pipeline
-    let config = InventoryNeutralMMConfig {
-        grid_levels: 3,
-        grid_spacing_bps: 5.0,
-        grid_size_decay: 0.7,
-        tick_size: 0.01,
-        step_size: 0.001,
-        ..Default::default()
-    };
+fn ttl_prevents_fresh_orders_from_immediate_requote_cancels() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Sell,
+        OrderType::PostOnly,
+        2110.0,
+        config.base_order_size,
+    );
 
-    let base_price = 3000.0;
-    let base_size = 0.1;
+    let existing = vec![active_order(
+        10,
+        201,
+        OrderSide::Sell,
+        desired[0].price + 1.0,
+        desired[0].size,
+        1,
+    )];
 
-    // Calculate bid levels
-    let mut bid_levels = Vec::new();
-    for i in 0..config.grid_levels {
-        let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-        let price = base_price - spacing_dollars;
-        let rounded_price = (price / config.tick_size).floor() * config.tick_size;
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
+    );
 
-        let size_multiplier = config.grid_size_decay.powi(i as i32);
-        let size = base_size * size_multiplier;
-        let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-        if rounded_size >= 0.001 {
-            bid_levels.push((rounded_price, rounded_size));
-        }
-    }
-
-    // Verify bid levels
-    assert_eq!(bid_levels.len(), 3);
-
-    // Level 0: base price, full size
-    assert!((bid_levels[0].0 - 3000.0).abs() < 0.01);
-    assert!((bid_levels[0].1 - 0.1).abs() < 0.001);
-
-    // Level 1: -5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
-    assert!((bid_levels[1].0 - 2998.5).abs() < 0.01);
-    assert!((bid_levels[1].1 - 0.069).abs() < 0.001);
-
-    // Level 2: -10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
-    assert!((bid_levels[2].0 - 2997.0).abs() < 0.01);
-    assert!((bid_levels[2].1 - 0.048).abs() < 0.001);
-
-    // Calculate ask levels
-    let mut ask_levels = Vec::new();
-    for i in 0..config.grid_levels {
-        let spacing_dollars = base_price * config.grid_spacing_bps * (i as f64) / 10000.0;
-        let price = base_price + spacing_dollars;
-        let rounded_price = (price / config.tick_size).floor() * config.tick_size;
-
-        let size_multiplier = config.grid_size_decay.powi(i as i32);
-        let size = base_size * size_multiplier;
-        let rounded_size = (size / config.step_size).floor() * config.step_size;
-
-        if rounded_size >= 0.001 {
-            ask_levels.push((rounded_price, rounded_size));
-        }
-    }
-
-    // Verify ask levels
-    assert_eq!(ask_levels.len(), 3);
-
-    // Level 0: base price, full size
-    assert!((ask_levels[0].0 - 3000.0).abs() < 0.01);
-    assert!((ask_levels[0].1 - 0.1).abs() < 0.001);
-
-    // Level 1: +5 bps (1.5 dollars), 70% size (0.1*0.7=0.0699.. → floor → 0.069)
-    assert!((ask_levels[1].0 - 3001.5).abs() < 0.01);
-    assert!((ask_levels[1].1 - 0.069).abs() < 0.001);
-
-    // Level 2: +10 bps (3.0 dollars), 49% size (0.1*0.49=0.0489.. → floor → 0.048)
-    assert!((ask_levels[2].0 - 3003.0).abs() < 0.01);
-    assert!((ask_levels[2].1 - 0.048).abs() < 0.001);
+    assert!(to_cancel.is_empty());
+    assert_eq!(to_place.len(), desired.len().saturating_sub(existing.len()));
 }
 
 #[test]
-fn test_sigmoid_size_multiplier() {
-    let config = InventoryNeutralMMConfig {
-        max_position: 0.15,
-        sigmoid_steepness: 4.0,
-        ..Default::default()
-    };
-
-    // Helper function to calculate sigmoid multiplier
-    let calc_multiplier = |position: f64| -> f64 {
-        let normalized_pos = position / config.max_position;
-        1.0 + 2.0 * (config.sigmoid_steepness * normalized_pos.abs()).tanh()
-    };
-
-    // Test at different position levels
-    let pos_0 = 0.0;
-    let pos_5pct = 0.05 * config.max_position; // 0.0075
-    let pos_50pct = 0.5 * config.max_position; // 0.075
-    let pos_80pct = 0.8 * config.max_position; // 0.12
-    let pos_100pct = config.max_position; // 0.15
-
-    let mult_0 = calc_multiplier(pos_0);
-    let mult_5 = calc_multiplier(pos_5pct);
-    let mult_50 = calc_multiplier(pos_50pct);
-    let mult_80 = calc_multiplier(pos_80pct);
-    let mult_100 = calc_multiplier(pos_100pct);
-
-    // Verify sigmoid properties:
-    // 1. At pos=0, multiplier ≈ 1.0 (minimal urgency)
-    assert!((mult_0 - 1.0).abs() < 0.01, "pos=0: mult={}", mult_0);
-
-    // 2. Monotonically increasing
-    assert!(
-        mult_5 > mult_0,
-        "mult_5={} should > mult_0={}",
-        mult_5,
-        mult_0
-    );
-    assert!(
-        mult_50 > mult_5,
-        "mult_50={} should > mult_5={}",
-        mult_50,
-        mult_5
-    );
-    assert!(
-        mult_80 > mult_50,
-        "mult_80={} should > mult_50={}",
-        mult_80,
-        mult_50
-    );
-    assert!(
-        mult_100 > mult_80,
-        "mult_100={} should > mult_80={}",
-        mult_100,
-        mult_80
+fn stale_mismatched_orders_are_canceled_and_missing_levels_replaced() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Sell,
+        OrderType::PostOnly,
+        2110.0,
+        config.base_order_size,
     );
 
-    // 3. At pos=100%, multiplier ≈ 3.0 (max urgency)
-    assert!((mult_100 - 3.0).abs() < 0.1, "pos=100%: mult={}", mult_100);
+    let existing = vec![
+        active_order(20, 301, OrderSide::Sell, desired[0].price, desired[0].size, 30),
+        active_order(21, 302, OrderSide::Sell, desired[1].price + 0.75, desired[1].size, 30),
+    ];
 
-    // 4. Steeper growth in middle range (50% → 80% should have larger delta than 5% → 50%)
-    // This validates the sigmoid curve is steeper in the middle
-    let delta_low = mult_50 - mult_5;
-    let delta_mid = mult_80 - mult_50;
-    assert!(
-        delta_mid > 0.0,
-        "delta_mid={} should be positive",
-        delta_mid
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
     );
-    assert!(
-        delta_low > 0.0,
-        "delta_low={} should be positive",
-        delta_low
-    );
+
+    assert_eq!(to_cancel, vec![302]);
+    assert_eq!(to_place.len(), desired.len().saturating_sub(1));
+    assert_eq!(to_place[0].price, desired[1].price);
+    assert_eq!(to_place[1].price, desired[2].price);
 }
 
 #[test]
-fn test_vw_micro_price_calculation() {
-    use crate::shm_depth_reader::{PriceLevel, ShmDepthSnapshot};
+fn fresh_mismatched_orders_do_not_allow_side_order_count_to_balloon() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
 
-    // Create mock depth snapshot
-    let depth = ShmDepthSnapshot {
+    let existing = vec![
+        active_order(1, 101, OrderSide::Buy, desired[0].price + 0.80, desired[0].size, 1),
+        active_order(2, 102, OrderSide::Buy, desired[1].price + 0.80, desired[1].size, 1),
+    ];
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
+    );
+
+    assert!(to_cancel.is_empty());
+    assert_eq!(to_place.len(), desired.len().saturating_sub(existing.len()));
+}
+
+#[test]
+fn execution_plan_uses_at_least_half_grid_spacing_as_requote_threshold() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2090.0,
+        ask_price: 2092.0,
+        bid_size: config.base_order_size,
+        ask_size: config.base_order_size,
+    };
+
+    let plan = build_execution_plan(&config, target, 2100.0);
+    let half_grid_spacing = 2100.0 * config.grid_spacing_bps / 20000.0;
+
+    assert!((plan.requote_threshold - half_grid_spacing).abs() <= 1e-9);
+}
+
+#[test]
+fn pending_create_without_order_index_is_not_scheduled_for_cancel() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Sell,
+        OrderType::PostOnly,
+        2110.0,
+        config.base_order_size,
+    );
+
+    let existing = vec![ActiveOrder {
+        client_order_id: 99,
+        order_index: None,
+        lifecycle: OrderLifecycle::PendingCreate,
+        side: OrderSide::Sell,
+        price: desired[0].price + 1.0,
+        size: desired[0].size,
+        placed_at: Instant::now() - Duration::from_secs(30),
+    }];
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        Duration::from_secs(config.order_ttl_secs),
+    );
+
+    assert!(to_cancel.is_empty());
+    assert_eq!(to_place.len(), desired.len().saturating_sub(existing.len()));
+}
+
+#[test]
+fn risk_limits_respect_existing_worst_case_exposure() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: 0.0,
+        worst_case_long: 0.19,
+        worst_case_short: -0.05,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 70.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.03, 0.03, 2100.0);
+
+    assert!(bid_size <= 0.01 + 1e-6);
+    assert!(ask_size > 0.0);
+}
+
+#[test]
+fn risk_limits_scale_down_when_margin_budget_is_tight() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 20.0,
+        position_for_quoting: 0.0,
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 20.0,
+        usable_balance: 5.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 4.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.03, 0.03, 2100.0);
+
+    assert!(bid_size < 0.03);
+    assert!(ask_size < 0.03);
+}
+
+#[test]
+fn pre_urgency_long_inventory_under_margin_pressure_keeps_both_sides_meaningful() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 25.0,
+        position_for_quoting: config.base_order_size * 2.0,
+        worst_case_long: 0.02,
+        worst_case_short: -0.01,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 21.0,
+        usable_balance: 15.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 4.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.013, 0.017, 2100.0);
+
+    assert!(ask_size > bid_size);
+    assert!(bid_size > config.step_size);
+    assert!(ask_size < config.base_order_size);
+}
+
+#[test]
+fn risk_limits_disable_same_side_when_inventory_urgency_triggers_long() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: config.inventory_urgency_threshold + 0.01,
+        worst_case_long: 0.05,
+        worst_case_short: -0.05,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.03, 0.01, 2100.0);
+
+    assert!(bid_size > 0.0);
+    assert!(bid_size < config.base_order_size);
+    assert!(ask_size >= config.base_order_size - config.step_size);
+}
+
+#[test]
+fn risk_limits_disable_same_side_when_inventory_urgency_triggers_short() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: -(config.inventory_urgency_threshold + 0.01),
+        worst_case_long: 0.05,
+        worst_case_short: -0.05,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.01, 0.03, 2100.0);
+
+    assert!(bid_size >= config.base_order_size - config.step_size);
+    assert!(ask_size > 0.0);
+    assert!(ask_size < config.base_order_size);
+}
+
+#[test]
+fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: config.base_order_size * 0.8,
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+
+    assert!(ask_size > bid_size);
+    assert!(bid_size > 0.0);
+    assert!(ask_size > 0.0);
+    assert!(bid_size >= config.base_order_size * 0.75);
+    assert!(ask_size <= config.base_order_size * 1.25);
+}
+
+#[test]
+fn inventory_outside_deadband_starts_directional_skew() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: config.base_order_size * 1.5,
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+
+    assert!(ask_size > bid_size);
+}
+
+#[test]
+fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: -(config.base_order_size * 1.02),
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+
+    assert!(bid_size >= config.base_order_size - config.step_size);
+    assert!(ask_size >= config.base_order_size * 0.5);
+}
+
+#[test]
+fn inventory_beyond_urgency_threshold_reduces_same_side_to_keepalive() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: -(config.inventory_urgency_threshold + 0.01),
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+
+    assert!(bid_size >= config.base_order_size - config.step_size);
+    assert!(ask_size < config.base_order_size * 0.5);
+}
+
+#[test]
+fn moderate_inventory_below_urgency_threshold_keeps_same_side_non_zero() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: -(config.base_order_size * 2.0),
+        worst_case_long: 0.0,
+        worst_case_short: 0.0,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 2.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+
+    assert!(bid_size > ask_size);
+    assert!(ask_size > config.step_size);
+}
+
+#[test]
+fn scaled_but_quotable_sizes_do_not_skip_execution() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2090.0,
+        ask_price: 2092.0,
+        bid_size: config.base_order_size - 5.0 * config.step_size,
+        ask_size: config.base_order_size - 6.0 * config.step_size,
+    };
+
+    let decision = decide_quote_cycle(
+        &config,
+        target,
+        2091.0,
+        config.min_available_balance + 1.0,
+        0.0,
+    );
+
+    assert!(matches!(decision, QuoteCycleDecision::Execute(_)));
+}
+
+#[test]
+fn sub_step_sizes_still_skip_when_not_low_margin() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2090.0,
+        ask_price: 2092.0,
+        bid_size: config.step_size * 0.5,
+        ask_size: config.step_size * 0.5,
+    };
+
+    let decision = decide_quote_cycle(
+        &config,
+        target,
+        2091.0,
+        config.min_available_balance + 1.0,
+        0.0,
+    );
+
+    assert!(matches!(decision, QuoteCycleDecision::Skip));
+}
+
+#[test]
+fn usable_balance_fraction_is_more_aggressive_when_inventory_and_margin_are_low() {
+    let calm = usable_balance_fraction(0.0, 0.0);
+    let stressed = usable_balance_fraction(1.0, 1.0);
+
+    assert!(calm > 0.85);
+    assert!(stressed < calm);
+    assert!(stressed >= 0.55);
+}
+
+#[test]
+fn inventory_skew_ratio_clamps_to_urgency_threshold() {
+    let config = test_config();
+
+    assert_eq!(inventory_skew_ratio(&config, 0.0), 0.0);
+    assert!(inventory_skew_ratio(&config, config.inventory_urgency_threshold * 2.0) > 0.99);
+    assert!(inventory_skew_ratio(&config, -config.inventory_urgency_threshold * 2.0) < -0.99);
+}
+
+#[test]
+fn local_reference_mid_uses_only_local_bid_when_ask_missing() {
+    let bbo = ShmBboMessage {
         seqlock: 0,
-        exchange_id: 2,
-        symbol_id: 1002,
-        _padding1: 0,
-        timestamp_ns: 1234567890,
-        bids: [
-            PriceLevel {
-                price: 3000.0,
-                size: 1.0,
-            },
-            PriceLevel {
-                price: 2999.0,
-                size: 2.0,
-            },
-            PriceLevel {
-                price: 2998.0,
-                size: 1.5,
-            },
-            PriceLevel {
-                price: 2997.0,
-                size: 1.0,
-            },
-            PriceLevel {
-                price: 2996.0,
-                size: 0.5,
-            },
-        ],
-        asks: [
-            PriceLevel {
-                price: 3001.0,
-                size: 1.0,
-            },
-            PriceLevel {
-                price: 3002.0,
-                size: 2.0,
-            },
-            PriceLevel {
-                price: 3003.0,
-                size: 1.5,
-            },
-            PriceLevel {
-                price: 3004.0,
-                size: 1.0,
-            },
-            PriceLevel {
-                price: 3005.0,
-                size: 0.5,
-            },
-        ],
-        _reserved: [0; 72],
+        msg_type: 0,
+        exchange_id: 0,
+        symbol_id: 0,
+        timestamp_ns: 1,
+        bid_price: 2100.0,
+        bid_size: 1.0,
+        ask_price: 0.0,
+        ask_size: 0.0,
+        _reserved: [0; 16],
     };
 
-    // Calculate VWMicro manually
-    let bid_notional: f64 = depth.bids.iter().map(|l| l.price * l.size).sum();
-    let ask_notional: f64 = depth.asks.iter().map(|l| l.price * l.size).sum();
-    let vw_micro =
-        (bid_notional * 3001.0 + ask_notional * 3000.0) / (bid_notional + ask_notional);
+    let mid = local_reference_mid(&bbo, 0.01, 2.0);
 
-    // VWMicro should be between bid and ask
-    assert!(
-        vw_micro > 3000.0 && vw_micro < 3001.0,
-        "VWMicro {} should be between 3000.0 and 3001.0",
-        vw_micro
-    );
+    assert_eq!(mid, 2100.02);
+}
 
-    // Should be closer to mid than simple average due to depth weighting
-    let simple_mid = 3000.5;
-    assert!(
-        (vw_micro - simple_mid).abs() < 1.0,
-        "VWMicro {} should be close to simple mid {}",
-        vw_micro,
-        simple_mid
-    );
+#[test]
+fn fallback_bbo_prices_synthesize_missing_side_around_local_mid() {
+    let bbo = ShmBboMessage {
+        seqlock: 0,
+        msg_type: 0,
+        exchange_id: 0,
+        symbol_id: 0,
+        timestamp_ns: 1,
+        bid_price: 0.0,
+        bid_size: 0.0,
+        ask_price: 2100.5,
+        ask_size: 1.0,
+        _reserved: [0; 16],
+    };
+
+    let mid = local_reference_mid(&bbo, 0.01, 2.0);
+    let (bid_price, ask_price) = fallback_bbo_prices(mid, &bbo, 0.01);
+
+    assert_eq!(mid, 2100.48);
+    assert_eq!(bid_price, 2100.47);
+    assert_eq!(ask_price, 2100.5);
+}
+
+#[test]
+fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
+    let (bid, ask) =
+        anchor_quotes_to_touch(2106.89, 2118.53, 2112.20, 2112.30, 2112.25, 0.01, 1.0, 8.0);
+
+    assert!(bid < 2112.30);
+    assert!(ask > 2112.20);
+    assert!(2112.20 - bid <= 2112.25 * 8.0 / 10000.0 + 0.02);
+    assert!(ask - 2112.30 <= 2112.25 * 8.0 / 10000.0 + 0.02);
+}
+
+#[test]
+fn anchored_quotes_respect_configured_join_buffer() {
+    let (bid, ask) =
+        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.03, 2105.015, 0.01, 2.0, 8.0);
+
+    assert!(bid <= 2105.01);
+    assert!(ask >= 2105.02);
+}
+
+#[test]
+fn safe_available_balance_caps_raw_balance_with_margin_usage() {
+    let safe_available = safe_available_balance(100.0, 50.0, 5.0, 10.0);
+
+    assert_eq!(safe_available, 25.0);
+}
+
+#[test]
+fn safe_available_balance_falls_back_to_raw_when_margin_usage_unavailable() {
+    let safe_available = safe_available_balance(42.0, 0.0, 0.0, 10.0);
+
+    assert_eq!(safe_available, 42.0);
+}
+
+#[test]
+fn residual_exposure_abs_uses_more_conservative_of_exchange_and_effective_positions() {
+    assert_eq!(residual_exposure_abs(-0.03, 0.05), 0.05);
+    assert_eq!(residual_exposure_abs(0.07, 0.02), 0.07);
+}
+
+#[test]
+fn position_for_quoting_does_not_flip_direction_against_real_exchange_inventory() {
+    let config = test_config();
+
+    let q = position_for_quoting(&config, 0.0675, -0.0372);
+
+    assert!((q - 0.0675).abs() < 1e-9);
+}
+
+#[test]
+fn position_for_quoting_uses_tracker_when_exchange_is_flat_and_drift_is_small() {
+    let config = test_config();
+
+    let q = position_for_quoting(&config, 0.0, -0.0125);
+
+    assert!((q + 0.0125).abs() < 1e-9);
+}
+
+#[test]
+fn scaled_sizes_grow_with_portfolio_value_when_using_legacy_base_units() {
+    let config = test_config();
+    let mid = 2000.0;
+
+    let small = scaled_base_order_size(&config, 100.0, mid);
+    let large = scaled_base_order_size(&config, 1000.0, mid);
+    let max_pos = scaled_max_position(&config, 1000.0, mid);
+
+    assert!(large > small);
+    assert!(max_pos > config.max_position);
+}
+
+#[test]
+fn scaled_sizes_prefer_usd_notional_when_configured() {
+    let mut config = test_config();
+    config.base_order_notional_usd = 40.0;
+    config.max_position_notional_usd = 400.0;
+    config.inventory_urgency_notional_usd = 160.0;
+
+    let mid = 2000.0;
+
+    assert!((scaled_base_order_size(&config, 50.0, mid) - 0.02).abs() < 1e-9);
+    assert!((scaled_max_position(&config, 50.0, mid) - 0.2).abs() < 1e-9);
+    assert!((scaled_inventory_urgency_threshold(&config, 50.0, mid, 0.2) - 0.08).abs() < 1e-9);
+}
+
+#[test]
+fn toxicity_controls_shrink_size_and_widen_spread_without_zeroing_quotes() {
+    let threshold = 3.0;
+
+    let size_scale = toxicity_size_scale(4.5, threshold);
+    let spread_mult = toxicity_spread_multiplier(4.5, threshold);
+
+    assert!(size_scale < 1.0);
+    assert!(size_scale >= 0.25);
+    assert!(spread_mult > 1.0);
+}
+
+#[test]
+fn toxicity_controls_are_neutral_below_threshold() {
+    let threshold = 3.0;
+
+    assert_eq!(toxicity_size_scale(2.0, threshold), 1.0);
+    assert_eq!(toxicity_spread_multiplier(2.0, threshold), 1.0);
+}
+
+#[test]
+fn cleanup_reference_mid_rejects_empty_book() {
+    let bbo = ShmBboMessage::default();
+
+    assert!(cleanup_reference_mid(&bbo, 0.01, 2.0).is_none());
+}
+
+#[test]
+fn decide_quote_cycle_requests_clear_when_low_margin_and_quotes_are_too_small() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2100.0,
+        ask_price: 2100.1,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+
+    let decision = decide_quote_cycle(&config, target, 2100.0, 1.0, 0.0);
+
+    assert!(matches!(decision, QuoteCycleDecision::ClearForLowMargin));
+}
+
+#[test]
+fn decide_quote_cycle_executes_when_at_least_one_side_is_actionable() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2100.0,
+        ask_price: 2100.1,
+        bid_size: config.base_order_size,
+        ask_size: 0.0,
+    };
+
+    let decision = decide_quote_cycle(&config, target.clone(), 2100.0, 10.0, 0.0);
+
+    match decision {
+        QuoteCycleDecision::Execute(plan) => {
+            assert_eq!(plan.target.bid_price, target.bid_price);
+            assert_eq!(plan.target.bid_size, target.bid_size);
+        }
+        _ => panic!("expected execute decision"),
+    }
+}
+
+#[test]
+fn decide_quote_cycle_flattens_when_low_margin_and_position_is_not_flat() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2100.0,
+        ask_price: 2100.1,
+        bid_size: 0.0,
+        ask_size: 0.0,
+    };
+
+    let decision = decide_quote_cycle(&config, target, 2100.0, 1.0, 0.02);
+
+    assert!(matches!(decision, QuoteCycleDecision::FlattenForLowMargin));
 }

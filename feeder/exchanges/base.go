@@ -5,6 +5,8 @@ import (
 	"log"
 	"math/rand"
 	"time"
+
+	"nhooyr.io/websocket"
 )
 
 // Exchange defines the interface for all feed handlers.
@@ -66,5 +68,39 @@ func RunConnectionLoop(ctx context.Context, name string, connect ConnectFunc) er
 			consecutiveFailures = 0
 			backoff = 1 * time.Second
 		}
+	}
+}
+
+func startWebSocketKeepalive(
+	parent context.Context,
+	name string,
+	c *websocket.Conn,
+	interval time.Duration,
+) func() {
+	done := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-parent.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(parent, 5*time.Second)
+				err := c.Ping(pingCtx)
+				cancel()
+				if err != nil && parent.Err() == nil {
+					log.Printf("%s: keepalive ping failed: %v", name, err)
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
 	}
 }

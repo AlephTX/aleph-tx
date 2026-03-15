@@ -26,8 +26,18 @@ pub struct TelemetryCollector {
     pub total_fees_paid: f64,
     /// Current available balance
     pub available_balance: f64,
+    /// Raw available balance reported by exchange before safety haircut
+    pub raw_available_balance: f64,
     /// Current portfolio value (equity)
     pub portfolio_value: f64,
+    /// Effective position including pending exposure
+    pub effective_position: f64,
+    /// Worst-case long exposure
+    pub worst_case_long: f64,
+    /// Worst-case short exposure
+    pub worst_case_short: f64,
+    /// Usable balance after strategy haircut
+    pub usable_balance: f64,
     /// Session start time for fill rate calculation
     session_start: Instant,
 }
@@ -51,7 +61,12 @@ impl TelemetryCollector {
             fill_count: 0,
             total_fees_paid: 0.0,
             available_balance: 0.0,
+            raw_available_balance: 0.0,
             portfolio_value: 0.0,
+            effective_position: 0.0,
+            worst_case_long: 0.0,
+            worst_case_short: 0.0,
+            usable_balance: 0.0,
             session_start: Instant::now(),
         }
     }
@@ -128,7 +143,12 @@ impl TelemetryCollector {
             total_fees_paid = format!("{:.4}", self.total_fees_paid).as_str(),
             fill_rate = format!("{:.2}", self.fill_rate()).as_str(),
             available_balance = format!("{:.2}", self.available_balance).as_str(),
+            raw_available_balance = format!("{:.2}", self.raw_available_balance).as_str(),
             portfolio_value = format!("{:.2}", self.portfolio_value).as_str(),
+            effective_position = format!("{:.4}", self.effective_position).as_str(),
+            worst_case_long = format!("{:.4}", self.worst_case_long).as_str(),
+            worst_case_short = format!("{:.4}", self.worst_case_short).as_str(),
+            usable_balance = format!("{:.2}", self.usable_balance).as_str(),
             "Telemetry snapshot"
         );
     }

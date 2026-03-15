@@ -342,6 +342,16 @@ impl OrderTracker {
         self.state.read().active_orders.keys().copied().collect()
     }
 
+    /// Snapshot all currently tracked active orders for strategy-side reconciliation.
+    pub fn active_orders_snapshot(&self) -> Vec<TrackedOrder> {
+        self.state
+            .read()
+            .active_orders
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Get order_index for a tracked order (used for cancel API)
     pub fn get_order_index(&self, client_order_id: i64) -> Option<i64> {
         let state = self.state.read();
@@ -428,6 +438,21 @@ impl OrderTracker {
         }
     }
 
+    /// Revert a pending cancel back to the last known live state when cancel submission failed.
+    pub fn revert_pending_cancel(&self, client_order_id: i64) {
+        let mut state = self.state.write();
+        if let Some(order) = state.active_orders.get_mut(&client_order_id)
+            && order.lifecycle == OrderLifecycle::PendingCancel
+        {
+            order.lifecycle = if order.filled_size > 1e-12 {
+                OrderLifecycle::PartiallyFilled
+            } else {
+                OrderLifecycle::Open
+            };
+            order.last_update = Instant::now();
+        }
+    }
+
     /// Force sync confirmed position from exchange REST API
     pub fn force_sync_position(&self, exchange_position: f64) -> f64 {
         let current = self.confirmed_position();
@@ -486,12 +511,11 @@ impl OrderTracker {
     }
 
     /// Reconcile active orders with exchange actual open orders
-    pub async fn reconcile_with_exchange(&self, exchange: &dyn Exchange) -> usize {
+    pub async fn reconcile_with_exchange(&self, exchange: &dyn Exchange) -> anyhow::Result<usize> {
         let open_orders = match exchange.get_active_orders().await {
             Ok(orders) => orders,
             Err(e) => {
-                tracing::error!("Reconcile: failed to fetch active orders: {}", e);
-                return 0;
+                return Err(e);
             }
         };
 
@@ -537,7 +561,7 @@ impl OrderTracker {
                 state.completed_orders.insert(coi, order);
             }
         }
-        count
+        Ok(count)
     }
 }
 
@@ -585,6 +609,20 @@ impl OrderTracker {
         let mut state = self.state.write();
 
         if let Some(order) = state.active_orders.get_mut(&client_id) {
+            if order.exchange_order_id == Some(event.exchange_order_id)
+                && order.order_index == Some(event.order_index)
+                && order.lifecycle != OrderLifecycle::PendingCreate
+            {
+                order.last_update = Instant::now();
+                tracing::debug!(
+                    "Ignoring duplicate order confirmation: coi={} exch_id={} order_idx={}",
+                    client_id,
+                    event.exchange_order_id,
+                    event.order_index
+                );
+                return Ok(());
+            }
+
             // Delayed binding: attach exchange IDs to locally registered order
             order.exchange_order_id = Some(event.exchange_order_id);
             order.order_index = Some(event.order_index);
@@ -602,7 +640,41 @@ impl OrderTracker {
                 event.exchange_order_id,
                 event.order_index
             );
+        } else if let Some(existing_cid) = state
+            .exchange_to_client
+            .get(&event.exchange_order_id)
+            .copied()
+        {
+            if let Some(order) = state.active_orders.get_mut(&existing_cid) {
+                order.last_update = Instant::now();
+                tracing::debug!(
+                    "Ignoring duplicate order-created event by exchange binding: exch_id={} coi={} event_coi={}",
+                    event.exchange_order_id,
+                    existing_cid,
+                    client_id
+                );
+                return Ok(());
+            }
+
+            if state.completed_orders.contains_key(&existing_cid) {
+                tracing::debug!(
+                    "Ignoring duplicate order-created event for completed order: exch_id={} coi={}",
+                    event.exchange_order_id,
+                    existing_cid
+                );
+                return Ok(());
+            }
         } else {
+            if let Some(order) = state.completed_orders.get_mut(&client_id) {
+                order.last_update = Instant::now();
+                tracing::debug!(
+                    "Ignoring duplicate order-created event for completed order: coi={} exch_id={}",
+                    client_id,
+                    event.exchange_order_id
+                );
+                return Ok(());
+            }
+
             // Auto-register untracked order (e.g. from restart, or manual order)
             let side = if event.is_ask != 0 {
                 OrderSide::Sell
@@ -658,7 +730,8 @@ impl OrderTracker {
         let client_id = state
             .exchange_to_client
             .get(&event.exchange_order_id)
-            .copied();
+            .copied()
+            .or_else(|| (event.client_order_id != 0).then_some(event.client_order_id));
 
         if let Some(cid) = client_id {
             let (is_filled, side) = if let Some(order) = state.active_orders.get_mut(&cid) {
@@ -714,8 +787,36 @@ impl OrderTracker {
             } else {
                 // Not in active_orders — might be in completed (late event)
                 if let Some(order) = state.completed_orders.get_mut(&cid) {
+                    if event.trade_id == 0
+                        && event.remaining_size < 1e-12
+                        && order.lifecycle == OrderLifecycle::Filled
+                        && order.fills.iter().any(|(tid, sz, px)| {
+                            *tid == 0
+                                && (*sz - event.fill_size).abs() < 1e-12
+                                && (*px - event.fill_price).abs() < 1e-9
+                        })
+                    {
+                        tracing::warn!(
+                            "Duplicate completed-order terminal fill ignored: coi={} size={:.4} price={:.2}",
+                            cid,
+                            event.fill_size,
+                            event.fill_price
+                        );
+                        return Ok(());
+                    }
+                    if event.trade_id != 0
+                        && order.fills.iter().any(|(tid, _, _)| *tid == event.trade_id)
+                    {
+                        tracing::warn!(
+                            "Duplicate completed-order fill ignored: trade_id={} coi={}",
+                            event.trade_id,
+                            cid
+                        );
+                        return Ok(());
+                    }
                     order.filled_size += event.fill_size;
                     order.total_fee += event.fee_paid;
+                    order.last_update = Instant::now();
                     order
                         .fills
                         .push((event.trade_id, event.fill_size, event.fill_price));
@@ -769,19 +870,34 @@ impl OrderTracker {
                 self.confirmed_position()
             );
         } else {
-            // Completely untracked fill (e.g. order from before restart)
             let side = if event.is_ask != 0 {
                 OrderSide::Sell
             } else {
                 OrderSide::Buy
             };
+
+            if event.client_order_id == 0 {
+                tracing::warn!(
+                    "⚠️  Ignoring unowned counterparty fill: exch_id={} side={} size={:.4} price={:.2} trade_id={}",
+                    event.exchange_order_id,
+                    side,
+                    event.fill_size,
+                    event.fill_price,
+                    event.trade_id
+                );
+                return Ok(());
+            }
+
+            // Untracked fill with a client_order_id is still assumed to be ours,
+            // e.g. after restart or if create/cancel ordering was missed.
             let signed = side.sign() * event.fill_size;
             let delta = (signed * POS_SCALE) as i64;
             self.confirmed_position.fetch_add(delta, Ordering::AcqRel);
 
             tracing::warn!(
-                "⚠️  Untracked fill: exch_id={} side={} size={:.4} price={:.2}",
+                "⚠️  Untracked owned fill: exch_id={} coi={} side={} size={:.4} price={:.2}",
                 event.exchange_order_id,
+                event.client_order_id,
                 side,
                 event.fill_size,
                 event.fill_price
@@ -797,7 +913,8 @@ impl OrderTracker {
         let client_id = state
             .exchange_to_client
             .get(&event.exchange_order_id)
-            .copied();
+            .copied()
+            .or_else(|| (event.client_order_id != 0).then_some(event.client_order_id));
 
         if let Some(cid) = client_id {
             if let Some(order) = state.active_orders.get_mut(&cid) {

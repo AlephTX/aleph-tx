@@ -70,16 +70,26 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		log.Printf("lighter: subscribed to market %d", mktIdx)
 	}
 
+	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-public", c, 15*time.Second)
+	defer stopKeepalive()
+
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
 			return err
 		}
 
-// Zero-copy JSON parsing with gjson
+		// Zero-copy JSON parsing with gjson
 		result := gjson.ParseBytes(data)
 		msgType := result.Get("type").String()
 		channel := result.Get("channel").String()
+
+		if msgType == "ping" {
+			if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`)); err != nil {
+				return fmt.Errorf("write app pong: %w", err)
+			}
+			continue
+		}
 
 		isSnapshot := msgType == "subscribed/order_book"
 		isUpdate := msgType == "update/order_book"
