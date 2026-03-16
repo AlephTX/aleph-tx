@@ -31,6 +31,7 @@ use crate::types::ShmPrivateEventV2;
 const POS_SCALE: f64 = 1e8;
 const PENDING_CREATE_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 const PENDING_CANCEL_RECONCILE_GRACE: Duration = Duration::from_secs(3);
+const FILL_COMPLETION_EPS: f64 = 1e-9;
 
 // ─── Order Side ──────────────────────────────────────────────────────────────
 
@@ -794,14 +795,18 @@ impl OrderTracker {
                 // Capture remaining before updating filled_size (for atomic exposure fix)
                 let pre_fill_remaining = order.remaining_size();
 
-                order.filled_size += event.fill_size;
+                let post_fill_size = order.filled_size + event.fill_size;
+                let residual_after_fill = (order.original_size - post_fill_size).max(0.0);
+
+                order.filled_size = post_fill_size;
                 order.total_fee += event.fee_paid;
                 order.last_update = Instant::now();
                 order
                     .fills
                     .push((event.trade_id, event.fill_size, event.fill_price));
 
-                let is_final_fill = event.remaining_size < 1e-12;
+                let is_final_fill =
+                    event.remaining_size < 1e-12 && residual_after_fill <= FILL_COMPLETION_EPS;
 
                 // Phase 2: Decrement atomic exposure
                 // On final fill, drain full pre-fill remaining to avoid f64 accumulation drift
