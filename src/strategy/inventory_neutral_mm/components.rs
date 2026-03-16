@@ -385,7 +385,7 @@ pub(super) fn apply_risk_limits(
             .clamp(0.0, 1.0)
     };
     let soft_same_side_floor = round_down_to_step(
-        (risk.base_order_size * (1.0 - 0.45 * bias_progress))
+        (risk.base_order_size * (1.0 - 0.60 * bias_progress))
             .max(min_size + config.step_size)
             .max(config.step_size),
         config.step_size,
@@ -408,7 +408,12 @@ pub(super) fn apply_risk_limits(
             hard_keepalive_size
         };
         bid_size = bid_size.min(same_side_floor);
-        if !pre_urgency {
+        if pre_urgency {
+            let flatten_boost = 1.0 + 0.35 * bias_progress;
+            ask_size = (ask_size * flatten_boost)
+                .min(hard_cap)
+                .min(ask_top_headroom);
+        } else {
             ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
         }
     } else if urgency_ratio < 0.0 {
@@ -420,7 +425,12 @@ pub(super) fn apply_risk_limits(
             hard_keepalive_size
         };
         ask_size = ask_size.min(same_side_floor);
-        if !pre_urgency {
+        if pre_urgency {
+            let flatten_boost = 1.0 + 0.35 * bias_progress;
+            bid_size = (bid_size * flatten_boost)
+                .min(hard_cap)
+                .min(bid_top_headroom);
+        } else {
             bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
         }
     }
