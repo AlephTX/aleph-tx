@@ -7,8 +7,6 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
-const MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
-
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
     pub raw_available_balance: f64,
@@ -290,6 +288,7 @@ pub(super) fn reconcile_side_plan(
     threshold: f64,
     step_size: f64,
     min_lifetime: Duration,
+    max_replacements_per_cycle: usize,
 ) -> (Vec<i64>, Vec<OrderParams>) {
     let mut matched_existing = vec![false; existing_orders.len()];
     let mut to_place = Vec::new();
@@ -320,8 +319,8 @@ pub(super) fn reconcile_side_plan(
         })
         .filter_map(|(_, order)| order.order_index)
         .collect();
-    if to_cancel.len() > MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE {
-        to_cancel.truncate(MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE);
+    if to_cancel.len() > max_replacements_per_cycle {
+        to_cancel.truncate(max_replacements_per_cycle);
     }
 
     let remaining_existing = existing_orders.len().saturating_sub(to_cancel.len());

@@ -103,6 +103,7 @@ fn keeps_existing_levels_that_already_match_grid() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert!(to_cancel.is_empty());
@@ -135,6 +136,7 @@ fn ttl_prevents_fresh_orders_from_immediate_requote_cancels() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert!(to_cancel.is_empty());
@@ -163,6 +165,7 @@ fn stale_mismatched_orders_are_canceled_and_missing_levels_replaced() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert_eq!(to_cancel, vec![302]);
@@ -193,6 +196,7 @@ fn fresh_mismatched_orders_do_not_allow_side_order_count_to_balloon() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert!(to_cancel.is_empty());
@@ -222,6 +226,7 @@ fn modest_size_drift_within_tolerance_does_not_force_requote() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert!(to_cancel.is_empty());
@@ -271,6 +276,7 @@ fn pending_create_without_order_index_is_not_scheduled_for_cancel() {
         0.05,
         config.step_size,
         Duration::from_secs(config.order_ttl_secs),
+        2,
     );
 
     assert!(to_cancel.is_empty());
