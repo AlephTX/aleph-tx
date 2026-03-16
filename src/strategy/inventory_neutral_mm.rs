@@ -822,9 +822,17 @@ impl InventoryNeutralMM {
             .abs();
         let usable_balance = safe_avail * usable_balance_fraction(position_ratio, margin_usage);
 
-        let pnl = equity - self.session_start_balance;
-        let pnl_pct = if self.session_start_balance > 0.0 {
-            (pnl / self.session_start_balance) * 100.0
+        let pnl_baseline = if self.session_start_balance.is_finite()
+            && self.session_start_balance > 0.0
+            && (equity - self.session_start_balance).abs() <= equity.abs().max(1.0) * 0.5
+        {
+            self.session_start_balance
+        } else {
+            equity
+        };
+        let pnl = equity - pnl_baseline;
+        let pnl_pct = if pnl_baseline > 0.0 {
+            (pnl / pnl_baseline) * 100.0
         } else {
             0.0
         };
