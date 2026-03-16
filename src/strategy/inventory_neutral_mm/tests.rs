@@ -420,6 +420,56 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_short() {
 }
 
 #[test]
+fn risk_limits_cap_flatten_side_when_pending_sell_would_flip_past_flat() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: 0.03,
+        worst_case_long: 0.04,
+        worst_case_short: -0.08,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 4.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.01, 0.02, 2100.0);
+
+    assert!(bid_size > 0.0);
+    assert!(ask_size <= config.base_order_size + config.step_size);
+}
+
+#[test]
+fn risk_limits_cap_flatten_side_when_pending_buy_would_flip_past_flat() {
+    let config = test_config();
+    let risk = RiskSnapshot {
+        raw_available_balance: 100.0,
+        position_for_quoting: -0.03,
+        worst_case_long: 0.08,
+        worst_case_short: -0.04,
+        base_order_size: config.base_order_size,
+        max_position: config.max_position,
+        inventory_urgency_threshold: config.inventory_urgency_threshold,
+        min_available_balance: config.min_available_balance,
+        available_balance: 100.0,
+        usable_balance: 100.0,
+        margin_per_eth: 210.0,
+        grid_multiplier: 4.0,
+    };
+
+    let (bid_size, ask_size) =
+        InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.02, 0.01, 2100.0);
+
+    assert!(ask_size > 0.0);
+    assert!(bid_size <= config.base_order_size + config.step_size);
+}
+
+#[test]
 fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
     let config = test_config();
     let mid = 2100.0;
