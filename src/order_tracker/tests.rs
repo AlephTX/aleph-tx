@@ -504,6 +504,28 @@ fn test_duplicate_order_created_does_not_auto_register_or_double_exposure() {
 }
 
 #[test]
+fn effective_position_matches_locked_exposure_after_duplicate_open_events() {
+    let tracker = make_tracker();
+
+    tracker.start_tracking(6102, OrderSide::Sell, 3001.0, 0.10);
+
+    let created =
+        ShmPrivateEventV2::order_created(1, 2, 1, 6702, 6102, 6602, 3001.0, 0.10, true, 0);
+    let _ = tracker.apply_event(&created);
+
+    for seq in 2..=5 {
+        let duplicate =
+            ShmPrivateEventV2::order_created(seq, 2, 1, 6702, 6102, 6602, 3001.0, 0.10, true, 0);
+        let _ = tracker.apply_event(&duplicate);
+    }
+
+    assert!((tracker.net_pending_exposure() - tracker.net_pending_exposure_locked()).abs() < 1e-10);
+    assert!((tracker.worst_case_long() - tracker.worst_case_long_locked()).abs() < 1e-10);
+    assert!((tracker.worst_case_short() - tracker.worst_case_short_locked()).abs() < 1e-10);
+    assert!((tracker.effective_position() - (tracker.confirmed_position() + tracker.net_pending_exposure_locked())).abs() < 1e-10);
+}
+
+#[test]
 fn test_cancel_without_open_ack_falls_back_to_client_order_id() {
     let tracker = make_tracker();
 
