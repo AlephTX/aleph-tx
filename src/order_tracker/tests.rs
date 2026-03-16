@@ -475,6 +475,42 @@ fn test_duplicate_terminal_fill_without_trade_id_is_ignored() {
 }
 
 #[test]
+fn test_zero_remaining_fill_does_not_complete_until_original_size_is_reached() {
+    let tracker = make_tracker();
+
+    tracker.start_tracking(6003, OrderSide::Sell, 3005.0, 0.0156);
+
+    let created =
+        ShmPrivateEventV2::order_created(1, 2, 1, 6603, 6003, 6503, 3005.0, 0.0156, true, 0);
+    let _ = tracker.apply_event(&created);
+
+    let premature_terminal = ShmPrivateEventV2::order_filled(
+        2, 2, 1, 6603, 6003, 6503, 3005.0, 0.0111, 0.0, 0.001, true, 0, 8803,
+    );
+    let _ = tracker.apply_event(&premature_terminal);
+
+    assert_eq!(tracker.active_order_count(), 1);
+    assert!((tracker.confirmed_position() - (-0.0111)).abs() < 1e-10);
+    assert!((tracker.net_pending_exposure() - (-0.0045)).abs() < 1e-10);
+
+    {
+        let state = tracker.state.read();
+        let active = state.active_orders.get(&6003).expect("order should stay active");
+        assert_eq!(active.lifecycle, OrderLifecycle::PartiallyFilled);
+        assert!((active.remaining_size() - 0.0045).abs() < 1e-10);
+    }
+
+    let final_fill = ShmPrivateEventV2::order_filled(
+        3, 2, 1, 6603, 6003, 6503, 3005.0, 0.0045, 0.0, 0.001, true, 0, 8804,
+    );
+    let _ = tracker.apply_event(&final_fill);
+
+    assert_eq!(tracker.active_order_count(), 0);
+    assert!((tracker.confirmed_position() - (-0.0156)).abs() < 1e-8);
+    assert!((tracker.net_pending_exposure() - 0.0).abs() < 1e-10);
+}
+
+#[test]
 fn test_duplicate_order_created_does_not_auto_register_or_double_exposure() {
     let tracker = make_tracker();
 
