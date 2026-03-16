@@ -287,6 +287,7 @@ pub(super) fn reconcile_side_plan(
     desired_quotes: &[OrderParams],
     threshold: f64,
     step_size: f64,
+    size_tolerance_ratio: f64,
     min_lifetime: Duration,
     max_replacements_per_cycle: usize,
 ) -> (Vec<i64>, Vec<OrderParams>) {
@@ -299,7 +300,7 @@ pub(super) fn reconcile_side_plan(
             .enumerate()
             .filter(|(idx, _)| !matched_existing[*idx])
             .find(|(_, order)| {
-                let size_tolerance = (desired.size * 0.08).max(step_size);
+                let size_tolerance = (desired.size * size_tolerance_ratio).max(step_size);
                 (order.price - desired.price).abs() <= threshold
                     && (order.size - desired.size).abs() <= size_tolerance
             })
@@ -479,9 +480,24 @@ pub(super) fn build_execution_plan(
     config: &InventoryNeutralMMConfig,
     target: QuoteTarget,
     mid: f64,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
 ) -> ExecutionPlan {
-    let requote_threshold = (mid * config.requote_threshold_bps / 10000.0)
+    let base_threshold = (mid * config.requote_threshold_bps / 10000.0)
         .max(mid * config.grid_spacing_bps / 20000.0);
+    let full_grid_spacing = mid * config.grid_spacing_bps / 10000.0;
+    let deadband = inventory_deadband_size(
+        config,
+        base_order_size,
+        inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
+    let requote_threshold = if position_for_quoting.abs() <= deadband {
+        base_threshold.max(full_grid_spacing)
+    } else {
+        base_threshold
+    };
     ExecutionPlan {
         requote_threshold,
         target,
@@ -494,6 +510,9 @@ pub(super) fn decide_quote_cycle(
     mid: f64,
     available_balance: f64,
     position_abs: f64,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
 ) -> QuoteCycleDecision {
     let min_quotable_size = config.step_size.max(0.0);
     if target.bid_size < min_quotable_size && target.ask_size < min_quotable_size {
@@ -507,6 +526,13 @@ pub(super) fn decide_quote_cycle(
             QuoteCycleDecision::Skip
         }
     } else {
-        QuoteCycleDecision::Execute(build_execution_plan(config, target, mid))
+        QuoteCycleDecision::Execute(build_execution_plan(
+            config,
+            target,
+            mid,
+            position_for_quoting,
+            base_order_size,
+            inventory_urgency_threshold,
+        ))
     }
 }

@@ -110,6 +110,7 @@ fn keeps_existing_levels_that_already_match_grid() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -143,6 +144,7 @@ fn ttl_prevents_fresh_orders_from_immediate_requote_cancels() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -172,6 +174,7 @@ fn stale_mismatched_orders_are_canceled_and_missing_levels_replaced() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -203,6 +206,7 @@ fn fresh_mismatched_orders_do_not_allow_side_order_count_to_balloon() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -233,6 +237,7 @@ fn modest_size_drift_within_tolerance_does_not_force_requote() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -251,10 +256,40 @@ fn execution_plan_uses_at_least_half_grid_spacing_as_requote_threshold() {
         ask_size: config.base_order_size,
     };
 
-    let plan = build_execution_plan(&config, target, 2100.0);
+    let plan = build_execution_plan(
+        &config,
+        target,
+        2100.0,
+        config.inventory_urgency_threshold * 2.0,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
     let half_grid_spacing = 2100.0 * config.grid_spacing_bps / 20000.0;
 
     assert!((plan.requote_threshold - half_grid_spacing).abs() <= 1e-9);
+}
+
+#[test]
+fn execution_plan_uses_full_grid_spacing_inside_inventory_deadband() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2090.0,
+        ask_price: 2092.0,
+        bid_size: config.base_order_size,
+        ask_size: config.base_order_size,
+    };
+
+    let plan = build_execution_plan(
+        &config,
+        target,
+        2100.0,
+        config.step_size,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
+    let full_grid_spacing = 2100.0 * config.grid_spacing_bps / 10000.0;
+
+    assert!((plan.requote_threshold - full_grid_spacing).abs() <= 1e-9);
 }
 
 #[test]
@@ -283,6 +318,7 @@ fn pending_create_without_order_index_is_not_scheduled_for_cancel() {
         &desired,
         0.05,
         config.step_size,
+        0.12,
         Duration::from_secs(config.order_ttl_secs),
         2,
     );
@@ -618,6 +654,9 @@ fn scaled_but_quotable_sizes_do_not_skip_execution() {
         2091.0,
         config.min_available_balance + 1.0,
         0.0,
+        0.0,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::Execute(_)));
@@ -639,6 +678,9 @@ fn sub_step_sizes_still_skip_when_not_low_margin() {
         2091.0,
         config.min_available_balance + 1.0,
         0.0,
+        0.0,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::Skip));
@@ -852,7 +894,16 @@ fn decide_quote_cycle_requests_clear_when_low_margin_and_quotes_are_too_small() 
         ask_size: 0.0,
     };
 
-    let decision = decide_quote_cycle(&config, target, 2100.0, 1.0, 0.0);
+    let decision = decide_quote_cycle(
+        &config,
+        target,
+        2100.0,
+        1.0,
+        0.0,
+        0.0,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
 
     assert!(matches!(decision, QuoteCycleDecision::ClearForLowMargin));
 }
@@ -867,7 +918,16 @@ fn decide_quote_cycle_executes_when_at_least_one_side_is_actionable() {
         ask_size: 0.0,
     };
 
-    let decision = decide_quote_cycle(&config, target.clone(), 2100.0, 10.0, 0.0);
+    let decision = decide_quote_cycle(
+        &config,
+        target.clone(),
+        2100.0,
+        10.0,
+        0.0,
+        0.0,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
 
     match decision {
         QuoteCycleDecision::Execute(plan) => {
@@ -888,7 +948,16 @@ fn decide_quote_cycle_flattens_when_low_margin_and_position_is_not_flat() {
         ask_size: 0.0,
     };
 
-    let decision = decide_quote_cycle(&config, target, 2100.0, 1.0, 0.02);
+    let decision = decide_quote_cycle(
+        &config,
+        target,
+        2100.0,
+        1.0,
+        0.02,
+        0.02,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
 
     assert!(matches!(decision, QuoteCycleDecision::FlattenForLowMargin));
 }
