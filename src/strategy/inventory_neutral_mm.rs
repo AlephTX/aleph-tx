@@ -40,8 +40,9 @@ use components::{
 };
 use execution::{
     apply_batch_success, build_side_execution_plan, classify_batch_failure,
-    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids, should_defer_cancel_only_refresh,
-    should_defer_one_sided_requote, BatchFailureAction,
+    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
+    should_defer_cancel_only_refresh, should_defer_one_sided_requote,
+    size_tolerance_ratio_for_requote, BatchFailureAction,
 };
 use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
@@ -1222,6 +1223,9 @@ impl InventoryNeutralMM {
             mid,
             safe_available,
             residual_exposure,
+            risk.position_for_quoting,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold,
         );
 
         let plan = match decision {
@@ -1263,6 +1267,13 @@ impl InventoryNeutralMM {
             risk.inventory_urgency_threshold,
             mid,
         );
+        let size_tolerance_ratio = size_tolerance_ratio_for_requote(
+            &self.config,
+            risk.position_for_quoting,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
+        );
 
         let bid_plan = build_side_execution_plan(
             &runtime_config,
@@ -1272,6 +1283,7 @@ impl InventoryNeutralMM {
             plan.target.bid_price,
             plan.target.bid_size,
             plan.requote_threshold,
+            size_tolerance_ratio,
             max_side_replacements,
         );
         let ask_plan = build_side_execution_plan(
@@ -1282,6 +1294,7 @@ impl InventoryNeutralMM {
             plan.target.ask_price,
             plan.target.ask_size,
             plan.requote_threshold,
+            size_tolerance_ratio,
             max_side_replacements,
         );
 
@@ -1415,6 +1428,7 @@ impl InventoryNeutralMM {
         desired_quotes: &[crate::exchange::OrderParams],
         threshold: f64,
         step_size: f64,
+        size_tolerance_ratio: f64,
         min_lifetime: Duration,
         max_replacements_per_cycle: usize,
     ) -> (Vec<i64>, Vec<crate::exchange::OrderParams>) {
@@ -1423,6 +1437,7 @@ impl InventoryNeutralMM {
             desired_quotes,
             threshold,
             step_size,
+            size_tolerance_ratio,
             min_lifetime,
             max_replacements_per_cycle,
         )

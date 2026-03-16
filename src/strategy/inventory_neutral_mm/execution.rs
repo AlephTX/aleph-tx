@@ -12,6 +12,8 @@ use std::time::Duration;
 
 const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
 const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
+const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
+const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
 
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
@@ -61,6 +63,7 @@ pub(super) fn build_side_execution_plan(
     target_px: f64,
     total_sz: f64,
     threshold: f64,
+    size_tolerance_ratio: f64,
     max_replacements_per_cycle: usize,
 ) -> SideExecutionPlan {
     let order_side = match side {
@@ -104,11 +107,32 @@ pub(super) fn build_side_execution_plan(
         &desired_quotes,
         threshold,
         config.step_size,
+        size_tolerance_ratio,
         min_lifetime,
         max_replacements_per_cycle,
     );
 
     SideExecutionPlan { to_cancel, to_place }
+}
+
+pub(super) fn size_tolerance_ratio_for_requote(
+    config: &InventoryNeutralMMConfig,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
+) -> f64 {
+    let deadband = inventory_deadband_size(
+        config,
+        base_order_size,
+        inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
+    if position_for_quoting.abs() <= deadband {
+        CALM_SIZE_TOLERANCE_RATIO
+    } else {
+        ACTIVE_SIZE_TOLERANCE_RATIO
+    }
 }
 
 pub(super) fn max_side_requote_replacements_per_cycle(
@@ -265,6 +289,7 @@ mod tests {
             2100.0,
             config.base_order_size,
             0.05,
+            ACTIVE_SIZE_TOLERANCE_RATIO,
             2,
         );
 
@@ -289,6 +314,7 @@ mod tests {
             2100.0,
             config.base_order_size,
             0.05,
+            ACTIVE_SIZE_TOLERANCE_RATIO,
             2,
         );
 
@@ -316,6 +342,7 @@ mod tests {
             2100.0,
             0.015,
             0.05,
+            ACTIVE_SIZE_TOLERANCE_RATIO,
             1,
         );
 
@@ -340,6 +367,7 @@ mod tests {
             2100.0,
             0.0,
             0.05,
+            ACTIVE_SIZE_TOLERANCE_RATIO,
             2,
         );
 
@@ -359,6 +387,7 @@ mod tests {
             2100.0,
             0.0102,
             0.05,
+            ACTIVE_SIZE_TOLERANCE_RATIO,
             2,
         );
 
@@ -393,6 +422,29 @@ mod tests {
 
         assert_eq!(total_orders_placed, 2);
         assert_eq!(telemetry.orders_placed, 2);
+    }
+
+    #[test]
+    fn calm_inventory_uses_wider_size_tolerance() {
+        let config = config();
+        let calm_ratio = size_tolerance_ratio_for_requote(
+            &config,
+            config.step_size,
+            config.base_order_size,
+            config.inventory_urgency_threshold,
+            2100.0,
+        );
+        let active_ratio = size_tolerance_ratio_for_requote(
+            &config,
+            config.inventory_urgency_threshold,
+            config.base_order_size,
+            config.inventory_urgency_threshold,
+            2100.0,
+        );
+
+        assert!(calm_ratio > active_ratio);
+        assert!((calm_ratio - CALM_SIZE_TOLERANCE_RATIO).abs() < 1e-9);
+        assert!((active_ratio - ACTIVE_SIZE_TOLERANCE_RATIO).abs() < 1e-9);
     }
 
     #[test]
