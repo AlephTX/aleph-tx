@@ -114,6 +114,10 @@ type lighterTrade struct {
 	MakerFee    int    `json:"maker_fee,omitempty"`
 }
 
+func lighterFeePaid(ratePPM float64, fillPrice float64, fillSize float64) float64 {
+	return ratePPM / 1_000_000.0 * fillPrice * fillSize
+}
+
 func (lp *LighterPrivate) Run(ctx context.Context) error {
 	return RunConnectionLoop(ctx, "lighter-private", lp.connect)
 }
@@ -249,27 +253,31 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 	status := order.Get("status").String()
 	price := order.Get("price").Float()
 	initialSize := order.Get("initial_base_amount").Float()
+	remainingSize := order.Get("remaining_base_amount").Float()
 	isAsk := order.Get("is_ask").Bool()
 	timestampNs := uint64(time.Now().UnixNano())
 
-	log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
-		orderID, clientOrderIndex, status, marketIndex)
-
 	switch status {
 	case "open":
-		if detail, ok := lp.orderDetails[orderID]; ok {
-			if detail.clientOrderIndex == clientOrderIndex &&
-				detail.orderIndex == orderIndex &&
-				detail.price == price &&
-				detail.initialSize == initialSize &&
-				detail.isAsk == isAsk {
-				if prevRemaining, ok := lp.orderSizes[orderID]; ok && prevRemaining == initialSize {
-					return
-				}
+		if detail, ok := lp.orderDetails[orderID]; ok &&
+			detail.clientOrderIndex == clientOrderIndex &&
+			detail.orderIndex == orderIndex &&
+			detail.price == price &&
+			detail.initialSize == initialSize &&
+			detail.isAsk == isAsk {
+			if remainingSize > 0 {
+				lp.orderSizes[orderID] = remainingSize
 			}
+			return
 		}
+		log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
+			orderID, clientOrderIndex, status, marketIndex)
 		// Order created — track remaining size + details for V2
-		lp.orderSizes[orderID] = initialSize
+		if remainingSize > 0 {
+			lp.orderSizes[orderID] = remainingSize
+		} else {
+			lp.orderSizes[orderID] = initialSize
+		}
 		lp.orderDetails[orderID] = orderDetail{
 			clientOrderIndex: clientOrderIndex,
 			orderIndex:       orderIndex,
@@ -290,10 +298,14 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 		)
 
 	case "canceled", "canceled-post-only":
+		log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
+			orderID, clientOrderIndex, status, marketIndex)
 		// Order canceled — clean up tracking
-		remainingSize := 0.0
-		if prev, ok := lp.orderSizes[orderID]; ok {
-			remainingSize = prev
+		cancelRemaining := remainingSize
+		if cancelRemaining == 0.0 {
+			if prev, ok := lp.orderSizes[orderID]; ok {
+				cancelRemaining = prev
+			}
 		}
 		coi := clientOrderIndex
 		oi := int64(orderIndex)
@@ -309,11 +321,13 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 			orderID,
 			coi,
 			oi,
-			remainingSize,
+			cancelRemaining,
 			timestampNs,
 		)
 
 	case "filled":
+		log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
+			orderID, clientOrderIndex, status, marketIndex)
 		// Some immediate fills arrive without a prior "open" event. Seed local
 		// tracking from the filled order payload so the following trade event can
 		// still bind to the correct client_order_index.
@@ -385,9 +399,9 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	// Calculate fee (Lighter uses basis points)
 	var feePaid float64
 	if isMakerAsk {
-		feePaid = trade.Get("maker_fee").Float() / 10000.0 * fillPrice * fillSize
+		feePaid = lighterFeePaid(trade.Get("maker_fee").Float(), fillPrice, fillSize)
 	} else {
-		feePaid = trade.Get("taker_fee").Float() / 10000.0 * fillPrice * fillSize
+		feePaid = lighterFeePaid(trade.Get("taker_fee").Float(), fillPrice, fillSize)
 	}
 
 	// Calculate remaining size from order tracking
