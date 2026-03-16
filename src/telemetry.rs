@@ -32,6 +32,10 @@ pub struct TelemetryCollector {
     pub portfolio_value: f64,
     /// Position used by the strategy for quoting decisions
     pub quote_position: f64,
+    /// Tracker confirmed position from fills only
+    pub tracker_confirmed_position: f64,
+    /// Net pending exposure from all live tracker orders
+    pub tracker_pending_exposure: f64,
     /// Tracker effective position including pending exposure
     pub tracker_effective_position: f64,
     /// Worst-case long exposure
@@ -66,6 +70,8 @@ impl TelemetryCollector {
             raw_available_balance: 0.0,
             portfolio_value: 0.0,
             quote_position: 0.0,
+            tracker_confirmed_position: 0.0,
+            tracker_pending_exposure: 0.0,
             tracker_effective_position: 0.0,
             worst_case_long: 0.0,
             worst_case_short: 0.0,
@@ -149,6 +155,8 @@ impl TelemetryCollector {
             raw_available_balance = format!("{:.2}", self.raw_available_balance).as_str(),
             portfolio_value = format!("{:.2}", self.portfolio_value).as_str(),
             quote_position = format!("{:.4}", self.quote_position).as_str(),
+            tracker_confirmed_position = format!("{:.4}", self.tracker_confirmed_position).as_str(),
+            tracker_pending_exposure = format!("{:.4}", self.tracker_pending_exposure).as_str(),
             tracker_effective_position = format!("{:.4}", self.tracker_effective_position).as_str(),
             worst_case_long = format!("{:.4}", self.worst_case_long).as_str(),
             worst_case_short = format!("{:.4}", self.worst_case_short).as_str(),

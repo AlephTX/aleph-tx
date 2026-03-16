@@ -811,6 +811,8 @@ impl InventoryNeutralMM {
             margin_usage,
             self.config.max_leverage,
         );
+        let tracker_confirmed_position = self.order_tracker.confirmed_position();
+        let tracker_pending_exposure = self.order_tracker.net_pending_exposure();
         let tracker_effective_position = self.order_tracker.effective_position();
         let quote_position = risk.position_for_quoting;
         let worst_case_long = self.order_tracker.worst_case_long();
@@ -828,7 +830,7 @@ impl InventoryNeutralMM {
         };
 
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Quote/Tracker): {:.4}/{:.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Quote/TrkConf/Pend/Eff): {:.4}/{:.4}/{:.4}/{:+.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
             pnl,
             pnl_pct,
             equity,
@@ -838,6 +840,8 @@ impl InventoryNeutralMM {
             margin_usage * 100.0,
             self.account_stats.position,
             quote_position,
+            tracker_confirmed_position,
+            tracker_pending_exposure,
             tracker_effective_position,
             worst_case_long,
             worst_case_short,
@@ -955,6 +959,8 @@ impl InventoryNeutralMM {
                 &risk,
                 fill_count,
                 total_fees,
+                self.order_tracker.confirmed_position(),
+                self.order_tracker.net_pending_exposure(),
                 self.order_tracker.effective_position(),
             );
             self.telemetry.export_metrics();

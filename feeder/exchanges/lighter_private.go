@@ -259,14 +259,18 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 
 	switch status {
 	case "open":
-		if detail, ok := lp.orderDetails[orderID]; ok &&
-			detail.clientOrderIndex == clientOrderIndex &&
-			detail.orderIndex == orderIndex &&
-			detail.price == price &&
-			detail.initialSize == initialSize &&
-			detail.isAsk == isAsk {
+		if detail, ok := lp.orderDetails[orderID]; ok {
 			if remainingSize > 0 {
 				lp.orderSizes[orderID] = remainingSize
+			} else if initialSize > 0 {
+				lp.orderSizes[orderID] = initialSize
+			}
+			lp.orderDetails[orderID] = orderDetail{
+				clientOrderIndex: detail.clientOrderIndex,
+				orderIndex:       detail.orderIndex,
+				price:            price,
+				initialSize:      initialSize,
+				isAsk:            isAsk,
 			}
 			return
 		}

@@ -14,6 +14,8 @@ pub(super) fn sync_telemetry_snapshot(
     risk: &RiskSnapshot,
     fill_count: u64,
     total_fees: f64,
+    tracker_confirmed_position: f64,
+    tracker_pending_exposure: f64,
     tracker_effective_position: f64,
 ) {
     telemetry.fill_count = fill_count;
@@ -22,6 +24,8 @@ pub(super) fn sync_telemetry_snapshot(
     telemetry.available_balance = risk.available_balance;
     telemetry.portfolio_value = account_stats.portfolio_value;
     telemetry.quote_position = risk.position_for_quoting;
+    telemetry.tracker_confirmed_position = tracker_confirmed_position;
+    telemetry.tracker_pending_exposure = tracker_pending_exposure;
     telemetry.tracker_effective_position = tracker_effective_position;
     telemetry.worst_case_long = risk.worst_case_long;
     telemetry.worst_case_short = risk.worst_case_short;
@@ -67,7 +71,7 @@ mod tests {
             grid_multiplier: 2.0,
         };
 
-        sync_telemetry_snapshot(&mut telemetry, &account_stats, &risk, 12, 1.25, -0.02);
+        sync_telemetry_snapshot(&mut telemetry, &account_stats, &risk, 12, 1.25, 0.01, -0.03, -0.02);
 
         assert_eq!(telemetry.fill_count, 12);
         assert_eq!(telemetry.total_fees_paid, 1.25);
@@ -75,6 +79,8 @@ mod tests {
         assert_eq!(telemetry.available_balance, 70.0);
         assert_eq!(telemetry.portfolio_value, 120.0);
         assert_eq!(telemetry.quote_position, 0.0);
+        assert_eq!(telemetry.tracker_confirmed_position, 0.01);
+        assert_eq!(telemetry.tracker_pending_exposure, -0.03);
         assert_eq!(telemetry.tracker_effective_position, -0.02);
         assert_eq!(telemetry.worst_case_long, 0.15);
         assert_eq!(telemetry.worst_case_short, -0.14);
