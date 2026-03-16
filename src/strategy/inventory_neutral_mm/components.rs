@@ -55,9 +55,7 @@ pub(super) fn round_up_to_step(value: f64, step: f64) -> f64 {
 }
 
 pub(super) fn min_quotable_size(config: &InventoryNeutralMMConfig, price: f64) -> f64 {
-    round_up_to_step(11.0 / price.max(config.tick_size), config.step_size)
-        .max(config.step_size)
-        + config.step_size
+    round_up_to_step(11.2 / price.max(config.tick_size), config.step_size).max(config.step_size)
 }
 
 pub(super) fn safe_available_balance(
