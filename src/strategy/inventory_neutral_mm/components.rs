@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
+const MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
 
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
@@ -310,7 +311,7 @@ pub(super) fn reconcile_side_plan(
         }
     }
 
-    let to_cancel: Vec<i64> = existing_orders
+    let mut to_cancel: Vec<i64> = existing_orders
         .iter()
         .enumerate()
         .filter(|(idx, order)| !matched_existing[*idx] && order.placed_at.elapsed() >= min_lifetime)
@@ -319,6 +320,9 @@ pub(super) fn reconcile_side_plan(
         })
         .filter_map(|(_, order)| order.order_index)
         .collect();
+    if to_cancel.len() > MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE {
+        to_cancel.truncate(MAX_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE);
+    }
 
     let remaining_existing = existing_orders.len().saturating_sub(to_cancel.len());
     let placement_capacity = desired_quotes.len().saturating_sub(remaining_existing);

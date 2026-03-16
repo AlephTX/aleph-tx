@@ -264,6 +264,31 @@ mod tests {
     }
 
     #[test]
+    fn planner_caps_side_requote_replacements_per_cycle() {
+        let config = config();
+        let active_orders = vec![
+            active_order(1, 101, OrderSide::Buy, 2090.0, 0.015, 30),
+            active_order(2, 102, OrderSide::Buy, 2089.0, 0.012, 30),
+            active_order(3, 103, OrderSide::Buy, 2088.0, 0.010, 30),
+            active_order(4, 104, OrderSide::Buy, 2087.0, 0.008, 30),
+            active_order(5, 105, OrderSide::Buy, 2086.0, 0.006, 30),
+        ];
+
+        let plan = build_side_execution_plan(
+            &config,
+            &active_orders,
+            OrderType::PostOnly,
+            Side::Buy,
+            2100.0,
+            0.015,
+            0.05,
+        );
+
+        assert_eq!(plan.to_cancel.len(), 2);
+        assert_eq!(plan.to_place.len(), 2);
+    }
+
+    #[test]
     fn planner_cancels_existing_side_orders_when_target_side_is_disabled() {
         let config = config();
         let active_orders = vec![
