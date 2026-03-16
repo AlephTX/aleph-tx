@@ -407,6 +407,11 @@ pub(super) fn apply_risk_limits(
             .max(min_size + config.step_size),
         config.step_size,
     );
+    let flatten_overshoot_allowance = inventory_deadband
+        .max(risk.base_order_size * 0.75)
+        .min(urgency_threshold);
+    let current_pending_buy = (risk.worst_case_long - risk.position_for_quoting).max(0.0);
+    let current_pending_sell = (risk.position_for_quoting - risk.worst_case_short).max(0.0);
     if risk.position_for_quoting.abs() <= inventory_deadband {
         bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
         ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
@@ -427,6 +432,11 @@ pub(super) fn apply_risk_limits(
         } else {
             ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
         }
+        let severe_sell_overshoot_limit =
+            risk.position_for_quoting + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
+        if current_pending_sell > severe_sell_overshoot_limit {
+            ask_size = ask_size.min(risk.base_order_size);
+        }
     } else if urgency_ratio < 0.0 {
         // Short inventory: bias toward bids. Stay near-symmetric until urgency, then fall back to keepalive.
         let pre_urgency = bias_progress < 1.0;
@@ -443,6 +453,11 @@ pub(super) fn apply_risk_limits(
                 .min(bid_top_headroom);
         } else {
             bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
+        }
+        let severe_buy_overshoot_limit =
+            risk.position_for_quoting.abs() + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
+        if current_pending_buy > severe_buy_overshoot_limit {
+            bid_size = bid_size.min(risk.base_order_size);
         }
     }
 

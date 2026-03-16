@@ -62,6 +62,10 @@ clean-shm:
 define exchange_up
 	@echo "$(BLUE)🚀 Starting $(1) - Strategy: $(STRATEGY)$(NC)"
 	@mkdir -p $(LOG_DIR) $(PID_DIR)
+	@# Clean up stale same-exchange processes before starting a fresh session
+	@pgrep -f '(^|/)$(STRATEGY)($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)$(STRATEGY)($$| )' || true
+	@pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)feeder-app($$| )' || true
+	@rm -f $(PID_DIR)/$(1)-$(STRATEGY).pid $(PID_DIR)/feeder-$(1).pid
 	@make clean-shm
 	@# Start Feeder
 	@set -a; . ./$(2); set +a; \
@@ -119,8 +123,8 @@ define exchange_down
 		rm -f $(PID_DIR)/feeder-$(1).pid; \
 	fi
 	@# Kill orphaned processes left behind by failed starts or stale pid files
-	@pgrep -x $(STRATEGY) >/dev/null 2>&1 && pkill -9 -x $(STRATEGY) || true
-	@pgrep -x feeder-app >/dev/null 2>&1 && pkill -9 -x feeder-app || true
+	@pgrep -f '(^|/)$(STRATEGY)($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)$(STRATEGY)($$| )' || true
+	@pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)feeder-app($$| )' || true
 	@make clean-shm
 	@echo "$(GREEN)✅ $(1) clean stop complete$(NC)"
 endef
