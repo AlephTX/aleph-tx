@@ -1,5 +1,8 @@
 use super::ActiveOrder;
-use super::components::{build_grid_plan, inventory_deadband_size, reconcile_side_plan, FLOAT_EPSILON};
+use super::components::{
+    build_grid_plan, inventory_deadband_size, min_quotable_size, reconcile_side_plan,
+    FLOAT_EPSILON,
+};
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::TradingError;
 use crate::exchange::{BatchResult, OrderParams, OrderType, Side};
@@ -66,8 +69,8 @@ pub(super) fn build_side_execution_plan(
         .cloned()
         .collect();
 
-    let min_quotable_size = (11.0 / target_px.max(config.tick_size)).max(config.step_size);
-    if total_sz + FLOAT_EPSILON < min_quotable_size {
+    let min_size = min_quotable_size(config, target_px);
+    if total_sz + FLOAT_EPSILON < min_size {
         let min_lifetime = Duration::from_secs(config.order_ttl_secs.max(1));
         return SideExecutionPlan {
             to_cancel: side_orders

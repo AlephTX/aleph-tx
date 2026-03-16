@@ -50,6 +50,16 @@ pub(super) fn round_down_to_step(value: f64, step: f64) -> f64 {
     (((value / step) + FLOAT_EPSILON).floor()) * step
 }
 
+pub(super) fn round_up_to_step(value: f64, step: f64) -> f64 {
+    (((value / step) - FLOAT_EPSILON).ceil()) * step
+}
+
+pub(super) fn min_quotable_size(config: &InventoryNeutralMMConfig, price: f64) -> f64 {
+    round_up_to_step(11.0 / price.max(config.tick_size), config.step_size)
+        .max(config.step_size)
+        + config.step_size
+}
+
 pub(super) fn safe_available_balance(
     available_balance: f64,
     portfolio_value: f64,
@@ -241,7 +251,7 @@ pub(super) fn build_grid_plan(
     start_px: f64,
     top_level_sz: f64,
 ) -> Vec<OrderParams> {
-    let min_level_size = (11.0 / start_px.max(config.tick_size)).max(config.step_size);
+    let min_level_size = min_quotable_size(config, start_px);
     if top_level_sz + FLOAT_EPSILON < min_level_size {
         return Vec::new();
     }
@@ -328,7 +338,7 @@ pub(super) fn apply_risk_limits(
     desired_ask_size: f64,
     mid: f64,
 ) -> (f64, f64) {
-    let min_size = 11.0 / mid;
+    let min_size = min_quotable_size(config, mid);
     let grid_multiplier = risk.grid_multiplier.max(1.0);
 
     let bid_headroom = (risk.max_position - risk.worst_case_long).max(0.0);
