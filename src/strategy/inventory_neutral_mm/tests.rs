@@ -75,7 +75,15 @@ fn min_quotable_size_rounds_up_to_safe_step_boundary() {
     let config = test_config();
     let min_size = min_quotable_size(&config, 2254.57);
 
-    assert_eq!(min_size, 0.0050);
+    assert!((min_size - 0.0052).abs() < 1e-10);
+}
+
+#[test]
+fn min_quotable_size_stays_above_recent_lighter_reject_edge_case() {
+    let config = test_config();
+    let min_size = min_quotable_size(&config, 2290.62);
+
+    assert!((min_size - 0.0051).abs() < 1e-10);
 }
 
 #[test]
