@@ -40,7 +40,7 @@ use components::{
 };
 use execution::{
     apply_batch_success, build_side_execution_plan, classify_batch_failure,
-    resolve_cancel_client_order_ids, should_defer_cancel_only_refresh,
+    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids, should_defer_cancel_only_refresh,
     should_defer_one_sided_requote, BatchFailureAction,
 };
 use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
@@ -1242,6 +1242,14 @@ impl InventoryNeutralMM {
             QuoteCycleDecision::Execute(plan) => plan,
         };
 
+        let max_side_replacements = max_side_requote_replacements_per_cycle(
+            &self.config,
+            risk.position_for_quoting,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
+        );
+
         let bid_plan = build_side_execution_plan(
             &runtime_config,
             &self.active_orders,
@@ -1250,6 +1258,7 @@ impl InventoryNeutralMM {
             plan.target.bid_price,
             plan.target.bid_size,
             plan.requote_threshold,
+            max_side_replacements,
         );
         let ask_plan = build_side_execution_plan(
             &runtime_config,
@@ -1259,6 +1268,7 @@ impl InventoryNeutralMM {
             plan.target.ask_price,
             plan.target.ask_size,
             plan.requote_threshold,
+            max_side_replacements,
         );
 
         if should_defer_one_sided_requote(
@@ -1392,6 +1402,7 @@ impl InventoryNeutralMM {
         threshold: f64,
         step_size: f64,
         min_lifetime: Duration,
+        max_replacements_per_cycle: usize,
     ) -> (Vec<i64>, Vec<crate::exchange::OrderParams>) {
         components::reconcile_side_plan(
             existing_orders,
@@ -1399,6 +1410,7 @@ impl InventoryNeutralMM {
             threshold,
             step_size,
             min_lifetime,
+            max_replacements_per_cycle,
         )
     }
 

@@ -10,6 +10,9 @@ use crate::order_tracker::{OrderLifecycle, OrderSide};
 use crate::telemetry::TelemetryCollector;
 use std::time::Duration;
 
+const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
+const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
+
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
     pub to_cancel: Vec<i64>,
@@ -58,6 +61,7 @@ pub(super) fn build_side_execution_plan(
     target_px: f64,
     total_sz: f64,
     threshold: f64,
+    max_replacements_per_cycle: usize,
 ) -> SideExecutionPlan {
     let order_side = match side {
         Side::Buy => OrderSide::Buy,
@@ -101,9 +105,37 @@ pub(super) fn build_side_execution_plan(
         threshold,
         config.step_size,
         min_lifetime,
+        max_replacements_per_cycle,
     );
 
     SideExecutionPlan { to_cancel, to_place }
+}
+
+pub(super) fn max_side_requote_replacements_per_cycle(
+    config: &InventoryNeutralMMConfig,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
+) -> usize {
+    let deadband = inventory_deadband_size(
+        config,
+        base_order_size,
+        inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
+    if position_for_quoting.abs() <= deadband {
+        return CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE;
+    }
+
+    let urgency = inventory_urgency_threshold.max(config.step_size);
+    let bias_progress = ((position_for_quoting.abs() - deadband) / (urgency - deadband).max(config.step_size))
+        .clamp(0.0, 1.0);
+    if bias_progress < 0.5 {
+        CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE
+    } else {
+        URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE
+    }
 }
 
 pub(super) fn resolve_cancel_client_order_ids(
@@ -233,6 +265,7 @@ mod tests {
             2100.0,
             config.base_order_size,
             0.05,
+            2,
         );
 
         assert_eq!(plan.to_cancel.len(), 0);
@@ -256,6 +289,7 @@ mod tests {
             2100.0,
             config.base_order_size,
             0.05,
+            2,
         );
 
         assert_eq!(plan.to_cancel, vec![102]);
@@ -282,10 +316,11 @@ mod tests {
             2100.0,
             0.015,
             0.05,
+            1,
         );
 
-        assert_eq!(plan.to_cancel.len(), 2);
-        assert_eq!(plan.to_place.len(), 2);
+        assert_eq!(plan.to_cancel.len(), 1);
+        assert_eq!(plan.to_place.len(), 1);
     }
 
     #[test]
@@ -305,6 +340,7 @@ mod tests {
             2100.0,
             0.0,
             0.05,
+            2,
         );
 
         assert_eq!(plan.to_cancel, vec![101, 102]);
@@ -323,6 +359,7 @@ mod tests {
             2100.0,
             0.0102,
             0.05,
+            2,
         );
 
         assert!(plan.to_cancel.is_empty());
@@ -500,5 +537,23 @@ mod tests {
         assert!(!should_defer_cancel_only_refresh(
             &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
         ));
+    }
+
+    #[test]
+    fn calm_inventory_uses_one_side_replacement_per_cycle() {
+        let config = config();
+        assert_eq!(
+            max_side_requote_replacements_per_cycle(&config, 0.0, 0.015, 0.08, 2100.0),
+            1
+        );
+    }
+
+    #[test]
+    fn urgent_inventory_uses_two_side_replacements_per_cycle() {
+        let config = config();
+        assert_eq!(
+            max_side_requote_replacements_per_cycle(&config, 0.08, 0.015, 0.08, 2100.0),
+            2
+        );
     }
 }
