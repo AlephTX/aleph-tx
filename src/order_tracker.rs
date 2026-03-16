@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 use crate::types::ShmPrivateEventV2;
 
 const POS_SCALE: f64 = 1e8;
+const PENDING_CREATE_RECONCILE_GRACE: Duration = Duration::from_secs(3);
+const PENDING_CANCEL_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 
 // ─── Order Side ──────────────────────────────────────────────────────────────
 
@@ -521,28 +523,67 @@ impl OrderTracker {
 
         let mut state = self.state.write();
         let mut stale_ids = Vec::new();
+        let mut exchange_bindings = Vec::new();
+        let now = Instant::now();
 
-        // 1. Identify tracker orders not present on exchange
-        for (coi, order) in &state.active_orders {
-            if order.lifecycle == OrderLifecycle::Open {
-                let found = open_orders.iter().any(|oo| {
-                    if let Some(exch_id) = order.exchange_order_id {
-                        oo.order_id == exch_id.to_string()
-                    } else {
-                        false
-                    }
-                });
-
-                if !found {
-                    stale_ids.push(*coi);
+        for (coi, order) in &mut state.active_orders {
+            let matched_open = open_orders.iter().find(|oo| {
+                if oo.client_order_index == *coi {
+                    return true;
                 }
+                order
+                    .exchange_order_id
+                    .map(|exch_id| oo.order_id == exch_id.to_string())
+                    .unwrap_or(false)
+            });
+
+            match (order.lifecycle, matched_open) {
+                (OrderLifecycle::PendingCreate, Some(oo)) => {
+                    order.lifecycle = OrderLifecycle::Open;
+                    order.last_update = now;
+                    if order.exchange_order_id.is_none()
+                        && let Ok(exchange_order_id) = oo.order_id.parse::<u64>()
+                    {
+                        order.exchange_order_id = Some(exchange_order_id);
+                        exchange_bindings.push((exchange_order_id, *coi));
+                    }
+                }
+                (OrderLifecycle::PendingCreate, None) => {
+                    if order.created_at.elapsed() >= PENDING_CREATE_RECONCILE_GRACE {
+                        stale_ids.push((*coi, OrderLifecycle::Rejected));
+                    }
+                }
+                (OrderLifecycle::PendingCancel, Some(_)) => {
+                    if order.last_update.elapsed() >= PENDING_CANCEL_RECONCILE_GRACE {
+                        order.lifecycle = if order.filled_size > 1e-12 {
+                            OrderLifecycle::PartiallyFilled
+                        } else {
+                            OrderLifecycle::Open
+                        };
+                        order.last_update = now;
+                    }
+                }
+                (
+                    OrderLifecycle::Open
+                    | OrderLifecycle::PartiallyFilled
+                    | OrderLifecycle::PendingCancel,
+                    None,
+                ) => {
+                    stale_ids.push((*coi, OrderLifecycle::Canceled));
+                }
+                _ => {}
             }
         }
 
+        for (exchange_order_id, client_order_id) in exchange_bindings {
+            state
+                .exchange_to_client
+                .insert(exchange_order_id, client_order_id);
+        }
+
         let count = stale_ids.len();
-        for coi in stale_ids {
+        for (coi, lifecycle) in stale_ids {
             if let Some(mut order) = state.active_orders.remove(&coi) {
-                // Phase 2: Decrement atomic exposure
                 if order.lifecycle.has_pending_exposure() {
                     let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
                     match order.side {
@@ -556,8 +597,11 @@ impl OrderTracker {
                         }
                     }
                 }
-                order.lifecycle = OrderLifecycle::Canceled; // Assumed canceled else we'd have a fill
-                order.last_update = Instant::now();
+                if let Some(exchange_order_id) = order.exchange_order_id {
+                    state.exchange_to_client.remove(&exchange_order_id);
+                }
+                order.lifecycle = lifecycle;
+                order.last_update = now;
                 state.completed_orders.insert(coi, order);
             }
         }

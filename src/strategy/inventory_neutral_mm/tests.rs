@@ -472,8 +472,9 @@ fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
     let (bid_size, ask_size) =
         InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, mid);
 
-    assert!(bid_size >= config.base_order_size - config.step_size);
+    assert!(bid_size > config.base_order_size);
     assert!(ask_size >= config.base_order_size * 0.5);
+    assert!(bid_size > ask_size);
 }
 
 #[test]
@@ -524,6 +525,8 @@ fn moderate_inventory_below_urgency_threshold_keeps_same_side_non_zero() {
 
     assert!(bid_size > ask_size);
     assert!(ask_size > config.step_size);
+    assert!(bid_size >= config.base_order_size * 1.15);
+    assert!(ask_size <= config.base_order_size * 0.85);
 }
 
 #[test]

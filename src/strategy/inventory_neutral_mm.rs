@@ -570,7 +570,7 @@ impl InventoryNeutralMM {
         if position.abs() <= inventory_deadband {
             let deadband_ratio = (position.abs() / inventory_deadband.max(config.step_size))
                 .clamp(0.0, 1.0);
-            let deadband_skew = risk.base_order_size * 0.20 * deadband_ratio;
+            let deadband_skew = risk.base_order_size * 0.30 * deadband_ratio;
             let (bid_size, ask_size) = if position > 0.0 {
                 (
                     (risk.base_order_size - deadband_skew).max(0.0),
@@ -609,7 +609,7 @@ impl InventoryNeutralMM {
         let max_offset = risk.base_order_size * (config.flattening_cap_mult - 1.0).max(0.5);
         let effective_position = (position.abs() - inventory_deadband).max(0.0);
         let raw_inventory_offset = effective_position * sigmoid_multiplier;
-        let max_pre_urgency_offset = risk.base_order_size * 0.45 * skew_progress;
+        let max_pre_urgency_offset = risk.base_order_size * 0.70 * skew_progress;
         let inventory_offset = if position.abs() < urgency_threshold {
             raw_inventory_offset.min(max_pre_urgency_offset)
         } else {

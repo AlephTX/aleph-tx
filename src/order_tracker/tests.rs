@@ -583,3 +583,96 @@ async fn test_reconcile_with_exchange_propagates_exchange_errors() {
     assert_eq!(tracker.active_order_count(), 1);
     assert!((tracker.worst_case_long() - 0.05).abs() < 1e-10);
 }
+
+#[tokio::test]
+async fn test_reconcile_with_exchange_removes_stale_pending_create_orders() {
+    let tracker = make_tracker();
+    tracker.start_tracking(8101, OrderSide::Buy, 3000.0, 0.05);
+
+    {
+        let mut state = tracker.state.write();
+        let order = state
+            .active_orders
+            .get_mut(&8101)
+            .expect("pending create should exist");
+        order.created_at = std::time::Instant::now() - Duration::from_secs(5);
+        order.last_update = order.created_at;
+    }
+
+    let exchange = MockExchange {
+        active_orders: Ok(vec![]),
+    };
+
+    let stale_count = tracker.reconcile_with_exchange(&exchange).await.unwrap();
+
+    assert_eq!(stale_count, 1);
+    assert_eq!(tracker.active_order_count(), 0);
+    assert!((tracker.net_pending_exposure() - 0.0).abs() < 1e-10);
+
+    let state = tracker.state.read();
+    let completed = state
+        .completed_orders
+        .get(&8101)
+        .expect("stale pending-create order should move to completed");
+    assert_eq!(completed.lifecycle, OrderLifecycle::Rejected);
+}
+
+#[tokio::test]
+async fn test_reconcile_with_exchange_rebinds_pending_create_and_reverts_stuck_pending_cancel() {
+    let tracker = make_tracker();
+    tracker.start_tracking(8201, OrderSide::Buy, 3000.0, 0.05);
+    tracker.start_tracking(8202, OrderSide::Sell, 3010.0, 0.04);
+
+    let created =
+        ShmPrivateEventV2::order_created(1, 2, 1, 9822, 8202, 7202, 3010.0, 0.04, true, 0);
+    let _ = tracker.apply_event(&created);
+    tracker.mark_pending_cancel(8202);
+
+    {
+        let mut state = tracker.state.write();
+        let order = state
+            .active_orders
+            .get_mut(&8202)
+            .expect("pending cancel should exist");
+        order.last_update = std::time::Instant::now() - Duration::from_secs(5);
+    }
+
+    let exchange = MockExchange {
+        active_orders: Ok(vec![
+            OrderInfo {
+                order_id: "9821".to_string(),
+                client_order_index: 8201,
+                side: Side::Buy,
+                price: 3000.0,
+                size: 0.05,
+                filled: 0.0,
+            },
+            OrderInfo {
+                order_id: "9822".to_string(),
+                client_order_index: 8202,
+                side: Side::Sell,
+                price: 3010.0,
+                size: 0.04,
+                filled: 0.0,
+            },
+        ]),
+    };
+
+    let stale_count = tracker.reconcile_with_exchange(&exchange).await.unwrap();
+
+    assert_eq!(stale_count, 0);
+    assert_eq!(tracker.active_order_count(), 2);
+    let state = tracker.state.read();
+    let pending_create = state
+        .active_orders
+        .get(&8201)
+        .expect("pending create should still be active");
+    assert_eq!(pending_create.lifecycle, OrderLifecycle::Open);
+    assert_eq!(pending_create.exchange_order_id, Some(9821));
+
+    let pending_cancel = state
+        .active_orders
+        .get(&8202)
+        .expect("pending cancel should still be active");
+    assert_eq!(pending_cancel.lifecycle, OrderLifecycle::Open);
+}
