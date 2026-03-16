@@ -223,7 +223,7 @@ impl OrderTracker {
 
     /// Net pending exposure from all active orders (lock-free via atomics)
     pub fn net_pending_exposure(&self) -> f64 {
-        self.pending_buy_exposure() - self.pending_sell_exposure()
+        self.net_pending_exposure_locked()
     }
 
     /// Debug: Net pending exposure via read lock (for verification)
@@ -239,13 +239,13 @@ impl OrderTracker {
     /// Effective position = confirmed + net pending
     #[inline]
     pub fn effective_position(&self) -> f64 {
-        self.confirmed_position() + self.net_pending_exposure()
+        self.confirmed_position() + self.net_pending_exposure_locked()
     }
 
     /// Worst-case long exposure: confirmed + all active buy remaining (lock-free)
     /// Used for pre-trade risk check before placing bids
     pub fn worst_case_long(&self) -> f64 {
-        self.confirmed_position() + self.pending_buy_exposure()
+        self.worst_case_long_locked()
     }
 
     /// Debug: Worst-case long via read lock (for verification)
@@ -263,7 +263,7 @@ impl OrderTracker {
     /// Worst-case short exposure: confirmed - all active sell remaining (lock-free)
     /// Used for pre-trade risk check before placing asks
     pub fn worst_case_short(&self) -> f64 {
-        self.confirmed_position() - self.pending_sell_exposure()
+        self.worst_case_short_locked()
     }
 
     /// Debug: Worst-case short via read lock (for verification)
@@ -283,7 +283,7 @@ impl OrderTracker {
     /// False positives possible under concurrent mutation. Use only for diagnostics.
     pub fn debug_verify_exposure(&self) {
         let locked_long = self.worst_case_long_locked();
-        let atomic_long = self.worst_case_long();
+        let atomic_long = self.confirmed_position() + self.pending_buy_exposure();
         if (locked_long - atomic_long).abs() > 1e-6 {
             tracing::error!(
                 "EXPOSURE DRIFT long: locked={:.8} atomic={:.8}",
@@ -292,7 +292,7 @@ impl OrderTracker {
             );
         }
         let locked_short = self.worst_case_short_locked();
-        let atomic_short = self.worst_case_short();
+        let atomic_short = self.confirmed_position() - self.pending_sell_exposure();
         if (locked_short - atomic_short).abs() > 1e-6 {
             tracing::error!(
                 "EXPOSURE DRIFT short: locked={:.8} atomic={:.8}",
