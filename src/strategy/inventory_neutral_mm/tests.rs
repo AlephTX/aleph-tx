@@ -1,7 +1,8 @@
 use super::*;
 use super::components::{
-    build_execution_plan, decide_quote_cycle, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
-    safe_available_balance, scaled_base_order_size, scaled_inventory_urgency_threshold,
+    build_execution_plan, decide_quote_cycle, inventory_skew_ratio, min_quotable_size,
+    position_for_quoting, residual_exposure_abs, safe_available_balance, scaled_base_order_size,
+    scaled_inventory_urgency_threshold,
     scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier, utilization_floor_base_order_size,
     usable_balance_fraction, QuoteCycleDecision,
 };
@@ -67,6 +68,14 @@ fn builds_multiple_grid_levels_when_inventory_budget_allows() {
     assert!(quotes[2].price < quotes[1].price);
     assert!(quotes[0].size >= quotes[1].size);
     assert!(quotes[1].size >= quotes[2].size);
+}
+
+#[test]
+fn min_quotable_size_rounds_up_to_safe_step_boundary() {
+    let config = test_config();
+    let min_size = min_quotable_size(&config, 2254.57);
+
+    assert_eq!(min_size, 0.0050);
 }
 
 #[test]
