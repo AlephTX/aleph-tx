@@ -294,6 +294,87 @@ fn top_levels_use_stickier_price_threshold_to_reduce_queue_churn() {
 }
 
 #[test]
+fn calm_mode_widens_matching_threshold_for_deeper_levels_too() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    let base_threshold = 2100.0 * config.grid_spacing_bps / 10000.0;
+    let calm_deeper_drift = base_threshold * 1.4;
+    assert!(calm_deeper_drift > base_threshold);
+
+    let existing = vec![
+        active_order(1, 101, OrderSide::Buy, desired[0].price, desired[0].size, 30),
+        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
+        active_order(
+            3,
+            103,
+            OrderSide::Buy,
+            desired[2].price + calm_deeper_drift,
+            desired[2].size,
+            30,
+        ),
+    ];
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        base_threshold,
+        config.step_size,
+        0.12,
+        Duration::from_secs(config.order_ttl_secs),
+        1,
+    );
+
+    assert!(to_cancel.is_empty());
+    assert!(to_place.len() < desired.len().saturating_sub(2));
+}
+
+#[test]
+fn calm_side_requote_cooldown_defers_back_to_back_replace_cycles() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    let mut existing = Vec::new();
+    for (i, quote) in desired.iter().enumerate() {
+        let age_secs = if i == 0 { 1 } else { 30 };
+        let price = if i == 1 { quote.price + 2.0 } else { quote.price };
+        existing.push(active_order(
+            (i + 1) as i64,
+            (101 + i) as i64,
+            OrderSide::Buy,
+            price,
+            quote.size,
+            age_secs,
+        ));
+    }
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        0.12,
+        Duration::from_secs(config.order_ttl_secs),
+        1,
+    );
+
+    assert!(to_cancel.is_empty());
+    assert!(to_place.is_empty());
+}
+
+#[test]
 fn execution_plan_uses_at_least_half_grid_spacing_as_requote_threshold() {
     let config = test_config();
     let target = QuoteTarget {

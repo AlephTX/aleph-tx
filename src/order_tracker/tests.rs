@@ -734,3 +734,15 @@ async fn test_reconcile_with_exchange_rebinds_pending_create_and_reverts_stuck_p
         .expect("pending cancel should still be active");
     assert_eq!(pending_cancel.lifecycle, OrderLifecycle::Open);
 }
+
+#[test]
+fn test_startup_grace_ignores_untracked_open_events() {
+    let tracker = make_tracker();
+
+    let created =
+        ShmPrivateEventV2::order_created(1, 2, 1, 990001, 880001, 770001, 3000.0, 0.05, false, 0);
+    let _ = tracker.apply_event(&created);
+
+    assert_eq!(tracker.active_order_count(), 0);
+    assert!((tracker.net_pending_exposure() - 0.0).abs() < 1e-10);
+}
