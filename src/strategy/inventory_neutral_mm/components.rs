@@ -296,14 +296,21 @@ pub(super) fn reconcile_side_plan(
     let mut matched_existing = vec![false; existing_orders.len()];
     let mut to_place = Vec::new();
 
-    for desired in desired_quotes {
+    for (level_idx, desired) in desired_quotes.iter().enumerate() {
+        // Top-of-book queue is the most expensive to churn away.
+        // Keep the nearest one or two levels slightly "stickier" than the rest.
+        let level_threshold = if level_idx < 2 {
+            threshold * 1.5
+        } else {
+            threshold
+        };
         if let Some((idx, _)) = existing_orders
             .iter()
             .enumerate()
             .filter(|(idx, _)| !matched_existing[*idx])
             .find(|(_, order)| {
                 let size_tolerance = (desired.size * size_tolerance_ratio).max(step_size);
-                (order.price - desired.price).abs() <= threshold
+                (order.price - desired.price).abs() <= level_threshold
                     && (order.size - desired.size).abs() <= size_tolerance
             })
         {
