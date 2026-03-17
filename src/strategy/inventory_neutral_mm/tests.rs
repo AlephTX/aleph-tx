@@ -6,7 +6,10 @@ use super::components::{
     scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier, utilization_floor_base_order_size,
     usable_balance_fraction, QuoteCycleDecision,
 };
-use super::pricing::{anchor_quotes_to_touch, cleanup_reference_mid, fallback_bbo_prices, local_reference_mid};
+use super::pricing::{
+    anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
+    fallback_bbo_prices, local_reference_mid,
+};
 use crate::exchange::{OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
 
@@ -789,6 +792,17 @@ fn anchored_quotes_respect_configured_join_buffer() {
 
     assert!(bid <= 2105.01);
     assert!(ask >= 2105.02);
+}
+
+#[test]
+fn effective_penny_ticks_widens_with_toxicity_and_inventory() {
+    let calm = effective_penny_ticks(1.0, 1.0, 3.0, 0.0);
+    let toxic = effective_penny_ticks(1.0, 4.5, 3.0, 0.0);
+    let inventory = effective_penny_ticks(1.0, 1.0, 3.0, 0.8);
+
+    assert_eq!(calm, 1.0);
+    assert!(toxic > calm);
+    assert!(inventory > calm);
 }
 
 #[test]

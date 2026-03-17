@@ -49,7 +49,10 @@ use market_state::{
     build_market_state, cross_exchange_offset_bps, data_age_ms, external_reference_mid,
     is_stale_bbo, MarketState,
 };
-use pricing::{anchor_quotes_to_touch, cleanup_reference_mid, fallback_bbo_prices, local_reference_mid};
+use pricing::{
+    anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
+    fallback_bbo_prices, local_reference_mid,
+};
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
@@ -1181,6 +1184,12 @@ impl InventoryNeutralMM {
         let raw_ask =
             ((reservation_price + half_spread) / self.config.tick_size).ceil() * self.config.tick_size;
 
+        let join_penny_ticks = effective_penny_ticks(
+            self.config.penny_ticks,
+            inputs.as_score,
+            self.config.adverse_selection_threshold,
+            urgency_ratio,
+        );
         let (our_bid, our_ask) = anchor_quotes_to_touch(
             raw_bid,
             raw_ask,
@@ -1188,7 +1197,7 @@ impl InventoryNeutralMM {
             inputs.ask_touch,
             inputs.mid,
             self.config.tick_size,
-            self.config.penny_ticks,
+            join_penny_ticks,
             MAX_TOUCH_OFFSET_BPS,
         );
 
