@@ -32,6 +32,7 @@ const POS_SCALE: f64 = 1e8;
 const PENDING_CREATE_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 const PENDING_CANCEL_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 const FILL_COMPLETION_EPS: f64 = 1e-9;
+const STARTUP_AUTO_REGISTER_GRACE: Duration = Duration::from_secs(20);
 
 // ─── Order Side ──────────────────────────────────────────────────────────────
 
@@ -188,6 +189,8 @@ pub struct OrderTracker {
     /// Phase 2 optimization: Incremental pending sell exposure (×POS_SCALE)
     /// Sum of all active sell orders' remaining_size
     pub pending_sell_exposure: CachePadded<AtomicI64>,
+    /// Startup time used to suppress stale open-event auto-registration during cleanup
+    started_at: Instant,
 }
 
 impl OrderTracker {
@@ -199,6 +202,7 @@ impl OrderTracker {
             last_sequence: AtomicI64::new(0),
             pending_buy_exposure: CachePadded::new(AtomicI64::new(0)),
             pending_sell_exposure: CachePadded::new(AtomicI64::new(0)),
+            started_at: Instant::now(),
         }
     }
 
@@ -721,6 +725,15 @@ impl OrderTracker {
             }
 
             // Auto-register untracked order (e.g. from restart, or manual order)
+            if self.started_at.elapsed() < STARTUP_AUTO_REGISTER_GRACE {
+                tracing::debug!(
+                    "Ignoring untracked order during startup grace: coi={} exch_id={}",
+                    client_id,
+                    event.exchange_order_id
+                );
+                return Ok(());
+            }
+
             let side = if event.is_ask != 0 {
                 OrderSide::Sell
             } else {

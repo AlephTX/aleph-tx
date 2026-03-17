@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
+const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
     pub raw_available_balance: f64,
@@ -295,11 +296,16 @@ pub(super) fn reconcile_side_plan(
 ) -> (Vec<i64>, Vec<OrderParams>) {
     let mut matched_existing = vec![false; existing_orders.len()];
     let mut to_place = Vec::new();
+    let calm_mode = max_replacements_per_cycle <= 1;
 
     for (level_idx, desired) in desired_quotes.iter().enumerate() {
         // Top-of-book queue is the most expensive to churn away.
-        // Keep the nearest one or two levels slightly "stickier" than the rest.
-        let level_threshold = if level_idx < 2 {
+        // Keep calm-market levels stickier so small touch drift does not constantly reset queue priority.
+        let level_threshold = if calm_mode && level_idx < 2 {
+            threshold * 2.0
+        } else if calm_mode {
+            threshold * 1.5
+        } else if level_idx < 2 {
             threshold * 1.5
         } else {
             threshold
@@ -320,10 +326,16 @@ pub(super) fn reconcile_side_plan(
         }
     }
 
+    let recent_same_side_refresh = max_replacements_per_cycle <= 1
+        && existing_orders
+            .iter()
+            .any(|order| order.placed_at.elapsed() < CALM_SIDE_REQUOTE_COOLDOWN);
+
     let mut to_cancel: Vec<i64> = existing_orders
         .iter()
         .enumerate()
         .filter(|(idx, order)| !matched_existing[*idx] && order.placed_at.elapsed() >= min_lifetime)
+        .filter(|_| !recent_same_side_refresh)
         .filter(|(_, order)| {
             order.order_index.is_some() && order.lifecycle != OrderLifecycle::PendingCancel
         })
