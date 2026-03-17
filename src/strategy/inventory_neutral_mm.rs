@@ -414,7 +414,7 @@ impl InventoryNeutralMM {
         let exchange_position = self.account_stats.position;
         // Quote direction should follow confirmed inventory, not pending-order imbalance.
         // Pending buy/sell exposure is still enforced via worst_case_long/short in risk limits.
-        let tracker_confirmed = self.order_tracker.confirmed_position();
+        let mut tracker_confirmed = self.order_tracker.confirmed_position();
         let mut base_order_size = components::round_down_to_step(
             scaled_base_order_size(&self.config, self.account_stats.portfolio_value, mid)
                 .max(self.config.step_size),
@@ -432,6 +432,16 @@ impl InventoryNeutralMM {
         );
         let min_available_balance =
             scaled_min_available_balance(&self.config, self.account_stats.portfolio_value);
+
+        let force_sync_threshold = (base_order_size * 2.0).max(self.config.step_size * 10.0);
+        let opposite_sign = exchange_position.abs() >= self.config.step_size
+            && tracker_confirmed.abs() >= self.config.step_size
+            && exchange_position.signum() != tracker_confirmed.signum();
+        let excessive_drift = (exchange_position - tracker_confirmed).abs() >= force_sync_threshold;
+        if opposite_sign || excessive_drift {
+            self.order_tracker.force_sync_position(exchange_position);
+            tracker_confirmed = exchange_position;
+        }
 
         let mut runtime_config = self.config.clone();
         runtime_config.max_position = max_position;

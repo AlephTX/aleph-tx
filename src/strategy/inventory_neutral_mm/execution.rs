@@ -13,6 +13,7 @@ use std::time::Duration;
 const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
 const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
 const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
+const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
 
 #[derive(Debug, Clone)]
@@ -128,8 +129,11 @@ pub(super) fn size_tolerance_ratio_for_requote(
         inventory_urgency_threshold.max(config.step_size),
         mid,
     );
+    let urgency = inventory_urgency_threshold.max(config.step_size);
     if position_for_quoting.abs() <= deadband {
         CALM_SIZE_TOLERANCE_RATIO
+    } else if position_for_quoting.abs() <= urgency {
+        PRE_URGENCY_SIZE_TOLERANCE_RATIO
     } else {
         ACTIVE_SIZE_TOLERANCE_RATIO
     }
@@ -436,14 +440,23 @@ mod tests {
         );
         let active_ratio = size_tolerance_ratio_for_requote(
             &config,
+            config.inventory_urgency_threshold * 2.0,
+            config.base_order_size,
             config.inventory_urgency_threshold,
+            2100.0,
+        );
+        let pre_urgency_ratio = size_tolerance_ratio_for_requote(
+            &config,
+            config.inventory_urgency_threshold * 0.75,
             config.base_order_size,
             config.inventory_urgency_threshold,
             2100.0,
         );
 
-        assert!(calm_ratio > active_ratio);
+        assert!(calm_ratio > pre_urgency_ratio);
+        assert!(pre_urgency_ratio > active_ratio);
         assert!((calm_ratio - CALM_SIZE_TOLERANCE_RATIO).abs() < 1e-9);
+        assert!((pre_urgency_ratio - PRE_URGENCY_SIZE_TOLERANCE_RATIO).abs() < 1e-9);
         assert!((active_ratio - ACTIVE_SIZE_TOLERANCE_RATIO).abs() < 1e-9);
     }
 

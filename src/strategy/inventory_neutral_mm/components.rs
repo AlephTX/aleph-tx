@@ -54,7 +54,9 @@ pub(super) fn round_up_to_step(value: f64, step: f64) -> f64 {
 }
 
 pub(super) fn min_quotable_size(config: &InventoryNeutralMMConfig, price: f64) -> f64 {
-    round_up_to_step(11.5 / price.max(config.tick_size), config.step_size).max(config.step_size)
+    // Live Lighter rejects some edge-case orders right at the theoretical notional floor.
+    // Keep a small safety buffer above the exchange threshold.
+    round_up_to_step(12.5 / price.max(config.tick_size), config.step_size).max(config.step_size)
 }
 
 pub(super) fn safe_available_balance(
@@ -481,19 +483,14 @@ pub(super) fn build_execution_plan(
     target: QuoteTarget,
     mid: f64,
     position_for_quoting: f64,
-    base_order_size: f64,
+    _base_order_size: f64,
     inventory_urgency_threshold: f64,
 ) -> ExecutionPlan {
     let base_threshold = (mid * config.requote_threshold_bps / 10000.0)
         .max(mid * config.grid_spacing_bps / 20000.0);
     let full_grid_spacing = mid * config.grid_spacing_bps / 10000.0;
-    let deadband = inventory_deadband_size(
-        config,
-        base_order_size,
-        inventory_urgency_threshold.max(config.step_size),
-        mid,
-    );
-    let requote_threshold = if position_for_quoting.abs() <= deadband {
+    let urgency_threshold = inventory_urgency_threshold.max(config.step_size);
+    let requote_threshold = if position_for_quoting.abs() <= urgency_threshold {
         base_threshold.max(full_grid_spacing)
     } else {
         base_threshold
