@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
-const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(3);
+const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
     pub raw_available_balance: f64,
