@@ -75,7 +75,7 @@ fn min_quotable_size_rounds_up_to_safe_step_boundary() {
     let config = test_config();
     let min_size = min_quotable_size(&config, 2254.57);
 
-    assert!((min_size - 0.0052).abs() < 1e-10);
+    assert!((min_size - 0.0056).abs() < 1e-10);
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn min_quotable_size_stays_above_recent_lighter_reject_edge_case() {
     let config = test_config();
     let min_size = min_quotable_size(&config, 2290.62);
 
-    assert!((min_size - 0.0051).abs() < 1e-10);
+    assert!((min_size - 0.0055).abs() < 1e-10);
 }
 
 #[test]
@@ -284,6 +284,29 @@ fn execution_plan_uses_full_grid_spacing_inside_inventory_deadband() {
         target,
         2100.0,
         config.step_size,
+        config.base_order_size,
+        config.inventory_urgency_threshold,
+    );
+    let full_grid_spacing = 2100.0 * config.grid_spacing_bps / 10000.0;
+
+    assert!((plan.requote_threshold - full_grid_spacing).abs() <= 1e-9);
+}
+
+#[test]
+fn execution_plan_uses_full_grid_spacing_below_inventory_urgency() {
+    let config = test_config();
+    let target = QuoteTarget {
+        bid_price: 2090.0,
+        ask_price: 2092.0,
+        bid_size: config.base_order_size,
+        ask_size: config.base_order_size,
+    };
+
+    let plan = build_execution_plan(
+        &config,
+        target,
+        2100.0,
+        config.inventory_urgency_threshold * 0.9,
         config.base_order_size,
         config.inventory_urgency_threshold,
     );
