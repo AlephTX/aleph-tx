@@ -43,6 +43,20 @@ pub(super) fn fallback_bbo_prices(mid: f64, bbo: &ShmBboMessage, tick_size: f64)
     (bid_price, ask_price)
 }
 
+pub(super) fn effective_penny_ticks(
+    base_penny_ticks: f64,
+    as_score: f64,
+    as_threshold: f64,
+    inventory_urgency_ratio: f64,
+) -> f64 {
+    let mut extra_ticks = 0.0;
+    if as_threshold > 0.0 && as_score > as_threshold {
+        extra_ticks += ((as_score / as_threshold) - 1.0).clamp(0.0, 1.0);
+    }
+    extra_ticks += inventory_urgency_ratio.abs().clamp(0.0, 1.0) * 0.5;
+    (base_penny_ticks + extra_ticks).clamp(1.0, base_penny_ticks.max(1.0) + 1.5)
+}
+
 pub(super) fn anchor_quotes_to_touch(
     raw_bid: f64,
     raw_ask: f64,
