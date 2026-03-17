@@ -8,13 +8,14 @@ use crate::error::TradingError;
 use crate::exchange::{BatchResult, OrderParams, OrderType, Side};
 use crate::order_tracker::{OrderLifecycle, OrderSide};
 use crate::telemetry::TelemetryCollector;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
 const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
 const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
 const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
+const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
@@ -239,6 +240,40 @@ pub(super) fn should_defer_cancel_only_refresh(
     let has_any_cancel = !bid_plan.to_cancel.is_empty() || !ask_plan.to_cancel.is_empty();
 
     has_any_cancel && !has_any_place
+}
+
+pub(super) fn should_defer_post_fill_replenishment(
+    config: &InventoryNeutralMMConfig,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
+    bid_plan: &SideExecutionPlan,
+    ask_plan: &SideExecutionPlan,
+    last_fill_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(last_fill_at) = last_fill_at else {
+        return false;
+    };
+    if now.duration_since(last_fill_at) > POST_FILL_REPLENISH_COOLDOWN {
+        return false;
+    }
+
+    let deadband = inventory_deadband_size(
+        config,
+        base_order_size,
+        inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
+    if position_for_quoting.abs() > inventory_urgency_threshold.max(deadband) {
+        return false;
+    }
+
+    let total_places = bid_plan.to_place.len() + ask_plan.to_place.len();
+    let has_any_cancel = !bid_plan.to_cancel.is_empty() || !ask_plan.to_cancel.is_empty();
+
+    total_places > 0 && total_places <= 2 && !has_any_cancel
 }
 
 #[cfg(test)]
@@ -601,6 +636,68 @@ mod tests {
 
         assert!(!should_defer_cancel_only_refresh(
             &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+        ));
+    }
+
+    #[test]
+    fn defer_small_post_fill_replenishment_in_pre_urgency_inventory() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: vec![OrderParams {
+                size: 0.0082,
+                price: 2100.0,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(should_defer_post_fill_replenishment(
+            &config,
+            0.01,
+            0.015,
+            0.08,
+            2100.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_millis(500)),
+            Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn do_not_defer_post_fill_replenishment_when_inventory_is_urgent() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: vec![OrderParams {
+                size: 0.0082,
+                price: 2100.0,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(!should_defer_post_fill_replenishment(
+            &config,
+            0.12,
+            0.015,
+            0.08,
+            2100.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_millis(500)),
+            Instant::now(),
         ));
     }
 

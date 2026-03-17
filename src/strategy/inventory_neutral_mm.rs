@@ -42,6 +42,7 @@ use execution::{
     apply_batch_success, build_side_execution_plan, classify_batch_failure,
     max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
     should_defer_cancel_only_refresh, should_defer_one_sided_requote,
+    should_defer_post_fill_replenishment,
     size_tolerance_ratio_for_requote, BatchFailureAction,
 };
 use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
@@ -239,6 +240,7 @@ pub struct InventoryNeutralMM {
     last_balance_check: Instant,
     reconcile_failures: u32,
     last_reconciled_fill_count: u64,
+    last_fill_at: Option<Instant>,
     margin_cooldown_until: Instant,
     stale_bbo_since_ns: Option<u64>,
 
@@ -298,6 +300,7 @@ impl InventoryNeutralMM {
             last_balance_check: Instant::now(),
             reconcile_failures: 0,
             last_reconciled_fill_count: 0,
+            last_fill_at: None,
             margin_cooldown_until: Instant::now(),
             stale_bbo_since_ns: None,
             telemetry: TelemetryCollector::new(),
@@ -1017,6 +1020,7 @@ impl InventoryNeutralMM {
         if fill_count <= self.last_reconciled_fill_count {
             return;
         }
+        self.last_fill_at = Some(Instant::now());
 
         match self.order_tracker.reconcile_with_exchange(&*self.trading).await {
             Ok(stale_count) => {
@@ -1374,6 +1378,27 @@ impl InventoryNeutralMM {
         ) {
             debug!(
                 "Deferring cancel-only refresh in symmetric mode: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
+                bid_plan.to_cancel.len(),
+                bid_plan.to_place.len(),
+                ask_plan.to_cancel.len(),
+                ask_plan.to_place.len(),
+            );
+            return;
+        }
+
+        if should_defer_post_fill_replenishment(
+            &self.config,
+            risk.position_for_quoting,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
+            &bid_plan,
+            &ask_plan,
+            self.last_fill_at,
+            Instant::now(),
+        ) {
+            debug!(
+                "Deferring immediate post-fill replenishment: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
                 bid_plan.to_cancel.len(),
                 bid_plan.to_place.len(),
                 ask_plan.to_cancel.len(),
