@@ -67,6 +67,8 @@ define exchange_up
 	@pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)feeder-app($$| )' || true
 	@rm -f $(PID_DIR)/$(1)-$(STRATEGY).pid $(PID_DIR)/feeder-$(1).pid
 	@make clean-shm
+	@# Build strategy before starting feeder so SHM readiness is checked immediately before launch
+	@cargo build --release --bin $(STRATEGY)
 	@# Start Feeder
 	@set -a; . ./$(2); set +a; \
 		: > $(LOG_DIR)/feeder-$(1).log; \
@@ -95,7 +97,6 @@ define exchange_up
 			exit 1; \
 		fi
 	@# Start Strategy
-	@cargo build --release --bin $(STRATEGY)
 	@set -a; . ./$(2); set +a; \
 		: > $(LOG_DIR)/$(1)-$(STRATEGY).log; \
 		export LD_LIBRARY_PATH=$$(pwd)/src/native:$$LD_LIBRARY_PATH; \
