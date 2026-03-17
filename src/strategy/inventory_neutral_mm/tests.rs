@@ -250,6 +250,50 @@ fn modest_size_drift_within_tolerance_does_not_force_requote() {
 }
 
 #[test]
+fn top_levels_use_stickier_price_threshold_to_reduce_queue_churn() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    let base_threshold = 2100.0 * config.grid_spacing_bps / 10000.0;
+    let sticky_threshold = base_threshold * 1.5;
+    let top_level_drift = base_threshold * 1.25;
+    assert!(top_level_drift > base_threshold);
+    assert!(top_level_drift < sticky_threshold);
+
+    let existing = vec![
+        active_order(
+            1,
+            101,
+            OrderSide::Buy,
+            desired[0].price + top_level_drift,
+            desired[0].size,
+            30,
+        ),
+        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
+        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
+    ];
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        base_threshold,
+        config.step_size,
+        0.12,
+        Duration::from_secs(config.order_ttl_secs),
+        2,
+    );
+
+    assert!(to_cancel.is_empty());
+    assert!(to_place.len() < desired.len().saturating_sub(2));
+}
+
+#[test]
 fn execution_plan_uses_at_least_half_grid_spacing_as_requote_threshold() {
     let config = test_config();
     let target = QuoteTarget {
