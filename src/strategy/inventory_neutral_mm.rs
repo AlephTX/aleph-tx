@@ -46,8 +46,8 @@ use execution::{
 };
 use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    build_market_state, cross_exchange_offset_bps, data_age_ms, external_reference_mid,
-    is_stale_bbo, MarketState,
+    build_market_state, classify_stale_bbo, cross_exchange_offset_bps, data_age_ms,
+    external_reference_mid, MarketState, StaleBboAction,
 };
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
@@ -200,6 +200,7 @@ impl ActiveOrder {
 // ═══════════════════════════════════════════════════════════════════
 
 const DATA_STALENESS_THRESHOLD_MS: u64 = 5000;
+const STALE_BBO_CANCEL_AFTER_MS: u64 = 15000;
 const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
@@ -239,6 +240,7 @@ pub struct InventoryNeutralMM {
     reconcile_failures: u32,
     last_reconciled_fill_count: u64,
     margin_cooldown_until: Instant,
+    stale_bbo_since_ns: Option<u64>,
 
     // Telemetry
     telemetry: TelemetryCollector,
@@ -297,6 +299,7 @@ impl InventoryNeutralMM {
             reconcile_failures: 0,
             last_reconciled_fill_count: 0,
             margin_cooldown_until: Instant::now(),
+            stale_bbo_since_ns: None,
             telemetry: TelemetryCollector::new(),
             is_running: Arc::new(AtomicBool::new(true)),
             shm_reader,
@@ -1056,15 +1059,39 @@ impl InventoryNeutralMM {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            if is_stale_bbo(market_state.bbo.timestamp_ns, now_ns, DATA_STALENESS_THRESHOLD_MS) {
-                warn!(
-                    "Stale BBO: age={}ms (>{}ms), canceling all orders",
-                    data_age_ms(market_state.bbo.timestamp_ns, now_ns),
-                    DATA_STALENESS_THRESHOLD_MS
-                );
-                self.cancel_all_orders().await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                return None;
+            let action = classify_stale_bbo(
+                market_state.bbo.timestamp_ns,
+                now_ns,
+                self.stale_bbo_since_ns,
+                DATA_STALENESS_THRESHOLD_MS,
+                STALE_BBO_CANCEL_AFTER_MS,
+            );
+            match action {
+                StaleBboAction::Fresh => {
+                    self.stale_bbo_since_ns = None;
+                }
+                StaleBboAction::Freeze => {
+                    if self.stale_bbo_since_ns.is_none() {
+                        self.stale_bbo_since_ns = Some(now_ns);
+                        warn!(
+                            "Stale BBO: age={}ms (>{}ms), freezing quotes and waiting for recovery",
+                            data_age_ms(market_state.bbo.timestamp_ns, now_ns),
+                            DATA_STALENESS_THRESHOLD_MS
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    return None;
+                }
+                StaleBboAction::Cancel => {
+                    warn!(
+                        "Stale BBO persisted for >{}ms (current age={}ms), canceling all orders",
+                        STALE_BBO_CANCEL_AFTER_MS,
+                        data_age_ms(market_state.bbo.timestamp_ns, now_ns),
+                    );
+                    self.cancel_all_orders().await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    return None;
+                }
             }
         }
 

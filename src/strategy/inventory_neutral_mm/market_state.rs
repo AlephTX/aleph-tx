@@ -25,6 +25,33 @@ pub(super) fn is_stale_bbo(timestamp_ns: u64, now_ns: u64, threshold_ms: u64) ->
     timestamp_ns > 0 && data_age_ms(timestamp_ns, now_ns) > threshold_ms
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StaleBboAction {
+    Fresh,
+    Freeze,
+    Cancel,
+}
+
+pub(super) fn classify_stale_bbo(
+    timestamp_ns: u64,
+    now_ns: u64,
+    first_stale_seen_ns: Option<u64>,
+    freeze_threshold_ms: u64,
+    cancel_after_ms: u64,
+) -> StaleBboAction {
+    if !is_stale_bbo(timestamp_ns, now_ns, freeze_threshold_ms) {
+        return StaleBboAction::Fresh;
+    }
+
+    let stale_origin_ns = first_stale_seen_ns.unwrap_or(now_ns);
+    let stale_for_ms = data_age_ms(stale_origin_ns, now_ns);
+    if stale_for_ms >= cancel_after_ms {
+        StaleBboAction::Cancel
+    } else {
+        StaleBboAction::Freeze
+    }
+}
+
 pub(super) fn build_market_state(
     exchanges: [(u8, ShmBboMessage); NUM_EXCHANGES],
     exchange_id: u8,
@@ -135,6 +162,25 @@ mod tests {
         let now_ns = 10_000_000_000;
         assert!(!is_stale_bbo(9_996_000_000, now_ns, 5));
         assert!(is_stale_bbo(9_994_000_000, now_ns, 5));
+    }
+
+    #[test]
+    fn classify_stale_bbo_freezes_before_canceling() {
+        let now_ns = 10_000_000_000;
+        let timestamp_ns = 9_994_000_000;
+
+        assert_eq!(
+            classify_stale_bbo(timestamp_ns, now_ns, None, 5, 10_000),
+            StaleBboAction::Freeze
+        );
+        assert_eq!(
+            classify_stale_bbo(timestamp_ns, now_ns, Some(0), 5, 10_000),
+            StaleBboAction::Cancel
+        );
+        assert_eq!(
+            classify_stale_bbo(9_999_000_000, now_ns, None, 5, 10_000),
+            StaleBboAction::Fresh
+        );
     }
 
     #[test]
