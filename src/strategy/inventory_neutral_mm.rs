@@ -53,7 +53,7 @@ use market_state::{
 };
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, local_reference_mid,
+    fallback_bbo_prices, local_reference_mid, stabilize_crossed_quotes,
 };
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
@@ -1235,17 +1235,24 @@ impl InventoryNeutralMM {
             MAX_TOUCH_OFFSET_BPS,
         );
 
-        if our_bid >= our_ask {
-            debug!(
-                "Skipping optimal quotes: crossed quote bid={:.2} ask={:.2} mid={:.2}",
-                our_bid,
-                our_ask,
-                inputs.mid
-            );
-            return None;
+        match stabilize_crossed_quotes(
+            our_bid,
+            our_ask,
+            inputs.bid_touch,
+            inputs.ask_touch,
+            self.config.tick_size,
+        ) {
+            Some((stable_bid, stable_ask)) => Some((stable_bid, stable_ask)),
+            None => {
+                debug!(
+                    "Skipping optimal quotes: crossed quote bid={:.2} ask={:.2} mid={:.2}",
+                    our_bid,
+                    our_ask,
+                    inputs.mid
+                );
+                None
+            }
         }
-
-        Some((our_bid, our_ask))
     }
 
     /// Execute the quoting cycle: size orders and submit batch

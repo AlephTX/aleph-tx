@@ -9,6 +9,7 @@ use super::components::{
 use super::pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
     fallback_bbo_prices, local_reference_mid,
+    stabilize_crossed_quotes,
 };
 use crate::exchange::{OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
@@ -917,6 +918,23 @@ fn anchored_quotes_respect_configured_join_buffer() {
 
     assert!(bid <= 2105.01);
     assert!(ask >= 2105.02);
+}
+
+#[test]
+fn stabilize_crossed_quotes_recovers_to_safe_touch_band() {
+    let stabilized =
+        stabilize_crossed_quotes(2188.82, 2187.31, 2188.07, 2188.17, 0.01).expect("stabilized");
+
+    assert!(stabilized.0 < stabilized.1);
+    assert!((stabilized.0 - 2188.07).abs() < 1e-9);
+    assert!((stabilized.1 - 2188.17).abs() < 1e-9);
+}
+
+#[test]
+fn stabilize_crossed_quotes_returns_none_when_touch_is_inverted() {
+    let stabilized = stabilize_crossed_quotes(2188.82, 2187.31, 2188.17, 2188.16, 0.01);
+
+    assert!(stabilized.is_none());
 }
 
 #[test]
