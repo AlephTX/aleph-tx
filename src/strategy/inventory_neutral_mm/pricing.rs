@@ -90,3 +90,37 @@ pub(super) fn anchor_quotes_to_touch(
     ask = (ask / tick_size).ceil() * tick_size;
     (bid, ask)
 }
+
+pub(super) fn stabilize_crossed_quotes(
+    bid: f64,
+    ask: f64,
+    bid_touch: f64,
+    ask_touch: f64,
+    tick_size: f64,
+) -> Option<(f64, f64)> {
+    if !bid.is_finite()
+        || !ask.is_finite()
+        || !bid_touch.is_finite()
+        || !ask_touch.is_finite()
+        || tick_size <= 0.0
+    {
+        return None;
+    }
+
+    if bid < ask {
+        return Some((bid, ask));
+    }
+
+    if ask_touch <= bid_touch {
+        return None;
+    }
+
+    let safe_bid = (bid_touch / tick_size).floor() * tick_size;
+    let safe_ask = (ask_touch / tick_size).ceil() * tick_size;
+
+    if safe_bid < safe_ask {
+        Some((safe_bid, safe_ask))
+    } else {
+        None
+    }
+}
