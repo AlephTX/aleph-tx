@@ -41,7 +41,8 @@ use components::{
 use execution::{
     apply_batch_success, build_side_execution_plan, classify_batch_failure,
     max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
-    should_defer_cancel_only_refresh, should_defer_one_sided_requote,
+    should_defer_cancel_only_refresh, should_defer_micro_refresh,
+    should_defer_one_sided_requote,
     should_defer_post_fill_replenishment,
     size_tolerance_ratio_for_requote, BatchFailureAction,
 };
@@ -241,6 +242,7 @@ pub struct InventoryNeutralMM {
     reconcile_failures: u32,
     last_reconciled_fill_count: u64,
     last_fill_at: Option<Instant>,
+    last_execution_batch_at: Option<Instant>,
     margin_cooldown_until: Instant,
     stale_bbo_since_ns: Option<u64>,
 
@@ -301,6 +303,7 @@ impl InventoryNeutralMM {
             reconcile_failures: 0,
             last_reconciled_fill_count: 0,
             last_fill_at: None,
+            last_execution_batch_at: None,
             margin_cooldown_until: Instant::now(),
             stale_bbo_since_ns: None,
             telemetry: TelemetryCollector::new(),
@@ -1407,6 +1410,28 @@ impl InventoryNeutralMM {
             return;
         }
 
+        if should_defer_micro_refresh(
+            &self.config,
+            risk.position_for_quoting,
+            risk.base_order_size,
+            risk.inventory_urgency_threshold,
+            mid,
+            &bid_plan,
+            &ask_plan,
+            self.last_execution_batch_at,
+            Instant::now(),
+            self.resting_order_count(),
+        ) {
+            debug!(
+                "Deferring small micro-refresh: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
+                bid_plan.to_cancel.len(),
+                bid_plan.to_place.len(),
+                ask_plan.to_cancel.len(),
+                ask_plan.to_place.len(),
+            );
+            return;
+        }
+
         let mut actions = Vec::new();
         let mut pending_cancel_ids = Vec::new();
 
@@ -1416,6 +1441,7 @@ impl InventoryNeutralMM {
         if !actions.is_empty() {
             match self.trading.execute_batch(actions).await {
                 Ok(result) => {
+                    self.last_execution_batch_at = Some(Instant::now());
                     apply_batch_success(&mut self.total_orders_placed, &mut self.telemetry, &result);
                     self.refresh_active_orders_from_tracker();
                 }

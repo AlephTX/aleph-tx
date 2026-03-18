@@ -16,6 +16,7 @@ const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
 const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
 const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_secs(2);
+const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
@@ -274,6 +275,47 @@ pub(super) fn should_defer_post_fill_replenishment(
     let has_any_cancel = !bid_plan.to_cancel.is_empty() || !ask_plan.to_cancel.is_empty();
 
     total_places > 0 && total_places <= 2 && !has_any_cancel
+}
+
+pub(super) fn should_defer_micro_refresh(
+    config: &InventoryNeutralMMConfig,
+    position_for_quoting: f64,
+    base_order_size: f64,
+    inventory_urgency_threshold: f64,
+    mid: f64,
+    bid_plan: &SideExecutionPlan,
+    ask_plan: &SideExecutionPlan,
+    last_execution_at: Option<Instant>,
+    now: Instant,
+    resting_orders: usize,
+) -> bool {
+    let Some(last_execution_at) = last_execution_at else {
+        return false;
+    };
+    if now.duration_since(last_execution_at) > MICRO_REFRESH_COOLDOWN {
+        return false;
+    }
+
+    let deadband = inventory_deadband_size(
+        config,
+        base_order_size,
+        inventory_urgency_threshold.max(config.step_size),
+        mid,
+    );
+    if position_for_quoting.abs() > inventory_urgency_threshold.max(deadband) {
+        return false;
+    }
+
+    let total_places = bid_plan.to_place.len() + ask_plan.to_place.len();
+    let total_cancels = bid_plan.to_cancel.len() + ask_plan.to_cancel.len();
+    let one_sided_activity = (bid_plan.to_place.is_empty() && bid_plan.to_cancel.is_empty())
+        ^ (ask_plan.to_place.is_empty() && ask_plan.to_cancel.is_empty());
+
+    resting_orders >= 5
+        && one_sided_activity
+        && total_places <= 1
+        && total_cancels <= 1
+        && (total_places + total_cancels) > 0
 }
 
 #[cfg(test)]
@@ -698,6 +740,108 @@ mod tests {
             &ask_plan,
             Some(Instant::now() - Duration::from_millis(500)),
             Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn defer_micro_refresh_when_recent_small_one_sided_requote() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: vec![101],
+            to_place: vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(should_defer_micro_refresh(
+            &config,
+            -0.02,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_secs(3)),
+            Instant::now(),
+            5,
+        ));
+    }
+
+    #[test]
+    fn do_not_defer_micro_refresh_when_recent_window_has_expired() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: vec![101],
+            to_place: vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(!should_defer_micro_refresh(
+            &config,
+            -0.02,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_secs(9)),
+            Instant::now(),
+            5,
+        ));
+    }
+
+    #[test]
+    fn do_not_defer_micro_refresh_for_multi_side_rebuild() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: vec![101],
+            to_place: vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: vec![OrderParams {
+                size: 0.0059,
+                price: 2237.12,
+                side: Side::Sell,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+
+        assert!(!should_defer_micro_refresh(
+            &config,
+            -0.02,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_secs(3)),
+            Instant::now(),
+            5,
         ));
     }
 
