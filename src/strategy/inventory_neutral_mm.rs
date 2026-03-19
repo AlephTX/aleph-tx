@@ -203,6 +203,7 @@ impl ActiveOrder {
 
 const DATA_STALENESS_THRESHOLD_MS: u64 = 5000;
 const STALE_BBO_CANCEL_AFTER_MS: u64 = 15000;
+const STATIC_TWO_SIDED_BOOK_GRACE_MS: u64 = 30000;
 const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
@@ -1067,11 +1068,12 @@ impl InventoryNeutralMM {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let action = classify_stale_bbo(
-                market_state.bbo.timestamp_ns,
+                &market_state.bbo,
                 now_ns,
                 self.stale_bbo_since_ns,
                 DATA_STALENESS_THRESHOLD_MS,
                 STALE_BBO_CANCEL_AFTER_MS,
+                STATIC_TWO_SIDED_BOOK_GRACE_MS,
             );
             match action {
                 StaleBboAction::Fresh => {
