@@ -16,7 +16,8 @@ const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
 const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
 const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_secs(2);
-const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(8);
+const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(12);
+const MICRO_REFRESH_MIN_RESTING_ORDERS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
@@ -311,7 +312,7 @@ pub(super) fn should_defer_micro_refresh(
     let one_sided_activity = (bid_plan.to_place.is_empty() && bid_plan.to_cancel.is_empty())
         ^ (ask_plan.to_place.is_empty() && ask_plan.to_cancel.is_empty());
 
-    resting_orders >= 5
+    resting_orders >= MICRO_REFRESH_MIN_RESTING_ORDERS
         && one_sided_activity
         && total_places <= 1
         && total_cancels <= 1
@@ -771,7 +772,7 @@ mod tests {
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(3)),
             Instant::now(),
-            5,
+            4,
         ));
     }
 
@@ -801,9 +802,9 @@ mod tests {
             2232.0,
             &bid_plan,
             &ask_plan,
-            Some(Instant::now() - Duration::from_secs(9)),
+            Some(Instant::now() - Duration::from_secs(13)),
             Instant::now(),
-            5,
+            4,
         ));
     }
 
@@ -841,7 +842,33 @@ mod tests {
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(3)),
             Instant::now(),
-            5,
+            4,
+        ));
+    }
+
+    #[test]
+    fn defer_micro_refresh_even_with_three_resting_orders_in_calm_market() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: vec![101],
+            to_place: Vec::new(),
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(should_defer_micro_refresh(
+            &config,
+            0.0,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_secs(2)),
+            Instant::now(),
+            3,
         ));
     }
 

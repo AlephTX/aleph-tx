@@ -7,7 +7,8 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
-const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(5);
+const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(12);
+const CALM_REQUOTE_MIN_LIFETIME: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
     pub raw_available_balance: f64,
@@ -331,10 +332,18 @@ pub(super) fn reconcile_side_plan(
             .iter()
             .any(|order| order.placed_at.elapsed() < CALM_SIDE_REQUOTE_COOLDOWN);
 
+    let replacement_min_lifetime = if calm_mode {
+        min_lifetime.max(CALM_REQUOTE_MIN_LIFETIME)
+    } else {
+        min_lifetime
+    };
+
     let mut to_cancel: Vec<i64> = existing_orders
         .iter()
         .enumerate()
-        .filter(|(idx, order)| !matched_existing[*idx] && order.placed_at.elapsed() >= min_lifetime)
+        .filter(|(idx, order)| {
+            !matched_existing[*idx] && order.placed_at.elapsed() >= replacement_min_lifetime
+        })
         .filter(|_| !recent_same_side_refresh)
         .filter(|(_, order)| {
             order.order_index.is_some() && order.lifecycle != OrderLifecycle::PendingCancel

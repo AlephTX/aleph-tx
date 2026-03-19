@@ -376,6 +376,45 @@ fn calm_side_requote_cooldown_defers_back_to_back_replace_cycles() {
 }
 
 #[test]
+fn calm_mode_requires_longer_min_lifetime_before_replacing_top_levels() {
+    let config = test_config();
+    let desired = InventoryNeutralMM::build_grid_plan(
+        &config,
+        Side::Buy,
+        OrderType::PostOnly,
+        2100.0,
+        config.base_order_size,
+    );
+
+    let mut existing = Vec::new();
+    for (i, quote) in desired.iter().enumerate() {
+        let age_secs = 11;
+        let price = if i < 2 { quote.price + 1.20 } else { quote.price };
+        existing.push(active_order(
+            (i + 1) as i64,
+            (101 + i) as i64,
+            OrderSide::Buy,
+            price,
+            quote.size,
+            age_secs,
+        ));
+    }
+
+    let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
+        &existing,
+        &desired,
+        0.05,
+        config.step_size,
+        0.12,
+        Duration::from_secs(config.order_ttl_secs),
+        1,
+    );
+
+    assert!(to_cancel.is_empty());
+    assert!(to_place.is_empty());
+}
+
+#[test]
 fn execution_plan_uses_at_least_half_grid_spacing_as_requote_threshold() {
     let config = test_config();
     let target = QuoteTarget {
