@@ -65,16 +65,28 @@ pub(super) fn anchor_quotes_to_touch(
     mid: f64,
     tick_size: f64,
     penny_ticks: f64,
+    inventory_urgency_ratio: f64,
     max_touch_offset_bps: f64,
 ) -> (f64, f64) {
     let join_buffer = (penny_ticks.max(1.0) * tick_size).max(tick_size);
-    let join_bid = if ask_touch - bid_touch > join_buffer {
-        ask_touch - join_buffer
+    let flatten_bias = inventory_urgency_ratio.abs().clamp(0.0, 1.0) * tick_size;
+    let bid_join_buffer = if inventory_urgency_ratio > 0.0 {
+        join_buffer + flatten_bias
+    } else {
+        (join_buffer - flatten_bias).max(tick_size)
+    };
+    let ask_join_buffer = if inventory_urgency_ratio < 0.0 {
+        join_buffer + flatten_bias
+    } else {
+        (join_buffer - flatten_bias).max(tick_size)
+    };
+    let join_bid = if ask_touch - bid_touch > bid_join_buffer {
+        ask_touch - bid_join_buffer
     } else {
         bid_touch
     };
-    let join_ask = if ask_touch - bid_touch > join_buffer {
-        bid_touch + join_buffer
+    let join_ask = if ask_touch - bid_touch > ask_join_buffer {
+        bid_touch + ask_join_buffer
     } else {
         ask_touch
     };

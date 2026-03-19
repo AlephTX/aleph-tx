@@ -1236,6 +1236,7 @@ impl InventoryNeutralMM {
             inputs.mid,
             self.config.tick_size,
             join_penny_ticks,
+            urgency_ratio,
             MAX_TOUCH_OFFSET_BPS,
         );
 
