@@ -942,7 +942,7 @@ fn fallback_bbo_prices_synthesize_missing_side_around_local_mid() {
 #[test]
 fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
     let (bid, ask) =
-        anchor_quotes_to_touch(2106.89, 2118.53, 2112.20, 2112.30, 2112.25, 0.01, 1.0, 8.0);
+        anchor_quotes_to_touch(2106.89, 2118.53, 2112.20, 2112.30, 2112.25, 0.01, 1.0, 0.0, 8.0);
 
     assert!(bid < 2112.30);
     assert!(ask > 2112.20);
@@ -953,7 +953,7 @@ fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
 #[test]
 fn anchored_quotes_respect_configured_join_buffer() {
     let (bid, ask) =
-        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.03, 2105.015, 0.01, 2.0, 8.0);
+        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.03, 2105.015, 0.01, 2.0, 0.0, 8.0);
 
     assert!(bid <= 2105.01);
     assert!(ask >= 2105.02);
@@ -985,6 +985,21 @@ fn effective_penny_ticks_widens_with_toxicity_and_inventory() {
     assert_eq!(calm, 1.0);
     assert!(toxic > calm);
     assert!(inventory > calm);
+}
+
+#[test]
+fn anchored_quotes_shift_toward_flatten_side_when_inventory_is_biased() {
+    let (flat_bid, flat_ask) =
+        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, 0.0, 8.0);
+    let (long_bid, long_ask) =
+        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, 1.0, 8.0);
+    let (short_bid, short_ask) =
+        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, -1.0, 8.0);
+
+    assert!(long_ask <= flat_ask);
+    assert!(long_bid <= flat_bid);
+    assert!(short_bid >= flat_bid);
+    assert!(short_ask >= flat_ask);
 }
 
 #[test]
