@@ -36,6 +36,10 @@ fn has_valid_two_sided_book(bbo: &ShmBboMessage) -> bool {
     bbo.bid_price > 0.0 && bbo.ask_price > 0.0 && bbo.ask_price > bbo.bid_price
 }
 
+fn has_quoteable_book(bbo: &ShmBboMessage) -> bool {
+    bbo.bid_price > 0.0 || bbo.ask_price > 0.0
+}
+
 pub(super) fn classify_stale_bbo(
     bbo: &ShmBboMessage,
     now_ns: u64,
@@ -43,13 +47,19 @@ pub(super) fn classify_stale_bbo(
     freeze_threshold_ms: u64,
     cancel_after_ms: u64,
     static_two_sided_grace_ms: u64,
+    static_quoteable_grace_ms: u64,
 ) -> StaleBboAction {
     let timestamp_ns = bbo.timestamp_ns;
     if !is_stale_bbo(timestamp_ns, now_ns, freeze_threshold_ms) {
         return StaleBboAction::Fresh;
     }
 
-    if has_valid_two_sided_book(bbo) && data_age_ms(timestamp_ns, now_ns) <= static_two_sided_grace_ms {
+    let age_ms = data_age_ms(timestamp_ns, now_ns);
+    if has_valid_two_sided_book(bbo) && age_ms <= static_two_sided_grace_ms {
+        return StaleBboAction::Fresh;
+    }
+
+    if has_quoteable_book(bbo) && age_ms <= static_quoteable_grace_ms {
         return StaleBboAction::Fresh;
     }
 
@@ -176,25 +186,39 @@ mod tests {
 
     #[test]
     fn classify_stale_bbo_freezes_before_canceling() {
-        let now_ns = 10_000_000_000;
-        let timestamp_ns = 9_994_000_000;
+        let now_ns = 40_000_000_000;
+        let timestamp_ns = 27_000_000_000;
         let two_sided = msg(2100.0, 2101.0, timestamp_ns);
         let one_sided = msg(2100.0, 0.0, timestamp_ns);
 
         assert_eq!(
-            classify_stale_bbo(&one_sided, now_ns, None, 5, 10_000, 30_000),
+            classify_stale_bbo(&one_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
             StaleBboAction::Freeze
         );
         assert_eq!(
-            classify_stale_bbo(&one_sided, now_ns, Some(0), 5, 10_000, 30_000),
+            classify_stale_bbo(&one_sided, now_ns, Some(0), 5, 10_000, 30_000, 12_000),
             StaleBboAction::Cancel
         );
         assert_eq!(
-            classify_stale_bbo(&msg(2100.0, 2101.0, 9_999_000_000), now_ns, None, 5, 10_000, 30_000),
+            classify_stale_bbo(
+                &msg(2100.0, 2101.0, 39_000_000_000),
+                now_ns,
+                None,
+                5,
+                10_000,
+                30_000,
+                12_000,
+            ),
             StaleBboAction::Fresh
         );
         assert_eq!(
-            classify_stale_bbo(&two_sided, now_ns, None, 5, 10_000, 30_000),
+            classify_stale_bbo(&two_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
+            StaleBboAction::Fresh
+        );
+
+        let quoteable_one_sided = msg(2100.0, 0.0, 34_000_000_000);
+        assert_eq!(
+            classify_stale_bbo(&quoteable_one_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
             StaleBboAction::Fresh
         );
     }
