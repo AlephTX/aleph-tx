@@ -18,6 +18,7 @@ const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
 const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_secs(2);
 const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(12);
 const MICRO_REFRESH_MIN_RESTING_ORDERS: usize = 3;
+const DEFER_INVENTORY_DEADBAND_MULTIPLIER: f64 = 1.5;
 
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
@@ -268,7 +269,10 @@ pub(super) fn should_defer_post_fill_replenishment(
         inventory_urgency_threshold.max(config.step_size),
         mid,
     );
-    if position_for_quoting.abs() > inventory_urgency_threshold.max(deadband) {
+    let defer_inventory_limit = (deadband * DEFER_INVENTORY_DEADBAND_MULTIPLIER)
+        .max(config.step_size)
+        .min(inventory_urgency_threshold.max(config.step_size));
+    if position_for_quoting.abs() > defer_inventory_limit {
         return false;
     }
 
@@ -303,7 +307,10 @@ pub(super) fn should_defer_micro_refresh(
         inventory_urgency_threshold.max(config.step_size),
         mid,
     );
-    if position_for_quoting.abs() > inventory_urgency_threshold.max(deadband) {
+    let defer_inventory_limit = (deadband * DEFER_INVENTORY_DEADBAND_MULTIPLIER)
+        .max(config.step_size)
+        .min(inventory_urgency_threshold.max(config.step_size));
+    if position_for_quoting.abs() > defer_inventory_limit {
         return false;
     }
 
@@ -702,7 +709,7 @@ mod tests {
 
         assert!(should_defer_post_fill_replenishment(
             &config,
-            0.01,
+            0.005,
             0.015,
             0.08,
             2100.0,
@@ -745,6 +752,37 @@ mod tests {
     }
 
     #[test]
+    fn do_not_defer_post_fill_replenishment_for_medium_inventory_above_deadband() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(!should_defer_post_fill_replenishment(
+            &config,
+            0.02,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_millis(500)),
+            Instant::now(),
+        ));
+    }
+
+    #[test]
     fn defer_micro_refresh_when_recent_small_one_sided_requote() {
         let config = config();
         let bid_plan = SideExecutionPlan {
@@ -764,7 +802,7 @@ mod tests {
 
         assert!(should_defer_micro_refresh(
             &config,
-            -0.02,
+            -0.005,
             0.015,
             0.08,
             2232.0,
@@ -843,6 +881,38 @@ mod tests {
             Some(Instant::now() - Duration::from_secs(3)),
             Instant::now(),
             4,
+        ));
+    }
+
+    #[test]
+    fn do_not_defer_micro_refresh_for_medium_inventory_above_deadband() {
+        let config = config();
+        let bid_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        };
+        let ask_plan = SideExecutionPlan {
+            to_cancel: Vec::new(),
+            to_place: Vec::new(),
+        };
+
+        assert!(!should_defer_micro_refresh(
+            &config,
+            0.02,
+            0.015,
+            0.08,
+            2232.0,
+            &bid_plan,
+            &ask_plan,
+            Some(Instant::now() - Duration::from_secs(2)),
+            Instant::now(),
+            3,
         ));
     }
 
