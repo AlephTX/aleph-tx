@@ -32,14 +32,24 @@ pub(super) enum StaleBboAction {
     Cancel,
 }
 
+fn has_valid_two_sided_book(bbo: &ShmBboMessage) -> bool {
+    bbo.bid_price > 0.0 && bbo.ask_price > 0.0 && bbo.ask_price > bbo.bid_price
+}
+
 pub(super) fn classify_stale_bbo(
-    timestamp_ns: u64,
+    bbo: &ShmBboMessage,
     now_ns: u64,
     first_stale_seen_ns: Option<u64>,
     freeze_threshold_ms: u64,
     cancel_after_ms: u64,
+    static_two_sided_grace_ms: u64,
 ) -> StaleBboAction {
+    let timestamp_ns = bbo.timestamp_ns;
     if !is_stale_bbo(timestamp_ns, now_ns, freeze_threshold_ms) {
+        return StaleBboAction::Fresh;
+    }
+
+    if has_valid_two_sided_book(bbo) && data_age_ms(timestamp_ns, now_ns) <= static_two_sided_grace_ms {
         return StaleBboAction::Fresh;
     }
 
@@ -168,17 +178,23 @@ mod tests {
     fn classify_stale_bbo_freezes_before_canceling() {
         let now_ns = 10_000_000_000;
         let timestamp_ns = 9_994_000_000;
+        let two_sided = msg(2100.0, 2101.0, timestamp_ns);
+        let one_sided = msg(2100.0, 0.0, timestamp_ns);
 
         assert_eq!(
-            classify_stale_bbo(timestamp_ns, now_ns, None, 5, 10_000),
+            classify_stale_bbo(&one_sided, now_ns, None, 5, 10_000, 30_000),
             StaleBboAction::Freeze
         );
         assert_eq!(
-            classify_stale_bbo(timestamp_ns, now_ns, Some(0), 5, 10_000),
+            classify_stale_bbo(&one_sided, now_ns, Some(0), 5, 10_000, 30_000),
             StaleBboAction::Cancel
         );
         assert_eq!(
-            classify_stale_bbo(9_999_000_000, now_ns, None, 5, 10_000),
+            classify_stale_bbo(&msg(2100.0, 2101.0, 9_999_000_000), now_ns, None, 5, 10_000, 30_000),
+            StaleBboAction::Fresh
+        );
+        assert_eq!(
+            classify_stale_bbo(&two_sided, now_ns, None, 5, 10_000, 30_000),
             StaleBboAction::Fresh
         );
     }
