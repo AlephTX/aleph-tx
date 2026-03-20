@@ -53,7 +53,8 @@ use market_state::{
 };
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, local_reference_mid, stabilize_crossed_quotes,
+    fallback_bbo_prices, inventory_adjusted_half_spreads, local_reference_mid,
+    stabilize_crossed_quotes,
 };
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
@@ -1216,11 +1217,13 @@ impl InventoryNeutralMM {
         let max_half_spread = inputs.pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
         let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
         let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
+        let (bid_half_spread, ask_half_spread) =
+            inventory_adjusted_half_spreads(half_spread, urgency_ratio);
 
-        let raw_bid =
-            ((reservation_price - half_spread) / self.config.tick_size).floor() * self.config.tick_size;
-        let raw_ask =
-            ((reservation_price + half_spread) / self.config.tick_size).ceil() * self.config.tick_size;
+        let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
+            * self.config.tick_size;
+        let raw_ask = ((reservation_price + ask_half_spread) / self.config.tick_size).ceil()
+            * self.config.tick_size;
 
         let join_penny_ticks = effective_penny_ticks(
             self.config.penny_ticks,

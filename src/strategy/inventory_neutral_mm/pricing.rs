@@ -57,6 +57,25 @@ pub(super) fn effective_penny_ticks(
     (base_penny_ticks + extra_ticks).clamp(1.0, base_penny_ticks.max(1.0) + 1.5)
 }
 
+pub(super) fn inventory_adjusted_half_spreads(
+    base_half_spread: f64,
+    urgency_ratio: f64,
+) -> (f64, f64) {
+    let flatten_progress = urgency_ratio.abs().clamp(0.0, 1.0);
+    if flatten_progress <= f64::EPSILON {
+        return (base_half_spread, base_half_spread);
+    }
+
+    let tighten = (1.0 - 0.45 * flatten_progress).clamp(0.55, 1.0);
+    let widen = (1.0 + 0.35 * flatten_progress).clamp(1.0, 1.35);
+
+    match urgency_ratio.partial_cmp(&0.0) {
+        Some(std::cmp::Ordering::Greater) => (base_half_spread * widen, base_half_spread * tighten),
+        Some(std::cmp::Ordering::Less) => (base_half_spread * tighten, base_half_spread * widen),
+        _ => (base_half_spread, base_half_spread),
+    }
+}
+
 pub(super) fn anchor_quotes_to_touch(
     raw_bid: f64,
     raw_ask: f64,
