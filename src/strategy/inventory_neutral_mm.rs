@@ -53,7 +53,7 @@ use market_state::{
 };
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, inventory_adjusted_half_spreads, local_reference_mid,
+    fallback_bbo_prices, local_reference_mid,
     stabilize_crossed_quotes,
 };
 
@@ -210,7 +210,7 @@ const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
-const MAX_TOUCH_OFFSET_BPS: f64 = 8.0;
+const MAX_TOUCH_OFFSET_BPS: f64 = 15.0;
 const EXTERNAL_OVERLAY_MAX_BPS: f64 = 2.0;
 const EXTERNAL_OVERLAY_SANITY_BPS: f64 = 25.0;
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
@@ -1208,7 +1208,11 @@ impl InventoryNeutralMM {
             inputs.pricing_mid * (1.0 - gamma * sigma * sigma * q * time_horizon - inventory_skew);
 
         // Spread logic
-        let kappa = self.config.as_kappa + self.estimate_fill_rate();
+        // κ from config is the base order arrival intensity.
+        // Scale it by observed fill rate: more fills → higher κ → tighter spread.
+        let fill_rate = self.estimate_fill_rate();
+        let fill_rate_scale = (fill_rate / 0.05).clamp(0.5, 2.0); // 0.05 fills/s = baseline
+        let kappa = self.config.as_kappa * fill_rate_scale;
         let gamma_safe = gamma.max(1e-6);
         let optimal_spread = gamma * sigma * sigma * time_horizon + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
         let half_spread_raw = optimal_spread / 2.0 * inputs.pricing_mid;
@@ -1217,8 +1221,10 @@ impl InventoryNeutralMM {
         let max_half_spread = inputs.pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
         let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
         let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
-        let (bid_half_spread, ask_half_spread) =
-            inventory_adjusted_half_spreads(half_spread, urgency_ratio);
+        // Inventory adjustment is already embedded in `reservation_price` via `inventory_skew`.
+        // Applying `inventory_adjusted_half_spreads` on top creates a double-skew that
+        // over-tightens the flattening side, causing adverse fills.  Use symmetric half-spreads.
+        let (bid_half_spread, ask_half_spread) = (half_spread, half_spread);
 
         let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
             * self.config.tick_size;
