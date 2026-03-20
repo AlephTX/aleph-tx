@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
-const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(12);
-const CALM_REQUOTE_MIN_LIFETIME: Duration = Duration::from_secs(20);
+const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(4);
+const CALM_REQUOTE_MIN_LIFETIME: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone)]
 pub(super) struct RiskSnapshot {
     pub raw_available_balance: f64,

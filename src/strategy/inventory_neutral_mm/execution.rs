@@ -15,8 +15,8 @@ const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
 const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
 const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
-const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_secs(2);
-const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(12);
+const POST_FILL_REPLENISH_COOLDOWN: Duration = Duration::from_millis(500);
+const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(4);
 const MICRO_REFRESH_MIN_RESTING_ORDERS: usize = 3;
 const DEFER_INVENTORY_DEADBAND_MULTIPLIER: f64 = 1.5;
 
