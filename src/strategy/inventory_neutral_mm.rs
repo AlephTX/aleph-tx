@@ -48,8 +48,8 @@ use execution::{
 };
 use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    build_market_state, classify_stale_bbo, cross_exchange_offset_bps, data_age_ms,
-    external_reference_mid, MarketState, StaleBboAction,
+    build_market_state, classify_stale_bbo, data_age_ms,
+    external_fair_value_mid, MarketState, StaleBboAction,
 };
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
@@ -211,10 +211,10 @@ const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
 const MAX_TOUCH_OFFSET_BPS: f64 = 15.0;
-const EXTERNAL_OVERLAY_MAX_BPS: f64 = 2.0;
-const EXTERNAL_OVERLAY_SANITY_BPS: f64 = 25.0;
+const POSITION_TIMEOUT_SECS: u64 = 120;
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PricingInputs {
     mid: f64,
     pricing_mid: f64,
@@ -222,7 +222,7 @@ struct PricingInputs {
     ask_touch: f64,
     vol_bps: f64,
     as_score: f64,
-    external_offset_bps: f64,
+    using_external_fair_value: bool,
 }
 
 pub struct InventoryNeutralMM {
@@ -393,6 +393,31 @@ impl InventoryNeutralMM {
                 self.execute_quoting_cycle(our_bid, our_ask, quoting_position, inputs.mid).await;
             }
 
+            // Phase 6: Position timeout — IOC flatten if stuck
+            if let Some(last_fill) = self.last_fill_at {
+                let position_abs = self.account_stats.position.abs();
+                let deadband = inventory_deadband_size(
+                    &self.config,
+                    scaled_base_order_size(&self.config, self.account_stats.portfolio_value, inputs.mid)
+                        .max(self.config.step_size),
+                    scaled_inventory_urgency_threshold(
+                        &self.config,
+                        self.account_stats.portfolio_value,
+                        inputs.mid,
+                        scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid),
+                    ),
+                    inputs.mid,
+                );
+                if position_abs > deadband && last_fill.elapsed() > Duration::from_secs(POSITION_TIMEOUT_SECS) {
+                    info!(
+                        "⏰ Position timeout: {:.4} base held for >{}s without fills, IOC flatten",
+                        self.account_stats.position,
+                        POSITION_TIMEOUT_SECS
+                    );
+                    self.execute_timeout_flatten(inputs.mid).await;
+                }
+            }
+
             tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
         
@@ -416,6 +441,7 @@ impl InventoryNeutralMM {
     /// Higher κ → tighter spread (fills are easy to get)
     /// Lower κ → wider spread (fills are scarce, need more edge)
     /// Returns fills per second (matching T's time unit)
+    #[allow(dead_code)]
     fn estimate_fill_rate(&self) -> f64 {
         let recent_fills = self
             .order_tracker
@@ -1111,48 +1137,44 @@ impl InventoryNeutralMM {
     }
 
     /// Calculate signal components and pricing inputs from market state
+    ///
+    /// New flow (v6.0.0): External exchanges (Binance, Hyperliquid) are the PRIMARY
+    /// fair value anchor. Local Lighter BBO is only used for touch positioning.
     fn calculate_pricing_inputs(&mut self, exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES], bbo: &ShmBboMessage) -> PricingInputs {
-        // Lighter MM should quote off its own book only.
-        let mid = local_reference_mid(bbo, self.config.tick_size, LOCAL_FALLBACK_SPREAD_TICKS);
+        // Local mid — always needed for touch positioning
+        let local_mid = local_reference_mid(bbo, self.config.tick_size, LOCAL_FALLBACK_SPREAD_TICKS);
+        let (bid_touch, ask_touch) = fallback_bbo_prices(local_mid, bbo, self.config.tick_size);
 
-        // Calculate VWMicro price if depth data available
-        let (bid_touch, ask_touch) = fallback_bbo_prices(mid, bbo, self.config.tick_size);
-        let mut pricing_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
-            if let Some(depth) = depth_reader.read_depth(self.config.symbol_id, self.config.exchange_id) {
-                self.calculate_vw_micro_price(&depth, bid_touch, ask_touch)
-            } else {
-                mid
-            }
-        } else {
-            mid
-        };
-
+        // External fair value: primary pricing anchor
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let external_offset_bps = external_reference_mid(
+        let external_fair = external_fair_value_mid(
             exchanges,
             self.config.exchange_id,
             now_ns,
-            DATA_STALENESS_THRESHOLD_MS,
-        )
-        .map(|external_mid| {
-            cross_exchange_offset_bps(
-                mid,
-                external_mid,
-                self.config.cross_exchange_as_threshold,
-                self.config.cross_exchange_scale,
-                EXTERNAL_OVERLAY_MAX_BPS,
-                EXTERNAL_OVERLAY_SANITY_BPS,
-            )
-        })
-        .unwrap_or(0.0);
-        if external_offset_bps != 0.0 {
-            pricing_mid *= 1.0 + external_offset_bps / 10000.0;
-        }
+            self.config.external_staleness_ms,
+        );
 
-        // Update microstructure
+        let (pricing_mid, using_external, mid) = if let Some(fair_mid) = external_fair {
+            // External exchanges drive fair value; local mid is only for touch
+            (fair_mid, true, local_mid)
+        } else {
+            // Fallback: use local VWMicro or simple mid when no external data
+            let vw_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
+                if let Some(depth) = depth_reader.read_depth(self.config.symbol_id, self.config.exchange_id) {
+                    self.calculate_vw_micro_price(&depth, bid_touch, ask_touch)
+                } else {
+                    local_mid
+                }
+            } else {
+                local_mid
+            };
+            (vw_mid, false, local_mid)
+        };
+
+        // Update microstructure tracker with pricing_mid (now driven by external exchanges)
         self.micro.update(pricing_mid);
         let vol_bps = self.micro.volatility_bps();
         let as_score = self.micro.adverse_selection_score();
@@ -1164,11 +1186,15 @@ impl InventoryNeutralMM {
             ask_touch,
             vol_bps,
             as_score,
-            external_offset_bps,
+            using_external_fair_value: using_external,
         }
     }
 
-    /// Avellaneda-Stoikov pricing logic
+    /// Avellaneda-Stoikov pricing logic (v6.0.0)
+    ///
+    /// Uses external fair value as pricing_mid. Kappa is used directly from config
+    /// (no fill-rate scaling). Spread cap is dynamic vol-based instead of hard clamp.
+    /// Momentum-aware asymmetric spread replaces old inventory_adjusted_half_spreads.
     fn calculate_optimal_quotes(&self, inputs: &PricingInputs, q: f64) -> Option<(f64, f64)> {
         let toxicity_spread_mult = toxicity_spread_multiplier(
             inputs.as_score,
@@ -1182,18 +1208,11 @@ impl InventoryNeutralMM {
             );
         }
 
-        if inputs.external_offset_bps.abs() >= self.config.cross_exchange_as_threshold {
-            debug!(
-                "External divergence overlay active: offset_bps={:.2}",
-                inputs.external_offset_bps
-            );
-        }
-
         let gamma = self.config.as_gamma;
         let time_horizon = self.config.as_time_horizon_sec;
         let sigma = inputs.vol_bps / 10000.0;
 
-        // Reservation price: local microprice shifted by inventory risk plus
+        // Reservation price: external fair value shifted by inventory risk plus
         // an explicit urgency skew to bias quotes toward flattening.
         let mut runtime_config = self.config.clone();
         runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
@@ -1207,24 +1226,24 @@ impl InventoryNeutralMM {
         let reservation_price =
             inputs.pricing_mid * (1.0 - gamma * sigma * sigma * q * time_horizon - inventory_skew);
 
-        // Spread logic
-        // κ from config is the base order arrival intensity.
-        // Scale it by observed fill rate: more fills → higher κ → tighter spread.
-        let fill_rate = self.estimate_fill_rate();
-        let fill_rate_scale = (fill_rate / 0.05).clamp(0.5, 2.0); // 0.05 fills/s = baseline
-        let kappa = self.config.as_kappa * fill_rate_scale;
+        // Spread logic: use config kappa directly (no fill-rate scaling)
+        let kappa = self.config.as_kappa;
         let gamma_safe = gamma.max(1e-6);
         let optimal_spread = gamma * sigma * sigma * time_horizon + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
         let half_spread_raw = optimal_spread / 2.0 * inputs.pricing_mid;
 
-        // Clamping and floors
-        let max_half_spread = inputs.pricing_mid * self.config.max_spread_bps / 10000.0 / 2.0;
+        // Dynamic vol-based cap replaces hard max_spread_bps clamp
+        let vol_cap_bps = (inputs.vol_bps * 3.0).clamp(6.0, 30.0);
+        let max_half_spread = inputs.pricing_mid * vol_cap_bps / 10000.0 / 2.0;
         let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
         let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
-        // Inventory adjustment is already embedded in `reservation_price` via `inventory_skew`.
-        // Applying `inventory_adjusted_half_spreads` on top creates a double-skew that
-        // over-tightens the flattening side, causing adverse fills.  Use symmetric half-spreads.
-        let (bid_half_spread, ask_half_spread) = (half_spread, half_spread);
+
+        // Momentum-aware asymmetric spread (v6.0.0)
+        // positive momentum = price going up → widen ask, tighten bid
+        let momentum = self.micro.momentum_bps();
+        let momentum_adjust = (momentum / 10.0).clamp(-0.5, 0.5);
+        let bid_half_spread = half_spread * (1.0 - momentum_adjust * 0.3);
+        let ask_half_spread = half_spread * (1.0 + momentum_adjust * 0.3);
 
         let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
             * self.config.tick_size;
@@ -1507,6 +1526,56 @@ impl InventoryNeutralMM {
                     Instant::now() + Duration::from_secs(self.config.margin_cooldown_secs);
             }
         }
+    }
+
+    /// Position timeout flatten: cancel all then IOC at 1-tick aggressive to cross spread
+    async fn execute_timeout_flatten(&mut self, mid: f64) {
+        self.cancel_all_and_sync("position-timeout flatten").await;
+
+        let position = self.account_stats.position;
+        if position.abs() < self.config.step_size || !mid.is_finite() || mid <= 0.0 {
+            return;
+        }
+
+        // Place IOC order at 1-tick aggressive (cross spread)
+        let (side, price) = if position > 0.0 {
+            // Long position: sell at 1 tick below mid to cross
+            (crate::exchange::Side::Sell, ((mid - self.config.tick_size) / self.config.tick_size).floor() * self.config.tick_size)
+        } else {
+            // Short position: buy at 1 tick above mid to cross
+            (crate::exchange::Side::Buy, ((mid + self.config.tick_size) / self.config.tick_size).ceil() * self.config.tick_size)
+        };
+
+        let size = components::round_down_to_step(position.abs(), self.config.step_size);
+        if size < self.config.step_size {
+            return;
+        }
+
+        let action = BatchAction::Place(crate::exchange::OrderParams {
+            side,
+            size,
+            price,
+            order_type: crate::exchange::OrderType::Ioc,
+            reduce_only: true,
+        });
+
+        match self.trading.execute_batch(vec![action]).await {
+            Ok(result) => {
+                info!(
+                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (IOC), tx={}",
+                    side,
+                    size,
+                    price,
+                    result.tx_hashes.first().map(|s| s.as_str()).unwrap_or("?")
+                );
+            }
+            Err(err) => {
+                warn!("⏰ Timeout flatten failed: {}", err);
+            }
+        }
+
+        // Reset last_fill_at to avoid re-triggering immediately
+        self.last_fill_at = Some(Instant::now());
     }
 
 // Removed unused legacy method: cancel_all_orders_legacy

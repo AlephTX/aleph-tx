@@ -178,11 +178,8 @@ fn default_vol_spread_scale() -> f64 {
 fn default_momentum_skew_scale() -> f64 {
     0.3
 }
-fn default_cross_exchange_scale() -> f64 {
-    0.5
-}
-fn default_cross_exchange_as_threshold() -> f64 {
-    8.0
+fn default_external_staleness_ms() -> u64 {
+    2000
 }
 fn default_reference_portfolio_value() -> f64 {
     100.0
@@ -268,11 +265,9 @@ pub struct InventoryNeutralMMConfig {
     pub vol_spread_scale: f64, // default: 0.5 (波动率价差缩放)
     #[serde(default = "default_momentum_skew_scale")]
     pub momentum_skew_scale: f64, // default: 0.3 (动量偏移缩放)
-    // 跨交易所信号 (v5.1.0)
-    #[serde(default = "default_cross_exchange_scale")]
-    pub cross_exchange_scale: f64, // default: 0.5 (跨交易所信号缩放)
-    #[serde(default = "default_cross_exchange_as_threshold")]
-    pub cross_exchange_as_threshold: f64, // default: 8.0 bps (跨交易所AS阈值)
+    // External fair value anchor (v6.0.0)
+    #[serde(default = "default_external_staleness_ms")]
+    pub external_staleness_ms: u64, // default: 2000 (max age for external BBO in ms)
     // Avellaneda-Stoikov 定价参数 (v5.1.0)
     #[serde(default = "default_as_gamma")]
     pub as_gamma: f64, // default: 5000.0 (风险厌恶系数，fractional σ 下需要大值)
@@ -321,8 +316,7 @@ impl Default for InventoryNeutralMMConfig {
             use_depth_pricing: true,
             vol_spread_scale: 0.5,
             momentum_skew_scale: 0.3,
-            cross_exchange_scale: 0.5,
-            cross_exchange_as_threshold: 8.0,
+            external_staleness_ms: 2000,
             as_gamma: 5000.0,
             as_time_horizon_sec: 1.0,
             as_kappa: 2000.0,
