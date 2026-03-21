@@ -5,7 +5,7 @@ alwaysApply: true
 
 # src/
 
-> Rust HFT core: lock-free SHM readers, shadow ledger, multi-exchange strategies, direct HTTP execution.
+> Rust HFT core: lock-free SHM readers, per-order state machine, multi-exchange strategies, direct HTTP execution.
 
 ## Key Files (Root Level)
 
@@ -16,7 +16,7 @@ alwaysApply: true
 | config.rs | `AppConfig` loader from config.toml, precision helpers (`round_to_tick`, `format_price`) |
 | error.rs | `TradingError` enum with all error variants |
 | exchange.rs | `Exchange` trait abstraction for unified trading interface |
-| shm_reader.rs | Lock-free BBO matrix reader (seqlock protocol) |
+| shm_reader.rs | Lock-free BBO matrix reader (seqlock protocol, 7 exchanges) |
 | shm_event_reader.rs | Lock-free V2 event ring buffer reader (SPSC 128-byte) |
 | account_stats_reader.rs | Account stats SHM reader (128-byte versioned) |
 | order_tracker.rs | **v5.0.0** Per-order state machine (`RwLock<TrackerState>`, worst-case bilateral risk) |
@@ -55,7 +55,11 @@ cannot bind `client_order_id -> order_index` and cancel/reconcile logic will deg
         ER --> OT[OrderTracker: Per-Order State Machine]
         OT --> |confirmed_position| POS[Atomic Position]
         OT --> |worst_case_long/short| RISK[Bilateral Risk Check]
-        SL[ShadowLedger - DEPRECATED, used by AdaptiveMM only]
+    end
+
+    subgraph "Pricing (v6.0.0)"
+        SR -->|Binance+HL+EdgeX BBO| EXT[external_fair_value_mid: Median]
+        EXT --> LMM
     end
 
     subgraph "Strategies"
@@ -98,6 +102,5 @@ cannot bind `client_order_id -> order_index` and cancel/reconcile logic will deg
 
 ```bash
 make build                              # Build Rust + Go
-make test-up                            # Integration test (feeder + lighter_trading example)
-make lighter-up STRATEGY=lighter_adaptive_mm    # Production adaptive MM
+make lighter-up STRATEGY=lighter_inventory_mm   # Production inventory-neutral MM
 ```
