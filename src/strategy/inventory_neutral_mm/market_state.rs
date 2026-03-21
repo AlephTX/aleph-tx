@@ -80,11 +80,17 @@ pub(super) fn build_market_state(
     Some(MarketState { exchanges, bbo })
 }
 
-pub(super) fn external_reference_mid(
+/// Primary fair value anchor from external high-liquidity exchanges.
+///
+/// Takes ALL non-local exchange BBOs (exchange_id != local AND != 0),
+/// filters stale data (> staleness_ms), calculates mid for each valid
+/// exchange, and returns the median (robust against single-exchange outlier).
+/// Returns None if no valid external data is available.
+pub(super) fn external_fair_value_mid(
     exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES],
     local_exchange_id: u8,
     now_ns: u64,
-    stale_threshold_ms: u64,
+    staleness_ms: u64,
 ) -> Option<f64> {
     let mut mids: Vec<f64> = exchanges
         .iter()
@@ -94,7 +100,7 @@ pub(super) fn external_reference_mid(
             bbo.bid_price > 0.0
                 && bbo.ask_price > 0.0
                 && bbo.ask_price > bbo.bid_price
-                && !is_stale_bbo(bbo.timestamp_ns, now_ns, stale_threshold_ms)
+                && !is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms)
         })
         .map(|bbo| (bbo.bid_price + bbo.ask_price) / 2.0)
         .collect();
@@ -110,35 +116,6 @@ pub(super) fn external_reference_mid(
             Some((mids[mid_idx - 1] + mids[mid_idx]) / 2.0)
         }
     }
-}
-
-pub(super) fn cross_exchange_offset_bps(
-    local_mid: f64,
-    external_mid: f64,
-    threshold_bps: f64,
-    scale: f64,
-    max_overlay_bps: f64,
-    sanity_band_bps: f64,
-) -> f64 {
-    if local_mid <= 0.0
-        || external_mid <= 0.0
-        || threshold_bps <= 0.0
-        || scale <= 0.0
-        || max_overlay_bps <= 0.0
-        || sanity_band_bps <= 0.0
-    {
-        return 0.0;
-    }
-
-    let raw_delta_bps = (external_mid - local_mid) / local_mid * 10000.0;
-    if raw_delta_bps.abs() > sanity_band_bps {
-        return 0.0;
-    }
-    if raw_delta_bps.abs() < threshold_bps {
-        return 0.0;
-    }
-
-    (raw_delta_bps * scale).clamp(-max_overlay_bps, max_overlay_bps)
 }
 
 #[cfg(test)]
@@ -160,15 +137,20 @@ mod tests {
         }
     }
 
+    fn default_exchange() -> (u8, ShmBboMessage) {
+        (0, ShmBboMessage::default())
+    }
+
     #[test]
     fn build_market_state_selects_local_bbo_when_one_side_exists() {
         let exchanges = [
-            (0, ShmBboMessage::default()),
+            default_exchange(),
             (1, msg(2100.0, 0.0, 1)),
-            (2, ShmBboMessage::default()),
-            (3, ShmBboMessage::default()),
-            (4, ShmBboMessage::default()),
-            (5, ShmBboMessage::default()),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
         ];
 
         let state = build_market_state(exchanges, 1).expect("local bbo should exist");
@@ -224,52 +206,61 @@ mod tests {
     }
 
     #[test]
-    fn external_reference_mid_uses_only_fresh_non_local_two_sided_books() {
+    fn external_fair_value_mid_uses_only_fresh_non_local_two_sided_books() {
         let now_ns = 10_000_000_000;
         let exchanges = [
-            (0, ShmBboMessage::default()),
+            default_exchange(),
             (1, msg(2100.0, 2101.0, 9_999_000_000)),
             (2, msg(2000.0, 2001.0, 9_999_000_000)),
             (3, msg(2200.0, 2201.0, 9_999_000_000)),
-            (4, msg(2300.0, 0.0, 9_999_000_000)),
-            (5, msg(2400.0, 2401.0, 9_000_000_000)),
+            (4, msg(2300.0, 0.0, 9_999_000_000)),   // one-sided, filtered out
+            (5, msg(2400.0, 2401.0, 9_000_000_000)), // stale at 500ms threshold
+            default_exchange(),
         ];
 
+        // local=2 excluded; exch 4 one-sided excluded; exch 5 stale excluded
+        // remaining: exch 1 (2100.5), exch 3 (2200.5) → median = (2100.5+2200.5)/2 = 2150.5
         let external_mid =
-            external_reference_mid(&exchanges, 2, now_ns, 500).expect("external mid");
+            external_fair_value_mid(&exchanges, 2, now_ns, 500).expect("external mid");
 
         assert!((external_mid - 2150.5).abs() < 1e-9);
     }
 
     #[test]
-    fn cross_exchange_offset_bps_requires_meaningful_divergence() {
-        assert_eq!(cross_exchange_offset_bps(2000.0, 2000.5, 5.0, 0.5, 2.0, 25.0), 0.0);
-
-        let offset = cross_exchange_offset_bps(2000.0, 2004.0, 5.0, 0.5, 2.0, 25.0);
-        assert!((offset - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn cross_exchange_offset_bps_rejects_external_outliers() {
-        let offset = cross_exchange_offset_bps(2000.0, 2020.0, 5.0, 0.5, 2.0, 25.0);
-        assert_eq!(offset, 0.0);
-    }
-
-    #[test]
-    fn external_reference_mid_uses_median_not_mean() {
+    fn external_fair_value_mid_uses_median_not_mean() {
         let now_ns = 10_000_000_000;
         let exchanges = [
-            (0, ShmBboMessage::default()),
+            default_exchange(),
             (1, msg(2100.0, 2101.0, 9_999_000_000)),
             (2, msg(2100.0, 2101.0, 9_999_000_000)),
             (3, msg(2500.0, 2501.0, 9_999_000_000)),
-            (4, ShmBboMessage::default()),
-            (5, ShmBboMessage::default()),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
         ];
 
+        // local=0 excluded; 3 valid mids: 2100.5, 2100.5, 2500.5 → median = 2100.5
         let external_mid =
-            external_reference_mid(&exchanges, 0, now_ns, 500).expect("external mid");
+            external_fair_value_mid(&exchanges, 0, now_ns, 500).expect("external mid");
 
         assert!((external_mid - 2100.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn external_fair_value_mid_returns_none_when_all_stale() {
+        let now_ns = 10_000_000_000;
+        let exchanges = [
+            default_exchange(),
+            (1, msg(2100.0, 2101.0, 7_000_000_000)), // 3000ms old, stale at 2000ms
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
+            default_exchange(),
+        ];
+
+        let external_mid = external_fair_value_mid(&exchanges, 0, now_ns, 2000);
+
+        assert!(external_mid.is_none());
     }
 }

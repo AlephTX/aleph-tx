@@ -13,6 +13,7 @@ type Config struct {
 	EdgeX       ExchangeSection `toml:"edgex"`
 	Backpack    ExchangeSection `toml:"backpack"`
 	Hyperliquid ExchangeSection `toml:"hyperliquid"`
+	Binance     ExchangeSection `toml:"binance"`
 }
 
 // ExchangeSection contains both feeder and strategy config
@@ -65,6 +66,12 @@ func (c *Config) ToExchangeMap() map[string]ExchangeConfig {
 			WSURL:   c.Hyperliquid.FeederWSURL,
 			RESTURL: c.Hyperliquid.FeederRESTURL,
 			Symbols: c.Hyperliquid.FeederSymbols,
+		},
+		"binance": {
+			Enabled: c.Binance.FeederEnabled,
+			WSURL:   c.Binance.FeederWSURL,
+			RESTURL: c.Binance.FeederRESTURL,
+			Symbols: c.Binance.FeederSymbols,
 		},
 	}
 }

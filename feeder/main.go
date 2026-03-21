@@ -96,6 +96,18 @@ func main() {
 		}()
 	}
 
+	if bnCfg, ok := exchangeConfigs["binance"]; ok && bnCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			bn := exchanges.NewBinance(bnCfg, matrix)
+			log.Println("🔌 Binance: starting...")
+			if err := bn.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Binance: %v", err)
+			}
+		}()
+	}
+
 	if ltCfg, ok := exchangeConfigs["lighter"]; ok && ltCfg.Enabled {
 		// Create account stats first (needed by private stream)
 		ltStats, err := exchanges.NewLighterAccountStats(ltCfg, accountStats)

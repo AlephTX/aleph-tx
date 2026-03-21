@@ -8,6 +8,7 @@ const (
 	ExchangeEdgeX       uint8 = 3
 	Exchange01          uint8 = 4
 	ExchangeBackpack    uint8 = 5
+	ExchangeBinance     uint8 = 6
 )
 
 // Symbol IDs — global normalized IDs.

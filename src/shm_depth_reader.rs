@@ -2,7 +2,7 @@
 use std::sync::atomic::{Ordering, compiler_fence};
 
 const NUM_SYMBOLS: usize = 2048;
-const NUM_EXCHANGES: usize = 6;
+const NUM_EXCHANGES: usize = 7;
 const DEPTH_LEVELS: usize = 5;
 const SLOT_SIZE: usize = 256; // 256 bytes per snapshot
 

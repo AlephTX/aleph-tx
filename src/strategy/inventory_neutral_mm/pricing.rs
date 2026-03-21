@@ -57,6 +57,7 @@ pub(super) fn effective_penny_ticks(
     (base_penny_ticks + extra_ticks).clamp(1.0, base_penny_ticks.max(1.0) + 1.5)
 }
 
+#[allow(dead_code)]
 pub(super) fn inventory_adjusted_half_spreads(
     base_half_spread: f64,
     urgency_ratio: f64,
