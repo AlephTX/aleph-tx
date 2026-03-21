@@ -6,10 +6,11 @@ use super::components::{
     scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier, utilization_floor_base_order_size,
     usable_balance_fraction, QuoteCycleDecision,
 };
+use super::execution::InventoryContext;
 use super::pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
     fallback_bbo_prices, inventory_adjusted_half_spreads, local_reference_mid,
-    stabilize_crossed_quotes,
+    stabilize_crossed_quotes, AnchorParams,
 };
 use crate::exchange::{OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
@@ -840,14 +841,16 @@ fn scaled_but_quotable_sizes_do_not_skip_execution() {
     };
 
     let decision = decide_quote_cycle(
-        &config,
+        &InventoryContext {
+            config: &config,
+            position_for_quoting: 0.0,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid: 2091.0,
+        },
         target,
-        2091.0,
         config.min_available_balance + 1.0,
         0.0,
-        0.0,
-        config.base_order_size,
-        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::Execute(_)));
@@ -864,14 +867,16 @@ fn sub_step_sizes_still_skip_when_not_low_margin() {
     };
 
     let decision = decide_quote_cycle(
-        &config,
+        &InventoryContext {
+            config: &config,
+            position_for_quoting: 0.0,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid: 2091.0,
+        },
         target,
-        2091.0,
         config.min_available_balance + 1.0,
         0.0,
-        0.0,
-        config.base_order_size,
-        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::Skip));
@@ -942,7 +947,10 @@ fn fallback_bbo_prices_synthesize_missing_side_around_local_mid() {
 #[test]
 fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
     let (bid, ask) =
-        anchor_quotes_to_touch(2106.89, 2118.53, 2112.20, 2112.30, 2112.25, 0.01, 1.0, 0.0, 8.0);
+        anchor_quotes_to_touch(&AnchorParams {
+            raw_bid: 2106.89, raw_ask: 2118.53, bid_touch: 2112.20, ask_touch: 2112.30,
+            mid: 2112.25, tick_size: 0.01, penny_ticks: 1.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
+        });
 
     assert!(bid < 2112.30);
     assert!(ask > 2112.20);
@@ -953,7 +961,10 @@ fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
 #[test]
 fn anchored_quotes_respect_configured_join_buffer() {
     let (bid, ask) =
-        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.03, 2105.015, 0.01, 2.0, 0.0, 8.0);
+        anchor_quotes_to_touch(&AnchorParams {
+            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.03,
+            mid: 2105.015, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
+        });
 
     assert!(bid <= 2105.01);
     assert!(ask >= 2105.02);
@@ -1003,11 +1014,20 @@ fn inventory_adjusted_half_spreads_tighten_flatten_side() {
 #[test]
 fn anchored_quotes_shift_toward_flatten_side_when_inventory_is_biased() {
     let (flat_bid, flat_ask) =
-        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, 0.0, 8.0);
+        anchor_quotes_to_touch(&AnchorParams {
+            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
+            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
+        });
     let (long_bid, long_ask) =
-        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, 1.0, 8.0);
+        anchor_quotes_to_touch(&AnchorParams {
+            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
+            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 1.0, max_touch_offset_bps: 8.0,
+        });
     let (short_bid, short_ask) =
-        anchor_quotes_to_touch(2100.0, 2110.0, 2105.00, 2105.20, 2105.10, 0.01, 2.0, -1.0, 8.0);
+        anchor_quotes_to_touch(&AnchorParams {
+            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
+            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: -1.0, max_touch_offset_bps: 8.0,
+        });
 
     assert!(long_ask <= flat_ask);
     assert!(long_bid <= flat_bid);
@@ -1142,14 +1162,16 @@ fn decide_quote_cycle_requests_clear_when_low_margin_and_quotes_are_too_small() 
     };
 
     let decision = decide_quote_cycle(
-        &config,
+        &InventoryContext {
+            config: &config,
+            position_for_quoting: 0.0,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid: 2100.0,
+        },
         target,
-        2100.0,
         1.0,
         0.0,
-        0.0,
-        config.base_order_size,
-        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::ClearForLowMargin));
@@ -1166,14 +1188,16 @@ fn decide_quote_cycle_executes_when_at_least_one_side_is_actionable() {
     };
 
     let decision = decide_quote_cycle(
-        &config,
+        &InventoryContext {
+            config: &config,
+            position_for_quoting: 0.0,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid: 2100.0,
+        },
         target.clone(),
-        2100.0,
         10.0,
         0.0,
-        0.0,
-        config.base_order_size,
-        config.inventory_urgency_threshold,
     );
 
     match decision {
@@ -1196,14 +1220,16 @@ fn decide_quote_cycle_flattens_when_low_margin_and_position_is_not_flat() {
     };
 
     let decision = decide_quote_cycle(
-        &config,
+        &InventoryContext {
+            config: &config,
+            position_for_quoting: 0.02,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid: 2100.0,
+        },
         target,
-        2100.0,
         1.0,
         0.02,
-        0.02,
-        config.base_order_size,
-        config.inventory_urgency_threshold,
     );
 
     assert!(matches!(decision, QuoteCycleDecision::FlattenForLowMargin));

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # CLAUDE.md
 
-> Rust + Go + Python HFT framework for crypto markets. v5.0.0: per-order state machine, worst-case bilateral risk, lock-free SHM.
+> Rust + Go + Python HFT framework for crypto markets. v6.0.0: external fair value anchor, Binance/HL feeders, momentum-aware spread, position timeout flatten.
 
 ## Build & Test (MANDATORY)
 
@@ -45,7 +45,9 @@ Lighter account stats should be treated as websocket-sourced; the previous REST 
 
 **Optimistic Accounting (v5.0.0)**: `OrderTracker` registers per-order state before API call. Worst-case bilateral exposure checked before every order.
 
-**Strategy Execution**: Market making is powered by the `InventoryNeutralMM` strategy using local-book A-S pricing, event-driven order tracking, and multi-tier grid quoting. Production binaries live in `src/bin/` and run via `cargo run --release --bin inventory_neutral_mm` (NOT `src/main.rs`).
+**External Fair Value Anchor (v6.0.0)**: Pricing uses Binance Futures + Hyperliquid mid-price median as the PRIMARY fair value. Lighter local BBO is only used for touch positioning. Key structs: `InventoryContext` (shared inventory params), `AnchorParams` (quote anchoring), `TelemetrySync` (telemetry update).
+
+**Strategy Execution**: Market making is powered by the `InventoryNeutralMM` strategy using external-anchor A-S pricing, momentum-aware asymmetric spread, event-driven order tracking, and multi-tier grid quoting. Position timeout (120s) triggers IOC flatten to prevent overnight inventory drift. Production binaries live in `src/bin/` and run via `cargo run --release --bin lighter_inventory_mm`.
 `InventoryNeutralMM` sizing is now equity-aware: prefer USD-notional knobs (`base_order_notional_usd`, `max_position_notional_usd`, `inventory_urgency_notional_usd`) over hardcoded base-unit sizes so the same profile scales across account sizes and symbols.
 
 ## Verification Protocol (MANDATORY)
@@ -91,11 +93,13 @@ When compressing context, preserve in priority order:
 
 ## Exchanges
 
-| Exchange | REST API | Auth |
-|----------|----------|------|
-| Lighter DEX | `https://mainnet.zklighter.elliot.ai/api/v1/` | Poseidon2 + EdDSA (FFI) |
-| Backpack | `https://api.backpack.exchange` | Ed25519 (Rust) |
-| EdgeX | `https://pro.edgex.exchange` | StarkNet Pedersen |
+| Exchange | REST API | Auth | SHM ID | Role |
+|----------|----------|------|--------|------|
+| Lighter DEX | `https://mainnet.zklighter.elliot.ai/api/v1/` | Poseidon2 + EdDSA (FFI) | 2 | Trading venue |
+| Binance Futures | `wss://fstream.binance.com` (bookTicker) | None (public) | 6 | Fair value anchor |
+| Hyperliquid | `wss://api.hyperliquid.xyz/ws` (l2Book) | None (public) | 1 | Fair value anchor |
+| EdgeX | `https://pro.edgex.exchange` | StarkNet Pedersen | 3 | Fair value anchor |
+| Backpack | `https://api.backpack.exchange` | Ed25519 (Rust) | 5 | Disabled |
 
 **Lighter DEX**: Chain ID 304, price in cents (×100), FFI lib: `src/native/lighter-signer-linux-amd64.so`
 

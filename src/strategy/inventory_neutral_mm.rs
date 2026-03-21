@@ -44,9 +44,9 @@ use execution::{
     should_defer_cancel_only_refresh, should_defer_micro_refresh,
     should_defer_one_sided_requote,
     should_defer_post_fill_replenishment,
-    size_tolerance_ratio_for_requote, BatchFailureAction,
+    size_tolerance_ratio_for_requote, BatchFailureAction, InventoryContext,
 };
-use housekeeping::{reconcile_interval, sync_telemetry_snapshot};
+use housekeeping::{reconcile_interval, sync_telemetry_snapshot, TelemetrySync};
 use market_state::{
     build_market_state, classify_stale_bbo, data_age_ms,
     external_fair_value_mid, MarketState, StaleBboAction,
@@ -54,7 +54,7 @@ use market_state::{
 use pricing::{
     anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
     fallback_bbo_prices, local_reference_mid,
-    stabilize_crossed_quotes,
+    stabilize_crossed_quotes, AnchorParams,
 };
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
@@ -830,14 +830,14 @@ impl InventoryNeutralMM {
 
     async fn fetch_cleanup_mid_price(&mut self) -> Option<f64> {
         for _ in 0..20 {
-            if let Some(market_state) = self.fetch_market_state().await {
-                if let Some(mid) = cleanup_reference_mid(
+            if let Some(market_state) = self.fetch_market_state().await
+                && let Some(mid) = cleanup_reference_mid(
                     &market_state.bbo,
                     self.config.tick_size,
                     LOCAL_FALLBACK_SPREAD_TICKS,
-                ) {
-                    return Some(mid);
-                }
+                )
+            {
+                return Some(mid);
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -1017,11 +1017,13 @@ impl InventoryNeutralMM {
                 &mut self.telemetry,
                 &self.account_stats,
                 &risk,
-                fill_count,
-                total_fees,
-                self.order_tracker.confirmed_position(),
-                self.order_tracker.net_pending_exposure(),
-                self.order_tracker.effective_position(),
+                &TelemetrySync {
+                    fill_count,
+                    total_fees,
+                    confirmed_position: self.order_tracker.confirmed_position(),
+                    pending_exposure: self.order_tracker.net_pending_exposure(),
+                    effective_position: self.order_tracker.effective_position(),
+                },
             );
             self.telemetry.export_metrics();
             self.print_pnl_update();
@@ -1256,17 +1258,17 @@ impl InventoryNeutralMM {
             self.config.adverse_selection_threshold,
             urgency_ratio,
         );
-        let (our_bid, our_ask) = anchor_quotes_to_touch(
+        let (our_bid, our_ask) = anchor_quotes_to_touch(&AnchorParams {
             raw_bid,
             raw_ask,
-            inputs.bid_touch,
-            inputs.ask_touch,
-            inputs.mid,
-            self.config.tick_size,
-            join_penny_ticks,
-            urgency_ratio,
-            MAX_TOUCH_OFFSET_BPS,
-        );
+            bid_touch: inputs.bid_touch,
+            ask_touch: inputs.ask_touch,
+            mid: inputs.mid,
+            tick_size: self.config.tick_size,
+            penny_ticks: join_penny_ticks,
+            inventory_urgency_ratio: urgency_ratio,
+            max_touch_offset_bps: MAX_TOUCH_OFFSET_BPS,
+        });
 
         match stabilize_crossed_quotes(
             our_bid,
@@ -1310,15 +1312,18 @@ impl InventoryNeutralMM {
         let mut runtime_config = self.config.clone();
         runtime_config.base_order_size = risk.base_order_size;
         runtime_config.min_available_balance = risk.min_available_balance;
-        let decision = decide_quote_cycle(
-            &runtime_config,
-            target.clone(),
+        let inv_ctx = InventoryContext {
+            config: &runtime_config,
+            position_for_quoting: risk.position_for_quoting,
+            base_order_size: risk.base_order_size,
+            inventory_urgency_threshold: risk.inventory_urgency_threshold,
             mid,
+        };
+        let decision = decide_quote_cycle(
+            &inv_ctx,
+            target.clone(),
             safe_available,
             residual_exposure,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
         );
 
         let plan = match decision {
@@ -1353,20 +1358,8 @@ impl InventoryNeutralMM {
             QuoteCycleDecision::Execute(plan) => plan,
         };
 
-        let max_side_replacements = max_side_requote_replacements_per_cycle(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
-        );
-        let size_tolerance_ratio = size_tolerance_ratio_for_requote(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
-        );
+        let max_side_replacements = max_side_requote_replacements_per_cycle(&inv_ctx);
+        let size_tolerance_ratio = size_tolerance_ratio_for_requote(&inv_ctx);
 
         let bid_plan = build_side_execution_plan(
             &runtime_config,
@@ -1392,11 +1385,7 @@ impl InventoryNeutralMM {
         );
 
         if should_defer_one_sided_requote(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
+            &inv_ctx,
             &bid_plan,
             &ask_plan,
         ) {
@@ -1411,11 +1400,7 @@ impl InventoryNeutralMM {
         }
 
         if should_defer_cancel_only_refresh(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
+            &inv_ctx,
             &bid_plan,
             &ask_plan,
         ) {
@@ -1430,11 +1415,7 @@ impl InventoryNeutralMM {
         }
 
         if should_defer_post_fill_replenishment(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
+            &inv_ctx,
             &bid_plan,
             &ask_plan,
             self.last_fill_at,
@@ -1451,11 +1432,7 @@ impl InventoryNeutralMM {
         }
 
         if should_defer_micro_refresh(
-            &self.config,
-            risk.position_for_quoting,
-            risk.base_order_size,
-            risk.inventory_urgency_threshold,
-            mid,
+            &inv_ctx,
             &bid_plan,
             &ask_plan,
             self.last_execution_batch_at,
