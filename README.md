@@ -1,14 +1,18 @@
-# AlephTX v5.0.0
+# AlephTX v6.0.0
 
 Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
 
-**v5.0.0 Highlights**: Per-order state machine (OrderTracker), 128-byte V2 SHM events, worst-case bilateral risk control, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
+**v6.0.0 Highlights**: External fair value anchor (Binance Futures + Hyperliquid median pricing), momentum-aware asymmetric spread, position timeout IOC flatten, `InventoryContext`/`AnchorParams`/`TelemetrySync` parameter structs, 0 clippy warnings.
+
+**v5.0.0 Foundation**: Per-order state machine (OrderTracker), 128-byte V2 SHM events, worst-case bilateral risk control, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
 
 Current Lighter production path:
 - `lighter_inventory_mm` reads `/dev/shm/aleph-events-v2` directly for authoritative private order events.
-- Lighter account stats are sourced from the authenticated websocket `user_stats` stream; the previous REST fallback endpoint is intentionally disabled because it returned persistent `403`.
-- `inventory_neutral_mm` now supports equity-aware sizing. `base_order_notional_usd`, `max_position_notional_usd`, and `inventory_urgency_notional_usd` let one strategy profile scale cleanly from small accounts to larger accounts without rewriting absolute ETH sizes.
-- `symbol_id` + `market_id` are runtime-configured. The same strategy path can be retargeted to other Lighter markets as long as the feeder symbol mapping and exchange metadata are configured.
+- **v6.0.0**: Pricing uses Binance Futures + Hyperliquid mid-price median as PRIMARY fair value anchor. Lighter local BBO only for touch positioning.
+- **v6.0.0**: Momentum-aware asymmetric spread widens against momentum direction to reduce adverse selection.
+- **v6.0.0**: Position timeout (120s) triggers IOC flatten to prevent overnight inventory drift.
+- Equity-aware sizing via `base_order_notional_usd`, `max_position_notional_usd`, `inventory_urgency_notional_usd`.
+- `symbol_id` + `market_id` are runtime-configured. The same strategy path can be retargeted to other Lighter markets.
 
 ## Architecture
 
@@ -18,8 +22,8 @@ Current Lighter production path:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            Go Feeder (Network I/O)                          │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
-│  │  Lighter WS  │  │ Hyperliquid  │  │   Backpack   │  │  EdgeX / 01  │   │
-│  │ Pub/Priv/Acc │  │      WS      │  │      WS      │  │      WS      │   │
+│  │  Lighter WS  │  │   Binance    │  │ Hyperliquid  │  │  EdgeX / 01  │   │
+│  │ Pub/Priv/Acc │  │  Futures WS  │  │      WS      │  │      WS      │   │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
 └─────────┼──────────────────┼──────────────────┼──────────────────┼──────────┘
           │                  │                  │                  │
@@ -29,7 +33,7 @@ Current Lighter production path:
           ┌───────────────────────────────────────────────────────┐
           │         Shared Memory IPC (Lock-Free)                 │
           │  ┌─────────────────────────────────────────────────┐  │
-          │  │ /dev/shm/aleph-matrix        (656KB BBO Matrix) │  │
+          │  │ /dev/shm/aleph-matrix        (917KB BBO Matrix, 7 exchanges) │  │
           │  │ /dev/shm/aleph-depth         (3MB Depth L1-L5)  │  │ ← v5.0.0
           │  │ /dev/shm/aleph-events-v2     (128KB V2 Events)  │  │
           │  │ /dev/shm/aleph-account-stats (128B Stats)       │  │
@@ -195,29 +199,29 @@ aleph-tx/
 
 ## Supported Exchanges
 
-| Exchange | Role | Auth | Status |
-|----------|------|------|--------|
-| **Lighter DEX** | Primary (HFT MM) | Poseidon2 + EdDSA via FFI | Production |
-| **Backpack** | Secondary (MM) | Ed25519 | Ready |
-| **EdgeX** | Secondary (MM) | StarkNet Pedersen L2 | Production |
-| **Hyperliquid** | Data feed | - | Feed only |
-| **01 Exchange** | Data feed | - | Feed only |
+| Exchange | SHM ID | Role | Auth | Status |
+|----------|--------|------|------|--------|
+| **Lighter DEX** | 2 | Trading venue (HFT MM) | Poseidon2 + EdDSA via FFI | Production |
+| **Binance Futures** | 6 | Fair value anchor | None (public bookTicker) | Production |
+| **Hyperliquid** | 1 | Fair value anchor | None (public l2Book) | Production |
+| **EdgeX** | 3 | Fair value anchor | StarkNet Pedersen L2 | Production |
+| **Backpack** | 5 | Secondary (MM) | Ed25519 | Ready |
+| **01 Exchange** | 4 | Data feed | - | Feed only |
 
 ## Strategies
 
-### Inventory-Neutral MM (Primary)
+### Inventory-Neutral MM v6.0 (Primary)
 
 The production strategy (`src/strategy/inventory_neutral_mm.rs`) implements config-driven HFT market making via the `Exchange` trait:
 
-- **Inventory Neutral**: Maintains near-zero net position (98.4% neutral in live testing)
-- **Sigmoid Skew** (v5.0.0): `tanh(pos/max_pos)` curve for smooth inventory control
-- **OBI+VWMicro Pricing** (v5.0.0): Volume-weighted micro price using L1-L5 depth
-- **Exchange Trait**: Works with any exchange implementing `Arc<dyn Exchange>`
-- **Config-Driven**: All parameters externalized to `config.toml` (no hardcoded constants)
-- **Equity-Aware Risk Sizing**: Supports both legacy base-unit knobs and preferred USD-notional sizing
-- **Shadow Ledger**: Optimistic `in_flight_pos` tracking with background reconciliation (lock-free atomics)
+- **External Fair Value Anchor** (v6.0.0): Binance Futures + Hyperliquid mid-price median as primary pricing source
+- **Momentum-Aware Spread** (v6.0.0): Asymmetric half-spreads widen against momentum direction
+- **Position Timeout Flatten** (v6.0.0): IOC flatten after 120s holding beyond deadband
+- **A-S Pricing** (v6.0.0): γ=10, κ=5000, dynamic vol-based spread cap (6-30 bps)
+- **Inventory Neutral**: Maintains near-zero net position via sigmoid skew
+- **Equity-Aware Risk Sizing**: USD-notional sizing (`base_order_notional_usd`, `max_position_notional_usd`)
 - **Batch Quoting**: Paired bid/ask via `place_batch` for atomic updates
-- **Telemetry** (v5.0.0): Structured metrics export (orders, margin cooldown, spread, adverse selection)
+- **Telemetry**: Structured metrics export (orders, margin cooldown, spread, adverse selection)
 
 ### Adaptive MM
 
@@ -270,8 +274,11 @@ EDGEX_ACCOUNT_ID=<id>
 
 | Priority | Item | Description | Status |
 |----------|------|-------------|--------|
+| P0 | **External Fair Value Anchor** | Binance+HL median pricing as primary fair value | ✅ v6.0.0 |
+| P0 | **Momentum-Aware Spread** | Asymmetric spread widening against momentum | ✅ v6.0.0 |
+| P0 | **Position Timeout Flatten** | IOC flatten after 120s holding beyond deadband | ✅ v6.0.0 |
 | P0 | **Sigmoid Inventory Skew** | Replace linear skew with sigmoid/logit curve | ✅ v5.0.0 |
-| P0 | **Grid Laddering** | 3-5 level quoting per side (tight→wide, small→large) | Planned |
+| P0 | **Grid Laddering** | 3-5 level quoting per side (tight→wide, small→large) | ✅ v5.0.0 |
 | P1 | **Micro-Price (OBI)** | Imbalance-weighted mid-price using L2-L5 depth | ✅ v5.0.0 |
 | P1 | **Cross-Exchange Arbitrage** | Statistical arb between Lighter/Backpack/EdgeX | Planned |
 

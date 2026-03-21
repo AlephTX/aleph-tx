@@ -11,16 +11,16 @@ alwaysApply: true
 
 | File | Description |
 |------|-------------|
-| matrix.go | BBO matrix writer (656KB, seqlock protocol, 2048 symbols x 5 exchanges) |
+| matrix.go | BBO matrix writer (917KB, seqlock protocol, 2048 symbols x 7 exchanges) |
 | events.go | Private event ring buffer writer (64KB, 1024 slots, SPSC) |
 | account_stats.go | Account statistics writer (128 bytes, versioned odd/even) |
 
 ## Memory Layouts
 
-### BBO Matrix (`/dev/shm/aleph-matrix`, 656 KB)
+### BBO Matrix (`/dev/shm/aleph-matrix`, ~917 KB)
 ```
 SymbolVersions[2048]  : 16 KB   (atomic u64, cache invalidation)
-BboMatrix[2048][5]    : 640 KB  (64-byte ShmBboMessage per cell)
+BboMatrix[2048][7]    : 896 KB  (64-byte ShmBboMessage per cell, 7 exchanges)
 ```
 
 ### ShmBboMessage (64 bytes, cache-line aligned)

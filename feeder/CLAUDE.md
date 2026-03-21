@@ -19,7 +19,7 @@ alwaysApply: true
 | Directory | Description |
 |-----------|-------------|
 | config/ | TOML config loader (`ExchangeConfig` struct) |
-| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Backpack, EdgeX, 01) |
+| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Binance, Backpack, EdgeX, 01) |
 | shm/ | Shared memory writers - BBO matrix, V1/V2 event rings, account stats, depth |
 
 ## Architecture
@@ -28,6 +28,7 @@ alwaysApply: true
 graph TD
     subgraph "Go Feeder (main.go)"
         CFG[config.toml] --> MAIN[main.go]
+        MAIN --> BN[Binance Futures WS]
         MAIN --> HL[Hyperliquid WS]
         MAIN --> LT[Lighter WS Public]
         MAIN --> LP[Lighter WS Private]
@@ -38,7 +39,7 @@ graph TD
     end
 
     subgraph "Shared Memory"
-        HL & LT & BP & EX & O1 -->|Seqlock Write| MTX["/dev/shm/aleph-matrix (656KB)"]
+        HL & LT & BP & EX & O1 & BN -->|Seqlock Write| MTX["/dev/shm/aleph-matrix (917KB, 7 exchanges)"]
         LP -->|Ring Buffer Write| EVT["/dev/shm/aleph-events (64KB)"]
         LA -->|Versioned Write| ACC["/dev/shm/aleph-account-stats (128B)"]
     end
