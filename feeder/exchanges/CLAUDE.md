@@ -13,6 +13,7 @@ alwaysApply: true
 |------|-------------|
 | base.go | `Exchange` interface + `RunConnectionLoop()` with auto-reconnect |
 | common.go | Exchange/Symbol ID constants, `BuildReverseSymbolMap()` helper |
+| binance.go | Binance Futures bookTicker WS (combined stream, no auth) |
 | lighter.go | Lighter DEX public orderbook WS (market BBO) |
 | lighter_auth.go | Lighter Poseidon2 + EdDSA auth token generator (cached) |
 | lighter_private.go | Lighter private WS (orders, trades, fills -> event ring buffer) |
@@ -31,6 +32,7 @@ alwaysApply: true
 | 3 | EdgeX |
 | 4 | 01 |
 | 5 | Backpack |
+| 6 | Binance |
 
 ## Symbol ID Constants
 

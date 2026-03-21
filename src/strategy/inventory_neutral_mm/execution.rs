@@ -20,6 +20,16 @@ const MICRO_REFRESH_COOLDOWN: Duration = Duration::from_secs(4);
 const MICRO_REFRESH_MIN_RESTING_ORDERS: usize = 3;
 const DEFER_INVENTORY_DEADBAND_MULTIPLIER: f64 = 1.5;
 
+/// Shared inventory context passed to defer/sizing functions to avoid repeating 5 args.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InventoryContext<'a> {
+    pub config: &'a InventoryNeutralMMConfig,
+    pub position_for_quoting: f64,
+    pub base_order_size: f64,
+    pub inventory_urgency_threshold: f64,
+    pub mid: f64,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SideExecutionPlan {
     pub to_cancel: Vec<i64>,
@@ -60,6 +70,7 @@ pub(super) fn classify_batch_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_side_execution_plan(
     config: &InventoryNeutralMMConfig,
     active_orders: &[ActiveOrder],
@@ -120,48 +131,36 @@ pub(super) fn build_side_execution_plan(
     SideExecutionPlan { to_cancel, to_place }
 }
 
-pub(super) fn size_tolerance_ratio_for_requote(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
-) -> f64 {
+pub(super) fn size_tolerance_ratio_for_requote(ctx: &InventoryContext) -> f64 {
     let deadband = inventory_deadband_size(
-        config,
-        base_order_size,
-        inventory_urgency_threshold.max(config.step_size),
-        mid,
+        ctx.config,
+        ctx.base_order_size,
+        ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+        ctx.mid,
     );
-    let urgency = inventory_urgency_threshold.max(config.step_size);
-    if position_for_quoting.abs() <= deadband {
+    let urgency = ctx.inventory_urgency_threshold.max(ctx.config.step_size);
+    if ctx.position_for_quoting.abs() <= deadband {
         CALM_SIZE_TOLERANCE_RATIO
-    } else if position_for_quoting.abs() <= urgency {
+    } else if ctx.position_for_quoting.abs() <= urgency {
         PRE_URGENCY_SIZE_TOLERANCE_RATIO
     } else {
         ACTIVE_SIZE_TOLERANCE_RATIO
     }
 }
 
-pub(super) fn max_side_requote_replacements_per_cycle(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
-) -> usize {
+pub(super) fn max_side_requote_replacements_per_cycle(ctx: &InventoryContext) -> usize {
     let deadband = inventory_deadband_size(
-        config,
-        base_order_size,
-        inventory_urgency_threshold.max(config.step_size),
-        mid,
+        ctx.config,
+        ctx.base_order_size,
+        ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+        ctx.mid,
     );
-    if position_for_quoting.abs() <= deadband {
+    if ctx.position_for_quoting.abs() <= deadband {
         return CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE;
     }
 
-    let urgency = inventory_urgency_threshold.max(config.step_size);
-    let bias_progress = ((position_for_quoting.abs() - deadband) / (urgency - deadband).max(config.step_size))
+    let urgency = ctx.inventory_urgency_threshold.max(ctx.config.step_size);
+    let bias_progress = ((ctx.position_for_quoting.abs() - deadband) / (urgency - deadband).max(ctx.config.step_size))
         .clamp(0.0, 1.0);
     if bias_progress < 0.5 {
         CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE
@@ -189,20 +188,16 @@ pub(super) fn resolve_cancel_client_order_ids(
 }
 
 pub(super) fn should_defer_one_sided_requote(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
+    ctx: &InventoryContext,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
 ) -> bool {
-    let symmetric_mode = position_for_quoting.abs()
+    let symmetric_mode = ctx.position_for_quoting.abs()
         <= inventory_deadband_size(
-            config,
-            base_order_size,
-            inventory_urgency_threshold.max(config.step_size),
-            mid,
+            ctx.config,
+            ctx.base_order_size,
+            ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+            ctx.mid,
         );
     if !symmetric_mode {
         return false;
@@ -215,25 +210,23 @@ pub(super) fn should_defer_one_sided_requote(
 
     // Allow one-sided replenishment and same-side cancel+replace.
     // Only defer pure one-sided cancel churn when the other side is completely idle.
-    (bid_has_cancel && !bid_has_place && !ask_has_cancel && !ask_has_place)
-        || (ask_has_cancel && !ask_has_place && !bid_has_cancel && !bid_has_place)
+    let bid_cancel_only = bid_has_cancel && !bid_has_place;
+    let ask_cancel_only = ask_has_cancel && !ask_has_place;
+    (bid_cancel_only && !ask_has_cancel && !ask_has_place)
+        || (ask_cancel_only && !bid_has_cancel && !bid_has_place)
 }
 
 pub(super) fn should_defer_cancel_only_refresh(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
+    ctx: &InventoryContext,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
 ) -> bool {
-    let symmetric_mode = position_for_quoting.abs()
+    let symmetric_mode = ctx.position_for_quoting.abs()
         <= inventory_deadband_size(
-            config,
-            base_order_size,
-            inventory_urgency_threshold.max(config.step_size),
-            mid,
+            ctx.config,
+            ctx.base_order_size,
+            ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+            ctx.mid,
         );
     if !symmetric_mode {
         return false;
@@ -246,11 +239,7 @@ pub(super) fn should_defer_cancel_only_refresh(
 }
 
 pub(super) fn should_defer_post_fill_replenishment(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
+    ctx: &InventoryContext,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
     last_fill_at: Option<Instant>,
@@ -264,15 +253,15 @@ pub(super) fn should_defer_post_fill_replenishment(
     }
 
     let deadband = inventory_deadband_size(
-        config,
-        base_order_size,
-        inventory_urgency_threshold.max(config.step_size),
-        mid,
+        ctx.config,
+        ctx.base_order_size,
+        ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+        ctx.mid,
     );
     let defer_inventory_limit = (deadband * DEFER_INVENTORY_DEADBAND_MULTIPLIER)
-        .max(config.step_size)
-        .min(inventory_urgency_threshold.max(config.step_size));
-    if position_for_quoting.abs() > defer_inventory_limit {
+        .max(ctx.config.step_size)
+        .min(ctx.inventory_urgency_threshold.max(ctx.config.step_size));
+    if ctx.position_for_quoting.abs() > defer_inventory_limit {
         return false;
     }
 
@@ -283,11 +272,7 @@ pub(super) fn should_defer_post_fill_replenishment(
 }
 
 pub(super) fn should_defer_micro_refresh(
-    config: &InventoryNeutralMMConfig,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
-    mid: f64,
+    ctx: &InventoryContext,
     bid_plan: &SideExecutionPlan,
     ask_plan: &SideExecutionPlan,
     last_execution_at: Option<Instant>,
@@ -302,15 +287,15 @@ pub(super) fn should_defer_micro_refresh(
     }
 
     let deadband = inventory_deadband_size(
-        config,
-        base_order_size,
-        inventory_urgency_threshold.max(config.step_size),
-        mid,
+        ctx.config,
+        ctx.base_order_size,
+        ctx.inventory_urgency_threshold.max(ctx.config.step_size),
+        ctx.mid,
     );
     let defer_inventory_limit = (deadband * DEFER_INVENTORY_DEADBAND_MULTIPLIER)
-        .max(config.step_size)
-        .min(inventory_urgency_threshold.max(config.step_size));
-    if position_for_quoting.abs() > defer_inventory_limit {
+        .max(ctx.config.step_size)
+        .min(ctx.inventory_urgency_threshold.max(ctx.config.step_size));
+    if ctx.position_for_quoting.abs() > defer_inventory_limit {
         return false;
     }
 
@@ -408,7 +393,7 @@ mod tests {
         );
 
         assert_eq!(plan.to_cancel, vec![102]);
-        assert!(plan.to_place.len() >= 1);
+        assert!(!plan.to_place.is_empty());
         assert!(plan.to_place.iter().all(|order| order.side == Side::Buy));
     }
 
@@ -513,29 +498,27 @@ mod tests {
         assert_eq!(telemetry.orders_placed, 2);
     }
 
+    fn inv_ctx(config: &InventoryNeutralMMConfig, position_for_quoting: f64, mid: f64) -> InventoryContext<'_> {
+        InventoryContext {
+            config,
+            position_for_quoting,
+            base_order_size: config.base_order_size,
+            inventory_urgency_threshold: config.inventory_urgency_threshold,
+            mid,
+        }
+    }
+
     #[test]
     fn calm_inventory_uses_wider_size_tolerance() {
         let config = config();
         let calm_ratio = size_tolerance_ratio_for_requote(
-            &config,
-            config.step_size,
-            config.base_order_size,
-            config.inventory_urgency_threshold,
-            2100.0,
+            &inv_ctx(&config, config.step_size, 2100.0),
         );
         let active_ratio = size_tolerance_ratio_for_requote(
-            &config,
-            config.inventory_urgency_threshold * 2.0,
-            config.base_order_size,
-            config.inventory_urgency_threshold,
-            2100.0,
+            &inv_ctx(&config, config.inventory_urgency_threshold * 2.0, 2100.0),
         );
         let pre_urgency_ratio = size_tolerance_ratio_for_requote(
-            &config,
-            config.inventory_urgency_threshold * 0.75,
-            config.base_order_size,
-            config.inventory_urgency_threshold,
-            2100.0,
+            &inv_ctx(&config, config.inventory_urgency_threshold * 0.75, 2100.0),
         );
 
         assert!(calm_ratio > pre_urgency_ratio);
@@ -605,7 +588,7 @@ mod tests {
         };
 
         assert!(should_defer_one_sided_requote(
-            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+            &inv_ctx(&config, 0.005, 2100.0), &bid_plan, &ask_plan
         ));
     }
 
@@ -622,7 +605,7 @@ mod tests {
         };
 
         assert!(should_defer_one_sided_requote(
-            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+            &inv_ctx(&config, 0.005, 2100.0), &bid_plan, &ask_plan
         ));
     }
 
@@ -645,7 +628,7 @@ mod tests {
         };
 
         assert!(!should_defer_one_sided_requote(
-            &config, 0.005, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+            &inv_ctx(&config, 0.005, 2100.0), &bid_plan, &ask_plan
         ));
     }
 
@@ -662,7 +645,7 @@ mod tests {
         };
 
         assert!(should_defer_cancel_only_refresh(
-            &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+            &inv_ctx(&config, 0.0, 2100.0), &bid_plan, &ask_plan
         ));
     }
 
@@ -685,7 +668,7 @@ mod tests {
         };
 
         assert!(!should_defer_cancel_only_refresh(
-            &config, 0.0, 0.015, 0.08, 2100.0, &bid_plan, &ask_plan
+            &inv_ctx(&config, 0.0, 2100.0), &bid_plan, &ask_plan
         ));
     }
 
@@ -708,11 +691,7 @@ mod tests {
         };
 
         assert!(should_defer_post_fill_replenishment(
-            &config,
-            0.005,
-            0.015,
-            0.08,
-            2100.0,
+            &inv_ctx(&config, 0.005, 2100.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_millis(500)),
@@ -739,11 +718,7 @@ mod tests {
         };
 
         assert!(!should_defer_post_fill_replenishment(
-            &config,
-            0.12,
-            0.015,
-            0.08,
-            2100.0,
+            &inv_ctx(&config, 0.12, 2100.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_millis(500)),
@@ -770,11 +745,7 @@ mod tests {
         };
 
         assert!(!should_defer_post_fill_replenishment(
-            &config,
-            0.02,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, 0.02, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_millis(500)),
@@ -801,11 +772,7 @@ mod tests {
         };
 
         assert!(should_defer_micro_refresh(
-            &config,
-            -0.005,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, -0.005, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(3)),
@@ -833,11 +800,7 @@ mod tests {
         };
 
         assert!(!should_defer_micro_refresh(
-            &config,
-            -0.02,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, -0.02, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(13)),
@@ -871,11 +834,7 @@ mod tests {
         };
 
         assert!(!should_defer_micro_refresh(
-            &config,
-            -0.02,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, -0.02, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(3)),
@@ -903,11 +862,7 @@ mod tests {
         };
 
         assert!(!should_defer_micro_refresh(
-            &config,
-            0.02,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, 0.02, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(2)),
@@ -929,11 +884,7 @@ mod tests {
         };
 
         assert!(should_defer_micro_refresh(
-            &config,
-            0.0,
-            0.015,
-            0.08,
-            2232.0,
+            &inv_ctx(&config, 0.0, 2232.0),
             &bid_plan,
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(2)),
@@ -946,7 +897,7 @@ mod tests {
     fn calm_inventory_uses_one_side_replacement_per_cycle() {
         let config = config();
         assert_eq!(
-            max_side_requote_replacements_per_cycle(&config, 0.0, 0.015, 0.08, 2100.0),
+            max_side_requote_replacements_per_cycle(&inv_ctx(&config, 0.0, 2100.0)),
             1
         );
     }
@@ -955,7 +906,7 @@ mod tests {
     fn urgent_inventory_uses_two_side_replacements_per_cycle() {
         let config = config();
         assert_eq!(
-            max_side_requote_replacements_per_cycle(&config, 0.08, 0.015, 0.08, 2100.0),
+            max_side_requote_replacements_per_cycle(&inv_ctx(&config, 0.08, 2100.0)),
             2
         );
     }

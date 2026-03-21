@@ -8,25 +8,29 @@ pub(super) fn reconcile_interval(base_secs: u64, consecutive_failures: u32) -> D
     Duration::from_secs(base_secs.saturating_mul(backoff_mult))
 }
 
+pub(super) struct TelemetrySync {
+    pub fill_count: u64,
+    pub total_fees: f64,
+    pub confirmed_position: f64,
+    pub pending_exposure: f64,
+    pub effective_position: f64,
+}
+
 pub(super) fn sync_telemetry_snapshot(
     telemetry: &mut TelemetryCollector,
     account_stats: &AccountStats,
     risk: &RiskSnapshot,
-    fill_count: u64,
-    total_fees: f64,
-    tracker_confirmed_position: f64,
-    tracker_pending_exposure: f64,
-    tracker_effective_position: f64,
+    ts: &TelemetrySync,
 ) {
-    telemetry.fill_count = fill_count;
-    telemetry.total_fees_paid = total_fees;
+    telemetry.fill_count = ts.fill_count;
+    telemetry.total_fees_paid = ts.total_fees;
     telemetry.raw_available_balance = risk.raw_available_balance;
     telemetry.available_balance = risk.available_balance;
     telemetry.portfolio_value = account_stats.portfolio_value;
     telemetry.quote_position = risk.position_for_quoting;
-    telemetry.tracker_confirmed_position = tracker_confirmed_position;
-    telemetry.tracker_pending_exposure = tracker_pending_exposure;
-    telemetry.tracker_effective_position = tracker_effective_position;
+    telemetry.tracker_confirmed_position = ts.confirmed_position;
+    telemetry.tracker_pending_exposure = ts.pending_exposure;
+    telemetry.tracker_effective_position = ts.effective_position;
     telemetry.worst_case_long = risk.worst_case_long;
     telemetry.worst_case_short = risk.worst_case_short;
     telemetry.usable_balance = risk.usable_balance;
@@ -71,7 +75,13 @@ mod tests {
             grid_multiplier: 2.0,
         };
 
-        sync_telemetry_snapshot(&mut telemetry, &account_stats, &risk, 12, 1.25, 0.01, -0.03, -0.02);
+        sync_telemetry_snapshot(&mut telemetry, &account_stats, &risk, &TelemetrySync {
+            fill_count: 12,
+            total_fees: 1.25,
+            confirmed_position: 0.01,
+            pending_exposure: -0.03,
+            effective_position: -0.02,
+        });
 
         assert_eq!(telemetry.fill_count, 12);
         assert_eq!(telemetry.total_fees_paid, 1.25);

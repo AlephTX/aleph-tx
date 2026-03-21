@@ -77,49 +77,51 @@ pub(super) fn inventory_adjusted_half_spreads(
     }
 }
 
-pub(super) fn anchor_quotes_to_touch(
-    raw_bid: f64,
-    raw_ask: f64,
-    bid_touch: f64,
-    ask_touch: f64,
-    mid: f64,
-    tick_size: f64,
-    penny_ticks: f64,
-    inventory_urgency_ratio: f64,
-    max_touch_offset_bps: f64,
-) -> (f64, f64) {
-    let join_buffer = (penny_ticks.max(1.0) * tick_size).max(tick_size);
-    let flatten_bias = inventory_urgency_ratio.abs().clamp(0.0, 1.0) * tick_size;
-    let bid_join_buffer = if inventory_urgency_ratio > 0.0 {
+pub(super) struct AnchorParams {
+    pub raw_bid: f64,
+    pub raw_ask: f64,
+    pub bid_touch: f64,
+    pub ask_touch: f64,
+    pub mid: f64,
+    pub tick_size: f64,
+    pub penny_ticks: f64,
+    pub inventory_urgency_ratio: f64,
+    pub max_touch_offset_bps: f64,
+}
+
+pub(super) fn anchor_quotes_to_touch(params: &AnchorParams) -> (f64, f64) {
+    let join_buffer = (params.penny_ticks.max(1.0) * params.tick_size).max(params.tick_size);
+    let flatten_bias = params.inventory_urgency_ratio.abs().clamp(0.0, 1.0) * params.tick_size;
+    let bid_join_buffer = if params.inventory_urgency_ratio > 0.0 {
         join_buffer + flatten_bias
     } else {
-        (join_buffer - flatten_bias).max(tick_size)
+        (join_buffer - flatten_bias).max(params.tick_size)
     };
-    let ask_join_buffer = if inventory_urgency_ratio < 0.0 {
+    let ask_join_buffer = if params.inventory_urgency_ratio < 0.0 {
         join_buffer + flatten_bias
     } else {
-        (join_buffer - flatten_bias).max(tick_size)
+        (join_buffer - flatten_bias).max(params.tick_size)
     };
-    let join_bid = if ask_touch - bid_touch > bid_join_buffer {
-        ask_touch - bid_join_buffer
+    let join_bid = if params.ask_touch - params.bid_touch > bid_join_buffer {
+        params.ask_touch - bid_join_buffer
     } else {
-        bid_touch
+        params.bid_touch
     };
-    let join_ask = if ask_touch - bid_touch > ask_join_buffer {
-        bid_touch + ask_join_buffer
+    let join_ask = if params.ask_touch - params.bid_touch > ask_join_buffer {
+        params.bid_touch + ask_join_buffer
     } else {
-        ask_touch
+        params.ask_touch
     };
-    let max_touch_offset = mid * max_touch_offset_bps / 10000.0;
+    let max_touch_offset = params.mid * params.max_touch_offset_bps / 10000.0;
 
-    let mut bid = raw_bid.max(join_bid - max_touch_offset);
-    let mut ask = raw_ask.min(join_ask + max_touch_offset);
+    let mut bid = params.raw_bid.max(join_bid - max_touch_offset);
+    let mut ask = params.raw_ask.min(join_ask + max_touch_offset);
 
-    bid = bid.min(ask_touch - tick_size);
-    ask = ask.max(bid_touch + tick_size);
+    bid = bid.min(params.ask_touch - params.tick_size);
+    ask = ask.max(params.bid_touch + params.tick_size);
 
-    bid = (bid / tick_size).floor() * tick_size;
-    ask = (ask / tick_size).ceil() * tick_size;
+    bid = (bid / params.tick_size).floor() * params.tick_size;
+    ask = (ask / params.tick_size).ceil() * params.tick_size;
     (bid, ask)
 }
 

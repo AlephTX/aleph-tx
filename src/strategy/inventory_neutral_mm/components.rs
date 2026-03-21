@@ -1,4 +1,5 @@
 use super::ActiveOrder;
+use super::execution::InventoryContext;
 use crate::order_tracker::OrderLifecycle;
 use crate::config::InventoryNeutralMMConfig;
 use crate::exchange::{OrderParams, OrderType, Side};
@@ -304,9 +305,7 @@ pub(super) fn reconcile_side_plan(
         // Keep calm-market levels stickier so small touch drift does not constantly reset queue priority.
         let level_threshold = if calm_mode && level_idx < 2 {
             threshold * 2.0
-        } else if calm_mode {
-            threshold * 1.5
-        } else if level_idx < 2 {
+        } else if calm_mode || level_idx < 2 {
             threshold * 1.5
         } else {
             threshold
@@ -530,19 +529,15 @@ pub(super) fn build_execution_plan(
 }
 
 pub(super) fn decide_quote_cycle(
-    config: &InventoryNeutralMMConfig,
+    ctx: &InventoryContext,
     target: QuoteTarget,
-    mid: f64,
     available_balance: f64,
     position_abs: f64,
-    position_for_quoting: f64,
-    base_order_size: f64,
-    inventory_urgency_threshold: f64,
 ) -> QuoteCycleDecision {
-    let min_quotable_size = config.step_size.max(0.0);
+    let min_quotable_size = ctx.config.step_size.max(0.0);
     if target.bid_size < min_quotable_size && target.ask_size < min_quotable_size {
-        if available_balance < config.min_available_balance {
-            if position_abs >= config.step_size {
+        if available_balance < ctx.config.min_available_balance {
+            if position_abs >= ctx.config.step_size {
                 QuoteCycleDecision::FlattenForLowMargin
             } else {
                 QuoteCycleDecision::ClearForLowMargin
@@ -552,12 +547,12 @@ pub(super) fn decide_quote_cycle(
         }
     } else {
         QuoteCycleDecision::Execute(build_execution_plan(
-            config,
+            ctx.config,
             target,
-            mid,
-            position_for_quoting,
-            base_order_size,
-            inventory_urgency_threshold,
+            ctx.mid,
+            ctx.position_for_quoting,
+            ctx.base_order_size,
+            ctx.inventory_urgency_threshold,
         ))
     }
 }
