@@ -86,35 +86,73 @@ pub(super) fn build_market_state(
 /// filters stale data (> staleness_ms), calculates mid for each valid
 /// exchange, and returns the median (robust against single-exchange outlier).
 /// Returns None if no valid external data is available.
+///
+/// v6.0.1: Added DEBUG logging to track staleness and fallback behavior.
 pub(super) fn external_fair_value_mid(
     exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES],
     local_exchange_id: u8,
     now_ns: u64,
     staleness_ms: u64,
 ) -> Option<f64> {
-    let mut mids: Vec<f64> = exchanges
+    let external_exchanges: Vec<(u8, ShmBboMessage)> = exchanges
         .iter()
         .filter(|(exchange_id, _)| *exchange_id != local_exchange_id && *exchange_id != 0)
-        .map(|(_, bbo)| *bbo)
-        .filter(|bbo| {
-            bbo.bid_price > 0.0
-                && bbo.ask_price > 0.0
-                && bbo.ask_price > bbo.bid_price
-                && !is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms)
-        })
-        .map(|bbo| (bbo.bid_price + bbo.ask_price) / 2.0)
+        .map(|(id, bbo)| (*id, *bbo))
         .collect();
 
-    if mids.is_empty() {
+    let mut valid_mids: Vec<(u8, f64, u64)> = Vec::new();
+    let mut stale_count = 0;
+    let mut invalid_count = 0;
+
+    for (exchange_id, bbo) in external_exchanges {
+        let age_ms = data_age_ms(bbo.timestamp_ns, now_ns);
+
+        if bbo.bid_price <= 0.0 || bbo.ask_price <= 0.0 || bbo.ask_price <= bbo.bid_price {
+            invalid_count += 1;
+            continue;
+        }
+
+        if is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms) {
+            stale_count += 1;
+            tracing::debug!(
+                "External exchange {} stale: age={}ms (threshold={}ms)",
+                exchange_id,
+                age_ms,
+                staleness_ms
+            );
+            continue;
+        }
+
+        let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
+        valid_mids.push((exchange_id, mid, age_ms));
+    }
+
+    if valid_mids.is_empty() {
+        if stale_count > 0 || invalid_count > 0 {
+            tracing::debug!(
+                "External fair value unavailable: stale={} invalid={} → fallback to local VWMicro",
+                stale_count,
+                invalid_count
+            );
+        }
         None
     } else {
-        mids.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid_idx = mids.len() / 2;
-        if mids.len() % 2 == 1 {
-            Some(mids[mid_idx])
+        valid_mids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mid_idx = valid_mids.len() / 2;
+        let median = if valid_mids.len() % 2 == 1 {
+            valid_mids[mid_idx].1
         } else {
-            Some((mids[mid_idx - 1] + mids[mid_idx]) / 2.0)
-        }
+            (valid_mids[mid_idx - 1].1 + valid_mids[mid_idx].1) / 2.0
+        };
+
+        tracing::debug!(
+            "External fair value: median=${:.2} from {} exchanges: {:?}",
+            median,
+            valid_mids.len(),
+            valid_mids.iter().map(|(id, mid, age)| format!("{}@${:.2}({}ms)", id, mid, age)).collect::<Vec<_>>()
+        );
+
+        Some(median)
     }
 }
 

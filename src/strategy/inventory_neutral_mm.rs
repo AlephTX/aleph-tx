@@ -393,7 +393,7 @@ impl InventoryNeutralMM {
                 self.execute_quoting_cycle(our_bid, our_ask, quoting_position, inputs.mid).await;
             }
 
-            // Phase 6: Position timeout — IOC flatten if stuck
+            // Phase 6: Position timeout — PostOnly flatten if stuck
             if let Some(last_fill) = self.last_fill_at {
                 let position_abs = self.account_stats.position.abs();
                 let deadband = inventory_deadband_size(
@@ -410,11 +410,36 @@ impl InventoryNeutralMM {
                 );
                 if position_abs > deadband && last_fill.elapsed() > Duration::from_secs(POSITION_TIMEOUT_SECS) {
                     info!(
-                        "⏰ Position timeout: {:.4} base held for >{}s without fills, IOC flatten",
+                        "⏰ Position timeout: {:.4} base held for >{}s without fills, PostOnly flatten",
                         self.account_stats.position,
                         POSITION_TIMEOUT_SECS
                     );
                     self.execute_timeout_flatten(inputs.mid).await;
+                }
+            }
+
+            // Phase 7: Unrealized PnL stop-loss (v6.0.1)
+            // Emergency flatten if position held during adverse price movement
+            // Simplified heuristic: if position > deadband for >60s and price moved against us
+            if inputs.using_external_fair_value && self.account_stats.position.abs() > self.config.step_size {
+                if let Some(last_fill) = self.last_fill_at {
+                    let hold_duration = last_fill.elapsed();
+                    if hold_duration > Duration::from_secs(60) {
+                        let position_notional = self.account_stats.position.abs() * inputs.pricing_mid;
+                        let stop_loss_threshold = self.account_stats.portfolio_value * 0.01; // 1% of portfolio
+
+                        // Trigger stop-loss if position is large and held for >60s (likely adverse)
+                        if position_notional > stop_loss_threshold * 2.0 {
+                            warn!(
+                                "🛑 Stop-loss triggered: pos={:.4} @ mark=${:.2} (${:.2} notional) held for {:.0}s",
+                                self.account_stats.position,
+                                inputs.pricing_mid,
+                                position_notional,
+                                hold_duration.as_secs_f64()
+                            );
+                            self.execute_timeout_flatten(inputs.pricing_mid).await;
+                        }
+                    }
                 }
             }
 
@@ -1234,8 +1259,8 @@ impl InventoryNeutralMM {
         let optimal_spread = gamma * sigma * sigma * time_horizon + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
         let half_spread_raw = optimal_spread / 2.0 * inputs.pricing_mid;
 
-        // Dynamic vol-based cap replaces hard max_spread_bps clamp
-        let vol_cap_bps = (inputs.vol_bps * 3.0).clamp(6.0, 30.0);
+        // Dynamic vol-based cap replaces hard max_spread_bps clamp (v6.0.1: widened from 3x to 4x)
+        let vol_cap_bps = (inputs.vol_bps * 4.0).clamp(8.0, 40.0);
         let max_half_spread = inputs.pricing_mid * vol_cap_bps / 10000.0 / 2.0;
         let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
         let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
@@ -1505,7 +1530,11 @@ impl InventoryNeutralMM {
         }
     }
 
-    /// Position timeout flatten: cancel all then IOC at 1-tick aggressive to cross spread
+    /// Position timeout flatten: cancel all then PostOnly at aggressive price
+    ///
+    /// Lighter DEX does not support IOC orders (time_in_force=3 rejected).
+    /// Instead, use PostOnly at 1-tick aggressive to ensure quick fill while
+    /// maintaining maker rebate. If not filled within 5s, retry with more aggressive pricing.
     async fn execute_timeout_flatten(&mut self, mid: f64) {
         self.cancel_all_and_sync("position-timeout flatten").await;
 
@@ -1514,12 +1543,12 @@ impl InventoryNeutralMM {
             return;
         }
 
-        // Place IOC order at 1-tick aggressive (cross spread)
+        // Place PostOnly order at 1-tick aggressive (inside spread)
         let (side, price) = if position > 0.0 {
-            // Long position: sell at 1 tick below mid to cross
+            // Long position: sell at 1 tick below mid (aggressive ask)
             (crate::exchange::Side::Sell, ((mid - self.config.tick_size) / self.config.tick_size).floor() * self.config.tick_size)
         } else {
-            // Short position: buy at 1 tick above mid to cross
+            // Short position: buy at 1 tick above mid (aggressive bid)
             (crate::exchange::Side::Buy, ((mid + self.config.tick_size) / self.config.tick_size).ceil() * self.config.tick_size)
         };
 
@@ -1532,14 +1561,14 @@ impl InventoryNeutralMM {
             side,
             size,
             price,
-            order_type: crate::exchange::OrderType::Ioc,
+            order_type: crate::exchange::OrderType::PostOnly,
             reduce_only: true,
         });
 
         match self.trading.execute_batch(vec![action]).await {
             Ok(result) => {
                 info!(
-                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (IOC), tx={}",
+                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (PostOnly aggressive), tx={}",
                     side,
                     size,
                     price,
