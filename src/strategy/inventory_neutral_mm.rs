@@ -211,7 +211,7 @@ const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
 const MAX_TOUCH_OFFSET_BPS: f64 = 15.0;
-const POSITION_TIMEOUT_SECS: u64 = 120;
+const POSITION_TIMEOUT_SECS: u64 = 60;
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -340,6 +340,22 @@ impl InventoryNeutralMM {
 
             // Phase 1: Institutional Housekeeping
             self.perform_periodic_housekeeping().await;
+
+            // Daily PnL circuit breaker (v6.0.2): shutdown if loss exceeds 5% of session start balance
+            if self.session_start_balance > 0.0 {
+                let daily_pnl_pct = (self.account_stats.portfolio_value - self.session_start_balance)
+                    / self.session_start_balance;
+                if daily_pnl_pct < -0.05 {
+                    tracing::error!(
+                        "🚨 Daily loss limit breached: {:.2}% (${:.2} → ${:.2}), shutting down",
+                        daily_pnl_pct * 100.0,
+                        self.session_start_balance,
+                        self.account_stats.portfolio_value
+                    );
+                    self.perform_graceful_shutdown().await.map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+                    return Ok(());
+                }
+            }
 
             // Margin cooldown check
             if Instant::now() < self.margin_cooldown_until {
@@ -1265,12 +1281,14 @@ impl InventoryNeutralMM {
         let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
         let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
 
-        // Momentum-aware asymmetric spread (v6.0.0)
-        // positive momentum = price going up → widen ask, tighten bid
+        // Momentum-aware asymmetric spread (v6.0.2 — direction FIXED)
+        // positive momentum = price going up → tighten ask (sell into strength), widen bid (don't chase)
+        // negative momentum = price going down → tighten bid (buy into weakness), widen ask (don't chase)
+        // This follows momentum instead of fighting it.
         let momentum = self.micro.momentum_bps();
         let momentum_adjust = (momentum / 10.0).clamp(-0.5, 0.5);
-        let bid_half_spread = half_spread * (1.0 - momentum_adjust * 0.3);
-        let ask_half_spread = half_spread * (1.0 + momentum_adjust * 0.3);
+        let bid_half_spread = half_spread * (1.0 + momentum_adjust * 0.3);
+        let ask_half_spread = half_spread * (1.0 - momentum_adjust * 0.3);
 
         let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
             * self.config.tick_size;
@@ -1530,11 +1548,10 @@ impl InventoryNeutralMM {
         }
     }
 
-    /// Position timeout flatten: cancel all then PostOnly at aggressive price
+    /// Position timeout flatten: cancel all then Limit cross-spread to guarantee fill
     ///
-    /// Lighter DEX does not support IOC orders (time_in_force=3 rejected).
-    /// Instead, use PostOnly at 1-tick aggressive to ensure quick fill while
-    /// maintaining maker rebate. If not filled within 5s, retry with more aggressive pricing.
+    /// Lighter DEX does not support IOC orders. PostOnly may not fill if no counterparty.
+    /// Use aggressive Limit order that crosses the spread (20 bps slippage) to guarantee execution.
     async fn execute_timeout_flatten(&mut self, mid: f64) {
         self.cancel_all_and_sync("position-timeout flatten").await;
 
@@ -1543,13 +1560,14 @@ impl InventoryNeutralMM {
             return;
         }
 
-        // Place PostOnly order at 1-tick aggressive (inside spread)
+        // Aggressive Limit order: cross spread by 20 bps to guarantee fill
+        let slippage = mid * 0.002; // 20 bps
         let (side, price) = if position > 0.0 {
-            // Long position: sell at 1 tick below mid (aggressive ask)
-            (crate::exchange::Side::Sell, ((mid - self.config.tick_size) / self.config.tick_size).floor() * self.config.tick_size)
+            // Long: sell aggressively below mid
+            (crate::exchange::Side::Sell, ((mid - slippage) / self.config.tick_size).floor() * self.config.tick_size)
         } else {
-            // Short position: buy at 1 tick above mid (aggressive bid)
-            (crate::exchange::Side::Buy, ((mid + self.config.tick_size) / self.config.tick_size).ceil() * self.config.tick_size)
+            // Short: buy aggressively above mid
+            (crate::exchange::Side::Buy, ((mid + slippage) / self.config.tick_size).ceil() * self.config.tick_size)
         };
 
         let size = components::round_down_to_step(position.abs(), self.config.step_size);
@@ -1561,14 +1579,14 @@ impl InventoryNeutralMM {
             side,
             size,
             price,
-            order_type: crate::exchange::OrderType::PostOnly,
+            order_type: crate::exchange::OrderType::Limit,
             reduce_only: true,
         });
 
         match self.trading.execute_batch(vec![action]).await {
             Ok(result) => {
                 info!(
-                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (PostOnly aggressive), tx={}",
+                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (Limit cross-spread), tx={}",
                     side,
                     size,
                     price,
