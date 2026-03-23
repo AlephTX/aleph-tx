@@ -62,3 +62,4 @@ skills-lock.json
 # Temporary review/prompt files
 claude_prompt.md
 deep_review_*.md
+.gstack/
