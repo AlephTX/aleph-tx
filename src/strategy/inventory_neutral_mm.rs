@@ -437,24 +437,23 @@ impl InventoryNeutralMM {
             // Phase 7: Unrealized PnL stop-loss (v6.0.1)
             // Emergency flatten if position held during adverse price movement
             // Simplified heuristic: if position > deadband for >60s and price moved against us
-            if inputs.using_external_fair_value && self.account_stats.position.abs() > self.config.step_size {
-                if let Some(last_fill) = self.last_fill_at {
-                    let hold_duration = last_fill.elapsed();
-                    if hold_duration > Duration::from_secs(60) {
-                        let position_notional = self.account_stats.position.abs() * inputs.pricing_mid;
-                        let stop_loss_threshold = self.account_stats.portfolio_value * 0.01; // 1% of portfolio
+            if inputs.using_external_fair_value && self.account_stats.position.abs() > self.config.step_size
+                && let Some(last_fill) = self.last_fill_at
+            {
+                let hold_duration = last_fill.elapsed();
+                if hold_duration > Duration::from_secs(60) {
+                    let position_notional = self.account_stats.position.abs() * inputs.pricing_mid;
+                    let stop_loss_threshold = self.account_stats.portfolio_value * 0.01;
 
-                        // Trigger stop-loss if position is large and held for >60s (likely adverse)
-                        if position_notional > stop_loss_threshold * 2.0 {
-                            warn!(
-                                "🛑 Stop-loss triggered: pos={:.4} @ mark=${:.2} (${:.2} notional) held for {:.0}s",
-                                self.account_stats.position,
-                                inputs.pricing_mid,
-                                position_notional,
-                                hold_duration.as_secs_f64()
-                            );
-                            self.execute_timeout_flatten(inputs.pricing_mid).await;
-                        }
+                    if position_notional > stop_loss_threshold * 2.0 {
+                        warn!(
+                            "🛑 Stop-loss triggered: pos={:.4} @ mark=${:.2} (${:.2} notional) held for {:.0}s",
+                            self.account_stats.position,
+                            inputs.pricing_mid,
+                            position_notional,
+                            hold_duration.as_secs_f64()
+                        );
+                        self.execute_timeout_flatten(inputs.pricing_mid).await;
                     }
                 }
             }

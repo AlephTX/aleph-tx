@@ -431,7 +431,7 @@ pub(super) fn apply_risk_limits(
             .max(config.step_size),
         config.step_size,
     );
-    let hard_keepalive_size = round_down_to_step(
+    let _hard_keepalive_size = round_down_to_step(
         (risk.base_order_size * (0.15 * (1.0 - urgency_ratio.abs()) + 0.05))
             .max(config.step_size)
             .max(min_size + config.step_size),
@@ -442,47 +442,40 @@ pub(super) fn apply_risk_limits(
         .min(urgency_threshold);
     let current_pending_buy = (risk.worst_case_long - risk.position_for_quoting).max(0.0);
     let current_pending_sell = (risk.position_for_quoting - risk.worst_case_short).max(0.0);
+    // v6.0.3: When position exceeds urgency threshold, ZERO out same-direction orders.
+    // Previous behavior kept a "keepalive" size which allowed 167 buys when already long 0.015+.
+    // This was the #1 cause of adverse selection losses across v6.0.0-v6.0.2.
+    let at_urgency = bias_progress >= 1.0;
+
     if risk.position_for_quoting.abs() <= inventory_deadband {
         bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
         ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
     } else if urgency_ratio > 0.0 {
-        // Long inventory: bias toward asks. Stay near-symmetric until urgency, then fall back to keepalive.
-        let pre_urgency = bias_progress < 1.0;
-        let same_side_floor = if pre_urgency {
-            soft_same_side_floor
-        } else {
-            hard_keepalive_size
-        };
-        bid_size = bid_size.min(same_side_floor);
-        if pre_urgency {
-            let flatten_boost = 1.0 + 0.35 * bias_progress;
-            ask_size = (ask_size * flatten_boost)
-                .min(hard_cap)
-                .min(ask_top_headroom);
-        } else {
+        // Long inventory: bias toward asks (selling to flatten).
+        if at_urgency {
+            bid_size = 0.0;
+            ask_size = (ask_size * 1.5).min(hard_cap).min(ask_top_headroom);
             ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
+        } else {
+            bid_size = bid_size.min(soft_same_side_floor);
+            let flatten_boost = 1.0 + 0.35 * bias_progress;
+            ask_size = (ask_size * flatten_boost).min(hard_cap).min(ask_top_headroom);
         }
         let severe_sell_overshoot_limit =
-            risk.position_for_quoting + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
+            risk.position_for_quoting.abs() + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
         if current_pending_sell > severe_sell_overshoot_limit {
             ask_size = ask_size.min(risk.base_order_size);
         }
     } else if urgency_ratio < 0.0 {
-        // Short inventory: bias toward bids. Stay near-symmetric until urgency, then fall back to keepalive.
-        let pre_urgency = bias_progress < 1.0;
-        let same_side_floor = if pre_urgency {
-            soft_same_side_floor
-        } else {
-            hard_keepalive_size
-        };
-        ask_size = ask_size.min(same_side_floor);
-        if pre_urgency {
-            let flatten_boost = 1.0 + 0.35 * bias_progress;
-            bid_size = (bid_size * flatten_boost)
-                .min(hard_cap)
-                .min(bid_top_headroom);
-        } else {
+        // Short inventory: bias toward bids (buying to flatten).
+        if at_urgency {
+            ask_size = 0.0;
+            bid_size = (bid_size * 1.5).min(hard_cap).min(bid_top_headroom);
             bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
+        } else {
+            ask_size = ask_size.min(soft_same_side_floor);
+            let flatten_boost = 1.0 + 0.35 * bias_progress;
+            bid_size = (bid_size * flatten_boost).min(hard_cap).min(bid_top_headroom);
         }
         let severe_buy_overshoot_limit =
             risk.position_for_quoting.abs() + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
