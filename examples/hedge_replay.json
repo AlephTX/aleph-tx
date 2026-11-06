@@ -1,0 +1,118 @@
+{
+  "plan": {
+    "execution_id": "replay-eth",
+    "instrument": "SYNTHETIC:ETH",
+    "primary": {
+      "venue": "lighter",
+      "side": "buy",
+      "quantity_step": "0.001",
+      "min_base": "0.001",
+      "limit_price": "2000.2",
+      "max_base": "0.02",
+      "max_notional": "50"
+    },
+    "hedge": {
+      "venue": "hyperliquid",
+      "side": "sell",
+      "quantity_step": "0.001",
+      "min_base": "0.001",
+      "limit_price": "2009.79",
+      "max_base": "0.02",
+      "max_notional": "50"
+    },
+    "target_base": "0.02",
+    "max_unhedged_base": "0.02",
+    "deadline_ms": 1800000000100,
+    "max_order_attempts": 8
+  },
+  "events": [
+    {
+      "now_ms": 1800000000011,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000012,
+      "event": "update",
+      "update": {
+        "client_order_id": "replay-eth:primary:0",
+        "venue": "lighter",
+        "exchange_order_id": "paper-0",
+        "cumulative_filled_base": "0",
+        "status": "accepted"
+      }
+    },
+    {
+      "now_ms": 1800000000013,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000014,
+      "event": "update",
+      "update": {
+        "client_order_id": "replay-eth:primary:0",
+        "venue": "lighter",
+        "exchange_order_id": "paper-0",
+        "cumulative_filled_base": "0.008",
+        "status": "canceled"
+      }
+    },
+    {
+      "now_ms": 1800000000015,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000016,
+      "event": "uncertain",
+      "client_order_id": "replay-eth:hedge:1"
+    },
+    {
+      "now_ms": 1800000000017,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000018,
+      "event": "reconcile",
+      "update": {
+        "client_order_id": "replay-eth:hedge:1",
+        "venue": "hyperliquid",
+        "exchange_order_id": "paper-1",
+        "cumulative_filled_base": "0.008",
+        "status": "filled"
+      }
+    },
+    {
+      "now_ms": 1800000000019,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000020,
+      "event": "update",
+      "update": {
+        "client_order_id": "replay-eth:primary:2",
+        "venue": "lighter",
+        "exchange_order_id": "paper-2",
+        "cumulative_filled_base": "0.012",
+        "status": "filled"
+      }
+    },
+    {
+      "now_ms": 1800000000021,
+      "event": "poll"
+    },
+    {
+      "now_ms": 1800000000022,
+      "event": "update",
+      "update": {
+        "client_order_id": "replay-eth:hedge:3",
+        "venue": "hyperliquid",
+        "exchange_order_id": "paper-3",
+        "cumulative_filled_base": "0.012",
+        "status": "filled"
+      }
+    },
+    {
+      "now_ms": 1800000000023,
+      "event": "poll"
+    }
+  ]
+}

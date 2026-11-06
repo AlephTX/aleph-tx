@@ -1,0 +1,368 @@
+//! Offline candidate and order-event replay. Network subcommands only read public data.
+use aleph_tx::{
+    exchanges::{arcus, hyperliquid, variational},
+    hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
+    strategy::cross_venue::{
+        PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
+    },
+    venues::VenueRegistry,
+};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
+use std::{collections::HashSet, fs::File, io::Read};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Replay {
+    #[serde(default)]
+    config: PlannerConfig,
+    frames: Vec<Frame>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Frame {
+    now_ms: u64,
+    snapshots: Vec<VenueSnapshot>,
+}
+
+#[derive(Serialize)]
+struct Candidate {
+    buy: String,
+    sell: String,
+    kind: PlanKind,
+    shares_risk_domain: bool,
+    result: std::result::Result<TradePlan, PlanRejection>,
+}
+
+fn evaluate(
+    frame: &Frame,
+    config: &PlannerConfig,
+    registry: &VenueRegistry,
+) -> Result<Vec<Candidate>> {
+    ensure!(
+        (2..=32).contains(&frame.snapshots.len()),
+        "Each frame needs 2 to 32 snapshots"
+    );
+    let mut identities = HashSet::new();
+    let venues = frame
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            ensure!(
+                identities.insert((&snapshot.venue, &snapshot.instrument.base)),
+                "Duplicate venue/base in replay frame"
+            );
+            registry.validate_snapshot(snapshot)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut candidates = Vec::new();
+    for (i, buy) in frame.snapshots.iter().enumerate() {
+        for (j, sell) in frame.snapshots.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for kind in [PlanKind::SpreadCapture, PlanKind::FundingCarry] {
+                candidates.push(Candidate {
+                    buy: buy.venue.clone(),
+                    sell: sell.venue.clone(),
+                    kind,
+                    shares_risk_domain: venues[i].risk_domain == venues[j].risk_domain,
+                    result: evaluate_pair(buy, sell, config, frame.now_ms, kind),
+                });
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HedgeReplay {
+    plan: HedgePlan,
+    events: Vec<HedgeEvent>,
+}
+
+#[derive(Deserialize)]
+struct HedgeEvent {
+    now_ms: u64,
+    #[serde(flatten)]
+    event: Event,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+enum Event {
+    Poll,
+    Update { update: OrderUpdate },
+    Uncertain { client_order_id: String },
+    Reconcile { update: OrderUpdate },
+}
+
+fn replay_hedge(replay: HedgeReplay, registry: &VenueRegistry) -> Result<serde_json::Value> {
+    let primary = registry.get(&replay.plan.primary.venue)?;
+    let hedge = registry.get(&replay.plan.hedge.venue)?;
+    ensure!(
+        primary.liquidity_domain != hedge.liquidity_domain,
+        "Hedge legs share a book"
+    );
+    for venue in [primary, hedge] {
+        ensure!(
+            !matches!(
+                venue.order_support,
+                aleph_tx::venues::OrderSupport::ReadOnly
+            ),
+            "{} cannot provide executable fills",
+            venue.id
+        );
+    }
+    ensure!(!replay.events.is_empty(), "Hedge replay is empty");
+    let mut machine = HedgeMachine::new(replay.plan)?;
+    let mut now = 0;
+    let mut actions: Vec<HedgeAction> = Vec::new();
+    for (index, frame) in replay.events.into_iter().enumerate() {
+        ensure!(
+            frame.now_ms >= now && frame.now_ms > 0,
+            "Hedge event times must be positive and monotonic"
+        );
+        now = frame.now_ms;
+        let result = match frame.event {
+            Event::Poll => machine.next_action(now).map(|action| actions.push(action)),
+            Event::Update { update } => machine.apply_update(update).map(|_| ()),
+            Event::Uncertain { client_order_id } => machine.mark_uncertain(&client_order_id),
+            Event::Reconcile { update } => machine.reconcile_order(update).map(|_| ()),
+        };
+        result.with_context(|| format!("Hedge event {}", index + 1))?;
+    }
+    Ok(json!({
+        "mode": "offline",
+        "actions": actions,
+        "residual_base": machine.residual_base()?.to_string(),
+        "checkpoint": machine.snapshot(),
+    }))
+}
+
+fn read_replay<T: DeserializeOwned>(path: &str) -> Result<T> {
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    File::open(path)?.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= LIMIT, "Replay exceeds 16 MiB");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn print(value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
+    println!();
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let registry = VenueRegistry::default();
+    match args.as_slice() {
+        [command] if command == "venues" => print(&registry.iter().collect::<Vec<_>>()),
+        [command, file] if command == "replay" => {
+            let replay: Replay = read_replay(file)?;
+            replay.config.validate()?;
+            ensure!(!replay.frames.is_empty(), "Market replay is empty");
+            let mut now = 0;
+            // Stream one JSON record per frame so long replays need no result buffer.
+            for frame in replay.frames {
+                ensure!(frame.now_ms > now, "Replay frame timestamps must increase");
+                now = frame.now_ms;
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "mode": "offline",
+                        "now_ms": now,
+                        "candidates": evaluate(&frame, &replay.config, &registry)?,
+                    }))?
+                );
+            }
+            Ok(())
+        }
+        [command, file] if command == "hedge-replay" => {
+            print(&replay_hedge(read_replay(file)?, &registry)?)
+        }
+        [command, venue, market] if command == "bbo" => match venue.as_str() {
+            "arcus" => print(
+                &arcus::ArcusInfo::new(arcus::Network::Mainnet)?
+                    .bbo(market)
+                    .await?,
+            ),
+            "hyperliquid" | "entropy" => {
+                let prefix = registry
+                    .get(venue)?
+                    .hyperliquid_dex
+                    .as_deref()
+                    .unwrap_or_default();
+                if prefix.is_empty() {
+                    ensure!(
+                        !market.contains(':'),
+                        "Use the named HIP-3 venue for namespaced coins"
+                    );
+                } else {
+                    ensure!(
+                        market
+                            .split_once(':')
+                            .is_some_and(|(dex, coin)| dex == prefix && !coin.is_empty()),
+                        "Coin must use the {prefix}: namespace"
+                    );
+                }
+                let book = hyperliquid::HyperliquidInfo::new(hyperliquid::Network::Mainnet)?
+                    .bbo(market)
+                    .await?;
+                print(&json!({
+                    "coin": book.coin, "timestamp_ms": book.timestamp_ms,
+                    "bid": book.bid.to_string(), "ask": book.ask.to_string(),
+                    "bid_size": book.bid_size.to_string(), "ask_size": book.ask_size.to_string(),
+                }))
+            }
+            _ => anyhow::bail!("Public BBO available for arcus, hyperliquid and entropy"),
+        },
+        [command, venue] if command == "markets" => match registry.get(venue)? {
+            venue if venue.hyperliquid_dex.is_some() => {
+                let info = hyperliquid::HyperliquidInfo::new(hyperliquid::Network::Mainnet)?;
+                let markets = info
+                    .perpetual_markets(venue.hyperliquid_dex.as_deref())
+                    .await?;
+                let rows: Vec<_> = markets
+                    .iter()
+                    .map(|m| {
+                        json!({
+                            "coin": m.asset.name,
+                            "asset_id": m.asset_id,
+                            "size_decimals": m.asset.sz_decimals,
+                            "collateral_token": m.collateral_token,
+                            "oracle_price": m.oracle_price.to_string(),
+                            "hourly_funding": m.hourly_funding.to_string(),
+                        })
+                    })
+                    .collect();
+                print(&rows)
+            }
+            venue if venue.id == "arcus" => print(
+                &arcus::ArcusInfo::new(arcus::Network::Mainnet)?
+                    .markets()
+                    .await?,
+            ),
+            venue if venue.id == "variational" => {
+                print(&variational::VariationalInfo::new()?.stats().await?)
+            }
+            _ => {
+                anyhow::bail!("Lighter discovery is provided by the existing feeder configuration")
+            }
+        },
+        _ => anyhow::bail!(
+            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | markets hyperliquid|entropy|arcus|variational"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aleph_tx::hedging::Leg;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn replay_finds_only_the_fresh_net_profitable_executable_pair() {
+        let replay: Replay =
+            serde_json::from_str(include_str!("../../examples/cross_venue_replay.json")).unwrap();
+        let registry = VenueRegistry::default();
+        let result =
+            |index: usize| evaluate(&replay.frames[index], &replay.config, &registry).unwrap();
+        let fresh = result(0);
+        let spread: Vec<_> = fresh
+            .iter()
+            .filter_map(|c| c.result.as_ref().ok())
+            .filter(|p| p.kind == PlanKind::SpreadCapture)
+            .collect();
+        assert_eq!(spread.len(), 1);
+        let plan = spread[0];
+        assert_eq!(
+            (&*plan.buy.venue, &*plan.sell.venue),
+            ("lighter", "hyperliquid")
+        );
+        assert_eq!(plan.base_quantity, 0.02);
+        assert!(plan.net_edge_usd > 0.0 && plan.entry_cost_usd > 0.0 && plan.exit_cost_usd > 0.0);
+        assert!(
+            fresh
+                .iter()
+                .any(|c| c.result == Err(PlanRejection::IndicativeQuote))
+        );
+        assert!(
+            result(1)
+                .iter()
+                .all(|c| c.result == Err(PlanRejection::InsufficientEdge))
+        );
+        assert!(
+            result(2)
+                .iter()
+                .all(|c| c.result == Err(PlanRejection::StaleQuotes))
+        );
+    }
+
+    #[test]
+    fn replay_reconciles_an_uncertain_partial_hedge_and_finishes_flat() {
+        let replay: HedgeReplay =
+            serde_json::from_str(include_str!("../../examples/hedge_replay.json")).unwrap();
+        let market_replay: Replay =
+            serde_json::from_str(include_str!("../../examples/cross_venue_replay.json")).unwrap();
+        let registry = VenueRegistry::default();
+        let candidates =
+            evaluate(&market_replay.frames[0], &market_replay.config, &registry).unwrap();
+        let spread = candidates
+            .iter()
+            .find_map(|c| {
+                c.result
+                    .as_ref()
+                    .ok()
+                    .filter(|p| p.kind == PlanKind::SpreadCapture)
+            })
+            .unwrap();
+        assert_eq!(
+            replay.plan.target_base,
+            spread.base_quantity.to_string().parse::<Decimal>().unwrap()
+        );
+        assert_eq!(
+            replay.plan.primary.limit_price,
+            spread
+                .buy
+                .limit_price
+                .to_string()
+                .parse::<Decimal>()
+                .unwrap()
+        );
+        assert_eq!(
+            replay.plan.hedge.limit_price,
+            spread
+                .sell
+                .limit_price
+                .to_string()
+                .parse::<Decimal>()
+                .unwrap()
+        );
+
+        let report = replay_hedge(replay, &registry).unwrap();
+        let actions: Vec<HedgeAction> = serde_json::from_value(report["actions"].clone()).unwrap();
+        assert!(matches!(&actions[1], HedgeAction::Await { .. }));
+        assert!(
+            matches!(&actions[2], HedgeAction::Submit { order } if order.leg == Leg::Hedge && order.base_quantity == Decimal::new(8, 3))
+        );
+        assert!(
+            matches!(&actions[3], HedgeAction::Reconcile { client_order_ids } if client_order_ids == &["replay-eth:hedge:1"])
+        );
+        assert_eq!(actions.last(), Some(&HedgeAction::Complete));
+        assert_eq!(
+            report["residual_base"]
+                .as_str()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            Decimal::ZERO
+        );
+    }
+}

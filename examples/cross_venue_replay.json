@@ -1,0 +1,297 @@
+{
+  "config": {
+    "max_base_quantity": 0.02,
+    "max_leg_notional_usd": 100,
+    "max_unhedged_notional_usd": 50
+  },
+  "frames": [
+    {
+      "now_ms": 1800000000010,
+      "snapshots": [
+        {
+          "venue": "lighter",
+          "liquidity_domain": "lighter",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 1999,
+          "ask": 2000,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000000,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 1e-05,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        },
+        {
+          "venue": "hyperliquid",
+          "liquidity_domain": "hyperliquid:core",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 2010,
+          "ask": 2011,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000000,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 0.00012,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        },
+        {
+          "venue": "variational",
+          "liquidity_domain": "variational",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "indicative"
+          },
+          "bid": 2040,
+          "ask": 2041,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000000,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 0.001,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        }
+      ]
+    },
+    {
+      "now_ms": 1800000000060,
+      "snapshots": [
+        {
+          "venue": "lighter",
+          "liquidity_domain": "lighter",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 1999,
+          "ask": 2000,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000050,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 1e-05,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        },
+        {
+          "venue": "hyperliquid",
+          "liquidity_domain": "hyperliquid:core",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 2010,
+          "ask": 2011,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000050,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 100,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 0.00012,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        }
+      ]
+    },
+    {
+      "now_ms": 1800000001100,
+      "snapshots": [
+        {
+          "venue": "lighter",
+          "liquidity_domain": "lighter",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 1999,
+          "ask": 2000,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000000,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 1e-05,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        },
+        {
+          "venue": "hyperliquid",
+          "liquidity_domain": "hyperliquid:core",
+          "instrument": {
+            "base": "ETH",
+            "quote": "USDC",
+            "settlement": "USDC",
+            "reference_index": "SYNTHETIC:ETH",
+            "kind": "linear_perpetual",
+            "contract_multiplier": 1,
+            "price_tick": 0.01,
+            "quantity_step": 0.001,
+            "min_quantity": 0.001,
+            "min_notional_usd": 1
+          },
+          "quote_kind": {
+            "type": "order_book"
+          },
+          "bid": 2010,
+          "ask": 2011,
+          "bid_size": 2,
+          "ask_size": 2,
+          "timestamp_ms": 1800000000000,
+          "available_notional_usd": 100,
+          "costs": {
+            "entry_fee_bps": 2,
+            "exit_fee_bps": 2,
+            "entry_slippage_bps": 1,
+            "exit_slippage_bps": 1
+          },
+          "funding": {
+            "rate": 0.00012,
+            "interval_ms": 3600000,
+            "next_payment_ms": 1800003600000,
+            "observed_at_ms": 1800000000000,
+            "uncertainty_bps": 0.1,
+            "oracle_price": 2000
+          }
+        }
+      ]
+    }
+  ]
+}

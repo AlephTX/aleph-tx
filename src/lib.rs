@@ -4,6 +4,7 @@ pub mod data_plane;
 pub mod error;
 pub mod exchange;
 pub mod exchanges;
+pub mod hedging;
 pub mod order_tracker;
 pub mod shadow_ledger;
 pub mod shm_depth_reader;
@@ -12,6 +13,7 @@ pub mod shm_reader;
 pub mod strategy;
 pub mod telemetry;
 pub mod types;
+pub mod venues;
 
 // Re-export for backward compatibility (callers can migrate incrementally)
 pub use exchanges::backpack as backpack_api;
