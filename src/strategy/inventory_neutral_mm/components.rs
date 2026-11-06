@@ -1,8 +1,8 @@
 use super::ActiveOrder;
 use super::execution::InventoryContext;
-use crate::order_tracker::OrderLifecycle;
 use crate::config::InventoryNeutralMMConfig;
 use crate::exchange::{OrderParams, OrderType, Side};
+use crate::order_tracker::OrderLifecycle;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -42,8 +42,8 @@ pub(super) struct ExecutionPlan {
 
 #[derive(Debug, Clone)]
 pub(super) enum QuoteCycleDecision {
-    Skip,
     ClearForLowMargin,
+    ClearForRisk,
     FlattenForLowMargin,
     Execute(ExecutionPlan),
 }
@@ -106,7 +106,9 @@ pub(super) fn portfolio_scale(config: &InventoryNeutralMMConfig, portfolio_value
     };
     raw.clamp(
         config.min_portfolio_scale.max(FLOAT_EPSILON),
-        config.max_portfolio_scale.max(1.0),
+        config
+            .max_portfolio_scale
+            .max(config.min_portfolio_scale.max(FLOAT_EPSILON)),
     )
 }
 
@@ -145,7 +147,9 @@ pub(super) fn scaled_inventory_urgency_threshold(
     max_position: f64,
 ) -> f64 {
     if mid > 0.0 && config.inventory_urgency_notional_usd > 0.0 {
-        return ((config.inventory_urgency_notional_usd * portfolio_scale(config, portfolio_value)) / mid)
+        return ((config.inventory_urgency_notional_usd
+            * portfolio_scale(config, portfolio_value))
+            / mid)
             .min(max_position)
             .max(config.step_size);
     }
@@ -173,10 +177,9 @@ pub(super) fn utilization_floor_base_order_size(
         return base_order_size;
     }
 
-    let top_level_notional_floor = usable_balance
-        * config.max_leverage
-        * TARGET_RESTING_MARGIN_UTILIZATION
-        / (2.0 * grid_multiplier.max(1.0));
+    let top_level_notional_floor =
+        usable_balance * config.max_leverage * TARGET_RESTING_MARGIN_UTILIZATION
+            / (2.0 * grid_multiplier.max(1.0));
     base_order_size.max(top_level_notional_floor / mid)
 }
 
@@ -253,35 +256,48 @@ pub(super) fn build_grid_plan(
     start_px: f64,
     top_level_sz: f64,
 ) -> Vec<OrderParams> {
-    let min_level_size = min_quotable_size(config, start_px);
-    if top_level_sz + FLOAT_EPSILON < min_level_size {
+    if !start_px.is_finite()
+        || start_px <= 0.0
+        || !top_level_sz.is_finite()
+        || top_level_sz <= 0.0
+        || !config.tick_size.is_finite()
+        || config.tick_size <= 0.0
+        || !config.step_size.is_finite()
+        || config.step_size <= 0.0
+    {
         return Vec::new();
     }
-
-    let mut current_px = start_px;
     let mut quotes = Vec::with_capacity(usize::from(config.grid_levels.max(1)));
-    let spacing = config.grid_spacing_bps / 10000.0 * start_px;
+    let spacing = (config.grid_spacing_bps / 10000.0 * start_px).max(config.tick_size);
 
     for level in 0..config.grid_levels.max(1) {
-        let weight = config.grid_size_decay.powi(level as i32);
-        let level_sz = round_down_to_step(top_level_sz * weight, config.step_size);
-        if level_sz + FLOAT_EPSILON < min_level_size {
+        let raw_price = if side == Side::Buy {
+            start_px - spacing * f64::from(level)
+        } else {
+            start_px + spacing * f64::from(level)
+        };
+        let price = if side == Side::Buy {
+            (raw_price / config.tick_size).floor() * config.tick_size
+        } else {
+            (raw_price / config.tick_size).ceil() * config.tick_size
+        };
+        if !price.is_finite() || price <= 0.0 {
             break;
         }
-
+        let weight = config.grid_size_decay.powi(level as i32);
+        let level_sz = round_down_to_step(top_level_sz * weight, config.step_size);
+        // A deeper bid has a lower notional for the same size. Check each
+        // level's actual tick-rounded price, not only the top-of-book price.
+        if !level_sz.is_finite() || level_sz + FLOAT_EPSILON < min_quotable_size(config, price) {
+            break;
+        }
         quotes.push(OrderParams {
             size: level_sz,
-            price: current_px,
+            price,
             side,
             order_type,
             reduce_only: false,
         });
-
-        if side == Side::Buy {
-            current_px -= spacing;
-        } else {
-            current_px += spacing;
-        }
     }
 
     quotes
@@ -369,6 +385,32 @@ pub(super) fn apply_risk_limits(
     desired_ask_size: f64,
     mid: f64,
 ) -> (f64, f64) {
+    if [
+        mid,
+        config.step_size,
+        config.tick_size,
+        risk.max_position,
+        risk.margin_per_eth,
+        risk.grid_multiplier,
+    ]
+    .iter()
+    .any(|value| !value.is_finite() || *value <= 0.0)
+        || [
+            desired_bid_size,
+            desired_ask_size,
+            risk.usable_balance,
+            risk.base_order_size,
+            config.flattening_cap_mult,
+            risk.inventory_urgency_threshold,
+        ]
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+        || !risk.position_for_quoting.is_finite()
+        || !risk.worst_case_long.is_finite()
+        || !risk.worst_case_short.is_finite()
+    {
+        return (0.0, 0.0);
+    }
     let min_size = min_quotable_size(config, mid);
     let grid_multiplier = risk.grid_multiplier.max(1.0);
 
@@ -378,33 +420,6 @@ pub(super) fn apply_risk_limits(
     let ask_top_headroom = ask_headroom / grid_multiplier;
     let bid_size = desired_bid_size.min(bid_top_headroom);
     let ask_size = desired_ask_size.min(ask_top_headroom);
-
-    let bid_margin_required = bid_size * risk.margin_per_eth * grid_multiplier;
-    let ask_margin_required = ask_size * risk.margin_per_eth * grid_multiplier;
-    let total_margin_required = bid_margin_required + ask_margin_required;
-
-    let (bid_size, ask_size) =
-        if total_margin_required > risk.usable_balance && total_margin_required > 0.0 {
-            let scale_factor = (risk.usable_balance / total_margin_required).min(1.0);
-            if scale_factor < 0.1 {
-                warn!(
-                    "Insufficient margin: available=${:.2} required=${:.2} (scale={:.1}%), skipping quotes",
-                    risk.available_balance,
-                    total_margin_required,
-                    scale_factor * 100.0
-                );
-                (0.0, 0.0)
-            } else {
-                debug!(
-                    "Margin constraint: scaled orders by {:.1}% (available=${:.2})",
-                    scale_factor * 100.0,
-                    risk.available_balance
-                );
-                (bid_size * scale_factor, ask_size * scale_factor)
-            }
-        } else {
-            (bid_size, ask_size)
-        };
 
     let hard_cap = risk.base_order_size * config.flattening_cap_mult;
     let mut bid_size = bid_size.min(hard_cap);
@@ -423,18 +438,12 @@ pub(super) fn apply_risk_limits(
     } else {
         ((risk.position_for_quoting.abs() - inventory_deadband)
             / (urgency_threshold - inventory_deadband).max(config.step_size))
-            .clamp(0.0, 1.0)
+        .clamp(0.0, 1.0)
     };
     let soft_same_side_floor = round_down_to_step(
         (risk.base_order_size * (1.0 - 0.60 * bias_progress))
             .max(min_size + config.step_size)
             .max(config.step_size),
-        config.step_size,
-    );
-    let _hard_keepalive_size = round_down_to_step(
-        (risk.base_order_size * (0.15 * (1.0 - urgency_ratio.abs()) + 0.05))
-            .max(config.step_size)
-            .max(min_size + config.step_size),
         config.step_size,
     );
     let flatten_overshoot_allowance = inventory_deadband
@@ -447,10 +456,7 @@ pub(super) fn apply_risk_limits(
     // This was the #1 cause of adverse selection losses across v6.0.0-v6.0.2.
     let at_urgency = bias_progress >= 1.0;
 
-    if risk.position_for_quoting.abs() <= inventory_deadband {
-        bid_size = bid_size.max(risk.base_order_size.min(hard_cap).min(bid_top_headroom));
-        ask_size = ask_size.max(risk.base_order_size.min(hard_cap).min(ask_top_headroom));
-    } else if urgency_ratio > 0.0 {
+    if risk.position_for_quoting.abs() > inventory_deadband && urgency_ratio > 0.0 {
         // Long inventory: bias toward asks (selling to flatten).
         if at_urgency {
             bid_size = 0.0;
@@ -459,14 +465,17 @@ pub(super) fn apply_risk_limits(
         } else {
             bid_size = bid_size.min(soft_same_side_floor);
             let flatten_boost = 1.0 + 0.35 * bias_progress;
-            ask_size = (ask_size * flatten_boost).min(hard_cap).min(ask_top_headroom);
+            ask_size = (ask_size * flatten_boost)
+                .min(hard_cap)
+                .min(ask_top_headroom);
         }
-        let severe_sell_overshoot_limit =
-            risk.position_for_quoting.abs() + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
+        let severe_sell_overshoot_limit = risk.position_for_quoting.abs()
+            + flatten_overshoot_allowance
+            + risk.base_order_size * grid_multiplier;
         if current_pending_sell > severe_sell_overshoot_limit {
             ask_size = ask_size.min(risk.base_order_size);
         }
-    } else if urgency_ratio < 0.0 {
+    } else if risk.position_for_quoting.abs() > inventory_deadband && urgency_ratio < 0.0 {
         // Short inventory: bias toward bids (buying to flatten).
         if at_urgency {
             ask_size = 0.0;
@@ -475,14 +484,49 @@ pub(super) fn apply_risk_limits(
         } else {
             ask_size = ask_size.min(soft_same_side_floor);
             let flatten_boost = 1.0 + 0.35 * bias_progress;
-            bid_size = (bid_size * flatten_boost).min(hard_cap).min(bid_top_headroom);
+            bid_size = (bid_size * flatten_boost)
+                .min(hard_cap)
+                .min(bid_top_headroom);
         }
-        let severe_buy_overshoot_limit =
-            risk.position_for_quoting.abs() + flatten_overshoot_allowance + risk.base_order_size * grid_multiplier;
+        let severe_buy_overshoot_limit = risk.position_for_quoting.abs()
+            + flatten_overshoot_allowance
+            + risk.base_order_size * grid_multiplier;
         if current_pending_buy > severe_buy_overshoot_limit {
             bid_size = bid_size.min(risk.base_order_size);
         }
     }
+
+    // Apply hard budgets LAST, after all inventory boosts/floors. No strategy
+    // preference is allowed to restore exposure removed by the margin check.
+    let bid_size = bid_size.min(bid_top_headroom);
+    let ask_size = ask_size.min(ask_top_headroom);
+    let bid_margin_required = bid_size * risk.margin_per_eth * grid_multiplier;
+    let ask_margin_required = ask_size * risk.margin_per_eth * grid_multiplier;
+    let total_margin_required = bid_margin_required + ask_margin_required;
+
+    let (bid_size, ask_size) = if total_margin_required > risk.usable_balance
+        && total_margin_required > 0.0
+    {
+        let scale_factor = (risk.usable_balance / total_margin_required).min(1.0);
+        if scale_factor < 0.1 {
+            warn!(
+                "Insufficient margin: available=${:.2} required=${:.2} (scale={:.1}%), skipping quotes",
+                risk.available_balance,
+                total_margin_required,
+                scale_factor * 100.0
+            );
+            (0.0, 0.0)
+        } else {
+            debug!(
+                "Margin constraint: scaled orders by {:.1}% (available=${:.2})",
+                scale_factor * 100.0,
+                risk.available_balance
+            );
+            (bid_size * scale_factor, ask_size * scale_factor)
+        }
+    } else {
+        (bid_size, ask_size)
+    };
 
     let bid_size = if bid_size + FLOAT_EPSILON < min_size {
         0.0
@@ -506,8 +550,8 @@ pub(super) fn build_execution_plan(
     _base_order_size: f64,
     inventory_urgency_threshold: f64,
 ) -> ExecutionPlan {
-    let base_threshold = (mid * config.requote_threshold_bps / 10000.0)
-        .max(mid * config.grid_spacing_bps / 20000.0);
+    let base_threshold =
+        (mid * config.requote_threshold_bps / 10000.0).max(mid * config.grid_spacing_bps / 20000.0);
     let full_grid_spacing = mid * config.grid_spacing_bps / 10000.0;
     let urgency_threshold = inventory_urgency_threshold.max(config.step_size);
     let requote_threshold = if position_for_quoting.abs() <= urgency_threshold {
@@ -536,7 +580,7 @@ pub(super) fn decide_quote_cycle(
                 QuoteCycleDecision::ClearForLowMargin
             }
         } else {
-            QuoteCycleDecision::Skip
+            QuoteCycleDecision::ClearForRisk
         }
     } else {
         QuoteCycleDecision::Execute(build_execution_plan(

@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("🚀 Inventory-Neutral Market Maker (v5.0.0)");
 
     // Load configuration
-    let config = AppConfig::load_default();
+    let config = AppConfig::load_default()?;
     let strategy_config = config
         .inventory_neutral_mm
         .ok_or("inventory_neutral_mm config not found in config.toml")?;
@@ -96,14 +96,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let order_tracker_for_events = Arc::clone(&order_tracker);
     tokio::spawn(async move {
         loop {
+            if event_reader.write_idx() < event_reader.local_read_idx() {
+                event_reader.skip_to_end();
+                order_tracker_for_events.reset_event_sequence();
+            }
             let mut processed = false;
             while let Some(event) = event_reader.try_read() {
                 processed = true;
                 if let Err(err) = order_tracker_for_events.apply_event(&event) {
+                    order_tracker_for_events.require_reconciliation();
                     tracing::warn!("Failed to apply V2 event seq={}: {}", event.sequence, err);
                 }
             }
 
+            if event_reader.take_integrity_loss() {
+                order_tracker_for_events.require_reconciliation();
+            }
             if !processed {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -123,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Lighter Trading API
     let mut trading = LighterTrading::new(strategy_config.market_id).await?;
+    trading.validate_precision(strategy_config.tick_size, strategy_config.step_size)?;
     trading.set_order_tracker(Arc::clone(&order_tracker));
     trading.set_post_only(strategy_config.use_post_only);
     let trading = Arc::new(trading);

@@ -3,7 +3,9 @@ package shm
 
 import (
 	"fmt"
+	"math"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -12,16 +14,17 @@ import (
 // ShmAccountStats is a 128-byte cache-line-aligned structure for account statistics.
 // Layout must match Rust #[repr(C, align(128))] exactly.
 type ShmAccountStats struct {
-	Version          uint64  // 0..8   - Incremented on each update
-	Collateral       float64 // 8..16  - Total collateral in USDC
-	PortfolioValue   float64 // 16..24 - Portfolio value
-	Leverage         float64 // 24..32 - Current leverage
-	AvailableBalance float64 // 32..40 - Available balance for trading
-	MarginUsage      float64 // 40..48 - Margin usage ratio (0-1)
-	BuyingPower      float64 // 48..56 - Buying power
-	UpdatedAt        uint64  // 56..64 - Unix timestamp in nanoseconds
-	Position         float64 // 64..72 - Net position (positive=long, negative=short)
-	_Reserved        [56]byte // 72..128 - Reserved for future use
+	Version           uint64   // 0..8   - Incremented on each update
+	Collateral        float64  // 8..16  - Total collateral in USDC
+	PortfolioValue    float64  // 16..24 - Portfolio value
+	Leverage          float64  // 24..32 - Current leverage
+	AvailableBalance  float64  // 32..40 - Available balance for trading
+	MarginUsage       float64  // 40..48 - Margin usage ratio (0-1)
+	BuyingPower       float64  // 48..56 - Buying power
+	UpdatedAt         uint64   // 56..64 - Unix timestamp in nanoseconds
+	Position          float64  // 64..72 - Net position (positive=long, negative=short)
+	PositionUpdatedAt uint64   // 72..80 - Independent private-position freshness
+	_Reserved         [48]byte // 80..128 - Reserved for future use
 }
 
 const AccountStatsSize = 128
@@ -35,6 +38,7 @@ func init() {
 
 // AccountStatsWriter wraps the shared memory for account statistics.
 type AccountStatsWriter struct {
+	mu    sync.Mutex // user_stats and private-position streams publish concurrently
 	data  []byte
 	stats *ShmAccountStats
 }
@@ -69,7 +73,9 @@ func (w *AccountStatsWriter) WriteStats(
 	collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower float64,
 	timestampNs uint64,
 ) {
-	w.WriteStatsWithPosition(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, 0.0, timestampNs)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writeStatsLocked(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, w.stats.Position, w.stats.PositionUpdatedAt, timestampNs)
 }
 
 // WriteStatsWithPosition writes account statistics including position to shared memory.
@@ -77,6 +83,23 @@ func (w *AccountStatsWriter) WriteStatsWithPosition(
 	collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, position float64,
 	timestampNs uint64,
 ) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writeStatsLocked(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, position, timestampNs, timestampNs)
+}
+
+func (w *AccountStatsWriter) writeStatsLocked(
+	collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, position float64,
+	positionTimestampNs, timestampNs uint64,
+) {
+	for _, value := range [...]float64{collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, position} {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return
+		}
+	}
+	if timestampNs == 0 || timestampNs < w.stats.UpdatedAt {
+		return
+	}
 	// Increment version first (acts as a write lock indicator)
 	version := atomic.LoadUint64(&w.stats.Version)
 	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
@@ -89,21 +112,30 @@ func (w *AccountStatsWriter) WriteStatsWithPosition(
 	w.stats.MarginUsage = marginUsage
 	w.stats.BuyingPower = buyingPower
 	w.stats.Position = position
+	w.stats.PositionUpdatedAt = positionTimestampNs
 	w.stats.UpdatedAt = timestampNs
 
 	// Increment version again to signal write complete
 	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
 }
 
-// WritePosition updates only the position field and timestamp.
+// WritePosition updates only position, preserving the full-account freshness timestamp.
 // Uses the same version protocol (odd=writing, even=done).
 // This enables instant position updates from private WS without waiting for user_stats.
 func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64) {
+	if math.IsNaN(position) || math.IsInf(position, 0) || timestampNs == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if timestampNs < w.stats.PositionUpdatedAt {
+		return
+	}
 	version := atomic.LoadUint64(&w.stats.Version)
 	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
 
 	w.stats.Position = position
-	w.stats.UpdatedAt = timestampNs
+	w.stats.PositionUpdatedAt = timestampNs
 
 	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
 }
@@ -116,4 +148,15 @@ func (w *AccountStatsWriter) GetVersion() uint64 {
 // Close unmaps the shared memory.
 func (w *AccountStatsWriter) Close() error {
 	return syscall.Munmap(w.data)
+}
+
+// InvalidatePosition marks the private stream unavailable without changing the
+// last position. A disconnect is never interpreted as a flat account.
+func (w *AccountStatsWriter) InvalidatePosition() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	version := atomic.LoadUint64(&w.stats.Version)
+	atomic.StoreUint64(&w.stats.Version, version+1)
+	w.stats.PositionUpdatedAt = 0
+	atomic.StoreUint64(&w.stats.Version, version+2)
 }

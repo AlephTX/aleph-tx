@@ -1,17 +1,17 @@
-use super::*;
 use super::components::{
-    build_execution_plan, decide_quote_cycle, inventory_skew_ratio, min_quotable_size,
-    position_for_quoting, residual_exposure_abs, safe_available_balance, scaled_base_order_size,
-    scaled_inventory_urgency_threshold,
-    scaled_max_position, toxicity_size_scale, toxicity_spread_multiplier, utilization_floor_base_order_size,
-    usable_balance_fraction, QuoteCycleDecision,
+    QuoteCycleDecision, build_execution_plan, decide_quote_cycle, inventory_skew_ratio,
+    min_quotable_size, position_for_quoting, residual_exposure_abs, safe_available_balance,
+    scaled_base_order_size, scaled_inventory_urgency_threshold, scaled_max_position,
+    toxicity_size_scale, toxicity_spread_multiplier, usable_balance_fraction,
+    utilization_floor_base_order_size,
 };
 use super::execution::InventoryContext;
 use super::pricing::{
-    anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
+    AnchorParams, anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
     fallback_bbo_prices, inventory_adjusted_half_spreads, local_reference_mid,
-    stabilize_crossed_quotes, AnchorParams,
+    stabilize_crossed_quotes,
 };
+use super::*;
 use crate::exchange::{OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
 
@@ -103,11 +103,46 @@ fn keeps_existing_levels_that_already_match_grid() {
     );
 
     let existing = vec![
-        active_order(1, 101, OrderSide::Buy, desired[0].price, desired[0].size, 30),
-        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
-        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
-        active_order(4, 104, OrderSide::Buy, desired[3].price, desired[3].size, 30),
-        active_order(5, 105, OrderSide::Buy, desired[4].price, desired[4].size, 30),
+        active_order(
+            1,
+            101,
+            OrderSide::Buy,
+            desired[0].price,
+            desired[0].size,
+            30,
+        ),
+        active_order(
+            2,
+            102,
+            OrderSide::Buy,
+            desired[1].price,
+            desired[1].size,
+            30,
+        ),
+        active_order(
+            3,
+            103,
+            OrderSide::Buy,
+            desired[2].price,
+            desired[2].size,
+            30,
+        ),
+        active_order(
+            4,
+            104,
+            OrderSide::Buy,
+            desired[3].price,
+            desired[3].size,
+            30,
+        ),
+        active_order(
+            5,
+            105,
+            OrderSide::Buy,
+            desired[4].price,
+            desired[4].size,
+            30,
+        ),
     ];
 
     let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
@@ -170,8 +205,22 @@ fn stale_mismatched_orders_are_canceled_and_missing_levels_replaced() {
     );
 
     let existing = vec![
-        active_order(20, 301, OrderSide::Sell, desired[0].price, desired[0].size, 30),
-        active_order(21, 302, OrderSide::Sell, desired[1].price + 0.75, desired[1].size, 30),
+        active_order(
+            20,
+            301,
+            OrderSide::Sell,
+            desired[0].price,
+            desired[0].size,
+            30,
+        ),
+        active_order(
+            21,
+            302,
+            OrderSide::Sell,
+            desired[1].price + 0.75,
+            desired[1].size,
+            30,
+        ),
     ];
 
     let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
@@ -202,8 +251,22 @@ fn fresh_mismatched_orders_do_not_allow_side_order_count_to_balloon() {
     );
 
     let existing = vec![
-        active_order(1, 101, OrderSide::Buy, desired[0].price + 0.80, desired[0].size, 1),
-        active_order(2, 102, OrderSide::Buy, desired[1].price + 0.80, desired[1].size, 1),
+        active_order(
+            1,
+            101,
+            OrderSide::Buy,
+            desired[0].price + 0.80,
+            desired[0].size,
+            1,
+        ),
+        active_order(
+            2,
+            102,
+            OrderSide::Buy,
+            desired[1].price + 0.80,
+            desired[1].size,
+            1,
+        ),
     ];
 
     let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
@@ -233,8 +296,22 @@ fn modest_size_drift_within_tolerance_does_not_force_requote() {
 
     let existing = vec![
         active_order(1, 101, OrderSide::Buy, desired[0].price, 0.0189, 30),
-        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
-        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
+        active_order(
+            2,
+            102,
+            OrderSide::Buy,
+            desired[1].price,
+            desired[1].size,
+            30,
+        ),
+        active_order(
+            3,
+            103,
+            OrderSide::Buy,
+            desired[2].price,
+            desired[2].size,
+            30,
+        ),
     ];
 
     let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
@@ -277,8 +354,22 @@ fn top_levels_use_stickier_price_threshold_to_reduce_queue_churn() {
             desired[0].size,
             30,
         ),
-        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
-        active_order(3, 103, OrderSide::Buy, desired[2].price, desired[2].size, 30),
+        active_order(
+            2,
+            102,
+            OrderSide::Buy,
+            desired[1].price,
+            desired[1].size,
+            30,
+        ),
+        active_order(
+            3,
+            103,
+            OrderSide::Buy,
+            desired[2].price,
+            desired[2].size,
+            30,
+        ),
     ];
 
     let (to_cancel, to_place) = InventoryNeutralMM::reconcile_side_plan(
@@ -311,8 +402,22 @@ fn calm_mode_widens_matching_threshold_for_deeper_levels_too() {
     assert!(calm_deeper_drift > base_threshold);
 
     let existing = vec![
-        active_order(1, 101, OrderSide::Buy, desired[0].price, desired[0].size, 30),
-        active_order(2, 102, OrderSide::Buy, desired[1].price, desired[1].size, 30),
+        active_order(
+            1,
+            101,
+            OrderSide::Buy,
+            desired[0].price,
+            desired[0].size,
+            30,
+        ),
+        active_order(
+            2,
+            102,
+            OrderSide::Buy,
+            desired[1].price,
+            desired[1].size,
+            30,
+        ),
         active_order(
             3,
             103,
@@ -351,7 +456,11 @@ fn calm_side_requote_cooldown_defers_back_to_back_replace_cycles() {
     let mut existing = Vec::new();
     for (i, quote) in desired.iter().enumerate() {
         let age_secs = if i == 0 { 1 } else { 30 };
-        let price = if i == 1 { quote.price + 2.0 } else { quote.price };
+        let price = if i == 1 {
+            quote.price + 2.0
+        } else {
+            quote.price
+        };
         existing.push(active_order(
             (i + 1) as i64,
             (101 + i) as i64,
@@ -378,7 +487,10 @@ fn calm_side_requote_cooldown_defers_back_to_back_replace_cycles() {
 
 #[test]
 fn calm_mode_requires_longer_min_lifetime_before_replacing_top_levels() {
-    let config = test_config();
+    let config = InventoryNeutralMMConfig {
+        order_ttl_secs: 5,
+        ..test_config()
+    };
     let desired = InventoryNeutralMM::build_grid_plan(
         &config,
         Side::Buy,
@@ -389,8 +501,12 @@ fn calm_mode_requires_longer_min_lifetime_before_replacing_top_levels() {
 
     let mut existing = Vec::new();
     for (i, quote) in desired.iter().enumerate() {
-        let age_secs = 11;
-        let price = if i < 2 { quote.price + 1.20 } else { quote.price };
+        let age_secs = 6;
+        let price = if i < 2 {
+            quote.price + 1.20
+        } else {
+            quote.price
+        };
         existing.push(active_order(
             (i + 1) as i64,
             (101 + i) as i64,
@@ -616,8 +732,7 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_long() {
     let (bid_size, ask_size) =
         InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.03, 0.01, 2100.0);
 
-    assert!(bid_size > 0.0);
-    assert!(bid_size < config.base_order_size);
+    assert_eq!(bid_size, 0.0);
     assert!(ask_size >= config.base_order_size - config.step_size);
 }
 
@@ -643,8 +758,7 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_short() {
         InventoryNeutralMM::apply_risk_limits(&config, &risk, 0.01, 0.03, 2100.0);
 
     assert!(bid_size >= config.base_order_size - config.step_size);
-    assert!(ask_size > 0.0);
-    assert!(ask_size < config.base_order_size);
+    assert_eq!(ask_size, 0.0);
 }
 
 #[test]
@@ -779,7 +893,7 @@ fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
 }
 
 #[test]
-fn inventory_beyond_urgency_threshold_reduces_same_side_to_keepalive() {
+fn inventory_beyond_urgency_threshold_disables_same_side() {
     let config = test_config();
     let risk = RiskSnapshot {
         raw_available_balance: 100.0,
@@ -800,7 +914,7 @@ fn inventory_beyond_urgency_threshold_reduces_same_side_to_keepalive() {
         InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
 
     assert!(bid_size >= config.base_order_size - config.step_size);
-    assert!(ask_size < config.base_order_size * 0.5);
+    assert_eq!(ask_size, 0.0);
 }
 
 #[test]
@@ -857,7 +971,7 @@ fn scaled_but_quotable_sizes_do_not_skip_execution() {
 }
 
 #[test]
-fn sub_step_sizes_still_skip_when_not_low_margin() {
+fn sub_step_sizes_request_clear_of_existing_risk() {
     let config = test_config();
     let target = QuoteTarget {
         bid_price: 2090.0,
@@ -879,7 +993,7 @@ fn sub_step_sizes_still_skip_when_not_low_margin() {
         0.0,
     );
 
-    assert!(matches!(decision, QuoteCycleDecision::Skip));
+    assert!(matches!(decision, QuoteCycleDecision::ClearForRisk));
 }
 
 #[test]
@@ -945,26 +1059,34 @@ fn fallback_bbo_prices_synthesize_missing_side_around_local_mid() {
 }
 
 #[test]
-fn anchored_quotes_stay_close_to_local_touch_without_crossing() {
-    let (bid, ask) =
-        anchor_quotes_to_touch(&AnchorParams {
-            raw_bid: 2106.89, raw_ask: 2118.53, bid_touch: 2112.20, ask_touch: 2112.30,
-            mid: 2112.25, tick_size: 0.01, penny_ticks: 1.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
-        });
+fn anchored_quotes_preserve_fair_value_edge_without_crossing() {
+    let (bid, ask) = anchor_quotes_to_touch(&AnchorParams {
+        raw_bid: 2106.89,
+        raw_ask: 2118.53,
+        bid_touch: 2112.20,
+        ask_touch: 2112.30,
+        tick_size: 0.01,
+        penny_ticks: 1.0,
+        inventory_urgency_ratio: 0.0,
+    });
 
     assert!(bid < 2112.30);
     assert!(ask > 2112.20);
-    assert!(2112.20 - bid <= 2112.25 * 8.0 / 10000.0 + 0.02);
-    assert!(ask - 2112.30 <= 2112.25 * 8.0 / 10000.0 + 0.02);
+    assert!(bid <= 2106.89);
+    assert!(ask >= 2118.53);
 }
 
 #[test]
 fn anchored_quotes_respect_configured_join_buffer() {
-    let (bid, ask) =
-        anchor_quotes_to_touch(&AnchorParams {
-            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.03,
-            mid: 2105.015, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
-        });
+    let (bid, ask) = anchor_quotes_to_touch(&AnchorParams {
+        raw_bid: 2100.0,
+        raw_ask: 2110.0,
+        bid_touch: 2105.00,
+        ask_touch: 2105.03,
+        tick_size: 0.01,
+        penny_ticks: 2.0,
+        inventory_urgency_ratio: 0.0,
+    });
 
     assert!(bid <= 2105.01);
     assert!(ask >= 2105.02);
@@ -1013,21 +1135,33 @@ fn inventory_adjusted_half_spreads_tighten_flatten_side() {
 
 #[test]
 fn anchored_quotes_shift_toward_flatten_side_when_inventory_is_biased() {
-    let (flat_bid, flat_ask) =
-        anchor_quotes_to_touch(&AnchorParams {
-            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
-            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 0.0, max_touch_offset_bps: 8.0,
-        });
-    let (long_bid, long_ask) =
-        anchor_quotes_to_touch(&AnchorParams {
-            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
-            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: 1.0, max_touch_offset_bps: 8.0,
-        });
-    let (short_bid, short_ask) =
-        anchor_quotes_to_touch(&AnchorParams {
-            raw_bid: 2100.0, raw_ask: 2110.0, bid_touch: 2105.00, ask_touch: 2105.20,
-            mid: 2105.10, tick_size: 0.01, penny_ticks: 2.0, inventory_urgency_ratio: -1.0, max_touch_offset_bps: 8.0,
-        });
+    let (flat_bid, flat_ask) = anchor_quotes_to_touch(&AnchorParams {
+        raw_bid: 2100.0,
+        raw_ask: 2110.0,
+        bid_touch: 2105.00,
+        ask_touch: 2105.20,
+        tick_size: 0.01,
+        penny_ticks: 2.0,
+        inventory_urgency_ratio: 0.0,
+    });
+    let (long_bid, long_ask) = anchor_quotes_to_touch(&AnchorParams {
+        raw_bid: 2100.0,
+        raw_ask: 2110.0,
+        bid_touch: 2105.00,
+        ask_touch: 2105.20,
+        tick_size: 0.01,
+        penny_ticks: 2.0,
+        inventory_urgency_ratio: 1.0,
+    });
+    let (short_bid, short_ask) = anchor_quotes_to_touch(&AnchorParams {
+        raw_bid: 2100.0,
+        raw_ask: 2110.0,
+        bid_touch: 2105.00,
+        ask_touch: 2105.20,
+        tick_size: 0.01,
+        penny_ticks: 2.0,
+        inventory_urgency_ratio: -1.0,
+    });
 
     assert!(long_ask <= flat_ask);
     assert!(long_bid <= flat_bid);
@@ -1233,4 +1367,335 @@ fn decide_quote_cycle_flattens_when_low_margin_and_position_is_not_flat() {
     );
 
     assert!(matches!(decision, QuoteCycleDecision::FlattenForLowMargin));
+}
+
+#[test]
+fn risk_budgets_hold_across_inventory_and_margin_scenarios() {
+    let config = test_config();
+    for position in [-0.2, -0.15, -0.09, -0.01, 0.0, 0.01, 0.09, 0.15, 0.2] {
+        for balance in [0.0, 0.1, 1.0, 5.0, 10.0, 30.0, 100.0] {
+            let risk = RiskSnapshot {
+                raw_available_balance: balance,
+                position_for_quoting: position,
+                worst_case_long: position + 0.025,
+                worst_case_short: position - 0.025,
+                base_order_size: config.base_order_size,
+                max_position: config.max_position,
+                inventory_urgency_threshold: config.inventory_urgency_threshold,
+                min_available_balance: config.min_available_balance,
+                available_balance: balance,
+                usable_balance: balance,
+                margin_per_eth: 210.0,
+                grid_multiplier: 4.0,
+            };
+            let (bid, ask) =
+                InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
+            assert!(bid.is_finite() && ask.is_finite() && bid >= 0.0 && ask >= 0.0);
+            assert!(
+                (bid + ask) * risk.grid_multiplier * risk.margin_per_eth <= balance + 1e-9,
+                "margin exceeded: position={position} balance={balance}, bid={bid} ask={ask}"
+            );
+            assert!(
+                bid * risk.grid_multiplier
+                    <= (risk.max_position - risk.worst_case_long).max(0.0) + 1e-9
+            );
+            assert!(
+                ask * risk.grid_multiplier
+                    <= (risk.max_position + risk.worst_case_short).max(0.0) + 1e-9
+            );
+            if position >= config.inventory_urgency_threshold {
+                assert_eq!(bid, 0.0);
+            }
+            if position <= -config.inventory_urgency_threshold {
+                assert_eq!(ask, 0.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn grid_prices_are_tick_aligned_and_every_level_meets_minimum_notional() {
+    let config = InventoryNeutralMMConfig {
+        tick_size: 0.25,
+        grid_levels: 20,
+        grid_spacing_bps: 0.1,
+        grid_size_decay: 1.0,
+        ..test_config()
+    };
+    for side in [Side::Buy, Side::Sell] {
+        let quotes =
+            InventoryNeutralMM::build_grid_plan(&config, side, OrderType::PostOnly, 2100.13, 0.006);
+        assert!(!quotes.is_empty());
+        for quote in &quotes {
+            assert!(
+                (quote.price / config.tick_size - (quote.price / config.tick_size).round()).abs()
+                    < 1e-9
+            );
+            assert!(quote.price * quote.size >= 12.5 - 1e-9);
+        }
+        for pair in quotes.windows(2) {
+            assert!((pair[0].price - pair[1].price).abs() >= config.tick_size - 1e-9);
+        }
+    }
+    let mut config = config;
+    config.grid_spacing_bps = 100.0;
+    let quotes =
+        InventoryNeutralMM::build_grid_plan(&config, Side::Buy, OrderType::PostOnly, 2100.0, 0.006);
+    assert_eq!(
+        quotes.len(),
+        1,
+        "deeper bid would fall below the notional floor"
+    );
+}
+
+#[test]
+fn zero_budget_cancels_fresh_orders_without_waiting_for_ttl() {
+    let config = test_config();
+    let mut order = active_order(1, 101, OrderSide::Buy, 2100.0, 0.015, 0);
+    order.placed_at = Instant::now();
+    let plan = execution::build_side_execution_plan(
+        &config,
+        &[order],
+        OrderType::PostOnly,
+        Side::Buy,
+        2100.0,
+        0.0,
+        1.0,
+        0.25,
+        1,
+    );
+    assert_eq!(plan.to_cancel, vec![101]);
+    assert!(plan.to_place.is_empty());
+}
+
+#[test]
+fn inventory_timeout_survives_repeated_fills_and_failed_flatten_attempts() {
+    let now = Instant::now();
+    let timeout = Duration::from_secs(60);
+    let mut age = InventoryAge::default();
+    age.observe(0.02, 0.005, now);
+    // These increasing positions model continued same-direction fills.
+    for (seconds, position) in [(20, 0.03), (40, 0.06), (61, 0.09)] {
+        age.observe(position, 0.005, now + Duration::from_secs(seconds));
+    }
+    assert!(age.is_expired(now + Duration::from_secs(61), timeout));
+    age.last_attempt = Some(now + Duration::from_secs(61));
+    assert!(!age.can_retry(now + Duration::from_secs(62)));
+    assert!(age.can_retry(now + Duration::from_secs(66)));
+    assert!(age.is_expired(now + Duration::from_secs(66), timeout));
+    age.observe(0.0, 0.005, now + Duration::from_secs(67));
+    assert!(!age.is_expired(now + Duration::from_secs(70), timeout));
+    age.observe(-0.02, 0.005, now + Duration::from_secs(71));
+    assert!(!age.is_expired(now + Duration::from_secs(72), timeout));
+}
+
+#[test]
+fn rolling_volatility_matches_reference_across_window_evictions() {
+    for window in [0, 2, 3, 17, 200] {
+        let mut micro = MicrostructureTracker::new(window, 5, 20);
+        let capacity = micro.price_samples.capacity();
+        for i in 0..10000 {
+            let price = 2100.0 + (i as f64 * 0.017).sin() * 15.0 + (i as f64 * 0.39).cos();
+            micro.update(price);
+            if micro.price_samples.len() >= 2 {
+                let returns: Vec<_> = micro
+                    .price_samples
+                    .iter()
+                    .zip(micro.price_samples.iter().skip(1))
+                    .map(|(a, b)| (b / a - 1.0) * 10000.0)
+                    .collect();
+                let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+                let expected = (returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
+                    / returns.len() as f64)
+                    .sqrt()
+                    .max(1.0);
+                assert!((micro.volatility_bps() - expected).abs() < 1e-7);
+            }
+        }
+        assert_eq!(
+            micro.price_samples.capacity(),
+            capacity,
+            "hot-path ring reallocated"
+        );
+        let old_price = micro.price_samples.back().copied();
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            micro.update(invalid);
+        }
+        assert_eq!(micro.price_samples.back().copied(), old_price);
+        assert!(micro.momentum_bps().is_finite());
+    }
+}
+
+#[test]
+fn trend_and_dislocation_replay_preserves_quote_edge() {
+    use super::pricing::{fee_aware_half_spread, momentum_half_spreads};
+    let mut micro = MicrostructureTracker::new(200, 5, 20);
+    // Deterministic rising/falling fair-value paths with a lagging venue.
+    for direction in [-1.0, 1.0] {
+        for i in 0..100 {
+            let fair = 2100.0 + direction * i as f64 * 0.1;
+            micro.update(fair);
+            let (bid_half, ask_half) = momentum_half_spreads(2.0, micro.momentum_bps(), 0.3);
+            let raw_bid = fair - bid_half;
+            let raw_ask = fair + ask_half;
+            let local = fair - direction * 10.0;
+            let (bid, ask) = anchor_quotes_to_touch(&AnchorParams {
+                raw_bid,
+                raw_ask,
+                bid_touch: local - 0.05,
+                ask_touch: local + 0.05,
+                tick_size: 0.01,
+                penny_ticks: 1.0,
+                inventory_urgency_ratio: 0.0,
+            });
+            assert!(bid <= raw_bid + 1e-9 && ask >= raw_ask - 1e-9);
+            assert!(bid < ask && ask - bid >= 4.0 - 1e-9);
+        }
+    }
+    let (bid, ask) = momentum_half_spreads(2.0, 10.0, 0.3);
+    assert!(
+        ask > 2.0 && bid < 2.0,
+        "upward momentum must protect the ask"
+    );
+    let (bid, ask) = momentum_half_spreads(2.0, -10.0, 0.3);
+    assert!(
+        bid > 2.0 && ask < 2.0,
+        "downward momentum must protect the bid"
+    );
+    assert!(fee_aware_half_spread(1.0, 2100.0, 10.0, 8.0).is_none());
+    assert_eq!(fee_aware_half_spread(0.0, 2000.0, 10.0, 20.0), Some(1.0));
+}
+
+#[test]
+#[ignore = "manual release-mode performance benchmark"]
+fn benchmark_rolling_volatility_vs_window_scan() {
+    use std::hint::black_box;
+    let iterations = 200_000;
+    let mut micro = MicrostructureTracker::new(200, 5, 20);
+    for i in 0..200 {
+        micro.update(2100.0 + (i as f64 * 0.1).sin());
+    }
+    let started = Instant::now();
+    for i in 0..iterations {
+        micro.update(black_box(2100.0 + (i as f64 * 0.1).sin()));
+        black_box(micro.volatility_bps());
+    }
+    let rolling = started.elapsed();
+    // Baseline reproduces the previous full-window scan on every quote cycle.
+    let mut prices = micro.price_samples.clone();
+    let started = Instant::now();
+    for i in 0..iterations {
+        prices.pop_front();
+        prices.push_back(black_box(2100.0 + (i as f64 * 0.1).sin()));
+        let (mut sum, mut squares) = (0.0, 0.0);
+        for j in 0..prices.len() - 1 {
+            let value = (prices[j + 1] / prices[j] - 1.0) * 10000.0;
+            sum += value;
+            squares += value * value;
+        }
+        let n = (prices.len() - 1) as f64;
+        black_box((squares / n - (sum / n).powi(2)).sqrt().max(1.0));
+    }
+    let scan = started.elapsed();
+    println!(
+        "volatility: {iterations} updates, window=200; rolling={rolling:?}, previous_scan={scan:?}, speedup={:.2}x",
+        scan.as_secs_f64() / rolling.as_secs_f64()
+    );
+}
+
+#[test]
+fn account_freshness_requires_independent_equity_and_position_timestamps() {
+    let now = wall_time_ns();
+    let mut snapshot = AccountStatsSnapshot {
+        portfolio_value: 100.0,
+        available_balance: 100.0,
+        updated_at: now,
+        position_updated_at: now,
+        ..Default::default()
+    };
+    assert!(AccountStats::from(snapshot).is_usable());
+    for (equity_time, position_time) in [
+        (0, now),
+        (now, 0),
+        (now + 1_000_000_000, now),
+        (now, now + 1_000_000_000),
+        (now, now - 31_000_000_000),
+        (now - 31_000_000_000, now),
+    ] {
+        snapshot.updated_at = equity_time;
+        snapshot.position_updated_at = position_time;
+        assert!(!AccountStats::from(snapshot).is_usable());
+    }
+    assert!(
+        !AccountStats::from(AccountStatsSnapshot::default()).is_usable(),
+        "a failed SHM read is not a confirmed zero position"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_acknowledgement_does_not_release_unknown_submission() {
+    use crate::exchange::{
+        BatchOrderParams, BatchOrderResult, BatchResult, OrderInfo, OrderResult,
+    };
+    struct EmptyBook;
+    #[async_trait::async_trait]
+    impl Exchange for EmptyBook {
+        async fn buy(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("unexpected buy")
+        }
+        async fn sell(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("unexpected sell")
+        }
+        async fn place_batch(&self, _: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
+            anyhow::bail!("unexpected place")
+        }
+        async fn cancel_order(&self, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn cancel_all(&self) -> anyhow::Result<u32> {
+            Ok(0)
+        }
+        async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+            Ok(vec![])
+        }
+        async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+            anyhow::bail!("unexpected close")
+        }
+        async fn execute_batch(&self, _: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+            anyhow::bail!("unexpected batch")
+        }
+        async fn get_account_stats(&self) -> anyhow::Result<AccountStats> {
+            anyhow::bail!("unexpected account query")
+        }
+        fn limit_order_type(&self) -> OrderType {
+            OrderType::PostOnly
+        }
+    }
+    let directory = std::env::temp_dir().join(format!("aleph-strategy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let matrix_path = directory.join("matrix");
+    let account_path = directory.join("account");
+    std::fs::write(&matrix_path, vec![0u8; 2048 * 8 + 7 * 64]).unwrap();
+    std::fs::write(&account_path, [0u8; 128]).unwrap();
+    let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
+    let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();
+    let tracker = Arc::new(OrderTracker::new());
+    tracker.start_tracking(1, OrderSide::Buy, 2100.0, 0.05);
+    tracker.mark_submission_uncertain(1);
+    let mut strategy = InventoryNeutralMM::new(
+        test_config(),
+        Arc::new(EmptyBook),
+        Arc::clone(&tracker),
+        shm,
+        account,
+    );
+    assert!(
+        !strategy
+            .cancel_all_and_sync("test uncertain cancellation")
+            .await
+    );
+    assert!((tracker.worst_case_long() - 0.05).abs() < 1e-9);
+    assert_eq!(tracker.active_orders_snapshot().len(), 1);
+    drop(strategy);
+    std::fs::remove_dir_all(directory).unwrap();
 }

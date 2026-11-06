@@ -459,6 +459,5 @@ const _: () = {
     assert!(std::mem::align_of::<ShmPrivateEventV2>() == 64);
 };
 
-
 #[cfg(test)]
 mod tests;

@@ -27,7 +27,11 @@ func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.
 	for localSym, exchIdxStr := range cfg.Symbols {
 		log.Printf("lighter: mapping symbol %s (exchIdx=%s)", localSym, exchIdxStr)
 		if id, ok := SymbolNameToID[localSym]; ok {
-			idx, _ := strconv.Atoi(exchIdxStr)
+			idx, err := strconv.Atoi(exchIdxStr)
+			if err != nil || idx < 0 {
+				log.Printf("lighter: invalid market mapping for %s: %q", localSym, exchIdxStr)
+				continue
+			}
 			mktMap[idx] = id
 			log.Printf("lighter: mapped market %d -> symbol %d (%s)", idx, id, localSym)
 		} else {
@@ -70,6 +74,14 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		log.Printf("lighter: subscribed to market %d", mktIdx)
 	}
 
+	// Reconnection always starts from a fresh snapshot. Never reuse a book
+	// across a disconnect, during which arbitrary deltas may have been lost.
+	books := make(map[int]*lighterBook, len(l.mktMap))
+	defer func() {
+		for _, symbolID := range l.mktMap {
+			l.matrix.InvalidateBBO(ExchangeLighter, symbolID)
+		}
+	}()
 	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-public", c, 15*time.Second)
 	defer stopKeepalive()
 
@@ -97,81 +109,40 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			continue
 		}
 
-		// Extract BBO directly without intermediate structs
-		bids := result.Get("order_book.bids")
-		asks := result.Get("order_book.asks")
-
-		if !bids.Exists() || !asks.Exists() || !bids.IsArray() || !asks.IsArray() {
-			log.Printf("lighter: invalid order_book structure")
-			continue
-		}
-
-		bidArray := bids.Array()
-		askArray := asks.Array()
-
-		if len(bidArray) == 0 && len(askArray) == 0 {
-			log.Printf("lighter: empty bids AND asks, skipping update")
-			continue
-		}
-
 		mktIdx := l.parseMarketIndex(channel)
 		symID, ok := l.mktMap[mktIdx]
 		if !ok {
-			log.Printf("lighter: market %d not in mktMap", mktIdx)
 			continue
 		}
-
-		var bidPx, bidSz, askPx, askSz float64
-
-		// Parse best bid if available
-		if len(bidArray) > 0 {
-			bidPx, err = strconv.ParseFloat(bidArray[0].Get("price").String(), 64)
-			if err != nil {
-				log.Printf("lighter: failed to parse bid price for market %d: %v", mktIdx, err)
-			}
-			bidSz, err = strconv.ParseFloat(bidArray[0].Get("size").String(), 64)
-			if err != nil {
-				log.Printf("lighter: failed to parse bid size for market %d: %v", mktIdx, err)
-			}
+		book := books[mktIdx]
+		if book == nil {
+			book = &lighterBook{}
+			books[mktIdx] = book
 		}
-
-		// Parse best ask if available
-		if len(askArray) > 0 {
-			askPx, err = strconv.ParseFloat(askArray[0].Get("price").String(), 64)
-			if err != nil {
-				log.Printf("lighter: failed to parse ask price for market %d: %v", mktIdx, err)
-			}
-			askSz, err = strconv.ParseFloat(askArray[0].Get("size").String(), 64)
-			if err != nil {
-				log.Printf("lighter: failed to parse ask size for market %d: %v", mktIdx, err)
-			}
+		changed, err := book.apply(result.Get("order_book"), isSnapshot)
+		if err != nil {
+			// Resubscribe via reconnect instead of quoting a corrupted book.
+			return fmt.Errorf("market %d: %w", mktIdx, err)
 		}
-
-		tsNs := uint64(result.Get("timestamp").Int()) * 1_000_000 // ms → ns
-		if tsNs == 0 {
-			tsNs = uint64(time.Now().UnixNano())
+		if !changed {
+			continue
 		}
-
-		// Write to shared matrix (triggers version increment)
+		bids, asks := book.depth()
+		if bids[0].Size == 0 || asks[0].Size == 0 {
+			l.matrix.InvalidateBBO(ExchangeLighter, symID)
+			continue
+		}
+		tsMs := result.Get("timestamp").Int()
+		if tsMs <= 0 {
+			tsMs = time.Now().UnixMilli()
+		}
+		if tsMs > time.Now().Add(time.Second).UnixMilli() {
+			return fmt.Errorf("market %d: future book timestamp", mktIdx)
+		}
+		tsNs := uint64(tsMs) * 1_000_000
 		l.matrix.WriteBBO(ExchangeLighter, symID, tsNs,
-			bidPx, bidSz, askPx, askSz)
-
-		// Parse and write depth data (L1-L5)
+			bids[0].Price, bids[0].Size, asks[0].Price, asks[0].Size)
 		if l.depthWriter != nil {
-			var bids, asks [shm.DepthLevels]shm.PriceLevel
-
-			for i := 0; i < shm.DepthLevels && i < len(bidArray); i++ {
-				px, _ := strconv.ParseFloat(bidArray[i].Get("price").String(), 64)
-				sz, _ := strconv.ParseFloat(bidArray[i].Get("size").String(), 64)
-				bids[i] = shm.PriceLevel{Price: px, Size: sz}
-			}
-
-			for i := 0; i < shm.DepthLevels && i < len(askArray); i++ {
-				px, _ := strconv.ParseFloat(askArray[i].Get("price").String(), 64)
-				sz, _ := strconv.ParseFloat(askArray[i].Get("size").String(), 64)
-				asks[i] = shm.PriceLevel{Price: px, Size: sz}
-			}
-
 			l.depthWriter.WriteDepth(symID, ExchangeLighter, tsNs, bids, asks)
 		}
 	}
@@ -180,7 +151,10 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 func (l *Lighter) parseMarketIndex(channel string) int {
 	for i := len(channel) - 1; i >= 0; i-- {
 		if channel[i] == ':' || channel[i] == '/' {
-			n, _ := strconv.Atoi(channel[i+1:])
+			n, err := strconv.Atoi(channel[i+1:])
+			if err != nil || n < 0 {
+				return -1
+			}
 			return n
 		}
 	}

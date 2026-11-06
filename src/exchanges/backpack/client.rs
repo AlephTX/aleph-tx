@@ -40,7 +40,10 @@ impl BackpackClient {
         };
 
         Ok(Self {
-            client: Client::builder().build()?,
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
+                .build()?,
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             signing_key,
@@ -402,7 +405,7 @@ impl BackpackClient {
     pub async fn get_account_stats(&self) -> Result<BackpackAccountStats> {
         let total_equity = self.get_total_equity().await?;
         let positions = self.get_open_positions().await?;
-        
+
         // Sum position notional for leverage calculation
         let mut total_notional = 0.0;
         let mut main_pos = 0.0;
@@ -416,8 +419,16 @@ impl BackpackClient {
             available_balance: total_equity, // Backpack treats all spot as collateral
             portfolio_value: total_equity,
             position: main_pos,
-            leverage: if total_equity > 0.0 { total_notional / total_equity } else { 0.0 },
-            margin_usage: if total_equity > 0.0 { (total_notional / total_equity) / 20.0 } else { 0.0 }, // Assuming 20x max
+            leverage: if total_equity > 0.0 {
+                total_notional / total_equity
+            } else {
+                0.0
+            },
+            margin_usage: if total_equity > 0.0 {
+                (total_notional / total_equity) / 20.0
+            } else {
+                0.0
+            }, // Assuming 20x max
         })
     }
 }

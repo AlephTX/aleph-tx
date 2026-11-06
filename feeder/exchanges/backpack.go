@@ -32,12 +32,12 @@ func NewBackpack(cfg config.ExchangeConfig, matrix *shm.Matrix) *Backpack {
 
 // Backpack depth message
 type backpackDepth struct {
-	EventTime int64            `json:"E"`
-	EventType string           `json:"e"`
-	Symbol    string           `json:"s"`
-	Timestamp int64            `json:"T"`
-	Bids      [][]string       `json:"b"` // [price, size]
-	Asks      [][]string       `json:"a"` // [price, size]
+	EventTime int64      `json:"E"`
+	EventType string     `json:"e"`
+	Symbol    string     `json:"s"`
+	Timestamp int64      `json:"T"`
+	Bids      [][]string `json:"b"` // [price, size]
+	Asks      [][]string `json:"a"` // [price, size]
 }
 
 func (b *Backpack) Run(ctx context.Context) error {
@@ -82,14 +82,14 @@ func (b *Backpack) connect(ctx context.Context) error {
 			Data backpackDepth `json:"data"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
-            log.Printf("backpack: unmarshal error: %v", err)
+			log.Printf("backpack: unmarshal error: %v", err)
 			continue
 		}
 
 		depth := msg.Data
 
 		if depth.EventType != "depth" {
-            log.Printf("backpack debug wrong event type: %s", depth.EventType)
+			log.Printf("backpack debug wrong event type: %s", depth.EventType)
 			continue
 		}
 
@@ -99,7 +99,7 @@ func (b *Backpack) connect(ctx context.Context) error {
 			continue
 		}
 
-		if len(depth.Bids) == 0 || len(depth.Asks) == 0 {
+		if len(depth.Bids) == 0 || len(depth.Asks) == 0 || len(depth.Bids[0]) < 2 || len(depth.Asks[0]) < 2 {
 			continue
 		}
 

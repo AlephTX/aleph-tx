@@ -2,10 +2,10 @@
 //!
 //! Loads from `config.toml` at the project root.
 //! All trading parameters are runtime-configurable — no recompilation needed.
- 
+
 pub const EXCH_LIGHTER: u8 = 2;
 pub const EXCH_EDGEX: u8 = 3;
-pub const EXCH_HYPERLIQUID: u8 = 4;
+pub const EXCH_HYPERLIQUID: u8 = 1;
 pub const EXCH_BACKPACK: u8 = 5;
 
 pub const SYM_BTC: u16 = 1001;
@@ -23,9 +23,24 @@ pub fn round_to_tick(val: f64, tick: f64) -> f64 {
     (val / tick).round() * tick
 }
 
+// Non-power-of-ten ticks (e.g. 0.25) need more precision than ceil(-log10(tick)).
+fn decimal_places(step: f64) -> usize {
+    if !step.is_finite() || step <= 0.0 {
+        return 0;
+    }
+    let mut scaled = step;
+    for places in 0..=12 {
+        if (scaled - scaled.round()).abs() <= 1e-9 {
+            return places;
+        }
+        scaled *= 10.0;
+    }
+    12
+}
+
 /// Format price with dynamic precision based on tick size
 pub fn format_price(price: f64, tick_size: f64) -> String {
-    let decimals = (-tick_size.log10()).ceil().max(0.0) as usize;
+    let decimals = decimal_places(tick_size);
     format!(
         "{:.prec$}",
         round_to_tick(price, tick_size),
@@ -35,7 +50,7 @@ pub fn format_price(price: f64, tick_size: f64) -> String {
 
 /// Format size with dynamic precision based on step size
 pub fn format_size(size: f64, step_size: f64) -> String {
-    let decimals = (-step_size.log10()).ceil().max(0.0) as usize;
+    let decimals = decimal_places(step_size);
     format!("{:.prec$}", round_to_tick(size, step_size), prec = decimals)
 }
 
@@ -208,6 +223,7 @@ fn default_min_inventory_notional_usd() -> f64 {
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InventoryNeutralMMConfig {
     // 交易所
     pub exchange_id: u8, // BBO 过滤用 (2=Lighter)
@@ -293,11 +309,168 @@ pub struct InventoryNeutralMMConfig {
     pub poll_interval_ms: u64, // default: 100
 }
 
+fn positive(name: &str, values: &[f64]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.iter().all(|v| v.is_finite() && *v > 0.0),
+        "{name}: values must be finite and positive"
+    );
+    Ok(())
+}
+
+fn nonnegative(name: &str, values: &[f64]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        values.iter().all(|v| v.is_finite() && *v >= 0.0),
+        "{name}: values must be finite and nonnegative"
+    );
+    Ok(())
+}
+
+impl ExchangeConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        positive(
+            name,
+            &[
+                self.risk_fraction,
+                self.tick_size,
+                self.step_size,
+                self.gamma,
+                self.time_horizon_sec,
+                self.stop_loss_pct,
+                self.momentum_spread_mult,
+            ],
+        )?;
+        nonnegative(
+            name,
+            &[
+                self.min_spread_bps,
+                self.vol_multiplier,
+                self.momentum_threshold_bps,
+                self.min_order_size,
+                self.requote_threshold_bps,
+            ],
+        )?;
+        anyhow::ensure!(
+            self.risk_fraction <= 1.0 && self.stop_loss_pct < 1.0,
+            "{name}: risk_fraction must be <= 1 and stop_loss_pct < 1"
+        );
+        anyhow::ensure!(
+            self.vol_window >= 2 && self.requote_interval_ms > 0 && self.balance_refresh_secs > 0,
+            "{name}: invalid sample window or update interval"
+        );
+        anyhow::ensure!(
+            self.price_decimals.is_none_or(|v| v <= 12)
+                && self.size_decimals.is_none_or(|v| v <= 12),
+            "{name}: unsupported precision"
+        );
+        anyhow::ensure!(
+            self.resolution != Some(0) && self.collateral_resolution != Some(0),
+            "{name}: resolution must be positive"
+        );
+        if let Some(rate) = self.fee_rate {
+            nonnegative(name, &[rate])?;
+        }
+        Ok(())
+    }
+}
+
+impl InventoryNeutralMMConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let name = "inventory_neutral_mm";
+        positive(
+            name,
+            &[
+                self.tick_size,
+                self.step_size,
+                self.base_order_size,
+                self.max_position,
+                self.inventory_urgency_threshold,
+                self.reference_portfolio_value,
+                self.min_portfolio_scale,
+                self.max_portfolio_scale,
+                self.flattening_cap_mult,
+                self.as_gamma,
+                self.as_kappa,
+                self.as_time_horizon_sec,
+                self.max_spread_bps,
+                self.max_leverage,
+                self.sigmoid_steepness,
+            ],
+        )?;
+        nonnegative(
+            name,
+            &[
+                self.min_profit_bps,
+                self.penny_ticks,
+                self.inventory_skew_bps,
+                self.grid_spacing_bps,
+                self.base_order_notional_usd,
+                self.max_position_notional_usd,
+                self.inventory_urgency_notional_usd,
+                self.min_inventory_notional_usd,
+                self.vol_spread_scale,
+                self.momentum_skew_scale,
+                self.adverse_selection_threshold,
+                self.requote_threshold_bps,
+                self.min_available_balance,
+            ],
+        )?;
+        anyhow::ensure!(
+            self.maker_fee_bps.is_finite(),
+            "{name}: maker fee must be finite"
+        );
+        anyhow::ensure!(
+            self.min_portfolio_scale <= self.max_portfolio_scale,
+            "{name}: portfolio scale bounds reversed"
+        );
+        anyhow::ensure!(
+            (1..=5).contains(&self.grid_levels)
+                && self.grid_size_decay.is_finite()
+                && self.grid_size_decay > 0.0
+                && self.grid_size_decay <= 1.0,
+            "{name}: invalid grid"
+        );
+        anyhow::ensure!(
+            self.micro_samples >= 2
+                && self.ema_fast_period > 0
+                && self.ema_slow_period >= self.ema_fast_period,
+            "{name}: invalid microstructure windows"
+        );
+        anyhow::ensure!(
+            self.poll_interval_ms > 0
+                && self.order_ttl_secs > 0
+                && self.external_staleness_ms > 0
+                && self.margin_cooldown_secs > 0,
+            "{name}: intervals must be positive"
+        );
+        anyhow::ensure!(
+            self.exchange_id == EXCH_LIGHTER && matches!(self.symbol_id, SYM_BTC | SYM_ETH),
+            "{name}: expected Lighter and a supported SHM symbol ID (1001/1002)"
+        );
+        anyhow::ensure!(
+            2.0 * self.maker_fee_bps + self.min_profit_bps >= 0.0
+                && self.max_spread_bps >= 2.0 * self.maker_fee_bps + self.min_profit_bps,
+            "{name}: maximum spread is below the fee/profit floor"
+        );
+        anyhow::ensure!(
+            self.step_size <= self.max_position
+                && self.inventory_urgency_threshold <= self.max_position,
+            "{name}: inventory urgency exceeds the position limit"
+        );
+        if self.inventory_urgency_notional_usd > 0.0 && self.max_position_notional_usd > 0.0 {
+            anyhow::ensure!(
+                self.inventory_urgency_notional_usd <= self.max_position_notional_usd,
+                "{name}: notional urgency exceeds the position limit"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for InventoryNeutralMMConfig {
     fn default() -> Self {
         Self {
             exchange_id: 2,
-            symbol_id: 0,
+            symbol_id: SYM_ETH,
             market_id: 0,
             tick_size: 0.01,
             step_size: 0.0001,
@@ -357,26 +530,29 @@ impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: AppConfig = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
     }
 
-    /// Load from the default location (project root config.toml).
-    pub fn load_default() -> Self {
-        // Try multiple paths
-        let candidates = [
-            "config.toml",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"),
-        ];
+    /// Load an explicit configuration. Missing, unreadable or invalid files must
+    /// stop startup rather than silently replace risk limits with defaults.
+    pub fn load_default() -> anyhow::Result<Self> {
+        let path = Path::new("config.toml");
+        Self::load(path).map_err(|error| {
+            anyhow::anyhow!(
+                "{}: {error}; copy config.example.toml and review its limits",
+                path.display()
+            )
+        })
+    }
 
-        for path in &candidates {
-            if let Ok(cfg) = Self::load(Path::new(path)) {
-                tracing::info!("📋 Loaded config from {}", path);
-                return cfg;
-            }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.backpack.validate("backpack")?;
+        self.edgex.validate("edgex")?;
+        if let Some(config) = &self.inventory_neutral_mm {
+            config.validate()?;
         }
-
-        tracing::warn!("⚠️ No config.toml found, using defaults");
-        Self::default()
+        Ok(())
     }
 }
 
@@ -461,6 +637,8 @@ mod tests {
         assert_eq!(format_price(0.123456, 0.0001), "0.1235");
         assert_eq!(format_price(1234.5, 0.1), "1234.5");
         assert_eq!(format_price(1234.56, 1.0), "1235");
+        assert_eq!(format_price(100.25, 0.25), "100.25");
+        assert_eq!(format_price(100.125, 0.125), "100.125");
     }
 
     #[test]
@@ -480,5 +658,46 @@ mod tests {
         assert_eq!(cfg.backpack.time_horizon_sec, 60.0);
         assert_eq!(cfg.edgex.tick_size, 0.01);
         assert_eq!(cfg.edgex.gamma, 0.1);
+    }
+    #[test]
+    fn example_and_default_configuration_validate() {
+        let config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.validate().unwrap();
+        AppConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_strategy_limits_are_rejected() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let config = InventoryNeutralMMConfig {
+                tick_size: value,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        let mut config = InventoryNeutralMMConfig {
+            min_portfolio_scale: 10.0,
+            max_portfolio_scale: 1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config = InventoryNeutralMMConfig {
+            as_kappa: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config = InventoryNeutralMMConfig {
+            max_spread_bps: 0.5,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_file_is_not_replaced_by_defaults() {
+        assert!(AppConfig::load(Path::new("/nonexistent/aleph-config.toml")).is_err());
+        let text = include_str!("../config.example.toml")
+            .replace("poll_interval_ms = 300", "poll_interval_typo = 300");
+        assert!(toml::from_str::<AppConfig>(&text).is_err());
     }
 }

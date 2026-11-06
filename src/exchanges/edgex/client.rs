@@ -38,7 +38,10 @@ pub struct EdgeXAccountStats {
 impl EdgeXClient {
     pub fn new(private_key: &str, base_url: Option<String>) -> Result<Self, ClientError> {
         let signature_manager = SignatureManager::new(private_key)?;
-        let client = Client::builder().build()?;
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
         let base_url = base_url.unwrap_or_else(|| BASE_URL.to_string());
 
         Ok(Self {
@@ -499,11 +502,16 @@ impl EdgeXClient {
                 });
             Ok(fills)
         } else {
-            Err(ClientError::JsonError("Missing 'data' field in get_fills response".to_string()))
+            Err(ClientError::JsonError(
+                "Missing 'data' field in get_fills response".to_string(),
+            ))
         }
     }
 
-    pub async fn get_account_stats(&self, account_id: u64) -> Result<EdgeXAccountStats, ClientError> {
+    pub async fn get_account_stats(
+        &self,
+        account_id: u64,
+    ) -> Result<EdgeXAccountStats, ClientError> {
         let balances = self.get_balances(account_id).await?;
         let positions = self.get_positions(account_id).await?;
 
@@ -520,7 +528,7 @@ impl EdgeXClient {
             let size: f64 = pos.open_size.parse().unwrap_or(0.0);
             // EdgeX model currently lacks entry_price in Position struct
             // We use a dummy price of 0.0 for now to fix compilation
-            let px: f64 = 0.0; 
+            let px: f64 = 0.0;
             total_notional += size.abs() * px;
             main_pos += size;
         }
@@ -529,8 +537,16 @@ impl EdgeXClient {
             available_balance: portfolio_value, // Simplification
             portfolio_value,
             position: main_pos,
-            leverage: if portfolio_value > 0.0 { total_notional / portfolio_value } else { 0.0 },
-            margin_usage: if portfolio_value > 0.0 { (total_notional / portfolio_value) / 20.0 } else { 0.0 },
+            leverage: if portfolio_value > 0.0 {
+                total_notional / portfolio_value
+            } else {
+                0.0
+            },
+            margin_usage: if portfolio_value > 0.0 {
+                (total_notional / portfolio_value) / 20.0
+            } else {
+                0.0
+            },
         })
     }
 }

@@ -34,9 +34,9 @@ type hlEnvelope struct {
 }
 
 type hlL2Book struct {
-	Coin   string       `json:"coin"`
-	Time   int64        `json:"time"`
-	Levels [][]hlLevel  `json:"levels"`
+	Coin   string      `json:"coin"`
+	Time   int64       `json:"time"`
+	Levels [][]hlLevel `json:"levels"`
 }
 
 type hlLevel struct {

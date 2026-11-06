@@ -14,6 +14,7 @@ package shm
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -29,16 +30,16 @@ const (
 // ShmBboMessage is the 64-byte cache-line-aligned BBO message.
 // Layout must match Rust #[repr(C, align(64))] exactly.
 type ShmBboMessage struct {
-	Seqlock      uint32   // 0..4
-	MsgType      uint8    // 4
-	ExchangeID   uint8    // 5
-	SymbolID     uint16   // 6..8
-	TimestampNs  uint64   // 8..16
-	BidPrice     float64  // 16..24
-	BidSize      float64  // 24..32
-	AskPrice     float64  // 32..40
-	AskSize      float64  // 40..48
-	_Reserved    [16]byte // 48..64 padding
+	Seqlock     uint32   // 0..4
+	MsgType     uint8    // 4
+	ExchangeID  uint8    // 5
+	SymbolID    uint16   // 6..8
+	TimestampNs uint64   // 8..16
+	BidPrice    float64  // 16..24
+	BidSize     float64  // 24..32
+	AskPrice    float64  // 32..40
+	AskSize     float64  // 40..48
+	_Reserved   [16]byte // 48..64 padding
 }
 
 // ShmMarketState is the single flat shared memory structure.
@@ -100,12 +101,17 @@ func (m *Matrix) WriteBBO(exchangeID uint8, symbolID uint16, tsNs uint64,
 	bidPrice, bidSize, askPrice, askSize float64) {
 
 	// Bounds check (runtime, but should never panic in practice)
-	if symbolID >= NumSymbols || exchangeID >= NumExchanges {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges || tsNs == 0 ||
+		!validPositive(bidPrice) || !validPositive(askPrice) ||
+		!validPositive(bidSize) || !validPositive(askSize) || bidPrice >= askPrice {
 		return
 	}
 
 	// Get pointers
 	slot := &m.shm.BboMatrix[symbolID][exchangeID]
+	if tsNs < slot.TimestampNs {
+		return // Delayed/replayed updates cannot make an older quote current.
+	}
 	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 
 	// Phase 1: mark slot as being written (odd seqlock)
@@ -140,4 +146,23 @@ func (m *Matrix) GetVersion(symbolID uint16) uint64 {
 // Close unmaps the shared memory.
 func (m *Matrix) Close() error {
 	return syscall.Munmap(m.data)
+}
+
+func validPositive(value float64) bool {
+	return value > 0 && !math.IsInf(value, 0) && !math.IsNaN(value)
+}
+
+// InvalidateBBO makes a disconnected or incomplete book unavailable immediately.
+// The adapter owning this exchange/symbol slot must be its only writer.
+func (m *Matrix) InvalidateBBO(exchangeID uint8, symbolID uint16) {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges {
+		return
+	}
+	slot := &m.shm.BboMatrix[symbolID][exchangeID]
+	seq := atomic.LoadUint32(&slot.Seqlock)
+	atomic.StoreUint32(&slot.Seqlock, seq+1)
+	slot.TimestampNs = 0
+	slot.BidPrice, slot.BidSize, slot.AskPrice, slot.AskSize = 0, 0, 0, 0
+	atomic.StoreUint32(&slot.Seqlock, seq+2)
+	atomic.AddUint64(&m.shm.SymbolVersions[symbolID], 1)
 }

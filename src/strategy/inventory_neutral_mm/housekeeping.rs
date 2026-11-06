@@ -75,13 +75,18 @@ mod tests {
             grid_multiplier: 2.0,
         };
 
-        sync_telemetry_snapshot(&mut telemetry, &account_stats, &risk, &TelemetrySync {
-            fill_count: 12,
-            total_fees: 1.25,
-            confirmed_position: 0.01,
-            pending_exposure: -0.03,
-            effective_position: -0.02,
-        });
+        sync_telemetry_snapshot(
+            &mut telemetry,
+            &account_stats,
+            &risk,
+            &TelemetrySync {
+                fill_count: 12,
+                total_fees: 1.25,
+                confirmed_position: 0.01,
+                pending_exposure: -0.03,
+                effective_position: -0.02,
+            },
+        );
 
         assert_eq!(telemetry.fill_count, 12);
         assert_eq!(telemetry.total_fees_paid, 1.25);

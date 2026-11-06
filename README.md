@@ -1,5 +1,8 @@
 # AlephTX v6.0.0
 
+
+> 2026-11-07 engineering audit: [findings, offline verification and measured performance](docs/AUDIT_2026_11.md). Run `make test`, `make check`, and `make build` before deployment. Lighter signing remains pinned to Linux x86-64; other platforms support offline verification.
+
 Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
 
 **v6.0.0 Highlights**: External fair value anchor (Binance Futures + Hyperliquid median pricing), momentum-aware asymmetric spread, position timeout IOC flatten, `InventoryContext`/`AnchorParams`/`TelemetrySync` parameter structs, 0 clippy warnings.

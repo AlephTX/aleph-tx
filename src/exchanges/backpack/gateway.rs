@@ -47,7 +47,10 @@ impl BackpackGateway {
             if err_str.contains("insufficient balance") || err_str.contains("insufficient funds") {
                 TradingError::InsufficientMargin
             } else if err_str.contains("Rate limit") || err_str.contains("429") {
-                TradingError::ApiError { status: 429, message: err_str }
+                TradingError::ApiError {
+                    status: 429,
+                    message: err_str,
+                }
             } else {
                 TradingError::OrderFailed(err_str)
             }
@@ -113,7 +116,10 @@ impl Exchange for BackpackGateway {
 
     async fn cancel_order(&self, _order_id: i64) -> anyhow::Result<()> {
         // Backpack uses string order IDs, not supported in generic trait
-        Err(TradingError::OrderFailed("cancel_order by ID not supported for Backpack".to_string()).into())
+        Err(
+            TradingError::OrderFailed("cancel_order by ID not supported for Backpack".to_string())
+                .into(),
+        )
     }
 
     async fn cancel_all(&self) -> anyhow::Result<u32> {
@@ -190,7 +196,9 @@ impl Exchange for BackpackGateway {
         })
     }
 
-    async fn get_account_stats(&self) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+    async fn get_account_stats(
+        &self,
+    ) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
         let stats = self.client.get_account_stats().await?;
         Ok(crate::strategy::inventory_neutral_mm::AccountStats {
             available_balance: stats.available_balance,

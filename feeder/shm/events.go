@@ -68,13 +68,13 @@ type ShmPrivateEventV2 struct {
 	_padding1       [7]byte // 7 bytes (offset 57)  - pad to 64
 
 	// ─── Cache Line 2 (64 bytes) ───
-	ClientOrderID   int64   // 8 bytes (offset 64)  - YOUR order ID (delayed binding key)
-	OrderIndex      int64   // 8 bytes (offset 72)  - exchange order index (for cancel API)
-	OriginalSize    float64 // 8 bytes (offset 80)  - original order size
-	OrderPrice      float64 // 8 bytes (offset 88)  - order price
-	TimestampNs     uint64  // 8 bytes (offset 96)  - event timestamp (nanoseconds)
-	TradeID         uint64  // 8 bytes (offset 104) - trade ID (for fill dedup)
-	_reserved       [16]byte // 16 bytes (offset 112) - reserved for future use
+	ClientOrderID int64    // 8 bytes (offset 64)  - YOUR order ID (delayed binding key)
+	OrderIndex    int64    // 8 bytes (offset 72)  - exchange order index (for cancel API)
+	OriginalSize  float64  // 8 bytes (offset 80)  - original order size
+	OrderPrice    float64  // 8 bytes (offset 88)  - order price
+	TimestampNs   uint64   // 8 bytes (offset 96)  - event timestamp (nanoseconds)
+	TradeID       uint64   // 8 bytes (offset 104) - trade ID (for fill dedup)
+	_reserved     [16]byte // 16 bytes (offset 112) - reserved for future use
 }
 
 // Compile-time size assertion
@@ -91,14 +91,16 @@ const (
 
 // EventRingBufferV2 is a lock-free ring buffer for V2 private events.
 // Memory layout:
-//   [0-7]:     write_idx (atomic u64)
-//   [8-63]:    padding (header)
-//   [64-...]:  1024 event slots (128 bytes each)
+//
+//	[0-7]:     write_idx (atomic u64)
+//	[8-63]:    padding (header)
+//	[64-...]:  1024 event slots (128 bytes each)
 type EventRingBufferV2 struct {
-	mmap      []byte
-	writeIdx  *uint64
-	slots     []ShmPrivateEventV2
-	localSeq  uint64
+	mmap       []byte
+	writeIdx   *uint64
+	generation *uint64 // header[8:16]: odd while any slot is being overwritten
+	slots      []ShmPrivateEventV2
+	localSeq   uint64
 }
 
 // NewEventRingBufferV2 creates or opens the V2 event ring buffer
@@ -121,16 +123,21 @@ func NewEventRingBufferV2() (*EventRingBufferV2, error) {
 	}
 
 	writeIdx := (*uint64)(unsafe.Pointer(&data[0]))
+	generation := (*uint64)(unsafe.Pointer(&data[8]))
+	// Recover a writer interrupted before publishing. Existing consumers must
+	// reconnect after feeder failure; never leave the ring permanently odd.
+	atomic.StoreUint64(generation, (atomic.LoadUint64(generation)+1)&^1)
 	slots := (*[V2RingBufferSlots]ShmPrivateEventV2)(unsafe.Pointer(&data[V2HeaderSize]))
 
 	// Resume from current write_idx to avoid index regression
 	currentIdx := atomic.LoadUint64(writeIdx)
 
 	return &EventRingBufferV2{
-		mmap:     data,
-		writeIdx: writeIdx,
-		slots:    slots[:],
-		localSeq: currentIdx,
+		mmap:       data,
+		writeIdx:   writeIdx,
+		generation: generation,
+		slots:      slots[:],
+		localSeq:   currentIdx,
 	}, nil
 }
 
@@ -144,6 +151,8 @@ func (rb *EventRingBufferV2) Close() error {
 
 // Push writes a new V2 event to the ring buffer (lock-free, single writer)
 func (rb *EventRingBufferV2) Push(event ShmPrivateEventV2) {
+	generation := atomic.LoadUint64(rb.generation)
+	atomic.StoreUint64(rb.generation, generation+1)
 	event.Sequence = rb.localSeq
 	rb.localSeq++
 
@@ -152,6 +161,7 @@ func (rb *EventRingBufferV2) Push(event ShmPrivateEventV2) {
 
 	// Release barrier: ensure event data is written before updating write_idx
 	atomic.StoreUint64(rb.writeIdx, event.Sequence+1)
+	atomic.StoreUint64(rb.generation, generation+2)
 }
 
 // ─── V2 Convenience Methods ──────────────────────────────────────────────────
@@ -268,10 +278,11 @@ func (rb *EventRingBufferV2) GetWriteIdxV2() uint64 {
 // EventRingBuffer is the V1 ring buffer (64-byte events)
 // DEPRECATED: Use EventRingBufferV2 for new code.
 type EventRingBuffer struct {
-	mmap      []byte
-	writeIdx  *uint64
-	slots     []ShmPrivateEvent
-	localSeq  uint64
+	mmap       []byte
+	writeIdx   *uint64
+	generation *uint64 // header[8:16]: odd while any slot is being overwritten
+	slots      []ShmPrivateEvent
+	localSeq   uint64
 }
 
 const (
@@ -300,16 +311,21 @@ func NewEventRingBuffer() (*EventRingBuffer, error) {
 	}
 
 	writeIdx := (*uint64)(unsafe.Pointer(&data[0]))
+	generation := (*uint64)(unsafe.Pointer(&data[8]))
+	// Recover a writer interrupted before publishing. Existing consumers must
+	// reconnect after feeder failure; never leave the ring permanently odd.
+	atomic.StoreUint64(generation, (atomic.LoadUint64(generation)+1)&^1)
 	slots := (*[RingBufferSlots]ShmPrivateEvent)(unsafe.Pointer(&data[HeaderSize]))
 
 	// Resume from current write_idx to avoid index regression
 	currentIdx := atomic.LoadUint64(writeIdx)
 
 	return &EventRingBuffer{
-		mmap:     data,
-		writeIdx: writeIdx,
-		slots:    slots[:],
-		localSeq: currentIdx,
+		mmap:       data,
+		writeIdx:   writeIdx,
+		generation: generation,
+		slots:      slots[:],
+		localSeq:   currentIdx,
 	}, nil
 }
 
@@ -321,11 +337,14 @@ func (rb *EventRingBuffer) Close() error {
 }
 
 func (rb *EventRingBuffer) Push(event ShmPrivateEvent) {
+	generation := atomic.LoadUint64(rb.generation)
+	atomic.StoreUint64(rb.generation, generation+1)
 	event.Sequence = rb.localSeq
 	rb.localSeq++
 	idx := event.Sequence % RingBufferSlots
 	rb.slots[idx] = event
 	atomic.StoreUint64(rb.writeIdx, event.Sequence+1)
+	atomic.StoreUint64(rb.generation, generation+2)
 }
 
 func (rb *EventRingBuffer) PushOrderCreated(exchangeID uint8, symbolID uint16, orderID uint64, size float64, isAsk bool) {

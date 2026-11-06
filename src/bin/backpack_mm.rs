@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 1: Load configuration
     tracing::info!("📋 Loading configuration...");
-    let config = AppConfig::load_default();
+    let config = AppConfig::load_default()?;
     let backpack_config = config.backpack;
     tracing::info!(
         "   Risk fraction: {:.1}%",

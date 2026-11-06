@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/pelletier/go-toml/v2"
@@ -87,6 +88,22 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	return &c, nil
 }
 
+// Validate rejects configurations that cannot be represented by the current
+// single-position account SHM ABI.
+func (c *Config) Validate() error {
+	if c.Lighter.FeederEnabled && len(c.Lighter.FeederSymbols) != 1 {
+		return fmt.Errorf("lighter feeder requires exactly one market: account position SHM is single-market")
+	}
+	for name, exchange := range c.ToExchangeMap() {
+		if exchange.Enabled && (exchange.WSURL == "" || len(exchange.Symbols) == 0) {
+			return fmt.Errorf("%s feeder requires a WebSocket URL and symbol mapping", name)
+		}
+	}
+	return nil
+}

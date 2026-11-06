@@ -4,9 +4,9 @@ use crate::config::ExchangeConfig;
 use crate::shm_reader::ShmBboMessage;
 use crate::strategy::Strategy;
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::pin::Pin;
 use tokio::runtime::Handle;
 use tracing::{error, info, warn};
 

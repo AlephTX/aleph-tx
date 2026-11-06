@@ -4,13 +4,13 @@
 //! 1. Asymmetric order sizing to maintain near-zero inventory
 //! 2. Dynamic spread based on realized volatility + adverse selection
 //! 3. Aggressive position flattening when inventory deviates
-//! 4. 100% maker fills (never cross spread)
+//! 4. Passive normal quoting with reduce-only emergency flattening
 //!
 //! Key Innovation: **Inventory-Weighted Order Sizing**
 //! - Short 0.1 ETH → Bid 0.13 ETH, Ask 0.03 ETH (net +0.1 if bid fills)
 //! - Long 0.1 ETH → Bid 0.03 ETH, Ask 0.13 ETH (net -0.1 if ask fills)
 //!
-//! Target: 10-20 bps daily return, Sharpe > 3.0
+//! Returns depend on execution costs and market conditions; no return target is guaranteed.
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
@@ -20,8 +20,8 @@ use crate::order_tracker::{OrderLifecycle, OrderSide, OrderTracker};
 use crate::shm_reader::{NUM_EXCHANGES, ShmBboMessage, ShmReader};
 use crate::telemetry::TelemetryCollector;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -31,30 +31,28 @@ mod housekeeping;
 mod market_state;
 mod pricing;
 use components::{
-    apply_risk_limits, decide_quote_cycle, inventory_deadband_size, inventory_skew_ratio, position_for_quoting,
-    residual_exposure_abs, safe_available_balance, scaled_base_order_size,
-    scaled_inventory_urgency_threshold, scaled_max_position, scaled_min_available_balance,
-    toxicity_size_scale, toxicity_spread_multiplier, usable_balance_fraction,
-    utilization_floor_base_order_size,
-    QuoteCycleDecision, QuoteTarget, RiskSnapshot,
+    QuoteCycleDecision, QuoteTarget, RiskSnapshot, apply_risk_limits, decide_quote_cycle,
+    inventory_deadband_size, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
+    safe_available_balance, scaled_base_order_size, scaled_inventory_urgency_threshold,
+    scaled_max_position, scaled_min_available_balance, toxicity_size_scale,
+    toxicity_spread_multiplier, usable_balance_fraction, utilization_floor_base_order_size,
 };
 use execution::{
-    apply_batch_success, build_side_execution_plan, classify_batch_failure,
-    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
-    should_defer_cancel_only_refresh, should_defer_micro_refresh,
-    should_defer_one_sided_requote,
-    should_defer_post_fill_replenishment,
-    size_tolerance_ratio_for_requote, BatchFailureAction, InventoryContext,
+    BatchFailureAction, InventoryContext, apply_batch_success, build_side_execution_plan,
+    classify_batch_failure, max_side_requote_replacements_per_cycle,
+    resolve_cancel_client_order_ids, should_defer_cancel_only_refresh, should_defer_micro_refresh,
+    should_defer_one_sided_requote, should_defer_post_fill_replenishment,
+    size_tolerance_ratio_for_requote,
 };
-use housekeeping::{reconcile_interval, sync_telemetry_snapshot, TelemetrySync};
+use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    build_market_state, classify_stale_bbo, data_age_ms,
-    external_fair_value_mid, MarketState, StaleBboAction,
+    MarketState, StaleBboAction, build_market_state, classify_stale_bbo, data_age_ms,
+    external_fair_value_mid,
 };
 use pricing::{
-    anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, local_reference_mid,
-    stabilize_crossed_quotes, AnchorParams,
+    AnchorParams, anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
+    fallback_bbo_prices, fee_aware_half_spread, local_reference_mid, momentum_half_spreads,
+    stabilize_crossed_quotes,
 };
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
@@ -76,20 +74,60 @@ impl Default for AccountStats {
             position: 0.0,
             leverage: 0.0,
             margin_usage: 0.0,
-            last_update: Instant::now(),
+            last_update: Instant::now() - Duration::from_secs(ACCOUNT_STALENESS_SECS + 1),
         }
     }
 }
 
+impl AccountStats {
+    fn is_usable(&self) -> bool {
+        [
+            self.available_balance,
+            self.portfolio_value,
+            self.position,
+            self.leverage,
+            self.margin_usage,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            && self.portfolio_value > 0.0
+            && self.leverage >= 0.0
+            && self.margin_usage >= 0.0
+            && self.last_update.elapsed() <= Duration::from_secs(ACCOUNT_STALENESS_SECS)
+    }
+}
+
+fn wall_time_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn account_source_age(snapshot: &AccountStatsSnapshot, now_ns: u64) -> Duration {
+    if snapshot.updated_at == 0
+        || snapshot.position_updated_at == 0
+        || snapshot.updated_at > now_ns
+        || snapshot.position_updated_at > now_ns
+    {
+        return Duration::from_secs(ACCOUNT_STALENESS_SECS + 1);
+    }
+    Duration::from_nanos(now_ns - snapshot.updated_at.min(snapshot.position_updated_at))
+}
+
 impl From<AccountStatsSnapshot> for AccountStats {
     fn from(snapshot: AccountStatsSnapshot) -> Self {
+        let now = Instant::now();
+        let age = account_source_age(&snapshot, wall_time_ns());
         Self {
             available_balance: snapshot.available_balance,
             portfolio_value: snapshot.portfolio_value,
             position: snapshot.position,
             leverage: snapshot.leverage,
             margin_usage: snapshot.margin_usage,
-            last_update: Instant::now(),
+            last_update: now
+                .checked_sub(age)
+                .unwrap_or(now - Duration::from_secs(ACCOUNT_STALENESS_SECS + 1)),
         }
     }
 }
@@ -103,10 +141,13 @@ struct MicrostructureTracker {
     ema_fast_alpha: f64,
     ema_slow_alpha: f64,
     ema_initialized: bool,
+    return_mean: f64,
+    return_m2: f64,
 }
 
 impl MicrostructureTracker {
     fn new(max_samples: usize, ema_fast_period: usize, ema_slow_period: usize) -> Self {
+        let max_samples = max_samples.max(2);
         Self {
             price_samples: VecDeque::with_capacity(max_samples),
             max_samples,
@@ -115,14 +156,45 @@ impl MicrostructureTracker {
             ema_fast_alpha: 2.0 / (ema_fast_period as f64 + 1.0),
             ema_slow_alpha: 2.0 / (ema_slow_period as f64 + 1.0),
             ema_initialized: false,
+            return_mean: 0.0,
+            return_m2: 0.0,
         }
     }
 
     fn update(&mut self, mid: f64) {
-        self.price_samples.push_back(mid);
-        if self.price_samples.len() > self.max_samples {
+        if !mid.is_finite() || mid <= 0.0 {
+            return;
+        }
+        let new_return = self
+            .price_samples
+            .back()
+            .map(|last| (mid / last - 1.0) * 10000.0);
+        if new_return.is_some_and(|value| !value.is_finite()) {
+            return;
+        }
+        // Remove before pushing so a full ring never reallocates. Maintain
+        // rolling Welford moments instead of rescanning the window every tick.
+        if self.price_samples.len() == self.max_samples {
+            let removed = (self.price_samples[1] / self.price_samples[0] - 1.0) * 10000.0;
+            let count = self.price_samples.len() - 1;
+            if count > 1 {
+                let new_mean = self.return_mean + (self.return_mean - removed) / (count - 1) as f64;
+                self.return_m2 =
+                    (self.return_m2 - (removed - self.return_mean) * (removed - new_mean)).max(0.0);
+                self.return_mean = new_mean;
+            } else {
+                self.return_mean = 0.0;
+                self.return_m2 = 0.0;
+            }
             self.price_samples.pop_front();
         }
+        if let Some(value) = new_return {
+            let count = self.price_samples.len();
+            let delta = value - self.return_mean;
+            self.return_mean += delta / count as f64;
+            self.return_m2 += delta * (value - self.return_mean);
+        }
+        self.price_samples.push_back(mid);
 
         if !self.ema_initialized {
             self.ema_fast = mid;
@@ -140,23 +212,7 @@ impl MicrostructureTracker {
             return 10.0; // Default
         }
 
-        // Zero-allocation single-pass variance calculation
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-        let mut count = 0;
-
-        for i in 0..n - 1 {
-            let p1 = self.price_samples[i];
-            let p2 = self.price_samples[i + 1];
-            let ret = (p2 / p1 - 1.0) * 10000.0;
-            sum += ret;
-            sum_sq += ret * ret;
-            count += 1;
-        }
-
-        let mean = sum / count as f64;
-        let variance = (sum_sq / count as f64) - (mean * mean);
-        variance.sqrt().max(1.0)
+        (self.return_m2.max(0.0) / (n - 1) as f64).sqrt().max(1.0)
     }
 
     fn momentum_bps(&self) -> f64 {
@@ -172,6 +228,36 @@ impl MicrostructureTracker {
             return 0.0;
         }
         self.momentum_bps().abs() / vol
+    }
+}
+
+/// Tracks continuous inventory independently of fill and request activity.
+#[derive(Default)]
+struct InventoryAge {
+    opened_at: Option<Instant>,
+    direction: f64,
+    last_attempt: Option<Instant>,
+}
+
+impl InventoryAge {
+    fn observe(&mut self, position: f64, deadband: f64, now: Instant) {
+        if position.abs() <= deadband {
+            *self = Self::default();
+        } else if self.opened_at.is_none() || position.signum() != self.direction {
+            self.opened_at = Some(now);
+            self.direction = position.signum();
+            self.last_attempt = None;
+        }
+    }
+
+    fn is_expired(&self, now: Instant, timeout: Duration) -> bool {
+        self.opened_at
+            .is_some_and(|opened| now.saturating_duration_since(opened) >= timeout)
+    }
+
+    fn can_retry(&self, now: Instant) -> bool {
+        self.last_attempt
+            .is_none_or(|attempt| now.saturating_duration_since(attempt) >= Duration::from_secs(5))
     }
 }
 
@@ -202,15 +288,13 @@ impl ActiveOrder {
 // Constants & Configuration
 // ═══════════════════════════════════════════════════════════════════
 
+const ACCOUNT_STALENESS_SECS: u64 = 30;
 const DATA_STALENESS_THRESHOLD_MS: u64 = 5000;
 const STALE_BBO_CANCEL_AFTER_MS: u64 = 15000;
-const STATIC_TWO_SIDED_BOOK_GRACE_MS: u64 = 30000;
-const STATIC_QUOTEABLE_BOOK_GRACE_MS: u64 = 12000;
 const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
-const MAX_TOUCH_OFFSET_BPS: f64 = 15.0;
 const POSITION_TIMEOUT_SECS: u64 = 60;
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
 #[derive(Debug, Clone)]
@@ -248,6 +332,8 @@ pub struct InventoryNeutralMM {
     last_execution_batch_at: Option<Instant>,
     margin_cooldown_until: Instant,
     stale_bbo_since_ns: Option<u64>,
+    inventory_age: InventoryAge,
+    position_confirmation_after_ns: Option<u64>,
 
     // Telemetry
     telemetry: TelemetryCollector,
@@ -309,6 +395,8 @@ impl InventoryNeutralMM {
             last_execution_batch_at: None,
             margin_cooldown_until: Instant::now(),
             stale_bbo_since_ns: None,
+            inventory_age: InventoryAge::default(),
+            position_confirmation_after_ns: None,
             telemetry: TelemetryCollector::new(),
             is_running: Arc::new(AtomicBool::new(true)),
             shm_reader,
@@ -319,17 +407,23 @@ impl InventoryNeutralMM {
         &mut self,
         mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> anyhow::Result<()> {
+        self.config.validate()?;
         info!("🎯 Inventory-Neutral MM started (Institutional Mode)");
 
         // Phase 0: Startup Cleanup & State Sync
-        self.perform_startup_initialization().await.map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+        self.perform_startup_initialization()
+            .await
+            .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
 
         info!("🚀 Starting main execution loop...");
         while self.is_running.load(Ordering::SeqCst) {
             // 0. Check shutdown signal
             if let Some(ref mut rx) = shutdown
-                && *rx.borrow() {
-                self.perform_graceful_shutdown().await.map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+                && *rx.borrow()
+            {
+                self.perform_graceful_shutdown()
+                    .await
+                    .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
                 return Ok(());
             }
 
@@ -338,12 +432,23 @@ impl InventoryNeutralMM {
                 self.account_stats = stats.into();
             }
 
+            if self.order_tracker.needs_reconciliation() {
+                self.clean_exchange_state("event-stream recovery").await?;
+            }
+            if !self.account_stats.is_usable() {
+                warn!("Account equity/position snapshot unavailable or stale; withdrawing quotes");
+                self.cancel_all_and_sync("stale account snapshot").await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
             // Phase 1: Institutional Housekeeping
             self.perform_periodic_housekeeping().await;
 
             // Daily PnL circuit breaker (v6.0.2): shutdown if loss exceeds 5% of session start balance
             if self.session_start_balance > 0.0 {
-                let daily_pnl_pct = (self.account_stats.portfolio_value - self.session_start_balance)
+                let daily_pnl_pct = (self.account_stats.portfolio_value
+                    - self.session_start_balance)
                     / self.session_start_balance;
                 if daily_pnl_pct < -0.05 {
                     tracing::error!(
@@ -352,7 +457,9 @@ impl InventoryNeutralMM {
                         self.session_start_balance,
                         self.account_stats.portfolio_value
                     );
-                    self.perform_graceful_shutdown().await.map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+                    self.perform_graceful_shutdown()
+                        .await
+                        .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
                     return Ok(());
                 }
             }
@@ -403,64 +510,50 @@ impl InventoryNeutralMM {
                 )
             };
 
-            // Phase 4: Avellaneda-Stoikov Optimal Quoting
-            if let Some((our_bid, our_ask)) = self.calculate_optimal_quotes(&inputs, quoting_position) {
-                // Phase 5: Sizing & Execution
-                self.execute_quoting_cycle(our_bid, our_ask, quoting_position, inputs.mid).await;
-            }
-
-            // Phase 6: Position timeout — PostOnly flatten if stuck
-            if let Some(last_fill) = self.last_fill_at {
-                let position_abs = self.account_stats.position.abs();
-                let deadband = inventory_deadband_size(
+            // Inventory age follows the exposure episode, not the last fill.
+            // Adding to a stuck position must never renew its timeout.
+            let deadband = inventory_deadband_size(
+                &self.config,
+                scaled_base_order_size(
                     &self.config,
-                    scaled_base_order_size(&self.config, self.account_stats.portfolio_value, inputs.mid)
-                        .max(self.config.step_size),
-                    scaled_inventory_urgency_threshold(
+                    self.account_stats.portfolio_value,
+                    inputs.mid,
+                )
+                .max(self.config.step_size),
+                scaled_inventory_urgency_threshold(
+                    &self.config,
+                    self.account_stats.portfolio_value,
+                    inputs.mid,
+                    scaled_max_position(
                         &self.config,
                         self.account_stats.portfolio_value,
                         inputs.mid,
-                        scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid),
                     ),
-                    inputs.mid,
-                );
-                if position_abs > deadband && last_fill.elapsed() > Duration::from_secs(POSITION_TIMEOUT_SECS) {
-                    info!(
-                        "⏰ Position timeout: {:.4} base held for >{}s without fills, PostOnly flatten",
-                        self.account_stats.position,
-                        POSITION_TIMEOUT_SECS
-                    );
+                ),
+                inputs.mid,
+            );
+            let now = Instant::now();
+            self.inventory_age.observe(quoting_position, deadband, now);
+            if self
+                .inventory_age
+                .is_expired(now, Duration::from_secs(POSITION_TIMEOUT_SECS))
+            {
+                if self.inventory_age.can_retry(now) {
+                    self.inventory_age.last_attempt = Some(now);
                     self.execute_timeout_flatten(inputs.mid).await;
                 }
-            }
-
-            // Phase 7: Unrealized PnL stop-loss (v6.0.1)
-            // Emergency flatten if position held during adverse price movement
-            // Simplified heuristic: if position > deadband for >60s and price moved against us
-            if inputs.using_external_fair_value && self.account_stats.position.abs() > self.config.step_size
-                && let Some(last_fill) = self.last_fill_at
+            } else if let Some((our_bid, our_ask)) =
+                self.calculate_optimal_quotes(&inputs, quoting_position)
             {
-                let hold_duration = last_fill.elapsed();
-                if hold_duration > Duration::from_secs(60) {
-                    let position_notional = self.account_stats.position.abs() * inputs.pricing_mid;
-                    let stop_loss_threshold = self.account_stats.portfolio_value * 0.01;
-
-                    if position_notional > stop_loss_threshold * 2.0 {
-                        warn!(
-                            "🛑 Stop-loss triggered: pos={:.4} @ mark=${:.2} (${:.2} notional) held for {:.0}s",
-                            self.account_stats.position,
-                            inputs.pricing_mid,
-                            position_notional,
-                            hold_duration.as_secs_f64()
-                        );
-                        self.execute_timeout_flatten(inputs.pricing_mid).await;
-                    }
-                }
+                self.execute_quoting_cycle(our_bid, our_ask, quoting_position, inputs.mid)
+                    .await;
+            } else {
+                self.cancel_all_orders().await;
             }
 
             tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
-        
+
         Ok(())
     }
 
@@ -468,12 +561,12 @@ impl InventoryNeutralMM {
     async fn perform_startup_initialization(&mut self) -> anyhow::Result<()> {
         self.clean_exchange_state("startup").await?;
 
-        // Sync authoritative account data
-        let stats = self.account_stats_reader.read();
-        self.account_stats = stats.into();
         self.session_start_balance = self.account_stats.portfolio_value;
-        
-        info!("✅ Startup complete: pos={:.4} bal=${:.2}", self.account_stats.position, self.account_stats.portfolio_value);
+
+        info!(
+            "✅ Startup complete: pos={:.4} bal=${:.2}",
+            self.account_stats.position, self.account_stats.portfolio_value
+        );
         Ok(())
     }
 
@@ -495,16 +588,18 @@ impl InventoryNeutralMM {
         let exchange_position = self.account_stats.position;
         // Quote direction should follow confirmed inventory, not pending-order imbalance.
         // Pending buy/sell exposure is still enforced via worst_case_long/short in risk limits.
-        let mut tracker_confirmed = self.order_tracker.confirmed_position();
+        let tracker_confirmed = self.order_tracker.confirmed_position();
         let mut base_order_size = components::round_down_to_step(
             scaled_base_order_size(&self.config, self.account_stats.portfolio_value, mid)
                 .max(self.config.step_size),
             self.config.step_size,
         )
         .max(self.config.step_size);
+        // An untradeably small cap means no opening orders; never enlarge a
+        // configured notional limit merely to make one lot tradable.
         let max_position =
-            scaled_max_position(&self.config, self.account_stats.portfolio_value, mid)
-                .max(base_order_size);
+            scaled_max_position(&self.config, self.account_stats.portfolio_value, mid).max(0.0);
+        base_order_size = base_order_size.min(max_position);
         let inventory_urgency_threshold = scaled_inventory_urgency_threshold(
             &self.config,
             self.account_stats.portfolio_value,
@@ -513,16 +608,6 @@ impl InventoryNeutralMM {
         );
         let min_available_balance =
             scaled_min_available_balance(&self.config, self.account_stats.portfolio_value);
-
-        let force_sync_threshold = (base_order_size * 2.0).max(self.config.step_size * 10.0);
-        let opposite_sign = exchange_position.abs() >= self.config.step_size
-            && tracker_confirmed.abs() >= self.config.step_size
-            && exchange_position.signum() != tracker_confirmed.signum();
-        let excessive_drift = (exchange_position - tracker_confirmed).abs() >= force_sync_threshold;
-        if opposite_sign || excessive_drift {
-            self.order_tracker.force_sync_position(exchange_position);
-            tracker_confirmed = exchange_position;
-        }
 
         let mut runtime_config = self.config.clone();
         runtime_config.max_position = max_position;
@@ -538,11 +623,11 @@ impl InventoryNeutralMM {
             self.config.max_leverage,
         );
         let position_ratio = (position_for_quoting / max_position.max(self.config.step_size)).abs();
-        let mut usable_balance =
-            available_balance * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
+        let mut usable_balance = available_balance
+            * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
         let margin_per_eth = mid / self.config.max_leverage;
         let r = self.config.grid_size_decay;
-        let n = self.config.grid_levels as i32;
+        let n = self.config.grid_levels.max(1) as i32;
         let grid_multiplier = if (1.0 - r).abs() < 1e-4 {
             n as f64
         } else {
@@ -560,15 +645,19 @@ impl InventoryNeutralMM {
             self.config.step_size,
         )
         .max(self.config.step_size);
-        let max_position = max_position.max(base_order_size);
-        usable_balance =
-            available_balance * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
+        base_order_size = base_order_size.min(max_position);
+        usable_balance = available_balance
+            * usable_balance_fraction(position_ratio, self.account_stats.margin_usage);
 
         RiskSnapshot {
             raw_available_balance,
             position_for_quoting,
-            worst_case_long: self.order_tracker.worst_case_long(),
-            worst_case_short: self.order_tracker.worst_case_short(),
+            // A lagging account snapshot must not erase a more recent fill.
+            // Reserve exposure against both observed positions until reconciled.
+            worst_case_long: self.order_tracker.worst_case_long()
+                + (exchange_position - tracker_confirmed).max(0.0),
+            worst_case_short: self.order_tracker.worst_case_short()
+                + (exchange_position - tracker_confirmed).min(0.0),
             base_order_size,
             max_position,
             inventory_urgency_threshold,
@@ -585,29 +674,31 @@ impl InventoryNeutralMM {
         our_bid: f64,
         our_ask: f64,
         mid: f64,
+        risk: &RiskSnapshot,
     ) -> Option<QuoteTarget> {
         let spread_bps = ((our_ask - our_bid) / mid) * 10000.0;
         self.telemetry.update_spread_size(spread_bps);
-        self.telemetry.update_adverse_selection(self.micro.adverse_selection_score());
+        self.telemetry
+            .update_adverse_selection(self.micro.adverse_selection_score());
 
         let min_spread_bps = self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps;
         if spread_bps < min_spread_bps {
             debug!(
                 "Skipping quote target: spread_bps={:.2} below min_spread_bps={:.2}",
-                spread_bps,
-                min_spread_bps
+                spread_bps, min_spread_bps
             );
             return None;
         }
 
-        let risk = self.build_risk_snapshot(mid);
-        let (bid_size, ask_size) = self.calculate_asymmetric_sizes(&risk, mid);
+        let (bid_size, ask_size) = self.calculate_asymmetric_sizes(risk, mid);
         let toxicity_scale = toxicity_size_scale(
             self.micro.adverse_selection_score(),
             self.config.adverse_selection_threshold,
         );
-        let bid_size = components::round_down_to_step(bid_size * toxicity_scale, self.config.step_size);
-        let ask_size = components::round_down_to_step(ask_size * toxicity_scale, self.config.step_size);
+        let bid_size =
+            components::round_down_to_step(bid_size * toxicity_scale, self.config.step_size);
+        let ask_size =
+            components::round_down_to_step(ask_size * toxicity_scale, self.config.step_size);
 
         Some(QuoteTarget {
             bid_price: our_bid,
@@ -649,10 +740,22 @@ impl InventoryNeutralMM {
             let min_size = 11.0 / mid;
             if position > 0.0 {
                 // Long at limit: only allow sells
-                return (0.0, min_size.max(risk.base_order_size));
+                return apply_risk_limits(
+                    config,
+                    risk,
+                    0.0,
+                    min_size.max(risk.base_order_size),
+                    mid,
+                );
             } else {
                 // Short at limit: only allow buys
-                return (min_size.max(risk.base_order_size), 0.0);
+                return apply_risk_limits(
+                    config,
+                    risk,
+                    min_size.max(risk.base_order_size),
+                    0.0,
+                    mid,
+                );
             }
         }
 
@@ -660,8 +763,8 @@ impl InventoryNeutralMM {
         // Keep the quote stack two-sided inside a deadband roughly equal to one top-level order,
         // but apply a mild skew so small inventory still gets nudged back toward flat.
         if position.abs() <= inventory_deadband {
-            let deadband_ratio = (position.abs() / inventory_deadband.max(config.step_size))
-                .clamp(0.0, 1.0);
+            let deadband_ratio =
+                (position.abs() / inventory_deadband.max(config.step_size)).clamp(0.0, 1.0);
             let deadband_skew = risk.base_order_size * 0.30 * deadband_ratio;
             let (bid_size, ask_size) = if position > 0.0 {
                 (
@@ -676,13 +779,7 @@ impl InventoryNeutralMM {
             } else {
                 (risk.base_order_size, risk.base_order_size)
             };
-            return apply_risk_limits(
-                config,
-                risk,
-                bid_size,
-                ask_size,
-                mid,
-            );
+            return apply_risk_limits(config, risk, bid_size, ask_size, mid);
         }
 
         // Sigmoid SIZE multiplier using tanh: 1.0 at pos=0, ~3.0 at pos=max_position
@@ -695,7 +792,7 @@ impl InventoryNeutralMM {
         let urgency_threshold = risk.inventory_urgency_threshold.max(config.step_size);
         let skew_progress = ((position.abs() - inventory_deadband)
             / (urgency_threshold - inventory_deadband).max(config.step_size))
-            .clamp(0.0, 1.0);
+        .clamp(0.0, 1.0);
 
         // Cap inventory_offset to prevent whiplash: flattening order <= cap_mult * base_order_size
         let max_offset = risk.base_order_size * (config.flattening_cap_mult - 1.0).max(0.5);
@@ -772,100 +869,98 @@ impl InventoryNeutralMM {
         Ok(())
     }
 
-    fn sync_local_after_cancel_all(&mut self) {
-        self.order_tracker.cancel_all_active();
-        self.active_orders.clear();
-    }
-
-    fn sync_tracker_position_to_exchange(&mut self, reason: &str) {
-        let delta = self
-            .order_tracker
-            .force_sync_position(self.account_stats.position);
-        if delta.abs() > 1e-8 {
-            info!(
-                "{}: synced tracker confirmed position to exchange position {:.4} base (delta={:+.4})",
-                reason,
-                self.account_stats.position,
-                delta
-            );
-        }
-    }
-
-    async fn cancel_all_and_sync(&mut self, reason: &str) {
+    /// Returns whether REST confirms an empty book. This alone never releases
+    /// reserved exposure: cleanup also needs an independent fresh position.
+    async fn cancel_all_and_sync(&mut self, reason: &str) -> bool {
+        let request_started = wall_time_ns();
         match self.trading.cancel_all().await {
-            Ok(_) => {
-                self.sync_local_after_cancel_all();
+            Ok(count) => {
+                if count > 0 || !self.order_tracker.active_orders_snapshot().is_empty() {
+                    self.position_confirmation_after_ns
+                        .get_or_insert(request_started);
+                }
             }
             Err(err) => {
-                warn!(
-                    "{}: exchange cancel_all failed, falling back to tracked cancels: {}",
-                    reason,
-                    err
-                );
+                warn!("{}: exchange cancel_all failed: {}", reason, err);
                 self.cancel_all_orders().await;
+                return false;
             }
         }
+        self.refresh_active_orders_from_tracker();
+        // An unbound submission can still be in flight and is not proved absent
+        // by a single open-orders snapshot.
+        if self
+            .active_orders
+            .iter()
+            .any(|order| order.order_index.is_none())
+        {
+            return false;
+        }
+        match self.trading.get_active_orders().await {
+            Ok(orders) => orders.is_empty(),
+            Err(err) => {
+                warn!("{}: cancellation confirmation failed: {}", reason, err);
+                false
+            }
+        }
+    }
+
+    async fn read_confirmed_account_stats(&mut self) -> anyhow::Result<()> {
+        for _ in 0..20 {
+            let snapshot = self.account_stats_reader.read();
+            let stats = AccountStats::from(snapshot);
+            let after_actions = self
+                .position_confirmation_after_ns
+                .is_none_or(|required| snapshot.position_updated_at >= required);
+            if stats.is_usable() && after_actions {
+                self.account_stats = stats;
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        anyhow::bail!(
+            "Cleanup cannot confirm a fresh equity and position snapshot after pending actions"
+        )
     }
 
     async fn clean_exchange_state(&mut self, phase: &str) -> anyhow::Result<()> {
-        info!("📤 {} cleanup: canceling all open orders...", phase);
-        self.cancel_all_and_sync(&format!("{phase} cleanup")).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Refresh account stats before deciding whether flattening is needed.
-        self.account_stats = self.account_stats_reader.read().into();
-
-        for attempt in 1..=2 {
-            if self.account_stats.position.abs() < self.config.step_size {
-                break;
-            }
-
-            if let Some(mid) = self.fetch_cleanup_mid_price().await {
-                info!(
-                    "📤 {} cleanup: flattening residual position {:.4} base @ ~${:.2} (attempt {}/{})",
-                    phase,
-                    self.account_stats.position,
-                    mid,
-                    attempt,
-                    2
-                );
-                if let Err(err) = self.trading.close_all_positions(mid).await {
-                    warn!(
-                        "{} cleanup: flatten position failed for {:.4} base on attempt {}: {}",
-                        phase,
-                        self.account_stats.position,
-                        attempt,
-                        err
+        let reconciliation_epoch = self.order_tracker.reconciliation_epoch();
+        for attempt in 0..3 {
+            let canceled = self.cancel_all_and_sync(phase).await;
+            if !canceled {
+                if attempt == 2 {
+                    anyhow::bail!(
+                        "{phase}: cancellation remains unconfirmed; reserved exposure retained"
                     );
-                    break;
                 }
-
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                self.cancel_all_and_sync(&format!("{phase} post-flatten cleanup")).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                self.account_stats = self.account_stats_reader.read().into();
-            } else {
-                warn!(
-                    "{} cleanup: unable to obtain a valid Lighter mid price, skipping forced flatten for position {:.4}",
-                    phase,
-                    self.account_stats.position
-                );
-                break;
+                continue;
             }
-        }
-
-        if self.account_stats.position.abs() >= self.config.step_size {
-            warn!(
-                "{} cleanup complete with residual position still open: {:.4} base",
-                phase,
-                self.account_stats.position
+            self.read_confirmed_account_stats().await?;
+            if self.account_stats.position.abs() < self.config.step_size {
+                // Only this independently confirmed empty-book + position barrier
+                // may release reservations after an event gap or uncertain cancel.
+                anyhow::ensure!(
+                    self.order_tracker
+                        .confirm_cleanup(reconciliation_epoch, self.account_stats.position),
+                    "{phase}: event stream changed during cleanup; exposure retained and trading halted"
+                );
+                self.active_orders.clear();
+                self.position_confirmation_after_ns = None;
+                return Ok(());
+            }
+            anyhow::ensure!(
+                attempt < 2,
+                "{phase}: residual inventory remains after cleanup attempts"
             );
+            let mid = self.fetch_cleanup_mid_price().await.ok_or_else(|| {
+                anyhow::anyhow!("{phase}: no fresh price for residual-position cleanup")
+            })?;
+            self.position_confirmation_after_ns = Some(wall_time_ns());
+            self.trading.close_all_positions(mid).await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-
-        self.account_stats = self.account_stats_reader.read().into();
-        self.sync_tracker_position_to_exchange(&format!("{phase} cleanup"));
-        self.refresh_active_orders_from_tracker();
-        Ok(())
+        anyhow::bail!("{phase}: residual inventory remains; refusing to report a clean state")
     }
 
     async fn fetch_cleanup_mid_price(&mut self) -> Option<f64> {
@@ -909,9 +1004,8 @@ impl InventoryNeutralMM {
         let quote_position = risk.position_for_quoting;
         let worst_case_long = self.order_tracker.worst_case_long();
         let worst_case_short = self.order_tracker.worst_case_short();
-        let position_ratio = (quote_position
-            / scaled_max_position(&self.config, equity, mid))
-            .abs();
+        let position_ratio =
+            (quote_position / scaled_max_position(&self.config, equity, mid)).abs();
         let usable_balance = safe_avail * usable_balance_fraction(position_ratio, margin_usage);
 
         let pnl_baseline = if self.session_start_balance.is_finite()
@@ -968,7 +1062,7 @@ impl InventoryNeutralMM {
             .bids
             .iter()
             .take(5)
-            .filter(|l| l.price > 0.0 && l.size > 0.0)
+            .filter(|l| l.price.is_finite() && l.size.is_finite() && l.price > 0.0 && l.size > 0.0)
             .map(|l| l.price * l.size)
             .sum();
 
@@ -977,17 +1071,18 @@ impl InventoryNeutralMM {
             .asks
             .iter()
             .take(5)
-            .filter(|l| l.price > 0.0 && l.size > 0.0)
+            .filter(|l| l.price.is_finite() && l.size.is_finite() && l.price > 0.0 && l.size > 0.0)
             .map(|l| l.price * l.size)
             .sum();
 
         // Avoid division by zero
-        if bid_notional + ask_notional < 0.001 {
+        if !(bid_notional + ask_notional).is_finite() || bid_notional + ask_notional < 0.001 {
             return (bid_l1 + ask_l1) / 2.0; // Fallback to simple mid
         }
 
         // VWMicro formula: weight L1 prices by opposite side notional
-        (bid_notional * ask_l1 + ask_notional * bid_l1) / (bid_notional + ask_notional)
+        let bid_weight = bid_notional / (bid_notional + ask_notional);
+        bid_weight * ask_l1 + (1.0 - bid_weight) * bid_l1
     }
 
     /// Periodic tasks: reconciliation, GC, PnL reporting, and telemetry export
@@ -1006,7 +1101,11 @@ impl InventoryNeutralMM {
             }
 
             // Phase 1: Reconcile active orders from OrderTracker with actual open orders
-            let stale_count = match self.order_tracker.reconcile_with_exchange(&*self.trading).await {
+            let stale_count = match self
+                .order_tracker
+                .reconcile_with_exchange(&*self.trading)
+                .await
+            {
                 Ok(stale_count) => {
                     if self.reconcile_failures > 0 {
                         info!(
@@ -1096,7 +1195,11 @@ impl InventoryNeutralMM {
         }
         self.last_fill_at = Some(Instant::now());
 
-        match self.order_tracker.reconcile_with_exchange(&*self.trading).await {
+        match self
+            .order_tracker
+            .reconcile_with_exchange(&*self.trading)
+            .await
+        {
             Ok(stale_count) => {
                 self.reconcile_failures = 0;
                 self.last_reconciled_fill_count = fill_count;
@@ -1104,8 +1207,7 @@ impl InventoryNeutralMM {
                 if stale_count > 0 {
                     info!(
                         "Post-fill reconcile cleared {} stale tracker entries after fill_count advanced to {}",
-                        stale_count,
-                        fill_count
+                        stale_count, fill_count
                     );
                 }
             }
@@ -1113,9 +1215,7 @@ impl InventoryNeutralMM {
                 self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                 warn!(
                     "Post-fill reconcile failed (fill_count={} attempt={}): {}",
-                    fill_count,
-                    self.reconcile_failures,
-                    err
+                    fill_count, self.reconcile_failures, err
                 );
             }
         }
@@ -1126,13 +1226,14 @@ impl InventoryNeutralMM {
         let market_state = match build_market_state(exchanges, self.config.exchange_id) {
             Some(state) => state,
             None => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Missing or corrupt data must not leave live quotes unattended.
+                self.cancel_all_orders().await;
                 return None;
             }
         };
 
         // Staleness check
-        if market_state.bbo.timestamp_ns > 0 {
+        {
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1140,11 +1241,8 @@ impl InventoryNeutralMM {
             let action = classify_stale_bbo(
                 &market_state.bbo,
                 now_ns,
-                self.stale_bbo_since_ns,
                 DATA_STALENESS_THRESHOLD_MS,
                 STALE_BBO_CANCEL_AFTER_MS,
-                STATIC_TWO_SIDED_BOOK_GRACE_MS,
-                STATIC_QUOTEABLE_BOOK_GRACE_MS,
             );
             match action {
                 StaleBboAction::Fresh => {
@@ -1182,9 +1280,14 @@ impl InventoryNeutralMM {
     ///
     /// New flow (v6.0.0): External exchanges (Binance, Hyperliquid) are the PRIMARY
     /// fair value anchor. Local Lighter BBO is only used for touch positioning.
-    fn calculate_pricing_inputs(&mut self, exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES], bbo: &ShmBboMessage) -> PricingInputs {
+    fn calculate_pricing_inputs(
+        &mut self,
+        exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES],
+        bbo: &ShmBboMessage,
+    ) -> PricingInputs {
         // Local mid — always needed for touch positioning
-        let local_mid = local_reference_mid(bbo, self.config.tick_size, LOCAL_FALLBACK_SPREAD_TICKS);
+        let local_mid =
+            local_reference_mid(bbo, self.config.tick_size, LOCAL_FALLBACK_SPREAD_TICKS);
         let (bid_touch, ask_touch) = fallback_bbo_prices(local_mid, bbo, self.config.tick_size);
 
         // External fair value: primary pricing anchor
@@ -1204,8 +1307,21 @@ impl InventoryNeutralMM {
             (fair_mid, true, local_mid)
         } else {
             // Fallback: use local VWMicro or simple mid when no external data
-            let vw_mid = if let Some(ref depth_reader) = self.shm_depth_reader {
-                if let Some(depth) = depth_reader.read_depth(self.config.symbol_id, self.config.exchange_id) {
+            let vw_mid = if self.config.use_depth_pricing {
+                if let Some(depth) = self
+                    .shm_depth_reader
+                    .as_ref()
+                    .and_then(|reader| {
+                        reader.read_depth(self.config.symbol_id, self.config.exchange_id)
+                    })
+                    .filter(|depth| {
+                        !market_state::is_stale_bbo(
+                            depth.timestamp_ns,
+                            now_ns,
+                            DATA_STALENESS_THRESHOLD_MS,
+                        )
+                    })
+                {
                     self.calculate_vw_micro_price(&depth, bid_touch, ask_touch)
                 } else {
                     local_mid
@@ -1238,15 +1354,12 @@ impl InventoryNeutralMM {
     /// (no fill-rate scaling). Spread cap is dynamic vol-based instead of hard clamp.
     /// Momentum-aware asymmetric spread replaces old inventory_adjusted_half_spreads.
     fn calculate_optimal_quotes(&self, inputs: &PricingInputs, q: f64) -> Option<(f64, f64)> {
-        let toxicity_spread_mult = toxicity_spread_multiplier(
-            inputs.as_score,
-            self.config.adverse_selection_threshold,
-        );
+        let toxicity_spread_mult =
+            toxicity_spread_multiplier(inputs.as_score, self.config.adverse_selection_threshold);
         if toxicity_spread_mult > 1.0 {
             debug!(
                 "AS soft filter active: score={:.2} spread_mult={:.2}",
-                inputs.as_score,
-                toxicity_spread_mult
+                inputs.as_score, toxicity_spread_mult
             );
         }
 
@@ -1271,23 +1384,26 @@ impl InventoryNeutralMM {
         // Spread logic: use config kappa directly (no fill-rate scaling)
         let kappa = self.config.as_kappa;
         let gamma_safe = gamma.max(1e-6);
-        let optimal_spread = gamma * sigma * sigma * time_horizon + (2.0 / gamma_safe) * (1.0 + gamma_safe / kappa).ln();
+        let optimal_spread = gamma * sigma * sigma * time_horizon
+            + (2.0 / gamma_safe) * (gamma_safe / kappa).ln_1p();
         let half_spread_raw = optimal_spread / 2.0 * inputs.pricing_mid;
 
-        // Dynamic vol-based cap replaces hard max_spread_bps clamp (v6.0.1: widened from 3x to 4x)
-        let vol_cap_bps = (inputs.vol_bps * 4.0).clamp(8.0, 40.0);
-        let max_half_spread = inputs.pricing_mid * vol_cap_bps / 10000.0 / 2.0;
-        let fee_floor = inputs.pricing_mid * (self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps) / 10000.0 / 2.0;
-        let half_spread = (half_spread_raw * toxicity_spread_mult).clamp(fee_floor, max_half_spread);
-
-        // Momentum-aware asymmetric spread (v6.0.2 — direction FIXED)
-        // positive momentum = price going up → tighten ask (sell into strength), widen bid (don't chase)
-        // negative momentum = price going down → tighten bid (buy into weakness), widen ask (don't chase)
-        // This follows momentum instead of fighting it.
-        let momentum = self.micro.momentum_bps();
-        let momentum_adjust = (momentum / 10.0).clamp(-0.5, 0.5);
-        let bid_half_spread = half_spread * (1.0 + momentum_adjust * 0.3);
-        let ask_half_spread = half_spread * (1.0 - momentum_adjust * 0.3);
+        let fee_floor_bps = self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps;
+        let vol_cap_bps = (inputs.vol_bps * 4.0)
+            .clamp(8.0, 40.0)
+            .max(fee_floor_bps)
+            .min(self.config.max_spread_bps);
+        let half_spread = fee_aware_half_spread(
+            half_spread_raw * toxicity_spread_mult,
+            inputs.pricing_mid,
+            fee_floor_bps,
+            vol_cap_bps,
+        )?;
+        let (bid_half_spread, ask_half_spread) = momentum_half_spreads(
+            half_spread,
+            self.micro.momentum_bps(),
+            self.config.momentum_skew_scale,
+        );
 
         let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
             * self.config.tick_size;
@@ -1305,11 +1421,9 @@ impl InventoryNeutralMM {
             raw_ask,
             bid_touch: inputs.bid_touch,
             ask_touch: inputs.ask_touch,
-            mid: inputs.mid,
             tick_size: self.config.tick_size,
             penny_ticks: join_penny_ticks,
             inventory_urgency_ratio: urgency_ratio,
-            max_touch_offset_bps: MAX_TOUCH_OFFSET_BPS,
         });
 
         match stabilize_crossed_quotes(
@@ -1323,9 +1437,7 @@ impl InventoryNeutralMM {
             None => {
                 debug!(
                     "Skipping optimal quotes: crossed quote bid={:.2} ask={:.2} mid={:.2}",
-                    our_bid,
-                    our_ask,
-                    inputs.mid
+                    our_bid, our_ask, inputs.mid
                 );
                 None
             }
@@ -1333,12 +1445,19 @@ impl InventoryNeutralMM {
     }
 
     /// Execute the quoting cycle: size orders and submit batch
-    async fn execute_quoting_cycle(&mut self, our_bid: f64, our_ask: f64, _position: f64, mid: f64) {
+    async fn execute_quoting_cycle(
+        &mut self,
+        our_bid: f64,
+        our_ask: f64,
+        _position: f64,
+        mid: f64,
+    ) {
         self.reconcile_after_new_fill_if_needed().await;
         self.refresh_active_orders_from_tracker();
 
         let risk = self.build_risk_snapshot(mid);
-        let Some(target) = self.build_quote_target(our_bid, our_ask, mid) else {
+        let Some(target) = self.build_quote_target(our_bid, our_ask, mid, &risk) else {
+            self.cancel_all_orders().await;
             return;
         };
         let safe_available = safe_available_balance(
@@ -1361,28 +1480,18 @@ impl InventoryNeutralMM {
             inventory_urgency_threshold: risk.inventory_urgency_threshold,
             mid,
         };
-        let decision = decide_quote_cycle(
-            &inv_ctx,
-            target.clone(),
-            safe_available,
-            residual_exposure,
-        );
+        let decision =
+            decide_quote_cycle(&inv_ctx, target.clone(), safe_available, residual_exposure);
 
         let plan = match decision {
-            QuoteCycleDecision::Skip => {
-                debug!(
-                    "Skipping quote cycle: bid_size={:.4} ask_size={:.4} safe_available={:.2}",
-                    target.bid_size,
-                    target.ask_size,
-                    safe_available
-                );
+            QuoteCycleDecision::ClearForRisk => {
+                self.cancel_all_and_sync("zero risk budget").await;
                 return;
             }
             QuoteCycleDecision::ClearForLowMargin => {
                 warn!(
                     "Low margin (safe=${:.2}, raw=${:.2}), clearing orders",
-                    safe_available,
-                    self.account_stats.available_balance
+                    safe_available, self.account_stats.available_balance
                 );
                 self.cancel_all_and_sync("low-margin clear").await;
                 return;
@@ -1390,9 +1499,7 @@ impl InventoryNeutralMM {
             QuoteCycleDecision::FlattenForLowMargin => {
                 warn!(
                     "Low margin (safe=${:.2}, raw=${:.2}) with residual exposure ({:.4} base), switching to flatten-only",
-                    safe_available,
-                    self.account_stats.available_balance,
-                    residual_exposure
+                    safe_available, self.account_stats.available_balance, residual_exposure
                 );
                 self.handle_low_margin_flatten(mid).await;
                 return;
@@ -1426,11 +1533,10 @@ impl InventoryNeutralMM {
             max_side_replacements,
         );
 
-        if should_defer_one_sided_requote(
-            &inv_ctx,
-            &bid_plan,
-            &ask_plan,
-        ) {
+        let risk_reducing = plan.target.bid_size
+            < components::min_quotable_size(&runtime_config, our_bid)
+            || plan.target.ask_size < components::min_quotable_size(&runtime_config, our_ask);
+        if !risk_reducing && should_defer_one_sided_requote(&inv_ctx, &bid_plan, &ask_plan) {
             debug!(
                 "Deferring one-sided requote churn in symmetric mode: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
                 bid_plan.to_cancel.len(),
@@ -1441,11 +1547,7 @@ impl InventoryNeutralMM {
             return;
         }
 
-        if should_defer_cancel_only_refresh(
-            &inv_ctx,
-            &bid_plan,
-            &ask_plan,
-        ) {
+        if !risk_reducing && should_defer_cancel_only_refresh(&inv_ctx, &bid_plan, &ask_plan) {
             debug!(
                 "Deferring cancel-only refresh in symmetric mode: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
                 bid_plan.to_cancel.len(),
@@ -1456,13 +1558,15 @@ impl InventoryNeutralMM {
             return;
         }
 
-        if should_defer_post_fill_replenishment(
-            &inv_ctx,
-            &bid_plan,
-            &ask_plan,
-            self.last_fill_at,
-            Instant::now(),
-        ) {
+        if !risk_reducing
+            && should_defer_post_fill_replenishment(
+                &inv_ctx,
+                &bid_plan,
+                &ask_plan,
+                self.last_fill_at,
+                Instant::now(),
+            )
+        {
             debug!(
                 "Deferring immediate post-fill replenishment: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
                 bid_plan.to_cancel.len(),
@@ -1473,14 +1577,16 @@ impl InventoryNeutralMM {
             return;
         }
 
-        if should_defer_micro_refresh(
-            &inv_ctx,
-            &bid_plan,
-            &ask_plan,
-            self.last_execution_batch_at,
-            Instant::now(),
-            self.resting_order_count(),
-        ) {
+        if !risk_reducing
+            && should_defer_micro_refresh(
+                &inv_ctx,
+                &bid_plan,
+                &ask_plan,
+                self.last_execution_batch_at,
+                Instant::now(),
+                self.resting_order_count(),
+            )
+        {
             debug!(
                 "Deferring small micro-refresh: bid(cancel/place)={}/{} ask(cancel/place)={}/{}",
                 bid_plan.to_cancel.len(),
@@ -1501,7 +1607,11 @@ impl InventoryNeutralMM {
             match self.trading.execute_batch(actions).await {
                 Ok(result) => {
                     self.last_execution_batch_at = Some(Instant::now());
-                    apply_batch_success(&mut self.total_orders_placed, &mut self.telemetry, &result);
+                    apply_batch_success(
+                        &mut self.total_orders_placed,
+                        &mut self.telemetry,
+                        &result,
+                    );
                     self.refresh_active_orders_from_tracker();
                 }
                 Err(e) => {
@@ -1513,8 +1623,7 @@ impl InventoryNeutralMM {
                         &mut self.telemetry,
                         &e,
                         self.config.margin_cooldown_secs,
-                    )
-                        == BatchFailureAction::EnterMarginCooldown
+                    ) == BatchFailureAction::EnterMarginCooldown
                     {
                         self.cancel_all_orders().await;
                         self.margin_cooldown_until =
@@ -1534,9 +1643,13 @@ impl InventoryNeutralMM {
     }
 
     async fn handle_low_margin_flatten(&mut self, mid: f64) {
-        self.cancel_all_and_sync("low-margin flatten").await;
+        if !self.cancel_all_and_sync("low-margin flatten").await {
+            return;
+        }
 
-        if self.account_stats.position.abs() >= self.config.step_size && mid.is_finite() && mid > 0.0
+        if self.account_stats.position.abs() >= self.config.step_size
+            && mid.is_finite()
+            && mid > 0.0
         {
             if let Err(err) = self.trading.close_all_positions(mid).await {
                 warn!("Low-margin flatten failed: {}", err);
@@ -1547,26 +1660,39 @@ impl InventoryNeutralMM {
         }
     }
 
-    /// Position timeout flatten: cancel all then Limit cross-spread to guarantee fill
-    ///
-    /// Lighter DEX does not support IOC orders. PostOnly may not fill if no counterparty.
-    /// Use aggressive Limit order that crosses the spread (20 bps slippage) to guarantee execution.
+    /// Submit a reduce-only marketable limit for expired inventory. A crossed
+    /// limit can still remain unfilled; retry until account/fill data confirms flat.
     async fn execute_timeout_flatten(&mut self, mid: f64) {
-        self.cancel_all_and_sync("position-timeout flatten").await;
+        if !self.cancel_all_and_sync("position-timeout flatten").await {
+            return;
+        }
 
-        let position = self.account_stats.position;
+        if let Some(stats) = self.account_stats_reader.read_if_updated() {
+            self.account_stats = stats.into();
+        }
+        let position = position_for_quoting(
+            &self.config,
+            self.account_stats.position,
+            self.order_tracker.confirmed_position(),
+        );
         if position.abs() < self.config.step_size || !mid.is_finite() || mid <= 0.0 {
             return;
         }
 
-        // Aggressive Limit order: cross spread by 20 bps to guarantee fill
+        // Bound the execution price to 20 bps from the current local mid.
         let slippage = mid * 0.002; // 20 bps
         let (side, price) = if position > 0.0 {
             // Long: sell aggressively below mid
-            (crate::exchange::Side::Sell, ((mid - slippage) / self.config.tick_size).floor() * self.config.tick_size)
+            (
+                crate::exchange::Side::Sell,
+                ((mid - slippage) / self.config.tick_size).floor() * self.config.tick_size,
+            )
         } else {
             // Short: buy aggressively above mid
-            (crate::exchange::Side::Buy, ((mid + slippage) / self.config.tick_size).ceil() * self.config.tick_size)
+            (
+                crate::exchange::Side::Buy,
+                ((mid + slippage) / self.config.tick_size).ceil() * self.config.tick_size,
+            )
         };
 
         let size = components::round_down_to_step(position.abs(), self.config.step_size);
@@ -1597,13 +1723,16 @@ impl InventoryNeutralMM {
             }
         }
 
-        // Reset last_fill_at to avoid re-triggering immediately
-        self.last_fill_at = Some(Instant::now());
+        // Keep inventory age unchanged: submission is not a confirmed fill.
     }
 
-// Removed unused legacy method: cancel_all_orders_legacy
+    // Removed unused legacy method: cancel_all_orders_legacy
 
-    fn prepare_side_actions(&mut self, plan: &execution::SideExecutionPlan, actions: &mut Vec<BatchAction>) -> Vec<i64> {
+    fn prepare_side_actions(
+        &mut self,
+        plan: &execution::SideExecutionPlan,
+        actions: &mut Vec<BatchAction>,
+    ) -> Vec<i64> {
         let pending_cancel_ids =
             resolve_cancel_client_order_ids(&self.active_orders, &plan.to_cancel);
         for client_order_id in &pending_cancel_ids {
@@ -1614,8 +1743,8 @@ impl InventoryNeutralMM {
             actions.push(BatchAction::Cancel(*oid));
         }
 
-        for desired in plan.to_place.clone() {
-            actions.push(BatchAction::Place(desired));
+        for desired in &plan.to_place {
+            actions.push(BatchAction::Place(desired.clone()));
         }
 
         pending_cancel_ids
@@ -1664,7 +1793,6 @@ impl InventoryNeutralMM {
         apply_risk_limits(config, risk, desired_bid_size, desired_ask_size, mid)
     }
 }
-
 
 #[cfg(test)]
 mod tests;

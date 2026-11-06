@@ -2,7 +2,7 @@
 # AlephTX v5.0.0 - Institutional Grade Build System
 # ============================================================================
 
-.PHONY: help build build-feeder clean status clean-shm
+.PHONY: help build build-rust build-feeder test test-rust test-go check fmt-check benchmark clean status clean-shm
 .PHONY: lighter-up lighter-down lighter-logs
 .PHONY: backpack-up backpack-down backpack-logs
 .PHONY: edgex-up edgex-down edgex-logs
@@ -13,7 +13,7 @@ LOG_DIR       ?= logs
 PID_DIR       ?= pids
 BIN_DIR       ?= target/release
 FEEDER_BIN    ?= feeder/feeder-app
-SHM_PATHS     ?= /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-account-stats /dev/shm/aleph-depth
+SHM_PATHS     ?= /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-events-v2 /dev/shm/aleph-account-stats /dev/shm/aleph-depth
 
 # Colors for terminal output
 BLUE   := \033[1;34m
@@ -28,7 +28,7 @@ help:
 	@echo "$(BLUE)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Build Commands:$(NC)"
-	@echo "  make build          - Compile all Rust binaries"
+	@echo "  make build          - Compile Rust binaries and Go feeder"
 	@echo "  make build-feeder   - Compile Go feeder only"
 	@echo ""
 	@echo "$(YELLOW)Exchange Commands (<exchange>-up/down/logs):$(NC)"
@@ -42,10 +42,33 @@ help:
 	@echo "  make clean          - Purge build artifacts and logs"
 	@echo ""
 
+# Offline verification never starts a strategy or submits exchange orders.
+benchmark:
+	cargo test --locked --release --lib benchmark_ -- --ignored --nocapture
+	cd feeder && go test -run '^$$' -bench . -benchmem ./shm ./exchanges
+
+test: test-rust test-go
+
+test-rust:
+	cargo test --locked --lib --bins
+
+test-go:
+	cd feeder && go test -race ./...
+
+check:
+	cargo clippy --locked --lib --bins -- -D warnings
+	cd feeder && go vet ./...
+
+fmt-check:
+	cargo fmt --check
+	test -z "$$(cd feeder && gofmt -l .)"
+
 # Core Build
-build:
+build: build-rust build-feeder
+
+build-rust:
 	@echo "$(BLUE)🔨 Building AlephTX binaries...$(NC)"
-	cargo build --release
+	cargo build --locked --release
 	@echo "$(GREEN)✅ Rust binaries ready$(NC)"
 
 build-feeder:
@@ -77,7 +100,7 @@ define exchange_up
 		echo $$feeder_pid > $(PID_DIR)/feeder-$(1).pid; \
 		ready=0; \
 		for i in $$(seq 1 75); do \
-			if [ -e /dev/shm/aleph-matrix ] && [ -e /dev/shm/aleph-account-stats ] && [ -e /dev/shm/aleph-depth ]; then \
+			if [ -e /dev/shm/aleph-matrix ] && [ -e /dev/shm/aleph-account-stats ] && [ -e /dev/shm/aleph-events-v2 ] && [ -e /dev/shm/aleph-depth ]; then \
 				ready=1; \
 				break; \
 			fi; \

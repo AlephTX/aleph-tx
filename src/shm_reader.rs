@@ -1,5 +1,5 @@
 // src/shm_reader.rs - Lock-free Shared Matrix for HFT
-use std::sync::atomic::{Ordering, compiler_fence};
+use std::sync::atomic::{Ordering, fence};
 
 pub const NUM_SYMBOLS: usize = 2048;
 pub const NUM_EXCHANGES: usize = 7; // Padding, HL, Lighter, EdgeX, 01, Backpack, Binance
@@ -29,12 +29,23 @@ pub struct ShmReader {
     data: *const u8,
     local_versions: [u64; NUM_SYMBOLS],
     max_symbols: usize,
+    next_symbol: usize,
 }
 
 impl ShmReader {
     pub fn open(path: &str, num_symbols: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=NUM_SYMBOLS).contains(&num_symbols),
+            "invalid symbol count"
+        );
         let file = std::fs::File::open(path)?;
+        // SAFETY: The producer owns the file and must not truncate a live mapping.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let expected_size = NUM_SYMBOLS * VERSION_SIZE + num_symbols * NUM_EXCHANGES * SLOT_SIZE;
+        anyhow::ensure!(
+            mmap.len() >= expected_size,
+            "BBO shared memory is truncated"
+        );
 
         let data = mmap.as_ptr();
 
@@ -42,13 +53,18 @@ impl ShmReader {
             _mmap: mmap,
             data,
             local_versions: [0u64; NUM_SYMBOLS],
-            max_symbols: num_symbols.min(NUM_SYMBOLS),
+            max_symbols: num_symbols,
+            next_symbol: 0,
         })
     }
 
     #[inline(always)]
     fn load_version(&self, symbol_id: u16) -> u64 {
+        if symbol_id as usize >= self.max_symbols {
+            return 0;
+        }
         let offset = (symbol_id as usize) * VERSION_SIZE;
+        // SAFETY: Bounds were validated above; the mmap base and offsets are u64 aligned.
         unsafe {
             let ptr = self.data.add(offset) as *const std::sync::atomic::AtomicU64;
             (*ptr).load(Ordering::Acquire)
@@ -57,11 +73,13 @@ impl ShmReader {
 
     #[inline(always)]
     pub fn try_poll(&mut self) -> Option<u16> {
-        for sym in 0..self.max_symbols {
+        for _ in 0..self.max_symbols {
+            let sym = self.next_symbol;
+            self.next_symbol = (sym + 1) % self.max_symbols;
             let sym_id = sym as u16;
             let version = self.load_version(sym_id);
 
-            if version > self.local_versions[sym] {
+            if version != self.local_versions[sym] {
                 self.local_versions[sym] = version;
                 return Some(sym_id);
             }
@@ -71,6 +89,9 @@ impl ShmReader {
 
     #[inline(always)]
     pub fn read_all_exchanges(&mut self, symbol_id: u16) -> [(u8, ShmBboMessage); NUM_EXCHANGES] {
+        if symbol_id as usize >= self.max_symbols {
+            return [(0, ShmBboMessage::default()); NUM_EXCHANGES];
+        }
         let version = self.load_version(symbol_id);
         self.local_versions[symbol_id as usize] = version;
 
@@ -106,12 +127,11 @@ impl ShmReader {
                     continue; // Writer is active, wait
                 }
 
-                compiler_fence(Ordering::Acquire);
-
                 // 2. Copy payload
                 msg = unsafe { core::ptr::read_volatile(ptr as *const ShmBboMessage) };
 
-                compiler_fence(Ordering::Acquire);
+                // Order payload loads before the validation load on ARM as well as x86.
+                fence(Ordering::Acquire);
 
                 // 3. Validate lock
                 let seq2 = unsafe { (*seq_ptr).load(Ordering::Acquire) };
@@ -138,10 +158,64 @@ impl ShmReader {
     }
 
     pub fn local_version(&self, symbol_id: u16) -> u64 {
-        self.local_versions[symbol_id as usize]
+        self.local_versions
+            .get(symbol_id as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn shared_version(&self, symbol_id: u16) -> u64 {
         self.load_version(symbol_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader(versions: &[u64]) -> ShmReader {
+        let mut map = memmap2::MmapMut::map_anon(
+            NUM_SYMBOLS * VERSION_SIZE + versions.len() * NUM_EXCHANGES * SLOT_SIZE,
+        )
+        .unwrap();
+        for (i, value) in versions.iter().enumerate() {
+            map[i * 8..i * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        let mmap = map.make_read_only().unwrap();
+        ShmReader {
+            data: mmap.as_ptr(),
+            _mmap: mmap,
+            local_versions: [0; NUM_SYMBOLS],
+            max_symbols: versions.len(),
+            next_symbol: 0,
+        }
+    }
+
+    #[test]
+    fn polling_is_fair_when_first_symbol_is_continuously_updated() {
+        let mut reader = reader(&[1, 1]);
+        assert_eq!(reader.try_poll(), Some(0));
+        reader.local_versions[0] = 0; // symbol zero has another pending update
+        assert_eq!(reader.try_poll(), Some(1));
+        assert_eq!(reader.try_poll(), Some(0));
+        assert_eq!(reader.try_poll(), None);
+    }
+
+    #[test]
+    fn invalid_symbols_never_read_outside_mapping() {
+        let mut reader = reader(&[1]);
+        assert_eq!(reader.shared_version(u16::MAX), 0);
+        assert_eq!(reader.local_version(u16::MAX), 0);
+        assert_eq!(reader.read_all_exchanges(u16::MAX)[0].1.timestamp_ns, 0);
+        assert_eq!(reader.shared_version(1), 0);
+    }
+
+    #[test]
+    fn opening_truncated_matrix_fails() {
+        let path = std::env::temp_dir().join(format!("aleph-bbo-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        assert!(ShmReader::open(path.to_str().unwrap(), 1).is_err());
+        assert!(ShmReader::open(path.to_str().unwrap(), NUM_SYMBOLS + 1).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

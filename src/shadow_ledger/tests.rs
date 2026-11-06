@@ -81,8 +81,7 @@ fn test_shadow_ledger_optimistic_fill() {
     );
 
     // Fill order (reconciles in_flight -> real_pos)
-    let fill_event =
-        ShmPrivateEvent::order_filled(2, 2, 0, 12345, 3000.0, 0.5, 1.0, 0.15, false);
+    let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12345, 3000.0, 0.5, 1.0, 0.15, false);
     state.apply_event(&fill_event).unwrap();
 
     assert!((state.real_pos_f64() - 0.5).abs() < 1e-6);
@@ -155,8 +154,7 @@ fn test_sell_order_pnl() {
     );
 
     // Fill sell order
-    let fill_event =
-        ShmPrivateEvent::order_filled(2, 2, 0, 12346, 51000.0, 1.0, 0.0, 3.0, true);
+    let fill_event = ShmPrivateEvent::order_filled(2, 2, 0, 12346, 51000.0, 1.0, 0.0, 3.0, true);
     state.apply_event(&fill_event).unwrap();
 
     // Check reconciliation
@@ -187,4 +185,25 @@ fn test_sequence_validation() {
     let event_gap = ShmPrivateEvent::order_created(5, 2, 0, 12351, 1.0, false);
     assert!(ledger.apply_event(&event_gap).is_ok());
     assert_eq!(ledger.last_sequence, 5);
+}
+
+#[test]
+fn sequence_zero_fill_is_processed_once() {
+    let mut ledger = ShadowLedger::default();
+    let fill = ShmPrivateEvent::order_filled(0, 2, 0, 42, 100.0, 0.5, 0.0, 0.0, false);
+    ledger.apply_event(&fill).unwrap();
+    assert!(ledger.apply_event(&fill).is_err());
+    assert_eq!(ledger.real_pos_f64(), 0.5);
+}
+
+#[test]
+fn invalid_numbers_leave_legacy_ledger_unchanged() {
+    let mut ledger = ShadowLedger::default();
+    ledger.add_in_flight(f64::INFINITY);
+    ledger.force_sync_position(f64::NEG_INFINITY);
+    let fill = ShmPrivateEvent::order_filled(0, 2, 0, 42, 100.0, f64::NAN, 0.0, 0.0, false);
+    assert!(ledger.apply_event(&fill).is_err());
+    assert_eq!(ledger.real_pos_f64(), 0.0);
+    assert_eq!(ledger.in_flight_pos_f64(), 0.0);
+    assert!(!ledger.has_processed_event);
 }

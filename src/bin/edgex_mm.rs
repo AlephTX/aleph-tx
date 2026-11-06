@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 1: Load configuration
     tracing::info!("📋 Loading configuration...");
-    let config = AppConfig::load_default();
+    let config = AppConfig::load_default()?;
     let edgex_config = config.edgex;
     tracing::info!(
         "   Risk fraction: {:.1}%",

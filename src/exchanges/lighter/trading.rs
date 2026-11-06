@@ -9,7 +9,7 @@
 //! - cancel_order / cancel_all — 撤单
 //! - get_order / get_active_orders / verify_order — 查询验证
 
-use super::error::{LighterErrorCode, LighterErrorResponse};
+use super::error::LighterErrorResponse;
 use crate::error::TradingError;
 use crate::order_tracker::{OrderSide as TrackerSide, OrderTracker};
 
@@ -72,8 +72,6 @@ struct OrdersResponse {
 /// API 响应：sendTx
 #[derive(Debug, Deserialize)]
 struct SendTxResponse {
-    code: i32,
-    message: Option<String>,
     #[allow(dead_code)]
     tx_hash: Option<String>,
 }
@@ -81,8 +79,6 @@ struct SendTxResponse {
 /// API 响应：sendTxBatch
 #[derive(Debug, Deserialize)]
 struct SendTxBatchResponse {
-    code: i32,
-    message: Option<String>,
     tx_hash: Option<Vec<String>>,
 }
 
@@ -116,6 +112,35 @@ struct AccountsResponse {
     accounts: Vec<AccountInfo>,
 }
 
+/// Cancellation-safe submission guard. Dropping an in-flight HTTP future must
+/// not silently make its uncertain order eligible for further risk taking.
+struct SubmissionGuard<'a> {
+    tracker: Option<&'a OrderTracker>,
+    armed: bool,
+}
+
+impl<'a> SubmissionGuard<'a> {
+    fn new(tracker: Option<&'a OrderTracker>) -> Self {
+        Self {
+            tracker,
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubmissionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(tracker) = self.tracker
+        {
+            tracker.require_reconciliation();
+        }
+    }
+}
+
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 /// Lighter 交易客户端（币种无关）
@@ -130,6 +155,8 @@ pub struct LighterTrading {
     market_id: u8,
     size_multiplier: f64,
     price_multiplier: f64,
+    /// Serialize nonce allocation, signing and submission across all writers.
+    submission_lock: TokioMutex<()>,
     nonce: AtomicI64,
     nonce_init: TokioMutex<bool>,
     client_order_counter: AtomicI64,
@@ -163,17 +190,32 @@ impl Exchange for LighterTrading {
 
     async fn get_active_orders(&self) -> Result<Vec<OrderInfo>> {
         let orders = self.get_active_orders().await?;
-        Ok(orders
+        orders
             .into_iter()
-            .map(|o| OrderInfo {
-                order_id: o.order_index.to_string(),
-                client_order_index: o.client_order_index,
-                side: if o.is_ask { Side::Sell } else { Side::Buy },
-                price: o.price.parse().unwrap_or(0.0),
-                size: o.initial_base_amount.parse().unwrap_or(0.0),
-                filled: o.filled_base_amount.parse().unwrap_or(0.0), // Corrected from executed_base_amount
+            .map(|o| {
+                let price: f64 = o.price.parse()?;
+                let size: f64 = o.initial_base_amount.parse()?;
+                let filled: f64 = o.filled_base_amount.parse()?;
+                anyhow::ensure!(
+                    price.is_finite()
+                        && price > 0.0
+                        && size.is_finite()
+                        && size > 0.0
+                        && filled.is_finite()
+                        && filled >= 0.0
+                        && filled <= size,
+                    "Invalid active order snapshot"
+                );
+                Ok(OrderInfo {
+                    order_id: o.order_index.to_string(),
+                    client_order_index: o.client_order_index,
+                    side: if o.is_ask { Side::Sell } else { Side::Buy },
+                    price,
+                    size,
+                    filled,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn close_all_positions(&self, current_price: f64) -> Result<()> {
@@ -188,24 +230,20 @@ impl Exchange for LighterTrading {
         self.limit_order_type
     }
 
-    async fn get_account_stats(&self) -> Result<crate::strategy::inventory_neutral_mm::AccountStats> {
-        // Lighter-specific: Account equity is primarily the value in the account plus unrealized PNL
-        let pos = self.get_position().await?;
-        let mut main_pos = 0.0;
-        if let Some(ref p) = pos {
-            main_pos = p.position.parse().unwrap_or(0.0);
-        }
-
-        // For Lighter, we might need a separate endpoint for full account equity if not in 'Position'
-        // Simplification: use portfolio_value placeholder or fetch from appropriate source
-        Ok(crate::strategy::inventory_neutral_mm::AccountStats {
-            available_balance: 0.0, // Should be fetched from balance API
-            portfolio_value: 0.0,
-            position: main_pos,
-            leverage: 0.0,
-            margin_usage: 0.0,
-            last_update: std::time::Instant::now(),
-        })
+    async fn get_account_stats(
+        &self,
+    ) -> Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+        let mut reader =
+            crate::account_stats_reader::AccountStatsReader::open("/dev/shm/aleph-account-stats")?;
+        let snapshot = reader.read();
+        let stats: crate::strategy::inventory_neutral_mm::AccountStats = snapshot.into();
+        anyhow::ensure!(
+            stats.portfolio_value.is_finite()
+                && stats.portfolio_value > 0.0
+                && stats.last_update.elapsed() < Duration::from_secs(30),
+            "Account statistics unavailable or stale"
+        );
+        Ok(stats)
     }
 }
 
@@ -263,7 +301,7 @@ impl LighterTrading {
         let counter_start = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0))
-            .as_secs() as i64;
+            .as_millis() as i64;
 
         let send_tx_url = format!("{}/api/v1/sendTx", base_url);
         let send_tx_batch_url = format!("{}/api/v1/sendTxBatch", base_url);
@@ -281,6 +319,7 @@ impl LighterTrading {
             market_id,
             size_multiplier,
             price_multiplier,
+            submission_lock: TokioMutex::new(()),
             nonce: AtomicI64::new(0),
             nonce_init: TokioMutex::new(false),
             client_order_counter: AtomicI64::new(counter_start),
@@ -345,6 +384,10 @@ impl LighterTrading {
             .find(|m| m.market_id == market_id)
             .ok_or_else(|| anyhow::anyhow!("Market {} not found in orderBookDetails", market_id))?;
 
+        anyhow::ensure!(
+            market.size_decimals <= 12 && market.price_decimals <= 12,
+            "Unsupported market precision"
+        );
         Ok((market.size_decimals, market.price_decimals))
     }
 
@@ -375,6 +418,10 @@ impl LighterTrading {
             anyhow::bail!("Failed to fetch nonce: HTTP {}", resp.status());
         }
         let nonce_resp: NonceResponse = resp.json().await?;
+        anyhow::ensure!(
+            nonce_resp.nonce >= 0 && nonce_resp.nonce <= i64::MAX - 1024,
+            "Invalid server nonce"
+        );
         Ok(nonce_resp.nonce)
     }
 
@@ -396,16 +443,6 @@ impl LighterTrading {
     /// 递增 nonce（仅在交易成功提交后调用）
     fn increment_nonce(&self) {
         self.nonce.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// 重置 nonce（遇到 invalid nonce 错误时调用）
-    async fn reset_nonce(&self) -> Result<i64> {
-        let mut initialized = self.nonce_init.lock().await;
-        let server_nonce = self.fetch_nonce().await?;
-        self.nonce.store(server_nonce, Ordering::Release);
-        *initialized = true;
-        tracing::warn!("Nonce reset to: {}", server_nonce);
-        Ok(server_nonce)
     }
 
     /// 生成唯一 client_order_index
@@ -444,14 +481,14 @@ impl LighterTrading {
         let client_order_index = self.next_client_order_index();
 
         // 使用 round() 防止浮点截断: 2085.87 * 100 = 208587.0 而非 208586
-        let price_int = (price * self.price_multiplier).round() as u32;
-        let base_amount = (size * self.size_multiplier).round() as i64;
+        let (price_int, base_amount) =
+            encode_order(price, size, self.price_multiplier, self.size_multiplier)?;
 
         let (ot, tif) = match order_type {
-            OrderType::Limit => (0u8, 1u8),         // Limit + GTC
-            OrderType::PostOnly => (0u8, 2u8),      // Limit + ALO (Add Liquidity Only / Post-Only)
-            OrderType::Market => (1u8, 3u8),        // Market + IOC
-            OrderType::Ioc => (0u8, 3u8),           // Limit + IOC
+            OrderType::Limit => (0u8, 1u8),    // Limit + GTC
+            OrderType::PostOnly => (0u8, 2u8), // Limit + ALO (Add Liquidity Only / Post-Only)
+            OrderType::Market => (1u8, 3u8),   // Market + IOC
+            OrderType::Ioc => (0u8, 3u8),      // Limit + IOC
         };
 
         let market_id = self.market_id;
@@ -513,76 +550,31 @@ impl LighterTrading {
             .text("tx_type", tx_type.to_string())
             .text("tx_info", tx_info);
 
+        // Invalidate before the request: cancellation/timeouts can leave a consumed
+        // nonce even when no response reaches this process.
+        *self.nonce_init.lock().await = false;
         let resp = self
             .client
             .post(&self.send_tx_url)
             .multipart(form)
             .send()
-            .await?;
-
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await?;
-
-        if body.contains("invalid nonce") || body.contains("21104") {
-            let _ = self.reset_nonce().await;
-            anyhow::bail!("Invalid nonce (reset scheduled), raw: {}", body);
-        }
-
-        if !status.is_success() {
-            // Try to parse as structured error response
-            if let Ok(error_resp) = serde_json::from_str::<LighterErrorResponse>(&body) {
-                let error_code = error_resp.error_code();
-
-                // Handle specific error codes
-                if error_code.requires_nonce_reset() {
-                    let _ = self.reset_nonce().await;
-                    anyhow::bail!(
-                        "Lighter error {}: {} (nonce reset)",
-                        error_resp.code,
-                        error_resp.message.as_deref().unwrap_or("unknown")
-                    );
-                }
-
-                if error_code.is_margin_error() {
-                    return Err(TradingError::InsufficientMargin.into());
-                }
-
-                anyhow::bail!(
-                    "Lighter error {}: {}",
-                    error_resp.code,
-                    error_resp.message.as_deref().unwrap_or("unknown")
-                );
-            }
-
-            // Fallback: check for margin error in body text
-            if body.contains("not enough margin")
-                || body.contains("insufficient margin")
-                || body.contains("21301")
-            {
-                return Err(TradingError::InsufficientMargin.into());
-            }
-
-            anyhow::bail!("sendTx HTTP {}: {}", status, body);
-        }
-
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        validate_submission_response(status, &body)?;
         let parsed: SendTxResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Parse sendTx response: {} body={}", e, body))?;
-
-        if parsed.code != 200 {
-            // Check if this is a margin error
-            let error_code = LighterErrorCode::from_code(parsed.code);
-            if error_code.is_margin_error() {
-                return Err(TradingError::InsufficientMargin.into());
-            }
-            anyhow::bail!(
-                "sendTx code={}: {}",
-                parsed.code,
-                parsed.message.as_deref().unwrap_or("unknown")
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        if parsed.tx_hash.as_ref().is_none_or(String::is_empty) {
+            return Err(
+                TradingError::SubmissionUncertain("Missing transaction hash".into()).into(),
             );
         }
-
-        // Only increment nonce after successful submission
         self.increment_nonce();
+        *self.nonce_init.lock().await = true;
 
         Ok(parsed)
     }
@@ -600,60 +592,69 @@ impl LighterTrading {
             .text("tx_types", tx_types_json)
             .text("tx_infos", tx_infos_json);
 
+        // Invalidate before the request: cancellation/timeouts can leave a consumed
+        // nonce even when no response reaches this process.
+        *self.nonce_init.lock().await = false;
         let resp = self
             .client
             .post(&self.send_tx_batch_url)
             .multipart(form)
             .send()
-            .await?;
-
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await?;
-
-        if body.contains("invalid nonce") || body.contains("21104") {
-            let _ = self.reset_nonce().await;
-            anyhow::bail!("Invalid nonce in batch (reset scheduled), raw: {}", body);
-        }
-
-        if !status.is_success() {
-            // Check for specific error patterns
-            if body.contains("not enough margin")
-                || body.contains("insufficient margin")
-                || body.contains("21711")
-            {
-                return Err(TradingError::InsufficientMargin.into());
-            }
-            anyhow::bail!("sendTxBatch HTTP {}: {}", status, body);
-        }
-
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        validate_submission_response(status, &body)?;
         let parsed: SendTxBatchResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Parse sendTxBatch: {} body={}", e, body))?;
-
-        if parsed.code != 200 {
-            // Check if this is a margin error
-            let error_code = LighterErrorCode::from_code(parsed.code);
-            if error_code.is_margin_error() {
-                return Err(TradingError::InsufficientMargin.into());
-            }
-            anyhow::bail!(
-                "sendTxBatch code={}: {}",
-                parsed.code,
-                parsed.message.as_deref().unwrap_or("unknown")
-            );
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        if parsed
+            .tx_hash
+            .as_ref()
+            .is_none_or(|hashes| hashes.len() != txs.len() || hashes.iter().any(String::is_empty))
+        {
+            return Err(TradingError::SubmissionUncertain(
+                "Incomplete batch acknowledgement".into(),
+            )
+            .into());
         }
-
-        // Increment nonce dynamically for the batch size
-        for _ in 0..txs.len() {
-            self.increment_nonce();
-        }
+        self.nonce.fetch_add(txs.len() as i64, Ordering::SeqCst);
+        *self.nonce_init.lock().await = true;
 
         Ok(parsed)
     }
 
     // ─── 公开交易接口 ─────────────────────────────────────────────────────
 
+    /// Verify a strategy's coarser tick/step is representable at the venue.
+    pub fn validate_precision(&self, tick: f64, step: f64) -> Result<()> {
+        encode_order(tick, step, self.price_multiplier, self.size_multiplier)?;
+        Ok(())
+    }
+
+    fn normalize_order(&self, params: OrderParams) -> Result<OrderParams> {
+        normalize_order(params, self.price_multiplier, self.size_multiplier)
+    }
+
+    fn ensure_can_place(&self, params: &OrderParams) -> Result<()> {
+        anyhow::ensure!(
+            params.reduce_only
+                || !self
+                    .order_tracker
+                    .as_ref()
+                    .is_some_and(|tracker| tracker.needs_reconciliation()),
+            "Order state requires reconciliation before new exposure"
+        );
+        Ok(())
+    }
+
     /// 通用下单 (v5.0.0: per-order tracking)
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+        let _submission = self.submission_lock.lock().await;
+        let params = self.normalize_order(params)?;
+        self.ensure_can_place(&params)?;
         let (tx_type, tx_info, tx_hash, client_order_index) = self
             .sign_order(
                 params.side,
@@ -670,7 +671,11 @@ impl LighterTrading {
             Side::Sell => TrackerSide::Sell,
         };
         if let Some(ref tracker) = self.order_tracker {
-            tracker.start_tracking(client_order_index, tracker_side, params.price, params.size);
+            anyhow::ensure!(
+                tracker.start_tracking(client_order_index, tracker_side, params.price, params.size),
+                "Tracker refused order reservation"
+            );
+            tracker.mark_submission_uncertain(client_order_index);
         }
 
         tracing::info!(
@@ -683,8 +688,10 @@ impl LighterTrading {
             client_order_index
         );
 
+        let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
         match self.send_tx(tx_type, tx_info).await {
             Ok(_) => {
+                guard.disarm();
                 tracing::info!("Order submitted: tx_hash={}", tx_hash);
                 Ok(OrderResult {
                     tx_hash,
@@ -693,8 +700,11 @@ impl LighterTrading {
             }
             Err(e) => {
                 // Rollback: mark order as failed (pending_exposure → 0 automatically)
-                if let Some(ref tracker) = self.order_tracker {
-                    tracker.mark_failed(client_order_index);
+                if !is_uncertain(&e) {
+                    if let Some(tracker) = &self.order_tracker {
+                        tracker.mark_failed(client_order_index);
+                    }
+                    guard.disarm();
                 }
                 Err(e)
             }
@@ -726,7 +736,38 @@ impl LighterTrading {
     }
 
     /// 批量下单（一买一卖），使用 sendTxBatch 一次性提交 (v5.0.0: per-order tracking)
-    pub async fn place_batch(&self, params: BatchOrderParams) -> Result<crate::exchange::BatchOrderResult> {
+    pub async fn place_batch(
+        &self,
+        params: BatchOrderParams,
+    ) -> Result<crate::exchange::BatchOrderResult> {
+        let _submission = self.submission_lock.lock().await;
+        anyhow::ensure!(
+            !self
+                .order_tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.needs_reconciliation()),
+            "Order state requires reconciliation before new exposure"
+        );
+        let bid = self.normalize_order(OrderParams {
+            side: Side::Buy,
+            price: params.bid_price,
+            size: params.bid_size,
+            order_type: self.limit_order_type,
+            reduce_only: false,
+        })?;
+        let ask = self.normalize_order(OrderParams {
+            side: Side::Sell,
+            price: params.ask_price,
+            size: params.ask_size,
+            order_type: self.limit_order_type,
+            reduce_only: false,
+        })?;
+        let params = BatchOrderParams {
+            bid_price: bid.price,
+            bid_size: bid.size,
+            ask_price: ask.price,
+            ask_size: ask.size,
+        };
         // Get base nonce for batch
         let base_nonce = self.get_nonce().await?;
 
@@ -766,20 +807,37 @@ impl LighterTrading {
 
         // Register BOTH orders independently (no net-value masking!)
         if let Some(ref tracker) = self.order_tracker {
-            tracker.start_tracking(bid_coi, TrackerSide::Buy, params.bid_price, params.bid_size);
-            tracker.start_tracking(
+            anyhow::ensure!(
+                tracker.start_tracking(
+                    bid_coi,
+                    TrackerSide::Buy,
+                    params.bid_price,
+                    params.bid_size
+                ),
+                "Tracker refused bid reservation"
+            );
+            if !tracker.start_tracking(
                 ask_coi,
                 TrackerSide::Sell,
                 params.ask_price,
                 params.ask_size,
-            );
+            ) {
+                tracker.mark_failed(bid_coi);
+                anyhow::bail!("Tracker refused ask reservation");
+            }
         }
 
+        if let Some(tracker) = &self.order_tracker {
+            tracker.mark_submission_uncertain(bid_coi);
+            tracker.mark_submission_uncertain(ask_coi);
+        }
+        let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
         match self
             .send_tx_batch(&[(bid_type, bid_info), (ask_type, ask_info)])
             .await
         {
             Ok(batch_resp) => {
+                guard.disarm();
                 let tx_hashes = batch_resp.tx_hash.unwrap_or_default();
                 tracing::info!("Batch submitted: tx_hashes={:?}", tx_hashes);
 
@@ -791,10 +849,8 @@ impl LighterTrading {
             }
             Err(e) => {
                 // Rollback: mark both orders as failed
-                if let Some(ref tracker) = self.order_tracker {
-                    tracker.mark_failed(bid_coi);
-                    tracker.mark_failed(ask_coi);
-                }
+                // A batch may have been partially accepted. Keep every reservation
+                // until authoritative order events/reconciliation resolve it.
                 Err(e)
             }
         }
@@ -802,6 +858,7 @@ impl LighterTrading {
 
     /// 核心：通用批量执行（支持混合 挂单/撤单），并在单一 RTT 内提交
     pub async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
+        let _submission = self.submission_lock.lock().await;
         if actions.is_empty() {
             return Ok(BatchResult {
                 tx_hashes: vec![],
@@ -809,6 +866,10 @@ impl LighterTrading {
             });
         }
 
+        anyhow::ensure!(
+            actions.len() <= 50,
+            "At most 50 actions per transaction batch"
+        );
         let mut txs = Vec::with_capacity(actions.len());
         let mut place_results = Vec::new();
         let market_id = self.market_id;
@@ -820,6 +881,8 @@ impl LighterTrading {
             let nonce = base_nonce + (i as i64);
             match action {
                 BatchAction::Place(params) => {
+                    let params = self.normalize_order(params)?;
+                    self.ensure_can_place(&params)?;
                     let (tx_type, tx_info, _hash, coi) = self
                         .sign_order_with_nonce(
                             params.side,
@@ -830,15 +893,6 @@ impl LighterTrading {
                             nonce,
                         )
                         .await?;
-
-                    // 预注册订单追踪
-                    if let Some(ref tracker) = self.order_tracker {
-                        let tracker_side = match params.side {
-                            Side::Buy => TrackerSide::Buy,
-                            Side::Sell => TrackerSide::Sell,
-                        };
-                        tracker.start_tracking(coi, tracker_side, params.price, params.size);
-                    }
 
                     txs.push((tx_type, tx_info));
                     place_results.push(PlaceResult {
@@ -858,10 +912,35 @@ impl LighterTrading {
             }
         }
 
+        // Register only after ALL actions have signed successfully. A local signing
+        // failure must not leave phantom reservations for an unsent partial batch.
+        if let Some(tracker) = &self.order_tracker {
+            for order in &place_results {
+                let side = if order.side == Side::Buy {
+                    TrackerSide::Buy
+                } else {
+                    TrackerSide::Sell
+                };
+                if !tracker.start_tracking(order.client_order_index, side, order.price, order.size)
+                {
+                    for reserved in place_results
+                        .iter()
+                        .take_while(|r| r.client_order_index != order.client_order_index)
+                    {
+                        tracker.mark_failed(reserved.client_order_index);
+                    }
+                    anyhow::bail!("Tracker refused batch reservation");
+                }
+                tracker.mark_submission_uncertain(order.client_order_index);
+            }
+        }
+
         tracing::info!("Submitting batch of {} mixed actions", txs.len());
 
+        let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
         match self.send_tx_batch(&txs).await {
             Ok(resp) => {
+                guard.disarm();
                 let hashes = resp.tx_hash.unwrap_or_default();
                 Ok(BatchResult {
                     tx_hashes: hashes,
@@ -869,12 +948,7 @@ impl LighterTrading {
                 })
             }
             Err(e) => {
-                // 回滚：所有在该批次中的 Place 订单标记为失败
-                if let Some(ref tracker) = self.order_tracker {
-                    for res in place_results {
-                        tracker.mark_failed(res.client_order_index);
-                    }
-                }
+                // Partial acceptance cannot be ruled out for batch errors.
                 Err(e)
             }
         }
@@ -884,6 +958,7 @@ impl LighterTrading {
 
     /// 撤销单笔订单
     pub async fn cancel_order(&self, order_index: i64) -> Result<()> {
+        let _submission = self.submission_lock.lock().await;
         let nonce = self.get_nonce().await?;
         let market_id = self.market_id;
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
@@ -892,8 +967,13 @@ impl LighterTrading {
             .sign_cancel_order(market_id, order_index, nonce)
             .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
 
+        let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
         self.send_tx(signed.tx_type, signed.tx_info).await?;
-        tracing::info!("Cancelled order: order_index={}", order_index);
+        guard.disarm();
+        tracing::info!(
+            "Submitted cancellation for order: order_index={}",
+            order_index
+        );
         Ok(())
     }
 
@@ -907,49 +987,16 @@ impl LighterTrading {
             return Ok(0);
         }
 
-        let market_id = self.market_id;
-        let mut success_batches = 0;
-        let mut total_chunks = 0;
-
-        // 1. Process in chunks of 50 to avoid rate limits and sequence issues
-        for chunk_orders in orders.chunks(50) {
-            total_chunks += 1;
-            let mut txs = Vec::with_capacity(chunk_orders.len());
-            
-            // Get fresh nonce for each chunk. If a previous batch failed and triggered a reset, this handles it.
-            let base_nonce = self.get_nonce().await?;
-
-            for (i, order) in chunk_orders.iter().enumerate() {
-                let nonce = base_nonce + (i as i64);
-                match self.signer.sign_cancel_order(market_id, order.order_index, nonce) {
-                    Ok(signed) => txs.push((signed.tx_type, signed.tx_info)),
-                    Err(e) => tracing::warn!("Failed to sign cancel for order {}: {}", order.order_index, e),
-                }
-            }
-
-            if txs.is_empty() {
-                continue;
-            }
-
-            // 2. Dispatch the chunk
-            match self.send_tx_batch(&txs).await {
-                Ok(resp) => {
-                    let hashes = resp.tx_hash.unwrap_or_default();
-                    tracing::info!("Batch cancel submitted ({} orders): {:?}", txs.len(), hashes);
-                    success_batches += 1;
-                }
-                Err(e) => {
-                    tracing::error!("Batch cancel failed: {}", e);
-                }
-            }
-            
-            // 3. Small sleep to ensure sequence order and avoid rate limits
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for chunk in orders.chunks(50) {
+            let actions = chunk
+                .iter()
+                .map(|order| BatchAction::Cancel(order.order_index))
+                .collect();
+            self.execute_batch(actions).await?;
         }
-
         tracing::info!(
-            "Cancelled {} orders (dispatched {}/{} batches successfully)",
-            count, success_batches, total_chunks
+            "Submitted cancellation of {} orders; awaiting exchange confirmation",
+            count
         );
 
         Ok(count)
@@ -960,10 +1007,6 @@ impl LighterTrading {
     /// 查询活跃订单
     pub async fn get_active_orders(&self) -> Result<Vec<OrderDetail>> {
         let auth = self.create_auth_token().await?;
-        tracing::debug!(
-            "Auth token (first 40 chars): {}",
-            &auth[..std::cmp::min(40, auth.len())]
-        );
 
         let url = format!(
             "{}/api/v1/accountActiveOrders?account_index={}&market_id={}",
@@ -1070,7 +1113,15 @@ impl LighterTrading {
             }
         };
 
-        let size: f64 = pos.position.parse().unwrap_or(0.0);
+        let size: f64 = pos.position.parse()?;
+        anyhow::ensure!(
+            size.is_finite() && size >= 0.0 && matches!(pos.sign, -1 | 1),
+            "Invalid position snapshot"
+        );
+        anyhow::ensure!(
+            current_price.is_finite() && current_price > 0.0,
+            "Invalid close price"
+        );
         if size.abs() < 0.0001 {
             tracing::info!("Position is zero, nothing to close");
             return Ok(());
@@ -1085,6 +1136,11 @@ impl LighterTrading {
             (Side::Buy, current_price * 1.02)
         };
 
+        let close_price = match side {
+            Side::Sell => (close_price * self.price_multiplier).floor() / self.price_multiplier,
+            Side::Buy => (close_price * self.price_multiplier).ceil() / self.price_multiplier,
+        };
+        let close_size = (size.abs() * self.size_multiplier).round() / self.size_multiplier;
         let min_close_size = 11.0 / close_price.max(1.0);
         if size.abs() + 1e-9 < min_close_size {
             tracing::warn!(
@@ -1093,7 +1149,9 @@ impl LighterTrading {
                 min_close_size,
                 close_price
             );
-            return Ok(());
+            anyhow::bail!(
+                "Residual position is below the configured close minimum; position is not flat"
+            );
         }
 
         tracing::info!(
@@ -1105,7 +1163,7 @@ impl LighterTrading {
 
         // 4. 下 reduce_only 限价单平仓
         self.place_order(OrderParams {
-            size: size.abs(),
+            size: close_size,
             price: close_price,
             side,
             order_type: OrderType::Limit,
@@ -1115,5 +1173,195 @@ impl LighterTrading {
 
         tracing::info!("Close position order submitted");
         Ok(())
+    }
+}
+
+/// Passive rounding preserves the caller's price bound and never increases size.
+fn normalize_order(
+    mut params: OrderParams,
+    price_scale: f64,
+    size_scale: f64,
+) -> Result<OrderParams> {
+    anyhow::ensure!(
+        [params.price, params.size, price_scale, size_scale]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0),
+        "Order price, size and precision must be finite and positive"
+    );
+    let price_units = params.price * price_scale;
+    let size_units = params.size * size_scale;
+    let snap = |units: f64| {
+        if (units - units.round()).abs() < 1e-7 {
+            units.round()
+        } else {
+            units
+        }
+    };
+    params.price = match params.side {
+        Side::Buy => snap(price_units).floor(),
+        Side::Sell => snap(price_units).ceil(),
+    } / price_scale;
+    params.size = snap(size_units).floor() / size_scale;
+    encode_order(params.price, params.size, price_scale, size_scale)?;
+    Ok(params)
+}
+
+/// Reject non-finite/out-of-range quantities before Rust's saturating float casts.
+fn encode_order(price: f64, size: f64, price_scale: f64, size_scale: f64) -> Result<(u32, i64)> {
+    anyhow::ensure!(
+        [price, size, price_scale, size_scale]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0),
+        "Order price, size and precision must be finite and positive"
+    );
+    let price_units = (price * price_scale).round();
+    let size_units = (size * size_scale).round();
+    anyhow::ensure!(
+        price_units >= 1.0 && price_units <= u32::MAX as f64,
+        "Order price out of range"
+    );
+    anyhow::ensure!(
+        size_units >= 1.0 && size_units < i64::MAX as f64,
+        "Order size out of range"
+    );
+    anyhow::ensure!(
+        (price * price_scale - price_units).abs() <= 1e-6
+            && (size * size_scale - size_units).abs() <= 1e-6,
+        "Order is not aligned to market tick/step size"
+    );
+    Ok((price_units as u32, size_units as i64))
+}
+
+fn is_uncertain(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<TradingError>(),
+        Some(TradingError::SubmissionUncertain(_))
+    )
+}
+
+fn validate_submission_response(status: reqwest::StatusCode, body: &str) -> Result<()> {
+    if status.is_server_error() {
+        return Err(TradingError::SubmissionUncertain(format!("HTTP {status}")).into());
+    }
+    let response: LighterErrorResponse = serde_json::from_str(body)
+        .map_err(|e| TradingError::SubmissionUncertain(format!("HTTP {status}: {e}")))?;
+    if response.code == 200 && status.is_success() {
+        return Ok(());
+    }
+    if response.code == 200 {
+        return Err(TradingError::SubmissionUncertain(format!("Conflicting HTTP {status}")).into());
+    }
+    if response.error_code().is_margin_error() {
+        return Err(TradingError::InsufficientMargin.into());
+    }
+    anyhow::bail!(
+        "Lighter rejected submission code={}: {}",
+        response.code,
+        response.message.as_deref().unwrap_or("unknown")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transport_failure_invalidates_nonce_without_releasing_reservation() {
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.start_tracking(42, TrackerSide::Buy, 100.0, 1.0));
+        tracker.mark_submission_uncertain(42);
+        let trading = LighterTrading {
+            signer: Arc::new(super::super::ffi::LighterSigner::offline_for_test()),
+            client: Client::builder()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap(),
+            base_url: "http://127.0.0.1:1".into(),
+            send_tx_url: "http://127.0.0.1:1".into(),
+            send_tx_batch_url: "http://127.0.0.1:1".into(),
+            account_index: 0,
+            api_key_index: 0,
+            market_id: 0,
+            size_multiplier: 1e6,
+            price_multiplier: 100.0,
+            submission_lock: TokioMutex::new(()),
+            nonce: AtomicI64::new(9),
+            nonce_init: TokioMutex::new(true),
+            client_order_counter: AtomicI64::new(43),
+            order_tracker: Some(Arc::clone(&tracker)),
+            limit_order_type: OrderType::PostOnly,
+        };
+        let error = trading.send_tx(14, "{}".into()).await.err().unwrap();
+        assert!(is_uncertain(&error));
+        assert!(!*trading.nonce_init.lock().await);
+        assert_eq!(trading.nonce.load(Ordering::Acquire), 9);
+        assert_eq!(tracker.worst_case_long(), 1.0);
+    }
+
+    #[test]
+    fn submission_guard_blocks_new_exposure_after_cancellation() {
+        let tracker = OrderTracker::new();
+        {
+            let mut guard = SubmissionGuard::new(Some(&tracker));
+            guard.disarm();
+        }
+        assert!(!tracker.needs_reconciliation());
+        {
+            let _cancelled_request = SubmissionGuard::new(Some(&tracker));
+        }
+        assert!(tracker.needs_reconciliation());
+    }
+
+    #[test]
+    fn normalization_preserves_price_limits_and_never_upsizes() {
+        for side in [Side::Buy, Side::Sell] {
+            let input = OrderParams {
+                side,
+                price: 100.005,
+                size: 0.0019,
+                order_type: OrderType::Limit,
+                reduce_only: false,
+            };
+            let result = normalize_order(input, 100.0, 1000.0).unwrap();
+            assert_eq!(result.size, 0.001);
+            assert_eq!(result.price, if side == Side::Buy { 100.0 } else { 100.01 });
+        }
+    }
+
+    #[test]
+    fn order_encoding_rejects_saturating_casts_and_dust() {
+        assert_eq!(
+            encode_order(2085.87, 0.001, 100.0, 1e6).unwrap(),
+            (208587, 1000)
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0, 1e30] {
+            assert!(encode_order(value, 1.0, 100.0, 1e6).is_err());
+            assert!(encode_order(100.0, value, 100.0, 1e6).is_err());
+        }
+        assert!(encode_order(100.0, 1e-12, 100.0, 1e6).is_err());
+        assert!(encode_order(100.005, 1.0, 100.0, 1e6).is_err());
+        assert!(encode_order(100.0, 0.0015, 100.0, 1000.0).is_err());
+    }
+
+    #[test]
+    fn ambiguous_responses_preserve_exposure() {
+        for (status, body) in [
+            (502, "bad gateway"),
+            (200, "truncated"),
+            (503, r#"{"code":21301}"#),
+            (400, r#"{"code":200}"#),
+        ] {
+            let error =
+                validate_submission_response(reqwest::StatusCode::from_u16(status).unwrap(), body)
+                    .unwrap_err();
+            assert!(is_uncertain(&error));
+        }
+        let error =
+            validate_submission_response(reqwest::StatusCode::OK, r#"{"code":21301}"#).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<TradingError>(),
+            Some(TradingError::InsufficientMargin)
+        ));
+        assert!(validate_submission_response(reqwest::StatusCode::OK, r#"{"code":200}"#).is_ok());
     }
 }

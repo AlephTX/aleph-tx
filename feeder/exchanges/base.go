@@ -28,6 +28,9 @@ func RunConnectionLoop(ctx context.Context, name string, connect ConnectFunc) er
 	const maxConsecutiveFailures = 10
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Circuit breaker: pause after too many consecutive failures
 		if consecutiveFailures >= maxConsecutiveFailures {
 			log.Printf("%s: circuit breaker open (>=%d failures), pausing 60s...", name, maxConsecutiveFailures)
@@ -41,7 +44,15 @@ func RunConnectionLoop(ctx context.Context, name string, connect ConnectFunc) er
 			}
 		}
 
-		if err := connect(ctx); err != nil {
+		started := time.Now()
+		err := connect(ctx)
+		// A connection that ran successfully for a minute is not another
+		// consecutive failed connection attempt.
+		if time.Since(started) >= time.Minute {
+			consecutiveFailures = 0
+			backoff = time.Second
+		}
+		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -95,6 +106,9 @@ func startWebSocketKeepalive(
 				cancel()
 				if err != nil && parent.Err() == nil {
 					log.Printf("%s: keepalive ping failed: %v", name, err)
+					// Unblock Read so RunConnectionLoop reconnects a dead peer.
+					_ = c.CloseNow()
+					return
 				}
 			}
 		}

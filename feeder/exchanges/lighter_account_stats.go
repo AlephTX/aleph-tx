@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
 )
 
@@ -20,7 +19,6 @@ type LighterAccountStats struct {
 	cfg         config.ExchangeConfig
 	auth        *LighterAuth
 	statsWriter *shm.AccountStatsWriter
-	position    float64 // Cached position from private stream
 }
 
 // NewLighterAccountStats creates a new account stats client
@@ -73,13 +71,15 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 
 	accountID := las.auth.GetAccountIndex()
 
+	guard := newSubscriptionGuard(ctx, "user_stats", []string{fmt.Sprintf("user_stats/%d", accountID)}, subscriptionTimeout)
+	defer guard.cancel()
 	// Subscribe to user_stats channel with authentication
 	sub := fmt.Sprintf(
 		`{"type":"subscribe","channel":"user_stats/%d","auth":"%s"}`,
 		accountID,
 		authToken,
 	)
-	if err := c.Write(ctx, websocket.MessageText, []byte(sub)); err != nil {
+	if err := c.Write(guard.ctx, websocket.MessageText, []byte(sub)); err != nil {
 		return fmt.Errorf("subscribe user_stats: %w", err)
 	}
 	log.Printf("lighter-account-stats: subscribed to user_stats/%d with auth", accountID)
@@ -94,18 +94,25 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 
 	// Read loop
 	for {
-		_, data, err := c.Read(ctx)
+		_, data, err := c.Read(guard.readContext(ctx))
 		if err != nil {
 			return err
 		}
 
-		if string(data) == `{"type":"ping"}` {
+		message := gjson.ParseBytes(data)
+		if err := guard.observe(message); err != nil {
+			return err
+		}
+		if message.Get("type").String() == "ping" {
 			if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`)); err != nil {
 				return fmt.Errorf("write app pong: %w", err)
 			}
 			continue
 		}
 
+		if !guard.acceptsData(message) {
+			continue
+		}
 		var stats lighterUserStats
 		if err := json.Unmarshal(data, &stats); err != nil {
 			log.Printf("lighter-account-stats: failed to parse message: %v", err)
@@ -152,93 +159,18 @@ func (las *LighterAccountStats) processStats(stats *lighterUserStats) {
 		return
 	}
 
-	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f position=%.4f",
-		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower, las.position)
+	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f",
+		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower)
 
 	// Write to shared memory for Rust to read (including position)
 	timestampNs := uint64(time.Now().UnixNano())
-	las.statsWriter.WriteStatsWithPosition(
+	las.statsWriter.WriteStats(
 		collateral,
 		portfolioValue,
 		leverage,
 		availableBalance,
 		marginUsage,
 		buyingPower,
-		las.position,
 		timestampNs,
 	)
-}
-
-// SetPosition updates the cached position (called from private stream)
-func (las *LighterAccountStats) SetPosition(position float64) {
-	las.position = position
-}
-
-func (las *LighterAccountStats) fetchStatsREST(ctx context.Context) {
-	accountID := las.auth.GetAccountIndex()
-
-	// Try the account endpoint
-	url := fmt.Sprintf("https://mainnet.zklighter.elliot.ai/api/v1/accounts/%d", accountID)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("User-Agent", "AlephTX/5.0")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("lighter-account-stats: REST fetch failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("lighter-account-stats: REST returned %d: %s", resp.StatusCode, string(body))
-		return
-	}
-
-	var result struct {
-		Code int `json:"code"`
-		Data struct {
-			Collateral       string `json:"collateral"`
-			PortfolioValue   string `json:"portfolio_value"`
-			Leverage         string `json:"leverage"`
-			AvailableBalance string `json:"available_balance"`
-			MarginUsage      string `json:"margin_usage"`
-			BuyingPower      string `json:"buying_power"`
-		} `json:"data"`
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("lighter-account-stats: REST parse failed: %v (body: %s)", err, string(body))
-		return
-	}
-
-	if result.Code != 0 {
-		log.Printf("lighter-account-stats: REST returned code %d", result.Code)
-		return
-	}
-
-	// Convert to WebSocket format and process
-	stats := &lighterUserStats{
-		Type:    "update/user_stats",
-		Channel: fmt.Sprintf("user_stats/%d", accountID),
-	}
-	stats.Stats.Collateral = result.Data.Collateral
-	stats.Stats.PortfolioValue = result.Data.PortfolioValue
-	stats.Stats.Leverage = result.Data.Leverage
-	stats.Stats.AvailableBalance = result.Data.AvailableBalance
-	stats.Stats.MarginUsage = result.Data.MarginUsage
-	stats.Stats.BuyingPower = result.Data.BuyingPower
-
-	las.processStats(stats)
 }

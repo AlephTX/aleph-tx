@@ -6,7 +6,7 @@ pub(super) fn local_reference_mid(
     fallback_spread_ticks: f64,
 ) -> f64 {
     if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
-        (bbo.bid_price + bbo.ask_price) / 2.0
+        bbo.bid_price * 0.5 + bbo.ask_price * 0.5
     } else if bbo.bid_price > 0.0 {
         bbo.bid_price + (tick_size * fallback_spread_ticks)
     } else if bbo.ask_price > 0.0 {
@@ -82,11 +82,9 @@ pub(super) struct AnchorParams {
     pub raw_ask: f64,
     pub bid_touch: f64,
     pub ask_touch: f64,
-    pub mid: f64,
     pub tick_size: f64,
     pub penny_ticks: f64,
     pub inventory_urgency_ratio: f64,
-    pub max_touch_offset_bps: f64,
 }
 
 pub(super) fn anchor_quotes_to_touch(params: &AnchorParams) -> (f64, f64) {
@@ -112,13 +110,17 @@ pub(super) fn anchor_quotes_to_touch(params: &AnchorParams) -> (f64, f64) {
     } else {
         params.ask_touch
     };
-    let max_touch_offset = params.mid * params.max_touch_offset_bps / 10000.0;
-
-    let mut bid = params.raw_bid.max(join_bid - max_touch_offset);
-    let mut ask = params.raw_ask.min(join_ask + max_touch_offset);
-
-    bid = bid.min(params.ask_touch - params.tick_size);
-    ask = ask.max(params.bid_touch + params.tick_size);
+    // Touch limits may make a quote less aggressive, never more aggressive
+    // than its fair-value/fee-aware model price. Pulling distant quotes toward
+    // the local book can erase edge when the venue dislocates from the anchor.
+    let mut bid = params
+        .raw_bid
+        .min(join_bid)
+        .min(params.ask_touch - params.tick_size);
+    let mut ask = params
+        .raw_ask
+        .max(join_ask)
+        .max(params.bid_touch + params.tick_size);
 
     bid = (bid / params.tick_size).floor() * params.tick_size;
     ask = (ask / params.tick_size).ceil() * params.tick_size;
@@ -136,7 +138,12 @@ pub(super) fn stabilize_crossed_quotes(
         || !ask.is_finite()
         || !bid_touch.is_finite()
         || !ask_touch.is_finite()
+        || !tick_size.is_finite()
         || tick_size <= 0.0
+        || bid <= 0.0
+        || ask <= 0.0
+        || bid_touch <= 0.0
+        || ask_touch <= bid_touch
     {
         return None;
     }
@@ -157,4 +164,34 @@ pub(super) fn stabilize_crossed_quotes(
     } else {
         None
     }
+}
+
+/// Preserve the fee/profit floor even when volatility would prefer a tighter cap.
+pub(super) fn fee_aware_half_spread(
+    raw: f64,
+    mid: f64,
+    fee_floor_bps: f64,
+    cap_bps: f64,
+) -> Option<f64> {
+    if !raw.is_finite()
+        || !mid.is_finite()
+        || mid <= 0.0
+        || !fee_floor_bps.is_finite()
+        || !cap_bps.is_finite()
+        || fee_floor_bps < 0.0
+        || cap_bps < fee_floor_bps
+    {
+        return None;
+    }
+    Some(raw.clamp(mid * fee_floor_bps / 20000.0, mid * cap_bps / 20000.0))
+}
+
+pub(super) fn momentum_half_spreads(half_spread: f64, momentum_bps: f64, scale: f64) -> (f64, f64) {
+    let adjustment = (momentum_bps / 10.0).clamp(-0.5, 0.5) * scale.clamp(0.0, 1.0);
+    // Rising fair value exposes the resting ask to informed buyers; widen the
+    // ask. Falling fair value symmetrically widens the bid against sellers.
+    (
+        half_spread * (1.0 - adjustment),
+        half_spread * (1.0 + adjustment),
+    )
 }

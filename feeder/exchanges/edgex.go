@@ -130,8 +130,6 @@ func (e *EdgeX) connect(ctx context.Context) error {
 			continue
 		}
 
-		log.Printf("edgex: BBO for symbol %d: bid=%.2f@%.4f ask=%.2f@%.4f", symID, bidPx, bidSz, askPx, askSz)
-
 		tsNs := uint64(time.Now().UnixNano())
 		e.matrix.WriteBBO(ExchangeEdgeX, symID, tsNs, bidPx, bidSz, askPx, askSz)
 	}

@@ -33,9 +33,7 @@ impl Exchange for MockExchange {
     }
 
     async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
-        self.active_orders
-            .clone()
-            .map_err(anyhow::Error::msg)
+        self.active_orders.clone().map_err(anyhow::Error::msg)
     }
 
     async fn close_all_positions(&self, _current_price: f64) -> anyhow::Result<()> {
@@ -262,7 +260,10 @@ fn test_mark_pending_cancel_keeps_exposure_until_confirmed() {
     assert!((tracker.worst_case_long() - 0.05).abs() < 1e-10);
 
     let state = tracker.state.read();
-    let order = state.active_orders.get(&5501).expect("order should remain active");
+    let order = state
+        .active_orders
+        .get(&5501)
+        .expect("order should remain active");
     assert_eq!(order.lifecycle, OrderLifecycle::PendingCancel);
 }
 
@@ -300,7 +301,8 @@ fn test_revert_pending_cancel_restores_open_or_partially_filled_state() {
 }
 
 #[test]
-fn test_pending_cancel_partial_fill_then_canceled_preserves_position_and_clears_remaining_exposure() {
+fn test_pending_cancel_partial_fill_then_canceled_preserves_position_and_clears_remaining_exposure()
+{
     let tracker = make_tracker();
 
     tracker.start_tracking(5551, OrderSide::Sell, 3010.0, 0.10);
@@ -372,10 +374,12 @@ fn test_cancel_all_active_clears_bilateral_exposure() {
 
     let state = tracker.state.read();
     assert_eq!(state.completed_orders.len(), 2);
-    assert!(state
-        .completed_orders
-        .values()
-        .all(|order| order.lifecycle == OrderLifecycle::Canceled));
+    assert!(
+        state
+            .completed_orders
+            .values()
+            .all(|order| order.lifecycle == OrderLifecycle::Canceled)
+    );
 }
 
 #[test]
@@ -495,7 +499,10 @@ fn test_zero_remaining_fill_does_not_complete_until_original_size_is_reached() {
 
     {
         let state = tracker.state.read();
-        let active = state.active_orders.get(&6003).expect("order should stay active");
+        let active = state
+            .active_orders
+            .get(&6003)
+            .expect("order should stay active");
         assert_eq!(active.lifecycle, OrderLifecycle::PartiallyFilled);
         assert!((active.remaining_size() - 0.0045).abs() < 1e-10);
     }
@@ -534,7 +541,10 @@ fn test_duplicate_order_created_does_not_auto_register_or_double_exposure() {
     let state = tracker.state.read();
     assert_eq!(state.completed_orders.len(), 0);
     assert_eq!(
-        state.active_orders.get(&6101).and_then(|o| o.exchange_order_id),
+        state
+            .active_orders
+            .get(&6101)
+            .and_then(|o| o.exchange_order_id),
         Some(6701)
     );
 }
@@ -558,7 +568,12 @@ fn effective_position_matches_locked_exposure_after_duplicate_open_events() {
     assert!((tracker.net_pending_exposure() - tracker.net_pending_exposure_locked()).abs() < 1e-10);
     assert!((tracker.worst_case_long() - tracker.worst_case_long_locked()).abs() < 1e-10);
     assert!((tracker.worst_case_short() - tracker.worst_case_short_locked()).abs() < 1e-10);
-    assert!((tracker.effective_position() - (tracker.confirmed_position() + tracker.net_pending_exposure_locked())).abs() < 1e-10);
+    assert!(
+        (tracker.effective_position()
+            - (tracker.confirmed_position() + tracker.net_pending_exposure_locked()))
+        .abs()
+            < 1e-10
+    );
 }
 
 #[test]
@@ -567,8 +582,7 @@ fn test_cancel_without_open_ack_falls_back_to_client_order_id() {
 
     tracker.start_tracking(6201, OrderSide::Buy, 3000.0, 0.10);
 
-    let canceled =
-        ShmPrivateEventV2::order_canceled(1, 2, 1, 6801, 6201, 0, 0.10, 0);
+    let canceled = ShmPrivateEventV2::order_canceled(1, 2, 1, 6801, 6201, 0, 0.10, 0);
     let _ = tracker.apply_event(&canceled);
 
     assert_eq!(tracker.active_order_count(), 0);
@@ -584,7 +598,7 @@ fn test_cancel_without_open_ack_falls_back_to_client_order_id() {
 }
 
 #[tokio::test]
-async fn test_reconcile_with_exchange_removes_stale_open_orders_and_exposure() {
+async fn test_reconcile_absent_open_order_preserves_exposure_and_requests_cleanup() {
     let tracker = make_tracker();
 
     tracker.start_tracking(7001, OrderSide::Buy, 3000.0, 0.05);
@@ -610,17 +624,14 @@ async fn test_reconcile_with_exchange_removes_stale_open_orders_and_exposure() {
 
     let stale_count = tracker.reconcile_with_exchange(&exchange).await.unwrap();
 
-    assert_eq!(stale_count, 1);
-    assert_eq!(tracker.active_order_count(), 1);
-    assert!((tracker.worst_case_long() - 0.0).abs() < 1e-10);
+    assert_eq!(stale_count, 0);
+    assert_eq!(tracker.active_order_count(), 2);
+    assert!((tracker.worst_case_long() - 0.05).abs() < 1e-10);
     assert!((tracker.worst_case_short() - (-0.04)).abs() < 1e-10);
-
+    assert!(tracker.needs_reconciliation());
     let state = tracker.state.read();
-    let stale = state
-        .completed_orders
-        .get(&7001)
-        .expect("stale order should move to completed");
-    assert_eq!(stale.lifecycle, OrderLifecycle::Canceled);
+    assert!(state.active_orders[&7001].submission_uncertain);
+    assert_eq!(state.active_orders[&7001].lifecycle, OrderLifecycle::Open);
 }
 
 #[tokio::test]
@@ -643,7 +654,7 @@ async fn test_reconcile_with_exchange_propagates_exchange_errors() {
 }
 
 #[tokio::test]
-async fn test_reconcile_with_exchange_removes_stale_pending_create_orders() {
+async fn test_reconcile_absent_pending_create_preserves_exposure_and_requests_cleanup() {
     let tracker = make_tracker();
     tracker.start_tracking(8101, OrderSide::Buy, 3000.0, 0.05);
 
@@ -663,16 +674,16 @@ async fn test_reconcile_with_exchange_removes_stale_pending_create_orders() {
 
     let stale_count = tracker.reconcile_with_exchange(&exchange).await.unwrap();
 
-    assert_eq!(stale_count, 1);
-    assert_eq!(tracker.active_order_count(), 0);
-    assert!((tracker.net_pending_exposure() - 0.0).abs() < 1e-10);
-
+    assert_eq!(stale_count, 0);
+    assert_eq!(tracker.active_order_count(), 1);
+    assert!((tracker.net_pending_exposure() - 0.05).abs() < 1e-10);
+    assert!(tracker.needs_reconciliation());
     let state = tracker.state.read();
-    let completed = state
-        .completed_orders
-        .get(&8101)
-        .expect("stale pending-create order should move to completed");
-    assert_eq!(completed.lifecycle, OrderLifecycle::Rejected);
+    assert_eq!(
+        state.active_orders[&8101].lifecycle,
+        OrderLifecycle::PendingCreate
+    );
+    assert!(state.active_orders[&8101].submission_uncertain);
 }
 
 #[tokio::test]
@@ -745,4 +756,264 @@ fn test_startup_grace_ignores_untracked_open_events() {
 
     assert_eq!(tracker.active_order_count(), 0);
     assert!((tracker.net_pending_exposure() - 0.0).abs() < 1e-10);
+}
+
+#[test]
+fn duplicate_registration_preserves_original_exposure() {
+    let tracker = make_tracker();
+    assert!(tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5));
+    assert!(!tracker.start_tracking(1, OrderSide::Sell, 101.0, 4.0));
+    assert_eq!(tracker.worst_case_long(), 0.5);
+    assert_eq!(tracker.worst_case_short(), 0.0);
+    assert_eq!(tracker.pending_buy_exposure(), 0.5);
+    assert_eq!(tracker.pending_sell_exposure(), 0.0);
+    tracker.mark_failed(1);
+    assert!(!tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5));
+}
+
+#[test]
+fn invalid_inputs_do_not_poison_positions_or_sequence() {
+    let tracker = make_tracker();
+    assert!(!tracker.start_tracking(1, OrderSide::Buy, f64::NAN, 1.0));
+    assert!(!tracker.start_tracking(2, OrderSide::Buy, 100.0, -1.0));
+    assert_eq!(tracker.active_order_count(), 0);
+    tracker.force_sync_position(0.5);
+    tracker.force_sync_position(f64::INFINITY);
+    assert_eq!(tracker.confirmed_position(), 0.5);
+    let mut event =
+        ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, f64::NAN, 0.0, 0.0, false, 0, 1);
+    assert!(tracker.apply_event(&event).is_err());
+    assert_eq!(tracker.last_sequence.load(Ordering::Acquire), -1);
+    event.fill_size = 0.1;
+    tracker.apply_event(&event).unwrap();
+    tracker.apply_event(&event).unwrap();
+    assert_eq!(tracker.confirmed_position(), 0.6);
+}
+
+#[test]
+fn ws_acknowledgment_wins_over_late_http_failure() {
+    let tracker = make_tracker();
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5);
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_created(
+            0, 2, 1, 10, 1, 10, 100.0, 0.5, false, 0,
+        ))
+        .unwrap();
+    tracker.mark_failed(1);
+    assert_eq!(tracker.active_order_count(), 1);
+    assert_eq!(tracker.worst_case_long(), 0.5);
+}
+
+#[test]
+fn late_fill_without_client_id_is_accounted_and_deduplicated() {
+    let tracker = make_tracker();
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5);
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_created(
+            0, 2, 1, 10, 1, 10, 100.0, 0.5, false, 0,
+        ))
+        .unwrap();
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_canceled(
+            1, 2, 1, 10, 1, 10, 0.5, 0,
+        ))
+        .unwrap();
+    let mut event =
+        ShmPrivateEventV2::order_filled(2, 2, 1, 10, 0, 10, 100.0, 0.1, 0.0, 0.02, false, 0, 99);
+    tracker.apply_event(&event).unwrap();
+    event.sequence += 1;
+    tracker.apply_event(&event).unwrap();
+    assert_eq!(tracker.confirmed_position(), 0.1);
+    assert!((tracker.realized_pnl() + 10.02).abs() < 1e-8);
+    assert_eq!(tracker.total_fill_stats(), (1, 0.02));
+    assert_eq!(tracker.pending_buy_exposure(), 0.0);
+    tracker.gc_completed_orders(Duration::ZERO);
+    assert!(tracker.state.read().exchange_to_client.is_empty());
+}
+
+#[test]
+fn untracked_owned_fill_is_deduplicated_and_keeps_remaining_risk() {
+    let tracker = make_tracker();
+    let mut event =
+        ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, 0.1, 0.4, 0.02, false, 0, 99);
+    tracker.apply_event(&event).unwrap();
+    event.sequence += 1;
+    tracker.apply_event(&event).unwrap();
+    assert_eq!(tracker.confirmed_position(), 0.1);
+    assert!((tracker.worst_case_long() - 0.5).abs() < 1e-8);
+    assert_eq!(tracker.total_fill_stats(), (1, 0.02));
+    assert!((tracker.realized_pnl() + 10.02).abs() < 1e-8);
+}
+
+#[test]
+fn fill_preserves_pending_cancel_and_atomic_exposure_drains_exactly() {
+    let tracker = make_tracker();
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.0156);
+    tracker.mark_pending_cancel(1);
+    let first =
+        ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, 0.0111, 0.0, 0.0, false, 0, 99);
+    tracker.apply_event(&first).unwrap();
+    assert_eq!(
+        tracker.state.read().active_orders[&1].lifecycle,
+        OrderLifecycle::PendingCancel
+    );
+    let last = ShmPrivateEventV2::order_filled(
+        1, 2, 1, 10, 1, 10, 100.0, 0.0045, 0.001, 0.0, false, 0, 100,
+    );
+    tracker.apply_event(&last).unwrap();
+    assert_eq!(tracker.pending_buy_exposure.load(Ordering::Acquire), 0);
+    assert_eq!(tracker.active_order_count(), 0);
+}
+
+#[tokio::test]
+async fn reconcile_cannot_release_uncertain_submission_from_absence_alone() {
+    let tracker = make_tracker();
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5);
+    tracker.mark_submission_uncertain(1);
+    tracker
+        .state
+        .write()
+        .active_orders
+        .get_mut(&1)
+        .unwrap()
+        .created_at = Instant::now() - Duration::from_secs(30);
+    let exchange = MockExchange {
+        active_orders: Ok(vec![]),
+    };
+    assert_eq!(tracker.reconcile_with_exchange(&exchange).await.unwrap(), 0);
+    assert_eq!(tracker.worst_case_long(), 0.5);
+}
+
+#[tokio::test]
+async fn stale_rest_response_cannot_cancel_orders_updated_during_request() {
+    struct DelayedExchange {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl Exchange for DelayedExchange {
+        async fn buy(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            unreachable!()
+        }
+        async fn sell(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            unreachable!()
+        }
+        async fn place_batch(&self, _: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
+            unreachable!()
+        }
+        async fn cancel_order(&self, _: i64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn cancel_all(&self) -> anyhow::Result<u32> {
+            unreachable!()
+        }
+        async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(vec![])
+        }
+        async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn execute_batch(&self, _: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+            unreachable!()
+        }
+        async fn get_account_stats(
+            &self,
+        ) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+            unreachable!()
+        }
+        fn limit_order_type(&self) -> OrderType {
+            OrderType::PostOnly
+        }
+    }
+    let tracker = std::sync::Arc::new(make_tracker());
+    let exchange = std::sync::Arc::new(DelayedExchange {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5);
+    let worker_tracker = tracker.clone();
+    let worker_exchange = exchange.clone();
+    let worker = tokio::spawn(async move {
+        worker_tracker
+            .reconcile_with_exchange(worker_exchange.as_ref())
+            .await
+    });
+    exchange.started.notified().await;
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_created(
+            0, 2, 1, 10, 1, 10, 100.0, 0.5, false, 0,
+        ))
+        .unwrap();
+    exchange.release.notify_one();
+    assert_eq!(worker.await.unwrap().unwrap(), 0);
+    assert_eq!(tracker.active_order_count(), 1);
+    assert_eq!(tracker.worst_case_long(), 0.5);
+}
+
+#[test]
+fn event_gap_latches_reconciliation_until_explicit_cleanup() {
+    let tracker = make_tracker();
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_filled(
+            0, 2, 1, 10, 1, 10, 100.0, 0.1, 0.0, 0.0, false, 0, 99,
+        ))
+        .unwrap();
+    assert!(!tracker.needs_reconciliation());
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_filled(
+            2, 2, 1, 11, 2, 11, 100.0, 0.2, 0.0, 0.0, false, 0, 100,
+        ))
+        .unwrap();
+    assert!(tracker.needs_reconciliation());
+    tracker.clear_reconciliation_required();
+    assert!(!tracker.needs_reconciliation());
+    tracker.reset_event_sequence();
+    assert!(tracker.needs_reconciliation());
+    assert_eq!(tracker.last_sequence.load(Ordering::Acquire), -1);
+}
+
+#[test]
+fn lifetime_fill_statistics_survive_completed_order_gc() {
+    let tracker = make_tracker();
+    let fill =
+        ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, 0.1, 0.0, -0.01, false, 0, 99);
+    tracker.apply_event(&fill).unwrap();
+    assert_eq!(tracker.total_fill_stats(), (1, -0.01));
+    tracker.gc_completed_orders(Duration::ZERO);
+    assert!(tracker.state.read().completed_orders.is_empty());
+    assert_eq!(tracker.total_fill_stats(), (1, -0.01));
+}
+
+#[test]
+fn cleanup_cannot_acknowledge_an_integrity_failure_that_arrived_during_await() {
+    let tracker = make_tracker();
+    tracker.require_reconciliation();
+    let cleanup_epoch = tracker.reconciliation_epoch();
+    tracker.require_reconciliation();
+    assert!(!tracker.clear_reconciliation_if_epoch(cleanup_epoch));
+    assert!(tracker.needs_reconciliation());
+    assert!(tracker.clear_reconciliation_if_epoch(tracker.reconciliation_epoch()));
+    assert!(!tracker.needs_reconciliation());
+}
+
+#[test]
+fn cleanup_commit_is_atomic_and_preserves_risk_when_epoch_changed() {
+    let tracker = make_tracker();
+    tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.5);
+    tracker.require_reconciliation();
+    let old_epoch = tracker.reconciliation_epoch();
+    tracker.require_reconciliation();
+    assert!(!tracker.confirm_cleanup(old_epoch, 0.0));
+    assert_eq!(tracker.active_order_count(), 1);
+    assert_eq!(tracker.worst_case_long(), 0.5);
+    assert!(!tracker.confirm_cleanup(tracker.reconciliation_epoch(), f64::NAN));
+    assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.01));
+    assert_eq!(tracker.active_order_count(), 0);
+    assert_eq!(tracker.pending_buy_exposure(), 0.0);
+    assert_eq!(tracker.confirmed_position(), 0.01);
+    assert!(!tracker.needs_reconciliation());
+    tracker.require_reconciliation();
+    assert!(tracker.needs_reconciliation());
 }

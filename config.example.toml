@@ -56,7 +56,7 @@ feeder_enabled = false
 feeder_ws_url = "wss://ws.backpack.exchange"
 feeder_symbols = { ETH = "ETH_USDC_PERP", BTC = "BTC_USDC_PERP" }
 
-exchange_id = 4
+exchange_id = 5
 symbol_id = 1002
 
 risk_fraction = 0.20
@@ -73,11 +73,11 @@ balance_refresh_secs = 60
 # Hyperliquid - Feeder + Strategy
 # ============================================================================
 [hyperliquid]
-feeder_enabled = false
+feeder_enabled = true
 feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
 feeder_symbols = { ETH = "ETH", BTC = "BTC" }
 
-exchange_id = 5
+exchange_id = 1
 symbol_id = 1002
 
 risk_fraction = 0.20

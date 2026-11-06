@@ -30,16 +30,16 @@ func NewZeroOne(cfg config.ExchangeConfig, matrix *shm.Matrix) *ZeroOne {
 }
 
 type zeroOneSubMessage struct {
-	Type     string `json:"type"`
-	Topic    string `json:"topic"`
-	Market   string `json:"market"`
+	Type   string `json:"type"`
+	Topic  string `json:"topic"`
+	Market string `json:"market"`
 }
 
 type zeroOneEvent struct {
-	Topic    string           `json:"topic"`
-	Market   string           `json:"market"`
-	Type     string           `json:"type"`
-	Data     zeroOneData      `json:"data"`
+	Topic  string      `json:"topic"`
+	Market string      `json:"market"`
+	Type   string      `json:"type"`
+	Data   zeroOneData `json:"data"`
 }
 
 type zeroOneData struct {

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
@@ -17,7 +19,7 @@ import (
 // LighterPrivate connects to Lighter private WebSocket for order/trade events
 type LighterPrivate struct {
 	cfg          config.ExchangeConfig
-	eventBuffer  *shm.EventRingBufferV2
+	eventBuffer  privateEventSink
 	auth         *LighterAuth
 	mktMap       map[int]uint16          // market_index -> symbol_id
 	accountStats *LighterAccountStats    // For updating position
@@ -25,6 +27,13 @@ type LighterPrivate struct {
 	orderSizes   map[uint64]float64      // order_id -> remaining_base_amount
 	orderDetails map[uint64]orderDetail  // order_id -> full order details
 	seenTradeIDs map[uint64]struct{}     // trade_id -> seen (dedupe duplicate WS payloads)
+}
+
+// privateEventSink permits deterministic replay without mmap or credentials.
+type privateEventSink interface {
+	PushOrderCreatedV2(uint8, uint16, uint64, int64, int64, float64, float64, bool, uint64)
+	PushOrderFilledV2(uint8, uint16, uint64, int64, int64, float64, float64, float64, float64, bool, uint64, uint64)
+	PushOrderCanceledV2(uint8, uint16, uint64, int64, int64, float64, uint64)
 }
 
 // orderDetail tracks order metadata for V2 events
@@ -52,7 +61,10 @@ func NewLighterPrivate(
 	mktMap := make(map[int]uint16)
 	for localSym, exchIdxStr := range cfg.Symbols {
 		if id, ok := SymbolNameToID[localSym]; ok {
-			idx, _ := strconv.Atoi(exchIdxStr)
+			idx, err := strconv.Atoi(exchIdxStr)
+			if err != nil || idx < 0 {
+				return nil, fmt.Errorf("invalid Lighter market for %s: %q", localSym, exchIdxStr)
+			}
 			mktMap[idx] = id
 		}
 	}
@@ -123,6 +135,10 @@ func (lp *LighterPrivate) Run(ctx context.Context) error {
 }
 
 func (lp *LighterPrivate) connect(ctx context.Context) error {
+	if lp.statsWriter != nil {
+		lp.statsWriter.InvalidatePosition()
+		defer lp.statsWriter.InvalidatePosition()
+	}
 	c, _, err := websocket.Dial(ctx, lp.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -143,6 +159,12 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 	log.Printf("lighter-private: authenticating with account_index=%d, api_key_index=%d",
 		accountID, lp.auth.GetAPIKeyIndex())
 
+	channels := make([]string, 0, len(lp.mktMap))
+	for mktIdx := range lp.mktMap {
+		channels = append(channels, fmt.Sprintf("account_market/%d/%d", mktIdx, accountID))
+	}
+	guard := newSubscriptionGuard(ctx, "account_market", channels, subscriptionTimeout)
+	defer guard.cancel()
 	// Subscribe to account_market for each configured market
 	for mktIdx := range lp.mktMap {
 		sub := fmt.Sprintf(
@@ -151,7 +173,7 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 			accountID,
 			authToken,
 		)
-		if err := c.Write(ctx, websocket.MessageText, []byte(sub)); err != nil {
+		if err := c.Write(guard.ctx, websocket.MessageText, []byte(sub)); err != nil {
 			return fmt.Errorf("subscribe account_market %d: %w", mktIdx, err)
 		}
 		log.Printf("lighter-private: subscribed to account_market/%d/%d", mktIdx, accountID)
@@ -162,7 +184,7 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 
 	// Read loop with automatic pong responses
 	for {
-		msgType, data, err := c.Read(ctx)
+		msgType, data, err := c.Read(guard.readContext(ctx))
 		if err != nil {
 			return err
 		}
@@ -171,6 +193,9 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 		if msgType == websocket.MessageBinary || msgType == websocket.MessageText {
 			// Zero-copy JSON parsing with gjson
 			result := gjson.ParseBytes(data)
+			if err := guard.observe(result); err != nil {
+				return err
+			}
 			if result.Get("type").String() == "ping" {
 				if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"pong"}`)); err != nil {
 					return fmt.Errorf("write app pong: %w", err)
@@ -178,6 +203,9 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 				continue
 			}
 
+			if !guard.acceptsData(result) {
+				continue
+			}
 			// Process position data. Lighter sometimes sends `"position": null`
 			// between real updates; that must not overwrite the last known
 			// position with 0.
@@ -219,7 +247,12 @@ func (lp *LighterPrivate) processPositionFast(positionData gjson.Result) {
 	sign := positionData.Get("sign").Int()
 	positionStr := positionData.Get("position").String()
 
-	posSize, _ := strconv.ParseFloat(positionStr, 64)
+	posSize, err := strconv.ParseFloat(positionStr, 64)
+	if err != nil || posSize < 0 || math.IsNaN(posSize) || math.IsInf(posSize, 0) ||
+		(sign != -1 && sign != 1 && !(sign == 0 && posSize == 0)) {
+		log.Printf("lighter-private: invalid position update, retaining last known position")
+		return
+	}
 	netPosition := float64(sign) * posSize
 
 	symbol := positionData.Get("symbol").String()
@@ -227,11 +260,6 @@ func (lp *LighterPrivate) processPositionFast(positionData gjson.Result) {
 		symbol = "BASE"
 	}
 	log.Printf("lighter-private: position updated: %.4f %s", netPosition, symbol)
-
-	// Update account stats cache (for user_stats to include in full writes)
-	if lp.accountStats != nil {
-		lp.accountStats.SetPosition(netPosition)
-	}
 
 	// Write position directly to SHM for instant Rust visibility
 	if lp.statsWriter != nil {
@@ -256,15 +284,24 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 	remainingSize := order.Get("remaining_base_amount").Float()
 	isAsk := order.Get("is_ask").Bool()
 	timestampNs := uint64(time.Now().UnixNano())
-
+	if orderIndex <= 0 || math.IsNaN(remainingSize) || math.IsInf(remainingSize, 0) || remainingSize < 0 {
+		return
+	}
+	if (status == "open" || status == "filled") && (initialSize <= 0 || price <= 0 ||
+		math.IsNaN(initialSize) || math.IsInf(initialSize, 0) || math.IsNaN(price) || math.IsInf(price, 0)) {
+		return
+	}
+	// The API includes canceled-expired/reduce-only/self-trade and other
+	// terminal cancellation reasons, all with the same risk-release semantics.
+	if strings.HasPrefix(status, "canceled-") {
+		status = "canceled"
+	}
 	switch status {
 	case "open":
 		if detail, ok := lp.orderDetails[orderID]; ok {
-			if remainingSize > 0 {
-				lp.orderSizes[orderID] = remainingSize
-			} else if initialSize > 0 {
-				lp.orderSizes[orderID] = initialSize
-			}
+			// Trade messages own incremental remaining accounting. Applying an
+			// open-order remaining snapshot here and subtracting its trade again
+			// would double-count a partial fill in the same WebSocket frame.
 			lp.orderDetails[orderID] = orderDetail{
 				clientOrderIndex: detail.clientOrderIndex,
 				orderIndex:       detail.orderIndex,
@@ -358,14 +395,22 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	}
 
 	tradeID := trade.Get("trade_id").Int()
+	if tradeID <= 0 {
+		return
+	}
 	tradeIDu64 := uint64(tradeID)
 	if _, seen := lp.seenTradeIDs[tradeIDu64]; seen {
 		return
 	}
-	lp.seenTradeIDs[tradeIDu64] = struct{}{}
 
 	price := trade.Get("price").String()
 	size := trade.Get("size").String()
+	fillPrice, priceErr := strconv.ParseFloat(price, 64)
+	fillSize, sizeErr := strconv.ParseFloat(size, 64)
+	if priceErr != nil || sizeErr != nil || fillPrice <= 0 || fillSize <= 0 ||
+		math.IsNaN(fillPrice) || math.IsInf(fillPrice, 0) || math.IsNaN(fillSize) || math.IsInf(fillSize, 0) {
+		return // Invalid payload must not poison dedup for a corrected replay.
+	}
 	isMakerAsk := trade.Get("is_maker_ask").Bool()
 
 	askID := uint64(trade.Get("ask_id").Int())
@@ -382,14 +427,25 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		orderID = askID
 	case bidTracked && !askTracked:
 		orderID = bidID
-	case askTracked:
-		orderID = askID
-	case bidTracked:
-		orderID = bidID
-	case isMakerAsk:
-		orderID = askID
 	default:
-		orderID = bidID
+		// Maker side does not identify our account. The official Trade model
+		// includes account IDs, allowing immediate taker fills to bind safely.
+		if lp.auth == nil {
+			return
+		}
+		accountID := lp.auth.GetAccountIndex()
+		askAccount, bidAccount := trade.Get("ask_account_id"), trade.Get("bid_account_id")
+		askOurs := askAccount.Exists() && askAccount.Int() == accountID
+		bidOurs := bidAccount.Exists() && bidAccount.Int() == accountID
+		if askOurs == bidOurs {
+			log.Printf("lighter-private: ambiguous trade %d, awaiting authoritative reconciliation", tradeID)
+			return
+		}
+		if askOurs {
+			orderID = askID
+		} else {
+			orderID = bidID
+		}
 	}
 
 	log.Printf(
@@ -397,16 +453,17 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		tradeID, marketID, price, size, isMakerAsk, askID, bidID, askTracked, bidTracked, orderID,
 	)
 
-	fillPrice, _ := strconv.ParseFloat(price, 64)
-	fillSize, _ := strconv.ParseFloat(size, 64)
-
-	// Calculate fee (Lighter uses basis points)
-	var feePaid float64
-	if isMakerAsk {
-		feePaid = lighterFeePaid(trade.Get("maker_fee").Float(), fillPrice, fillSize)
-	} else {
-		feePaid = lighterFeePaid(trade.Get("taker_fee").Float(), fillPrice, fillSize)
+	orderIsAsk := orderID == askID
+	// Fees are selected by OUR maker/taker role, not merely by maker side.
+	feeRate := trade.Get("taker_fee").Float()
+	if orderIsAsk == isMakerAsk {
+		feeRate = trade.Get("maker_fee").Float()
 	}
+	feePaid := lighterFeePaid(feeRate, fillPrice, fillSize)
+	if math.IsNaN(feePaid) || math.IsInf(feePaid, 0) {
+		return
+	}
+	lp.seenTradeIDs[tradeIDu64] = struct{}{}
 
 	// Calculate remaining size from order tracking
 	remainingSize := 0.0
@@ -423,9 +480,11 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	}
 
 	// Look up client_order_id and order_index from tracked details
-	coi := int64(0)
-	oi := int64(0)
-	orderIsAsk := isMakerAsk
+	coi := trade.Get("bid_client_id").Int()
+	if orderIsAsk {
+		coi = trade.Get("ask_client_id").Int()
+	}
+	oi := int64(orderID)
 	if detail, ok := lp.orderDetails[orderID]; ok {
 		coi = detail.clientOrderIndex
 		oi = detail.orderIndex

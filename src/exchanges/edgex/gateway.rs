@@ -7,7 +7,7 @@ use super::model::{
     CancelAllOrderRequest, CancelOrderRequest, CreateOrderRequest, OrderSide,
     OrderType as EdgeXOrderType, TimeInForce,
 };
-use crate::error::{TradingError};
+use crate::error::TradingError;
 use crate::exchange::{
     BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, Exchange, OrderInfo, OrderParams,
     OrderResult, OrderType, PlaceResult, Side,
@@ -41,7 +41,7 @@ impl EdgeXConfig {
             .parse()?;
 
         // Load from config.toml (non-sensitive)
-        let app_config = crate::config::AppConfig::load_default();
+        let app_config = crate::config::AppConfig::load_default()?;
         let edgex_cfg = &app_config.edgex;
 
         let contract_id = edgex_cfg
@@ -247,11 +247,11 @@ impl EdgeXGateway {
                 .get("errorParam")
                 .and_then(|v| serde_json::to_string(v).ok())
                 .unwrap_or_else(|| code.to_string());
-            
+
             if code == "INSUFFICIENT_MARGIN" || error_msg.contains("insufficient margin") {
                 return Err(TradingError::InsufficientMargin.into());
             }
-            
+
             return Err(anyhow!("EdgeX API error: {} - {}", code, error_msg));
         }
 
@@ -352,7 +352,8 @@ impl Exchange for EdgeXGateway {
     }
 
     async fn close_all_positions(&self, current_price: f64) -> anyhow::Result<()> {
-        let positions = self.client
+        let positions = self
+            .client
             .get_positions(self.config.account_id)
             .await
             .map_err(|e| anyhow!("EdgeX get_positions failed: {}", e))?;
@@ -408,8 +409,13 @@ impl Exchange for EdgeXGateway {
         })
     }
 
-    async fn get_account_stats(&self) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
-        let stats = self.client.get_account_stats(self.config.account_id).await?;
+    async fn get_account_stats(
+        &self,
+    ) -> anyhow::Result<crate::strategy::inventory_neutral_mm::AccountStats> {
+        let stats = self
+            .client
+            .get_account_stats(self.config.account_id)
+            .await?;
         Ok(crate::strategy::inventory_neutral_mm::AccountStats {
             available_balance: stats.available_balance,
             portfolio_value: stats.portfolio_value,

@@ -49,6 +49,9 @@ pub enum TradingError {
     #[error("API error (status {status}): {message}")]
     ApiError { status: u16, message: String },
 
+    #[error("Submission outcome is uncertain; reconcile before releasing exposure: {0}")]
+    SubmissionUncertain(String),
+
     #[error("Insufficient margin to place order")]
     InsufficientMargin,
 }

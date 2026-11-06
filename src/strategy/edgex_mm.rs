@@ -4,14 +4,14 @@
 //! TODO: Migrate to EdgeXGateway (unified Exchange trait) for consistency.
 
 use crate::config::{ExchangeConfig, format_price, format_size, round_to_tick};
-use crate::shm_reader::ShmBboMessage;
-use crate::strategy::Strategy;
 use crate::edgex_api::client::EdgeXClient;
 use crate::edgex_api::model::{CreateOrderRequest, OrderSide, OrderType, TimeInForce};
+use crate::shm_reader::ShmBboMessage;
+use crate::strategy::Strategy;
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::pin::Pin;
 use tokio::runtime::Handle;
 
 pub struct MarketMakerStrategy {

@@ -19,10 +19,10 @@
 
 use crate::error::{Result, TradingError};
 use crate::types::{ShmPrivateEvent, ShmPrivateEventV2};
-use memmap2::MmapMut;
+use memmap2::Mmap;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering, compiler_fence};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 // ─── V1 Constants (64-byte events) ──────────────────────────────────────────
 
@@ -38,6 +38,15 @@ const V2_EVENT_SIZE: usize = 128;
 const V2_HEADER_SIZE: usize = 64;
 const V2_TOTAL_SIZE: usize = V2_HEADER_SIZE + (V2_RING_BUFFER_SLOTS as usize * V2_EVENT_SIZE);
 
+// Header bytes 8..16 form a producer generation: odd while any slot is
+// being overwritten, even after write_idx is published. The old write_idx-only
+// protocol cannot protect a slow reader when a full ring wraps over its slot.
+#[inline]
+fn generation(mmap: &Mmap) -> u64 {
+    // SAFETY: Both constructors validate the complete 64-byte aligned header.
+    unsafe { (*mmap.as_ptr().add(8).cast::<AtomicU64>()).load(Ordering::Acquire) }
+}
+
 // ─── V1 Reader (backward compatible) ────────────────────────────────────────
 
 /// Lock-free event ring buffer reader (V1: 64-byte events)
@@ -49,8 +58,9 @@ const V2_TOTAL_SIZE: usize = V2_HEADER_SIZE + (V2_RING_BUFFER_SLOTS as usize * V
 /// - Uses AtomicU64::load(Acquire) for correct memory ordering on all architectures
 /// - No heap allocations in hot path
 pub struct ShmEventReader {
-    mmap: MmapMut,
+    mmap: Mmap,
     local_read_idx: u64,
+    integrity_lost: bool,
 }
 
 impl ShmEventReader {
@@ -58,7 +68,6 @@ impl ShmEventReader {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
             .open(path.as_ref())
             .map_err(|e| {
                 TradingError::SharedMemory(format!(
@@ -68,7 +77,7 @@ impl ShmEventReader {
                 ))
             })?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file) }
+        let mmap = unsafe { Mmap::map(&file) }
             .map_err(|e| TradingError::SharedMemory(format!("Failed to mmap: {}", e)))?;
 
         if mmap.len() < V1_TOTAL_SIZE {
@@ -82,6 +91,7 @@ impl ShmEventReader {
         Ok(Self {
             mmap,
             local_read_idx: 0,
+            integrity_lost: false,
         })
     }
 
@@ -109,7 +119,7 @@ impl ShmEventReader {
 
         // Belt-and-suspenders: compiler fence to prevent any subsequent reads
         // from being reordered before the atomic load.
-        compiler_fence(Ordering::Acquire);
+        fence(Ordering::Acquire);
 
         val
     }
@@ -129,28 +139,47 @@ impl ShmEventReader {
     ///
     /// Returns `None` if no new events are available.
     pub fn try_read(&mut self) -> Option<ShmPrivateEvent> {
-        let write_idx = self.read_write_idx();
-
-        if self.local_read_idx >= write_idx {
+        let before = generation(&self.mmap);
+        if before & 1 != 0 {
             return None;
         }
-
-        // Detect gaps (writer wrapped around and overwrote unread events)
-        let unread = write_idx.saturating_sub(self.local_read_idx);
-        if unread > V1_RING_BUFFER_SLOTS {
-            let gap_size = unread - V1_RING_BUFFER_SLOTS;
-            tracing::error!(
-                "⚠️  Event gap detected: {} events lost (buffer overflow)",
-                gap_size
-            );
-            self.local_read_idx = write_idx.saturating_sub(V1_RING_BUFFER_SLOTS);
+        let write_idx = self.read_write_idx();
+        if write_idx < self.local_read_idx {
+            self.integrity_lost = true;
+            return None;
         }
-
-        let slot = (self.local_read_idx % V1_RING_BUFFER_SLOTS) as usize;
+        if self.local_read_idx == write_idx {
+            return None;
+        }
+        let read_idx = self
+            .local_read_idx
+            .max(write_idx.saturating_sub(V1_RING_BUFFER_SLOTS));
+        let slot = (read_idx % V1_RING_BUFFER_SLOTS) as usize;
         let event = self.read_slot(slot);
-        self.local_read_idx += 1;
-
+        fence(Ordering::Acquire);
+        // If the writer touched the ring during our copy, retry without consuming.
+        if generation(&self.mmap) != before {
+            return None;
+        }
+        if event.sequence != read_idx {
+            self.integrity_lost = true;
+            return None;
+        }
+        if read_idx > self.local_read_idx {
+            self.integrity_lost = true;
+            tracing::error!(
+                "V1 event ring overflow: {} events lost",
+                read_idx - self.local_read_idx
+            );
+        }
+        self.local_read_idx = read_idx + 1;
         Some(event)
+    }
+
+    /// Consume an integrity alarm (overflow, corrupt slot, or producer index reset).
+    /// The caller must stop new orders and reconcile authoritative account state.
+    pub fn take_integrity_loss(&mut self) -> bool {
+        std::mem::take(&mut self.integrity_lost)
     }
 
     pub fn local_read_idx(&self) -> u64 {
@@ -181,8 +210,9 @@ impl ShmEventReader {
 ///   on x86, ARM, and Apple Silicon
 /// - No heap allocations in hot path
 pub struct ShmEventReaderV2 {
-    mmap: MmapMut,
+    mmap: Mmap,
     local_read_idx: u64,
+    integrity_lost: bool,
 }
 
 impl ShmEventReaderV2 {
@@ -190,7 +220,6 @@ impl ShmEventReaderV2 {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
             .open(path.as_ref())
             .map_err(|e| {
                 TradingError::SharedMemory(format!(
@@ -200,7 +229,7 @@ impl ShmEventReaderV2 {
                 ))
             })?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file) }
+        let mmap = unsafe { Mmap::map(&file) }
             .map_err(|e| TradingError::SharedMemory(format!("Failed to mmap: {}", e)))?;
 
         if mmap.len() < V2_TOTAL_SIZE {
@@ -214,6 +243,7 @@ impl ShmEventReaderV2 {
         Ok(Self {
             mmap,
             local_read_idx: 0,
+            integrity_lost: false,
         })
     }
 
@@ -232,7 +262,7 @@ impl ShmEventReaderV2 {
     fn read_write_idx(&self) -> u64 {
         let ptr = self.mmap.as_ptr() as *const AtomicU64;
         let val = unsafe { (*ptr).load(Ordering::Acquire) };
-        compiler_fence(Ordering::Acquire);
+        fence(Ordering::Acquire);
         val
     }
 
@@ -248,28 +278,47 @@ impl ShmEventReaderV2 {
     ///
     /// Returns `None` if no new events are available.
     pub fn try_read(&mut self) -> Option<ShmPrivateEventV2> {
-        let write_idx = self.read_write_idx();
-
-        if self.local_read_idx >= write_idx {
+        let before = generation(&self.mmap);
+        if before & 1 != 0 {
             return None;
         }
-
-        // Detect gaps
-        let unread = write_idx.saturating_sub(self.local_read_idx);
-        if unread > V2_RING_BUFFER_SLOTS {
-            let gap_size = unread - V2_RING_BUFFER_SLOTS;
-            tracing::error!(
-                "⚠️  V2 Event gap detected: {} events lost (buffer overflow)",
-                gap_size
-            );
-            self.local_read_idx = write_idx.saturating_sub(V2_RING_BUFFER_SLOTS);
+        let write_idx = self.read_write_idx();
+        if write_idx < self.local_read_idx {
+            self.integrity_lost = true;
+            return None;
         }
-
-        let slot = (self.local_read_idx % V2_RING_BUFFER_SLOTS) as usize;
+        if self.local_read_idx == write_idx {
+            return None;
+        }
+        let read_idx = self
+            .local_read_idx
+            .max(write_idx.saturating_sub(V2_RING_BUFFER_SLOTS));
+        let slot = (read_idx % V2_RING_BUFFER_SLOTS) as usize;
         let event = self.read_slot(slot);
-        self.local_read_idx += 1;
-
+        fence(Ordering::Acquire);
+        // If the writer touched the ring during our copy, retry without consuming.
+        if generation(&self.mmap) != before {
+            return None;
+        }
+        if event.sequence != read_idx {
+            self.integrity_lost = true;
+            return None;
+        }
+        if read_idx > self.local_read_idx {
+            self.integrity_lost = true;
+            tracing::error!(
+                "V2 event ring overflow: {} events lost",
+                read_idx - self.local_read_idx
+            );
+        }
+        self.local_read_idx = read_idx + 1;
         Some(event)
+    }
+
+    /// Consume an integrity alarm (overflow, corrupt slot, or producer index reset).
+    /// The caller must stop new orders and reconcile authoritative account state.
+    pub fn take_integrity_loss(&mut self) -> bool {
+        std::mem::take(&mut self.integrity_lost)
     }
 
     pub fn local_read_idx(&self) -> u64 {
@@ -293,41 +342,97 @@ impl ShmEventReaderV2 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_v1_reader_creation() {
-        match ShmEventReader::new_default() {
-            Ok(reader) => {
-                assert_eq!(reader.local_read_idx(), 0);
-                println!("V1 Reader created successfully");
-            }
-            Err(e) => {
-                println!(
-                    "Expected: shared memory not yet created by Go feeder: {}",
-                    e
-                );
-            }
+    fn ring_v2(index: u64, generation: u64, event: ShmPrivateEventV2) -> ShmEventReaderV2 {
+        let mut map = memmap2::MmapMut::map_anon(V2_TOTAL_SIZE).unwrap();
+        map[0..8].copy_from_slice(&index.to_ne_bytes());
+        map[8..16].copy_from_slice(&generation.to_ne_bytes());
+        let slot = event.sequence as usize % V2_RING_BUFFER_SLOTS as usize;
+        // SAFETY: anonymous mmap is page aligned; slot is within allocated extent.
+        unsafe {
+            std::ptr::write(
+                map.as_mut_ptr()
+                    .add(V2_HEADER_SIZE + slot * V2_EVENT_SIZE)
+                    .cast(),
+                event,
+            );
+        }
+        ShmEventReaderV2 {
+            mmap: map.make_read_only().unwrap(),
+            local_read_idx: 0,
+            integrity_lost: false,
         }
     }
 
     #[test]
-    fn test_v2_reader_creation() {
-        match ShmEventReaderV2::new_default() {
-            Ok(reader) => {
-                assert_eq!(reader.local_read_idx(), 0);
-                println!("V2 Reader created successfully");
-            }
-            Err(e) => {
-                println!(
-                    "Expected: V2 shared memory not yet created by Go feeder: {}",
-                    e
-                );
-            }
-        }
+    fn v2_reads_zero_based_first_event_once() {
+        let event = ShmPrivateEventV2::order_created(0, 2, 1, 5, 7, 5, 100.0, 0.1, false, 0);
+        let mut reader = ring_v2(1, 2, event);
+        assert_eq!(reader.try_read().unwrap().client_order_id, 7);
+        assert_eq!(reader.local_read_idx(), 1);
+        assert!(reader.try_read().is_none());
     }
 
     #[test]
-    fn test_v2_constants() {
-        assert_eq!(V2_EVENT_SIZE, 128);
-        assert_eq!(V2_TOTAL_SIZE, 64 + 1024 * 128);
+    fn v2_does_not_consume_while_writer_is_overwriting() {
+        let event = ShmPrivateEventV2::order_created(0, 2, 1, 5, 7, 5, 100.0, 0.1, false, 0);
+        let mut reader = ring_v2(1, 3, event);
+        assert!(reader.try_read().is_none());
+        assert_eq!(reader.local_read_idx(), 0);
+    }
+
+    #[test]
+    fn v2_overflow_reads_oldest_surviving_slot() {
+        let event = ShmPrivateEventV2::order_created(5, 2, 1, 5, 7, 5, 100.0, 0.1, false, 0);
+        let mut reader = ring_v2(V2_RING_BUFFER_SLOTS + 5, 10, event);
+        assert_eq!(reader.try_read().unwrap().sequence, 5);
+        assert_eq!(reader.local_read_idx(), 6);
+        assert!(reader.take_integrity_loss());
+        assert!(!reader.take_integrity_loss());
+    }
+
+    #[test]
+    fn v2_rejects_mismatched_slot_sequence() {
+        let event = ShmPrivateEventV2::order_created(
+            V2_RING_BUFFER_SLOTS,
+            2,
+            1,
+            5,
+            7,
+            5,
+            100.0,
+            0.1,
+            false,
+            0,
+        );
+        let mut reader = ring_v2(1, 2, event);
+        assert!(reader.try_read().is_none());
+        assert_eq!(reader.local_read_idx(), 0);
+    }
+
+    #[test]
+    fn producer_index_regression_is_reported() {
+        let mut reader = ring_v2(1, 2, ShmPrivateEventV2::default());
+        reader.local_read_idx = 100;
+        assert!(reader.try_read().is_none());
+        assert!(reader.take_integrity_loss());
+    }
+
+    #[test]
+    fn v1_uses_the_same_generation_protocol() {
+        let mut map = memmap2::MmapMut::map_anon(V1_TOTAL_SIZE).unwrap();
+        map[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        map[8..16].copy_from_slice(&2u64.to_ne_bytes());
+        let event = ShmPrivateEvent::order_created(0, 2, 1, 5, 0.1, false);
+        // SAFETY: anonymous map has a fully allocated aligned first slot.
+        unsafe {
+            std::ptr::write(map.as_mut_ptr().add(V1_HEADER_SIZE).cast(), event);
+        }
+        let mut reader = ShmEventReader {
+            mmap: map.make_read_only().unwrap(),
+            local_read_idx: 0,
+            integrity_lost: false,
+        };
+        assert_eq!(reader.try_read().unwrap().order_id, 5);
+        assert!(reader.try_read().is_none());
     }
 }

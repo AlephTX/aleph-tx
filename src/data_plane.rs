@@ -51,10 +51,8 @@ fn data_plane_loop(
     tx: Sender<BboUpdate>,
 ) {
     // Pin to CPU core if specified
-    if let Some(core) = cpu_core
-        && let Some(core_id) = (core_affinity::CoreId { id: core }).into()
-    {
-        if core_affinity::set_for_current(core_id) {
+    if let Some(core) = cpu_core {
+        if core_affinity::set_for_current(core_affinity::CoreId { id: core }) {
             info!("📌 Data plane pinned to CPU core {}", core);
         } else {
             error!("⚠️ Failed to pin data plane to CPU core {}", core);
@@ -77,11 +75,17 @@ fn data_plane_loop(
 
     // Spin-loop: poll SHM and send updates via channel
     loop {
+        if tx.is_disconnected() {
+            info!("Data plane stopped: all strategy receivers dropped");
+            return;
+        }
         if let Some(symbol_id) = reader.try_poll() {
             // Read all exchanges for this symbol
             let exchanges = reader.read_all_exchanges(symbol_id);
             for (exch_idx, bbo) in exchanges.iter() {
-                if bbo.bid_price > 0.0 && bbo.ask_price > 0.0 {
+                // A published zero-valued slot is a feeder invalidation and
+                // must reach consumers so they discard their cached quotes.
+                if bbo.seqlock > 0 {
                     let update = BboUpdate {
                         symbol_id,
                         exchange_id: *exch_idx,

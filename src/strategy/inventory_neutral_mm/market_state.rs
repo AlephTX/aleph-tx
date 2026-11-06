@@ -14,7 +14,7 @@ pub(super) fn select_exchange_bbo(
         .iter()
         .find(|(exch_id, _)| *exch_id == exchange_id)
         .map(|(_, msg)| *msg)
-        .filter(|bbo| bbo.bid_price > 0.0 || bbo.ask_price > 0.0)
+        .filter(valid_quoteable_book)
 }
 
 pub(super) fn data_age_ms(timestamp_ns: u64, now_ns: u64) -> u64 {
@@ -22,7 +22,7 @@ pub(super) fn data_age_ms(timestamp_ns: u64, now_ns: u64) -> u64 {
 }
 
 pub(super) fn is_stale_bbo(timestamp_ns: u64, now_ns: u64, threshold_ms: u64) -> bool {
-    timestamp_ns > 0 && data_age_ms(timestamp_ns, now_ns) > threshold_ms
+    timestamp_ns == 0 || timestamp_ns > now_ns || data_age_ms(timestamp_ns, now_ns) > threshold_ms
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,43 +32,37 @@ pub(super) enum StaleBboAction {
     Cancel,
 }
 
-fn has_valid_two_sided_book(bbo: &ShmBboMessage) -> bool {
-    bbo.bid_price > 0.0 && bbo.ask_price > 0.0 && bbo.ask_price > bbo.bid_price
-}
-
-fn has_quoteable_book(bbo: &ShmBboMessage) -> bool {
-    bbo.bid_price > 0.0 || bbo.ask_price > 0.0
+fn valid_quoteable_book(bbo: &ShmBboMessage) -> bool {
+    bbo.bid_price.is_finite()
+        && bbo.ask_price.is_finite()
+        && bbo.bid_size.is_finite()
+        && bbo.ask_size.is_finite()
+        && bbo.bid_price >= 0.0
+        && bbo.ask_price >= 0.0
+        && bbo.bid_size >= 0.0
+        && bbo.ask_size >= 0.0
+        && (bbo.bid_price > 0.0 || bbo.ask_price > 0.0)
+        && (bbo.bid_price == 0.0 || bbo.ask_price == 0.0 || bbo.bid_price < bbo.ask_price)
 }
 
 pub(super) fn classify_stale_bbo(
     bbo: &ShmBboMessage,
     now_ns: u64,
-    first_stale_seen_ns: Option<u64>,
     freeze_threshold_ms: u64,
     cancel_after_ms: u64,
-    static_two_sided_grace_ms: u64,
-    static_quoteable_grace_ms: u64,
 ) -> StaleBboAction {
-    let timestamp_ns = bbo.timestamp_ns;
-    if !is_stale_bbo(timestamp_ns, now_ns, freeze_threshold_ms) {
-        return StaleBboAction::Fresh;
+    // A static book is not proof of a live feed. Age the source timestamp,
+    // rather than starting another timeout only after a stale read is observed.
+    if bbo.timestamp_ns == 0 || bbo.timestamp_ns > now_ns || !valid_quoteable_book(bbo) {
+        return StaleBboAction::Cancel;
     }
-
-    let age_ms = data_age_ms(timestamp_ns, now_ns);
-    if has_valid_two_sided_book(bbo) && age_ms <= static_two_sided_grace_ms {
-        return StaleBboAction::Fresh;
-    }
-
-    if has_quoteable_book(bbo) && age_ms <= static_quoteable_grace_ms {
-        return StaleBboAction::Fresh;
-    }
-
-    let stale_origin_ns = first_stale_seen_ns.unwrap_or(now_ns);
-    let stale_for_ms = data_age_ms(stale_origin_ns, now_ns);
-    if stale_for_ms >= cancel_after_ms {
+    let age_ms = data_age_ms(bbo.timestamp_ns, now_ns);
+    if age_ms >= cancel_after_ms {
         StaleBboAction::Cancel
-    } else {
+    } else if age_ms > freeze_threshold_ms {
         StaleBboAction::Freeze
+    } else {
+        StaleBboAction::Fresh
     }
 }
 
@@ -94,66 +88,34 @@ pub(super) fn external_fair_value_mid(
     now_ns: u64,
     staleness_ms: u64,
 ) -> Option<f64> {
-    let external_exchanges: Vec<(u8, ShmBboMessage)> = exchanges
-        .iter()
-        .filter(|(exchange_id, _)| *exchange_id != local_exchange_id && *exchange_id != 0)
-        .map(|(id, bbo)| (*id, *bbo))
-        .collect();
-
-    let mut valid_mids: Vec<(u8, f64, u64)> = Vec::new();
-    let mut stale_count = 0;
-    let mut invalid_count = 0;
-
-    for (exchange_id, bbo) in external_exchanges {
-        let age_ms = data_age_ms(bbo.timestamp_ns, now_ns);
-
-        if bbo.bid_price <= 0.0 || bbo.ask_price <= 0.0 || bbo.ask_price <= bbo.bid_price {
-            invalid_count += 1;
+    // Exchange count is fixed by the SHM ABI: keep the fair-value hot path
+    // on the stack, including median sorting.
+    let mut valid_mids = [0.0_f64; NUM_EXCHANGES];
+    let mut count = 0;
+    for (exchange_id, bbo) in exchanges {
+        if *exchange_id == local_exchange_id
+            || *exchange_id == 0
+            || !valid_quoteable_book(bbo)
+            || bbo.bid_price == 0.0
+            || bbo.ask_price == 0.0
+            || is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms)
+        {
             continue;
         }
-
-        if is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms) {
-            stale_count += 1;
-            tracing::debug!(
-                "External exchange {} stale: age={}ms (threshold={}ms)",
-                exchange_id,
-                age_ms,
-                staleness_ms
-            );
-            continue;
-        }
-
-        let mid = (bbo.bid_price + bbo.ask_price) / 2.0;
-        valid_mids.push((exchange_id, mid, age_ms));
+        // Halve before adding to avoid overflow on otherwise finite prices.
+        valid_mids[count] = bbo.bid_price * 0.5 + bbo.ask_price * 0.5;
+        count += 1;
     }
-
-    if valid_mids.is_empty() {
-        if stale_count > 0 || invalid_count > 0 {
-            tracing::debug!(
-                "External fair value unavailable: stale={} invalid={} → fallback to local VWMicro",
-                stale_count,
-                invalid_count
-            );
-        }
-        None
+    if count == 0 {
+        return None;
+    }
+    valid_mids[..count].sort_unstable_by(f64::total_cmp);
+    let middle = count / 2;
+    Some(if count % 2 == 1 {
+        valid_mids[middle]
     } else {
-        valid_mids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mid_idx = valid_mids.len() / 2;
-        let median = if valid_mids.len() % 2 == 1 {
-            valid_mids[mid_idx].1
-        } else {
-            (valid_mids[mid_idx - 1].1 + valid_mids[mid_idx].1) / 2.0
-        };
-
-        tracing::debug!(
-            "External fair value: median=${:.2} from {} exchanges: {:?}",
-            median,
-            valid_mids.len(),
-            valid_mids.iter().map(|(id, mid, age)| format!("{}@${:.2}({}ms)", id, mid, age)).collect::<Vec<_>>()
-        );
-
-        Some(median)
-    }
+        valid_mids[middle - 1] * 0.5 + valid_mids[middle] * 0.5
+    })
 }
 
 #[cfg(test)]
@@ -205,42 +167,45 @@ mod tests {
     }
 
     #[test]
-    fn classify_stale_bbo_freezes_before_canceling() {
-        let now_ns = 40_000_000_000;
-        let timestamp_ns = 27_000_000_000;
-        let two_sided = msg(2100.0, 2101.0, timestamp_ns);
-        let one_sided = msg(2100.0, 0.0, timestamp_ns);
+    fn stale_static_books_freeze_and_cancel_based_on_source_age() {
+        let now = 40_000_000_000;
+        for book in [
+            msg(2100.0, 2101.0, 34_000_000_000),
+            msg(2100.0, 0.0, 34_000_000_000),
+        ] {
+            assert_eq!(
+                classify_stale_bbo(&book, now, 5_000, 15_000),
+                StaleBboAction::Freeze
+            );
+            assert_eq!(
+                classify_stale_bbo(&book, now + 10_000_000_000, 5_000, 15_000),
+                StaleBboAction::Cancel
+            );
+        }
+        assert_eq!(
+            classify_stale_bbo(&msg(2100.0, 2101.0, now), now, 5_000, 15_000),
+            StaleBboAction::Fresh
+        );
+    }
 
-        assert_eq!(
-            classify_stale_bbo(&one_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
-            StaleBboAction::Freeze
-        );
-        assert_eq!(
-            classify_stale_bbo(&one_sided, now_ns, Some(0), 5, 10_000, 30_000, 12_000),
-            StaleBboAction::Cancel
-        );
-        assert_eq!(
-            classify_stale_bbo(
-                &msg(2100.0, 2101.0, 39_000_000_000),
-                now_ns,
-                None,
-                5,
-                10_000,
-                30_000,
-                12_000,
-            ),
-            StaleBboAction::Fresh
-        );
-        assert_eq!(
-            classify_stale_bbo(&two_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
-            StaleBboAction::Fresh
-        );
-
-        let quoteable_one_sided = msg(2100.0, 0.0, 34_000_000_000);
-        assert_eq!(
-            classify_stale_bbo(&quoteable_one_sided, now_ns, None, 5, 10_000, 30_000, 12_000),
-            StaleBboAction::Fresh
-        );
+    #[test]
+    fn invalid_prices_and_timestamps_never_become_fair_value() {
+        let now = 10_000_000_000;
+        for book in [
+            msg(f64::NAN, 2101.0, now),
+            msg(2100.0, f64::INFINITY, now),
+            msg(2101.0, 2100.0, now),
+            msg(2100.0, 2101.0, 0),
+            msg(2100.0, 2101.0, now + 1),
+        ] {
+            let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+            exchanges[1] = (1, book);
+            assert!(external_fair_value_mid(&exchanges, 2, now, 2_000).is_none());
+            assert_eq!(
+                classify_stale_bbo(&book, now, 5_000, 15_000),
+                StaleBboAction::Cancel
+            );
+        }
     }
 
     #[test]
@@ -251,7 +216,7 @@ mod tests {
             (1, msg(2100.0, 2101.0, 9_999_000_000)),
             (2, msg(2000.0, 2001.0, 9_999_000_000)),
             (3, msg(2200.0, 2201.0, 9_999_000_000)),
-            (4, msg(2300.0, 0.0, 9_999_000_000)),   // one-sided, filtered out
+            (4, msg(2300.0, 0.0, 9_999_000_000)), // one-sided, filtered out
             (5, msg(2400.0, 2401.0, 9_000_000_000)), // stale at 500ms threshold
             default_exchange(),
         ];
@@ -300,5 +265,43 @@ mod tests {
         let external_mid = external_fair_value_mid(&exchanges, 0, now_ns, 2000);
 
         assert!(external_mid.is_none());
+    }
+    #[test]
+    #[ignore = "manual release-mode performance benchmark"]
+    fn benchmark_stack_median_vs_allocating_anchor() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let now = 10_000_000_000;
+        let exchanges =
+            std::array::from_fn(|i| (i as u8, msg(2100.0 + i as f64, 2101.0 + i as f64, now)));
+        let iterations = 200_000;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(external_fair_value_mid(black_box(&exchanges), 2, now, 2000));
+        }
+        let stack = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..iterations {
+            // Previous implementation: collect external BBOs, grow a second
+            // vector of valid mids, then stable-sort to obtain the median.
+            let external: Vec<_> = black_box(&exchanges)
+                .iter()
+                .filter(|(id, _)| *id != 2 && *id != 0)
+                .copied()
+                .collect();
+            let mut mids = Vec::new();
+            for (_, bbo) in external {
+                if valid_quoteable_book(&bbo) && !is_stale_bbo(bbo.timestamp_ns, now, 2000) {
+                    mids.push((bbo.bid_price + bbo.ask_price) / 2.0);
+                }
+            }
+            mids.sort_by(f64::total_cmp);
+            black_box(mids[mids.len() / 2]);
+        }
+        let allocated = started.elapsed();
+        println!(
+            "fair-value median: {iterations} updates; stack={stack:?}, previous_allocating={allocated:?}, speedup={:.2}x",
+            allocated.as_secs_f64() / stack.as_secs_f64()
+        );
     }
 }

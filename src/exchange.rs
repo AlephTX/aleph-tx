@@ -125,7 +125,9 @@ pub trait Exchange: Send + Sync {
     async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult>;
 
     /// Get account stats (balance, position, etc.)
-    async fn get_account_stats(&self) -> Result<crate::strategy::inventory_neutral_mm::AccountStats>;
+    async fn get_account_stats(
+        &self,
+    ) -> Result<crate::strategy::inventory_neutral_mm::AccountStats>;
 
     /// 获取限价单类型（PostOnly 或 Limit）
     fn limit_order_type(&self) -> OrderType;

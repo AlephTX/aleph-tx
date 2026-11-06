@@ -22,14 +22,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("🦀 AlephTX Core v4 starting (Institutional Pipeline)...");
 
     // 2. Load configuration
-    let config = AppConfig::load_default();
-    
+    let config = AppConfig::load_default()?;
+
     // 3. Initialize strategies
     let mut strategies: Vec<Box<dyn Strategy>> = vec![
         Box::new(ArbitrageEngine::new(25.0)),
         Box::new(MarketMakerStrategy::new(
-            EXCH_EDGEX, 
-            SYM_ETH, 
+            EXCH_EDGEX,
+            SYM_ETH,
             25.0,
             config.edgex.clone(),
         )),
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // 5. Main loop with graceful shutdown
     let sigint = signal::ctrl_c();
     tokio::pin!(sigint);
-    
+
     loop {
         // Async select: receive BBO updates from data plane, idle timeout, or shutdown signal
         tokio::select! {

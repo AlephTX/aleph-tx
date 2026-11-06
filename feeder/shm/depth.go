@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	DepthLevels = 5
+	DepthLevels   = 5
 	DepthSlotSize = 256 // sizeof(ShmDepthSnapshot)
 )
 
@@ -23,14 +23,14 @@ type PriceLevel struct {
 // ShmDepthSnapshot is the 256-byte depth snapshot message.
 // Layout must match Rust #[repr(C)] exactly.
 type ShmDepthSnapshot struct {
-	Seqlock     uint32               // 0..4
-	ExchangeID  uint8                // 4
-	SymbolID    uint16               // 5..7
-	_Padding1   uint8                // 7
-	TimestampNs uint64               // 8..16
-	Bids        [DepthLevels]PriceLevel // 16..96 (5 * 16 = 80 bytes)
-	Asks        [DepthLevels]PriceLevel // 96..176 (5 * 16 = 80 bytes)
-	_Reserved   [72]byte             // 176..248 padding (+ 8 alignment = 256)
+	Seqlock     uint32                  // 0..4
+	ExchangeID  uint8                   // 4
+	SymbolID    uint16                  // 6..8 (implicit byte at offset 5)
+	_Padding1   uint8                   // 8 (implicit padding to offset 16)
+	TimestampNs uint64                  // 16..24
+	Bids        [DepthLevels]PriceLevel // 24..104 (5 * 16 = 80 bytes)
+	Asks        [DepthLevels]PriceLevel // 104..184 (5 * 16 = 80 bytes)
+	_Reserved   [72]byte                // 184..256
 }
 
 // ShmDepthState is the shared memory structure for depth data.
@@ -59,7 +59,11 @@ func init() {
 
 // NewDepthWriter creates a new depth writer with the specified SHM path.
 func NewDepthWriter(shmPath string, numSymbols int) (*DepthWriter, error) {
-	expectedSize := 8 + numSymbols*NumExchanges*DepthSlotSize
+	// The ABI has one version counter per symbol, not a single u64 header.
+	if numSymbols != NumSymbols {
+		return nil, fmt.Errorf("depth ABI requires %d symbols, got %d", NumSymbols, numSymbols)
+	}
+	expectedSize := int(unsafe.Sizeof(ShmDepthState{}))
 
 	file, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
@@ -99,6 +103,9 @@ func (w *DepthWriter) WriteDepth(
 	timestampNs uint64,
 	bids, asks [DepthLevels]PriceLevel,
 ) {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges || timestampNs == 0 {
+		return
+	}
 	slot := &w.data.DepthMatrix[symbolID][exchangeID]
 
 	// Seqlock write protocol: odd -> write -> even

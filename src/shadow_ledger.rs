@@ -86,6 +86,7 @@ pub struct ShadowLedger {
 
     /// Last event sequence number processed
     pub last_sequence: u64,
+    has_processed_event: bool,
 
     /// Last update timestamp
     pub last_update: Instant,
@@ -113,6 +114,7 @@ impl Clone for ShadowLedger {
             realized_pnl: self.realized_pnl,
             active_orders: self.active_orders.clone(),
             last_sequence: self.last_sequence,
+            has_processed_event: self.has_processed_event,
             last_update: self.last_update,
         }
     }
@@ -126,6 +128,7 @@ impl Default for ShadowLedger {
             realized_pnl: 0.0,
             active_orders: HashMap::new(),
             last_sequence: 0,
+            has_processed_event: false,
             last_update: Instant::now(),
         }
     }
@@ -152,6 +155,10 @@ impl ShadowLedger {
 
     /// Add to in_flight position (optimistic accounting) - LOCK-FREE
     pub fn add_in_flight(&self, delta: f64) {
+        if !delta.is_finite() || delta.abs() * POS_SCALE >= i64::MAX as f64 {
+            tracing::error!("Ignoring invalid in-flight position delta");
+            return;
+        }
         let delta_scaled = (delta * POS_SCALE) as i64;
         self.in_flight_pos.fetch_add(delta_scaled, Ordering::AcqRel);
         tracing::debug!(
@@ -206,21 +213,40 @@ impl ShadowLedger {
             event.fill_size
         );
 
-        // Detect out-of-order or duplicate events
-        if event.sequence <= self.last_sequence && self.last_sequence > 0 {
+        if event.event_type().is_none() {
+            return Err(TradingError::InvalidEventType(event.event_type));
+        }
+        if event.is_ask > 1
+            || !event.remaining_size.is_finite()
+            || event.remaining_size < 0.0
+            || (event.event_type() == Some(EventType::OrderFilled)
+                && (!event.fill_size.is_finite()
+                    || event.fill_size <= 0.0
+                    || event.fill_size * POS_SCALE >= i64::MAX as f64
+                    || !event.fill_price.is_finite()
+                    || event.fill_price <= 0.0
+                    || !event.fee_paid.is_finite()
+                    || !(event.fill_price * event.fill_size).is_finite()))
+        {
+            return Err(TradingError::Serialization(
+                "invalid private event numeric payload".to_owned(),
+            ));
+        }
+        // Sequence zero is a valid first event, not an uninitialized sentinel.
+        if event.sequence <= self.last_sequence && self.has_processed_event {
             tracing::warn!(
                 "Out-of-order event: got seq={} but last_sequence={}",
                 event.sequence,
                 self.last_sequence
             );
             return Err(TradingError::OutOfOrderEvent {
-                expected: self.last_sequence + 1,
+                expected: self.last_sequence.saturating_add(1),
                 actual: event.sequence,
             });
         }
 
         // Detect gaps
-        if event.sequence > self.last_sequence + 1 && self.last_sequence > 0 {
+        if self.has_processed_event && event.sequence > self.last_sequence.saturating_add(1) {
             let gap_size = event.sequence - self.last_sequence - 1;
             tracing::error!(
                 "Event gap detected: expected seq={} got seq={} (gap={})",
@@ -232,6 +258,7 @@ impl ShadowLedger {
         }
 
         self.last_sequence = event.sequence;
+        self.has_processed_event = true;
         self.last_update = Instant::now();
 
         match event.event_type() {
@@ -460,6 +487,11 @@ impl ShadowLedger {
     /// Call periodically to correct drift from missed events.
     /// Returns the correction delta applied.
     pub fn force_sync_position(&self, authoritative_pos: f64) -> f64 {
+        if !authoritative_pos.is_finite() || authoritative_pos.abs() * POS_SCALE >= i64::MAX as f64
+        {
+            tracing::error!("Ignoring invalid authoritative position");
+            return 0.0;
+        }
         let current = self.real_pos_f64();
         let delta = authoritative_pos - current;
         if delta.abs() > 1e-8 {
@@ -540,7 +572,6 @@ impl Default for ShadowLedgerManager {
         Self::new()
     }
 }
-
 
 #[cfg(test)]
 mod tests;
