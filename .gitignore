@@ -3,6 +3,7 @@
 **/*.rs.bk
 feeder/feeder
 feeder/feeder-app
+feeder/perp-capture
 feeder/lighter_feeder
 feeder/simple_mm
 feeder/market_maker
@@ -24,6 +25,7 @@ logs/
 # Runtime
 *.pid
 pids/
+recordings/
 
 # OS
 .DS_Store

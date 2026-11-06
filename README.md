@@ -3,7 +3,7 @@
 
 > 2026-11-07 engineering audit: [findings, offline verification and measured performance](docs/AUDIT_2026_11.md). Run `make test`, `make check`, and `make build` before deployment. Lighter signing remains pinned to Linux x86-64; other platforms support offline verification.
 
-> [Crypto and equity perpetual strategies with paper replay](docs/PERP_RELATIVE_VALUE.md) · [Cross-venue platform support](docs/CROSS_VENUE.md).
+> [Crypto and equity perpetual strategies with paper replay](docs/PERP_RELATIVE_VALUE.md) · [Cross-venue platform support](docs/CROSS_VENUE.md) · [Public market recording](docs/PERP_RECORDING.md).
 
 Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
 

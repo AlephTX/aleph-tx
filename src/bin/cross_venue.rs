@@ -1,5 +1,6 @@
 //! Offline candidate and order-event replay. Network subcommands only read public data.
 use aleph_tx::{
+    capture::{CaptureConfig, compile as compile_capture},
     exchanges::{arcus, hyperliquid, variational},
     hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
     strategy::cross_venue::{
@@ -15,8 +16,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::{
     collections::HashSet,
-    fs::File,
-    io::{BufRead, BufReader, Read},
+    fs::{self, File},
+    io::{BufRead, BufReader, BufWriter, Read},
+    path::Path,
 };
 
 #[derive(Deserialize)]
@@ -204,6 +206,34 @@ fn print(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn capture_to_replay(
+    config: &str,
+    input: &str,
+    output: &str,
+    registry: &VenueRegistry,
+) -> Result<()> {
+    let config: CaptureConfig = read_replay(config)?;
+    let input = BufReader::new(File::open(input)?);
+    let output = Path::new(output);
+    ensure!(
+        output.extension().is_some_and(|suffix| suffix == "ndjson"),
+        "output must have the .ndjson extension"
+    );
+    let temporary = output.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
+    let result: Result<_> = (|| {
+        let file = File::create_new(&temporary)?;
+        let coverage = compile_capture(&config, input, BufWriter::new(&file), registry)?;
+        file.sync_all()?;
+        // Publish a complete replay and never overwrite an earlier dataset.
+        fs::hard_link(&temporary, output).context("publish replay without overwriting")?;
+        Ok(coverage)
+    })();
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    print(&result?)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -242,13 +272,16 @@ async fn main() -> Result<()> {
             };
             print(&report)
         }
+        [command, config, input, output] if command == "perp-compile" => {
+            capture_to_replay(config, input, output, &registry)
+        }
         [command, venue, market] if command == "bbo" => match venue.as_str() {
             "arcus" => print(
                 &arcus::ArcusInfo::new(arcus::Network::Mainnet)?
                     .bbo(market)
                     .await?,
             ),
-            "hyperliquid" | "entropy" => {
+            "hyperliquid" | "entropy" | "trade_xyz" => {
                 let prefix = registry
                     .get(venue)?
                     .hyperliquid_dex
@@ -312,7 +345,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | markets VENUE | bbo VENUE MARKET"
+            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT | markets VENUE | bbo VENUE MARKET"
         ),
     }
 }

@@ -74,6 +74,7 @@ build-rust:
 build-feeder:
 	@echo "$(BLUE)🔨 Building Go feeder...$(NC)"
 	@cd feeder && go build -o feeder-app
+	@cd feeder && go build -o perp-capture ./cmd/perp-capture
 	@echo "$(GREEN)✅ Feeder binary ready$(NC)"
 
 clean-shm:

@@ -54,6 +54,9 @@ adapter before onboarding.
 
 ## Replay
 
+The [public recording workflow](PERP_RECORDING.md) creates this input format
+from venue data and reports timestamp and reference coverage.
+
 ```sh
 make build
 target/release/cross_venue perp-replay examples/crypto_funding_paper.json

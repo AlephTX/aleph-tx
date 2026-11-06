@@ -1,0 +1,93 @@
+{
+  "pair": {
+    "asset_class": "crypto",
+    "strategy": "basis_reversion",
+    "legs": [
+      {
+        "venue": "lighter",
+        "market": "ETH",
+        "underlying_id": "ETH",
+        "payoff_id": "RESEARCH-ASSUMPTION:ETH",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "base_per_contract": "1",
+        "tick": "0.01",
+        "lot": "0.0001",
+        "min_contracts": "0.002",
+        "min_notional": "10",
+        "taker_fee_bps": "4",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      },
+      {
+        "venue": "hyperliquid",
+        "market": "ETH",
+        "underlying_id": "ETH",
+        "payoff_id": "RESEARCH-ASSUMPTION:ETH",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "base_per_contract": "1",
+        "tick": "0.1",
+        "lot": "0.0001",
+        "min_contracts": "0.0001",
+        "min_notional": "10",
+        "taker_fee_bps": "5",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      }
+    ],
+    "planner": {
+      "max_quote_age_ms": 2200,
+      "max_quote_skew_ms": 750,
+      "max_funding_age_ms": 8000,
+      "funding_horizon_ms": 25000,
+      "max_leg_notional_usd": 150,
+      "max_unhedged_notional_usd": 100,
+      "max_base_quantity": 1.0,
+      "depth_fraction": 0.2,
+      "min_net_edge_bps": 2.0,
+      "exit_basis_reserve_bps": 5.0
+    },
+    "basis": {
+      "min_samples": 12,
+      "min_sample_ms": 200,
+      "max_sample_gap_ms": 5000,
+      "half_life_ms": 15000,
+      "volatility_floor_bps": 1.5,
+      "entry_z": 2.5,
+      "exit_z": 0.5,
+      "stop_z": 8.0,
+      "stress_sigma": 1.0,
+      "reversion_fraction": 0.5
+    },
+    "execution_window_ms": 1800,
+    "oracle_max_age_ms": 7000,
+    "max_oracle_deviation_bps": 50.0,
+    "equity_close_buffer_ms": 0,
+    "max_depth_impact_bps": 15.0,
+    "limit_buffer_bps": 1.0
+  },
+  "one_way_latency_ms": 250,
+  "sample_ms": 250,
+  "paper_entries": false,
+  "legs": [
+    {
+      "lighter_market_id": 0,
+      "available_notional": "150",
+      "external_oracle": true
+    },
+    {
+      "available_notional": "150",
+      "external_oracle": true,
+      "accept_receipt_time_for_oracle": true
+    }
+  ],
+  "reference": {
+    "kind": "coinbase",
+    "product": "ETH-USD"
+  }
+}

@@ -45,6 +45,13 @@ impl Default for VenueRegistry {
                     Some("io"),
                     RestClient,
                 ),
+                (
+                    "trade_xyz",
+                    "hyperliquid:xyz",
+                    "hyperliquid",
+                    Some("xyz"),
+                    RestClient,
+                ),
                 ("arcus", "arcus", "arcus", None, SignedRequests),
                 ("variational", "variational", "variational", None, ReadOnly),
             ]

@@ -176,6 +176,26 @@ fn duplicate_or_regressed_books_do_not_train_a_pair() {
 }
 
 #[test]
+fn short_book_skew_rejects_the_frame_without_starving_the_estimator() {
+    let scenario = equity();
+    let mut engine = RelativeValue::new(scenario.pair.clone(), &VenueRegistry::default()).unwrap();
+    for frame in &scenario.frames[..3] {
+        assert!(matches!(
+            engine.observe(frame).unwrap(),
+            Err(Rejection::Warmup)
+        ));
+    }
+    let mut skewed = scenario.frames[3].clone();
+    skewed.legs[0].book.timestamp_ms -= 60;
+    assert!(matches!(
+        engine.observe(&skewed).unwrap(),
+        Err(Rejection::Book)
+    ));
+    let plan = engine.observe(&scenario.frames[4]).unwrap().unwrap();
+    assert_eq!(plan.basis.prior_samples, 3);
+}
+
+#[test]
 fn paper_does_not_fill_using_a_book_generated_before_arrival() {
     let mut scenario = crypto();
     scenario.frames.truncate(5);

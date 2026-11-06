@@ -21,7 +21,7 @@ const MAX_FUNDING_POINTS: usize = 1024;
 const MIN_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 12);
 const MAX_MULTIPLIER: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetClass {
     Crypto,
@@ -35,7 +35,7 @@ pub enum Strategy {
     BasisReversion,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
     pub asset_class: AssetClass,
@@ -60,7 +60,7 @@ pub struct PairConfig {
     pub capital_charge_bps_per_day: f64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketTerms {
     pub venue: String,
@@ -106,7 +106,7 @@ impl MarketTerms {
 
 /// A verified fixed UTC cadence. Equity markets with irregular intraday
 /// funding schedules require a separate adapter/calendar before use here.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingSchedule {
     pub interval_ms: u64,
@@ -134,7 +134,7 @@ impl FundingSchedule {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BasisConfig {
     pub min_samples: u32,
@@ -167,7 +167,7 @@ impl Default for BasisConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OracleMode {
     LiveExternal,
@@ -175,7 +175,7 @@ pub enum OracleMode {
     LastClose,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Oracle {
     #[serde(with = "rust_decimal::serde::str")]
@@ -184,7 +184,7 @@ pub struct Oracle {
     pub mode: OracleMode,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EquitySession {
     pub observed_at_ms: u64,
@@ -195,7 +195,7 @@ pub struct EquitySession {
     pub halted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Level {
     #[serde(with = "rust_decimal::serde::str")]
@@ -205,7 +205,7 @@ pub struct Level {
     pub contracts: Decimal,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriceBounds {
     #[serde(with = "rust_decimal::serde::str")]
@@ -214,7 +214,7 @@ pub struct PriceBounds {
     pub upper: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Book {
     pub market: String,
@@ -227,7 +227,7 @@ pub struct Book {
     pub available_notional: Decimal,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingPoint {
     pub at_ms: u64,
@@ -240,14 +240,14 @@ pub struct FundingPoint {
     pub oracle_price: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingForecast {
     pub observed_at_ms: u64,
     pub payments: Vec<FundingPoint>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FundingSettlement {
     pub at_ms: u64,
@@ -257,7 +257,7 @@ pub struct FundingSettlement {
     pub oracle_price: Decimal,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarketFrame {
     pub book: Book,
@@ -267,7 +267,7 @@ pub struct MarketFrame {
     pub settled: Vec<FundingSettlement>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frame {
     /// Local availability time. Source observations must be at or before it.
@@ -797,6 +797,10 @@ impl RelativeValue {
             "non-increasing replay availability time"
         );
         let times = self.book_times(frame);
+        let regressed = times
+            .iter()
+            .enumerate()
+            .any(|(i, time)| *time > 0 && *time < self.last_book_ms[i]);
         // Track each venue even if the other venue is stale. The simulator can
         // fill one leg independently and must never accept a regressed book.
         for (i, time) in times.into_iter().enumerate() {
@@ -806,10 +810,9 @@ impl RelativeValue {
         }
         self.last_frame_ms = frame.now_ms;
         let result = self.observe_inner(frame, times);
-        if matches!(
-            result,
-            Err(Rejection::Book | Rejection::Session | Rejection::Oracle)
-        ) {
+        // A short gap between venue publications is common. The next usable
+        // sample enforces max_sample_gap_ms without training on rejected data.
+        if regressed || matches!(result, Err(Rejection::Session | Rejection::Oracle)) {
             self.basis = BasisModel::default();
         }
         Ok(result)
