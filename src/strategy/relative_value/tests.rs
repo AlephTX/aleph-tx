@@ -334,3 +334,43 @@ fn benchmark_relative_value_l2_plan() {
         start.elapsed().as_nanos() as f64 / f64::from(trials)
     );
 }
+
+#[test]
+fn witnessed_funding_is_booked_as_a_range_and_requires_boundary_guard() {
+    let mut scenario = crypto();
+    let frame = &mut scenario.frames[7];
+    let payment = frame.legs[1].settled.pop().unwrap();
+    frame.legs[1]
+        .witnessed_settlements
+        .push(WitnessedSettlement {
+            at_ms: payment.at_ms,
+            exchange_time_ms: payment.at_ms + 28,
+            rate: payment.rate,
+            long_cash_low_per_base: d("-2.801"),
+            long_cash_high_per_base: d("-2.799"),
+        });
+    let registry = VenueRegistry::default();
+    assert!(run_paper(&scenario, &registry).is_err());
+    scenario.funding_guard_ms = 100;
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(report.witnessed_funding_payments, 1);
+    assert_eq!(report.funding, d("0.10316"));
+    assert_eq!(report.funding_upper_bound, d("0.10324"));
+    assert_eq!(report.realized_pnl, d("0.02316"));
+    assert_eq!(report.realized_pnl_upper_bound, d("0.02324"));
+    assert_eq!(report.trades[0].realized_pnl_upper_bound, d("0.02324"));
+
+    // An exact-price payment and a witness cannot credit the same slot twice.
+    scenario.frames[7].legs[1].settled.push(payment);
+    assert!(run_paper(&scenario, &registry).is_err());
+}
+
+#[test]
+fn entry_does_not_start_if_the_paired_execution_window_straddles_a_guard() {
+    let mut scenario = crypto();
+    scenario.funding_guard_ms = 1_500;
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert!(report.funding_guard_skipped_entries > 0);
+    assert_eq!(report.ioc_filled, 0);
+    assert_eq!(report.funding, Decimal::ZERO);
+}

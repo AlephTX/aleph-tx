@@ -70,7 +70,8 @@ Hyperliquid's context funding field to build at most one forecast for the next
 configured payment. Once that payment time passes, a stale estimate cannot
 become the next forecast. Archive settled rates separately. Supply
 `settlements` as two arrays of reviewed payment records with normalized
-per-interval rates, schedule times and actual settlement oracle prices.
+per-interval rates, schedule times and the actual notional price used for each
+payment in `oracle_price`.
 The replay fails on missing cashflows for held legs. The public Hyperliquid
 funding history supplies rates and timestamps, and settlement prices require
 additional data. [Lighter SDK](https://github.com/elliottech/lighter-python),
@@ -103,3 +104,69 @@ The recordings did not span a settlement for a held position. The public
 stock books were available, while the independent equity price check returned
 HTTP 401 and company action coverage was unavailable. The RWA runs exercised
 coverage checks only. [Pyth price endpoint](https://docs.pyth.network/api-reference/hermes/latest-price-updates)
+
+## Audited funding cashflows
+
+Public payment evidence is available for Lighter and Hyperliquid core USDC
+perpetuals. A proof archives the venue responses, contract and witness policy,
+the result for each requested hourly slot, and the accepted unit cashflow
+intervals. The audit command reconstructs those intervals from the archive.
+
+```sh
+slot=1793991600000
+target/release/cross_venue perp-funding-proof lighter \
+  examples/eth_lighter_funding_evidence.json "$slot" "$slot" > recordings/llp-proof.json
+target/release/cross_venue perp-funding-proof hyperliquid \
+  examples/eth_funding_evidence.json "$slot" "$slot" > recordings/hlp-proof.json
+target/release/cross_venue perp-funding-audit lighter recordings/llp-proof.json
+target/release/cross_venue perp-funding-audit hyperliquid recordings/hlp-proof.json
+target/release/cross_venue perp-compile examples/eth_capture.json \
+  recordings/eth-raw.ndjson recordings/eth-settlement-replay.ndjson \
+  recordings/llp-proof.json recordings/hlp-proof.json
+target/release/cross_venue perp-replay recordings/eth-settlement-replay.ndjson
+```
+
+Use nominal UTC payment slots in milliseconds. A request can cover one slot
+or an inclusive range of up to 24 hours. Select public witnesses with verified
+market positions. Lighter checks the market's reported value and percentage
+rate against signed, undiscounted position receipts from public pools. Its
+funding notional uses the mark price. Hyperliquid matches the published
+market payment time and rate to at least two distinct ledger witnesses and
+uses the intersection of their cash per base unit intervals. Its funding
+notional uses the spot oracle. The example's receipt tolerances are explicit
+model inputs at the displayed quote precision. When a Hyperliquid ledger
+response reaches 500 rows, the collector subdivides its time window and
+retries within its public request budget.
+[Lighter funding prefix sum](https://assets.lighter.xyz/whitepaper.pdf),
+[Lighter position funding schema](https://github.com/elliottech/lighter-python/blob/main/docs/PositionFunding.md),
+[Hyperliquid funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding)
+
+An attached archive is reconciled again and matched to the replay's venue,
+native market, base units, settlement currency and cadence. Pass a hyphen
+in place of one proof when only the other venue is available. Only events
+inside the captured replay are emitted. The replay requires evidence for
+every funding slot crossed by a held leg and rejects duplicate exact-price
+and witnessed records for the same slot.
+
+Witness cash bounds are expressed for one long base unit. A short reverses
+the sign and the order of the bounds. The report's funding and realized PnL
+use the lower cash outcome and include separate upper bounds. The
+`funding_guard_ms` interval reserves time on either side of the nominal slot.
+Paper fills pause in that window and new entries require an execution
+window outside it. This separates nominal replay booking time from the
+exchange event time and the second precision of Lighter's public receipts.
+
+Funding forecasts still use only observations available at the signal.
+Lighter's context supplies its last settled epoch and mark price. Repeated
+context messages from a completed epoch cannot become next-slot forecasts.
+The witnessed payment archive contributes to cash accounting during replay.
+
+The 2026-11-06 ETH capture crossed the 20:00 UTC payment in 33 minutes of
+public data. Both clock policies emitted one audited settlement per leg in
+the first frame after the slot. The strict replay joined 443 of 6,952 frames,
+and the replay with an assumed 50 ms clock bound joined 2,094. Both paper
+books remained flat under the configured fee and edge policy. The conditional
+funding for one ETH long on Lighter and short on Hyperliquid was
+0.00111796–0.00111894 USDC before trading costs. The local manifest at
+`recordings/2026-11-06-settlement/manifest.json` indexes the evidence,
+parameters, coverage and replay reports by SHA-256.

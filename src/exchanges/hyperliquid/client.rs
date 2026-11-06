@@ -28,7 +28,7 @@ impl HyperliquidInfo {
         })
     }
 
-    async fn info<T: DeserializeOwned>(&self, query: serde_json::Value) -> Result<T> {
+    pub(crate) async fn info<T: DeserializeOwned>(&self, query: serde_json::Value) -> Result<T> {
         Ok(self
             .client
             .post(format!("{}/info", self.network.base_url()))

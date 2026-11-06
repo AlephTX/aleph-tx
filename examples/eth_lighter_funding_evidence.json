@@ -1,0 +1,8 @@
+{
+  "market_id": 0,
+  "symbol": "ETH",
+  "funding_guard_ms": 1000,
+  "cash_tolerance_quote": "0.000001",
+  "market_value_tolerance_per_base": "0.00000001",
+  "public_pool_indices": [281474976710654]
+}

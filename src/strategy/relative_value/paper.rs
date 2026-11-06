@@ -11,6 +11,8 @@ const MAX_FRAMES: usize = 1_000_000;
 pub struct PaperScenario {
     pub pair: PairConfig,
     pub one_way_latency_ms: u64,
+    #[serde(default)]
+    pub funding_guard_ms: u64,
     /// Earlier frames update the estimator without placing simulated orders.
     pub trade_from_ms: Option<u64>,
     pub frames: Vec<Frame>,
@@ -41,7 +43,11 @@ pub struct PaperTrade {
     #[serde(with = "rust_decimal::serde::str")]
     pub funding: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
+    pub funding_upper_bound: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     pub realized_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub realized_pnl_upper_bound: Decimal,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -56,6 +62,10 @@ pub struct PaperReport {
     pub ioc_partial: usize,
     pub ioc_unfilled: usize,
     pub ioc_expired_without_book: usize,
+    pub funding_guard_ms: u64,
+    pub funding_guard_blocked_fills: usize,
+    pub funding_guard_skipped_entries: usize,
+    pub witnessed_funding_payments: usize,
     pub trades: Vec<PaperTrade>,
     #[serde(with = "rust_decimal::serde::str")]
     pub gross_turnover: Decimal,
@@ -64,7 +74,11 @@ pub struct PaperReport {
     #[serde(with = "rust_decimal::serde::str")]
     pub funding: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
+    pub funding_upper_bound: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     pub realized_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub realized_pnl_upper_bound: Decimal,
     /// Whole replay PnL after an estimated immediate unwind of remaining legs.
     /// Missing if the final book cannot support a liquidation mark.
     #[serde(with = "rust_decimal::serde::str_option")]
@@ -97,6 +111,8 @@ struct Ledger {
     cash: Decimal,
     fees: Decimal,
     funding: Decimal,
+    funding_upper: Decimal,
+    witnessed_funding_payments: usize,
     turnover: Decimal,
 }
 
@@ -107,6 +123,8 @@ impl Default for Ledger {
             cash: Decimal::ZERO,
             fees: Decimal::ZERO,
             funding: Decimal::ZERO,
+            funding_upper: Decimal::ZERO,
+            witnessed_funding_payments: 0,
             turnover: Decimal::ZERO,
         }
     }
@@ -130,47 +148,94 @@ impl Ledger {
         self.positions == [Decimal::ZERO; 2]
     }
 
-    fn book_funding(&mut self, frame: &Frame, prev: u64, terms: &[MarketTerms; 2]) -> Result<()> {
+    fn book_funding(
+        &mut self,
+        frame: &Frame,
+        prev: u64,
+        terms: &[MarketTerms; 2],
+        guard_ms: u64,
+    ) -> Result<()> {
         for (i, leg) in frame.legs.iter().enumerate() {
             let schedule = terms[i].funding;
-            let events = &leg.settled;
+            let count = leg.settled.len() + leg.witnessed_settlements.len();
             ensure!(
-                events.len() <= MAX_FUNDING_POINTS,
-                "too many realized funding payments in a frame"
+                count <= MAX_FUNDING_POINTS
+                    && leg.settled.windows(2).all(|w| w[0].at_ms < w[1].at_ms)
+                    && leg
+                        .witnessed_settlements
+                        .windows(2)
+                        .all(|w| w[0].at_ms < w[1].at_ms),
+                "invalid funding event count or order"
             );
+            let mut events: Vec<_> = leg
+                .settled
+                .iter()
+                .map(FundingEvent::Price)
+                .chain(leg.witnessed_settlements.iter().map(FundingEvent::Witness))
+                .collect();
+            events.sort_unstable_by_key(FundingEvent::at_ms);
             let mut last = prev;
-            for event in events {
+            for event in &events {
                 ensure!(
-                    event.at_ms > last
-                        && event.at_ms <= frame.now_ms
-                        && schedule.matches(event.at_ms)
-                        && event.rate.abs() <= Decimal::ONE
-                        && price(event.oracle_price),
+                    event.at_ms() > last
+                        && event.at_ms() <= frame.now_ms
+                        && event.valid(schedule, guard_ms),
                     "invalid realized funding event for {}",
                     terms[i].venue
                 );
-                last = event.at_ms;
+                last = event.at_ms();
             }
             if self.positions[i] == Decimal::ZERO {
                 continue;
             }
-            let (_, count) = schedule
+            let (_, expected) = schedule
                 .window(prev, frame.now_ms)
                 .context("funding schedule overflow")?;
             ensure!(
-                events.len() as u64 == count,
+                count as u64 == expected,
                 "missing realized funding on {} between {prev} and {}",
                 terms[i].venue,
                 frame.now_ms
             );
             for event in events {
                 // Events at frame time settle before any simulated fills at that time.
-                let cashflow = -self.positions[i] * event.oracle_price * event.rate;
-                self.cash += cashflow;
-                self.funding += cashflow;
+                let (low, high) = match event {
+                    FundingEvent::Price(event) => {
+                        let cash = -self.positions[i] * event.oracle_price * event.rate;
+                        (cash, cash)
+                    }
+                    FundingEvent::Witness(event) => {
+                        self.witnessed_funding_payments += 1;
+                        event.cash_bounds(self.positions[i])
+                    }
+                };
+                self.cash += low;
+                self.funding += low;
+                self.funding_upper += high;
             }
         }
         Ok(())
+    }
+}
+
+enum FundingEvent<'a> {
+    Price(&'a FundingSettlement),
+    Witness(&'a WitnessedSettlement),
+}
+
+impl FundingEvent<'_> {
+    fn at_ms(&self) -> u64 {
+        match self {
+            Self::Price(event) => event.at_ms,
+            Self::Witness(event) => event.at_ms,
+        }
+    }
+
+    fn valid(&self, schedule: FundingSchedule, guard_ms: u64) -> bool {
+        match self {
+            Self::Price(event) => event.valid(schedule),
+            Self::Witness(event) => event.valid(schedule, guard_ms),
+        }
     }
 }
 
@@ -219,6 +284,7 @@ struct Active {
     baseline_cash: Decimal,
     baseline_fees: Decimal,
     baseline_funding: Decimal,
+    baseline_funding_upper: Decimal,
     session_open: Option<u64>,
     opened_at: u64,
     base_opened: Decimal,
@@ -270,6 +336,7 @@ fn sweep(
 struct Runner {
     planner: RelativeValue,
     latency: u64,
+    funding_guard_ms: u64,
     trade_from_ms: Option<u64>,
     active: Option<Active>,
     ledger: Ledger,
@@ -306,6 +373,16 @@ impl Runner {
                 || !self.planner.usable_book(frame, i)
                 || self.planner.session_end(frame).is_err()
             {
+                execution.pending = Some(Pending { order, ..pending });
+                return Ok(Advance::Working);
+            } else if self
+                .planner
+                .config
+                .legs
+                .iter()
+                .any(|leg| leg.funding.near_payment(now, self.funding_guard_ms))
+            {
+                self.report.funding_guard_blocked_fills += 1;
                 execution.pending = Some(Pending { order, ..pending });
                 return Ok(Advance::Working);
             } else if !book.in_bounds(order.limit_price) {
@@ -519,7 +596,11 @@ impl Runner {
                 Advance::Complete => {
                     ensure!(self.ledger.is_flat(), "completed exit left exposure");
                     let pnl = self.ledger.cash - active.baseline_cash;
+                    let funding = self.ledger.funding - active.baseline_funding;
+                    let funding_upper = self.ledger.funding_upper - active.baseline_funding_upper;
+                    let pnl_upper = pnl + (funding_upper - funding);
                     self.report.realized_pnl += pnl;
+                    self.report.realized_pnl_upper_bound += pnl_upper;
                     self.report.trades.push(PaperTrade {
                         plan: active.plan.clone(),
                         opened_at_ms: active.opened_at,
@@ -527,8 +608,10 @@ impl Runner {
                         base_opened: active.base_opened,
                         exit_reason: active.exit_reason.context("missing exit trigger")?,
                         fees: self.ledger.fees - active.baseline_fees,
-                        funding: self.ledger.funding - active.baseline_funding,
+                        funding,
+                        funding_upper_bound: funding_upper,
                         realized_pnl: pnl,
+                        realized_pnl_upper_bound: pnl_upper,
                     });
                     return Ok(true);
                 }
@@ -547,6 +630,22 @@ impl Runner {
             *self.report.rejected.entry(Rejection::Book).or_default() += 1;
             return Ok(());
         }
+        if self.funding_guard_ms > 0
+            && self.planner.config.legs.iter().any(|leg| {
+                leg.funding
+                    .near_payment(frame.now_ms, self.funding_guard_ms)
+                    || leg
+                        .funding
+                        .window(
+                            frame.now_ms,
+                            plan.hedge.deadline_ms.saturating_add(self.funding_guard_ms),
+                        )
+                        .is_none_or(|(_, count)| count > 0)
+            })
+        {
+            self.report.funding_guard_skipped_entries += 1;
+            return Ok(());
+        }
         let mut exec = Execution::new(&plan.hedge)?;
         self.advance(&mut exec, frame, true)?;
         self.report.entries_submitted += 1;
@@ -556,6 +655,7 @@ impl Runner {
             baseline_cash: self.ledger.cash,
             baseline_fees: self.ledger.fees,
             baseline_funding: self.ledger.funding,
+            baseline_funding_upper: self.ledger.funding_upper,
             session_open: frame.equity_session.map(|s| s.opens_at_ms),
             opened_at: 0,
             base_opened: Decimal::ZERO,
@@ -655,8 +755,12 @@ impl Runner {
             self.report.frames += 1;
             ensure!(self.report.frames <= MAX_FRAMES, "too many paper frames");
             let sample = self.planner.sample(frame)?;
-            self.ledger
-                .book_funding(frame, previous, &self.planner.config.legs)?;
+            self.ledger.book_funding(
+                frame,
+                previous,
+                &self.planner.config.legs,
+                self.funding_guard_ms,
+            )?;
             previous = frame.now_ms;
             if self.trade_from_ms.is_some_and(|start| frame.now_ms < start) {
                 self.report.training_frames += 1;
@@ -682,6 +786,8 @@ impl Runner {
         self.report.gross_turnover = self.ledger.turnover;
         self.report.fees = self.ledger.fees;
         self.report.funding = self.ledger.funding;
+        self.report.funding_upper_bound = self.ledger.funding_upper;
+        self.report.witnessed_funding_payments = self.ledger.witnessed_funding_payments;
         if let Some(active) = self.active {
             self.report.open_phase = Some(active.phase.label());
             self.report.active_plan = Some(active.plan);
@@ -695,6 +801,7 @@ pub fn run_paper(scenario: &PaperScenario, registry: &VenueRegistry) -> Result<P
         &scenario.pair,
         scenario.one_way_latency_ms,
         scenario.trade_from_ms,
+        scenario.funding_guard_ms,
         scenario.frames.iter().map(Ok),
         registry,
     )
@@ -706,6 +813,7 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
     pair: &PairConfig,
     one_way_latency_ms: u64,
     trade_from_ms: Option<u64>,
+    funding_guard_ms: u64,
     frames: impl IntoIterator<Item = Result<T>>,
     registry: &VenueRegistry,
 ) -> Result<PaperReport> {
@@ -713,13 +821,18 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
         one_way_latency_ms > 0 && one_way_latency_ms.saturating_mul(2) < pair.execution_window_ms,
         "execution window must exceed the sequential two-leg latency"
     );
+    validate_funding_guard(funding_guard_ms, &pair.legs)?;
     Runner {
         planner: RelativeValue::new(pair.clone(), registry)?,
         latency: one_way_latency_ms,
+        funding_guard_ms,
         trade_from_ms,
         active: None,
         ledger: Ledger::default(),
-        report: PaperReport::default(),
+        report: PaperReport {
+            funding_guard_ms,
+            ..Default::default()
+        },
         peak_pnl: Decimal::ZERO,
         unhedged_since: None,
         consumed: [None; 2],

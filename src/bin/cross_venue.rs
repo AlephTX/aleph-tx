@@ -2,6 +2,7 @@
 use aleph_tx::{
     capture::{CaptureConfig, compile as compile_capture},
     exchanges::{arcus, hyperliquid, variational},
+    funding_evidence,
     hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
     strategy::cross_venue::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
@@ -167,6 +168,8 @@ fn stream_paper(mut reader: impl BufRead, registry: &VenueRegistry) -> Result<Pa
         pair: PairConfig,
         one_way_latency_ms: u64,
         trade_from_ms: Option<u64>,
+        #[serde(default)]
+        funding_guard_ms: u64,
     }
     let mut bytes = Vec::new();
     let header: Header =
@@ -182,6 +185,7 @@ fn stream_paper(mut reader: impl BufRead, registry: &VenueRegistry) -> Result<Pa
         &header.pair,
         header.one_way_latency_ms,
         header.trade_from_ms,
+        header.funding_guard_ms,
         frames,
         registry,
     )
@@ -206,13 +210,89 @@ fn print(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct ArchivedProof<P, R> {
+    policy: P,
+    raw: R,
+}
+
+type HyperliquidProof = ArchivedProof<funding_evidence::Policy, funding_evidence::RawEvidence>;
+type LighterProof =
+    ArchivedProof<funding_evidence::lighter::Policy, funding_evidence::lighter::RawEvidence>;
+
+fn attach_funding_proofs(
+    config: &mut CaptureConfig,
+    lighter: &str,
+    hyperliquid: &str,
+) -> Result<()> {
+    if lighter != "-" {
+        let archive: LighterProof = read_replay(lighter)?;
+        let i = config
+            .pair
+            .legs
+            .iter()
+            .position(|leg| leg.venue == "lighter")
+            .context("capture has no Lighter leg")?;
+        let leg = &config.pair.legs[i];
+        ensure!(
+            config.legs[i].lighter_market_id == Some(archive.policy.market_id)
+                && leg.market == archive.policy.symbol
+                && leg.funding.interval_ms == 3_600_000
+                && leg.funding.offset_ms == 0
+                && leg.base_per_contract == rust_decimal::Decimal::ONE
+                && leg.settlement == "USDC",
+            "Lighter proof does not match the replay contract or schedule"
+        );
+        ensure!(
+            config.witnessed_settlements[i].is_empty(),
+            "Lighter witnesses already configured"
+        );
+        let audit = funding_evidence::lighter::reconcile(&archive.policy, &archive.raw)?;
+        ensure!(
+            !audit.witnessed_settlements.is_empty(),
+            "no audited Lighter funding settlement to attach"
+        );
+        config.witnessed_settlements[i] = audit.witnessed_settlements;
+        config.funding_guard_ms = config.funding_guard_ms.max(archive.policy.funding_guard_ms);
+    }
+    if hyperliquid != "-" {
+        let archive: HyperliquidProof = read_replay(hyperliquid)?;
+        let i = config
+            .pair
+            .legs
+            .iter()
+            .position(|leg| leg.venue == "hyperliquid")
+            .context("capture has no Hyperliquid core leg")?;
+        let leg = &config.pair.legs[i];
+        ensure!(
+            leg.market == archive.policy.coin
+                && leg.funding.interval_ms == archive.policy.schedule.interval_ms
+                && leg.funding.offset_ms == archive.policy.schedule.offset_ms
+                && leg.base_per_contract == rust_decimal::Decimal::ONE
+                && leg.settlement == "USDC",
+            "Hyperliquid proof does not match the replay contract or schedule"
+        );
+        ensure!(
+            config.witnessed_settlements[i].is_empty(),
+            "Hyperliquid witnesses already configured"
+        );
+        let audit = funding_evidence::reconcile(&archive.policy, &archive.raw)?;
+        ensure!(
+            !audit.witnessed_settlements.is_empty(),
+            "no audited Hyperliquid funding settlement to attach"
+        );
+        config.witnessed_settlements[i] = audit.witnessed_settlements;
+        config.funding_guard_ms = config.funding_guard_ms.max(archive.policy.funding_guard_ms);
+    }
+    Ok(())
+}
+
 fn capture_to_replay(
-    config: &str,
+    config: &CaptureConfig,
     input: &str,
     output: &str,
     registry: &VenueRegistry,
 ) -> Result<()> {
-    let config: CaptureConfig = read_replay(config)?;
     let input = BufReader::new(File::open(input)?);
     let output = Path::new(output);
     ensure!(
@@ -222,7 +302,7 @@ fn capture_to_replay(
     let temporary = output.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
     let result: Result<_> = (|| {
         let file = File::create_new(&temporary)?;
-        let coverage = compile_capture(&config, input, BufWriter::new(&file), registry)?;
+        let coverage = compile_capture(config, input, BufWriter::new(&file), registry)?;
         file.sync_all()?;
         // Publish a complete replay and never overwrite an earlier dataset.
         fs::hard_link(&temporary, output).context("publish replay without overwriting")?;
@@ -273,8 +353,39 @@ async fn main() -> Result<()> {
             print(&report)
         }
         [command, config, input, output] if command == "perp-compile" => {
-            capture_to_replay(config, input, output, &registry)
+            capture_to_replay(&read_replay(config)?, input, output, &registry)
         }
+        [command, config, input, output, lighter, hyperliquid] if command == "perp-compile" => {
+            let mut config = read_replay(config)?;
+            attach_funding_proofs(&mut config, lighter, hyperliquid)?;
+            capture_to_replay(&config, input, output, &registry)
+        }
+        [command, venue, policy, first, last] if command == "perp-funding-proof" => {
+            let (first, last) = (first.parse()?, last.parse()?);
+            match venue.as_str() {
+                "lighter" => print(
+                    &funding_evidence::lighter::collect(&read_replay(policy)?, first, last).await?,
+                ),
+                "hyperliquid" => {
+                    print(&funding_evidence::collect(&read_replay(policy)?, first, last).await?)
+                }
+                _ => anyhow::bail!("funding proofs support lighter and hyperliquid"),
+            }
+        }
+        [command, venue, file] if command == "perp-funding-audit" => match venue.as_str() {
+            "lighter" => {
+                let archive: LighterProof = read_replay(file)?;
+                print(&funding_evidence::lighter::reconcile(
+                    &archive.policy,
+                    &archive.raw,
+                )?)
+            }
+            "hyperliquid" => {
+                let archive: HyperliquidProof = read_replay(file)?;
+                print(&funding_evidence::reconcile(&archive.policy, &archive.raw)?)
+            }
+            _ => anyhow::bail!("funding audits support lighter and hyperliquid"),
+        },
         [command, venue, market] if command == "bbo" => match venue.as_str() {
             "arcus" => print(
                 &arcus::ArcusInfo::new(arcus::Network::Mainnet)?
@@ -345,7 +456,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT | markets VENUE | bbo VENUE MARKET"
+            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET"
         ),
     }
 }

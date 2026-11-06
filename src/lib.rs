@@ -5,6 +5,7 @@ pub mod data_plane;
 pub mod error;
 pub mod exchange;
 pub mod exchanges;
+pub mod funding_evidence;
 pub mod hedging;
 pub mod order_tracker;
 pub mod shadow_ledger;

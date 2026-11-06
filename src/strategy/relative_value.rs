@@ -129,8 +129,13 @@ impl FundingSchedule {
         Some((first, 1 + (end - first) / self.interval_ms))
     }
 
-    fn matches(self, time: u64) -> bool {
+    pub(crate) fn matches(self, time: u64) -> bool {
         time % self.interval_ms == self.offset_ms
+    }
+
+    fn near_payment(self, time: u64, guard_ms: u64) -> bool {
+        let distance = (time % self.interval_ms).abs_diff(self.offset_ms);
+        guard_ms > 0 && distance.min(self.interval_ms - distance) <= guard_ms
     }
 }
 
@@ -237,6 +242,7 @@ pub struct FundingPoint {
     #[serde(with = "rust_decimal::serde::str")]
     pub uncertainty_bps: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
+    /// Funding notional price. This is the mark on venues that settle on mark.
     pub oracle_price: Decimal,
 }
 
@@ -254,7 +260,72 @@ pub struct FundingSettlement {
     #[serde(with = "rust_decimal::serde::str")]
     pub rate: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
+    /// Verified price actually used to value the position for this payment.
     pub oracle_price: Decimal,
+}
+
+impl FundingSettlement {
+    pub(crate) fn valid(&self, schedule: FundingSchedule) -> bool {
+        self.at_ms > 0
+            && schedule.matches(self.at_ms)
+            && self.rate.abs() <= Decimal::ONE
+            && price(self.oracle_price)
+    }
+}
+
+/// Cash per long base unit bounded by observed venue ledger entries and an
+/// explicit cash reporting tolerance. The short cashflow has opposite sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessedSettlement {
+    pub at_ms: u64,
+    pub exchange_time_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub rate: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub long_cash_low_per_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub long_cash_high_per_base: Decimal,
+}
+
+impl WitnessedSettlement {
+    pub(crate) fn valid(&self, schedule: FundingSchedule, guard_ms: u64) -> bool {
+        let low = self.long_cash_low_per_base;
+        let high = self.long_cash_high_per_base;
+        guard_ms > 0
+            && self.at_ms > 0
+            && schedule.matches(self.at_ms)
+            && self
+                .exchange_time_ms
+                .checked_sub(self.at_ms)
+                .is_some_and(|lag| lag <= guard_ms)
+            && self.rate.abs() <= Decimal::ONE
+            && low <= high
+            && bounded(low.abs())
+            && bounded(high.abs())
+            && match self.rate.cmp(&Decimal::ZERO) {
+                std::cmp::Ordering::Greater => high <= Decimal::ZERO && low < Decimal::ZERO,
+                std::cmp::Ordering::Less => low >= Decimal::ZERO && high > Decimal::ZERO,
+                std::cmp::Ordering::Equal => low.is_zero() && high.is_zero(),
+            }
+    }
+
+    fn cash_bounds(&self, position: Decimal) -> (Decimal, Decimal) {
+        let a = position * self.long_cash_low_per_base;
+        let b = position * self.long_cash_high_per_base;
+        (a.min(b), a.max(b))
+    }
+}
+
+pub(crate) fn validate_funding_guard(guard_ms: u64, legs: &[MarketTerms; 2]) -> Result<()> {
+    ensure!(
+        guard_ms <= 60_000
+            && legs
+                .iter()
+                .all(|leg| guard_ms <= leg.funding.interval_ms / 4),
+        "funding guard exceeds the allowable settlement window"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +336,8 @@ pub struct MarketFrame {
     pub forecast: Option<FundingForecast>,
     #[serde(default)]
     pub settled: Vec<FundingSettlement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnessed_settlements: Vec<WitnessedSettlement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

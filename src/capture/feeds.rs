@@ -20,6 +20,8 @@ pub(super) enum Change {
 pub(super) struct ContextTick {
     pub oracle: Oracle,
     pub raw_rate: Option<Decimal>,
+    pub funding_price: Option<Decimal>,
+    pub last_settled_ms: Option<u64>,
 }
 
 pub(super) struct LegFeed {
@@ -123,7 +125,9 @@ impl LegFeed {
                     market_id: u16,
                     symbol: String,
                     index_price: String,
+                    mark_price: Option<String>,
                     current_funding_rate: Option<String>,
+                    funding_timestamp: Option<u64>,
                 }
                 let value = Stats::deserialize(&payload["market_stats"])?;
                 ensure!(
@@ -145,6 +149,10 @@ impl LegFeed {
                         .as_deref()
                         .map(str::parse)
                         .transpose()?,
+                    value.mark_price.as_deref().map(str::parse).transpose()?,
+                    value
+                        .funding_timestamp
+                        .filter(|time| *time > 0 && *time <= raw_time),
                 )?;
                 Ok(Change::Other)
             }
@@ -199,7 +207,7 @@ impl LegFeed {
                 } else {
                     0
                 };
-                self.set_context(time, price, raw_rate)?;
+                self.set_context(time, price, raw_rate, Some(price), None)?;
                 Ok(Change::Other)
             }
             _ => Ok(Change::Other),
@@ -216,6 +224,8 @@ impl LegFeed {
         timestamp_ms: u64,
         price: Decimal,
         raw_rate: Option<Decimal>,
+        funding_price: Option<Decimal>,
+        last_settled_ms: Option<u64>,
     ) -> Result<()> {
         ensure!(price > Decimal::ZERO, "invalid exchange oracle");
         if self
@@ -234,6 +244,8 @@ impl LegFeed {
                     mode,
                 },
                 raw_rate,
+                funding_price: funding_price.filter(|price| *price > Decimal::ZERO),
+                last_settled_ms,
             });
         }
         Ok(())

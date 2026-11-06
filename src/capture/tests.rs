@@ -163,14 +163,33 @@ fn forecast_expires_at_the_payment_and_never_reads_settlement_as_prediction() {
         "lighter",
         T - 200,
         json!({"type":"update/market_stats","channel":"market_stats:0","timestamp":T-201,
-            "market_stats":{"market_id":0,"symbol":"ETH","index_price":"2000","current_funding_rate":"0.001","funding_rate":"0.40"}
+        "market_stats":{"market_id":0,"symbol":"ETH","index_price":"2000","mark_price":"1999.5","current_funding_rate":"0.001","funding_rate":"0.40","funding_timestamp":T-3_600_000+1}
         }),
     );
-    let (coverage, frames) = replay(&config, &[stats, hl("hyperliquid", T), footer(T + 100)]);
+    let stale_republication = row(
+        "lighter",
+        T + 100,
+        json!({"type":"update/market_stats","channel":"market_stats:0","timestamp":T+99,
+            "market_stats":{"market_id":0,"symbol":"ETH","index_price":"2000","mark_price":"1999.5","current_funding_rate":"0.001","funding_timestamp":T-3_600_000+1}
+        }),
+    );
+    let (coverage, frames) = replay(
+        &config,
+        &[
+            stats,
+            hl("hyperliquid", T),
+            stale_republication,
+            footer(T + 200),
+        ],
+    );
     assert_eq!(frames[0]["legs"][0]["forecast"]["payments"][0]["at_ms"], T);
     assert_eq!(
         frames[0]["legs"][0]["forecast"]["payments"][0]["rate"],
         "0.00001"
+    );
+    assert_eq!(
+        frames[0]["legs"][0]["forecast"]["payments"][0]["oracle_price"],
+        "1999.5"
     );
     assert!(
         frames[0]["legs"][0]["settled"]
@@ -179,6 +198,7 @@ fn forecast_expires_at_the_payment_and_never_reads_settlement_as_prediction() {
             .is_empty()
     );
     assert!(frames[1]["legs"][0]["forecast"].is_null());
+    assert!(frames[2]["legs"][0]["forecast"].is_null());
     assert_eq!(frames[1]["legs"][0]["settled"][0]["rate"], "0.00003");
     assert_eq!(coverage.settlement_records_written, [1, 0]);
 }

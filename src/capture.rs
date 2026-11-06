@@ -5,7 +5,8 @@ mod feeds;
 use crate::{
     strategy::relative_value::{
         AssetClass, Book, EquitySession, Frame, FundingForecast, FundingPoint, FundingSettlement,
-        MarketFrame, Oracle, OracleMode, PairConfig, RelativeValue,
+        MarketFrame, Oracle, OracleMode, PairConfig, RelativeValue, WitnessedSettlement,
+        validate_funding_guard,
     },
     venues::VenueRegistry,
 };
@@ -24,6 +25,8 @@ pub struct CaptureConfig {
     pub pair: PairConfig,
     pub one_way_latency_ms: u64,
     pub trade_from_ms: Option<u64>,
+    #[serde(default)]
+    pub funding_guard_ms: u64,
     pub sample_ms: u64,
     #[serde(default)]
     pub paper_entries: bool,
@@ -33,6 +36,8 @@ pub struct CaptureConfig {
     pub equity_sessions: Vec<EquitySession>,
     #[serde(default)]
     pub settlements: [Vec<FundingSettlement>; 2],
+    #[serde(default)]
+    pub witnessed_settlements: [Vec<WitnessedSettlement>; 2],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +119,7 @@ pub struct Coverage {
     pub equity_session_frames: usize,
     pub joined_input_frames: usize,
     pub settlement_records_written: [usize; 2],
+    pub witnessed_settlement_records_written: [usize; 2],
     pub paper_entries: bool,
 }
 
@@ -122,6 +128,7 @@ struct Header<'a> {
     pair: &'a PairConfig,
     one_way_latency_ms: u64,
     trade_from_ms: Option<u64>,
+    funding_guard_ms: u64,
 }
 
 const MAX_LINE: u64 = 2 * 1024 * 1024;
@@ -160,6 +167,7 @@ fn fresh(timestamp: u64, now: u64, age: u64) -> bool {
 impl CaptureConfig {
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
         RelativeValue::new(self.pair.clone(), registry)?;
+        validate_funding_guard(self.funding_guard_ms, &self.pair.legs)?;
         ensure!(
             (100..=60_000).contains(&self.sample_ms),
             "sample_ms must be 100..=60000"
@@ -199,11 +207,19 @@ impl CaptureConfig {
             let schedule = self.pair.legs[i].funding;
             ensure!(
                 payments.windows(2).all(|w| w[0].at_ms < w[1].at_ms)
-                    && payments.iter().all(|p| p.at_ms > 0
-                        && p.at_ms % schedule.interval_ms == schedule.offset_ms
-                        && p.rate.abs() <= Decimal::ONE
-                        && p.oracle_price > Decimal::ZERO),
+                    && payments.iter().all(|p| p.valid(schedule)),
                 "invalid or duplicate normalized funding settlement"
+            );
+            let witnessed = &self.witnessed_settlements[i];
+            ensure!(
+                witnessed.windows(2).all(|w| w[0].at_ms < w[1].at_ms)
+                    && witnessed
+                        .iter()
+                        .all(|p| p.valid(schedule, self.funding_guard_ms)
+                            && payments
+                                .binary_search_by_key(&p.at_ms, |event| event.at_ms)
+                                .is_err()),
+                "invalid, duplicate or unguarded witnessed funding settlement"
             );
         }
         ensure!(
@@ -392,11 +408,16 @@ impl<'a> Compiler<'a> {
         let payments = &self.config.settlements[i];
         let start = payments.partition_point(|p| p.at_ms <= self.last_frame_ms.unwrap_or(now));
         let end = payments.partition_point(|p| p.at_ms <= now);
+        let witnessed = &self.config.witnessed_settlements[i];
+        let witness_start =
+            witnessed.partition_point(|p| p.at_ms <= self.last_frame_ms.unwrap_or(now));
+        let witness_end = witnessed.partition_point(|p| p.at_ms <= now);
         MarketFrame {
             book,
             oracle: leg.context().map_or_else(missing_oracle, |ctx| ctx.oracle),
             forecast: leg.context().and_then(|ctx| self.forecast(i, now, ctx)),
             settled: payments[start..end].to_vec(),
+            witnessed_settlements: witnessed[witness_start..witness_end].to_vec(),
         }
     }
 
@@ -404,13 +425,28 @@ impl<'a> Compiler<'a> {
         let rule = self.config.legs[i].funding?;
         let schedule = self.config.pair.legs[i].funding;
         let observed = ctx.oracle.timestamp_ms;
-        let remainder = observed % schedule.interval_ms;
+        let origin = if self.config.legs[i].lighter_market_id.is_some() {
+            let settled = ctx.last_settled_ms?;
+            if settled > observed {
+                return None;
+            }
+            let delay = ((settled % schedule.interval_ms) + schedule.interval_ms
+                - schedule.offset_ms)
+                % schedule.interval_ms;
+            if delay > self.config.funding_guard_ms.max(1_000) {
+                return None;
+            }
+            settled
+        } else {
+            observed
+        };
+        let remainder = origin % schedule.interval_ms;
         let delay = if remainder < schedule.offset_ms {
             schedule.offset_ms - remainder
         } else {
             schedule.interval_ms - (remainder - schedule.offset_ms)
         };
-        let at_ms = observed.checked_add(delay)?;
+        let at_ms = origin.checked_add(delay)?;
         let rate = ctx.raw_rate?.checked_mul(rule.raw_rate_scale)?;
         if at_ms <= now
             || observed > now
@@ -426,7 +462,7 @@ impl<'a> Compiler<'a> {
                 at_ms,
                 rate,
                 uncertainty_bps: rule.uncertainty_bps,
-                oracle_price: ctx.oracle.price,
+                oracle_price: ctx.funding_price?,
             }],
         })
     }
@@ -469,6 +505,7 @@ impl<'a> Compiler<'a> {
         );
         for (i, leg) in frame.legs.iter().enumerate() {
             counts.settlement_records_written[i] += leg.settled.len();
+            counts.witnessed_settlement_records_written[i] += leg.witnessed_settlements.len();
         }
     }
 }
@@ -487,6 +524,7 @@ pub fn compile(
             pair: &config.pair,
             one_way_latency_ms: config.one_way_latency_ms,
             trade_from_ms: config.trade_from_ms,
+            funding_guard_ms: config.funding_guard_ms,
         },
     )?;
     let mut bytes = Vec::new();
