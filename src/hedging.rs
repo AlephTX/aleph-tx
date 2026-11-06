@@ -210,7 +210,7 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 
 /// Exact least common quantity step; decimal division alone can round for
 /// incompatible lot sizes (for example 0.003 and 0.002 need a 0.006 common lot).
-fn common_quantity_step(a: Decimal, b: Decimal) -> Result<Decimal> {
+pub(crate) fn common_quantity_step(a: Decimal, b: Decimal) -> Result<Decimal> {
     ensure!(
         a > Decimal::ZERO && b > Decimal::ZERO,
         "quantity steps must be positive"
@@ -236,7 +236,7 @@ fn common_quantity_step(a: Decimal, b: Decimal) -> Result<Decimal> {
     Decimal::try_from_i128_with_scale(lcm, scale).map_err(Into::into)
 }
 
-fn floor_step(value: Decimal, step: Decimal) -> Result<Decimal> {
+pub(crate) fn floor_step(value: Decimal, step: Decimal) -> Result<Decimal> {
     let remainder = value
         .checked_rem(step)
         .ok_or_else(|| anyhow!("invalid quantity step"))?;
@@ -316,6 +316,10 @@ impl HedgeMachine {
 
     pub fn snapshot(&self) -> HedgeSnapshot {
         self.snapshot.clone()
+    }
+
+    pub(crate) fn target_base(&self) -> Decimal {
+        self.snapshot.plan.target_base
     }
 
     /// Restoring a checkpoint never authorizes new opening orders. Every saved

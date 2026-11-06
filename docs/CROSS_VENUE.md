@@ -1,5 +1,9 @@
 # Cross-venue research and execution primitives
 
+For same-underlying crypto and stock perp strategies, use the
+[multi-level paper replay](PERP_RELATIVE_VALUE.md). It evaluates executable
+depth, a causal basis model, per-payment funding and equity session constraints.
+
 The cross-venue tool evaluates price and funding opportunities and replays order
 events locally. Its market commands read public endpoints. Existing Lighter and
 Hyperliquid Go feeds keep their original shared-memory layout.

@@ -1,0 +1,86 @@
+{
+  "pair": {
+    "asset_class": "equity",
+    "strategy": "basis_reversion",
+    "legs": [
+      {
+        "venue": "lighter",
+        "market": "DEMO",
+        "underlying_id": "XNYS:DEMO:CLASS_A",
+        "payoff_id": "SYNTH:DEMO:PRICE_RETURN:v1",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "tick": "0.01",
+        "lot": "0.01",
+        "base_per_contract": "1",
+        "min_contracts": "0.01",
+        "min_notional": "5",
+        "taker_fee_bps": "1",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      },
+      {
+        "venue": "entropy",
+        "market": "io:DEMO",
+        "underlying_id": "XNYS:DEMO:CLASS_A",
+        "payoff_id": "SYNTH:DEMO:PRICE_RETURN:v1",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "tick": "0.01",
+        "lot": "1",
+        "base_per_contract": "0.05",
+        "min_contracts": "1",
+        "min_notional": "5",
+        "taker_fee_bps": "1",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      }
+    ],
+    "planner": {
+      "max_quote_age_ms": 1000,
+      "max_quote_skew_ms": 50,
+      "max_funding_age_ms": 2000,
+      "max_leg_notional_usd": 300,
+      "max_unhedged_notional_usd": 200,
+      "max_base_quantity": 1,
+      "depth_fraction": 1,
+      "min_net_edge_bps": 1,
+      "exit_basis_reserve_bps": 2,
+      "funding_horizon_ms": 3000
+    },
+    "basis": {
+      "min_samples": 3,
+      "min_sample_ms": 100,
+      "max_sample_gap_ms": 1500,
+      "half_life_ms": 1000,
+      "volatility_floor_bps": 4,
+      "stress_sigma": 0.5,
+      "entry_z": 2.5,
+      "exit_z": 0.5,
+      "stop_z": 8,
+      "reversion_fraction": 0.8
+    },
+    "execution_window_ms": 800,
+    "oracle_max_age_ms": 1000,
+    "max_oracle_deviation_bps": 100,
+    "equity_close_buffer_ms": 1000,
+    "max_depth_impact_bps": 30,
+    "limit_buffer_bps": 0
+  },
+  "one_way_latency_ms": 100,
+  "frames": [
+    {"now_ms":1800000060000,"reference":{"price":"100","timestamp_ms":1800000060000,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060000,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060000,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060000,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060000,"mode":"live_external"}}]},
+    {"now_ms":1800000060100,"reference":{"price":"100","timestamp_ms":1800000060100,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060100,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060100,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060100,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060100,"mode":"live_external"}}]},
+    {"now_ms":1800000060200,"reference":{"price":"100","timestamp_ms":1800000060200,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060200,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060200,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060200,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060200,"mode":"live_external"}}]},
+    {"now_ms":1800000060300,"reference":{"price":"100","timestamp_ms":1800000060300,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060300,"tradable":true,"bids":[{"price":"99.89","contracts":"2"}],"asks":[{"price":"99.91","contracts":"0.5"},{"price":"100.04","contracts":"1.5"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060300,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060300,"tradable":true,"bids":[{"price":"100.09","contracts":"100"}],"asks":[{"price":"100.11","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060300,"mode":"live_external"}}]},
+    {"now_ms":1800000060400,"reference":{"price":"100","timestamp_ms":1800000060400,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060400,"tradable":true,"bids":[{"price":"99.89","contracts":"2"}],"asks":[{"price":"99.91","contracts":"0.5"},{"price":"100.04","contracts":"1.5"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060400,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060400,"tradable":true,"bids":[{"price":"100.09","contracts":"100"}],"asks":[{"price":"100.11","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060400,"mode":"live_external"}}]},
+    {"now_ms":1800000060500,"reference":{"price":"100","timestamp_ms":1800000060500,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060500,"tradable":true,"bids":[{"price":"99.89","contracts":"2"}],"asks":[{"price":"99.91","contracts":"0.5"},{"price":"100.04","contracts":"1.5"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060500,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060500,"tradable":true,"bids":[{"price":"100.09","contracts":"100"}],"asks":[{"price":"100.11","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060500,"mode":"live_external"}}]},
+    {"now_ms":1800000060800,"reference":{"price":"100","timestamp_ms":1800000060800,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060800,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060800,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060800,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060800,"mode":"live_external"}}]},
+    {"now_ms":1800000060900,"reference":{"price":"100","timestamp_ms":1800000060900,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000060900,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060900,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000060900,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000060900,"mode":"live_external"}}]},
+    {"now_ms":1800000061000,"reference":{"price":"100","timestamp_ms":1800000061000,"mode":"live_external"},"equity_session":{"observed_at_ms":1800000060000,"opens_at_ms":1800000059000,"closes_at_ms":1800000110000,"clear_until_ms":1800000110000,"halted":false},"legs":[{"book":{"market":"DEMO","timestamp_ms":1800000061000,"tradable":true,"bids":[{"price":"99.99","contracts":"2"}],"asks":[{"price":"100.01","contracts":"2"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000061000,"mode":"live_external"}},{"book":{"market":"io:DEMO","timestamp_ms":1800000061000,"tradable":true,"bids":[{"price":"99.99","contracts":"100"}],"asks":[{"price":"100.01","contracts":"100"}],"available_notional":"300"},"oracle":{"price":"100","timestamp_ms":1800000061000,"mode":"live_external"}}]}
+  ]
+}

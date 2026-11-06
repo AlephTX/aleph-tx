@@ -1,0 +1,89 @@
+{
+  "pair": {
+    "asset_class": "crypto",
+    "strategy": "funding_carry",
+    "legs": [
+      {
+        "venue": "lighter",
+        "market": "ETH",
+        "underlying_id": "ETH",
+        "payoff_id": "SYNTH:ETH:LINEAR:USDC",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "tick": "0.1",
+        "lot": "0.001",
+        "base_per_contract": "1",
+        "min_contracts": "0.001",
+        "min_notional": "5",
+        "taker_fee_bps": "2",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      },
+      {
+        "venue": "hyperliquid",
+        "market": "ETH",
+        "underlying_id": "ETH",
+        "payoff_id": "SYNTH:ETH:LINEAR:USDC",
+        "quote": "USDC",
+        "settlement": "USDC",
+        "tick": "0.1",
+        "lot": "0.002",
+        "base_per_contract": "1",
+        "min_contracts": "0.002",
+        "min_notional": "5",
+        "taker_fee_bps": "2",
+        "funding": {
+          "interval_ms": 3600000,
+          "offset_ms": 0
+        }
+      }
+    ],
+    "planner": {
+      "max_quote_age_ms": 1000,
+      "max_quote_skew_ms": 50,
+      "max_funding_age_ms": 2000,
+      "max_leg_notional_usd": 300,
+      "max_unhedged_notional_usd": 200,
+      "max_base_quantity": 0.04,
+      "depth_fraction": 1,
+      "min_net_edge_bps": 1,
+      "exit_basis_reserve_bps": 2,
+      "funding_horizon_ms": 3000
+    },
+    "basis": {
+      "min_samples": 3,
+      "min_sample_ms": 100,
+      "max_sample_gap_ms": 1500,
+      "half_life_ms": 1000,
+      "volatility_floor_bps": 4,
+      "stress_sigma": 0.5,
+      "entry_z": 2.5,
+      "exit_z": 0.5,
+      "stop_z": 8,
+      "reversion_fraction": 0.8
+    },
+    "execution_window_ms": 800,
+    "oracle_max_age_ms": 1000,
+    "max_oracle_deviation_bps": 100,
+    "equity_close_buffer_ms": 0,
+    "max_depth_impact_bps": 30,
+    "limit_buffer_bps": 0
+  },
+  "one_way_latency_ms": 100,
+  "frames": [
+    {"now_ms":1799999998000,"reference":{"price":"2000","timestamp_ms":1799999998000,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998000,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998000,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998000,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998000,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998000,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998000,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999998100,"reference":{"price":"2000","timestamp_ms":1799999998100,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998100,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998100,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998100,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998100,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998100,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998100,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999998200,"reference":{"price":"2000","timestamp_ms":1799999998200,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998200,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998200,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998200,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998200,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998200,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998200,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999998300,"reference":{"price":"2000","timestamp_ms":1799999998300,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998300,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998300,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998300,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998300,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998300,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998300,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999998400,"reference":{"price":"2000","timestamp_ms":1799999998400,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998400,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998400,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998400,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998400,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998400,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998400,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999998500,"reference":{"price":"2000","timestamp_ms":1799999998500,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999998500,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998500,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998500,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999998500,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999998500,"mode":"live_external"},"forecast":{"observed_at_ms":1799999998500,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1799999999200,"reference":{"price":"2000","timestamp_ms":1799999999200,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1799999999200,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999999200,"mode":"live_external"},"forecast":{"observed_at_ms":1799999999200,"payments":[{"at_ms":1800000000000,"rate":"0.0001","uncertainty_bps":"0.1","oracle_price":"2000"}]}},{"book":{"market":"ETH","timestamp_ms":1799999999200,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1799999999200,"mode":"live_external"},"forecast":{"observed_at_ms":1799999999200,"payments":[{"at_ms":1800000000000,"rate":"0.0015","uncertainty_bps":"0.1","oracle_price":"2000"}]}}]},
+    {"now_ms":1800000000000,"reference":{"price":"2000","timestamp_ms":1800000000000,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1800000000000,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000000000,"mode":"live_external"},"settled":[{"at_ms":1800000000000,"rate":"0.00011","oracle_price":"2000"}]},{"book":{"market":"ETH","timestamp_ms":1800000000000,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000000000,"mode":"live_external"},"settled":[{"at_ms":1800000000000,"rate":"0.0014","oracle_price":"2000"}]}]},
+    {"now_ms":1800000000600,"reference":{"price":"2000","timestamp_ms":1800000000600,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1800000000600,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000000600,"mode":"live_external"}},{"book":{"market":"ETH","timestamp_ms":1800000000600,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000000600,"mode":"live_external"}}]},
+    {"now_ms":1800000001300,"reference":{"price":"2000","timestamp_ms":1800000001300,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1800000001300,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001300,"mode":"live_external"}},{"book":{"market":"ETH","timestamp_ms":1800000001300,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001300,"mode":"live_external"}}]},
+    {"now_ms":1800000001400,"reference":{"price":"2000","timestamp_ms":1800000001400,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1800000001400,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001400,"mode":"live_external"}},{"book":{"market":"ETH","timestamp_ms":1800000001400,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001400,"mode":"live_external"}}]},
+    {"now_ms":1800000001500,"reference":{"price":"2000","timestamp_ms":1800000001500,"mode":"live_external"},"legs":[{"book":{"market":"ETH","timestamp_ms":1800000001500,"tradable":true,"bids":[{"price":"1999.9","contracts":"0.5"}],"asks":[{"price":"2000.1","contracts":"0.5"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001500,"mode":"live_external"}},{"book":{"market":"ETH","timestamp_ms":1800000001500,"tradable":true,"bids":[{"price":"1999.9","contracts":"1"}],"asks":[{"price":"2000.1","contracts":"1"}],"available_notional":"300"},"oracle":{"price":"2000","timestamp_ms":1800000001500,"mode":"live_external"}}]}
+  ]
+}

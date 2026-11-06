@@ -5,12 +5,19 @@ use aleph_tx::{
     strategy::cross_venue::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
+    strategy::relative_value::{
+        Frame as PerpFrame, PairConfig, PaperReport, PaperScenario, run_paper, run_paper_frames,
+    },
     venues::VenueRegistry,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use std::{collections::HashSet, fs::File, io::Read};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{BufRead, BufReader, Read},
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +158,46 @@ fn read_replay<T: DeserializeOwned>(path: &str) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+fn stream_paper(mut reader: impl BufRead, registry: &VenueRegistry) -> Result<PaperReport> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Header {
+        pair: PairConfig,
+        one_way_latency_ms: u64,
+        trade_from_ms: Option<u64>,
+    }
+    let mut bytes = Vec::new();
+    let header: Header =
+        read_record(&mut reader, &mut bytes)?.context("Missing paper replay header")?;
+    let mut line = 1;
+    let frames = std::iter::from_fn(|| {
+        line += 1;
+        read_record::<PerpFrame>(&mut reader, &mut bytes)
+            .with_context(|| format!("Invalid replay frame on line {line}"))
+            .transpose()
+    });
+    run_paper_frames(
+        &header.pair,
+        header.one_way_latency_ms,
+        header.trade_from_ms,
+        frames,
+        registry,
+    )
+}
+
+fn read_record<T: DeserializeOwned>(
+    reader: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+) -> Result<Option<T>> {
+    const LIMIT: u64 = 1024 * 1024;
+    bytes.clear();
+    if reader.take(LIMIT + 1).read_until(b'\n', bytes)? == 0 {
+        return Ok(None);
+    }
+    ensure!(bytes.len() as u64 <= LIMIT, "Replay record exceeds 1 MiB");
+    Ok(Some(serde_json::from_slice(bytes)?))
+}
+
 fn print(value: &impl Serialize) -> Result<()> {
     serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
     println!();
@@ -185,6 +232,15 @@ async fn main() -> Result<()> {
         }
         [command, file] if command == "hedge-replay" => {
             print(&replay_hedge(read_replay(file)?, &registry)?)
+        }
+        [command, file] if command == "perp-replay" => {
+            let report = if file.ends_with(".ndjson") {
+                stream_paper(BufReader::new(File::open(file)?), &registry)?
+            } else {
+                let scenario: PaperScenario = read_replay(file)?;
+                run_paper(&scenario, &registry)?
+            };
+            print(&report)
         }
         [command, venue, market] if command == "bbo" => match venue.as_str() {
             "arcus" => print(
@@ -256,7 +312,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | markets hyperliquid|entropy|arcus|variational"
+            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | markets VENUE | bbo VENUE MARKET"
         ),
     }
 }
@@ -266,6 +322,24 @@ mod tests {
     use super::*;
     use aleph_tx::hedging::Leg;
     use rust_decimal::Decimal;
+
+    #[test]
+    fn streamed_perp_recording_has_the_same_pnl_as_the_json_fixture() {
+        let fixture = include_str!("../../examples/crypto_funding_paper.json");
+        let mut header: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let frames = header.as_object_mut().unwrap().remove("frames").unwrap();
+        let mut ndjson = format!("{header}\n");
+        for frame in frames.as_array().unwrap() {
+            ndjson.push_str(&format!("{frame}\n"));
+        }
+        let registry = VenueRegistry::default();
+        let streamed = stream_paper(std::io::Cursor::new(ndjson), &registry).unwrap();
+        let batch = run_paper(&serde_json::from_str(fixture).unwrap(), &registry).unwrap();
+        assert_eq!(
+            serde_json::to_value(streamed).unwrap(),
+            serde_json::to_value(batch).unwrap()
+        );
+    }
 
     #[test]
     fn replay_finds_only_the_fresh_net_profitable_executable_pair() {

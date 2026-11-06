@@ -4,6 +4,7 @@ pub mod cross_venue;
 pub mod edgex_mm;
 pub mod inventory_neutral_mm;
 pub mod lighter_adaptive_mm;
+pub mod relative_value;
 
 use crate::shm_reader::ShmBboMessage;
 use std::future::Future;
