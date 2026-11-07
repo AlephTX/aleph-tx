@@ -4,6 +4,7 @@
 
 .PHONY: help build build-rust build-feeder test test-rust test-go check fmt-check benchmark clean status clean-shm
 .PHONY: trade
+.PHONY: dashboard-install dashboard-build dashboard-check dashboard-dev test-python
 .PHONY: lighter-up lighter-down lighter-logs
 .PHONY: backpack-up backpack-down backpack-logs
 .PHONY: edgex-up edgex-down edgex-logs
@@ -49,6 +50,9 @@ help:
 	@echo ""
 	@echo "$(YELLOW)Monitoring:$(NC)"
 	@echo "  make status         - Show all running components"
+	@echo "  make dashboard-build - Check and build the trading console SPA"
+	@echo "  make dashboard-dev  - Run the console against the oasis tunnel"
+	@echo "  make test-python    - Test the monitor telemetry store"
 	@echo ""
 	@echo "$(YELLOW)Utilities:$(NC)"
 	@echo "  make clean          - Purge build artifacts and logs"
@@ -66,6 +70,23 @@ test-rust:
 
 test-go:
 	cd feeder && go test -race ./...
+
+test-python:
+	cd deploy/oasis && python3 -m unittest -v test_telemetry_store
+
+# Dashboard SPA (Vite + React). Built locally; install.sh ships dashboard/dist.
+dashboard-install:
+	cd dashboard && npm ci
+
+dashboard-check: dashboard-install
+	cd dashboard && npm run check
+
+dashboard-build: dashboard-check
+	cd dashboard && npm run build
+
+# Dev server proxies /api to ALEPH_API (default: the IAP tunnel on 127.0.0.1:8765).
+dashboard-dev:
+	cd dashboard && npm run dev
 
 check:
 	cargo clippy --locked --lib --bins -- -D warnings

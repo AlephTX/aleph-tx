@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AlephTX · Oasis 运行看板</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top"><div class="top-inner">
+    <div class="brand"><span class="mark" aria-hidden="true">α</span><span>Aleph<span class="accent">TX</span><small>OPERATIONS</small></span></div>
+    <span id="connection" class="pill" role="status">连接中</span>
+  </div></header>
+  <main>
+    <div class="intro">
+      <div><div class="eyebrow"><span class="accent">◈</span> <span id="host">OASIS</span> <span class="divider">/</span> GOOGLE CLOUD</div>
+      <h1>运行看板</h1><p>查看服务、公开行情和已配置账户的合约仓位。</p></div>
+      <div class="stamp"><span>最近刷新</span><time id="checked">—</time></div>
+    </div>
+    <div id="disconnect" class="notice" role="status" hidden>无法读取 Oasis。请检查本地 SSH 隧道；下方为最后一次成功读取的数据。</div>
+    <section class="cards" aria-label="服务运行状态">
+      <article class="card"><p class="label">01 / 行情采集</p><strong id="feeder">—</strong><p id="feeder-detail" class="detail">等待主机返回状态</p></article>
+      <article class="card"><p class="label">02 / 实时市场</p><strong id="markets">—</strong><p id="markets-detail" class="detail">等待盘口数据</p></article>
+      <article class="card"><p class="label">03 / 实盘策略</p><strong id="live">—</strong><p id="live-detail" class="detail">等待主机返回状态</p></article>
+    </section>
+    <section class="panel">
+      <div class="panel-title"><div><p class="label">MARKET DATA</p><h2>盘口行情</h2></div><span class="tag">主网 · 永续</span></div>
+      <div class="table-scroll"><table>
+        <thead><tr><th>交易所 / 市场</th><th>最优买价</th><th>最优卖价</th><th>中间价</th><th>价差 (bps)</th><th>状态</th></tr></thead>
+        <tbody id="quotes"><tr><td colspan="6" class="empty">正在读取行情采集器…</td></tr></tbody>
+      </table></div>
+    </section>
+    <section class="panel">
+      <div class="panel-title"><div><p class="label">ACCOUNT EXPOSURE</p><h2>账户仓位</h2></div><span class="tag">只读</span></div>
+      <div id="accounts" class="accounts"><div class="empty">正在读取账户配置…</div></div>
+      <div class="table-scroll" id="position-table" hidden><table>
+        <thead><tr><th>交易所 / 市场</th><th>方向</th><th>持仓数量</th><th>开仓均价</th><th>未实现盈亏</th><th>强平价</th></tr></thead>
+        <tbody id="positions"></tbody>
+      </table></div>
+    </section>
+    <footer><span>AlephTX <span class="divider">/</span> 通过 SSH 隧道访问</span><span id="release">—</span></footer>
+  </main>
+</body>
+</html>

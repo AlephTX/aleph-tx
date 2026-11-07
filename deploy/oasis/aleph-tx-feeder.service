@@ -1,0 +1,23 @@
+[Unit]
+Description=AlephTX public market feeder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=aleph-tx
+Group=aleph-tx
+RuntimeDirectory=aleph-tx-market
+RuntimeDirectoryMode=0750
+Environment=ALEPH_FEEDER_CONFIG=/etc/aleph-tx/feeder.toml
+Environment=ALEPH_FEEDER_PUBLIC_ONLY=true
+Environment=ALEPH_SHM_DIR=/run/aleph-tx-market
+ExecStart=/opt/aleph-tx/current/bin/feeder-app
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

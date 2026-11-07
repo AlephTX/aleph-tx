@@ -66,3 +66,6 @@ skills-lock.json
 claude_prompt.md
 deep_review_*.md
 .gstack/
+
+# Python
+__pycache__/

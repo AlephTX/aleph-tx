@@ -1,0 +1,28 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'PingFang SC', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --color-bg: #07090c;
+  --color-panel: #0d1117;
+  --color-panel-2: #121821;
+  --color-line: #1d2531;
+  --color-muted: #7d8a9c;
+  --color-text: #d8e0ea;
+  --color-up: #2ed3a0;
+  --color-down: #f0596b;
+  --color-warn: #f5b84a;
+  --color-accent: #5aa9ff;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-bg text-text font-sans antialiased;
+    font-feature-settings: 'tnum' 1, 'cv11' 1;
+  }
+  ::selection { background: color-mix(in oklab, var(--color-accent) 35%, transparent); }
+}
+
+@utility num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+@utility card { @apply rounded-lg border border-line bg-panel; }

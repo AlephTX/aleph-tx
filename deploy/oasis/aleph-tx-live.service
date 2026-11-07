@@ -1,0 +1,24 @@
+[Unit]
+Description=AlephTX supervised Lighter live strategy (manual start)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/aleph-tx/live.toml
+ConditionPathExists=/etc/aleph-tx/live.env
+
+[Service]
+User=aleph-tx-trader
+Group=aleph-tx-trader
+StateDirectory=aleph-tx-live
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/aleph-tx-live
+Environment=LD_LIBRARY_PATH=/opt/aleph-tx/current/lib
+Environment=ALEPH_TELEMETRY_DIR=/var/lib/aleph-tx-telemetry
+ReadWritePaths=/var/lib/aleph-tx-telemetry
+ExecStartPre=/opt/aleph-tx/current/bin/lighter_inventory_mm --check /etc/aleph-tx/live.toml
+ExecStart=/opt/aleph-tx/current/bin/lighter_inventory_mm --live /etc/aleph-tx/live.toml /etc/aleph-tx/live.env /opt/aleph-tx/current/bin/feeder-app
+KillMode=mixed
+TimeoutStopSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

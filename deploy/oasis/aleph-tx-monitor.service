@@ -1,0 +1,24 @@
+[Unit]
+Description=AlephTX read-only loopback dashboard
+After=aleph-tx-feeder.service
+
+[Service]
+User=aleph-tx
+Group=aleph-tx
+# journal: dashboard log viewer. Telemetry is read via group aleph-tx (see tmpfiles).
+SupplementaryGroups=systemd-journal
+StateDirectory=aleph-tx-monitor
+StateDirectoryMode=0700
+Environment=ALEPH_TELEMETRY_DIR=/var/lib/aleph-tx-telemetry
+Environment=ALEPH_MONITOR_DB=/var/lib/aleph-tx-monitor/telemetry.sqlite3
+EnvironmentFile=-/etc/aleph-tx/monitor.env
+ExecStart=/usr/bin/python3 /opt/aleph-tx/current/monitor.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

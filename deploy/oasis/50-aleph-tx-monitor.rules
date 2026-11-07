@@ -1,0 +1,9 @@
+// The dashboard's emergency stop: user aleph-tx may stop the live strategy and nothing else.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      subject.user == "aleph-tx" &&
+      action.lookup("unit") == "aleph-tx-live.service" &&
+      action.lookup("verb") == "stop") {
+    return polkit.Result.YES;
+  }
+});

@@ -1,0 +1,9 @@
+[lighter]
+feeder_enabled = true
+feeder_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+feeder_symbols = { ETH = "0" }
+
+[hyperliquid]
+feeder_enabled = true
+feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
+feeder_symbols = { ETH = "ETH", BTC = "BTC" }
