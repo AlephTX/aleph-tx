@@ -72,7 +72,7 @@ test-go:
 	cd feeder && go test -race ./...
 
 test-python:
-	cd deploy/oasis && python3 -m unittest -v test_telemetry_store
+	cd deploy/oasis && python3 -m unittest -v test_telemetry_store test_alerts
 
 # Dashboard SPA (Vite + React). Built locally; install.sh ships dashboard/dist.
 dashboard-install:

@@ -42,6 +42,14 @@ export interface StatusResp {
   markets: Market[]
   accounts: Record<string, AccountSnapshot>
   control_enabled: boolean
+  alerts?: Alert[]
+}
+
+export interface Alert {
+  key: string
+  severity: 'critical' | 'warning'
+  message: string
+  since_ms: number
 }
 
 export interface Session {

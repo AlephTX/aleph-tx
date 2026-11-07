@@ -33,6 +33,17 @@ export default function App() {
         sessionStopped={session?.stopped_ms ?? null}
       />
       <main className="mx-auto max-w-[1680px] space-y-3 p-4">
+        {status.data?.alerts?.map((alert) => (
+          <div
+            key={alert.key}
+            role="alert"
+            className={`card px-4 py-2 text-sm ${
+              alert.severity === 'critical' ? 'border-down/40 text-down' : 'border-warn/40 text-warn'
+            }`}
+          >
+            {alert.severity === 'critical' ? '严重' : '警告'}：{alert.message}
+          </div>
+        ))}
         {summary.error && (
           <div className="card border-down/40 px-4 py-2 text-sm text-down">
             遥测数据不可用：{summary.error.message}

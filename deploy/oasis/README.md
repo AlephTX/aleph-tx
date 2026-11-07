@@ -10,7 +10,7 @@ The console (`dashboard/`, Vite + React) shows service state, quotes, exchange p
 
 When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file per session (orders, fills, risk snapshots) to `/var/lib/aleph-tx-telemetry`. Writes go through a bounded queue off the trading path; dropped records are counted and shown on the console. The monitor ingests those files incrementally into SQLite at `/var/lib/aleph-tx-monitor/telemetry.sqlite3`, so history survives restarts and the database can be deleted and rebuilt from the JSONL files. PnL uses average cost, includes fees and rebates, and marks open inventory to the latest snapshot mid.
 
-API: `/api/status`, `/api/summary`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
+API: `/api/status`, `/api/summary`, `/api/alerts`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
 Lighter trade PnL covers Lighter fills, fees and rebates. When the inventory
 hedge is enabled, each reconciled Hyperliquid IOC is exported as a
@@ -22,6 +22,18 @@ payments are not included. Lighter account equity is shown separately. A success
 strategy shutdown drains the telemetry queue and persists the final marker
 before returning. Ingest preserves checkpoints when session files are copied
 or restored to new inodes, and deduplicates each record before updating totals.
+
+## Alerts
+
+The monitor evaluates alert rules every 15 seconds: feeder down, live unit
+failed, stale or missing quotes while live, stale telemetry, private-stream
+gaps, dropped telemetry records, session drawdown approaching the daily loss
+breaker (warning at 60%, critical at 90% of `ALEPH_MONITOR_MAX_DAILY_LOSS_PCT`,
+default `0.05`), and a cross-venue imbalance while hedged. Active alerts appear
+as banners in the console and at `/api/alerts`. To also receive a JSON
+`{"text": ...}` POST when an alert is raised or resolved, set
+`ALEPH_MONITOR_ALERT_WEBHOOK` in `/etc/aleph-tx/monitor.env` and restart the
+monitor. Alerts never act on trading.
 
 ## Emergency stop
 

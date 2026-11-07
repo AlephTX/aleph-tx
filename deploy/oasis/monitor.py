@@ -19,6 +19,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
+from alerts import Alerter, evaluate
 from telemetry_store import TelemetryStore
 
 ROOT = Path(__file__).resolve().parent
@@ -34,6 +35,9 @@ STATIC = Path(os.environ.get("ALEPH_DASHBOARD_DIR", ROOT / "dashboard")).resolve
 TELEMETRY_DIR = os.environ.get("ALEPH_TELEMETRY_DIR", "/var/lib/aleph-tx-telemetry")
 DB_PATH = os.environ.get("ALEPH_MONITOR_DB", "/var/lib/aleph-tx-monitor/telemetry.sqlite3")
 CONTROL_TOKEN = os.environ.get("ALEPH_MONITOR_CONTROL_TOKEN", "")
+ALERT_WEBHOOK = os.environ.get("ALEPH_MONITOR_ALERT_WEBHOOK", "").strip()
+ALERT_INTERVAL = 15
+MAX_DAILY_LOSS_PCT = float(os.environ.get("ALEPH_MONITOR_MAX_DAILY_LOSS_PCT", "0.05"))
 LIVE_UNIT = "aleph-tx-live.service"
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
@@ -212,6 +216,17 @@ def ingest_loop(store):
         time.sleep(2)
 
 
+def alert_loop(store, alerter):
+    while True:
+        try:
+            status = {"services": services(), "markets": markets()}
+            alerter.update(evaluate(status, store.summary(), int(time.time() * 1000),
+                                    MAX_DAILY_LOSS_PCT))
+        except Exception as exc:  # keep serving; the next pass retries
+            print(f"alert evaluation failed: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(ALERT_INTERVAL)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AlephTX"
     sys_version = ""
@@ -241,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
             return {"host": socket.gethostname(), "checked_at": now_iso(),
                     "release": self.server.release, "services": services(),
                     "markets": markets(), "accounts": self.server.accounts.snapshots.copy(),
-                    "control_enabled": bool(CONTROL_TOKEN)}
+                    "control_enabled": bool(CONTROL_TOKEN),
+                    "alerts": self.server.alerter.snapshot()}
+        if route == "/api/alerts":
+            return {"alerts": self.server.alerter.snapshot(), "webhook": bool(ALERT_WEBHOOK)}
         if route == "/api/summary":
             return store.summary()
         if route == "/api/fills":
@@ -342,5 +360,7 @@ if __name__ == "__main__":
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     server.store = TelemetryStore(DB_PATH, TELEMETRY_DIR)
     threading.Thread(target=ingest_loop, args=(server.store,), daemon=True).start()
+    server.alerter = Alerter(ALERT_WEBHOOK)
+    threading.Thread(target=alert_loop, args=(server.store, server.alerter), daemon=True).start()
     print(f"AlephTX dashboard listening on http://127.0.0.1:{port}", flush=True)
     server.serve_forever()

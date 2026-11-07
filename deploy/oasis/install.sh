@@ -32,7 +32,7 @@ sudo -n install -m 0755 feeder/feeder-app feeder/perp-capture \
   target/release/{aleph-tx,backpack_mm,cross_venue,edgex_mm,lighter_adaptive_mm,lighter_inventory_mm} "$dest/bin/"
 sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
-sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store}.py "$dest/"
+sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts}.py "$dest/"
 sudo -n cp -R --no-preserve=ownership dashboard/dist/. "$dest/dashboard/"
 sudo -n chmod -R u=rwX,go=rX "$dest/dashboard"
 printf '{"id":"%s","source_sha256":"%s","base_commit":"%s"}\n' "$release" "$source_sha" "$commit" |
