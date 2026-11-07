@@ -163,6 +163,18 @@ fn default_margin_cooldown_secs() -> u64 {
 fn default_max_daily_loss_pct() -> f64 {
     0.05
 }
+fn default_position_timeout_secs() -> u64 {
+    60
+}
+fn default_local_staleness_ms() -> u64 {
+    5000
+}
+fn default_stale_bbo_cancel_ms() -> u64 {
+    15000
+}
+fn default_target_resting_margin_utilization() -> f64 {
+    0.35
+}
 fn default_grid_levels() -> u8 {
     3
 }
@@ -320,6 +332,18 @@ pub struct InventoryNeutralMMConfig {
     /// strategy halts. The baseline and breach persist across restarts.
     #[serde(default = "default_max_daily_loss_pct")]
     pub max_daily_loss_pct: f64, // default: 0.05
+    /// Unhedged inventory held beyond the deadband this long is IOC-flattened.
+    #[serde(default = "default_position_timeout_secs")]
+    pub position_timeout_secs: u64, // default: 60
+    /// Local BBO older than this freezes quoting.
+    #[serde(default = "default_local_staleness_ms")]
+    pub local_staleness_ms: u64, // default: 5000
+    /// Local BBO stale for longer than this cancels all resting orders.
+    #[serde(default = "default_stale_bbo_cancel_ms")]
+    pub stale_bbo_cancel_ms: u64, // default: 15000
+    /// Fraction of leveraged usable balance targeted by resting top-level quotes.
+    #[serde(default = "default_target_resting_margin_utilization")]
+    pub target_resting_margin_utilization: f64, // default: 0.35
     // Post-Only: use ALO (Add Liquidity Only) to guarantee maker fees
     #[serde(default)]
     pub use_post_only: bool, // default: false (GTC), true = Post-Only
@@ -466,8 +490,20 @@ impl InventoryNeutralMMConfig {
             self.poll_interval_ms > 0
                 && self.order_ttl_secs > 0
                 && self.external_staleness_ms > 0
-                && self.margin_cooldown_secs > 0,
+                && self.margin_cooldown_secs > 0
+                && self.position_timeout_secs > 0
+                && self.local_staleness_ms > 0,
             "{name}: intervals must be positive"
+        );
+        anyhow::ensure!(
+            self.stale_bbo_cancel_ms >= self.local_staleness_ms,
+            "{name}: stale_bbo_cancel_ms must be >= local_staleness_ms"
+        );
+        anyhow::ensure!(
+            self.target_resting_margin_utilization.is_finite()
+                && self.target_resting_margin_utilization > 0.0
+                && self.target_resting_margin_utilization <= 1.0,
+            "{name}: target_resting_margin_utilization must be in (0, 1]"
         );
         anyhow::ensure!(
             self.exchange_id == EXCH_LIGHTER && matches!(self.symbol_id, SYM_BTC | SYM_ETH),
@@ -544,6 +580,10 @@ impl Default for InventoryNeutralMMConfig {
             min_available_balance: 2.0,
             margin_cooldown_secs: 5,
             max_daily_loss_pct: default_max_daily_loss_pct(),
+            position_timeout_secs: default_position_timeout_secs(),
+            local_staleness_ms: default_local_staleness_ms(),
+            stale_bbo_cancel_ms: default_stale_bbo_cancel_ms(),
+            target_resting_margin_utilization: default_target_resting_margin_utilization(),
             use_post_only: false,
             poll_interval_ms: 100,
         }
@@ -725,6 +765,51 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn risk_knobs_default_to_previous_constants_and_are_validated() {
+        let config = InventoryNeutralMMConfig::default();
+        assert_eq!(config.max_daily_loss_pct, 0.05);
+        assert_eq!(config.position_timeout_secs, 60);
+        assert_eq!(config.local_staleness_ms, 5000);
+        assert_eq!(config.stale_bbo_cancel_ms, 15000);
+        assert_eq!(config.target_resting_margin_utilization, 0.35);
+        assert_eq!(config.max_basis_bps, 20.0);
+
+        let invalid = [
+            InventoryNeutralMMConfig {
+                max_daily_loss_pct: 0.0,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                max_daily_loss_pct: 1.0,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                position_timeout_secs: 0,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                stale_bbo_cancel_ms: 1000,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                target_resting_margin_utilization: 1.5,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                max_basis_bps: -1.0,
+                ..Default::default()
+            },
+            InventoryNeutralMMConfig {
+                basis_tau_secs: 0.0,
+                ..Default::default()
+            },
+        ];
+        for config in invalid {
+            assert!(config.validate().is_err(), "{config:?}");
+        }
     }
 
     #[test]

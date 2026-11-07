@@ -350,13 +350,10 @@ impl ActiveOrder {
 // ═══════════════════════════════════════════════════════════════════
 
 const ACCOUNT_STALENESS_SECS: u64 = 30;
-const DATA_STALENESS_THRESHOLD_MS: u64 = 5000;
-const STALE_BBO_CANCEL_AFTER_MS: u64 = 15000;
 const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
-const POSITION_TIMEOUT_SECS: u64 = 60;
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -664,7 +661,7 @@ impl InventoryNeutralMM {
             if self.hedge.is_none()
                 && self
                     .inventory_age
-                    .is_expired(now, Duration::from_secs(POSITION_TIMEOUT_SECS))
+                    .is_expired(now, Duration::from_secs(self.config.position_timeout_secs))
             {
                 if self.inventory_age.can_retry(now) {
                     self.inventory_age.last_attempt = Some(now);
@@ -1457,8 +1454,8 @@ impl InventoryNeutralMM {
             let action = classify_stale_bbo(
                 &market_state.bbo,
                 now_ns,
-                DATA_STALENESS_THRESHOLD_MS,
-                STALE_BBO_CANCEL_AFTER_MS,
+                self.config.local_staleness_ms,
+                self.config.stale_bbo_cancel_ms,
             );
             match action {
                 StaleBboAction::Fresh => {
@@ -1470,7 +1467,7 @@ impl InventoryNeutralMM {
                         warn!(
                             "Stale BBO: age={}ms (>{}ms), freezing quotes and waiting for recovery",
                             data_age_ms(market_state.bbo.timestamp_ns, now_ns),
-                            DATA_STALENESS_THRESHOLD_MS
+                            self.config.local_staleness_ms
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1479,7 +1476,7 @@ impl InventoryNeutralMM {
                 StaleBboAction::Cancel => {
                     warn!(
                         "Stale BBO persisted for >{}ms (current age={}ms), canceling all orders",
-                        STALE_BBO_CANCEL_AFTER_MS,
+                        self.config.stale_bbo_cancel_ms,
                         data_age_ms(market_state.bbo.timestamp_ns, now_ns),
                     );
                     self.cancel_all_orders().await;
@@ -1529,7 +1526,7 @@ impl InventoryNeutralMM {
                 && !market_state::is_stale_bbo(
                     bbo.timestamp_ns,
                     now_ns,
-                    DATA_STALENESS_THRESHOLD_MS,
+                    self.config.local_staleness_ms,
                 )
             {
                 self.basis
@@ -1551,7 +1548,7 @@ impl InventoryNeutralMM {
                         !market_state::is_stale_bbo(
                             depth.timestamp_ns,
                             now_ns,
-                            DATA_STALENESS_THRESHOLD_MS,
+                            self.config.local_staleness_ms,
                         )
                     })
                 {

@@ -7,7 +7,6 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
-const TARGET_RESTING_MARGIN_UTILIZATION: f64 = 0.35;
 const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(4);
 const CALM_REQUOTE_MIN_LIFETIME: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone)]
@@ -178,7 +177,7 @@ pub(super) fn utilization_floor_base_order_size(
     }
 
     let top_level_notional_floor =
-        usable_balance * config.max_leverage * TARGET_RESTING_MARGIN_UTILIZATION
+        usable_balance * config.max_leverage * config.target_resting_margin_utilization
             / (2.0 * grid_multiplier.max(1.0));
     base_order_size.max(top_level_notional_floor / mid)
 }
