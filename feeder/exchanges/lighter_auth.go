@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elliottech/lighter-go/signer"
@@ -26,14 +27,13 @@ type LighterAuth struct {
 // LoadLighterAuthFromEnv loads authentication credentials from .env.lighter
 func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	// Load private key (40 bytes hex)
-	privKeyHex := os.Getenv("API_KEY_PRIVATE_KEY")
+	privKeyHex := os.Getenv("LIGHTER_PRIVATE_KEY")
 	if privKeyHex == "" {
-		return nil, fmt.Errorf("API_KEY_PRIVATE_KEY not set in environment")
+		privKeyHex = os.Getenv("API_KEY_PRIVATE_KEY")
 	}
-
-	privKeyBytes, err := hex.DecodeString(privKeyHex)
+	privKeyBytes, err := hex.DecodeString(strings.TrimPrefix(privKeyHex, "0x"))
 	if err != nil {
-		return nil, fmt.Errorf("invalid API_KEY_PRIVATE_KEY hex: %w", err)
+		return nil, fmt.Errorf("invalid Lighter private key encoding")
 	}
 
 	if len(privKeyBytes) != 40 {
@@ -55,6 +55,9 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid LIGHTER_ACCOUNT_INDEX: %w", err)
 	}
+	if accountIndex <= 0 {
+		return nil, fmt.Errorf("LIGHTER_ACCOUNT_INDEX must be positive")
+	}
 
 	// Load API key index
 	apiKeyIndexStr := os.Getenv("LIGHTER_API_KEY_INDEX")
@@ -64,6 +67,9 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	apiKeyIndexInt, err := strconv.Atoi(apiKeyIndexStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid LIGHTER_API_KEY_INDEX: %w", err)
+	}
+	if apiKeyIndexInt < 0 || apiKeyIndexInt > 254 {
+		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX is outside the signing range")
 	}
 	apiKeyIndex := uint8(apiKeyIndexInt)
 

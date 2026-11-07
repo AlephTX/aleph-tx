@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub struct HyperliquidInfo {
     client: Client,
     network: Network,
+    base_url: String,
 }
 
 impl HyperliquidInfo {
@@ -25,13 +26,20 @@ impl HyperliquidInfo {
                 .user_agent("AlephTX/Hyperliquid")
                 .build()?,
             network,
+            base_url: network.base_url().to_owned(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 
     pub(crate) async fn info<T: DeserializeOwned>(&self, query: serde_json::Value) -> Result<T> {
         Ok(self
             .client
-            .post(format!("{}/info", self.network.base_url()))
+            .post(format!("{}/info", self.base_url))
             .json(&query)
             .send()
             .await?
@@ -71,6 +79,21 @@ impl HyperliquidInfo {
     /// Master/subaccount address, never substitute an approved agent's address.
     pub async fn account_state(&self, account_address: &str) -> Result<AccountState> {
         self.account_state_for_dex(account_address, "").await
+    }
+
+    pub async fn validate_agent(&self, signer: &HyperliquidSigner, account: &str) -> Result<()> {
+        validate_hex(account, 20)?;
+        let role: serde_json::Value = self
+            .info(json!({"type": "userRole", "user": signer.address()}))
+            .await?;
+        ensure!(
+            role["role"] == "agent"
+                && role["data"]["user"]
+                    .as_str()
+                    .is_some_and(|user| user.eq_ignore_ascii_case(account)),
+            "Hyperliquid signing key is not an approved agent for the configured account"
+        );
+        Ok(())
     }
 
     pub async fn account_state_for_dex(
@@ -156,6 +179,8 @@ pub struct OpenOrder {
     pub timestamp: u64,
     #[serde(default)]
     pub cloid: Option<String>,
+    #[serde(default, rename = "origSz")]
+    pub original_size: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,7 +303,7 @@ impl HyperliquidTrading {
         let response = self
             .info
             .client
-            .post(format!("{}/exchange", self.info.network.base_url()))
+            .post(format!("{}/exchange", self.info.base_url))
             .json(&request)
             .send()
             .await

@@ -143,36 +143,27 @@ Current Lighter production path:
 ## Quick Start
 
 ```bash
-# 1. Configure (unified config for all exchanges)
 cp config.example.toml config.toml
-# Edit config.toml: set feeder_enabled=true for your exchange
-
-# 2. Set credentials (only private keys/API keys)
-cp .env.lighter.example .env.lighter
-# Fill in your exchange credentials
-
-# 3. Build & Run (always use Makefile)
-make build              # Build Go feeder + Rust core
-make lighter-up         # Start Lighter DEX (or edgex-up, backpack-up)
-make lighter-logs       # Monitor logs
-make lighter-down       # Stop and clean up
+make trade               # Validate the profile offline
+make trade MODE=live     # Linux x86-64, after configuring credentials and risk limits
 ```
 
-See [Configuration Guide](docs/CONFIGURATION.md) for detailed setup.
+The foreground session starts Lighter market making and enables the Hyperliquid inventory hedge when `[inventory_hedge]` is configured. Stop it with Ctrl+C or SIGTERM. Logs go to the terminal. See the [supervised trading runbook](docs/LIVE_TRADING.md) for credentials, testnet and restart handling.
 
 ## Make Targets
 
 | Target | Description |
 |--------|-------------|
 | `make build` | Build all binaries (Go feeder + Rust) |
-| `make lighter-up STRATEGY=<name>` | Start Lighter DEX strategy (default: inventory_neutral_mm) |
-| `make lighter-down` / `lighter-logs` | Stop / view logs for Lighter |
+| `make trade [MODE=live]` | Check the trading profile or start supervised trading |
+| `make lighter-up` | Alias for supervised Lighter trading |
+| `make lighter-down` / `lighter-logs` | Manage the legacy background launcher |
 | `make backpack-up STRATEGY=<name>` | Start Backpack strategy |
 | `make backpack-down` / `backpack-logs` | Stop / view logs for Backpack |
 | `make edgex-up STRATEGY=<name>` | Start EdgeX strategy |
 | `make edgex-down` / `edgex-logs` | Stop / view logs for EdgeX |
 | `make status` | Show all running strategies across exchanges |
-| `make test-up` / `test-down` / `test-logs` | Integration test environment |
+| `make test` | Run Rust tests and Go race tests |
 | `make clean` | Clean build artifacts |
 
 ## Project Structure

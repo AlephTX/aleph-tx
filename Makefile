@@ -3,6 +3,7 @@
 # ============================================================================
 
 .PHONY: help build build-rust build-feeder test test-rust test-go check fmt-check benchmark clean status clean-shm
+.PHONY: trade
 .PHONY: lighter-up lighter-down lighter-logs
 .PHONY: backpack-up backpack-down backpack-logs
 .PHONY: edgex-up edgex-down edgex-logs
@@ -13,6 +14,9 @@ LOG_DIR       ?= logs
 PID_DIR       ?= pids
 BIN_DIR       ?= target/release
 FEEDER_BIN    ?= feeder/feeder-app
+MODE          ?= check
+CONFIG        ?= config.toml
+ENV_FILE      ?= .env.lighter
 SHM_PATHS     ?= /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-events-v2 /dev/shm/aleph-account-stats /dev/shm/aleph-depth
 
 # Colors for terminal output
@@ -30,6 +34,8 @@ help:
 	@echo "$(YELLOW)Build Commands:$(NC)"
 	@echo "  make build          - Compile Rust binaries and Go feeder"
 	@echo "  make build-feeder   - Compile Go feeder only"
+	@echo "  make trade          - Check the trading profile offline"
+	@echo "  make trade MODE=live - Run Lighter with optional Hyperliquid inventory hedge"
 	@echo ""
 	@echo "$(YELLOW)Exchange Commands (<exchange>-up/down/logs):$(NC)"
 	@echo "  Target exchanges: lighter, backpack, edgex"
@@ -63,6 +69,18 @@ fmt-check:
 	cargo fmt --check
 	test -z "$$(cd feeder && gofmt -l .)"
 
+ifeq ($(MODE),live)
+trade: build-feeder
+	cargo build --locked --release --bin lighter_inventory_mm
+	"$(BIN_DIR)/lighter_inventory_mm" --live "$(CONFIG)" "$(ENV_FILE)" "$(FEEDER_BIN)"
+else ifeq ($(MODE),check)
+trade:
+	cargo run --locked --quiet --bin lighter_inventory_mm -- --check "$(CONFIG)"
+else
+trade:
+	@echo "MODE must be check or live" >&2; exit 2
+endif
+
 # Core Build
 build: build-rust build-feeder
 
@@ -86,9 +104,10 @@ clean-shm:
 define exchange_up
 	@echo "$(BLUE)🚀 Starting $(1) - Strategy: $(STRATEGY)$(NC)"
 	@mkdir -p $(LOG_DIR) $(PID_DIR)
-	@# Clean up stale same-exchange processes before starting a fresh session
-	@pgrep -f '(^|/)$(STRATEGY)($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)$(STRATEGY)($$| )' || true
-	@pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)feeder-app($$| )' || true
+	@# Legacy stacks share one IPC namespace. Refuse to start over another feeder.
+	@if pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1; then \
+		echo "A feeder is already running. Stop its strategy and feeder before using the legacy launcher." >&2; exit 1; \
+	fi
 	@rm -f $(PID_DIR)/$(1)-$(STRATEGY).pid $(PID_DIR)/feeder-$(1).pid
 	@make clean-shm
 	@# Build strategy before starting feeder so SHM readiness is checked immediately before launch
@@ -138,7 +157,9 @@ define exchange_down
 			kill -2 $$pid 2>/dev/null || true; \
 			echo "⏳ Waiting for PID $$pid..."; \
 			timeout 30s tail --pid=$$pid -f /dev/null 2>/dev/null || true; \
-			kill -9 $$pid 2>/dev/null || true; \
+			if kill -0 $$pid 2>/dev/null; then \
+				echo "Strategy did not finish cleanup; feeder left running." >&2; exit 1; \
+			fi; \
 			rm -f $$pid_file; \
 		fi; \
 	done
@@ -147,16 +168,17 @@ define exchange_down
 		kill -9 $$(cat $(PID_DIR)/feeder-$(1).pid) 2>/dev/null || true; \
 		rm -f $(PID_DIR)/feeder-$(1).pid; \
 	fi
-	@# Kill orphaned processes left behind by failed starts or stale pid files
-	@pgrep -f '(^|/)$(STRATEGY)($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)$(STRATEGY)($$| )' || true
-	@pgrep -f '(^|/)feeder-app($$| )' >/dev/null 2>&1 && pkill -9 -f '(^|/)feeder-app($$| )' || true
-	@make clean-shm
 	@echo "$(GREEN)✅ $(1) clean stop complete$(NC)"
 endef
 
 # Exchange Targets
+ifeq ($(STRATEGY),lighter_inventory_mm)
+lighter-up:
+	$(MAKE) trade MODE=live CONFIG="$(CONFIG)" ENV_FILE="$(ENV_FILE)"
+else
 lighter-up: build-feeder
 	$(call exchange_up,lighter,.env.lighter)
+endif
 
 lighter-down:
 	$(call exchange_down,lighter)
@@ -166,6 +188,7 @@ lighter-logs:
 
 backpack-up: build-feeder
 	$(call exchange_up,backpack,.env.backpack)
+backpack-up: STRATEGY := $(if $(filter lighter_inventory_mm,$(STRATEGY)),backpack_mm,$(STRATEGY))
 
 backpack-down:
 	$(call exchange_down,backpack)
@@ -175,6 +198,7 @@ backpack-logs:
 
 edgex-up: build-feeder
 	$(call exchange_up,edgex,.env.edgex)
+edgex-up: STRATEGY := $(if $(filter lighter_inventory_mm,$(STRATEGY)),edgex_mm,$(STRATEGY))
 
 edgex-down:
 	$(call exchange_down,edgex)

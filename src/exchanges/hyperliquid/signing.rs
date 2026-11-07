@@ -31,6 +31,12 @@ impl HyperliquidSigner {
         Ok(Self { key })
     }
 
+    pub fn address(&self) -> String {
+        let public_key = self.key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&public_key.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..]))
+    }
+
     pub fn sign_action<T: Serialize>(
         &self,
         action: &T,

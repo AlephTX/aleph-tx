@@ -71,7 +71,7 @@ type Matrix struct {
 
 // NewMatrix creates or opens a shared memory matrix.
 func NewMatrix(name string) (*Matrix, error) {
-	path := "/dev/shm/" + name
+	path := Path(name)
 	shmSize := unsafe.Sizeof(ShmMarketState{})
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)

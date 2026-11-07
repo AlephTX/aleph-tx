@@ -13,6 +13,8 @@ type eventRecorder struct {
 	cancels int
 }
 
+func (r *eventRecorder) PushPrivateStreamLost() {}
+
 func (r *eventRecorder) PushOrderCreatedV2(uint8, uint16, uint64, int64, int64, float64, float64, bool, uint64) {
 }
 func (r *eventRecorder) PushOrderCanceledV2(uint8, uint16, uint64, int64, int64, float64, uint64) {

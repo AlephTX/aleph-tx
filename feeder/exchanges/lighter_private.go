@@ -35,6 +35,7 @@ type privateEventSink interface {
 	PushOrderCreatedV2(uint8, uint16, uint64, int64, int64, float64, float64, bool, uint64)
 	PushOrderFilledV2(uint8, uint16, uint64, int64, int64, float64, float64, float64, float64, bool, uint64, uint64)
 	PushOrderCanceledV2(uint8, uint16, uint64, int64, int64, float64, uint64)
+	PushPrivateStreamLost()
 }
 
 // orderDetail tracks order metadata for V2 events
@@ -182,6 +183,17 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 
 	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-private", c, 15*time.Second, nil)
 	defer stopKeepalive()
+	var refreshDone chan struct{}
+	refreshCtx, stopRefresh := context.WithCancel(ctx)
+	defer func() {
+		stopRefresh()
+		if refreshDone != nil {
+			<-refreshDone
+		}
+		if guard.pending == 0 && ctx.Err() == nil {
+			lp.eventBuffer.PushPrivateStreamLost()
+		}
+	}()
 
 	// Read loop with automatic pong responses
 	for {
@@ -206,6 +218,13 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 
 			if !guard.acceptsData(result) {
 				continue
+			}
+			if lp.statsWriter != nil && guard.pending == 0 && refreshDone == nil {
+				refreshDone = make(chan struct{})
+				go func() {
+					defer close(refreshDone)
+					lp.refreshPosition(refreshCtx)
+				}()
 			}
 			// Process position data. Lighter sometimes sends `"position": null`
 			// between real updates; that must not overwrite the last known

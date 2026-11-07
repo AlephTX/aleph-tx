@@ -14,6 +14,7 @@ const (
 	EventTypeOrderFilled   uint8 = 2
 	EventTypeOrderCanceled uint8 = 3
 	EventTypeOrderRejected uint8 = 4
+	EventTypePrivateLost   uint8 = 5
 )
 
 // Exchange IDs matching Rust constants
@@ -105,7 +106,7 @@ type EventRingBufferV2 struct {
 
 // NewEventRingBufferV2 creates or opens the V2 event ring buffer
 func NewEventRingBufferV2() (*EventRingBufferV2, error) {
-	path := "/dev/shm/aleph-events-v2"
+	path := Path("aleph-events-v2")
 
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT, 0600)
 	if err != nil {
@@ -165,6 +166,10 @@ func (rb *EventRingBufferV2) Push(event ShmPrivateEventV2) {
 }
 
 // ─── V2 Convenience Methods ──────────────────────────────────────────────────
+
+func (rb *EventRingBufferV2) PushPrivateStreamLost() {
+	rb.Push(ShmPrivateEventV2{ExchangeID: ExchangeLighter, EventType: EventTypePrivateLost})
+}
 
 // PushOrderCreatedV2 writes an order created event with full ID information
 func (rb *EventRingBufferV2) PushOrderCreatedV2(
@@ -293,7 +298,7 @@ const (
 )
 
 func NewEventRingBuffer() (*EventRingBuffer, error) {
-	path := "/dev/shm/aleph-events"
+	path := Path("aleph-events")
 
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT, 0600)
 	if err != nil {

@@ -449,7 +449,7 @@ impl ShadowLedger {
                 }
                 self.active_orders.remove(&event.order_id);
             }
-            None => {
+            Some(EventType::PrivateStreamLost) | None => {
                 tracing::warn!("Unknown event type: {}", event.event_type);
                 return Err(TradingError::InvalidEventType(event.event_type));
             }

@@ -7,6 +7,7 @@ pub mod exchange;
 pub mod exchanges;
 pub mod funding_evidence;
 pub mod hedging;
+pub mod live_hedge;
 pub mod order_tracker;
 pub mod shadow_ledger;
 pub mod shm_depth_reader;

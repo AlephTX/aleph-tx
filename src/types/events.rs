@@ -24,6 +24,8 @@ pub enum EventType {
     OrderCanceled = 3,
     /// Order rejected by exchange
     OrderRejected = 4,
+    /// Private websocket disconnected and may have dropped order or fill events.
+    PrivateStreamLost = 5,
 }
 
 impl EventType {
@@ -33,6 +35,7 @@ impl EventType {
             2 => Some(Self::OrderFilled),
             3 => Some(Self::OrderCanceled),
             4 => Some(Self::OrderRejected),
+            5 => Some(Self::PrivateStreamLost),
             _ => None,
         }
     }

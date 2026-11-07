@@ -135,3 +135,13 @@ ema_slow_period = 20
 use_depth_pricing = true
 vol_spread_scale = 0.5
 momentum_skew_scale = 0.3
+
+# Optional Hyperliquid inventory hedge for make trade MODE=live.
+# Review all limits and the account's actual taker fee before enabling this section.
+# [inventory_hedge]
+# max_unhedged_base = "0.02"       # absolute cap per leg and on net base exposure
+# deadband_base = "0.006"          # residual tolerated during the session, in ETH
+# max_order_notional_usd = "25"    # per IOC, evaluated at the book/limit price
+# min_available_usd = "50"         # required Hyperliquid withdrawable balance
+# slippage_bps = 5                 # IOC limit distance from executable touch
+# taker_fee_bps = 4.5              # use the configured account's actual fee

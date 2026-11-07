@@ -40,7 +40,7 @@ func main() {
 		log.Fatalf("shm: %v", err)
 	}
 	defer matrix.Close()
-	log.Printf("📡 Shared matrix: /dev/shm/%s (~656 KB)", shmName)
+	log.Printf("📡 Shared matrix: %s (~656 KB)", shm.Path(shmName))
 
 	// Create V1 event ring buffer for backward compatibility (~64 KB)
 	eventBuffer, err := shm.NewEventRingBuffer()
@@ -48,7 +48,7 @@ func main() {
 		log.Fatalf("event ring buffer: %v", err)
 	}
 	defer eventBuffer.Close()
-	log.Printf("📡 Event ring buffer V1: /dev/shm/aleph-events (~64 KB)")
+	log.Printf("📡 Event ring buffer V1: %s (~64 KB)", shm.Path("aleph-events"))
 
 	// Create V2 event ring buffer for per-order tracking (~128 KB)
 	eventBufferV2, err := shm.NewEventRingBufferV2()
@@ -56,7 +56,7 @@ func main() {
 		log.Fatalf("event ring buffer v2: %v", err)
 	}
 	defer eventBufferV2.Close()
-	log.Printf("📡 Event ring buffer V2: /dev/shm/aleph-events-v2 (~128 KB)")
+	log.Printf("📡 Event ring buffer V2: %s (~128 KB)", shm.Path("aleph-events-v2"))
 
 	// Create account stats shared memory (~128 bytes)
 	accountStats, err := shm.NewAccountStatsWriter("aleph-account-stats")
@@ -64,15 +64,15 @@ func main() {
 		log.Fatalf("account stats: %v", err)
 	}
 	defer accountStats.Close()
-	log.Printf("📡 Account stats: /dev/shm/aleph-account-stats (~128 bytes)")
+	log.Printf("📡 Account stats: %s (~128 bytes)", shm.Path("aleph-account-stats"))
 
 	// Create depth writer for OBI+VWMicro pricing (~3 MB)
-	depthWriter, err := shm.NewDepthWriter("/dev/shm/aleph-depth", 2048)
+	depthWriter, err := shm.NewDepthWriter(shm.Path("aleph-depth"), 2048)
 	if err != nil {
 		log.Fatalf("depth writer: %v", err)
 	}
 	defer depthWriter.Close()
-	log.Printf("📡 Depth writer: /dev/shm/aleph-depth (~3 MB)")
+	log.Printf("📡 Depth writer: %s (~3 MB)", shm.Path("aleph-depth"))
 
 	var wg sync.WaitGroup
 

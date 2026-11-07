@@ -1,160 +1,175 @@
-//! Inventory-Neutral Market Maker Example
-//!
-//! Production-ready HFT strategy with asymmetric order sizing for inventory control.
-//! v5.0.0: Uses OrderTracker (per-order state machine) instead of ShadowLedger.
+//! Lighter inventory market maker and supervised trading entry point.
+
+#[path = "lighter_inventory_mm/session.rs"]
+mod session;
 
 use aleph_tx::account_stats_reader::AccountStatsReader;
-use aleph_tx::config::{AppConfig, symbol_name};
-use aleph_tx::lighter_trading::LighterTrading;
+use aleph_tx::config::{InventoryNeutralMMConfig, symbol_name};
+use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
+use aleph_tx::shm_depth_reader::ShmDepthReader;
 use aleph_tx::shm_event_reader::ShmEventReaderV2;
 use aleph_tx::shm_reader::ShmReader;
 use aleph_tx::strategy::inventory_neutral_mm::InventoryNeutralMM;
+use aleph_tx::types::events::EventType;
+use anyhow::{Context, Result, bail};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
+use tracing_subscriber::EnvFilter;
 
-const SHM_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-const SHM_WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-
-async fn wait_for_resource<T, E, F>(
-    label: &str,
-    path: &str,
-    mut open_fn: F,
-) -> Result<T, Box<dyn std::error::Error>>
-where
-    F: FnMut() -> Result<T, E>,
-    E: ToString,
-{
+async fn wait_for_resource<T>(path: &Path, open: impl Fn(&str) -> Result<T>) -> Result<T> {
     let start = std::time::Instant::now();
-
+    let path = path.to_str().context("Shared-memory path must be UTF-8")?;
     loop {
-        match open_fn() {
-            Ok(resource) => {
-                if start.elapsed() > Duration::from_secs(0) {
-                    tracing::info!(
-                        "Opened {} after waiting {} ms: {}",
-                        label,
-                        start.elapsed().as_millis(),
-                        path
-                    );
-                }
-                return Ok(resource);
+        match open(path) {
+            Ok(value) => return Ok(value),
+            Err(error) if start.elapsed() >= Duration::from_secs(15) => {
+                return Err(error.context(format!("Timed out waiting for {path}")));
             }
-            Err(err) => {
-                let err_msg = err.to_string();
-                if start.elapsed() >= SHM_WAIT_TIMEOUT {
-                    return Err(format!(
-                        "Timed out waiting for {} at {} after {}s: {}",
-                        label,
-                        path,
-                        SHM_WAIT_TIMEOUT.as_secs(),
-                        err_msg
-                    )
-                    .into());
-                }
-            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
         }
-
-        if start.elapsed().as_millis() % 1000 < SHM_WAIT_RETRY_INTERVAL.as_millis() {
-            tracing::info!("Waiting for {}: {}", label, path);
-        }
-        tokio::time::sleep(SHM_WAIT_RETRY_INTERVAL).await;
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info,aleph_tx=debug")
-        .init();
-
-    tracing::info!("🚀 Inventory-Neutral Market Maker (v5.0.0)");
-
-    // Load configuration
-    let config = AppConfig::load_default()?;
-    let strategy_config = config
-        .inventory_neutral_mm
-        .ok_or("inventory_neutral_mm config not found in config.toml")?;
-    tracing::info!(
-        "Exchange ID: {}, Symbol ID: {} ({}), Market ID: {}",
-        strategy_config.exchange_id,
-        strategy_config.symbol_id,
-        symbol_name(strategy_config.symbol_id),
-        strategy_config.market_id
-    );
-
-    // Initialize OrderTracker (v5.0.0 per-order state machine)
-    let order_tracker = Arc::new(OrderTracker::new());
-
-    // Consume private V2 events so the tracker receives order_index / fills / cancels.
-    let mut event_reader = wait_for_resource("event stream", "/dev/shm/aleph-events-v2", || {
-        ShmEventReaderV2::new_default()
-    })
-    .await?;
+async fn connect_strategy(
+    config: InventoryNeutralMMConfig,
+    mut trading: LighterTrading,
+    ipc: &Path,
+) -> Result<(InventoryNeutralMM, Arc<LighterTrading>)> {
+    let events = ipc.join("aleph-events-v2");
+    let market = ipc.join("aleph-matrix");
+    let stats = ipc.join("aleph-account-stats");
+    let depth = ipc.join("aleph-depth");
+    let (mut event_reader, shm_reader, account_reader, depth_reader) = tokio::try_join!(
+        wait_for_resource(&events, |path| Ok(ShmEventReaderV2::new(path)?)),
+        wait_for_resource(&market, |path| ShmReader::open(path, 2048)),
+        wait_for_resource(&stats, |path| Ok(AccountStatsReader::open(path)?)),
+        async {
+            if config.use_depth_pricing {
+                Ok(Some(
+                    wait_for_resource(&depth, |path| Ok(ShmDepthReader::open(path, 2048)?)).await?,
+                ))
+            } else {
+                Ok(None)
+            }
+        },
+    )?;
     event_reader.skip_to_end();
-    let order_tracker_for_events = Arc::clone(&order_tracker);
+    let tracker = Arc::new(OrderTracker::new());
+    let event_tracker = Arc::clone(&tracker);
+    let (exchange_id, symbol_id) = (config.exchange_id, config.symbol_id);
     tokio::spawn(async move {
         loop {
             if event_reader.write_idx() < event_reader.local_read_idx() {
                 event_reader.skip_to_end();
-                order_tracker_for_events.reset_event_sequence();
+                event_tracker.reset_event_sequence();
             }
             let mut processed = false;
             while let Some(event) = event_reader.try_read() {
                 processed = true;
-                if let Err(err) = order_tracker_for_events.apply_event(&event) {
-                    order_tracker_for_events.require_reconciliation();
-                    tracing::warn!("Failed to apply V2 event seq={}: {}", event.sequence, err);
+                if event.exchange_id != exchange_id
+                    || (event.symbol_id != symbol_id
+                        && event.event_type() != Some(EventType::PrivateStreamLost))
+                {
+                    event_tracker.require_reconciliation();
+                    tracing::error!(
+                        sequence = event.sequence,
+                        "Private event market does not match the strategy"
+                    );
+                    continue;
+                }
+                if let Err(error) = event_tracker.apply_event(&event) {
+                    // apply_event already marks the reconciliation epoch.
+                    tracing::warn!(sequence=event.sequence, %error, "Failed to apply private event");
                 }
             }
-
             if event_reader.take_integrity_loss() {
-                order_tracker_for_events.require_reconciliation();
+                event_tracker.require_reconciliation();
             }
             if !processed {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     });
-
-    // Connect to SHM
-    let shm_reader = wait_for_resource("market matrix", "/dev/shm/aleph-matrix", || {
-        ShmReader::open("/dev/shm/aleph-matrix", 2048)
-    })
-    .await?;
-    let account_stats_reader =
-        wait_for_resource("account stats", "/dev/shm/aleph-account-stats", || {
-            AccountStatsReader::open("/dev/shm/aleph-account-stats")
-        })
-        .await?;
-
-    // Initialize Lighter Trading API
-    let mut trading = LighterTrading::new(strategy_config.market_id).await?;
-    trading.validate_precision(strategy_config.tick_size, strategy_config.step_size)?;
-    trading.set_order_tracker(Arc::clone(&order_tracker));
-    trading.set_post_only(strategy_config.use_post_only);
+    trading.set_order_tracker(Arc::clone(&tracker));
+    trading.set_post_only(config.use_post_only);
     let trading = Arc::new(trading);
-
-    // Initialize Strategy
-    let mut strategy = InventoryNeutralMM::new(
-        strategy_config,
-        trading,
-        order_tracker,
+    let strategy = InventoryNeutralMM::with_data_sources(
+        config,
+        Arc::clone(&trading) as _,
+        tracker,
         shm_reader,
-        account_stats_reader,
+        account_reader,
+        depth_reader,
     );
+    Ok((strategy, trading))
+}
 
-    // Graceful shutdown
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.as_slice() {
+        [flag, path] if flag == "--check" => {
+            let profile = session::Profile::load(Path::new(path))?;
+            println!(
+                "Configuration OK: Lighter {} market {}, Hyperliquid hedge {}",
+                symbol_name(profile.strategy.symbol_id),
+                profile.strategy.market_id,
+                if profile.has_hedge() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            Ok(())
+        }
+        [flag, path, dotenv, feeder] if flag == "--live" => {
+            let profile = session::Profile::load(Path::new(path))?;
+            session::launch(profile, Path::new(dotenv), Path::new(feeder)).await
+        }
+        [] => run_existing_feeder().await,
+        _ => bail!("Usage: lighter_inventory_mm --check CONFIG | --live CONFIG DOTENV FEEDER"),
+    }
+}
+
+// Keep the established standalone entry for an externally managed feeder.
+async fn run_existing_feeder() -> Result<()> {
+    session::require_platform()?;
+    let profile = session::Profile::load(Path::new("config.toml"))?;
+    anyhow::ensure!(
+        !profile.has_hedge(),
+        "Use make trade MODE=live for the inventory hedge"
+    );
+    let config = profile.strategy;
+    let credentials = LighterCredentials::from_env(|key| std::env::var(key).ok())?;
+    let network = credentials.network()?;
+    anyhow::ensure!(
+        profile.network == network,
+        "Lighter feeder and signer must use the same network"
+    );
+    let _lock = session::lock_account(&credentials, network)?;
+    anyhow::ensure!(
+        !Path::new("pids/aleph-trade.active.jsonl").try_exists()?,
+        "Previous supervised trading session still requires reconciliation"
+    );
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let (stop, shutdown) = watch::channel(false);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("🛑 Ctrl+C received, shutting down...");
-        let _ = shutdown_tx.send(true);
+        tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
+        let _ = stop.send(true);
     });
-
-    strategy.run(Some(shutdown_rx)).await?;
-
-    tracing::info!("✅ Strategy shutdown complete");
-    Ok(())
+    let trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
+    trading.validate_symbol(symbol_name(config.symbol_id))?;
+    trading.validate_precision(config.tick_size, config.step_size)?;
+    let (mut strategy, _) = connect_strategy(config, trading, Path::new("/dev/shm")).await?;
+    strategy.run(Some(shutdown)).await
 }

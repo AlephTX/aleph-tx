@@ -64,12 +64,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("🛑 Ctrl+C received — shutting down gracefully...");
                 break;
             }
-            Ok(update) = bbo_rx.recv_async() => {
-                // Process BBO update from data plane thread
-                if update.bbo.bid_price > 0.0 && update.bbo.ask_price > 0.0 {
-                    for strategy in strategies.iter_mut() {
-                        strategy.on_bbo_update(update.symbol_id, update.exchange_id, &update.bbo);
-                    }
+            update = bbo_rx.recv_async() => {
+                let Ok(update) = update else {
+                    tracing::error!("Market data thread stopped");
+                    break;
+                };
+                for strategy in strategies.iter_mut() {
+                    strategy.on_bbo_update(update.symbol_id, update.exchange_id, &update.bbo);
                 }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(1)) => {

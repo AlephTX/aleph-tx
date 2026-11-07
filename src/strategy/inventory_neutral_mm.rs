@@ -14,8 +14,8 @@
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
 use crate::config::InventoryNeutralMMConfig;
-use crate::error::TradingError;
-use crate::exchange::{BatchAction, Exchange, Side};
+use crate::exchange::{BatchAction, Exchange, OrderType, Side};
+use crate::live_hedge::{LiveInventoryHedge, QuoteAllowance};
 use crate::order_tracker::{OrderLifecycle, OrderSide, OrderTracker};
 use crate::shm_reader::{NUM_EXCHANGES, ShmBboMessage, ShmReader};
 use crate::telemetry::TelemetryCollector;
@@ -314,6 +314,7 @@ pub struct InventoryNeutralMM {
 
     trading: Arc<dyn Exchange>,
     order_tracker: Arc<OrderTracker>,
+    hedge: Option<LiveInventoryHedge>,
     shm_reader: ShmReader,
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
     account_stats_reader: AccountStatsReader,
@@ -361,10 +362,26 @@ impl InventoryNeutralMM {
         shm_reader: ShmReader,
         account_stats_reader: AccountStatsReader,
     ) -> Self {
-        // Try to open depth reader (optional, for OBI+VWMicro pricing)
         let shm_depth_reader =
             crate::shm_depth_reader::ShmDepthReader::open("/dev/shm/aleph-depth", 2048).ok();
+        Self::with_data_sources(
+            config,
+            trading,
+            order_tracker,
+            shm_reader,
+            account_stats_reader,
+            shm_depth_reader,
+        )
+    }
 
+    pub fn with_data_sources(
+        config: InventoryNeutralMMConfig,
+        trading: Arc<dyn Exchange>,
+        order_tracker: Arc<OrderTracker>,
+        shm_reader: ShmReader,
+        account_stats_reader: AccountStatsReader,
+        shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
+    ) -> Self {
         if shm_depth_reader.is_some() {
             info!("📊 OBI+VWMicro pricing enabled (depth reader initialized)");
         } else {
@@ -382,6 +399,7 @@ impl InventoryNeutralMM {
             config,
             trading,
             order_tracker,
+            hedge: None,
             shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
@@ -403,27 +421,38 @@ impl InventoryNeutralMM {
         }
     }
 
+    pub fn with_inventory_hedge(mut self, hedge: LiveInventoryHedge) -> Self {
+        self.hedge = Some(hedge);
+        self
+    }
+
     pub async fn run(
         &mut self,
-        mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> anyhow::Result<()> {
         self.config.validate()?;
         info!("🎯 Inventory-Neutral MM started (Institutional Mode)");
 
-        // Phase 0: Startup Cleanup & State Sync
-        self.perform_startup_initialization()
-            .await
-            .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+        if shutdown_requested(shutdown.as_ref()) {
+            return Ok(());
+        }
+        self.perform_startup_initialization().await?;
 
+        let result = self.quote_until_stopped(shutdown.as_ref()).await;
+        let cleanup = self.perform_graceful_shutdown().await;
+        match (result, cleanup) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(run), Err(stop)) => Err(run.context(format!("Shutdown also failed: {stop:#}"))),
+        }
+    }
+
+    async fn quote_until_stopped(
+        &mut self,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
         info!("🚀 Starting main execution loop...");
         while self.is_running.load(Ordering::SeqCst) {
-            // 0. Check shutdown signal
-            if let Some(ref mut rx) = shutdown
-                && *rx.borrow()
-            {
-                self.perform_graceful_shutdown()
-                    .await
-                    .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
+            if shutdown_requested(shutdown) {
                 return Ok(());
             }
 
@@ -433,12 +462,23 @@ impl InventoryNeutralMM {
             }
 
             if self.order_tracker.needs_reconciliation() {
+                anyhow::ensure!(
+                    self.hedge.is_none(),
+                    "Lighter event stream requires reconciliation"
+                );
                 self.clean_exchange_state("event-stream recovery").await?;
             }
             if !self.account_stats.is_usable() {
                 warn!("Account equity/position snapshot unavailable or stale; withdrawing quotes");
                 self.cancel_all_and_sync("stale account snapshot").await;
+                if let Some(hedge) = &mut self.hedge {
+                    hedge.check_blocked(true)?;
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            if !self.prepare_inventory_hedge().await? {
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
 
@@ -457,10 +497,7 @@ impl InventoryNeutralMM {
                         self.session_start_balance,
                         self.account_stats.portfolio_value
                     );
-                    self.perform_graceful_shutdown()
-                        .await
-                        .map_err(|e| TradingError::OrderFailed(e.to_string()))?;
-                    return Ok(());
+                    anyhow::bail!("Lighter session loss limit breached");
                 }
             }
 
@@ -545,7 +582,7 @@ impl InventoryNeutralMM {
             } else if let Some((our_bid, our_ask)) =
                 self.calculate_optimal_quotes(&inputs, quoting_position)
             {
-                self.execute_quoting_cycle(our_bid, our_ask, quoting_position, inputs.mid)
+                self.execute_quoting_cycle(our_bid, our_ask, inputs.mid, shutdown)
                     .await;
             } else {
                 self.cancel_all_orders().await;
@@ -555,6 +592,36 @@ impl InventoryNeutralMM {
         }
 
         Ok(())
+    }
+
+    fn quote_allowance(&self, confirmed: f64, short: f64, long: f64) -> Option<QuoteAllowance> {
+        let allowance = self.hedge.as_ref()?.allowance()?;
+        let tolerance = 0.5e-8; // Half of the order tracker's base-unit precision.
+        let (low, high) = allowance.bounds();
+        ((allowance.primary - self.account_stats.position).abs() < tolerance
+            && (allowance.primary - confirmed).abs() < tolerance
+            && short >= low
+            && long <= high)
+            .then_some(allowance)
+    }
+
+    async fn prepare_inventory_hedge(&mut self) -> anyhow::Result<bool> {
+        let Some(hedge) = &mut self.hedge else {
+            return Ok(true);
+        };
+        hedge.poll().await?;
+        let (confirmed, short, long) = self.order_tracker.exposure_bounds();
+        let blocked = self.quote_allowance(confirmed, short, long).is_none();
+        if blocked
+            && self.cancel_all_and_sync("inventory hedge").await
+            && let Some(hedge) = &mut self.hedge
+        {
+            hedge.rebalance().await?;
+        }
+        if let Some(hedge) = &mut self.hedge {
+            hedge.check_blocked(blocked)?;
+        }
+        Ok(!blocked)
     }
 
     /// Startup sequence: cancel orders, sync state, and perform initial initialization
@@ -588,7 +655,7 @@ impl InventoryNeutralMM {
         let exchange_position = self.account_stats.position;
         // Quote direction should follow confirmed inventory, not pending-order imbalance.
         // Pending buy/sell exposure is still enforced via worst_case_long/short in risk limits.
-        let tracker_confirmed = self.order_tracker.confirmed_position();
+        let (tracker_confirmed, tracker_short, tracker_long) = self.order_tracker.exposure_bounds();
         let mut base_order_size = components::round_down_to_step(
             scaled_base_order_size(&self.config, self.account_stats.portfolio_value, mid)
                 .max(self.config.step_size),
@@ -654,10 +721,8 @@ impl InventoryNeutralMM {
             position_for_quoting,
             // A lagging account snapshot must not erase a more recent fill.
             // Reserve exposure against both observed positions until reconciled.
-            worst_case_long: self.order_tracker.worst_case_long()
-                + (exchange_position - tracker_confirmed).max(0.0),
-            worst_case_short: self.order_tracker.worst_case_short()
-                + (exchange_position - tracker_confirmed).min(0.0),
+            worst_case_long: tracker_long + (exchange_position - tracker_confirmed).max(0.0),
+            worst_case_short: tracker_short + (exchange_position - tracker_confirmed).min(0.0),
             base_order_size,
             max_position,
             inventory_urgency_threshold,
@@ -681,7 +746,7 @@ impl InventoryNeutralMM {
         self.telemetry
             .update_adverse_selection(self.micro.adverse_selection_score());
 
-        let min_spread_bps = self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps;
+        let min_spread_bps = self.minimum_spread_bps();
         if spread_bps < min_spread_bps {
             debug!(
                 "Skipping quote target: spread_bps={:.2} below min_spread_bps={:.2}",
@@ -706,6 +771,15 @@ impl InventoryNeutralMM {
             bid_size,
             ask_size,
         })
+    }
+
+    fn minimum_spread_bps(&self) -> f64 {
+        self.config.maker_fee_bps * 2.0
+            + self.config.min_profit_bps
+            + self
+                .hedge
+                .as_ref()
+                .map_or(0.0, LiveInventoryHedge::round_trip_cost_bps)
     }
 
     /// Calculate asymmetric order sizes to neutralize inventory
@@ -865,6 +939,9 @@ impl InventoryNeutralMM {
         info!("🛑 Graceful shutdown initiated...");
         self.is_running.store(false, Ordering::SeqCst);
         self.clean_exchange_state("shutdown").await?;
+        if let Some(hedge) = &mut self.hedge {
+            hedge.finish().await?;
+        }
         info!("👋 Strategy stopped cleanly.");
         Ok(())
     }
@@ -937,7 +1014,7 @@ impl InventoryNeutralMM {
                 continue;
             }
             self.read_confirmed_account_stats().await?;
-            if self.account_stats.position.abs() < self.config.step_size {
+            if self.account_stats.position == 0.0 {
                 // Only this independently confirmed empty-book + position barrier
                 // may release reservations after an event gap or uncertain cancel.
                 anyhow::ensure!(
@@ -1388,7 +1465,7 @@ impl InventoryNeutralMM {
             + (2.0 / gamma_safe) * (gamma_safe / kappa).ln_1p();
         let half_spread_raw = optimal_spread / 2.0 * inputs.pricing_mid;
 
-        let fee_floor_bps = self.config.maker_fee_bps * 2.0 + self.config.min_profit_bps;
+        let fee_floor_bps = self.minimum_spread_bps();
         let vol_cap_bps = (inputs.vol_bps * 4.0)
             .clamp(8.0, 40.0)
             .max(fee_floor_bps)
@@ -1449,10 +1526,13 @@ impl InventoryNeutralMM {
         &mut self,
         our_bid: f64,
         our_ask: f64,
-        _position: f64,
         mid: f64,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) {
         self.reconcile_after_new_fill_if_needed().await;
+        if shutdown_requested(shutdown) {
+            return;
+        }
         self.refresh_active_orders_from_tracker();
 
         let risk = self.build_risk_snapshot(mid);
@@ -1599,9 +1679,20 @@ impl InventoryNeutralMM {
 
         let mut actions = Vec::new();
         let mut pending_cancel_ids = Vec::new();
+        let (confirmed, short, long) = self.order_tracker.exposure_bounds();
+        let allowance = self.quote_allowance(confirmed, short, long);
+        if self.hedge.is_some() && allowance.is_none() {
+            self.cancel_all_and_sync("expired hedge allowance").await;
+            return;
+        }
 
         pending_cancel_ids.extend(self.prepare_side_actions(&bid_plan, &mut actions));
         pending_cancel_ids.extend(self.prepare_side_actions(&ask_plan, &mut actions));
+        if let Some(allowance) = allowance {
+            allowance.cap_batch(&mut actions, short, long, self.config.step_size, |price| {
+                components::min_quotable_size(&self.config, price)
+            });
+        }
 
         if !actions.is_empty() {
             match self.trading.execute_batch(actions).await {
@@ -1660,8 +1751,7 @@ impl InventoryNeutralMM {
         }
     }
 
-    /// Submit a reduce-only marketable limit for expired inventory. A crossed
-    /// limit can still remain unfilled; retry until account/fill data confirms flat.
+    /// Submit a reduce-only IOC for expired inventory and wait for confirmation.
     async fn execute_timeout_flatten(&mut self, mid: f64) {
         if !self.cancel_all_and_sync("position-timeout flatten").await {
             return;
@@ -1685,13 +1775,13 @@ impl InventoryNeutralMM {
             // Long: sell aggressively below mid
             (
                 crate::exchange::Side::Sell,
-                ((mid - slippage) / self.config.tick_size).floor() * self.config.tick_size,
+                ((mid - slippage) / self.config.tick_size).ceil() * self.config.tick_size,
             )
         } else {
             // Short: buy aggressively above mid
             (
                 crate::exchange::Side::Buy,
-                ((mid + slippage) / self.config.tick_size).ceil() * self.config.tick_size,
+                ((mid + slippage) / self.config.tick_size).floor() * self.config.tick_size,
             )
         };
 
@@ -1704,14 +1794,14 @@ impl InventoryNeutralMM {
             side,
             size,
             price,
-            order_type: crate::exchange::OrderType::Limit,
+            order_type: OrderType::Ioc,
             reduce_only: true,
         });
 
         match self.trading.execute_batch(vec![action]).await {
             Ok(result) => {
                 info!(
-                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (Limit cross-spread), tx={}",
+                    "⏰ Timeout flatten submitted: {} {:.4} @ {:.2} (IOC), tx={}",
                     side,
                     size,
                     price,
@@ -1792,6 +1882,10 @@ impl InventoryNeutralMM {
     ) -> (f64, f64) {
         apply_risk_limits(config, risk, desired_bid_size, desired_ask_size, mid)
     }
+}
+
+fn shutdown_requested(shutdown: Option<&tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown.is_some_and(|rx| *rx.borrow())
 }
 
 #[cfg(test)]

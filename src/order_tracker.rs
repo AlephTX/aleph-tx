@@ -374,6 +374,22 @@ impl OrderTracker {
                 .sum::<f64>()
     }
 
+    /// One consistent snapshot across both sides and confirmed fills.
+    pub fn exposure_bounds(&self) -> (f64, f64, f64) {
+        let state = self.state.read();
+        let confirmed = self.confirmed_position();
+        let (mut short, mut long) = (confirmed, confirmed);
+        for order in state.active_orders.values() {
+            if order.lifecycle.has_pending_exposure() {
+                match order.side {
+                    OrderSide::Buy => long += order.remaining_size(),
+                    OrderSide::Sell => short -= order.remaining_size(),
+                }
+            }
+        }
+        (confirmed, short, long)
+    }
+
     /// Debug: Verify atomic exposure matches locked traversal.
     /// NOTE: Not linearizable — TOCTOU window between locked and atomic reads.
     /// False positives possible under concurrent mutation. Use only for diagnostics.
@@ -767,7 +783,7 @@ impl OrderTracker {
             event.sequence <= i64::MAX as u64,
             "event sequence out of range"
         );
-        anyhow::ensure!((1..=4).contains(&event.event_type), "invalid event type");
+        anyhow::ensure!((1..=5).contains(&event.event_type), "invalid event type");
         anyhow::ensure!(event.is_ask <= 1, "invalid event side");
         anyhow::ensure!(
             event.remaining_size.is_finite()
@@ -815,6 +831,7 @@ impl OrderTracker {
             2 => self.handle_order_filled(event)?,
             3 => self.handle_order_canceled(event)?,
             4 => self.handle_order_rejected(event)?,
+            5 => self.require_reconciliation(),
             _ => unreachable!("validated above"),
         }
         self.last_sequence

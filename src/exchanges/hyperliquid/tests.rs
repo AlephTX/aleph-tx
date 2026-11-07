@@ -10,6 +10,15 @@ use std::sync::atomic::AtomicU64;
 const SDK_TEST_KEY: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";
 const CLOID: &str = "0x00000000000000000000000000000001";
 
+#[test]
+fn approved_agent_lookup_uses_the_ethereum_address() {
+    let key = format!("{:064x}", 1);
+    assert_eq!(
+        HyperliquidSigner::from_private_key(&key).unwrap().address(),
+        "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+    );
+}
+
 fn decimal(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
 }

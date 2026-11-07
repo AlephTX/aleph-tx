@@ -103,6 +103,7 @@ pub struct Position {
 /// 账户信息
 #[derive(Debug, Deserialize)]
 struct AccountInfo {
+    index: i64,
     positions: Vec<Position>,
 }
 
@@ -110,6 +111,74 @@ struct AccountInfo {
 struct AccountsResponse {
     code: i32,
     accounts: Vec<AccountInfo>,
+}
+
+#[derive(Deserialize)]
+struct MarketDetail {
+    market_id: u32,
+    symbol: String,
+    market_type: String,
+    status: String,
+    size_decimals: u8,
+    price_decimals: u8,
+}
+
+pub struct LighterCredentials {
+    base_url: String,
+    private_key: String,
+    chain_id: i32,
+    api_key_index: i64,
+    account_index: i64,
+}
+
+impl LighterCredentials {
+    pub fn account_index(&self) -> i64 {
+        self.account_index
+    }
+
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let required = |key| {
+            get(key)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{key} is required"))
+        };
+        let private_key =
+            required("LIGHTER_PRIVATE_KEY").or_else(|_| required("API_KEY_PRIVATE_KEY"))?;
+        let private_key = private_key.strip_prefix("0x").unwrap_or(&private_key);
+        anyhow::ensure!(
+            private_key.len() == 80 && private_key.bytes().all(|c| c.is_ascii_hexdigit()),
+            "Lighter API private key must be 40 bytes in hex"
+        );
+        let account_index = required("LIGHTER_ACCOUNT_INDEX")?.parse()?;
+        let api_key_index = required("LIGHTER_API_KEY_INDEX")?.parse()?;
+        anyhow::ensure!(
+            account_index > 0 && (0..=254).contains(&api_key_index),
+            "Invalid Lighter account or API key index"
+        );
+        Ok(Self {
+            base_url: get("LIGHTER_BASE_URL")
+                .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai".into())
+                .trim_end_matches('/')
+                .to_owned(),
+            private_key: private_key.to_owned(),
+            chain_id: get("LIGHTER_CHAIN_ID")
+                .unwrap_or_else(|| "304".into())
+                .parse()?,
+            account_index,
+            api_key_index,
+        })
+    }
+
+    pub fn network(&self) -> Result<crate::exchanges::hyperliquid::Network> {
+        use crate::exchanges::hyperliquid::Network;
+        match (self.base_url.as_str(), self.chain_id) {
+            ("https://mainnet.zklighter.elliot.ai", 304) => Ok(Network::Mainnet),
+            ("https://testnet.zklighter.elliot.ai", 300) => Ok(Network::Testnet),
+            _ => anyhow::bail!(
+                "Lighter REST endpoint and chain ID must identify the same supported network"
+            ),
+        }
+    }
 }
 
 /// Cancellation-safe submission guard. Dropping an in-flight HTTP future must
@@ -153,6 +222,7 @@ pub struct LighterTrading {
     account_index: i64,
     api_key_index: i64,
     market_id: u8,
+    market_symbol: String,
     size_multiplier: f64,
     price_multiplier: f64,
     /// Serialize nonce allocation, signing and submission across all writers.
@@ -164,6 +234,7 @@ pub struct LighterTrading {
     order_tracker: Option<Arc<OrderTracker>>,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
+    quote_expiry: Option<Duration>,
 }
 
 #[async_trait]
@@ -248,25 +319,53 @@ impl Exchange for LighterTrading {
 }
 
 impl LighterTrading {
+    #[cfg(test)]
+    pub(crate) fn offline_test_client(base_url: &str) -> Self {
+        Self {
+            signer: Arc::new(super::ffi::LighterSigner::offline_for_test()),
+            client: Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap(),
+            base_url: base_url.to_owned(),
+            send_tx_url: format!("{base_url}/api/v1/sendTx"),
+            send_tx_batch_url: format!("{base_url}/api/v1/sendTxBatch"),
+            account_index: 0,
+            api_key_index: 0,
+            market_id: 0,
+            market_symbol: "ETH".into(),
+            size_multiplier: 1e6,
+            price_multiplier: 100.0,
+            submission_lock: TokioMutex::new(()),
+            nonce: AtomicI64::new(0),
+            nonce_init: TokioMutex::new(false),
+            client_order_counter: AtomicI64::new(43),
+            order_tracker: None,
+            limit_order_type: OrderType::PostOnly,
+            quote_expiry: None,
+        }
+    }
+
     /// 创建交易客户端
     ///
     /// `market_id`: 市场索引 (0 = ETH perps)
     /// 自动从 orderBookDetails 获取价格/大小精度
     pub async fn new(market_id: u8) -> Result<Self> {
-        let base_url = std::env::var("LIGHTER_BASE_URL")
-            .unwrap_or_else(|_| "https://mainnet.zklighter.elliot.ai".to_string());
-        let private_key = std::env::var("LIGHTER_PRIVATE_KEY")
-            .or_else(|_| std::env::var("API_KEY_PRIVATE_KEY"))
-            .map_err(|_| anyhow::anyhow!("LIGHTER_PRIVATE_KEY or API_KEY_PRIVATE_KEY not set"))?;
-        let chain_id: i32 = std::env::var("LIGHTER_CHAIN_ID")
-            .unwrap_or_else(|_| "304".to_string())
-            .parse()?;
-        let api_key_index: i64 = std::env::var("LIGHTER_API_KEY_INDEX")
-            .map_err(|_| anyhow::anyhow!("LIGHTER_API_KEY_INDEX not set"))?
-            .parse()?;
-        let account_index: i64 = std::env::var("LIGHTER_ACCOUNT_INDEX")
-            .map_err(|_| anyhow::anyhow!("LIGHTER_ACCOUNT_INDEX not set"))?
-            .parse()?;
+        Self::with_credentials(
+            market_id,
+            LighterCredentials::from_env(|key| std::env::var(key).ok())?,
+        )
+        .await
+    }
+
+    pub async fn with_credentials(market_id: u8, credentials: LighterCredentials) -> Result<Self> {
+        let LighterCredentials {
+            base_url,
+            private_key,
+            chain_id,
+            api_key_index,
+            account_index,
+        } = credentials;
 
         let signer = Arc::new(
             super::ffi::LighterSigner::new(
@@ -284,16 +383,23 @@ impl LighterTrading {
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .user_agent("AlephTX/5.0")
             .build()?;
 
         // orderBookDetails occasionally returns transient transport errors at
         // startup; retry a few times instead of aborting the whole strategy.
-        let (size_decimals, price_decimals) =
-            Self::fetch_market_decimals_with_retry(&client, &base_url, market_id).await?;
+        let MarketDetail {
+            symbol: market_symbol,
+            size_decimals,
+            price_decimals,
+            ..
+        } = Self::fetch_market_with_retry(&client, &base_url, market_id).await?;
         tracing::info!(
-            "Market {} decimals: size={} price={}",
+            "Market {} ({}) decimals: size={} price={}",
             market_id,
+            market_symbol,
             size_decimals,
             price_decimals
         );
@@ -317,6 +423,7 @@ impl LighterTrading {
             account_index,
             api_key_index,
             market_id,
+            market_symbol,
             size_multiplier,
             price_multiplier,
             submission_lock: TokioMutex::new(()),
@@ -325,20 +432,21 @@ impl LighterTrading {
             client_order_counter: AtomicI64::new(counter_start),
             order_tracker: None,
             limit_order_type: OrderType::Limit,
+            quote_expiry: None,
         })
     }
 
     /// 从 orderBookDetails 获取市场精度
-    async fn fetch_market_decimals_with_retry(
+    async fn fetch_market_with_retry(
         client: &Client,
         base_url: &str,
         market_id: u8,
-    ) -> Result<(u8, u8)> {
+    ) -> Result<MarketDetail> {
         let mut last_err = None;
 
         for attempt in 1..=5 {
-            match Self::fetch_market_decimals(client, base_url, market_id).await {
-                Ok(decimals) => return Ok(decimals),
+            match Self::fetch_market(client, base_url, market_id).await {
+                Ok(market) => return Ok(market),
                 Err(err) => {
                     tracing::warn!(
                         "orderBookDetails attempt {}/5 failed for market {}: {}",
@@ -356,23 +464,13 @@ impl LighterTrading {
     }
 
     /// 从 orderBookDetails 获取市场精度
-    async fn fetch_market_decimals(
-        client: &Client,
-        base_url: &str,
-        market_id: u8,
-    ) -> Result<(u8, u8)> {
-        #[derive(Deserialize)]
-        struct MarketDetail {
-            market_id: u8,
-            size_decimals: u8,
-            price_decimals: u8,
-        }
+    async fn fetch_market(client: &Client, base_url: &str, market_id: u8) -> Result<MarketDetail> {
         #[derive(Deserialize)]
         struct OBDetailsResp {
             order_book_details: Vec<MarketDetail>,
         }
 
-        let url = format!("{}/api/v1/orderBookDetails", base_url);
+        let url = format!("{base_url}/api/v1/orderBookDetails?market_id={market_id}");
         let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("orderBookDetails HTTP {}", resp.status());
@@ -380,15 +478,19 @@ impl LighterTrading {
         let details: OBDetailsResp = resp.json().await?;
         let market = details
             .order_book_details
-            .iter()
-            .find(|m| m.market_id == market_id)
+            .into_iter()
+            .find(|m| m.market_id == u32::from(market_id))
             .ok_or_else(|| anyhow::anyhow!("Market {} not found in orderBookDetails", market_id))?;
 
+        anyhow::ensure!(
+            market.market_type == "perp" && market.status == "active",
+            "Lighter market {market_id} is not an active perpetual"
+        );
         anyhow::ensure!(
             market.size_decimals <= 12 && market.price_decimals <= 12,
             "Unsupported market precision"
         );
-        Ok((market.size_decimals, market.price_decimals))
+        Ok(market)
     }
 
     /// Attach an order tracker for per-order state machine (v5.0.0)
@@ -403,6 +505,12 @@ impl LighterTrading {
         } else {
             OrderType::Limit
         };
+    }
+
+    pub fn set_supervised_quote_expiry(&mut self) {
+        // The pinned signer requires at least five minutes of resting expiry.
+        // Leave clock headroom while limiting exposure after a process crash.
+        self.quote_expiry = Some(Duration::from_secs(600));
     }
 
     // ─── Nonce 管理 ────────────────────────────────────────────────────────
@@ -484,12 +592,13 @@ impl LighterTrading {
         let (price_int, base_amount) =
             encode_order(price, size, self.price_multiplier, self.size_multiplier)?;
 
-        let (ot, tif) = match order_type {
-            OrderType::Limit => (0u8, 1u8),    // Limit + GTC
-            OrderType::PostOnly => (0u8, 2u8), // Limit + ALO (Add Liquidity Only / Post-Only)
-            OrderType::Market => (1u8, 3u8),   // Market + IOC
-            OrderType::Ioc => (0u8, 3u8),      // Limit + IOC
-        };
+        let (ot, tif, mut expiry) = order_wire_policy(order_type);
+        if expiry < 0
+            && let Some(ttl) = self.quote_expiry
+        {
+            expiry =
+                i64::try_from((SystemTime::now().duration_since(UNIX_EPOCH)? + ttl).as_millis())?;
+        }
 
         let market_id = self.market_id;
         let is_ask = side == Side::Sell;
@@ -507,7 +616,7 @@ impl LighterTrading {
                 tif,
                 reduce_only,
                 0u32,
-                -1i64,
+                expiry,
                 nonce,
             )
             .map_err(|e| anyhow::anyhow!("Sign failed: {}", e))?;
@@ -634,17 +743,33 @@ impl LighterTrading {
         Ok(())
     }
 
+    pub fn validate_symbol(&self, symbol: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.market_symbol == symbol,
+            "Lighter market {} is {}, expected {symbol}",
+            self.market_id,
+            self.market_symbol
+        );
+        Ok(())
+    }
+
     fn normalize_order(&self, params: OrderParams) -> Result<OrderParams> {
         normalize_order(params, self.price_multiplier, self.size_multiplier)
     }
 
     fn ensure_can_place(&self, params: &OrderParams) -> Result<()> {
+        if params.reduce_only {
+            return Ok(());
+        }
+        self.ensure_open_risk_allowed()
+    }
+
+    fn ensure_open_risk_allowed(&self) -> Result<()> {
         anyhow::ensure!(
-            params.reduce_only
-                || !self
-                    .order_tracker
-                    .as_ref()
-                    .is_some_and(|tracker| tracker.needs_reconciliation()),
+            !self
+                .order_tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.needs_reconciliation()),
             "Order state requires reconciliation before new exposure"
         );
         Ok(())
@@ -664,6 +789,7 @@ impl LighterTrading {
                 params.reduce_only,
             )
             .await?;
+        self.ensure_can_place(&params)?;
 
         // Optimistic accounting: register per-order BEFORE API call
         let tracker_side = match params.side {
@@ -741,13 +867,7 @@ impl LighterTrading {
         params: BatchOrderParams,
     ) -> Result<crate::exchange::BatchOrderResult> {
         let _submission = self.submission_lock.lock().await;
-        anyhow::ensure!(
-            !self
-                .order_tracker
-                .as_ref()
-                .is_some_and(|tracker| tracker.needs_reconciliation()),
-            "Order state requires reconciliation before new exposure"
-        );
+        self.ensure_open_risk_allowed()?;
         let bid = self.normalize_order(OrderParams {
             side: Side::Buy,
             price: params.bid_price,
@@ -794,6 +914,7 @@ impl LighterTrading {
                 base_nonce + 1,
             )
             .await?;
+        self.ensure_open_risk_allowed()?;
 
         tracing::info!(
             "Signed batch: bid={} @ {} x {} / ask={} @ {} x {}",
@@ -873,6 +994,9 @@ impl LighterTrading {
         let mut txs = Vec::with_capacity(actions.len());
         let mut place_results = Vec::new();
         let market_id = self.market_id;
+        let opens_risk = actions
+            .iter()
+            .any(|action| matches!(action, BatchAction::Place(order) if !order.reduce_only));
 
         // 获取起始 Nonce
         let base_nonce = self.get_nonce().await?;
@@ -912,6 +1036,9 @@ impl LighterTrading {
             }
         }
 
+        if opens_risk {
+            self.ensure_open_risk_allowed()?;
+        }
         // Register only after ALL actions have signed successfully. A local signing
         // failure must not leave phantom reservations for an unsent partial batch.
         if let Some(tracker) = &self.order_tracker {
@@ -1034,6 +1161,14 @@ impl LighterTrading {
                 orders_resp.message.as_deref().unwrap_or("unknown")
             );
         }
+        anyhow::ensure!(
+            orders_resp
+                .orders
+                .iter()
+                .all(|o| o.market_index == self.market_id
+                    && o.owner_account_index == self.account_index),
+            "Active-order response does not match the Lighter account and market"
+        );
 
         Ok(orders_resp.orders)
     }
@@ -1089,46 +1224,62 @@ impl LighterTrading {
         if acct_resp.code != 200 || acct_resp.accounts.is_empty() {
             anyhow::bail!("get_position: no account data");
         }
-        let pos = acct_resp.accounts[0]
+        let account = acct_resp
+            .accounts
+            .into_iter()
+            .find(|account| account.index == self.account_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Position response does not match the Lighter account")
+            })?;
+        let pos = account
             .positions
-            .iter()
-            .find(|p| p.market_id == self.market_id)
-            .cloned();
+            .into_iter()
+            .find(|p| p.market_id == self.market_id);
         Ok(pos)
+    }
+
+    pub async fn signed_position(&self) -> Result<rust_decimal::Decimal> {
+        use rust_decimal::Decimal;
+        let Some(position) = self.get_position().await? else {
+            return Ok(Decimal::ZERO);
+        };
+        let size: Decimal = position.position.parse()?;
+        anyhow::ensure!(
+            position.symbol == self.market_symbol
+                && size >= Decimal::ZERO
+                && (matches!(position.sign, -1 | 1) || (position.sign == 0 && size.is_zero())),
+            "Invalid Lighter position snapshot"
+        );
+        Ok(size * Decimal::from(position.sign))
     }
 
     /// 关闭所有仓位：先撤销所有订单，再用市价单平仓
     pub async fn close_all_positions(&self, current_price: f64) -> Result<()> {
-        // 1. 撤销所有活跃订单
-        self.cancel_all().await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // 2. 查询当前仓位
-        let pos = self.get_position().await?;
-        let pos = match pos {
-            Some(p) => p,
-            None => {
-                tracing::info!("No position found for market {}", self.market_id);
-                return Ok(());
+        if self.cancel_all().await? > 0 {
+            for _ in 0..5 {
+                if self.get_active_orders().await?.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        };
+            anyhow::ensure!(
+                self.get_active_orders().await?.is_empty(),
+                "Lighter has active orders after cancellation"
+            );
+        }
 
-        let size: f64 = pos.position.parse()?;
-        anyhow::ensure!(
-            size.is_finite() && size >= 0.0 && matches!(pos.sign, -1 | 1),
-            "Invalid position snapshot"
-        );
+        let position: f64 = self.signed_position().await?.try_into()?;
         anyhow::ensure!(
             current_price.is_finite() && current_price > 0.0,
             "Invalid close price"
         );
-        if size.abs() < 0.0001 {
+        if position == 0.0 {
             tracing::info!("Position is zero, nothing to close");
             return Ok(());
         }
 
         // 3. 确定平仓方向和价格（带 2% 滑点保护，不能太大否则 quote amount 可能低于最低限额）
-        let (side, close_price) = if pos.sign > 0 {
+        let (side, close_price) = if position > 0.0 {
             // 多头 → 卖出平仓
             (Side::Sell, current_price * 0.98)
         } else {
@@ -1137,27 +1288,15 @@ impl LighterTrading {
         };
 
         let close_price = match side {
-            Side::Sell => (close_price * self.price_multiplier).floor() / self.price_multiplier,
-            Side::Buy => (close_price * self.price_multiplier).ceil() / self.price_multiplier,
+            Side::Sell => (close_price * self.price_multiplier).ceil() / self.price_multiplier,
+            Side::Buy => (close_price * self.price_multiplier).floor() / self.price_multiplier,
         };
-        let close_size = (size.abs() * self.size_multiplier).round() / self.size_multiplier;
-        let min_close_size = 11.0 / close_price.max(1.0);
-        if size.abs() + 1e-9 < min_close_size {
-            tracing::warn!(
-                "Position {:.4} below Lighter min close size {:.4} @ ${:.2}, skipping reduce_only close",
-                size.abs(),
-                min_close_size,
-                close_price
-            );
-            anyhow::bail!(
-                "Residual position is below the configured close minimum; position is not flat"
-            );
-        }
+        let close_size = position.abs();
 
         tracing::info!(
             "Closing position: {} {} @ ~${:.2} (reduce_only)",
             side,
-            size.abs(),
+            close_size,
             close_price
         );
 
@@ -1166,13 +1305,22 @@ impl LighterTrading {
             size: close_size,
             price: close_price,
             side,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Ioc,
             reduce_only: true,
         })
         .await?;
 
         tracing::info!("Close position order submitted");
         Ok(())
+    }
+}
+
+fn order_wire_policy(order_type: OrderType) -> (u8, u8, i64) {
+    match order_type {
+        OrderType::Limit => (0, 1, -1),
+        OrderType::PostOnly => (0, 2, -1),
+        OrderType::Market => (1, 0, 0),
+        OrderType::Ioc => (0, 0, 0),
     }
 }
 
@@ -1270,27 +1418,10 @@ mod tests {
         let tracker = Arc::new(OrderTracker::new());
         assert!(tracker.start_tracking(42, TrackerSide::Buy, 100.0, 1.0));
         tracker.mark_submission_uncertain(42);
-        let trading = LighterTrading {
-            signer: Arc::new(super::super::ffi::LighterSigner::offline_for_test()),
-            client: Client::builder()
-                .timeout(Duration::from_millis(100))
-                .build()
-                .unwrap(),
-            base_url: "http://127.0.0.1:1".into(),
-            send_tx_url: "http://127.0.0.1:1".into(),
-            send_tx_batch_url: "http://127.0.0.1:1".into(),
-            account_index: 0,
-            api_key_index: 0,
-            market_id: 0,
-            size_multiplier: 1e6,
-            price_multiplier: 100.0,
-            submission_lock: TokioMutex::new(()),
-            nonce: AtomicI64::new(9),
-            nonce_init: TokioMutex::new(true),
-            client_order_counter: AtomicI64::new(43),
-            order_tracker: Some(Arc::clone(&tracker)),
-            limit_order_type: OrderType::PostOnly,
-        };
+        let mut trading = LighterTrading::offline_test_client("http://127.0.0.1:1");
+        trading.nonce.store(9, Ordering::Release);
+        *trading.nonce_init.lock().await = true;
+        trading.set_order_tracker(Arc::clone(&tracker));
         let error = trading.send_tx(14, "{}".into()).await.err().unwrap();
         assert!(is_uncertain(&error));
         assert!(!*trading.nonce_init.lock().await);
@@ -1363,5 +1494,32 @@ mod tests {
             Some(TradingError::InsufficientMargin)
         ));
         assert!(validate_submission_response(reqwest::StatusCode::OK, r#"{"code":200}"#).is_ok());
+    }
+    #[test]
+    fn lighter_ioc_and_resting_orders_use_distinct_expiry_policies() {
+        assert_eq!(order_wire_policy(OrderType::Ioc), (0, 0, 0));
+        assert_eq!(order_wire_policy(OrderType::Market), (1, 0, 0));
+        assert_eq!(order_wire_policy(OrderType::Limit), (0, 1, -1));
+        assert_eq!(order_wire_policy(OrderType::PostOnly), (0, 2, -1));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn pinned_native_signer_accepts_reduce_only_ioc_offline() {
+        let signer = crate::lighter_ffi::LighterSigner::new(
+            "http://127.0.0.1:1",
+            &"01".repeat(40),
+            304,
+            7,
+            1001,
+        )
+        .unwrap();
+        let (kind, tif, expiry) = order_wire_policy(OrderType::Ioc);
+        let signed = signer
+            .sign_create_order(0, 1234, 100, 200_000, true, kind, tif, true, 0, expiry, 1)
+            .unwrap();
+        let tx: serde_json::Value = serde_json::from_str(&signed.tx_info).unwrap();
+        assert_eq!(tx["TimeInForce"], 0);
+        assert_eq!(tx["OrderExpiry"], 0);
     }
 }

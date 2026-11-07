@@ -45,7 +45,7 @@ type AccountStatsWriter struct {
 
 // NewAccountStatsWriter creates or opens a shared memory region for account stats.
 func NewAccountStatsWriter(name string) (*AccountStatsWriter, error) {
-	path := "/dev/shm/" + name
+	path := Path(name)
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -138,6 +138,13 @@ func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64)
 	w.stats.PositionUpdatedAt = timestampNs
 
 	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
+}
+
+func (w *AccountStatsWriter) PositionNeedsRefresh(now, maxAge uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	at := w.stats.PositionUpdatedAt
+	return at == 0 || at > now || now-at >= maxAge
 }
 
 // GetVersion returns the current version (for diagnostics).
