@@ -1713,3 +1713,51 @@ async fn cancellation_acknowledgement_does_not_release_unknown_submission() {
     drop(strategy);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn time_scaled_sigma_is_independent_of_sampling_interval() {
+    // A random walk with sigma = 2e-4 per sqrt(second), observed at 100 ms and
+    // at 1 s, must yield the same A-S sigma; the per-sample figure would differ
+    // by sqrt(10).
+    let target = 2e-4;
+    let estimate = |dt_ms: u64| {
+        let mut vol = TimeScaledVolatility::new();
+        let start = Instant::now();
+        let step = target * (dt_ms as f64 / 1000.0).sqrt();
+        let mut mid = 2000.0;
+        for i in 0..5_000u64 {
+            vol.update(mid, start + Duration::from_millis(i * dt_ms));
+            mid *= if i % 2 == 0 {
+                step.exp()
+            } else {
+                (-step).exp()
+            };
+        }
+        vol.sigma().expect("warm estimate")
+    };
+    for dt_ms in [100, 250, 1000] {
+        let sigma = estimate(dt_ms);
+        assert!(
+            (sigma - target).abs() / target < 0.01,
+            "dt={dt_ms}ms sigma={sigma}"
+        );
+    }
+}
+
+#[test]
+fn time_scaled_sigma_ignores_invalid_and_stalled_samples() {
+    let mut vol = TimeScaledVolatility::new();
+    let start = Instant::now();
+    assert!(vol.sigma().is_none());
+    vol.update(2000.0, start);
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        vol.update(invalid, start + Duration::from_secs(1));
+    }
+    assert!(vol.sigma().is_none());
+    // A 60 s gap restarts the baseline instead of booking one huge return.
+    vol.update(2100.0, start + Duration::from_secs(60));
+    assert!(vol.sigma().is_none());
+    // Sub-10 ms updates are merged rather than divided by a tiny dt.
+    vol.update(2100.5, start + Duration::from_millis(60_001));
+    assert!(vol.sigma().is_none());
+}

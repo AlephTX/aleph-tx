@@ -231,6 +231,67 @@ impl MicrostructureTracker {
     }
 }
 
+/// Volatility in fractional units per sqrt(second), for Avellaneda-Stoikov.
+///
+/// The main loop samples at irregular intervals (100 ms to 1 s sleeps), so the
+/// per-sample standard deviation is not in the same time unit as the A-S
+/// horizon `as_time_horizon_sec`. This estimator normalises each log return by
+/// its real elapsed time and keeps a time-decayed EWMA of `r^2 / dt`.
+struct TimeScaledVolatility {
+    last: Option<(f64, Instant)>,
+    variance_per_sec: f64,
+    weight: f64,
+}
+
+impl TimeScaledVolatility {
+    /// EWMA time constant; ~1 minute of history dominates the estimate.
+    const TAU_SECS: f64 = 60.0;
+    /// Returns over shorter intervals are merged into the next sample.
+    const MIN_DT_SECS: f64 = 0.01;
+    /// Gaps longer than this (stalls, reconnects) restart the baseline.
+    const MAX_DT_SECS: f64 = 10.0;
+    /// Minimum accumulated weight before the estimate is trusted.
+    const WARM_WEIGHT: f64 = 0.05;
+
+    fn new() -> Self {
+        Self {
+            last: None,
+            variance_per_sec: 0.0,
+            weight: 0.0,
+        }
+    }
+
+    fn update(&mut self, mid: f64, now: Instant) {
+        if !mid.is_finite() || mid <= 0.0 {
+            return;
+        }
+        let Some((last_mid, last_at)) = self.last else {
+            self.last = Some((mid, now));
+            return;
+        };
+        let dt = now.saturating_duration_since(last_at).as_secs_f64();
+        if dt < Self::MIN_DT_SECS {
+            return; // Keep the older anchor so the next dt is meaningful.
+        }
+        self.last = Some((mid, now));
+        if dt > Self::MAX_DT_SECS {
+            return;
+        }
+        let r = (mid / last_mid).ln();
+        if !r.is_finite() {
+            return;
+        }
+        let alpha = 1.0 - (-dt / Self::TAU_SECS).exp();
+        self.variance_per_sec += alpha * (r * r / dt - self.variance_per_sec);
+        self.weight += alpha * (1.0 - self.weight);
+    }
+
+    /// Sigma per sqrt(second), or `None` until enough time has been observed.
+    fn sigma(&self) -> Option<f64> {
+        (self.weight >= Self::WARM_WEIGHT).then(|| self.variance_per_sec.max(0.0).sqrt())
+    }
+}
+
 /// Tracks continuous inventory independently of fill and request activity.
 #[derive(Default)]
 struct InventoryAge {
@@ -305,6 +366,8 @@ struct PricingInputs {
     bid_touch: f64,
     ask_touch: f64,
     vol_bps: f64,
+    /// A-S sigma in fractional units per sqrt(second).
+    sigma_per_sqrt_sec: f64,
     as_score: f64,
     using_external_fair_value: bool,
 }
@@ -321,6 +384,7 @@ pub struct InventoryNeutralMM {
     account_stats_reader: AccountStatsReader,
     account_stats: AccountStats,
     micro: MicrostructureTracker,
+    sigma: TimeScaledVolatility,
 
     // Order tracking (multi-level grid)
     active_orders: Vec<ActiveOrder>,
@@ -401,6 +465,7 @@ impl InventoryNeutralMM {
                 config.ema_fast_period,
                 config.ema_slow_period,
             ),
+            sigma: TimeScaledVolatility::new(),
             config,
             trading,
             order_tracker,
@@ -1488,6 +1553,10 @@ impl InventoryNeutralMM {
         // Update microstructure tracker with pricing_mid (now driven by external exchanges)
         self.micro.update(pricing_mid);
         let vol_bps = self.micro.volatility_bps();
+        self.sigma.update(pricing_mid, Instant::now());
+        // Until the time-scaled estimate warms up, fall back to the per-sample
+        // figure; both are ~1e-4 for liquid perps at sub-second sampling.
+        let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);
         let as_score = self.micro.adverse_selection_score();
 
         PricingInputs {
@@ -1496,6 +1565,7 @@ impl InventoryNeutralMM {
             bid_touch,
             ask_touch,
             vol_bps,
+            sigma_per_sqrt_sec,
             as_score,
             using_external_fair_value: using_external,
         }
@@ -1538,7 +1608,9 @@ impl InventoryNeutralMM {
 
         let gamma = self.config.as_gamma;
         let time_horizon = self.config.as_time_horizon_sec;
-        let sigma = inputs.vol_bps / 10000.0;
+        // sigma^2 * T must share time units: sigma is per sqrt(second) and T is
+        // in seconds. vol_bps (per sample) still drives the empirical caps.
+        let sigma = inputs.sigma_per_sqrt_sec;
 
         // Reservation price: external fair value shifted by inventory risk plus
         // an explicit urgency skew to bias quotes toward flattening.
