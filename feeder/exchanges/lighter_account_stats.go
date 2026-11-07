@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
@@ -84,7 +85,7 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 	}
 	log.Printf("lighter-account-stats: subscribed to user_stats/%d with auth", accountID)
 
-	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-account-stats", c, 15*time.Second)
+	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-account-stats", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
 	// The previous REST fallback used an invalid account endpoint and produced

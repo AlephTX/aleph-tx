@@ -17,11 +17,16 @@ target/release/cross_venue perp-replay recordings/eth-replay.ndjson
 ```
 
 The example compiles a coverage check with zero order capacity. It selects
-Hyperliquid WebSocket books by default. Set `legs[1].use_hyperliquid_snapshots`
-to `true` in a copy of the configuration to select the REST books from the
-same recording. The optional polling mode supports at most four markets,
-with a minimum interval of one second. The exchange applies request weights
-across clients on the same IP.
+Hyperliquid WebSocket books by default. Compare transports on the same
+recording by setting `legs[1].hyperliquid_book_mode` to `websocket`, `snapshot`
+or `freshest`. Existing configurations with `use_hyperliquid_snapshots: true`
+select REST and omit the new field. The `freshest` mode accepts a book from
+either transport once it has arrived and its exchange timestamp exceeds the
+last accepted publication. A disconnected transport invalidates its own
+current book, and the next publication must still advance that timestamp.
+The optional REST polling supports at most four markets with a minimum
+interval of one second. The exchange applies request weights across clients
+on the same IP.
 [Hyperliquid rate limits](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits)
 
 ```sh
@@ -33,6 +38,11 @@ target/release/cross_venue perp-compile examples/nvda_capture.json \
 
 ## Timing and dataset coverage
 
+- The recorder shares WebSocket keepalives with the production feeder.
+  Hyperliquid also receives its application heartbeat. A failed transport
+  probe ends the connection and triggers reconnect. Heartbeats are excluded
+  from market publications and preserve the age of the last quote.
+  [Hyperliquid heartbeats](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/timeouts-and-heartbeats)
 - The compiler reconstructs Lighter's exact decimal price levels. It
   invalidates the book after a nonce gap until a new snapshot arrives. The
   collector reconnects on a detected gap and records the disconnection.
@@ -47,8 +57,13 @@ target/release/cross_venue perp-compile examples/nvda_capture.json \
   context. Its L2 books always use their own source timestamps. Classify
   a venue oracle as external only for periods where its methodology is known.
 - `perp-compile` reports book freshness and skew, reference and venue oracle
-  coverage, sequence gaps, clock rejections and cashflow records. Joined
-  inputs still pass the existing strategy checks for economics and risk.
+  coverage, sequence gaps, clock rejections and cashflow records.
+  `book_age_at_availability_ms` describes valid accepted books at the time
+  they became available, including any configured clock correction.
+  `fresh_book_skew_ms` describes the source-time difference on frames where
+  both books are fresh, including frames beyond the skew limit. Both fields
+  report percentile upper bounds from fixed buckets and the observed maximum.
+  Joined inputs still pass the strategy checks for economics and risk.
   Compiling requires a complete raw footer and writes a new output file only.
 - Supply an independent equity reference as `reference.kind = "external"`
   with observations containing `available_at_ms` and an `oracle` object
@@ -170,3 +185,24 @@ funding for one ETH long on Lighter and short on Hyperliquid was
 0.00111796–0.00111894 USDC before trading costs. The local manifest at
 `recordings/2026-11-06-settlement/manifest.json` indexes the evidence,
 parameters, coverage and replay reports by SHA-256.
+
+## Recorder keepalive and transport comparison
+
+The 2026-11-07 UTC capture recorded ETH, BTC and NVDA for six minutes with
+zero disconnects and zero Lighter book nonce gaps. All comparisons below use
+the same 1,323 frames per pair, the strict clock policy, a maximum book age of
+2.2 seconds and a maximum book skew of 750 ms.
+
+| Hyperliquid book mode | ETH joined | BTC joined | NVDA synchronized |
+| --- | ---: | ---: | ---: |
+| WebSocket | 3 | 6 | 144 |
+| REST | 19 | 20 | 564 |
+| Freshest | 21 | 24 | 606 |
+
+The largest rejected Lighter clock lead was 29 ms. Under the separate 50 ms
+sensitivity assumption, freshest joined 546 ETH and 562 BTC frames. Both
+crypto pairs stayed flat in every paper holdout under the configured fees
+and edge thresholds. NVDA was a book coverage check pending independent
+equity reference and session data. The local manifest at
+`recordings/2026-11-07-heartbeat/manifest.json` indexes the capture and all 18
+replays by SHA-256.

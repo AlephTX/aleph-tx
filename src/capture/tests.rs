@@ -220,6 +220,67 @@ fn snapshot_selection_does_not_mix_transports_or_drop_the_rest_book_on_ws_gap() 
 }
 
 #[test]
+fn freshest_book_keeps_source_time_monotonic_across_transport_failures() {
+    let mut config = config();
+    config.legs[1].hyperliquid_book_mode = Some(HyperliquidBookMode::Freshest);
+    let snapshot = "hyperliquid_snapshot";
+    let ws = "hyperliquid";
+    let stale = |source, at, time| {
+        let mut event = hl(source, at);
+        event["payload"]["data"]["time"] = json!(time);
+        event
+    };
+    let disconnect = |source, at| json!({"source":source,"event":"disconnect","received_at_ms":at,"available_at_ms":at});
+    let rows = [
+        lighter(T, T - 1, 10, 0, true),
+        hl(ws, T),
+        stale(snapshot, T + 100, T - 1),
+        hl(snapshot, T + 200),
+        disconnect(ws, T + 300),
+        stale(ws, T + 400, T + 100),
+        disconnect(snapshot, T + 500),
+        stale(ws, T + 600, T + 199),
+        stale(ws, T + 700, T + 650),
+        stale(snapshot, T + 800, T + 900),
+        footer(T + 900),
+    ];
+    let (coverage, frames) = replay(&config, &rows);
+    let times: Vec<_> = frames
+        .iter()
+        .map(|f| f["legs"][1]["book"]["timestamp_ms"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        times,
+        [
+            T - 1,
+            T - 1,
+            T + 199,
+            T + 199,
+            T + 199,
+            0,
+            0,
+            T + 650,
+            T + 650
+        ]
+    );
+    assert_eq!(coverage.leg_book_updates, [1, 3]);
+    assert_eq!(coverage.leg_snapshot_updates, [0, 1]);
+    assert_eq!(coverage.leg_fresh_book_frames, [9, 7]);
+    assert_eq!(coverage.clock_rejections, [0, 1]);
+    assert_eq!(coverage.book_age_at_availability_ms[1].observations, 3);
+    assert_eq!(
+        coverage.book_age_at_availability_ms[1].p50_upper_ms,
+        Some(1)
+    );
+    assert_eq!(
+        coverage.book_age_at_availability_ms[1].p95_upper_ms,
+        Some(50)
+    );
+    assert_eq!(coverage.fresh_book_skew_ms.observations, 7);
+    assert_eq!(coverage.fresh_book_skew_ms.p50_upper_ms, Some(200));
+}
+
+#[test]
 fn rejects_truncated_input_and_equity_entries_without_the_underlying_feed() {
     let input = text(&[hl("hyperliquid", T)]);
     let err = compile(

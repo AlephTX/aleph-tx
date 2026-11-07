@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
@@ -45,15 +47,23 @@ type hlLevel struct {
 }
 
 func (h *Hyperliquid) Run(ctx context.Context) error {
-	return RunConnectionLoop(ctx, "hyperliquid", h.connect)
+	lastPublication := make(map[uint16]int64, len(h.symMap))
+	return RunConnectionLoop(ctx, "hyperliquid", func(ctx context.Context) error {
+		return h.connect(ctx, lastPublication)
+	})
 }
 
-func (h *Hyperliquid) connect(ctx context.Context) error {
+func (h *Hyperliquid) connect(ctx context.Context, lastPublication map[uint16]int64) error {
 	c, _, err := websocket.Dial(ctx, h.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.CloseNow()
+	defer func() {
+		for _, symbolID := range h.symMap {
+			h.matrix.InvalidateBBO(ExchangeHyperliquid, symbolID)
+		}
+	}()
 
 	log.Printf("hyperliquid: connected to %s", h.cfg.WSURL)
 
@@ -72,6 +82,9 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 		log.Printf("hyperliquid: subscribed to %v", rawCoin)
 	}
 
+	stopKeepalive := wsutil.StartKeepalive(ctx, "hyperliquid", c, 15*time.Second, []byte(`{"method":"ping"}`))
+	defer stopKeepalive()
+
 	for {
 		var raw json.RawMessage
 		if err := wsjson.Read(ctx, c, &raw); err != nil {
@@ -89,8 +102,11 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 		}
 
 		symID, ok := h.symMap[book.Coin]
-		if !ok || len(book.Levels) < 2 {
+		if !ok || len(book.Levels) < 2 || book.Time <= lastPublication[symID] {
 			continue
+		}
+		if book.Time > time.Now().Add(time.Second).UnixMilli() {
+			return fmt.Errorf("market %s: future book timestamp", book.Coin)
 		}
 
 		bids := book.Levels[0]
@@ -125,5 +141,6 @@ func (h *Hyperliquid) connect(ctx context.Context) error {
 		// Write to shared matrix (triggers version increment)
 		h.matrix.WriteBBO(ExchangeHyperliquid, symID, tsNs,
 			bidPx, bidSz, askPx, askSz)
+		lastPublication[symID] = book.Time
 	}
 }

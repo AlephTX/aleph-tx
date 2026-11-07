@@ -1,6 +1,7 @@
 //! Compile public market recordings into causal paper replay frames.
 
 mod feeds;
+mod timing;
 
 use crate::{
     strategy::relative_value::{
@@ -18,6 +19,7 @@ use std::{
     collections::BTreeMap,
     io::{BufRead, Read, Write},
 };
+use timing::{TimingHistogram, TimingSummary};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,11 +56,31 @@ pub struct LegConfig {
     pub accept_receipt_time_for_oracle: bool,
     #[serde(default)]
     pub use_hyperliquid_snapshots: bool,
+    pub hyperliquid_book_mode: Option<HyperliquidBookMode>,
     /// An independently established upper bound on how far the source clock
     /// leads the recorder. Subtract it from every source publication time.
     #[serde(default)]
     pub source_clock_ahead_bound_ms: u64,
     pub funding: Option<FundingRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HyperliquidBookMode {
+    Websocket,
+    Snapshot,
+    Freshest,
+}
+
+impl LegConfig {
+    fn book_mode(&self) -> HyperliquidBookMode {
+        self.hyperliquid_book_mode
+            .unwrap_or(if self.use_hyperliquid_snapshots {
+                HyperliquidBookMode::Snapshot
+            } else {
+                HyperliquidBookMode::Websocket
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -108,6 +130,10 @@ pub struct Coverage {
     pub source_messages: BTreeMap<String, usize>,
     pub disconnects: BTreeMap<String, usize>,
     pub leg_book_updates: [usize; 2],
+    pub leg_snapshot_updates: [usize; 2],
+    pub leg_fresh_book_frames: [usize; 2],
+    pub book_age_at_availability_ms: [TimingSummary; 2],
+    pub fresh_book_skew_ms: TimingSummary,
     pub rejected_publications: [usize; 2],
     pub clock_rejections: [usize; 2],
     pub max_rejected_clock_lead_ms: [u64; 2],
@@ -186,7 +212,9 @@ impl CaptureConfig {
             );
             ensure!(
                 leg.source_clock_ahead_bound_ms <= 1_000
-                    && (!leg.use_hyperliquid_snapshots || venue.hyperliquid_dex.is_some()),
+                    && (!(leg.use_hyperliquid_snapshots || leg.hyperliquid_book_mode.is_some())
+                        || venue.hyperliquid_dex.is_some())
+                    && !(leg.use_hyperliquid_snapshots && leg.hyperliquid_book_mode.is_some()),
                 "invalid capture clock or snapshot policy"
             );
             ensure!(
@@ -266,6 +294,8 @@ struct Compiler<'a> {
     coinbase: Option<Oracle>,
     last_frame_ms: Option<u64>,
     coverage: Coverage,
+    book_availability: [TimingHistogram; 2],
+    fresh_book_skew: TimingHistogram,
 }
 
 impl<'a> Compiler<'a> {
@@ -279,6 +309,8 @@ impl<'a> Compiler<'a> {
                 paper_entries: config.paper_entries,
                 ..Default::default()
             },
+            book_availability: Default::default(),
+            fresh_book_skew: Default::default(),
         }
     }
 
@@ -326,7 +358,15 @@ impl<'a> Compiler<'a> {
                             continue;
                         }
                         match leg.apply(&payload, row.received_at_ms, &row.source) {
-                            Ok(feeds::Change::Book) => self.coverage.leg_book_updates[i] += 1,
+                            Ok(feeds::Change::Book) => {
+                                self.coverage.leg_book_updates[i] += 1;
+                                self.coverage.leg_snapshot_updates[i] +=
+                                    usize::from(row.source == "hyperliquid_snapshot");
+                                if let Some(book) = leg.book().filter(|book| book.tradable) {
+                                    self.book_availability[i]
+                                        .observe(row.available_at_ms - book.timestamp_ms);
+                                }
+                            }
                             Ok(feeds::Change::Gap) => self.coverage.lighter_nonce_gaps[i] += 1,
                             Ok(feeds::Change::Clock(ahead)) => {
                                 self.coverage.clock_rejections[i] += 1;
@@ -470,15 +510,20 @@ impl<'a> Compiler<'a> {
     fn measure(&mut self, frame: &Frame) {
         let now = frame.now_ms;
         let pair = &self.config.pair;
-        let both_books = frame.legs.iter().all(|leg| {
+        let fresh_books = frame.legs.each_ref().map(|leg| {
             leg.book.tradable && fresh(leg.book.timestamp_ms, now, pair.planner.max_quote_age_ms)
         });
-        let synchronized = both_books
-            && frame.legs[0]
+        let both_books = fresh_books[0] && fresh_books[1];
+        let synchronized = if both_books {
+            let skew = frame.legs[0]
                 .book
                 .timestamp_ms
-                .abs_diff(frame.legs[1].book.timestamp_ms)
-                <= pair.planner.max_quote_skew_ms;
+                .abs_diff(frame.legs[1].book.timestamp_ms);
+            self.fresh_book_skew.observe(skew);
+            skew <= pair.planner.max_quote_skew_ms
+        } else {
+            false
+        };
         let is_reference = |oracle: Oracle| {
             oracle.mode == OracleMode::LiveExternal
                 && fresh(oracle.timestamp_ms, now, pair.oracle_max_age_ms)
@@ -504,6 +549,7 @@ impl<'a> Compiler<'a> {
                 && (pair.asset_class == AssetClass::Crypto || session),
         );
         for (i, leg) in frame.legs.iter().enumerate() {
+            counts.leg_fresh_book_frames[i] += usize::from(fresh_books[i]);
             counts.settlement_records_written[i] += leg.settled.len();
             counts.witnessed_settlement_records_written[i] += leg.witnessed_settlements.len();
         }
@@ -556,6 +602,9 @@ pub fn compile(
         "capture incomplete or empty"
     );
     output.flush()?;
+    compiler.coverage.book_age_at_availability_ms =
+        compiler.book_availability.map(TimingHistogram::summarize);
+    compiler.coverage.fresh_book_skew_ms = compiler.fresh_book_skew.summarize();
     Ok(compiler.coverage)
 }
 

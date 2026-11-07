@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
@@ -179,7 +180,7 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 		log.Printf("lighter-private: subscribed to account_market/%d/%d", mktIdx, accountID)
 	}
 
-	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-private", c, 15*time.Second)
+	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-private", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
 	// Read loop with automatic pong responses

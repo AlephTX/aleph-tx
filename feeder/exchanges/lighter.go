@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
@@ -82,7 +83,7 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			l.matrix.InvalidateBBO(ExchangeLighter, symbolID)
 		}
 	}()
-	stopKeepalive := startWebSocketKeepalive(ctx, "lighter-public", c, 15*time.Second)
+	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-public", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
 	for {

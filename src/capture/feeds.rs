@@ -1,4 +1,4 @@
-use super::LegConfig;
+use super::{HyperliquidBookMode, LegConfig};
 use crate::strategy::relative_value::{Book, Level, MarketTerms, Oracle, OracleMode};
 use anyhow::{Context, Result, ensure};
 use rust_decimal::Decimal;
@@ -29,6 +29,8 @@ pub(super) struct LegFeed {
     config: LegConfig,
     depth: LighterDepth,
     book: Option<Book>,
+    book_from_snapshot: bool,
+    latest_hyperliquid_book_ms: u64,
     context: Option<ContextTick>,
 }
 
@@ -39,6 +41,8 @@ impl LegFeed {
             config: config.clone(),
             depth: LighterDepth::default(),
             book: None,
+            book_from_snapshot: false,
+            latest_hyperliquid_book_ms: 0,
             context: None,
         }
     }
@@ -48,7 +52,8 @@ impl LegFeed {
             source == "lighter"
         } else {
             source == "hyperliquid"
-                || (source == "hyperliquid_snapshot" && self.config.use_hyperliquid_snapshots)
+                || (source == "hyperliquid_snapshot"
+                    && self.config.book_mode() != HyperliquidBookMode::Websocket)
         }
     }
 
@@ -62,13 +67,17 @@ impl LegFeed {
                 self.book = None;
                 self.context = None;
             }
-            "hyperliquid_snapshot" => self.book = None,
+            "hyperliquid_snapshot" => self.invalidate_hyperliquid_book(true),
             _ => {
                 self.context = None;
-                if !self.config.use_hyperliquid_snapshots {
-                    self.book = None;
-                }
+                self.invalidate_hyperliquid_book(false);
             }
+        }
+    }
+
+    fn invalidate_hyperliquid_book(&mut self, snapshot: bool) {
+        if self.book_from_snapshot == snapshot {
+            self.book = None;
         }
     }
 
@@ -170,18 +179,21 @@ impl LegFeed {
         if data["coin"].as_str() != Some(self.market.as_str()) {
             return Ok(Change::Other);
         }
+        let use_book = match self.config.book_mode() {
+            HyperliquidBookMode::Websocket => !snapshot,
+            HyperliquidBookMode::Snapshot => snapshot,
+            HyperliquidBookMode::Freshest => true,
+        };
         match payload["channel"].as_str().unwrap_or_default() {
-            "l2Book" if snapshot == self.config.use_hyperliquid_snapshots => {
+            "l2Book" if use_book => {
                 let book = crate::exchanges::hyperliquid::L2Book::deserialize(data)?;
                 let Some(time) = self.source_time(book.time, received) else {
-                    self.book = None;
+                    self.invalidate_hyperliquid_book(snapshot);
                     return Ok(Change::Clock(book.time.saturating_sub(received)));
                 };
-                if self
-                    .book
-                    .as_ref()
-                    .is_some_and(|old| time <= old.timestamp_ms)
-                {
+                // Both transports use the exchange clock. Retain the last
+                // accepted publication time across transport failures.
+                if time <= self.latest_hyperliquid_book_ms {
                     return Ok(Change::Other);
                 }
                 let [bids, asks] = book.levels.map(|levels| {
@@ -192,6 +204,8 @@ impl LegFeed {
                         .collect::<Result<Vec<_>>>()
                 });
                 self.set_book(time, bids?, asks?);
+                self.latest_hyperliquid_book_ms = time;
+                self.book_from_snapshot = snapshot;
                 Ok(Change::Book)
             }
             "activeAssetCtx" if !snapshot => {

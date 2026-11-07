@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
 	"nhooyr.io/websocket"
 )
@@ -72,7 +73,7 @@ func (b *Binance) connect(ctx context.Context) error {
 	log.Printf("binance: connected to %s", wsURL)
 
 	// Start keepalive pings (Binance drops idle connections after 5 min)
-	stopKeepalive := startWebSocketKeepalive(ctx, "binance", c, 30*time.Second)
+	stopKeepalive := wsutil.StartKeepalive(ctx, "binance", c, 30*time.Second, nil)
 	defer stopKeepalive()
 
 	for {

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -187,6 +188,13 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			return fmt.Errorf("subscribe: %w", err)
 		}
 	}
+	var heartbeat []byte
+	if source.source == "hyperliquid" {
+		heartbeat = []byte(`{"method":"ping"}`)
+	}
+	stopKeepalive := wsutil.StartKeepalive(ctx, source.source, conn, 15*time.Second, heartbeat)
+	defer stopKeepalive()
+
 	nonces := make(map[string]uint64)
 	for {
 		readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
