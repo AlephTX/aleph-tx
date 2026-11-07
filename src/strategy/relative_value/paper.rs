@@ -77,6 +77,8 @@ pub struct PaperLegExecution {
     #[serde(with = "rust_decimal::serde::str")]
     pub filled_notional_quote: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
+    pub fees_quote: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     pub submit_touch_notional_quote: Decimal,
     /// Signed cost relative to the same-side touch at submission.
     #[serde(with = "rust_decimal::serde::str")]
@@ -84,6 +86,20 @@ pub struct PaperLegExecution {
     /// Cost of sweeping levels beyond the arrival book's same-side touch.
     #[serde(with = "rust_decimal::serde::str")]
     pub depth_impact_quote: Decimal,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct PaperMarketCosts {
+    pub venue: String,
+    pub market: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub turnover_quote: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub fees_quote: Decimal,
+    /// Fees plus signed execution slippage against the submit-time touch.
+    /// Missing without turnover or when any fill lacked a submit-time touch.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub execution_cost_bps: Option<Decimal>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -120,6 +136,7 @@ pub struct PaperReport {
     pub ioc_expired_without_book: usize,
     pub opening_execution: [PaperLegExecution; 2],
     pub closing_execution: [PaperLegExecution; 2],
+    pub market_costs: [PaperMarketCosts; 2],
     pub funding_guard_ms: u64,
     pub funding_guard_blocked_fills: usize,
     pub funding_guard_skipped_entries: usize,
@@ -216,7 +233,7 @@ impl Default for Ledger {
 }
 
 impl Ledger {
-    fn trade(&mut self, i: usize, side: HedgeSide, fill: Fill, fee_bps: Decimal) {
+    fn trade(&mut self, i: usize, side: HedgeSide, fill: Fill, fee_bps: Decimal) -> Decimal {
         let sign = if side == HedgeSide::Buy {
             Decimal::ONE
         } else {
@@ -227,6 +244,7 @@ impl Ledger {
         self.cash -= sign * fill.notional + fee;
         self.fees += fee;
         self.turnover += fill.notional;
+        fee
     }
 
     fn is_flat(&self) -> bool {
@@ -546,7 +564,7 @@ impl Runner {
                     stats.fills_without_submit_touch += 1;
                 }
             }
-            self.ledger.trade(
+            stats.fees_quote += self.ledger.trade(
                 i,
                 order.side,
                 fill,
@@ -926,6 +944,7 @@ impl Runner {
                         frame,
                         signal,
                         cutoff,
+                        self.funding_guard_ms,
                         Some(&mut diagnostics.best_net_edge_bps),
                     )
                 });
@@ -949,6 +968,24 @@ impl Runner {
         self.report.funding = self.ledger.funding;
         self.report.funding_upper_bound = self.ledger.funding_upper;
         self.report.witnessed_funding_payments = self.ledger.witnessed_funding_payments;
+        self.report.market_costs = std::array::from_fn(|i| {
+            let terms = &self.planner.config.legs[i];
+            let entry = &self.report.opening_execution[i];
+            let exit = &self.report.closing_execution[i];
+            let turnover = entry.filled_notional_quote + exit.filled_notional_quote;
+            let fees = entry.fees_quote + exit.fees_quote;
+            let execution_cost_bps = (turnover > Decimal::ZERO
+                && entry.fills_without_submit_touch == 0
+                && exit.fills_without_submit_touch == 0)
+                .then(|| (fees + entry.slippage_quote + exit.slippage_quote) / turnover * BPS);
+            PaperMarketCosts {
+                venue: terms.venue.clone(),
+                market: terms.market.clone(),
+                turnover_quote: turnover,
+                fees_quote: fees,
+                execution_cost_bps,
+            }
+        });
         for stats in self
             .report
             .opening_execution

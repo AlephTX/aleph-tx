@@ -26,6 +26,8 @@ pub struct PerpAsset {
     pub max_leverage: u32,
     #[serde(default)]
     pub is_delisted: bool,
+    pub growth_mode: Option<String>,
+    pub deployer_fee_scale: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

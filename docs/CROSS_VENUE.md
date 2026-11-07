@@ -14,6 +14,7 @@ Hyperliquid Go feeds keep their original shared-memory layout.
 | Hyperliquid | Existing Go BBO plus Rust REST book and perpetual metadata | Rust REST limit orders, cancellation and status lookup |
 | Entropy | Hyperliquid HIP-3 metadata and `io:SYMBOL` books | Same Hyperliquid REST client with dynamically resolved HIP-3 asset IDs |
 | Arcus | Public REST perpetual markets, BBO, orders, fills and positions | Ed25519 REST limit orders and cancellation |
+| BULK | Public REST market metadata and BBO | Read-only |
 | Variational | Public v2 perpetual/swap statistics with source timestamps | Read-only. Public prices are indicative |
 
 The registry separates liquidity from shared infrastructure risk. Hyperliquid
@@ -43,8 +44,10 @@ Both fixtures run in `make test`.
 ```sh
 target/release/cross_venue markets hyperliquid
 target/release/cross_venue markets entropy
+target/release/cross_venue markets bulk
 target/release/cross_venue markets variational
 target/release/cross_venue bbo arcus BTC-USD
+target/release/cross_venue bbo bulk NVDA-USD
 ```
 
 Use an explicit contract mapping for underlying/index identity, settlement and

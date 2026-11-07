@@ -3,8 +3,8 @@
 
 mod paper;
 pub use paper::{
-    ExitReason, PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperReport, PaperScenario,
-    PaperTrade, run_paper, run_paper_frames,
+    ExitReason, PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperMarketCosts,
+    PaperReport, PaperScenario, PaperTrade, run_paper, run_paper_frames,
 };
 
 use crate::{
@@ -65,6 +65,9 @@ pub struct PairConfig {
     /// Charge on gross notional for the full planned hold plus unwind time.
     #[serde(default)]
     pub capital_charge_bps_per_day: f64,
+    /// For funding carry, consider exiting after each reachable settlement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optimize_funding_horizon: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1026,7 +1029,7 @@ impl RelativeValue {
     pub fn observe(&mut self, frame: &Frame) -> Result<Decision<Plan>> {
         Ok(self
             .sample(frame)?
-            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff, None))
+            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff, 0, None))
             .map_err(|blocked| blocked.gate.rejection()))
     }
 
@@ -1097,12 +1100,88 @@ impl RelativeValue {
         frame: &Frame,
         signal: BasisSignal,
         cutoff: u64,
+        funding_guard_ms: u64,
         mut best_edge_bps: Option<&mut Option<Decimal>>,
     ) -> EntryDecision<Plan> {
         let now = frame.now_ms;
-        let hold_until = now
+        let max_hold = now
             .checked_add(self.config.planner.funding_horizon_ms)
             .ok_or(EntryGate::Session)?;
+        let mut depth = None;
+        if self.config.strategy != Strategy::FundingCarry || !self.config.optimize_funding_horizon {
+            return self.plan_for_hold(frame, signal, max_hold, cutoff, &mut depth, best_edge_bps);
+        }
+        let max_hold = max_hold.min(
+            cutoff
+                .checked_sub(self.config.execution_window_ms)
+                .filter(|latest| *latest > now)
+                .ok_or(EntryGate::Session)?,
+        );
+        // The carry bound credits payments strictly before the hold deadline.
+        // Leave the full execution window after the settlement guard.
+        let after_payment = funding_guard_ms.saturating_add(1);
+        let Some(last_payment) = max_hold
+            .checked_sub(after_payment)
+            .filter(|last| *last > now)
+        else {
+            return Err(EntryGate::NetEdge.into());
+        };
+        let mut holds = Vec::new();
+        for (i, leg) in self.config.legs.iter().enumerate() {
+            let (first, count) = leg
+                .funding
+                .window(now, last_payment)
+                .ok_or(EntryGate::FundingForecast.on_leg(i))?;
+            holds.extend(
+                (0..count.min(MAX_FUNDING_POINTS as u64))
+                    .map(|index| first + index * leg.funding.interval_ms + after_payment),
+            );
+        }
+        holds.sort_unstable();
+        holds.dedup();
+        let mut best: Option<Plan> = None;
+        let mut rejection: Option<BlockedEntry> = None;
+        for hold in holds {
+            match self.plan_for_hold(
+                frame,
+                signal,
+                hold,
+                cutoff,
+                &mut depth,
+                best_edge_bps.as_deref_mut(),
+            ) {
+                Ok(plan)
+                    if best
+                        .as_ref()
+                        .is_none_or(|previous| plan.net_edge > previous.net_edge) =>
+                {
+                    best = Some(plan);
+                }
+                Ok(_) => {}
+                Err(blocked) => {
+                    if rejection.is_none_or(|previous| previous.gate < blocked.gate) {
+                        rejection = Some(blocked);
+                    }
+                    // Later unwinds would require the same missing evidence.
+                    if blocked.gate == EntryGate::FundingForecast {
+                        break;
+                    }
+                }
+            }
+        }
+        best.ok_or_else(|| rejection.unwrap_or_else(|| EntryGate::NetEdge.into()))
+    }
+
+    fn plan_for_hold(
+        &self,
+        frame: &Frame,
+        signal: BasisSignal,
+        hold_until: u64,
+        cutoff: u64,
+        depth: &mut Option<[[Depth; 2]; 2]>,
+        mut best_edge_bps: Option<&mut Option<Decimal>>,
+    ) -> EntryDecision<Plan> {
+        let now = frame.now_ms;
         let unwind_until = hold_until
             .checked_add(self.config.execution_window_ms)
             .ok_or(EntryGate::Session)?;
@@ -1178,9 +1257,11 @@ impl RelativeValue {
         .map_err(|_| EntryGate::NetEdge)?
             / BPS
             * frame.reference.price;
-        let depth = [0, 1].map(|i| {
-            [HedgeSide::Buy, HedgeSide::Sell].map(|side| {
-                Depth::build(&frame.legs[i].book, &self.config.legs[i], side, self.rules)
+        let depth = depth.get_or_insert_with(|| {
+            [0, 1].map(|i| {
+                [HedgeSide::Buy, HedgeSide::Sell].map(|side| {
+                    Depth::build(&frame.legs[i].book, &self.config.legs[i], side, self.rules)
+                })
             })
         });
         let mut best: Option<Plan> = None;
@@ -1207,7 +1288,7 @@ impl RelativeValue {
                 reserve,
                 window,
             };
-            match self.size_plan(frame, &depth, score, best_edge_bps.as_deref_mut()) {
+            match self.size_plan(frame, depth, score, best_edge_bps.as_deref_mut()) {
                 Ok(plan)
                     if best
                         .as_ref()
@@ -1313,6 +1394,7 @@ impl RelativeValue {
         let mut best: Option<(Decimal, Economics)> = None;
         let mut sized = false;
         let mids = frame.legs.each_ref().map(|leg| leg.book.mid());
+        let days = Decimal::from(score.window[2] - frame.now_ms) / Decimal::from(DAY_MS);
         let budget = frame
             .legs
             .each_ref()
@@ -1328,7 +1410,7 @@ impl RelativeValue {
             if qty <= Decimal::ZERO {
                 continue;
             }
-            let mut econ = self.economics(depth, score, qty, mids)?;
+            let mut econ = self.economics(depth, score, qty, mids, days)?;
             // Size at the risk prices of this band, so unrelated deep levels
             // cannot consume the notional budget of a smaller executable lot.
             let affordable = (0..2).fold(qty, |q, i| q.min(budget[i] / risk_price(i, &econ)));
@@ -1337,7 +1419,7 @@ impl RelativeValue {
                 if qty <= Decimal::ZERO {
                     continue;
                 }
-                econ = self.economics(depth, score, qty, mids)?;
+                econ = self.economics(depth, score, qty, mids, days)?;
             }
             if (0..2).any(|i| {
                 qty * risk_price(i, &econ) > budget[i]
@@ -1406,6 +1488,7 @@ impl RelativeValue {
         score: Score,
         qty: Decimal,
         mid: [Decimal; 2],
+        days: Decimal,
     ) -> Decision<Economics> {
         let mut econ = Economics::default();
         for i in 0..2 {
@@ -1418,9 +1501,6 @@ impl RelativeValue {
             econ.exit_limits[i] = exit_limit;
             econ.entry += sign * (entry_limit - mid[i]) + entry_limit * fee;
             econ.exit += sign * (mid[i] - exit_limit) + exit_limit * fee;
-            let days = Decimal::from(
-                self.config.planner.funding_horizon_ms + self.config.execution_window_ms,
-            ) / Decimal::from(DAY_MS);
             econ.capital += entry_limit.max(exit_limit) * self.rules.capital_charge * days;
         }
         Ok(econ)

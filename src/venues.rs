@@ -53,6 +53,7 @@ impl Default for VenueRegistry {
                     RestClient,
                 ),
                 ("arcus", "arcus", "arcus", None, RestClient),
+                ("bulk", "bulk", "bulk", None, ReadOnly),
                 ("variational", "variational", "variational", None, ReadOnly),
             ]
             .into_iter()

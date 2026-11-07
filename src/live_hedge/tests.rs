@@ -15,6 +15,8 @@ fn market() -> PerpMarket {
             sz_decimals: 4,
             max_leverage: 20,
             is_delisted: false,
+            growth_mode: None,
+            deployer_fee_scale: None,
         },
         collateral_token: None,
         mark_price: d("2000"),
@@ -63,6 +65,8 @@ fn hedge_reserves_the_net_cap_without_releasing_pending_cancels() {
     };
     let allowance = QuoteAllowance {
         primary: 0.02,
+        sell_proceeds: 1997.0,
+        buy_cost: 2004.0,
         hedge: -0.02,
         max_unhedged: 0.05,
         expires: Instant::now(),

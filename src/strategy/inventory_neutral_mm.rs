@@ -50,9 +50,9 @@ use market_state::{
     external_fair_value_mid,
 };
 use pricing::{
-    AnchorParams, anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, fee_aware_half_spread, local_reference_mid, momentum_half_spreads,
-    stabilize_crossed_quotes,
+    AnchorParams, MakerPriceBounds, anchor_quotes_to_touch, cleanup_reference_mid,
+    effective_penny_ticks, fallback_bbo_prices, fee_aware_half_spread, local_reference_mid,
+    momentum_half_spreads, stabilize_crossed_quotes,
 };
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
@@ -585,10 +585,10 @@ impl InventoryNeutralMM {
                     self.inventory_age.last_attempt = Some(now);
                     self.execute_timeout_flatten(inputs.mid).await;
                 }
-            } else if let Some((our_bid, our_ask)) =
+            } else if let Some((our_bid, our_ask, bounds)) =
                 self.calculate_optimal_quotes(&inputs, quoting_position)
             {
-                self.execute_quoting_cycle(our_bid, our_ask, inputs.mid, shutdown)
+                self.execute_quoting_cycle(our_bid, our_ask, bounds, inputs.mid, shutdown)
                     .await;
             } else {
                 self.cancel_all_orders().await;
@@ -1448,7 +1448,27 @@ impl InventoryNeutralMM {
     /// Uses external fair value as pricing_mid. Kappa is used directly from config
     /// (no fill-rate scaling). Spread cap is dynamic vol-based instead of hard clamp.
     /// Momentum-aware asymmetric spread replaces old inventory_adjusted_half_spreads.
-    fn calculate_optimal_quotes(&self, inputs: &PricingInputs, q: f64) -> Option<(f64, f64)> {
+    fn calculate_optimal_quotes(
+        &self,
+        inputs: &PricingInputs,
+        q: f64,
+    ) -> Option<(f64, f64, MakerPriceBounds)> {
+        let (sell_proceeds, buy_cost) = if let Some(hedge) = &self.hedge {
+            let allowance = hedge.allowance()?;
+            (
+                inputs.pricing_mid.min(allowance.sell_proceeds),
+                inputs.pricing_mid.max(allowance.buy_cost),
+            )
+        } else {
+            (inputs.pricing_mid, inputs.pricing_mid)
+        };
+        let bounds = MakerPriceBounds::new(
+            sell_proceeds,
+            buy_cost,
+            self.config.maker_fee_bps,
+            self.config.min_profit_bps,
+            self.config.tick_size,
+        )?;
         let toxicity_spread_mult =
             toxicity_spread_multiplier(inputs.as_score, self.config.adverse_selection_threshold);
         if toxicity_spread_mult > 1.0 {
@@ -1528,7 +1548,11 @@ impl InventoryNeutralMM {
             inputs.ask_touch,
             self.config.tick_size,
         ) {
-            Some((stable_bid, stable_ask)) => Some((stable_bid, stable_ask)),
+            Some((stable_bid, stable_ask)) => {
+                let bid = stable_bid.min(bounds.max_bid);
+                let ask = stable_ask.max(bounds.min_ask);
+                Some((bid, ask, bounds))
+            }
             None => {
                 debug!(
                     "Skipping optimal quotes: crossed quote bid={:.2} ask={:.2} mid={:.2}",
@@ -1544,6 +1568,7 @@ impl InventoryNeutralMM {
         &mut self,
         our_bid: f64,
         our_ask: f64,
+        bounds: MakerPriceBounds,
         mid: f64,
         shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) {
@@ -1552,6 +1577,16 @@ impl InventoryNeutralMM {
             return;
         }
         self.refresh_active_orders_from_tracker();
+        if self
+            .active_orders
+            .iter()
+            .any(|order| !bounds.allows(order.side, order.price))
+        {
+            // A requote tolerance must never retain a price below the
+            // current edge floor, even during the minimum order lifetime.
+            self.cancel_all_and_sync("maker edge below floor").await;
+            return;
+        }
 
         let risk = self.build_risk_snapshot(mid);
         let Some(target) = self.build_quote_target(our_bid, our_ask, mid, &risk) else {

@@ -1077,6 +1077,20 @@ fn anchored_quotes_preserve_fair_value_edge_without_crossing() {
 }
 
 #[test]
+fn maker_price_bounds_preserve_each_fills_net_edge_after_fees() {
+    let bounds = MakerPriceBounds::new(1_997.10, 2_003.90, 0.38, 1.0, 0.01).unwrap();
+    let maker_fee = 0.38 / 10_000.0;
+    let profit = 0.5 / 10_000.0;
+    assert!(1_997.10 - bounds.max_bid * (1.0 + maker_fee) >= bounds.max_bid * profit);
+    assert!(bounds.min_ask * (1.0 - maker_fee) - 2_003.90 >= bounds.min_ask * profit);
+    assert!(bounds.allows(OrderSide::Buy, bounds.max_bid));
+    assert!(bounds.allows(OrderSide::Sell, bounds.min_ask));
+    // A wide two-sided spread can hide a losing fill on one leg.
+    assert!(!bounds.allows(OrderSide::Buy, 2_000.00));
+    assert!(!bounds.allows(OrderSide::Sell, 2_002.00));
+}
+
+#[test]
 fn anchored_quotes_respect_configured_join_buffer() {
     let (bid, ask) = anchor_quotes_to_touch(&AnchorParams {
         raw_bid: 2100.0,

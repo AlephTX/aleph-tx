@@ -62,6 +62,8 @@ impl HedgeLimits {
 #[derive(Clone, Copy)]
 pub(crate) struct QuoteAllowance {
     pub primary: f64,
+    pub sell_proceeds: f64,
+    pub buy_cost: f64,
     hedge: f64,
     max_unhedged: f64,
     pub expires: Instant,
@@ -261,11 +263,20 @@ impl LiveInventoryHedge {
         if let Some(observed) = self.observe(false).await?
             && (observed.primary + observed.hedge).abs() <= self.limits.deadband_base
         {
+            let fee = self.limits.taker_fee_bps / 10_000.0;
+            let sell_limit = hedge_price_limit(observed.book.bid, self.limits.slippage_bps, false)?
+                .to_f64()
+                .context("Invalid Hyperliquid sell limit")?;
+            let buy_limit = hedge_price_limit(observed.book.ask, self.limits.slippage_bps, true)?
+                .to_f64()
+                .context("Invalid Hyperliquid buy limit")?;
             self.allowance = Some(QuoteAllowance {
                 primary: observed
                     .primary
                     .to_f64()
                     .context("Invalid Lighter exposure")?,
+                sell_proceeds: sell_limit * (1.0 - fee),
+                buy_cost: buy_limit * (1.0 + fee),
                 hedge: observed
                     .hedge
                     .to_f64()
@@ -581,14 +592,7 @@ fn plan_ioc(
     } else {
         (observation.book.bid, observation.book.bid_size)
     };
-    let slip = Decimal::new(i64::from(limits.slippage_bps), 4);
-    let price = touch
-        .checked_mul(if is_buy {
-            Decimal::ONE + slip
-        } else {
-            Decimal::ONE - slip
-        })
-        .context("Hedge price exceeds decimal range")?;
+    let price = hedge_price_limit(touch, limits.slippage_bps, is_buy)?;
     let cap = limits
         .max_order_notional_usd
         .checked_div(price.max(touch))
@@ -620,6 +624,17 @@ fn plan_ioc(
         return Ok(None);
     }
     Ok(Some(order))
+}
+
+fn hedge_price_limit(touch: Decimal, slippage_bps: u32, is_buy: bool) -> Result<Decimal> {
+    let slip = Decimal::new(i64::from(slippage_bps), 4);
+    touch
+        .checked_mul(if is_buy {
+            Decimal::ONE + slip
+        } else {
+            Decimal::ONE - slip
+        })
+        .context("Hedge price exceeds decimal range")
 }
 
 fn unix_ms() -> Result<u64> {

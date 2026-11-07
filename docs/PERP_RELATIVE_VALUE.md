@@ -46,6 +46,15 @@ The open position keeps its entry baseline for exit decisions.
   rates separately. Unknown schedules, incomplete forecasts and read-only
   indicative quotes cannot support an entry.
 
+Set `pair.optimize_funding_horizon` to `true` for funding carry to make
+`planner.funding_horizon_ms` the maximum hold. The planner evaluates closes
+after scheduled payments, with any configured funding guard and the full
+unwind window. It ranks the feasible sizes and holds by conservative net
+edge and favors the shorter hold at equal edge. Capital is charged for the
+candidate's own hold and unwind. A later missing forecast only rules out
+holds whose unwind window reaches that payment. Existing configurations use
+the fixed horizon.
+
 Use the venue's current price grid for the applicable price band. A fixture's
 tick, fee, contract multiplier, settlement mapping or event schedule does not
 establish live venue terms. This path supports constant funding cadence within
@@ -86,12 +95,49 @@ marks, peak observed drawdown, maximum single-leg exposure and time exposed.
 An expired intent with no usable post-arrival book is counted separately.
 Funding at a frame time is booked before simulated fills at that time.
 
+Each `market_costs` row names the venue and contract and totals simulated
+filled turnover and fees for both directions. `execution_cost_bps` divides
+fees plus signed slippage from the submit-time touch by filled turnover.
+The field is null when there are no fills or any fill lacks that benchmark.
+Cash PnL uses fill prices, fees and settled funding, so it also captures the
+spread paid at the touch.
+
 Paper fills still assume the discounted displayed liquidity is available to
 this order. The replay models one pair at a time and does not simulate venue
 queue priority, liquidations, collateral transfers or intraframe price paths.
 The capital charge is an entry reserve; realized PnL accounts for simulated
 fills, fees and settled funding. A time or session cutoff without sufficient
 depth can leave positions open. Preserve those cases when comparing strategies.
+
+## Entropy and venue rewards
+
+- Entropy is the Hyperliquid HIP-3 deployer `io`. It shares Hyperliquid's
+  infrastructure risk. `cross_venue markets entropy` shows the native
+  collateral ID, delisting status and fee mode. Check the contract and
+  account fee tier for the observed period. The equity oracle references the
+  public listing during regular trading hours and can blend Entropy's own
+  book outside that session. Keep a separate underlying reference. Entropy's
+  rebate terms apply to its share of eligible fees and require an Entropy
+  account for the trading address.
+  [Entropy fees](https://docs.entropy.io/equity-perp-mechanics/fees),
+  [equity oracle](https://docs.entropy.io/equity-perp-mechanics/oracle-price),
+  [rebates](https://docs.entropy.io/about-entropy/referrals).
+- Arcus publishes Season 1 points rules and considers trading quality and
+  liquidity. Self-matching and wash trading can reduce or forfeit points.
+  Use the venue's posted account points when reconciling eligible activity.
+  [Arcus Points](https://arcus.xyz/blog/introducing-arcus-points),
+  [Protocol Terms](https://arcus.xyz/legal/protocol-terms).
+- BULK publishes Trading AURA and weekly Challenger Series rules. The
+  series excludes traders BULK classifies as market makers and screens
+  activity for wash trading and Sybil behavior. Use `cross_venue markets bulk`
+  and `cross_venue bbo bulk BTC-USD` to inspect its public markets. The
+  integration is read-only.
+  [Challenger Series](https://docs.bulk.trade/bulk-exchange/aura),
+  [BULK exchange info](https://docs.bulk.trade/api-reference/getExchangeInfo).
+
+The planner values future points and airdrops at zero. Paper turnover
+measures execution economics. Reconcile live fills and any rewards posted
+by the venue separately from strategy PnL.
 
 The next validation step is synchronized venue L2, external reference, contract
 terms and funding recordings for verified matched markets. Use a chronological

@@ -37,10 +37,85 @@ fn crypto_carry_uses_explicit_funding_and_settles_four_fills() {
     assert_eq!(report.trades[0].exit_reason, ExitReason::HoldingTime);
     assert_eq!(report.funding, d("0.1032"));
     assert_eq!(report.fees, d("0.064"));
+    for (cost, venue) in report.market_costs.iter().zip(["lighter", "hyperliquid"]) {
+        assert_eq!(cost.venue, venue);
+        assert_eq!(cost.market, "ETH");
+        assert_eq!(cost.turnover_quote, d("160"));
+        assert_eq!(cost.fees_quote, d("0.032"));
+        assert_eq!(cost.execution_cost_bps, Some(d("2")));
+    }
     assert_eq!(report.realized_pnl, d("0.0232"));
     assert_eq!(report.final_liquidation_pnl, Some(report.realized_pnl));
     assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
     assert_eq!(report.max_unhedged_ms, 100);
+}
+
+#[test]
+fn carry_can_close_after_the_next_verified_payment_with_guard_and_full_unwind() {
+    let mut scenario = crypto();
+    scenario.pair.planner.funding_horizon_ms = 7_200_000;
+    scenario.pair.capital_charge_bps_per_day = 5.0;
+    assert!(matches!(first_plan(&scenario), Err(Rejection::Funding)));
+
+    scenario.pair.optimize_funding_horizon = true;
+    scenario.funding_guard_ms = 100;
+    let payment = scenario.frames[7].now_ms;
+    for (index, delay) in [200, 300, 400].into_iter().enumerate() {
+        let mut frame = scenario.frames[8 + index].clone();
+        let now = payment + delay;
+        frame.now_ms = now;
+        frame.reference.timestamp_ms = now;
+        for leg in &mut frame.legs {
+            leg.book.timestamp_ms = now;
+            leg.oracle.timestamp_ms = now;
+        }
+        scenario.frames.insert(8 + index, frame);
+    }
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert_eq!(report.ioc_filled, 4);
+    assert_eq!(report.funding, d("0.1032"));
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    let trade = &report.trades[0];
+    assert_eq!(trade.plan.hold_until_ms, payment + 101);
+    assert_eq!(trade.plan.unwind_until_ms, payment + 901);
+    assert_eq!(trade.exit_reason, ExitReason::HoldingTime);
+    assert_eq!(trade.closed_at_ms, payment + 400);
+    assert!(trade.plan.capital_charge > Decimal::ZERO);
+    assert!(trade.plan.capital_charge < d("0.00001"));
+}
+
+#[test]
+fn optimized_carry_compares_verified_holds_and_reserves_unwind_payments() {
+    let mut scenario = crypto();
+    scenario.pair.planner.funding_horizon_ms = 7_200_000;
+    scenario.pair.optimize_funding_horizon = true;
+    let second = {
+        let legs = &mut scenario.frames[3].legs;
+        for leg in legs.iter_mut() {
+            let payments = &mut leg.forecast.as_mut().unwrap().payments;
+            let mut payment = payments[0];
+            payment.at_ms += 3_600_000;
+            payments.push(payment);
+        }
+        legs[1].forecast.as_ref().unwrap().payments[1].at_ms
+    };
+    assert_eq!(first_plan(&scenario).unwrap().hold_until_ms, second + 1);
+    scenario.frames[3].legs[1]
+        .forecast
+        .as_mut()
+        .unwrap()
+        .payments[1]
+        .rate = d("-0.0015");
+    assert_eq!(
+        first_plan(&scenario).unwrap().hold_until_ms,
+        second - 3_600_000 + 1
+    );
+
+    // A later slot on the other leg falls inside the first slot's unwind.
+    // Its unverified cashflow cannot be treated as zero.
+    scenario.pair.legs[0].funding.offset_ms = 500;
+    scenario.frames[3].legs[0].forecast = None;
+    assert!(matches!(first_plan(&scenario), Err(Rejection::Funding)));
 }
 
 #[test]
@@ -464,7 +539,13 @@ fn benchmark_relative_value_l2_plan() {
     for _ in 0..trials {
         black_box(
             engine
-                .plan(black_box(frame), black_box(signal), black_box(cutoff), None)
+                .plan(
+                    black_box(frame),
+                    black_box(signal),
+                    black_box(cutoff),
+                    0,
+                    None,
+                )
                 .unwrap(),
         );
     }

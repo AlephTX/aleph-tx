@@ -36,6 +36,23 @@ target/release/cross_venue perp-compile examples/nvda_capture.json \
   recordings/nvda-raw.ndjson recordings/nvda-replay.ndjson
 ```
 
+To check the Entropy feed on the same Lighter market, copy the NVDA profile
+and change `pair.legs[1].venue` to `entropy` and `pair.legs[1].market` to
+`io:NVDA`. Set `legs[1].hyperliquid_book_mode` to `freshest` and leave
+`paper_entries` disabled for the coverage check.
+
+```sh
+feeder/perp-capture -lighter 110 -hyperliquid io:NVDA \
+  -lighter-clock-refresh 2m -hl-snapshot-interval 1s -duration 5m \
+  -output recordings/entropy-nvda-raw.ndjson
+target/release/cross_venue perp-compile recordings/entropy-nvda-config.json \
+  recordings/entropy-nvda-raw.ndjson recordings/entropy-nvda-replay.ndjson
+```
+
+Enable Lighter calibration on the copied profile with `legs[0].lighter_clock`
+as described below. Review Entropy's contract economics and session-specific
+oracle before using the capture for paper entries.
+
 ## Timing and dataset coverage
 
 - The recorder shares WebSocket keepalives with the production feeder.

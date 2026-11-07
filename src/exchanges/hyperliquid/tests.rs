@@ -28,6 +28,8 @@ fn asset(sz_decimals: u32) -> PerpAsset {
         sz_decimals,
         max_leverage: 20,
         is_delisted: false,
+        growth_mode: None,
+        deployer_fee_scale: None,
     }
 }
 fn order(price: &str, size: &str) -> PerpOrder {

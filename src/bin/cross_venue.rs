@@ -3,7 +3,7 @@
 mod arcus_cli;
 use aleph_tx::{
     capture::{CaptureConfig, compile as compile_capture},
-    exchanges::{arcus, hyperliquid, variational},
+    exchanges::{arcus, bulk, hyperliquid, variational},
     funding_evidence,
     hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
     strategy::cross_venue::{
@@ -397,6 +397,7 @@ async fn main() -> Result<()> {
                     .bbo(market)
                     .await?,
             ),
+            "bulk" => print(&bulk::BulkInfo::new()?.bbo(market).await?),
             "hyperliquid" | "entropy" | "trade_xyz" => {
                 let prefix = registry
                     .get(venue)?
@@ -425,7 +426,9 @@ async fn main() -> Result<()> {
                     "bid_size": book.bid_size.to_string(), "ask_size": book.ask_size.to_string(),
                 }))
             }
-            _ => anyhow::bail!("Public BBO available for arcus, hyperliquid and entropy"),
+            _ => anyhow::bail!(
+                "Public BBO available for arcus, bulk, hyperliquid, entropy and trade_xyz"
+            ),
         },
         [command, venue] if command == "markets" => match registry.get(venue)? {
             venue if venue.hyperliquid_dex.is_some() => {
@@ -440,6 +443,9 @@ async fn main() -> Result<()> {
                             "coin": m.asset.name,
                             "asset_id": m.asset_id,
                             "size_decimals": m.asset.sz_decimals,
+                            "is_delisted": m.asset.is_delisted,
+                            "growth_mode": m.asset.growth_mode,
+                            "deployer_fee_scale": m.asset.deployer_fee_scale,
                             "collateral_token": m.collateral_token,
                             "oracle_price": m.oracle_price.to_string(),
                             "hourly_funding": m.hourly_funding.to_string(),
@@ -453,6 +459,7 @@ async fn main() -> Result<()> {
                     .markets()
                     .await?,
             ),
+            venue if venue.id == "bulk" => print(&bulk::BulkInfo::new()?.markets().await?),
             venue if venue.id == "variational" => {
                 print(&variational::VariationalInfo::new()?.stats().await?)
             }

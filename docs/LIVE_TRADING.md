@@ -73,8 +73,10 @@ the strategy's normal shorter cancellation timer.
   lot sizes and the hedge venue's order minimum. Shutdown requires both legs
   to be flat.
 - The strategy adds the configured round-trip taker fees and slippage budget
-  to its maker quote spread floor. Execution still depends on available
-  liquidity, venue limits and the price when each order reaches the book.
+  to its maker quote spread floor. It also checks each side against fair
+  value and, when hedged, the opposing Hyperliquid price after taker fees and
+  slippage. A resting quote outside those limits triggers a cancellation.
+  Execution depends on liquidity, venue limits and the book at order arrival.
 - `pids/aleph-trade.active.jsonl` records the live session and each
   Hyperliquid order intent before dispatch. A lost acknowledgment retains
   that reservation. Recovery checks the client order ID and reconciles a
