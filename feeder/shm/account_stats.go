@@ -147,6 +147,13 @@ func (w *AccountStatsWriter) PositionNeedsRefresh(now, maxAge uint64) bool {
 	return at == 0 || at > now || now-at >= maxAge
 }
 
+func (w *AccountStatsWriter) EquityNeedsRefresh(now, maxAge uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	at := w.stats.UpdatedAt
+	return at == 0 || at > now || now-at >= maxAge
+}
+
 // GetVersion returns the current version (for diagnostics).
 func (w *AccountStatsWriter) GetVersion() uint64 {
 	return atomic.LoadUint64(&w.stats.Version)

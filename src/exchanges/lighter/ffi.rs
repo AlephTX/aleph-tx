@@ -32,7 +32,7 @@ mod unavailable {
         #[allow(clippy::too_many_arguments)]
         pub fn sign_create_order(
             &self,
-            _: u8,
+            _: impl Into<i64>,
             _: i64,
             _: i64,
             _: u32,
@@ -49,7 +49,7 @@ mod unavailable {
 
         pub fn sign_cancel_order(
             &self,
-            _: u8,
+            _: impl Into<i64>,
             _: i64,
             _: i64,
         ) -> Result<SignedTransaction, String> {

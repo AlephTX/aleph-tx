@@ -315,6 +315,7 @@ pub struct InventoryNeutralMM {
     trading: Arc<dyn Exchange>,
     order_tracker: Arc<OrderTracker>,
     hedge: Option<LiveInventoryHedge>,
+    use_external_fair_value: bool,
     shm_reader: ShmReader,
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
     account_stats_reader: AccountStatsReader,
@@ -400,6 +401,7 @@ impl InventoryNeutralMM {
             trading,
             order_tracker,
             hedge: None,
+            use_external_fair_value: true,
             shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
@@ -424,6 +426,10 @@ impl InventoryNeutralMM {
     pub fn with_inventory_hedge(mut self, hedge: LiveInventoryHedge) -> Self {
         self.hedge = Some(hedge);
         self
+    }
+
+    pub fn use_local_fair_value(&mut self) {
+        self.use_external_fair_value = false;
     }
 
     pub async fn run(
@@ -938,7 +944,15 @@ impl InventoryNeutralMM {
     async fn perform_graceful_shutdown(&mut self) -> anyhow::Result<()> {
         info!("🛑 Graceful shutdown initiated...");
         self.is_running.store(false, Ordering::SeqCst);
-        self.clean_exchange_state("shutdown").await?;
+        if let Err(error) = self.clean_exchange_state("shutdown").await {
+            warn!(%error, "Normal shutdown failed; checking independent exchange state");
+            self.trading
+                .recover_flat_without_feed()
+                .await
+                .map_err(|recovery| {
+                    recovery.context(format!("Normal shutdown failed: {error:#}"))
+                })?;
+        }
         if let Some(hedge) = &mut self.hedge {
             hedge.finish().await?;
         }
@@ -1372,12 +1386,16 @@ impl InventoryNeutralMM {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let external_fair = external_fair_value_mid(
-            exchanges,
-            self.config.exchange_id,
-            now_ns,
-            self.config.external_staleness_ms,
-        );
+        let external_fair = if self.use_external_fair_value {
+            external_fair_value_mid(
+                exchanges,
+                self.config.exchange_id,
+                now_ns,
+                self.config.external_staleness_ms,
+            )
+        } else {
+            None
+        };
 
         let (pricing_mid, using_external, mid) = if let Some(fair_mid) = external_fair {
             // External exchanges drive fair value; local mid is only for touch

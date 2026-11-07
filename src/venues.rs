@@ -52,7 +52,7 @@ impl Default for VenueRegistry {
                     Some("xyz"),
                     RestClient,
                 ),
-                ("arcus", "arcus", "arcus", None, SignedRequests),
+                ("arcus", "arcus", "arcus", None, RestClient),
                 ("variational", "variational", "variational", None, ReadOnly),
             ]
             .into_iter()

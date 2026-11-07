@@ -1,0 +1,382 @@
+//! REST-only shutdown after the private feed becomes unavailable.
+
+use super::*;
+use anyhow::{Context, ensure};
+use rust_decimal::Decimal;
+use std::collections::BTreeSet;
+
+#[derive(Deserialize)]
+struct OrderHistory {
+    code: i32,
+    orders: Vec<HistoricalOrder>,
+}
+
+#[derive(Deserialize)]
+struct HistoricalOrder {
+    client_order_index: i64,
+    market_index: i64,
+    owner_account_index: i64,
+    status: String,
+    filled_base_amount: Decimal,
+    transaction_time: u64,
+}
+
+impl LighterTrading {
+    pub(super) async fn recover_flat(&self) -> Result<()> {
+        let tracker = self
+            .order_tracker
+            .as_ref()
+            .context("Shutdown recovery requires the order tracker")?;
+        tracker.require_reconciliation();
+        let mut orders = tracker.active_cois().into_iter().collect::<BTreeSet<_>>();
+        let mut canceled = BTreeSet::new();
+        let mut closes = 0;
+        for _ in 0..10 {
+            let open = self.get_active_orders().await?;
+            if !open.is_empty() {
+                orders.extend(open.iter().map(|order| order.client_order_index));
+                let actions: Vec<_> = open
+                    .iter()
+                    .filter(|order| canceled.insert(order.order_index))
+                    .map(|order| BatchAction::Cancel(order.order_index))
+                    .collect();
+                for chunk in actions.chunks(50) {
+                    self.execute_batch(chunk.to_vec()).await?;
+                }
+            } else if let Some(fill_time) = self.terminal_fill_time(&orders).await? {
+                let (position, account_time) = self.signed_position_snapshot().await?;
+                if account_time >= fill_time {
+                    if position.is_zero() {
+                        tracing::info!(
+                            "Lighter REST recovery confirmed zero position and terminal orders"
+                        );
+                        return Ok(());
+                    }
+                    ensure!(closes < 3, "Lighter REST recovery left residual inventory");
+                    let position: f64 = position.try_into()?;
+                    let touch = self.recovery_touch(position > 0.0).await?;
+                    let close = self.place_order(self.close_order(position, touch)?).await?;
+                    orders.insert(close.client_order_index);
+                    closes += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        anyhow::bail!("Lighter REST recovery could not prove zero position and terminal orders")
+    }
+
+    // The absence of an order from either REST endpoint is insufficient. For
+    // fills, require the account snapshot to be at least as recent as the order.
+    async fn terminal_fill_time(&self, orders: &BTreeSet<i64>) -> Result<Option<u64>> {
+        if orders.is_empty() {
+            return Ok(Some(0));
+        }
+        ensure!(
+            orders.iter().all(|&id| id > 0),
+            "Lighter recovery found an order without a client ID"
+        );
+        let auth = self.create_auth_token().await?;
+        let orders: Vec<_> = orders.iter().copied().collect();
+        let mut watermark = 0;
+        for chunk in orders.chunks(20) {
+            let ids = chunk
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let response: OrderHistory = self
+                .client
+                .get(format!("{}/api/v1/accountOrders", self.base_url))
+                .query(&[
+                    ("account_index", self.account_index.to_string()),
+                    ("client_order_indexes", ids),
+                ])
+                .header("Authorization", &auth)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            ensure!(
+                response.code == 200,
+                "Lighter order reconciliation failed with code {}",
+                response.code
+            );
+            let Some(chunk_time) =
+                terminal_fill_time(&response.orders, chunk, self.account_index, self.market_id)?
+            else {
+                return Ok(None);
+            };
+            watermark = watermark.max(chunk_time);
+        }
+        Ok(Some(watermark))
+    }
+
+    async fn recovery_touch(&self, sell: bool) -> Result<f64> {
+        #[derive(Deserialize)]
+        struct Level {
+            price: String,
+            remaining_base_amount: String,
+        }
+        #[derive(Deserialize)]
+        struct Book {
+            code: i32,
+            bids: Vec<Level>,
+            asks: Vec<Level>,
+        }
+
+        let book: Book = self
+            .client
+            .get(format!("{}/api/v1/orderBookOrders", self.base_url))
+            .query(&[("market_id", self.market_id), ("limit", 1)])
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure!(
+            book.code == 200,
+            "Lighter recovery book returned code {}",
+            book.code
+        );
+        let touch = if sell {
+            book.bids.first()
+        } else {
+            book.asks.first()
+        }
+        .context("Lighter recovery has no executable touch")?;
+        let price = touch.price.parse::<f64>()?;
+        let size = touch.remaining_base_amount.parse::<f64>()?;
+        ensure!(
+            price.is_finite() && price > 0.0 && size.is_finite() && size > 0.0,
+            "Invalid Lighter recovery quote"
+        );
+        Ok(price)
+    }
+}
+
+fn terminal_fill_time(
+    records: &[HistoricalOrder],
+    client_ids: &[i64],
+    account_index: i64,
+    market_id: i64,
+) -> Result<Option<u64>> {
+    let mut watermark = 0;
+    for id in client_ids {
+        let mut matched = records
+            .iter()
+            .filter(|order| order.client_order_index == *id);
+        let Some(order) = matched.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            order.owner_account_index == account_index
+                && order.market_index == market_id
+                && matched.next().is_none()
+                && order.filled_base_amount >= Decimal::ZERO,
+            "Lighter historical order identity or quantity mismatch"
+        );
+        if !(matches!(
+            order.status.as_str(),
+            "filled" | "canceled" | "rejected" | "expired"
+        ) || order.status.starts_with("canceled-"))
+        {
+            return Ok(None);
+        }
+        if order.filled_base_amount > Decimal::ZERO {
+            ensure!(
+                order.transaction_time > 0,
+                "Lighter fill has no transaction watermark"
+            );
+            watermark = watermark.max(order.transaction_time);
+        } else {
+            ensure!(
+                order.status != "filled",
+                "Lighter filled order reports zero quantity"
+            );
+        }
+    }
+    Ok(Some(watermark))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_requires_terminal_orders_for_the_exact_account_and_market() {
+        let mut order = HistoricalOrder {
+            client_order_index: 123,
+            market_index: 4095,
+            owner_account_index: 7,
+            status: "open".into(),
+            filled_base_amount: Decimal::new(2, 2),
+            transaction_time: 30,
+        };
+        assert_eq!(terminal_fill_time(&[], &[123], 7, 4095).unwrap(), None);
+        assert_eq!(
+            terminal_fill_time(std::slice::from_ref(&order), &[123], 7, 4095).unwrap(),
+            None
+        );
+        order.status = "canceled-ioc".into();
+        assert_eq!(
+            terminal_fill_time(std::slice::from_ref(&order), &[123], 7, 4095).unwrap(),
+            Some(30)
+        );
+        assert!(terminal_fill_time(std::slice::from_ref(&order), &[123], 7, 4096).is_err());
+        assert!(terminal_fill_time(std::slice::from_ref(&order), &[123], 8, 4095).is_err());
+        order.transaction_time = 0;
+        assert!(terminal_fill_time(&[order], &[123], 7, 4095).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn signed_maker_partial_fill_can_be_canceled_and_closed_without_the_feeder() {
+        use serde_json::{Value, json};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let post_close_snapshots = Arc::new(AtomicUsize::new(0));
+        let snapshots = Arc::clone(&post_close_snapshots);
+        let server = tokio::spawn(async move {
+            let (mut maker, mut close) = (None, None);
+            let mut canceled = false;
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                socket.read_line(&mut request).await.unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    socket.read_line(&mut header).await.unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("Content-Length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let body = String::from_utf8(body).unwrap();
+                let response = match path.split('?').next().unwrap() {
+                    "/api/v1/orderBookDetails" => {
+                        assert!(path.ends_with("?market_id=4095"));
+                        json!({"order_book_details":[{"symbol":"ETH","market_type":"perp",
+                            "status":"active","market_id":4095,"size_decimals":4,"price_decimals":2}]})
+                    }
+                    "/api/v1/nextNonce" => json!({"nonce":7}),
+                    "/api/v1/sendTx" => {
+                        let tx = body.lines().find(|line| line.starts_with('{')).unwrap();
+                        let tx: Value = serde_json::from_str(tx).unwrap();
+                        assert_eq!(tx["MarketIndex"], 4095);
+                        let id = tx["ClientOrderIndex"].as_i64().unwrap();
+                        if maker.is_none() {
+                            assert_eq!(tx["TimeInForce"], 2);
+                            assert_eq!(tx["ReduceOnly"], 0);
+                            assert_eq!(tx["Nonce"], 7);
+                            maker = Some(id);
+                        } else {
+                            assert!(canceled && close.is_none());
+                            assert_eq!(tx["TimeInForce"], 0);
+                            assert_eq!(tx["ReduceOnly"], 1);
+                            assert_eq!(tx["IsAsk"], 1);
+                            assert_eq!(tx["BaseAmount"], 200);
+                            assert_eq!(tx["Nonce"], 9);
+                            close = Some(id);
+                        }
+                        json!({"code":200,"tx_hash":"fixture-order-hash"})
+                    }
+                    "/api/v1/sendTxBatch" => {
+                        assert!(maker.is_some() && !canceled);
+                        assert!(body.contains(r#"\"MarketIndex\":4095"#));
+                        assert!(body.contains(r#"\"Nonce\":8"#));
+                        canceled = true;
+                        json!({"code":200,"tx_hash":["fixture-cancel-hash"]})
+                    }
+                    "/api/v1/accountActiveOrders" => {
+                        let orders = if !canceled && let Some(id) = maker {
+                            vec![json!({"order_index":281474976710677_i64,"client_order_index":id,
+                                "order_id":"fixture-order","market_index":4095,"owner_account_index":1801,
+                                "initial_base_amount":"0.03","price":"2000.00","nonce":7,
+                                "remaining_base_amount":"0.01","is_ask":false,"base_size":300,"base_price":200000,
+                                "filled_base_amount":"0.02","filled_quote_amount":"40.00","side":"buy","type":"limit",
+                                "time_in_force":"post-only","reduce_only":false,"trigger_price":"0",
+                                "order_expiry":0,"status":"open","trigger_status":"n/a","block_height":1,
+                                "timestamp":10,"created_at":10,"updated_at":20})]
+                        } else {
+                            vec![]
+                        };
+                        json!({"code":200,"orders":orders})
+                    }
+                    "/api/v1/accountOrders" => {
+                        assert!(canceled);
+                        let mut orders = vec![json!({"client_order_index":maker.unwrap(),"market_index":4095,
+                            "owner_account_index":1801,"status":"canceled","filled_base_amount":"0.02","transaction_time":20})];
+                        if let Some(id) = close {
+                            orders.push(json!({"client_order_index":id,"market_index":4095,
+                                "owner_account_index":1801,"status":"filled","filled_base_amount":"0.02","transaction_time":30}));
+                        }
+                        json!({"code":200,"orders":orders})
+                    }
+                    "/api/v1/account" => {
+                        let (size, time) = if close.is_none() {
+                            ("0.02", 20)
+                        } else if snapshots.fetch_add(1, Ordering::AcqRel) == 0 {
+                            ("0", 20) // An apparently flat but stale account snapshot.
+                        } else {
+                            ("0", 30)
+                        };
+                        json!({"code":200,"accounts":[{"index":1801,"transaction_time":time,"positions":[{
+                            "market_id":4095,"symbol":"ETH","sign":1,"position":size,
+                            "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"
+                        }]}]})
+                    }
+                    "/api/v1/orderBookOrders" => json!({"code":200,
+                        "bids":[{"price":"2000","remaining_base_amount":"0.1"}],"asks":[]}),
+                    other => panic!("unexpected Lighter recovery endpoint {other}"),
+                }.to_string();
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let credentials = LighterCredentials::from_env(|key| match key {
+            "LIGHTER_PRIVATE_KEY" => Some("01".repeat(40)),
+            "LIGHTER_BASE_URL" => Some(url.clone()),
+            "LIGHTER_CHAIN_ID" => Some("300".into()),
+            "LIGHTER_ACCOUNT_INDEX" => Some("1801".into()),
+            "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+            _ => None,
+        })
+        .unwrap();
+        let mut trading = LighterTrading::with_credentials(4095, credentials)
+            .await
+            .unwrap();
+        trading.set_order_tracker(Arc::new(OrderTracker::new()));
+        trading
+            .place_order(OrderParams {
+                size: 0.03,
+                price: 2000.0,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            })
+            .await
+            .unwrap();
+        trading.recover_flat().await.unwrap();
+        assert_eq!(post_close_snapshots.load(Ordering::Acquire), 2);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+}

@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
+mod recovery;
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 use crate::exchange::{
@@ -35,7 +37,7 @@ pub struct OrderDetail {
     pub order_index: i64,
     pub client_order_index: i64,
     pub order_id: String,
-    pub market_index: u8,
+    pub market_index: i64,
     pub owner_account_index: i64,
     pub initial_base_amount: String,
     pub price: String,
@@ -91,7 +93,7 @@ struct NonceResponse {
 /// 仓位信息
 #[derive(Debug, Clone, Deserialize)]
 pub struct Position {
-    pub market_id: u8,
+    pub market_id: i64,
     pub symbol: String,
     pub sign: i8,
     pub position: String,
@@ -105,6 +107,8 @@ pub struct Position {
 struct AccountInfo {
     index: i64,
     positions: Vec<Position>,
+    #[serde(default)]
+    transaction_time: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +119,7 @@ struct AccountsResponse {
 
 #[derive(Deserialize)]
 struct MarketDetail {
-    market_id: u32,
+    market_id: i64,
     symbol: String,
     market_type: String,
     status: String,
@@ -221,7 +225,7 @@ pub struct LighterTrading {
     send_tx_batch_url: String,
     account_index: i64,
     api_key_index: i64,
-    market_id: u8,
+    market_id: i64,
     market_symbol: String,
     size_multiplier: f64,
     price_multiplier: f64,
@@ -293,6 +297,10 @@ impl Exchange for LighterTrading {
         self.close_all_positions(current_price).await
     }
 
+    async fn recover_flat_without_feed(&self) -> Result<()> {
+        self.recover_flat().await
+    }
+
     async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
         self.execute_batch(actions).await
     }
@@ -350,7 +358,7 @@ impl LighterTrading {
     ///
     /// `market_id`: 市场索引 (0 = ETH perps)
     /// 自动从 orderBookDetails 获取价格/大小精度
-    pub async fn new(market_id: u8) -> Result<Self> {
+    pub async fn new(market_id: impl Into<i64>) -> Result<Self> {
         Self::with_credentials(
             market_id,
             LighterCredentials::from_env(|key| std::env::var(key).ok())?,
@@ -358,7 +366,15 @@ impl LighterTrading {
         .await
     }
 
-    pub async fn with_credentials(market_id: u8, credentials: LighterCredentials) -> Result<Self> {
+    pub async fn with_credentials(
+        market_id: impl Into<i64>,
+        credentials: LighterCredentials,
+    ) -> Result<Self> {
+        let market_id = market_id.into();
+        anyhow::ensure!(
+            super::valid_market_id(market_id),
+            "Invalid Lighter market ID"
+        );
         let LighterCredentials {
             base_url,
             private_key,
@@ -440,7 +456,7 @@ impl LighterTrading {
     async fn fetch_market_with_retry(
         client: &Client,
         base_url: &str,
-        market_id: u8,
+        market_id: i64,
     ) -> Result<MarketDetail> {
         let mut last_err = None;
 
@@ -464,7 +480,7 @@ impl LighterTrading {
     }
 
     /// 从 orderBookDetails 获取市场精度
-    async fn fetch_market(client: &Client, base_url: &str, market_id: u8) -> Result<MarketDetail> {
+    async fn fetch_market(client: &Client, base_url: &str, market_id: i64) -> Result<MarketDetail> {
         #[derive(Deserialize)]
         struct OBDetailsResp {
             order_book_details: Vec<MarketDetail>,
@@ -479,7 +495,7 @@ impl LighterTrading {
         let market = details
             .order_book_details
             .into_iter()
-            .find(|m| m.market_id == u32::from(market_id))
+            .find(|m| m.market_id == market_id)
             .ok_or_else(|| anyhow::anyhow!("Market {} not found in orderBookDetails", market_id))?;
 
         anyhow::ensure!(
@@ -1212,6 +1228,10 @@ impl LighterTrading {
 
     /// 查询当前仓位
     pub async fn get_position(&self) -> Result<Option<Position>> {
+        Ok(self.position_snapshot().await?.0)
+    }
+
+    async fn position_snapshot(&self) -> Result<(Option<Position>, u64)> {
         let url = format!(
             "{}/api/v1/account?by=index&value={}",
             self.base_url, self.account_index
@@ -1235,13 +1255,18 @@ impl LighterTrading {
             .positions
             .into_iter()
             .find(|p| p.market_id == self.market_id);
-        Ok(pos)
+        Ok((pos, account.transaction_time))
     }
 
     pub async fn signed_position(&self) -> Result<rust_decimal::Decimal> {
+        Ok(self.signed_position_snapshot().await?.0)
+    }
+
+    async fn signed_position_snapshot(&self) -> Result<(rust_decimal::Decimal, u64)> {
         use rust_decimal::Decimal;
-        let Some(position) = self.get_position().await? else {
-            return Ok(Decimal::ZERO);
+        let (position, transaction_time) = self.position_snapshot().await?;
+        let Some(position) = position else {
+            return Ok((Decimal::ZERO, transaction_time));
         };
         let size: Decimal = position.position.parse()?;
         anyhow::ensure!(
@@ -1250,7 +1275,7 @@ impl LighterTrading {
                 && (matches!(position.sign, -1 | 1) || (position.sign == 0 && size.is_zero())),
             "Invalid Lighter position snapshot"
         );
-        Ok(size * Decimal::from(position.sign))
+        Ok((size * Decimal::from(position.sign), transaction_time))
     }
 
     /// 关闭所有仓位：先撤销所有订单，再用市价单平仓
@@ -1269,16 +1294,25 @@ impl LighterTrading {
         }
 
         let position: f64 = self.signed_position().await?.try_into()?;
-        anyhow::ensure!(
-            current_price.is_finite() && current_price > 0.0,
-            "Invalid close price"
-        );
         if position == 0.0 {
             tracing::info!("Position is zero, nothing to close");
             return Ok(());
         }
 
-        // 3. 确定平仓方向和价格（带 2% 滑点保护，不能太大否则 quote amount 可能低于最低限额）
+        self.place_order(self.close_order(position, current_price)?)
+            .await?;
+        tracing::info!("Close position order submitted");
+        Ok(())
+    }
+
+    fn close_order(&self, position: f64, current_price: f64) -> Result<OrderParams> {
+        anyhow::ensure!(
+            position.is_finite()
+                && position != 0.0
+                && current_price.is_finite()
+                && current_price > 0.0,
+            "Invalid position or close price"
+        );
         let (side, close_price) = if position > 0.0 {
             // 多头 → 卖出平仓
             (Side::Sell, current_price * 0.98)
@@ -1300,18 +1334,13 @@ impl LighterTrading {
             close_price
         );
 
-        // 4. 下 reduce_only 限价单平仓
-        self.place_order(OrderParams {
+        Ok(OrderParams {
             size: close_size,
             price: close_price,
             side,
             order_type: OrderType::Ioc,
             reduce_only: true,
         })
-        .await?;
-
-        tracing::info!("Close position order submitted");
-        Ok(())
     }
 }
 
@@ -1505,21 +1534,40 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn pinned_native_signer_accepts_reduce_only_ioc_offline() {
-        let signer = crate::lighter_ffi::LighterSigner::new(
-            "http://127.0.0.1:1",
-            &"01".repeat(40),
-            304,
-            7,
-            1001,
-        )
-        .unwrap();
-        let (kind, tif, expiry) = order_wire_policy(OrderType::Ioc);
-        let signed = signer
-            .sign_create_order(0, 1234, 100, 200_000, true, kind, tif, true, 0, expiry, 1)
+    fn native_signer_preserves_mainnet_and_testnet_market_ids_offline() {
+        for (chain, account, markets) in [(304, 1001, [0, 1]), (300, 1002, [4095, 4096])] {
+            let signer = crate::lighter_ffi::LighterSigner::new(
+                "http://127.0.0.1:1",
+                &"01".repeat(40),
+                chain,
+                7,
+                account,
+            )
             .unwrap();
-        let tx: serde_json::Value = serde_json::from_str(&signed.tx_info).unwrap();
-        assert_eq!(tx["TimeInForce"], 0);
-        assert_eq!(tx["OrderExpiry"], 0);
+            for market in markets {
+                let (kind, tif, expiry) = order_wire_policy(OrderType::Ioc);
+                let signed = signer
+                    .sign_create_order(
+                        market, 1234, 100, 200_000, true, kind, tif, true, 0, expiry, 19,
+                    )
+                    .unwrap();
+                let tx: serde_json::Value = serde_json::from_str(&signed.tx_info).unwrap();
+                assert_eq!(tx["MarketIndex"], market);
+                assert_eq!(tx["TimeInForce"], 0);
+                assert_eq!(tx["OrderExpiry"], 0);
+                assert_eq!(tx["ReduceOnly"], 1);
+                assert_eq!(tx["AccountIndex"], account);
+                assert_eq!(tx["ApiKeyIndex"], 7);
+                assert_eq!(tx["Nonce"], 19);
+
+                let order_index = (1i64 << 48) + 7;
+                let canceled = signer.sign_cancel_order(market, order_index, 20).unwrap();
+                let tx: serde_json::Value = serde_json::from_str(&canceled.tx_info).unwrap();
+                assert_eq!(tx["MarketIndex"], market);
+                assert_eq!(tx["Index"], order_index);
+                assert_eq!(tx["Nonce"], 20);
+            }
+            assert!(signer.sign_cancel_order(255, (1i64 << 48) + 7, 20).is_err());
+        }
     }
 }

@@ -146,6 +146,7 @@ Current Lighter production path:
 cp config.example.toml config.toml
 make trade               # Validate the profile offline
 make trade MODE=live     # Linux x86-64, after configuring credentials and risk limits
+make trade MODE=testnet  # Uses config.testnet.toml and .env.testnet
 ```
 
 The foreground session starts Lighter market making and enables the Hyperliquid inventory hedge when `[inventory_hedge]` is configured. Stop it with Ctrl+C or SIGTERM. Logs go to the terminal. See the [supervised trading runbook](docs/LIVE_TRADING.md) for credentials, testnet and restart handling.

@@ -1,4 +1,6 @@
-//! Offline candidate and order-event replay. Network subcommands only read public data.
+//! Cross-venue replay, market discovery, and explicit Arcus REST operations.
+#[path = "cross_venue/arcus_cli.rs"]
+mod arcus_cli;
 use aleph_tx::{
     capture::{CaptureConfig, compile as compile_capture},
     exchanges::{arcus, hyperliquid, variational},
@@ -319,6 +321,9 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let registry = VenueRegistry::default();
     match args.as_slice() {
+        [venue, network, command @ ..] if venue == "arcus" => {
+            arcus_cli::run(network, command).await
+        }
         [command] if command == "venues" => print(&registry.iter().collect::<Vec<_>>()),
         [command, file] if command == "replay" => {
             let replay: Replay = read_replay(file)?;
@@ -456,7 +461,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET"
+            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }

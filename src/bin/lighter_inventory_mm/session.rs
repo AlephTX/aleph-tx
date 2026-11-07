@@ -44,13 +44,15 @@ impl Profile {
         let contents =
             fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?;
         let feeds: Feeds = toml::from_str(&contents)?;
-        match feeds.lighter.feeder_ws_url.as_str() {
-            "wss://mainnet.zklighter.elliot.ai/stream" => (),
-            "wss://testnet.zklighter.elliot.ai/stream" => anyhow::bail!(
-                "The pinned Lighter signer cannot sign current BTC/ETH testnet market IDs"
-            ),
+        let (network, hedge_ws) = match feeds.lighter.feeder_ws_url.as_str() {
+            "wss://mainnet.zklighter.elliot.ai/stream" => {
+                (Network::Mainnet, "wss://api.hyperliquid.xyz/ws")
+            }
+            "wss://testnet.zklighter.elliot.ai/stream" => {
+                (Network::Testnet, "wss://api.hyperliquid-testnet.xyz/ws")
+            }
             _ => anyhow::bail!("Unsupported Lighter websocket endpoint"),
-        }
+        };
         let app: AppConfig = toml::from_str(&contents)?;
         app.validate()?;
         let strategy = app
@@ -88,7 +90,7 @@ impl Profile {
                 "Hyperliquid feeder must map the strategy symbol to its native perpetual"
             );
             ensure!(
-                hl.feeder_ws_url == "wss://api.hyperliquid.xyz/ws",
+                hl.feeder_ws_url == hedge_ws,
                 "Hyperliquid feeder network differs from Lighter"
             );
         }
@@ -114,7 +116,7 @@ impl Profile {
         let feeder_config = toml::to_string(&feeder)?;
         Ok(Self {
             strategy,
-            network: Network::Mainnet,
+            network,
             feeds,
             feeder_config,
         })
@@ -122,6 +124,15 @@ impl Profile {
 
     pub fn has_hedge(&self) -> bool {
         self.feeds.inventory_hedge.is_some()
+    }
+
+    pub fn require_network(&self, expected: Network) -> Result<()> {
+        ensure!(
+            self.network == expected,
+            "Launch mode requires a {expected:?} profile, found {:?}",
+            self.network
+        );
+        Ok(())
     }
 }
 
@@ -296,7 +307,13 @@ impl Drop for Session {
     }
 }
 
-pub(super) async fn launch(profile: Profile, dotenv: &Path, feeder_bin: &Path) -> Result<()> {
+pub(super) async fn launch(
+    profile: Profile,
+    expected: Network,
+    dotenv: &Path,
+    feeder_bin: &Path,
+) -> Result<()> {
+    profile.require_network(expected)?;
     require_platform()?;
     let env = read_env(dotenv)?;
     let credentials = LighterCredentials::from_env(|key| env.get(key).cloned())?;
@@ -373,6 +390,7 @@ pub(super) async fn launch(profile: Profile, dotenv: &Path, feeder_bin: &Path) -
 
     let (stop, shutdown) = watch::channel(false);
     let mut started = false;
+    let mut verified_flat = false;
     let result = supervise(
         &mut feeder,
         &stop,
@@ -396,7 +414,7 @@ pub(super) async fn launch(profile: Profile, dotenv: &Path, feeder_bin: &Path) -
                 symbol,
             )?;
             let (mut strategy, trading) =
-                super::connect_strategy(profile.strategy, trading, &session.ipc).await?;
+                super::connect_strategy(profile.strategy, trading, network, &session.ipc).await?;
             if let Some(setup) = hedge {
                 strategy = strategy.with_inventory_hedge(
                     LiveInventoryHedge::connect(
@@ -422,6 +440,7 @@ pub(super) async fn launch(profile: Profile, dotenv: &Path, feeder_bin: &Path) -
                 orders.is_empty() && position.is_zero(),
                 "Lighter shutdown verification found residual exposure"
             );
+            verified_flat = true;
             Ok(())
         },
         async {
@@ -432,7 +451,7 @@ pub(super) async fn launch(profile: Profile, dotenv: &Path, feeder_bin: &Path) -
 
     if !started {
         session.discard_unstarted()?;
-    } else if result.is_ok() {
+    } else if verified_flat {
         session
             .journal
             .write_all(b"{\"event\":\"verified_flat\"}\n")?;
@@ -495,21 +514,38 @@ mod tests {
         assert!(Profile::load(&path).is_err());
         fs::write(&path, example.replace("ETH = \"0\"", "ETH = \"1\"")).unwrap();
         assert!(Profile::load(&path).is_err());
-        fs::write(
-            &path,
-            example.replace(
+        assert!(profile.require_network(Network::Testnet).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn testnet_profile_preserves_both_wide_market_ids_and_blocks_mainnet_mode() {
+        let example = include_str!("../../../config.example.toml")
+            .replace(
                 "mainnet.zklighter.elliot.ai/stream",
                 "testnet.zklighter.elliot.ai/stream",
-            ),
-        )
-        .unwrap();
-        assert!(
-            Profile::load(&path)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("pinned Lighter signer")
-        );
+            )
+            .replace("api.hyperliquid.xyz/ws", "api.hyperliquid-testnet.xyz/ws");
+        let path =
+            std::env::temp_dir().join(format!("aleph-testnet-profile-{}.toml", Uuid::new_v4()));
+        for (symbol, symbol_id, market_id) in [("ETH", 1002, 4095), ("BTC", 1001, 4096)] {
+            fs::write(
+                &path,
+                example
+                    .replace("ETH = \"0\"", &format!("{symbol} = \"{market_id}\""))
+                    .replace("market_id = 0", &format!("market_id = {market_id}"))
+                    .replace(
+                        "symbol_id = 1002         # ETH-PERP",
+                        &format!("symbol_id = {symbol_id}"),
+                    ),
+            )
+            .unwrap();
+            let profile = Profile::load(&path).unwrap();
+            assert_eq!(profile.strategy.market_id, market_id);
+            assert_eq!(profile.strategy.symbol_id, symbol_id);
+            assert!(profile.require_network(Network::Testnet).is_ok());
+            assert!(profile.require_network(Network::Mainnet).is_err());
+        }
         fs::remove_file(path).unwrap();
     }
 

@@ -15,8 +15,13 @@ PID_DIR       ?= pids
 BIN_DIR       ?= target/release
 FEEDER_BIN    ?= feeder/feeder-app
 MODE          ?= check
+ifeq ($(MODE),testnet)
+CONFIG        ?= config.testnet.toml
+ENV_FILE      ?= .env.testnet
+else
 CONFIG        ?= config.toml
 ENV_FILE      ?= .env.lighter
+endif
 SHM_PATHS     ?= /dev/shm/aleph-matrix /dev/shm/aleph-events /dev/shm/aleph-events-v2 /dev/shm/aleph-account-stats /dev/shm/aleph-depth
 
 # Colors for terminal output
@@ -36,6 +41,7 @@ help:
 	@echo "  make build-feeder   - Compile Go feeder only"
 	@echo "  make trade          - Check the trading profile offline"
 	@echo "  make trade MODE=live - Run Lighter with optional Hyperliquid inventory hedge"
+	@echo "  make trade MODE=testnet - Run the isolated Lighter/Hyperliquid testnet profile"
 	@echo ""
 	@echo "$(YELLOW)Exchange Commands (<exchange>-up/down/logs):$(NC)"
 	@echo "  Target exchanges: lighter, backpack, edgex"
@@ -69,16 +75,16 @@ fmt-check:
 	cargo fmt --check
 	test -z "$$(cd feeder && gofmt -l .)"
 
-ifeq ($(MODE),live)
+ifneq ($(filter $(MODE),live testnet),)
 trade: build-feeder
 	cargo build --locked --release --bin lighter_inventory_mm
-	"$(BIN_DIR)/lighter_inventory_mm" --live "$(CONFIG)" "$(ENV_FILE)" "$(FEEDER_BIN)"
+	"$(BIN_DIR)/lighter_inventory_mm" "--$(MODE)" "$(CONFIG)" "$(ENV_FILE)" "$(FEEDER_BIN)"
 else ifeq ($(MODE),check)
 trade:
 	cargo run --locked --quiet --bin lighter_inventory_mm -- --check "$(CONFIG)"
 else
 trade:
-	@echo "MODE must be check or live" >&2; exit 2
+	@echo "MODE must be check, live, or testnet" >&2; exit 2
 endif
 
 # Core Build

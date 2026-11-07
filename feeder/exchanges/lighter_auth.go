@@ -9,9 +9,7 @@ import (
 	"time"
 
 	"github.com/elliottech/lighter-go/signer"
-	g "github.com/elliottech/poseidon_crypto/field/goldilocks"
-	p2 "github.com/elliottech/poseidon_crypto/hash/poseidon2_goldilocks"
-	ethCommon "github.com/ethereum/go-ethereum/common"
+	"github.com/elliottech/lighter-go/types"
 )
 
 // LighterAuth handles Lighter authentication using Poseidon2 + Schnorr signatures
@@ -90,25 +88,13 @@ func (la *LighterAuth) CreateAuthToken() (string, error) {
 	}
 
 	deadline := time.Now().Add(la.authExpiry)
-	message := fmt.Sprintf("%d:%d:%d", deadline.Unix(), la.accountIndex, la.apiKeyIndex)
-
-	// Convert message to Goldilocks field elements
-	msgInField, err := g.ArrayFromCanonicalLittleEndianBytes([]byte(message))
+	authToken, err := types.ConstructAuthToken(la.keyManager, deadline, &types.TransactOpts{
+		FromAccountIndex: &la.accountIndex,
+		ApiKeyIndex:      &la.apiKeyIndex,
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to convert message to field elements: %w", err)
+		return "", fmt.Errorf("failed to sign Lighter auth token: %w", err)
 	}
-
-	// Hash using Poseidon2
-	msgHash := p2.HashToQuinticExtension(msgInField).ToLittleEndianBytes()
-
-	// Sign with Schnorr
-	signatureBytes, err := la.keyManager.Sign(msgHash, p2.NewPoseidon2())
-	if err != nil {
-		return "", fmt.Errorf("failed to sign message: %w", err)
-	}
-
-	signature := ethCommon.Bytes2Hex(signatureBytes)
-	authToken := fmt.Sprintf("%s:%s", message, signature)
 
 	// Cache the token
 	la.lastAuthToken = authToken

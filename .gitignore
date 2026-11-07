@@ -41,6 +41,7 @@ keys/
 
 # Config (copy config.example.toml -> config.toml)
 config.toml
+config.testnet.toml
 feeder/config.toml
 
 # Backup files

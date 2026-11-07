@@ -228,7 +228,7 @@ pub struct InventoryNeutralMMConfig {
     // 交易所
     pub exchange_id: u8, // BBO 过滤用 (2=Lighter)
     pub symbol_id: u16,  // SHM symbol ID
-    pub market_id: u8,   // 交易所 market ID
+    pub market_id: i64,  // Lighter market ID, independent of the SHM symbol ID
     pub tick_size: f64,  // 价格精度
     pub step_size: f64,  // 数量精度
     // 费率
@@ -445,6 +445,10 @@ impl InventoryNeutralMMConfig {
         anyhow::ensure!(
             self.exchange_id == EXCH_LIGHTER && matches!(self.symbol_id, SYM_BTC | SYM_ETH),
             "{name}: expected Lighter and a supported SHM symbol ID (1001/1002)"
+        );
+        anyhow::ensure!(
+            crate::exchanges::lighter::valid_market_id(self.market_id),
+            "{name}: invalid Lighter market ID"
         );
         anyhow::ensure!(
             2.0 * self.maker_fee_bps + self.min_profit_bps >= 0.0

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"time"
 
@@ -88,10 +89,14 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-account-stats", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
-	// The previous REST fallback used an invalid account endpoint and produced
-	// persistent 403s. For Lighter, the authenticated user_stats stream is the
-	// authoritative source here, so keep the path websocket-only until a valid
-	// REST account endpoint is implemented.
+	refreshCtx, cancelRefresh := context.WithCancel(ctx)
+	var refreshDone chan struct{}
+	defer func() {
+		cancelRefresh()
+		if refreshDone != nil {
+			<-refreshDone
+		}
+	}()
 
 	// Read loop
 	for {
@@ -124,8 +129,83 @@ func (las *LighterAccountStats) connect(ctx context.Context) error {
 
 		if stats.Type == "update/user_stats" || stats.Type == "subscribed/user_stats" {
 			las.processStats(&stats)
+			if refreshDone == nil && guard.pending == 0 {
+				refreshDone = make(chan struct{})
+				go func() {
+					defer close(refreshDone)
+					las.refreshEquity(refreshCtx, accountID)
+				}()
+			}
 		}
 	}
+}
+
+func (las *LighterAccountStats) refreshEquity(ctx context.Context, account int64) {
+	endpoint, err := lighterAccountEndpoint(las.cfg.WSURL, account)
+	if err != nil {
+		return
+	}
+	ticker := time.NewTicker(positionPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if !las.statsWriter.EquityNeedsRefresh(uint64(now.UnixNano()), uint64(5*time.Second)) {
+				continue
+			}
+			startedAt := uint64(time.Now().UnixNano())
+			snapshot, err := requestLighterAccount(ctx, endpoint, account)
+			var stats lighterEquityStats
+			if err == nil {
+				stats, err = snapshot.equityStats()
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				log.Printf("lighter-account-stats: equity refresh failed: %v", err)
+				continue
+			}
+			// WriteStats ignores a result that started before a newer WS update.
+			las.statsWriter.WriteStats(stats.collateral, stats.equity, stats.leverage, stats.available, stats.marginUsage, 0, startedAt)
+		}
+	}
+}
+
+type lighterEquityStats struct {
+	collateral, equity, available, leverage, marginUsage float64
+}
+
+func (snapshot lighterAccountSnapshot) equityStats() (lighterEquityStats, error) {
+	var values [3]float64
+	for i, value := range [...]string{snapshot.Collateral, snapshot.TotalAssetValue, snapshot.AvailableBalance} {
+		parsed, parseErr := strconv.ParseFloat(value, 64)
+		if parseErr != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return lighterEquityStats{}, fmt.Errorf("missing or invalid Lighter account equity fields")
+		}
+		values[i] = parsed
+	}
+	collateral, equity, available := values[0], values[1], values[2]
+	if equity <= 0 {
+		return lighterEquityStats{}, fmt.Errorf("non-positive Lighter account equity")
+	}
+	var grossNotional float64
+	for _, position := range snapshot.Positions {
+		value, parseErr := strconv.ParseFloat(position.Value, 64)
+		if parseErr != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+			return lighterEquityStats{}, fmt.Errorf("missing or invalid Lighter position value")
+		}
+		grossNotional += math.Abs(value)
+	}
+	return lighterEquityStats{
+		collateral:  collateral,
+		equity:      equity,
+		available:   available,
+		leverage:    grossNotional / equity,
+		marginUsage: 1 - math.Min(1, math.Max(0, available/equity)),
+	}, nil
 }
 
 func (las *LighterAccountStats) processStats(stats *lighterUserStats) {

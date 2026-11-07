@@ -121,6 +121,11 @@ pub trait Exchange: Send + Sync {
     /// 平仓（紧急风控用）
     async fn close_all_positions(&self, current_price: f64) -> Result<()>;
 
+    /// Shutdown fallback when the strategy cannot obtain fresh private-feed data.
+    async fn recover_flat_without_feed(&self) -> Result<()> {
+        anyhow::bail!("Independent shutdown recovery is unavailable for this venue")
+    }
+
     /// 通用批量执行（支持混合 挂单/撤单）
     async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult>;
 

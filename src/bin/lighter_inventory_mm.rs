@@ -5,6 +5,7 @@ mod session;
 
 use aleph_tx::account_stats_reader::AccountStatsReader;
 use aleph_tx::config::{InventoryNeutralMMConfig, symbol_name};
+use aleph_tx::exchanges::hyperliquid::Network;
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
 use aleph_tx::shm_depth_reader::ShmDepthReader;
@@ -37,6 +38,7 @@ async fn wait_for_resource<T>(path: &Path, open: impl Fn(&str) -> Result<T>) -> 
 async fn connect_strategy(
     config: InventoryNeutralMMConfig,
     mut trading: LighterTrading,
+    network: Network,
     ipc: &Path,
 ) -> Result<(InventoryNeutralMM, Arc<LighterTrading>)> {
     let events = ipc.join("aleph-events-v2");
@@ -97,7 +99,7 @@ async fn connect_strategy(
     trading.set_order_tracker(Arc::clone(&tracker));
     trading.set_post_only(config.use_post_only);
     let trading = Arc::new(trading);
-    let strategy = InventoryNeutralMM::with_data_sources(
+    let mut strategy = InventoryNeutralMM::with_data_sources(
         config,
         Arc::clone(&trading) as _,
         tracker,
@@ -105,6 +107,10 @@ async fn connect_strategy(
         account_reader,
         depth_reader,
     );
+    if network == Network::Testnet {
+        // Testnet matching engines can have unrelated price levels.
+        strategy.use_local_fair_value();
+    }
     Ok((strategy, trading))
 }
 
@@ -120,7 +126,8 @@ async fn main() -> Result<()> {
         [flag, path] if flag == "--check" => {
             let profile = session::Profile::load(Path::new(path))?;
             println!(
-                "Configuration OK: Lighter {} market {}, Hyperliquid hedge {}",
+                "Configuration OK: {:?} Lighter {} market {}, Hyperliquid hedge {}",
+                profile.network,
                 symbol_name(profile.strategy.symbol_id),
                 profile.strategy.market_id,
                 if profile.has_hedge() {
@@ -131,12 +138,19 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        [flag, path, dotenv, feeder] if flag == "--live" => {
+        [flag, path, dotenv, feeder] if matches!(flag.as_str(), "--live" | "--testnet") => {
             let profile = session::Profile::load(Path::new(path))?;
-            session::launch(profile, Path::new(dotenv), Path::new(feeder)).await
+            let network = if flag == "--testnet" {
+                Network::Testnet
+            } else {
+                Network::Mainnet
+            };
+            session::launch(profile, network, Path::new(dotenv), Path::new(feeder)).await
         }
         [] => run_existing_feeder().await,
-        _ => bail!("Usage: lighter_inventory_mm --check CONFIG | --live CONFIG DOTENV FEEDER"),
+        _ => bail!(
+            "Usage: lighter_inventory_mm --check CONFIG | (--live | --testnet) CONFIG DOTENV FEEDER"
+        ),
     }
 }
 
@@ -170,6 +184,7 @@ async fn run_existing_feeder() -> Result<()> {
     let trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
     trading.validate_symbol(symbol_name(config.symbol_id))?;
     trading.validate_precision(config.tick_size, config.step_size)?;
-    let (mut strategy, _) = connect_strategy(config, trading, Path::new("/dev/shm")).await?;
+    let (mut strategy, _) =
+        connect_strategy(config, trading, network, Path::new("/dev/shm")).await?;
     strategy.run(Some(shutdown)).await
 }

@@ -5,7 +5,7 @@
 //!
 //! Architecture: Rust → FFI → Go CGO → Poseidon2/Schnorr → Signed TX
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::os::raw::{c_char, c_int, c_longlong};
 
 /// C struct for signed transaction response
@@ -21,7 +21,7 @@ pub struct SignedTxResponse {
 /// C struct for create order request
 #[repr(C)]
 pub struct CreateOrderTxReq {
-    pub market_index: u8,
+    pub market_index: i64,
     pub client_order_index: i64,
     pub base_amount: i64,
     pub price: u32,
@@ -48,7 +48,7 @@ pub struct StrOrErr {
     pub err: *mut c_char,
 }
 
-// External C functions from lighter-signer.so
+// Signatures from lighter-signer-linux-amd64.h in lighter-go v1.0.12.
 unsafe extern "C" {
     /// Create a new client instance
     pub fn CreateClient(
@@ -64,7 +64,7 @@ unsafe extern "C" {
 
     /// Sign a create order transaction
     pub fn SignCreateOrder(
-        market_index: c_int,
+        market_index: c_longlong,
         client_order_index: c_longlong,
         base_amount: c_longlong,
         price: c_int,
@@ -74,6 +74,12 @@ unsafe extern "C" {
         reduce_only: c_int,
         trigger_price: c_int,
         order_expiry: c_longlong,
+        integrator_account_index: c_longlong,
+        integrator_taker_fee: c_int,
+        integrator_maker_fee: c_int,
+        self_trade_behavior_mode: u8,
+        self_trade_equality_mode: u8,
+        skip_nonce: u8,
         nonce: c_longlong,
         api_key_index: c_int,
         account_index: c_longlong,
@@ -81,8 +87,9 @@ unsafe extern "C" {
 
     /// Sign a cancel order transaction
     pub fn SignCancelOrder(
-        market_index: c_int,
+        market_index: c_longlong,
         order_index: c_longlong,
+        skip_nonce: u8,
         nonce: c_longlong,
         api_key_index: c_int,
         account_index: c_longlong,
@@ -95,8 +102,8 @@ unsafe extern "C" {
         account_index: c_longlong,
     ) -> StrOrErr;
 
-    /// Free C string allocated by Go
-    pub fn free(ptr: *mut c_char);
+    /// Release memory allocated by the native SDK.
+    pub fn Free(ptr: *mut c_void);
 }
 
 /// Safe wrapper for SignedTxResponse
@@ -126,8 +133,8 @@ impl SignedTxResponse {
             let value = unsafe { CStr::from_ptr(ptr) }
                 .to_string_lossy()
                 .into_owned();
-            // SAFETY: the pinned Linux signer uses the process C allocator.
-            unsafe { free(ptr) };
+            // SAFETY: the pointer is owned by the caller and allocated by the SDK.
+            unsafe { Free(ptr.cast()) };
             Some(value)
         }
         // Consume all fields before returning, including on malformed/error responses.
@@ -197,7 +204,7 @@ impl LighterSigner {
             if !err_ptr.is_null() {
                 let err_cstr = CStr::from_ptr(err_ptr);
                 let err_msg = err_cstr.to_string_lossy().to_string();
-                free(err_ptr);
+                Free(err_ptr.cast());
                 return Err(err_msg);
             }
         }
@@ -212,7 +219,7 @@ impl LighterSigner {
     #[allow(clippy::too_many_arguments)]
     pub fn sign_create_order(
         &self,
-        market_index: u8,
+        market_index: impl Into<i64>,
         client_order_index: i64,
         base_amount: i64,
         price: u32,
@@ -224,9 +231,14 @@ impl LighterSigner {
         order_expiry: i64,
         nonce: i64,
     ) -> Result<SignedTransaction, String> {
+        let market_index = market_index.into();
+        if !super::super::valid_market_id(market_index) {
+            return Err("Invalid Lighter market ID".into());
+        }
+        // SAFETY: argument widths and order match the v1.0.12 release header.
         unsafe {
             let response = SignCreateOrder(
-                market_index as c_int,
+                market_index,
                 client_order_index,
                 base_amount,
                 price as c_int,
@@ -236,6 +248,12 @@ impl LighterSigner {
                 reduce_only as c_int,
                 trigger_price as c_int,
                 order_expiry,
+                0, // No integrator account or fees.
+                0,
+                0,
+                0, // SDK default self-trade protection.
+                0,
+                0, // Check the explicit nonce.
                 nonce,
                 self.api_key_index as c_int,
                 self.account_index,
@@ -248,14 +266,20 @@ impl LighterSigner {
     /// Sign a cancel order transaction
     pub fn sign_cancel_order(
         &self,
-        market_index: u8,
+        market_index: impl Into<i64>,
         order_index: i64,
         nonce: i64,
     ) -> Result<SignedTransaction, String> {
+        let market_index = market_index.into();
+        if !super::super::valid_market_id(market_index) {
+            return Err("Invalid Lighter market ID".into());
+        }
+        // SAFETY: argument widths and order match the v1.0.12 release header.
         unsafe {
             let response = SignCancelOrder(
-                market_index as c_int,
+                market_index,
                 order_index,
+                0, // Check the explicit nonce.
                 nonce,
                 self.api_key_index as c_int,
                 self.account_index,
@@ -266,17 +290,20 @@ impl LighterSigner {
     }
 
     /// Create authentication token for WebSocket
-    pub fn create_auth_token(&self, deadline_ms: i64) -> Result<String, String> {
+    pub fn create_auth_token(&self, deadline_secs: i64) -> Result<String, String> {
         unsafe {
-            let response =
-                CreateAuthToken(deadline_ms, self.api_key_index as c_int, self.account_index);
+            let response = CreateAuthToken(
+                deadline_secs,
+                self.api_key_index as c_int,
+                self.account_index,
+            );
 
             if !response.err.is_null() {
                 let err_cstr = CStr::from_ptr(response.err);
                 let err_msg = err_cstr.to_string_lossy().to_string();
-                free(response.err);
+                Free(response.err.cast());
                 if !response.str.is_null() {
-                    free(response.str);
+                    Free(response.str.cast());
                 }
                 return Err(err_msg);
             }
@@ -284,7 +311,7 @@ impl LighterSigner {
             if !response.str.is_null() {
                 let token_cstr = CStr::from_ptr(response.str);
                 let token = token_cstr.to_string_lossy().to_string();
-                free(response.str);
+                Free(response.str.cast());
                 Ok(token)
             } else {
                 Err("Token is null".to_string())
