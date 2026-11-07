@@ -39,6 +39,9 @@ export default function App() {
           </div>
         )}
         <Headline summary={summary.data} />
+        <p className="px-1 text-xs text-muted">
+          成交盈亏仅统计 Lighter 成交、手续费和返佣，不包含 Hyperliquid 对冲盈亏或资金费。
+        </p>
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
           <div className="xl:col-span-2">
             <PnlChart />

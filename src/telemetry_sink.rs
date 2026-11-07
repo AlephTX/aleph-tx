@@ -13,7 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Environment variable that enables telemetry export.
@@ -103,11 +103,11 @@ impl OrderEventRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum Record {
     Order(OrderEventRecord),
     Snapshot(StrategySnapshot),
-    Stopped,
+    Stopped(Sender<std::io::Result<()>>),
 }
 
 #[derive(Serialize)]
@@ -186,9 +186,19 @@ impl TelemetrySink {
         self.send(Record::Snapshot(snapshot));
     }
 
-    /// Write a final marker; the writer flushes and exits after it.
-    pub fn stopped(&self) {
-        self.send(Record::Stopped);
+    /// Drain queued records and persist the final marker before shutdown.
+    /// Only shutdown may wait for queue capacity; trading sends remain nonblocking.
+    pub async fn stopped(&self) -> std::io::Result<()> {
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let (done, completed) = channel();
+            let disconnected =
+                || std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Telemetry writer stopped");
+            tx.send(Record::Stopped(done)).map_err(|_| disconnected())?;
+            completed.recv().map_err(|_| disconnected())?
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     pub fn dropped(&self) -> u64 {
@@ -234,10 +244,12 @@ fn writer_loop(
                 snapshot,
             )
             .and_then(|()| out.flush()),
-            Record::Stopped => {
-                let _ = write_line(&mut out, "stopped", None, serde_json::json!({}))
-                    .and_then(|()| out.flush());
-                break;
+            Record::Stopped(done) => {
+                let result = write_line(&mut out, "stopped", None, serde_json::json!({}))
+                    .and_then(|()| out.flush())
+                    .and_then(|()| out.get_ref().sync_data());
+                let _ = done.send(result);
+                return;
             }
         };
         if let Err(error) = result {
@@ -279,8 +291,8 @@ mod tests {
         panic!("timed out waiting for {n} telemetry lines");
     }
 
-    #[test]
-    fn writes_session_order_snapshot_and_stop_lines() {
+    #[tokio::test]
+    async fn writes_session_order_snapshot_and_stop_lines() {
         let dir = std::env::temp_dir().join(format!("aleph-telemetry-{}", uuid::Uuid::new_v4()));
         let sink = TelemetrySink::open(&dir, &session("s1")).unwrap();
         let fill = ShmPrivateEventV2::order_filled(
@@ -292,7 +304,7 @@ mod tests {
             fill_count: 1,
             ..Default::default()
         });
-        sink.stopped();
+        sink.stopped().await.unwrap();
         let lines = wait_for_lines(&dir.join("s1.jsonl"), 4);
         assert_eq!(lines[0]["type"], "session");
         assert_eq!(lines[0]["symbol"], "ETH");
@@ -306,6 +318,47 @@ mod tests {
         assert_eq!(lines[2]["dropped"], 0);
         assert_eq!(lines[3]["type"], "stopped");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_full_queue_before_acknowledging_persistence() {
+        let path = std::env::temp_dir().join(format!("aleph-drain-{}", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (tx, rx) = sync_channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sink = TelemetrySink {
+            tx,
+            dropped: Arc::clone(&dropped),
+        };
+        sink.snapshot(StrategySnapshot {
+            equity: 123.0,
+            ..Default::default()
+        });
+        let shutdown = tokio::spawn(async move { sink.stopped().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        let writer_path = path.clone();
+        let writer_dropped = Arc::clone(&dropped);
+        let writer = std::thread::spawn(move || {
+            writer_loop(rx, BufWriter::new(file), writer_path, writer_dropped);
+        });
+        shutdown.await.unwrap().unwrap();
+        // No polling: a successful shutdown must make both records readable.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["equity"], 123.0);
+        assert_eq!(lines[1]["type"], "stopped");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        writer.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

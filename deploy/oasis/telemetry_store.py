@@ -22,6 +22,9 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS ingest_offsets (
   file TEXT PRIMARY KEY, inode INTEGER NOT NULL, offset INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ingest_records (
+  session_id TEXT NOT NULL, offset INTEGER NOT NULL,
+  PRIMARY KEY (session_id, offset)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY, network TEXT, exchange TEXT, symbol TEXT,
   market_id INTEGER, account INTEGER, hedge_account TEXT,
@@ -70,6 +73,17 @@ def finite(value, default=0.0):
     except (TypeError, ValueError):
         return default
     return value if math.isfinite(value) else default
+
+
+def integer(value, default=0):
+    """Keep signed 64-bit IDs exact; a float round trip aliases adjacent IDs."""
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            return default
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if -(2**63) <= parsed < 2**63 else default
 
 
 def apply_fill(position, avg_cost, sign, price, qty):
@@ -126,7 +140,10 @@ class TelemetryStore:
             return 0
         row = self.db.execute("SELECT inode, offset FROM ingest_offsets WHERE file=?",
                               (path.name,)).fetchone()
-        offset = row["offset"] if row and row["inode"] == stat.st_ino else 0
+        # A session filename is immutable, even if an archive restore changes
+        # its inode. Retain the committed checkpoint, including for databases
+        # created before per-record deduplication was introduced.
+        offset = row["offset"] if row else 0
         if stat.st_size <= offset:
             return 0
         with path.open("rb") as handle:
@@ -159,8 +176,13 @@ class TelemetryStore:
         return count
 
     def _apply(self, sid, offset, record):
+        # The source may be restored/copied to a new inode. Deduplicate before
+        # any additive update, in the same transaction as the file checkpoint.
+        inserted = self.db.execute("INSERT OR IGNORE INTO ingest_records VALUES (?,?)", (sid, offset))
+        if inserted.rowcount == 0:
+            return
         kind = record.get("type")
-        ts = int(finite(record.get("ts_ms"), 0))
+        ts = integer(record.get("ts_ms"))
         if kind == "session":
             self.db.execute(
                 "INSERT INTO sessions (session_id, network, exchange, symbol, market_id, account,"
@@ -183,8 +205,10 @@ class TelemetryStore:
 
     def _apply_order(self, sid, offset, ts, r):
         event = r.get("kind")
-        coid = int(finite(r.get("client_order_id"), 0))
-        side = r.get("side") if r.get("side") in ("buy", "sell") else None
+        coid = integer(r.get("client_order_id"))
+        # V2 cancel/reject events do not carry side; their zero is not a buy.
+        side = (r.get("side") if event in ("created", "filled")
+                and r.get("side") in ("buy", "sell") else None)
         if event == "stream_lost":
             self.db.execute("UPDATE sessions SET stream_lost=stream_lost+1 WHERE session_id=?", (sid,))
             return
@@ -197,10 +221,11 @@ class TelemetryStore:
                 "INSERT INTO orders (session_id, client_order_id, order_index, side, price, size, status,"
                 " created_ms, updated_ms) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET"
                 " order_index=coalesce(nullif(excluded.order_index,0), order_index),"
-                " side=coalesce(side, excluded.side),"
+                " side=coalesce(excluded.side, side),"
                 " price=CASE WHEN excluded.price>0 THEN excluded.price ELSE price END,"
                 " size=CASE WHEN excluded.size>0 THEN excluded.size ELSE size END,"
-                " status=CASE WHEN status='filled' THEN status ELSE excluded.status END,"
+                " status=CASE WHEN status IN ('filled','canceled','rejected')"
+                " OR (status='partial' AND excluded.status='open') THEN status ELSE excluded.status END,"
                 " updated_ms=excluded.updated_ms",
                 (sid, coid, r.get("order_index"), side, price, size, status, ts, ts))
         elif event == "filled":
@@ -208,7 +233,7 @@ class TelemetryStore:
 
     def _apply_fill(self, sid, offset, ts, coid, side, r):
         price, qty, fee = finite(r.get("fill_price")), finite(r.get("fill_size")), finite(r.get("fee"))
-        trade_id = int(finite(r.get("trade_id"), 0))
+        trade_id = integer(r.get("trade_id"))
         if side is None or price <= 0 or qty <= 0:
             return
         if trade_id and self.db.execute("SELECT 1 FROM fills WHERE session_id=? AND trade_id=?",
@@ -219,10 +244,12 @@ class TelemetryStore:
         position, avg_cost, delta = apply_fill(s["position"], s["avg_cost"],
                                                1 if side == "buy" else -1, price, qty)
         realized, fees, notional = s["realized"] + delta, s["fees"] + fee, price * qty
-        self.db.execute(
+        inserted = self.db.execute(
             "INSERT OR IGNORE INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, offset, ts, r.get("exchange_ts_ns"), coid, side, price, qty, notional, fee,
              trade_id, delta, position, avg_cost, realized - fees))
+        if inserted.rowcount == 0:
+            return
         self.db.execute(
             "UPDATE sessions SET position=?, avg_cost=?, realized=?, fees=?, volume=volume+?,"
             " fills=fills+1, buy_volume=buy_volume+?, sell_volume=sell_volume+? WHERE session_id=?",

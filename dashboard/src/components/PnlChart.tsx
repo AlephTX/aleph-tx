@@ -87,7 +87,7 @@ export function PnlChart() {
   const empty = data && data.pnl.length === 0 && data.equity.length === 0
   return (
     <Card
-      title="累计净盈亏 / 权益"
+      title="Lighter 累计净盈亏 / 权益"
       right={
         <div className="flex rounded-md bg-bg p-0.5 text-xs">
           {RANGES.map((x, i) => (

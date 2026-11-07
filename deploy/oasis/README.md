@@ -12,6 +12,12 @@ When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file
 
 API: `/api/status`, `/api/summary`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
+Trade PnL covers the Lighter leg only; it excludes Hyperliquid hedge fills and
+funding payments. Lighter account equity is shown separately. A successful
+strategy shutdown drains the telemetry queue and persists the final marker
+before returning. Ingest preserves checkpoints when session files are copied
+or restored to new inodes, and deduplicates each record before updating totals.
+
 ## Emergency stop
 
 The console's stop button sends `systemctl stop aleph-tx-live.service`; the strategy cancels its orders and checks flat on SIGTERM. A polkit rule allows user `aleph-tx` to stop that one unit and nothing else; there is no start control. `install.sh` generates the control token once in `/etc/aleph-tx/monitor.env` (mode 0600). Read it with `sudo grep CONTROL_TOKEN /etc/aleph-tx/monitor.env`; the browser keeps it only for the tab session. Remove the line and restart the monitor to disable the button.

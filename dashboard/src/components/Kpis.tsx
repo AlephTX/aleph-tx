@@ -25,7 +25,7 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         sub={<>可用 {usd(snap?.available_balance)} · 保证金 {pct(snap?.margin_usage)}</>}
       />
       <Stat
-        label="会话总盈亏"
+        label="Lighter 会话盈亏"
         value={signedUsd(s?.total_pnl)}
         valueClass={toneClass[tone(s?.total_pnl)]}
         sub={<>已实现 {signedUsd(s?.net_pnl)} · 浮动 {signedUsd(s?.unrealized)}</>}
@@ -77,7 +77,7 @@ export function Performance({ summary }: { summary: SummaryResp | undefined }) {
   const w: Window | undefined = summary?.windows[key]
   return (
     <Card
-      title="交易绩效"
+      title="Lighter 交易绩效"
       right={
         <div className="flex rounded-md bg-bg p-0.5 text-xs">
           {WINDOWS.map(([k, label]) => (

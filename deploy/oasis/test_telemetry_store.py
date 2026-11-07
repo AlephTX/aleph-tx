@@ -97,6 +97,71 @@ class StoreTest(unittest.TestCase):
         series = self.store.pnl_series("1m")["pnl"]
         self.assertEqual([row["cumulative"] for row in series], [0.0, 1.0, 1.0, 3.0])
 
+    def test_replaced_file_does_not_reapply_fills_or_event_counters(self):
+        self.write({"type": "session", "ts_ms": 1},
+                   fill(2, "buy", 100.0, 1.0, 0.1, 0),
+                   {"type": "order", "ts_ms": 3, "kind": "stream_lost"},
+                   {"type": "order", "ts_ms": 4, "kind": "rejected", "client_order_id": 2})
+        self.store.ingest()
+        before = self.store.latest_session()
+        replacement = self.dir / "replacement"
+        replacement.write_bytes(self.file.read_bytes())
+        replacement.replace(self.file)
+        self.store.ingest()
+        self.assertEqual(self.store.latest_session(), before)
+        self.assertEqual(len(self.store.fills()), 1)
+
+        # An explicit full replay is also idempotent for every event kind.
+        self.store.db.execute("DELETE FROM ingest_offsets")
+        self.store.ingest()
+        self.assertEqual(self.store.latest_session(), before)
+
+    def test_existing_checkpoint_survives_upgrade_and_inode_change(self):
+        self.write({"type": "session", "ts_ms": 1},
+                   {"type": "order", "ts_ms": 2, "kind": "stream_lost"})
+        self.store.ingest()
+        # Old databases had a file checkpoint but no per-record registry.
+        self.store.db.execute("DELETE FROM ingest_records")
+        replacement = self.dir / "replacement"
+        replacement.write_bytes(self.file.read_bytes())
+        replacement.replace(self.file)
+        self.write({"type": "order", "ts_ms": 3, "kind": "stream_lost"})
+        self.store.ingest()
+        self.assertEqual(self.store.latest_session()["stream_lost"], 2)
+
+    def test_integer_identifiers_are_not_rounded_through_float(self):
+        first = 2**53
+        self.write({"type": "session", "ts_ms": 1},
+                   fill(2, "buy", 100.0, 1.0, 0.0, first, coid=first),
+                   fill(3, "sell", 101.0, 1.0, 0.0, first + 1, coid=first + 1))
+        self.store.ingest()
+        self.assertEqual({r["trade_id"] for r in self.store.fills()}, {first, first + 1})
+        self.assertEqual({r["client_order_id"] for r in self.store.orders("all")},
+                         {first, first + 1})
+        self.assertAlmostEqual(self.store.latest_session()["realized"], 1.0)
+
+    def test_late_create_does_not_reopen_a_canceled_order(self):
+        self.write({"type": "session", "ts_ms": 1},
+                   {"type": "order", "ts_ms": 2, "kind": "canceled", "client_order_id": 1,
+                    "order_index": 9, "side": "buy", "price": 0.0, "size": 0.0},
+                   {"type": "order", "ts_ms": 3, "kind": "created", "client_order_id": 1,
+                    "order_index": 9, "side": "sell", "price": 100.0, "size": 1.0})
+        self.store.ingest()
+        self.assertEqual(self.store.orders(), [])
+        order = self.store.orders("all")[0]
+        self.assertEqual(order["status"], "canceled")
+        self.assertEqual(order["side"], "sell")
+
+    def test_late_create_preserves_partial_fill_state(self):
+        self.write({"type": "session", "ts_ms": 1},
+                   fill(2, "sell", 100.0, 0.5, 0.0, 1, remaining=0.5),
+                   {"type": "order", "ts_ms": 3, "kind": "created", "client_order_id": 1,
+                    "order_index": 9, "side": "sell", "price": 100.0, "size": 1.0})
+        self.store.ingest()
+        order = self.store.orders()[0]
+        self.assertEqual(order["status"], "partial")
+        self.assertEqual(order["filled"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

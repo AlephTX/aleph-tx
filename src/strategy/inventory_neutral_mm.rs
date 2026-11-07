@@ -967,8 +967,10 @@ impl InventoryNeutralMM {
         if let Some(hedge) = &mut self.hedge {
             hedge.finish().await?;
         }
-        if let Some(sink) = &self.telemetry_sink {
-            sink.stopped();
+        if let Some(sink) = &self.telemetry_sink
+            && let Err(error) = sink.stopped().await
+        {
+            warn!(%error, "Could not persist final telemetry records");
         }
         info!("👋 Strategy stopped cleanly.");
         Ok(())
