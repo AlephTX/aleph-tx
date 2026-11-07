@@ -6,7 +6,9 @@ complete lines, and keys every row by (session_id, offset), so re-reading a
 file is idempotent. Fills are additionally unique by exchange trade ID.
 
 Trade PnL uses the average-cost method, updated incrementally per fill.
-Fees are positive costs; negative fees are maker rebates.
+Fees are positive costs; negative fees are maker rebates. Hedge-venue IOC
+fills (`hedge_fill` lines) are tracked as a separate leg with their own
+average cost; funding payments are not included.
 """
 
 import json
@@ -50,6 +52,14 @@ CREATE TABLE IF NOT EXISTS orders (
   fee REAL NOT NULL DEFAULT 0, created_ms INTEGER, updated_ms INTEGER,
   PRIMARY KEY (session_id, client_order_id));
 CREATE INDEX IF NOT EXISTS orders_updated ON orders (session_id, updated_ms);
+CREATE TABLE IF NOT EXISTS hedge_fills (
+  session_id TEXT NOT NULL, offset INTEGER NOT NULL, ts_ms INTEGER NOT NULL,
+  venue TEXT NOT NULL, client_order_id TEXT NOT NULL, side TEXT NOT NULL,
+  price REAL NOT NULL, price_source TEXT, size REAL NOT NULL, notional REAL NOT NULL,
+  fee REAL NOT NULL, realized_delta REAL NOT NULL, position_after REAL NOT NULL,
+  PRIMARY KEY (session_id, offset));
+CREATE UNIQUE INDEX IF NOT EXISTS hedge_fills_cloid ON hedge_fills (session_id, client_order_id);
+CREATE INDEX IF NOT EXISTS hedge_fills_ts ON hedge_fills (ts_ms);
 CREATE TABLE IF NOT EXISTS snapshots (
   session_id TEXT NOT NULL, ts_ms INTEGER NOT NULL, equity REAL,
   session_start_equity REAL, available_balance REAL, margin_usage REAL,
@@ -65,6 +75,15 @@ SNAPSHOT_FIELDS = ("equity", "session_start_equity", "available_balance", "margi
                    "pending_exposure", "worst_case_long", "worst_case_short", "mid",
                    "spread_bps", "adverse_selection", "trade_cash_flow", "total_fees",
                    "fill_count", "orders_placed", "orders_rejected", "active_orders", "dropped")
+
+
+# Columns added after the first release; created on demand for old databases.
+SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
+                      ("hedge_avg_cost", "REAL NOT NULL DEFAULT 0"),
+                      ("hedge_realized", "REAL NOT NULL DEFAULT 0"),
+                      ("hedge_fees", "REAL NOT NULL DEFAULT 0"),
+                      ("hedge_volume", "REAL NOT NULL DEFAULT 0"),
+                      ("hedge_fills", "INTEGER NOT NULL DEFAULT 0"))
 
 
 def finite(value, default=0.0):
@@ -120,6 +139,10 @@ class TelemetryStore:
         self.db = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        for name, ddl in SESSION_MIGRATIONS:
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
         self.db.execute("PRAGMA synchronous=NORMAL")
 
     # ── ingest ──────────────────────────────────────────────────────────
@@ -202,6 +225,30 @@ class TelemetryStore:
             self.db.execute("UPDATE sessions SET stopped_ms=? WHERE session_id=?", (ts, sid))
         elif kind == "order":
             self._apply_order(sid, offset, ts, record)
+        elif kind == "hedge_fill":
+            self._apply_hedge_fill(sid, offset, ts, record)
+
+    def _apply_hedge_fill(self, sid, offset, ts, r):
+        side, cloid = r.get("side"), r.get("client_order_id")
+        price, qty, fee = finite(r.get("price")), finite(r.get("size")), finite(r.get("fee"))
+        if side not in ("buy", "sell") or not isinstance(cloid, str) or not cloid \
+                or price <= 0 or qty <= 0:
+            return
+        s = self.db.execute("SELECT hedge_position, hedge_avg_cost FROM sessions WHERE session_id=?",
+                            (sid,)).fetchone()
+        position, avg_cost, delta = apply_fill(s["hedge_position"], s["hedge_avg_cost"],
+                                               1 if side == "buy" else -1, price, qty)
+        notional = price * qty
+        inserted = self.db.execute(
+            "INSERT OR IGNORE INTO hedge_fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sid, offset, ts, str(r.get("venue") or "hyperliquid"), cloid, side, price,
+             r.get("price_source"), qty, notional, fee, delta, finite(r.get("position_after"))))
+        if inserted.rowcount == 0:
+            return
+        self.db.execute(
+            "UPDATE sessions SET hedge_position=?, hedge_avg_cost=?, hedge_realized=hedge_realized+?,"
+            " hedge_fees=hedge_fees+?, hedge_volume=hedge_volume+?, hedge_fills=hedge_fills+1"
+            " WHERE session_id=?", (position, avg_cost, delta, fee, notional, sid))
 
     def _apply_order(self, sid, offset, ts, r):
         event = r.get("kind")
@@ -282,6 +329,7 @@ class TelemetryStore:
         rows = self._rows("SELECT * FROM sessions ORDER BY started_ms DESC LIMIT ?", (limit,))
         for row in rows:
             row["net_pnl"] = row["realized"] - row["fees"]
+            row["hedge_net_pnl"] = row["hedge_realized"] - row["hedge_fees"]
         return rows
 
     @locked
@@ -318,10 +366,20 @@ class TelemetryStore:
             mid = snapshot["mid"] if snapshot and snapshot["mid"] > 0 else None
             unrealized = (session["position"] * (mid - session["avg_cost"])
                           if mid and abs(session["position"]) > EPS else 0.0)
+            # The hedge leg is marked to the same reference mid; venue basis
+            # makes this approximate, and funding is not included.
+            hedge_unrealized = (session["hedge_position"] * (mid - session["hedge_avg_cost"])
+                                if mid and abs(session["hedge_position"]) > EPS else 0.0)
+            hedge_net = session["hedge_realized"] - session["hedge_fees"]
             start_equity = snapshot["session_start_equity"] if snapshot else 0.0
+            total = session["realized"] - session["fees"] + unrealized
             current = {**session, "unrealized": unrealized,
                        "net_pnl": session["realized"] - session["fees"],
-                       "total_pnl": session["realized"] - session["fees"] + unrealized,
+                       "total_pnl": total,
+                       "hedge_unrealized": hedge_unrealized,
+                       "hedge_net_pnl": hedge_net,
+                       "hedge_total_pnl": hedge_net + hedge_unrealized,
+                       "combined_pnl": total + hedge_net + hedge_unrealized,
                        "equity_change": (snapshot["equity"] - start_equity
                                          if snapshot and start_equity > 0 else None),
                        "open_orders": self.db.execute(
@@ -341,6 +399,16 @@ class TelemetryStore:
         if session_id:
             clauses.append("session_id=?"); args.append(session_id)
         return self._rows(f"SELECT * FROM fills WHERE {' AND '.join(clauses)}"
+                          " ORDER BY ts_ms DESC, offset DESC LIMIT ?", (*args, limit))
+
+    @locked
+    def hedge_fills(self, limit=200, before_ms=None, session_id=None):
+        clauses, args = ["1=1"], []
+        if before_ms:
+            clauses.append("ts_ms<?"); args.append(before_ms)
+        if session_id:
+            clauses.append("session_id=?"); args.append(session_id)
+        return self._rows(f"SELECT * FROM hedge_fills WHERE {' AND '.join(clauses)}"
                           " ORDER BY ts_ms DESC, offset DESC LIMIT ?", (*args, limit))
 
     @locked

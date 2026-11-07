@@ -70,6 +70,16 @@ export interface Session {
   total_pnl: number
   equity_change: number | null
   open_orders: number
+  hedge_position: number
+  hedge_avg_cost: number
+  hedge_realized: number
+  hedge_fees: number
+  hedge_volume: number
+  hedge_fills: number
+  hedge_unrealized: number
+  hedge_net_pnl: number
+  hedge_total_pnl: number
+  combined_pnl: number
 }
 
 export interface Snapshot {

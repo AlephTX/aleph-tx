@@ -162,6 +162,53 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(order["status"], "partial")
         self.assertEqual(order["filled"], 0.5)
 
+    def test_hedge_fills_track_a_separate_leg_and_dedupe_by_cloid(self):
+        hedge = lambda ts, side, price, size, cloid: {
+            "type": "hedge_fill", "ts_ms": ts, "venue": "hyperliquid", "client_order_id": cloid,
+            "side": side, "size": size, "price": price, "price_source": "fill",
+            "fee": price * size * 4.5e-4, "position_after": 0.0}
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.0, 601),
+                   hedge(1200, "sell", 2001.0, 0.1, "0xa"),
+                   hedge(1200, "sell", 2001.0, 0.1, "0xa"),  # duplicate cloid
+                   fill(1300, "sell", 2010.0, 0.1, 0.0, 602, coid=2),
+                   hedge(1400, "buy", 2008.0, 0.1, "0xb"),
+                   {"type": "hedge_fill", "ts_ms": 1450, "side": "buy", "size": 0.1, "price": 0},
+                   {"type": "snapshot", "ts_ms": 1500, "mid": 2009.0, "session_start_equity": 1.0})
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        # Lighter-only figures are unchanged by the hedge leg.
+        self.assertAlmostEqual(session["net_pnl"], 1.0)
+        self.assertEqual(session["hedge_fills"], 2)
+        self.assertAlmostEqual(session["hedge_position"], 0.0)
+        self.assertAlmostEqual(session["hedge_realized"], -0.7)
+        fees = (2001.0 + 2008.0) * 0.1 * 4.5e-4
+        self.assertAlmostEqual(session["hedge_net_pnl"], -0.7 - fees)
+        self.assertAlmostEqual(session["combined_pnl"], 1.0 - 0.7 - fees)
+        self.assertEqual(len(self.store.hedge_fills()), 2)
+
+    def test_old_database_gains_hedge_columns(self):
+        import sqlite3
+        path = self.dir / "old.sqlite3"
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, network TEXT, exchange TEXT,"
+                   " symbol TEXT, market_id INTEGER, account INTEGER, hedge_account TEXT,"
+                   " started_ms INTEGER, last_ms INTEGER, stopped_ms INTEGER,"
+                   " position REAL NOT NULL DEFAULT 0, avg_cost REAL NOT NULL DEFAULT 0,"
+                   " realized REAL NOT NULL DEFAULT 0, fees REAL NOT NULL DEFAULT 0,"
+                   " volume REAL NOT NULL DEFAULT 0, fills INTEGER NOT NULL DEFAULT 0,"
+                   " buy_volume REAL NOT NULL DEFAULT 0, sell_volume REAL NOT NULL DEFAULT 0,"
+                   " stream_lost INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0)")
+        db.execute("INSERT INTO sessions (session_id, started_ms) VALUES ('old', 1)")
+        db.commit()
+        db.close()
+        store = TelemetryStore(str(path), self.dir)
+        try:
+            row = store.sessions()[0]
+            self.assertEqual((row["hedge_fills"], row["hedge_net_pnl"]), (0, 0.0))
+        finally:
+            store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

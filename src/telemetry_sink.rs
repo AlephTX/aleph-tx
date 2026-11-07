@@ -103,9 +103,27 @@ impl OrderEventRecord {
     }
 }
 
+/// A reconciled hedge IOC fill on the hedge venue. Emitted from the hedge
+/// poll path (about 1 Hz, already journaling), not the quoting hot path.
+#[derive(Debug, Clone, Serialize)]
+pub struct HedgeFillRecord {
+    pub venue: &'static str,
+    pub client_order_id: String,
+    pub side: &'static str,
+    pub size: f64,
+    pub price: f64,
+    /// `fill` when the venue reported the average price, otherwise `limit`
+    /// (the journaled worst-case IOC price, a conservative bound).
+    pub price_source: &'static str,
+    /// Estimated taker fee from the configured fee rate.
+    pub fee: f64,
+    pub position_after: f64,
+}
+
 #[derive(Debug)]
 enum Record {
     Order(OrderEventRecord),
+    HedgeFill(HedgeFillRecord),
     Snapshot(StrategySnapshot),
     Stopped(Sender<std::io::Result<()>>),
 }
@@ -182,6 +200,10 @@ impl TelemetrySink {
         self.send(Record::Order(OrderEventRecord::from_event(event)));
     }
 
+    pub fn hedge_fill(&self, fill: HedgeFillRecord) {
+        self.send(Record::HedgeFill(fill));
+    }
+
     pub fn snapshot(&self, snapshot: StrategySnapshot) {
         self.send(Record::Snapshot(snapshot));
     }
@@ -236,6 +258,9 @@ fn writer_loop(
         let result = match record {
             Record::Order(event) => {
                 write_line(&mut out, "order", None, event).and_then(|()| out.flush())
+            }
+            Record::HedgeFill(fill) => {
+                write_line(&mut out, "hedge_fill", None, fill).and_then(|()| out.flush())
             }
             Record::Snapshot(snapshot) => write_line(
                 &mut out,
@@ -304,8 +329,18 @@ mod tests {
             fill_count: 1,
             ..Default::default()
         });
+        sink.hedge_fill(HedgeFillRecord {
+            venue: "hyperliquid",
+            client_order_id: "0xabc".into(),
+            side: "buy",
+            size: 0.02,
+            price: 2501.0,
+            price_source: "fill",
+            fee: 0.0225,
+            position_after: 0.02,
+        });
         sink.stopped().await.unwrap();
-        let lines = wait_for_lines(&dir.join("s1.jsonl"), 4);
+        let lines = wait_for_lines(&dir.join("s1.jsonl"), 5);
         assert_eq!(lines[0]["type"], "session");
         assert_eq!(lines[0]["symbol"], "ETH");
         assert_eq!(lines[1]["type"], "order");
@@ -316,7 +351,11 @@ mod tests {
         assert_eq!(lines[2]["type"], "snapshot");
         assert_eq!(lines[2]["equity"], 1000.0);
         assert_eq!(lines[2]["dropped"], 0);
-        assert_eq!(lines[3]["type"], "stopped");
+        assert_eq!(lines[3]["type"], "hedge_fill");
+        assert_eq!(lines[3]["venue"], "hyperliquid");
+        assert_eq!(lines[3]["side"], "buy");
+        assert_eq!(lines[3]["price_source"], "fill");
+        assert_eq!(lines[4]["type"], "stopped");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

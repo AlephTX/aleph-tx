@@ -271,7 +271,24 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         last_rebalance: None,
         allowance: None,
         blocked_since: None,
+        telemetry: None,
     };
+    let telemetry_dir =
+        std::env::temp_dir().join(format!("aleph-hedge-telemetry-{}", uuid::Uuid::new_v4()));
+    let sink = crate::telemetry_sink::TelemetrySink::open(
+        &telemetry_dir,
+        &crate::telemetry_sink::SessionInfo {
+            session_id: "hedge".into(),
+            network: "Testnet".into(),
+            exchange: "lighter".into(),
+            symbol: "ETH".into(),
+            market_id: 0,
+            account: 1,
+            hedge_account: None,
+        },
+    )
+    .unwrap();
+    hedge.set_telemetry(Some(sink.clone()));
     let mut observed = observation("0.03", "0");
     observed.book.timestamp_ms = unix_ms().unwrap();
     hedge.execute(observed, false).await.unwrap();
@@ -298,6 +315,22 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     let log = std::fs::read_to_string(&journal_path).unwrap();
     assert_eq!(log.matches("hedge_intent").count(), 2);
     assert_eq!(log.matches("hedge_terminal").count(), 2);
+    // Both reconciled fills are exported as Hyperliquid sells, after journaling.
+    sink.stopped().await.unwrap();
+    let exported: Vec<serde_json::Value> =
+        std::fs::read_to_string(telemetry_dir.join("hedge.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|line: &serde_json::Value| line["type"] == "hedge_fill")
+            .collect();
+    assert_eq!(exported.len(), 2);
+    assert!(exported.iter().all(|f| f["venue"] == "hyperliquid"
+        && f["side"] == "sell"
+        && f["size"].as_f64().unwrap() > 0.0
+        && f["fee"].as_f64().unwrap() > 0.0));
+    assert_eq!(exported[1]["position_after"], -0.011);
+    std::fs::remove_dir_all(telemetry_dir).unwrap();
     drop(hedge);
     server.abort();
     let error = server.await.unwrap_err();

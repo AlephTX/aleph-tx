@@ -498,7 +498,8 @@ impl InventoryNeutralMM {
         }
     }
 
-    pub fn with_inventory_hedge(mut self, hedge: LiveInventoryHedge) -> Self {
+    pub fn with_inventory_hedge(mut self, mut hedge: LiveInventoryHedge) -> Self {
+        hedge.set_telemetry(self.telemetry_sink.clone());
         self.hedge = Some(hedge);
         self
     }

@@ -248,6 +248,10 @@ class Handler(BaseHTTPRequestHandler):
             return {"fills": store.fills(limit=bounded(q.get("limit"), 200, 1000),
                                          before_ms=int(q["before"]) if "before" in q else None,
                                          session_id=q.get("session"))}
+        if route == "/api/hedge_fills":
+            return {"fills": store.hedge_fills(limit=bounded(q.get("limit"), 200, 1000),
+                                               before_ms=int(q["before"]) if "before" in q else None,
+                                               session_id=q.get("session"))}
         if route == "/api/orders":
             status = q.get("status", "open")
             if status not in ("open", "all"):

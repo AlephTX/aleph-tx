@@ -30,6 +30,14 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         valueClass={toneClass[tone(s?.total_pnl)]}
         sub={<>已实现 {signedUsd(s?.net_pnl)} · 浮动 {signedUsd(s?.unrealized)}</>}
       />
+      {s?.hedge_account && (
+        <Stat
+          label="组合盈亏（含对冲）"
+          value={signedUsd(s?.combined_pnl)}
+          valueClass={toneClass[tone(s?.combined_pnl)]}
+          sub={<>对冲 {signedUsd(s?.hedge_total_pnl)} · {num(s?.hedge_fills, 0)} 笔 · 持仓 {size(s?.hedge_position)}</>}
+        />
+      )}
       <Stat
         label="权益变化"
         value={signedUsd(s?.equity_change)}

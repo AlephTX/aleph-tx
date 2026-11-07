@@ -172,9 +172,15 @@ pub struct LiveInventoryHedge {
     last_rebalance: Option<Instant>,
     allowance: Option<QuoteAllowance>,
     blocked_since: Option<Instant>,
+    telemetry: Option<crate::telemetry_sink::TelemetrySink>,
 }
 
 impl LiveInventoryHedge {
+    /// Export reconciled hedge fills alongside the primary-venue telemetry.
+    pub(crate) fn set_telemetry(&mut self, sink: Option<crate::telemetry_sink::TelemetrySink>) {
+        self.telemetry = sink;
+    }
+
     pub(crate) fn round_trip_cost_bps(&self) -> f64 {
         self.limits.round_trip_cost_bps()
     }
@@ -253,6 +259,7 @@ impl LiveInventoryHedge {
             last_rebalance: None,
             allowance: None,
             blocked_since: None,
+            telemetry: None,
         })
     }
 
@@ -376,11 +383,20 @@ impl LiveInventoryHedge {
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.price);
+            let telemetry = self
+                .telemetry
+                .is_some()
+                .then(|| hedge_fill_record(pending, fill, price, hedge, &self.limits))
+                .flatten();
             self.record(
                 json!({"event": "hedge_terminal", "cloid": id, "filled": fill.to_string(),
                 "average_price": price.map(|p| p.to_string()), "position": hedge.to_string()}),
             )?;
             tracing::info!(%id, %fill, %hedge, "Hyperliquid IOC reconciled");
+            // Export only after the journal has durably recorded the terminal.
+            if let (Some(sink), Some(record)) = (&self.telemetry, telemetry) {
+                sink.hedge_fill(record);
+            }
             self.pending = None;
             self.confirmed = hedge;
         }
@@ -627,6 +643,37 @@ fn plan_ioc(
         return Ok(None);
     }
     Ok(Some(order))
+}
+
+/// Telemetry for a reconciled IOC. Uses the reported average price when
+/// known, else the journaled limit (a worst-case bound). Zero fills emit
+/// nothing.
+fn hedge_fill_record(
+    pending: &PendingIoc,
+    fill: Decimal,
+    average_price: Option<Decimal>,
+    position_after: Decimal,
+    limits: &HedgeLimits,
+) -> Option<crate::telemetry_sink::HedgeFillRecord> {
+    if fill <= Decimal::ZERO {
+        return None;
+    }
+    let (price, price_source) = match average_price {
+        Some(price) => (price, "fill"),
+        None => (pending.order.limit_price, "limit"),
+    };
+    let size = fill.to_f64()?;
+    let price = price.to_f64().filter(|p| p.is_finite() && *p > 0.0)?;
+    Some(crate::telemetry_sink::HedgeFillRecord {
+        venue: "hyperliquid",
+        client_order_id: pending.id.clone(),
+        side: if pending.order.is_buy { "buy" } else { "sell" },
+        size,
+        price,
+        price_source,
+        fee: size * price * limits.taker_fee_bps / 10_000.0,
+        position_after: position_after.to_f64()?,
+    })
 }
 
 fn hedge_price_limit(touch: Decimal, slippage_bps: u32, is_buy: bool) -> Result<Decimal> {

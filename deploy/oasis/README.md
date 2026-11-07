@@ -10,10 +10,15 @@ The console (`dashboard/`, Vite + React) shows service state, quotes, exchange p
 
 When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file per session (orders, fills, risk snapshots) to `/var/lib/aleph-tx-telemetry`. Writes go through a bounded queue off the trading path; dropped records are counted and shown on the console. The monitor ingests those files incrementally into SQLite at `/var/lib/aleph-tx-monitor/telemetry.sqlite3`, so history survives restarts and the database can be deleted and rebuilt from the JSONL files. PnL uses average cost, includes fees and rebates, and marks open inventory to the latest snapshot mid.
 
-API: `/api/status`, `/api/summary`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
+API: `/api/status`, `/api/summary`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
-Trade PnL covers the Lighter leg only; it excludes Hyperliquid hedge fills and
-funding payments. Lighter account equity is shown separately. A successful
+Lighter trade PnL covers Lighter fills, fees and rebates. When the inventory
+hedge is enabled, each reconciled Hyperliquid IOC is exported as a
+`hedge_fill` record after it is journaled, and tracked as a separate leg with
+its own average cost and an estimated taker fee. Its price is the venue's
+average fill price, or the journaled IOC limit when that is unavailable. The
+console's combined PnL marks both legs to the same reference mid; funding
+payments are not included. Lighter account equity is shown separately. A successful
 strategy shutdown drains the telemetry queue and persists the final marker
 before returning. Ingest preserves checkpoints when session files are copied
 or restored to new inodes, and deduplicates each record before updating totals.
