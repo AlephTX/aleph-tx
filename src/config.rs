@@ -12,6 +12,7 @@ pub const SYM_BTC: u16 = 1001;
 pub const SYM_ETH: u16 = 1002;
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Round value to nearest tick/step size
@@ -54,6 +55,16 @@ pub fn format_size(size: f64, step_size: f64) -> String {
     format!("{:.prec$}", round_to_tick(size, step_size), prec = decimals)
 }
 
+/// Exclusive upper bound on symbol IDs imposed by the SHM matrix layout.
+pub const MAX_SYMBOL_ID: u16 = 2048;
+
+/// Historical ticker -> symbol ID table used when `[symbols]` is absent.
+pub fn default_symbols() -> BTreeMap<String, u16> {
+    BTreeMap::from([("BTC".to_string(), SYM_BTC), ("ETH".to_string(), SYM_ETH)])
+}
+
+/// Built-in name for the historical IDs. Prefer [`AppConfig::symbol_name`],
+/// which honours the configured `[symbols]` table.
 pub fn symbol_name(symbol_id: u16) -> &'static str {
     match symbol_id {
         SYM_BTC => "BTC",
@@ -506,8 +517,9 @@ impl InventoryNeutralMMConfig {
             "{name}: target_resting_margin_utilization must be in (0, 1]"
         );
         anyhow::ensure!(
-            self.exchange_id == EXCH_LIGHTER && matches!(self.symbol_id, SYM_BTC | SYM_ETH),
-            "{name}: expected Lighter and a supported SHM symbol ID (1001/1002)"
+            self.exchange_id == EXCH_LIGHTER && (1..MAX_SYMBOL_ID).contains(&self.symbol_id),
+            "{name}: expected Lighter and an SHM symbol ID in 1..{}",
+            MAX_SYMBOL_ID - 1
         );
         anyhow::ensure!(
             crate::exchanges::lighter::valid_market_id(self.market_id),
@@ -593,6 +605,9 @@ impl Default for InventoryNeutralMMConfig {
 /// Top-level config file structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
+    /// Ticker -> global SHM symbol ID, shared with the Go feeder.
+    #[serde(default = "default_symbols")]
+    pub symbols: BTreeMap<String, u16>,
     pub backpack: ExchangeConfig,
     pub edgex: ExchangeConfig,
     #[serde(default)]
@@ -621,18 +636,41 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, id) in &self.symbols {
+            anyhow::ensure!(
+                !name.is_empty() && (1..MAX_SYMBOL_ID).contains(id),
+                "symbols.{name}: id {id} must be in 1..{}",
+                MAX_SYMBOL_ID - 1
+            );
+            anyhow::ensure!(seen.insert(*id), "symbols: duplicate id {id}");
+        }
         self.backpack.validate("backpack")?;
         self.edgex.validate("edgex")?;
         if let Some(config) = &self.inventory_neutral_mm {
             config.validate()?;
+            anyhow::ensure!(
+                self.symbol_name(config.symbol_id).is_some(),
+                "inventory_neutral_mm: symbol_id {} is not in [symbols]",
+                config.symbol_id
+            );
         }
         Ok(())
+    }
+
+    /// Ticker for a configured symbol ID.
+    pub fn symbol_name(&self, symbol_id: u16) -> Option<&str> {
+        self.symbols
+            .iter()
+            .find(|(_, id)| **id == symbol_id)
+            .map(|(name, _)| name.as_str())
     }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            symbols: default_symbols(),
             backpack: ExchangeConfig {
                 risk_fraction: 0.10,
                 min_spread_bps: 12.0,
@@ -765,6 +803,36 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn symbol_table_defaults_and_custom_entries() {
+        let app = AppConfig::default();
+        assert_eq!(app.symbol_name(SYM_BTC), Some("BTC"));
+        assert_eq!(app.symbol_name(SYM_ETH), Some("ETH"));
+        assert_eq!(app.symbol_name(1003), None);
+
+        let mut app = AppConfig::default();
+        app.symbols.insert("SOL".into(), 1003);
+        app.inventory_neutral_mm = Some(InventoryNeutralMMConfig {
+            symbol_id: 1003,
+            ..Default::default()
+        });
+        assert!(app.validate().is_ok());
+        assert_eq!(app.symbol_name(1003), Some("SOL"));
+
+        // The strategy symbol must be registered.
+        app.symbols.remove("SOL");
+        assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_symbol_tables_are_rejected() {
+        for (name, id) in [("SOL", 0u16), ("SOL", MAX_SYMBOL_ID), ("DUP", SYM_ETH)] {
+            let mut app = AppConfig::default();
+            app.symbols.insert(name.into(), id);
+            assert!(app.validate().is_err(), "{name}={id}");
+        }
     }
 
     #[test]

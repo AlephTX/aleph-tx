@@ -4,7 +4,7 @@
 mod session;
 
 use aleph_tx::account_stats_reader::AccountStatsReader;
-use aleph_tx::config::{InventoryNeutralMMConfig, symbol_name};
+use aleph_tx::config::InventoryNeutralMMConfig;
 use aleph_tx::exchanges::hyperliquid::Network;
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
             println!(
                 "Configuration OK: {:?} Lighter {} market {}, Hyperliquid hedge {}",
                 profile.network,
-                symbol_name(profile.strategy.symbol_id),
+                profile.symbol,
                 profile.strategy.market_id,
                 if profile.has_hedge() {
                     "enabled"
@@ -178,6 +178,7 @@ async fn run_existing_feeder() -> Result<()> {
         !profile.has_hedge(),
         "Use make trade MODE=live for the inventory hedge"
     );
+    let symbol = profile.symbol;
     let config = profile.strategy;
     let credentials = LighterCredentials::from_env(|key| std::env::var(key).ok())?;
     let network = credentials.network()?;
@@ -199,13 +200,13 @@ async fn run_existing_feeder() -> Result<()> {
     });
     let account = credentials.account_index();
     let trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
-    trading.validate_symbol(symbol_name(config.symbol_id))?;
+    trading.validate_symbol(&symbol)?;
     trading.validate_precision(config.tick_size, config.step_size)?;
     let telemetry = TelemetrySink::from_env(&SessionInfo {
         session_id: uuid::Uuid::new_v4().to_string(),
         network: format!("{network:?}"),
         exchange: "lighter".into(),
-        symbol: symbol_name(config.symbol_id).into(),
+        symbol: symbol.clone(),
         market_id: config.market_id as u64,
         account,
         hedge_account: None,

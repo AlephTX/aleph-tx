@@ -48,3 +48,17 @@ func TestTradeIDSetStaysBoundedUnderLoad(t *testing.T) {
 		t.Fatalf("window does not hold the most recent ids")
 	}
 }
+
+func TestSetSymbolRegistryCopiesTable(t *testing.T) {
+	saved := SymbolNameToID
+	defer func() { SymbolNameToID = saved }()
+	table := map[string]uint16{"SOL": 1003}
+	SetSymbolRegistry(table)
+	table["SOL"] = 9
+	if SymbolNameToID["SOL"] != 1003 || len(SymbolNameToID) != 1 {
+		t.Fatalf("registry = %v", SymbolNameToID)
+	}
+	if got := BuildReverseSymbolMap(map[string]string{"SOL": "SOLUSDT", "ETH": "ETHUSDT"}); got["SOLUSDT"] != 1003 || len(got) != 1 {
+		t.Fatalf("reverse map = %v", got)
+	}
+}

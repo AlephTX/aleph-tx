@@ -1,4 +1,4 @@
-use aleph_tx::config::{AppConfig, EXCH_LIGHTER, InventoryNeutralMMConfig, symbol_name};
+use aleph_tx::config::{AppConfig, EXCH_LIGHTER, InventoryNeutralMMConfig};
 use aleph_tx::exchanges::hyperliquid::{HyperliquidSigner, Network, validate_hex};
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::live_hedge::{HedgeLimits, LiveInventoryHedge};
@@ -36,6 +36,8 @@ struct Feeds {
 pub(super) struct Profile {
     pub strategy: InventoryNeutralMMConfig,
     pub network: Network,
+    /// Ticker of the strategy symbol, resolved from `[symbols]`.
+    pub symbol: String,
     feeds: Feeds,
     feeder_config: String,
 }
@@ -58,11 +60,15 @@ impl Profile {
         app.validate()?;
         let strategy = app
             .inventory_neutral_mm
+            .clone()
             .context("Missing inventory_neutral_mm section")?;
-        let symbol = symbol_name(strategy.symbol_id);
+        let symbol = app
+            .symbol_name(strategy.symbol_id)
+            .context("Inventory strategy symbol_id is not in [symbols]")?
+            .to_string();
         ensure!(
-            strategy.exchange_id == EXCH_LIGHTER && symbol != "UNKNOWN",
-            "Inventory strategy requires a supported Lighter symbol (BTC or ETH)"
+            strategy.exchange_id == EXCH_LIGHTER,
+            "Inventory strategy requires the Lighter exchange"
         );
         ensure!(
             feeds.lighter.feeder_enabled
@@ -70,7 +76,7 @@ impl Profile {
                 && feeds
                     .lighter
                     .feeder_symbols
-                    .get(symbol)
+                    .get(&symbol)
                     .is_some_and(|market| market == &strategy.market_id.to_string()),
             "Lighter feeder must publish exactly the strategy's symbol and market ID"
         );
@@ -81,13 +87,11 @@ impl Profile {
         if let Some(hl) = feeds.hyperliquid.as_ref().filter(|hl| hl.feeder_enabled) {
             ensure!(
                 hl.feeder_symbols
-                    .get(symbol)
-                    .is_some_and(|market| market == symbol)
-                    && hl
-                        .feeder_symbols
-                        .iter()
-                        .all(|(ticker, market)| matches!(ticker.as_str(), "ETH" | "BTC")
-                            && market == ticker),
+                    .get(&symbol)
+                    .is_some_and(|market| market == &symbol)
+                    && hl.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && market == ticker
+                    }),
                 "Hyperliquid feeder must map the strategy symbol to its native perpetual"
             );
             ensure!(
@@ -113,11 +117,12 @@ impl Profile {
         // Hyperliquid books as pricing inputs. Serialize that exact validated
         // profile to the private session directory before the feeder starts.
         let mut feeder: toml::Table = toml::from_str(&contents)?;
-        feeder.retain(|key, _| matches!(key, "lighter" | "hyperliquid"));
+        feeder.retain(|key, _| matches!(key, "lighter" | "hyperliquid" | "symbols"));
         let feeder_config = toml::to_string(&feeder)?;
         Ok(Self {
             strategy,
             network,
+            symbol,
             feeds,
             feeder_config,
         })
@@ -396,7 +401,7 @@ pub(super) async fn launch(
         &mut feeder,
         &stop,
         async {
-            let symbol = symbol_name(profile.strategy.symbol_id);
+            let symbol = profile.symbol.as_str();
             let mut trading =
                 LighterTrading::with_credentials(profile.strategy.market_id, credentials).await?;
             trading.validate_symbol(symbol)?;

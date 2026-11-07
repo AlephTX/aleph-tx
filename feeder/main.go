@@ -26,6 +26,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config %s: %v", cfgPath, err)
 	}
+	exchanges.SetSymbolRegistry(cfg.SymbolTable())
 	publicOnly := false
 	if value := os.Getenv("ALEPH_FEEDER_PUBLIC_ONLY"); value != "" {
 		publicOnly, err = strconv.ParseBool(value)

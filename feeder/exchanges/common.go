@@ -18,9 +18,21 @@ const (
 )
 
 // SymbolNameToID maps standard local ticker names to our global symbol IDs.
+// main replaces it from config via SetSymbolRegistry before starting any
+// adapter; it is read-only afterwards.
 var SymbolNameToID = map[string]uint16{
 	"BTC": SymbolBTCPERP,
 	"ETH": SymbolETHPERP,
+}
+
+// SetSymbolRegistry installs the configured ticker -> symbol ID table. It must
+// be called before adapters start; the map is copied.
+func SetSymbolRegistry(symbols map[string]uint16) {
+	registry := make(map[string]uint16, len(symbols))
+	for name, id := range symbols {
+		registry[name] = id
+	}
+	SymbolNameToID = registry
 }
 
 // BuildReverseSymbolMap creates a map from the exchange's specific symbol string directly to our internal global symbol ID.

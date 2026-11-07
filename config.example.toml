@@ -2,6 +2,13 @@
 # Copy to config.toml and adjust values
 # Sensitive credentials (private keys, API keys) are stored in .env files
 
+# Global SHM symbol IDs shared by the Go feeder and Rust strategies (1..2047).
+# Every ticker used in a feeder_symbols table must be listed here.
+# Omitting this table keeps the historical defaults (BTC = 1001, ETH = 1002).
+[symbols]
+BTC = 1001
+ETH = 1002
+
 # ============================================================================
 # Lighter DEX - Feeder
 # ============================================================================
