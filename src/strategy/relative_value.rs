@@ -3,8 +3,8 @@
 
 mod paper;
 pub use paper::{
-    ExitReason, PaperLegExecution, PaperReport, PaperScenario, PaperTrade, run_paper,
-    run_paper_frames,
+    ExitReason, PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperReport, PaperScenario,
+    PaperTrade, run_paper, run_paper_frames,
 };
 
 use crate::{
@@ -383,6 +383,80 @@ pub enum Rejection {
     Edge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryGate {
+    Session,
+    BookMissing,
+    BookStale,
+    BookClock,
+    BookInvalid,
+    QuoteSkew,
+    ReferenceStale,
+    ReferenceInvalid,
+    VenueOracleStale,
+    VenueOracleInvalid,
+    VenueOracleDeviation,
+    BookReferenceDeviation,
+    SampleCadence,
+    Warmup,
+    BasisBelowEntry,
+    BasisBeyondStop,
+    EntryWindow,
+    FundingForecast,
+    Capacity,
+    NetEdge,
+    LatencyWindow,
+    FundingGuard,
+}
+
+impl EntryGate {
+    fn rejection(self) -> Rejection {
+        match self {
+            Self::Session => Rejection::Session,
+            Self::BookMissing
+            | Self::BookStale
+            | Self::BookClock
+            | Self::BookInvalid
+            | Self::QuoteSkew
+            | Self::EntryWindow
+            | Self::LatencyWindow => Rejection::Book,
+            Self::ReferenceStale | Self::VenueOracleStale => Rejection::OracleStale,
+            Self::ReferenceInvalid
+            | Self::VenueOracleInvalid
+            | Self::VenueOracleDeviation
+            | Self::BookReferenceDeviation => Rejection::Oracle,
+            Self::SampleCadence => Rejection::SampleCadence,
+            Self::Warmup => Rejection::Warmup,
+            Self::BasisBelowEntry | Self::BasisBeyondStop => Rejection::BasisBand,
+            Self::FundingForecast | Self::FundingGuard => Rejection::Funding,
+            Self::Capacity => Rejection::Capacity,
+            Self::NetEdge => Rejection::Edge,
+        }
+    }
+
+    fn on_leg(self, leg: usize) -> BlockedEntry {
+        BlockedEntry {
+            gate: self,
+            leg: Some(leg),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockedEntry {
+    gate: EntryGate,
+    leg: Option<usize>,
+}
+
+impl From<EntryGate> for BlockedEntry {
+    fn from(gate: EntryGate) -> Self {
+        Self { gate, leg: None }
+    }
+}
+
+type EntryDecision<T> = std::result::Result<T, BlockedEntry>;
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct BasisSignal {
     pub observed_bps: f64,
@@ -599,10 +673,9 @@ impl PairConfig {
 }
 
 impl Book {
-    fn usable(&self, terms: &MarketTerms, now: u64, age: u64) -> bool {
+    fn valid_depth(&self, terms: &MarketTerms) -> bool {
         self.market == terms.market
             && self.tradable
-            && fresh(self.timestamp_ms, now, age)
             && bounded(self.available_notional)
             && self
                 .bounds
@@ -837,19 +910,35 @@ impl RelativeValue {
     }
 
     fn usable_books(&self, frame: &Frame) -> bool {
-        let timestamps = self.book_times(frame);
-        timestamps[0].abs_diff(timestamps[1]) <= self.config.planner.max_quote_skew_ms
+        self.check_quote_skew(self.book_times(frame)).is_ok()
             && (0..2).all(|i| self.usable_book(frame, i))
     }
 
     fn usable_book(&self, frame: &Frame, i: usize) -> bool {
+        self.check_book(frame, i).is_ok()
+    }
+
+    fn check_book(&self, frame: &Frame, i: usize) -> EntryDecision<()> {
         let book = &frame.legs[i].book;
-        book.timestamp_ms >= self.last_book_ms[i]
-            && book.usable(
-                &self.config.legs[i],
-                frame.now_ms,
-                self.config.planner.max_quote_age_ms,
-            )
+        let gate = if book.timestamp_ms == 0 {
+            EntryGate::BookMissing
+        } else if book.timestamp_ms < self.last_book_ms[i] || book.timestamp_ms > frame.now_ms {
+            EntryGate::BookClock
+        } else if frame.now_ms - book.timestamp_ms > self.config.planner.max_quote_age_ms {
+            EntryGate::BookStale
+        } else if !book.valid_depth(&self.config.legs[i]) {
+            EntryGate::BookInvalid
+        } else {
+            return Ok(());
+        };
+        Err(gate.on_leg(i))
+    }
+
+    fn check_quote_skew(&self, times: [u64; 2]) -> EntryDecision<()> {
+        if times[0].abs_diff(times[1]) > self.config.planner.max_quote_skew_ms {
+            return Err(EntryGate::QuoteSkew.into());
+        }
+        Ok(())
     }
 
     fn session_end(&self, frame: &Frame) -> Decision<u64> {
@@ -884,36 +973,45 @@ impl RelativeValue {
         }
     }
 
-    fn basis_bps(&self, frame: &Frame) -> Decision<f64> {
+    fn basis_bps(&self, frame: &Frame) -> EntryDecision<f64> {
         self.config
-            .reference_deadline_ms(frame.reference, frame.equity_session, frame.now_ms)?;
+            .reference_deadline_ms(frame.reference, frame.equity_session, frame.now_ms)
+            .map_err(|reason| match reason {
+                Rejection::OracleStale => EntryGate::ReferenceStale,
+                _ => EntryGate::ReferenceInvalid,
+            })?;
         let earliest = frame
             .equity_session
             .map_or(0, |session| session.opens_at_ms);
-        for leg in &frame.legs {
-            if leg.oracle.mode != OracleMode::LiveExternal {
-                return Err(invalid_oracle_mode(leg.oracle));
-            }
-            oracle_deadline_ms(
-                leg.oracle,
-                frame.now_ms,
-                earliest,
-                self.config.oracle_max_age_ms,
-            )?;
+        for (i, leg) in frame.legs.iter().enumerate() {
+            let validity = if leg.oracle.mode == OracleMode::LiveExternal {
+                oracle_deadline_ms(
+                    leg.oracle,
+                    frame.now_ms,
+                    earliest,
+                    self.config.oracle_max_age_ms,
+                )
+            } else {
+                Err(invalid_oracle_mode(leg.oracle))
+            };
+            validity.map_err(|reason| match reason {
+                Rejection::OracleStale => EntryGate::VenueOracleStale.on_leg(i),
+                _ => EntryGate::VenueOracleInvalid.on_leg(i),
+            })?;
             if !self.within_reference(leg.oracle.price, frame.reference.price) {
-                return Err(Rejection::Oracle);
+                return Err(EntryGate::VenueOracleDeviation.on_leg(i));
             }
         }
         // Reject incoherent books instead of training the model on dislocations
         // caused by unit, contract or oracle mismatches.
-        for leg in &frame.legs {
+        for (i, leg) in frame.legs.iter().enumerate() {
             if !self.within_reference(leg.book.mid(), frame.reference.price) {
-                return Err(Rejection::Oracle);
+                return Err(EntryGate::BookReferenceDeviation.on_leg(i));
             }
         }
         ((frame.legs[1].book.mid() - frame.legs[0].book.mid()) / frame.reference.price * BPS)
             .to_f64()
-            .ok_or(Rejection::Oracle)
+            .ok_or_else(|| EntryGate::ReferenceInvalid.into())
     }
 
     fn within_reference(&self, observed: Decimal, reference: Decimal) -> bool {
@@ -928,10 +1026,11 @@ impl RelativeValue {
     pub fn observe(&mut self, frame: &Frame) -> Result<Decision<Plan>> {
         Ok(self
             .sample(frame)?
-            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff)))
+            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff, None))
+            .map_err(|blocked| blocked.gate.rejection()))
     }
 
-    fn sample(&mut self, frame: &Frame) -> Result<Decision<(BasisSignal, u64)>> {
+    fn sample(&mut self, frame: &Frame) -> Result<EntryDecision<(BasisSignal, u64)>> {
         ensure!(
             frame.now_ms > self.last_frame_ms,
             "non-increasing replay availability time"
@@ -943,51 +1042,80 @@ impl RelativeValue {
             .any(|(i, time)| *time > 0 && *time < self.last_book_ms[i]);
         // Track each venue even if the other venue is stale. The simulator can
         // fill one leg independently and must never accept a regressed book.
-        for (i, time) in times.into_iter().enumerate() {
-            if self.usable_book(frame, i) {
-                self.last_book_ms[i] = time;
+        let books = [0, 1].map(|i| self.check_book(frame, i));
+        for (i, book) in books.iter().enumerate() {
+            if book.is_ok() {
+                self.last_book_ms[i] = times[i];
             }
         }
         self.last_frame_ms = frame.now_ms;
-        let result = self.observe_inner(frame, times);
+        let result = self.observe_inner(frame, times, books);
         // Short gaps in valid books or external updates do not train the model.
         // The next usable sample enforces the configured maximum gap.
-        if regressed || matches!(result, Err(Rejection::Session | Rejection::Oracle)) {
+        if regressed
+            || result.is_err_and(|blocked| {
+                matches!(
+                    blocked.gate.rejection(),
+                    Rejection::Session | Rejection::Oracle
+                )
+            })
+        {
             self.basis = BasisModel::default();
         }
         Ok(result)
     }
 
-    fn observe_inner(&mut self, frame: &Frame, times: [u64; 2]) -> Decision<(BasisSignal, u64)> {
-        let cutoff = self.cutoff(frame)?;
-        if !self.usable_books(frame) {
-            return Err(Rejection::Book);
-        }
+    fn observe_inner(
+        &mut self,
+        frame: &Frame,
+        times: [u64; 2],
+        books: [EntryDecision<()>; 2],
+    ) -> EntryDecision<(BasisSignal, u64)> {
+        let cutoff = self.cutoff(frame).map_err(|_| EntryGate::Session)?;
+        books[0]?;
+        books[1]?;
+        self.check_quote_skew(times)?;
         let basis = self.basis_bps(frame)?;
-        let signal = self.basis.update(
-            &self.config.basis,
-            frame.now_ms,
-            times,
-            frame.equity_session.map(|s| s.opens_at_ms),
-            basis,
-        )?;
+        let signal = self
+            .basis
+            .update(
+                &self.config.basis,
+                frame.now_ms,
+                times,
+                frame.equity_session.map(|s| s.opens_at_ms),
+                basis,
+            )
+            .map_err(|reason| match reason {
+                Rejection::Warmup => EntryGate::Warmup,
+                _ => EntryGate::SampleCadence,
+            })?;
         Ok((signal, cutoff))
     }
 
-    fn plan(&self, frame: &Frame, signal: BasisSignal, cutoff: u64) -> Decision<Plan> {
+    fn plan(
+        &self,
+        frame: &Frame,
+        signal: BasisSignal,
+        cutoff: u64,
+        mut best_edge_bps: Option<&mut Option<Decimal>>,
+    ) -> EntryDecision<Plan> {
         let now = frame.now_ms;
         let hold_until = now
             .checked_add(self.config.planner.funding_horizon_ms)
-            .ok_or(Rejection::Session)?;
+            .ok_or(EntryGate::Session)?;
         let unwind_until = hold_until
             .checked_add(self.config.execution_window_ms)
-            .ok_or(Rejection::Session)?;
+            .ok_or(EntryGate::Session)?;
         if unwind_until > cutoff {
-            return Err(Rejection::Session);
+            return Err(EntryGate::Session.into());
         }
         let inputs_expire = frame.legs.iter().fold(
             self.config
-                .reference_deadline_ms(frame.reference, frame.equity_session, now)?,
+                .reference_deadline_ms(frame.reference, frame.equity_session, now)
+                .map_err(|reason| match reason {
+                    Rejection::OracleStale => EntryGate::ReferenceStale,
+                    _ => EntryGate::ReferenceInvalid,
+                })?,
             |time, leg| {
                 time.min(
                     leg.book
@@ -1006,15 +1134,18 @@ impl RelativeValue {
             .min(inputs_expire);
         // The planned hold must start after the last permitted entry fill.
         if entry_until <= now || entry_until >= hold_until {
-            return Err(Rejection::Book);
+            return Err(EntryGate::EntryWindow.into());
         }
         for (i, leg) in frame.legs.iter().enumerate() {
             let (_, count) = self.config.legs[i]
                 .funding
                 .window(now, unwind_until)
-                .ok_or(Rejection::Funding)?;
+                .ok_or(EntryGate::FundingForecast)?;
             if count > 0 {
-                let forecast = leg.forecast.as_ref().ok_or(Rejection::Funding)?;
+                let forecast = leg
+                    .forecast
+                    .as_ref()
+                    .ok_or(EntryGate::FundingForecast.on_leg(i))?;
                 entry_until = entry_until.min(
                     forecast
                         .observed_at_ms
@@ -1023,28 +1154,28 @@ impl RelativeValue {
             }
         }
         if entry_until <= now {
-            return Err(Rejection::Funding);
+            return Err(EntryGate::FundingForecast.into());
         }
         let bps = &self.config.basis;
         if signal.z.abs() >= bps.stop_z {
-            return Err(Rejection::BasisBand);
+            return Err(EntryGate::BasisBeyondStop.into());
         }
         let mean_reversion = match self.config.strategy {
             Strategy::FundingCarry => Decimal::ZERO,
             Strategy::BasisReversion if signal.z.abs() >= bps.entry_z => {
                 dec((signal.observed_bps - signal.mean_bps).abs() * bps.reversion_fraction)
-                    .map_err(|_| Rejection::Edge)?
+                    .map_err(|_| EntryGate::NetEdge)?
                     / BPS
                     * frame.reference.price
             }
-            Strategy::BasisReversion => return Err(Rejection::BasisBand),
+            Strategy::BasisReversion => return Err(EntryGate::BasisBelowEntry.into()),
         };
         let reserve = dec(self
             .config
             .planner
             .exit_basis_reserve_bps
             .max(signal.sigma_bps * bps.stress_sigma))
-        .map_err(|_| Rejection::Edge)?
+        .map_err(|_| EntryGate::NetEdge)?
             / BPS
             * frame.reference.price;
         let depth = [0, 1].map(|i| {
@@ -1061,7 +1192,9 @@ impl RelativeValue {
                 continue;
             }
             let window = [entry_until, hold_until, unwind_until];
-            let funding = self.funding_bound(frame, buy_leg, window)?;
+            let funding = self
+                .funding_bound(frame, buy_leg, window)
+                .map_err(|_| EntryGate::FundingForecast)?;
             if self.config.strategy == Strategy::FundingCarry && funding <= Decimal::ZERO {
                 rejected = Rejection::Edge;
                 continue;
@@ -1074,7 +1207,7 @@ impl RelativeValue {
                 reserve,
                 window,
             };
-            match self.size_plan(frame, &depth, score) {
+            match self.size_plan(frame, &depth, score, best_edge_bps.as_deref_mut()) {
                 Ok(plan)
                     if best
                         .as_ref()
@@ -1086,7 +1219,10 @@ impl RelativeValue {
                 Err(reason) => rejected = rejected.max(reason),
             }
         }
-        best.ok_or(rejected)
+        best.ok_or_else(|| match rejected {
+            Rejection::Edge => EntryGate::NetEdge.into(),
+            _ => EntryGate::Capacity.into(),
+        })
     }
 
     fn funding_bound(&self, frame: &Frame, buy_leg: usize, window: [u64; 3]) -> Decision<Decimal> {
@@ -1148,7 +1284,13 @@ impl RelativeValue {
         Ok(bound)
     }
 
-    fn size_plan(&self, frame: &Frame, depth: &[[Depth; 2]; 2], score: Score) -> Decision<Plan> {
+    fn size_plan(
+        &self,
+        frame: &Frame,
+        depth: &[[Depth; 2]; 2],
+        score: Score,
+        mut best_edge_bps: Option<&mut Option<Decimal>>,
+    ) -> Decision<Plan> {
         let mut cap = self.rules.max_base;
         for curve in depth.iter().flatten() {
             cap = cap.min(curve.last()?.base);
@@ -1206,8 +1348,16 @@ impl RelativeValue {
             }
             sized = true;
             let net = econ.net(score);
+            let net_bps = if net > Decimal::ZERO || best_edge_bps.is_some() {
+                net / frame.reference.price * BPS
+            } else {
+                Decimal::ZERO
+            };
+            if let Some(best) = best_edge_bps.as_deref_mut() {
+                *best = Some(best.map_or(net_bps, |previous| previous.max(net_bps)));
+            }
             if net > Decimal::ZERO
-                && net / frame.reference.price * BPS >= self.rules.min_edge
+                && net_bps >= self.rules.min_edge
                 && best
                     .as_ref()
                     .is_none_or(|(previous, old)| net * qty > old.net(score) * previous)

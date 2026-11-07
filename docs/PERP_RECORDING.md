@@ -346,3 +346,30 @@ submission. Depth impact uses the touch of the later book that simulated
 the fill. The report records fills without a valid submission touch
 separately. Unhedged size, duration and any halt remain visible beside the
 fill counts.
+
+For a replay with zero entries, inspect `entry_diagnostics.blocked_by_gate`.
+It counts the first blocking check on each flat holdout frame. Per-leg
+failures use the pair's leg order in `blocked_by_leg`. The reported maximum
+absolute z-score is from flat scored frames. The best net edge is measured
+after size and budget checks and includes candidates below the configured
+edge threshold. A missing edge value means no candidate reached that check.
+For an IOC that resolves without a fill, `unfilled_by_gate` records its
+terminal price or depth check, or the last condition it was waiting for at
+expiry. An outstanding IOC at the end of the recording stays in its open
+phase.
+
+On the five-minute November 6 recording, each 15-second gap replay had 648
+holdout frames and zero submitted IOC orders. The first blocking checks were
+as follows.
+
+| First gate | NVDA | TSLA |
+| --- | ---: | ---: |
+| Lighter book missing | 335 | 270 |
+| Hyperliquid book stale | 208 | 244 |
+| Pair timestamp skew | 83 | 108 |
+| Lighter oracle stale | 21 | 26 |
+| Basis below entry threshold | 1 | 0 |
+
+NVDA's one scored holdout frame had an absolute z-score of about 0.266,
+below the configured 2.5 entry threshold. TSLA's holdout never reached
+scoring. Neither sample reached the net edge calculation.

@@ -279,6 +279,73 @@ fn paper_does_not_fill_using_a_book_generated_before_arrival() {
 }
 
 #[test]
+fn paper_identifies_the_first_unusable_book_and_cross_leg_skew() {
+    let mut scenario = equity();
+    scenario.frames.truncate(3);
+    scenario.frames[0].legs[0].book.timestamp_ms = 0;
+    scenario.frames[1].legs[0].book.timestamp_ms =
+        scenario.frames[1].now_ms - scenario.pair.planner.max_quote_age_ms - 1;
+    scenario.frames[2].legs[1].book.timestamp_ms -= 60;
+
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    let diagnostics = report.entry_diagnostics;
+    assert_eq!(diagnostics.idle_frames, 3);
+    assert_eq!(diagnostics.blocked_by_leg[0][&EntryGate::BookMissing], 1);
+    assert_eq!(diagnostics.blocked_by_leg[0][&EntryGate::BookStale], 1);
+    assert_eq!(diagnostics.blocked_by_gate[&EntryGate::QuoteSkew], 1);
+    assert_eq!(report.rejected[&Rejection::Book], 3);
+}
+
+#[test]
+fn paper_distinguishes_basis_threshold_from_net_edge() {
+    let mut scenario = equity();
+    scenario.frames.truncate(4);
+    scenario.pair.basis.entry_z = 6.0;
+    let registry = VenueRegistry::default();
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(
+        report.entry_diagnostics.blocked_by_gate[&EntryGate::BasisBelowEntry],
+        1
+    );
+    assert_eq!(report.entry_diagnostics.max_abs_z, Some(5.0));
+    assert_eq!(report.entry_diagnostics.best_net_edge_bps, None);
+
+    scenario.pair.basis.entry_z = 2.5;
+    scenario.pair.planner.min_net_edge_bps = 100.0;
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(
+        report.entry_diagnostics.blocked_by_gate[&EntryGate::NetEdge],
+        1
+    );
+    let best = report.entry_diagnostics.best_net_edge_bps.unwrap();
+    assert!(best > Decimal::ZERO && best < d("100"));
+    assert_eq!(report.entries_submitted, 0);
+}
+
+#[test]
+fn paper_distinguishes_an_unmarketable_ioc_from_missing_books() {
+    let mut scenario = equity();
+    scenario.frames.truncate(5);
+    let primary = first_plan(&scenario).unwrap().hedge.primary;
+    let i = usize::from(primary.venue == scenario.pair.legs[1].venue);
+    let tick = scenario.pair.legs[i].tick;
+    let book = &mut scenario.frames[4].legs[i].book;
+    match primary.side {
+        HedgeSide::Buy => book.asks[0].price = primary.limit_price + tick,
+        HedgeSide::Sell => book.bids[0].price = primary.limit_price - tick,
+    }
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert_eq!(report.entries_submitted, 1);
+    assert_eq!(
+        report.opening_execution[i].unfilled_by_gate[&PaperIocGate::LimitNotMarketable],
+        1
+    );
+    assert_eq!(report.ioc_unfilled, 1);
+    assert_eq!(report.ioc_expired_without_book, 0);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+}
+
+#[test]
 fn primary_can_fill_when_hedge_book_is_unavailable_and_exposure_is_reported() {
     let mut scenario = crypto();
     scenario.frames.truncate(7);
@@ -288,6 +355,10 @@ fn primary_can_fill_when_hedge_book_is_unavailable_and_exposure_is_reported() {
     let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
     assert_eq!(report.ioc_filled, 1);
     assert_eq!(report.ioc_expired_without_book, 1);
+    assert_eq!(
+        report.opening_execution[1].unfilled_by_gate[&PaperIocGate::DeadlineBookUnavailable],
+        1
+    );
     assert!(report.halted.is_some());
     assert!(report.trades.is_empty());
     assert_eq!(report.open_positions_base, [d("0.04"), Decimal::ZERO]);
@@ -393,7 +464,7 @@ fn benchmark_relative_value_l2_plan() {
     for _ in 0..trials {
         black_box(
             engine
-                .plan(black_box(frame), black_box(signal), black_box(cutoff))
+                .plan(black_box(frame), black_box(signal), black_box(cutoff), None)
                 .unwrap(),
         );
     }

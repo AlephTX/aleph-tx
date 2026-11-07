@@ -50,12 +50,26 @@ pub struct PaperTrade {
     pub realized_pnl_upper_bound: Decimal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperIocGate {
+    DeadlineNoFrame,
+    DeadlineBookUnavailable,
+    DeadlineBookBeforeArrival,
+    DeadlineSession,
+    DeadlineFundingGuard,
+    PriceBand,
+    LimitNotMarketable,
+    DepthBelowLot,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct PaperLegExecution {
     pub ioc_submitted: usize,
     pub ioc_filled: usize,
     pub ioc_partial: usize,
     pub ioc_unfilled: usize,
+    pub unfilled_by_gate: BTreeMap<PaperIocGate, usize>,
     pub fills_without_submit_touch: usize,
     pub max_fill_elapsed_ms: u64,
     #[serde(with = "rust_decimal::serde::str")]
@@ -73,6 +87,20 @@ pub struct PaperLegExecution {
 }
 
 #[derive(Debug, Default, Serialize)]
+pub struct PaperEntryDiagnostics {
+    pub idle_frames: usize,
+    pub blocked_by_gate: BTreeMap<EntryGate, usize>,
+    pub blocked_by_leg: [BTreeMap<EntryGate, usize>; 2],
+    pub entry_z: f64,
+    pub stop_z: f64,
+    pub max_abs_z: Option<f64>,
+    pub min_net_edge_bps: f64,
+    /// Best conservative edge among candidates that fit size and budget limits.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub best_net_edge_bps: Option<Decimal>,
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct PaperReport {
     pub frames: usize,
     pub training_frames: usize,
@@ -80,6 +108,7 @@ pub struct PaperReport {
     pub max_basis_samples: u32,
     pub holdout_basis_ready_frames: usize,
     pub rejected: BTreeMap<Rejection, usize>,
+    pub entry_diagnostics: PaperEntryDiagnostics,
     pub entry_signals: usize,
     pub entries_submitted: usize,
     pub entries_unfilled: usize,
@@ -126,6 +155,23 @@ pub struct PaperReport {
 }
 
 impl PaperReport {
+    fn reject(&mut self, blocked: BlockedEntry) {
+        let gate = blocked.gate;
+        *self
+            .entry_diagnostics
+            .blocked_by_gate
+            .entry(gate)
+            .or_default() += 1;
+        if let Some(i) = blocked.leg {
+            *self.entry_diagnostics.blocked_by_leg[i]
+                .entry(gate)
+                .or_default() += 1;
+        }
+        if gate != EntryGate::FundingGuard {
+            *self.rejected.entry(gate.rejection()).or_default() += 1;
+        }
+    }
+
     fn execution(&mut self, opening: bool, leg: usize) -> &mut PaperLegExecution {
         if opening {
             &mut self.opening_execution[leg]
@@ -282,6 +328,7 @@ struct Pending {
     order: OrderIntent,
     submitted_at_ms: u64,
     submit_touch: Option<Decimal>,
+    expiry_gate: PaperIocGate,
 }
 
 struct Execution {
@@ -400,44 +447,62 @@ impl Runner {
         opening: bool,
     ) -> Result<Advance> {
         let now = frame.now_ms;
-        if let Some(pending) = execution.pending.take() {
+        if let Some(mut pending) = execution.pending.take() {
             let i = usize::from(pending.order.venue == self.planner.config.legs[1].venue);
             let book = &frame.legs[i].book;
-            let order = pending.order;
-            let fill = if now >= execution.deadline {
+            let order = &pending.order;
+            let (fill, unfilled_gate) = if now >= execution.deadline {
                 // The simulator expires intents without a usable publication
                 // before their deadline. It has no exchange-side order in flight.
                 self.report.ioc_expired_without_book += 1;
-                Fill::default()
-            } else if book.timestamp_ms < pending.submitted_at_ms.saturating_add(self.latency)
-                || !self.planner.usable_book(frame, i)
-                || self.planner.session_end(frame).is_err()
-            {
-                execution.pending = Some(Pending { order, ..pending });
-                return Ok(Advance::Working);
-            } else if self
-                .planner
-                .config
-                .legs
-                .iter()
-                .any(|leg| leg.funding.near_payment(now, self.funding_guard_ms))
-            {
-                self.report.funding_guard_blocked_fills += 1;
-                execution.pending = Some(Pending { order, ..pending });
-                return Ok(Advance::Working);
-            } else if !book.in_bounds(order.limit_price) {
-                // The venue's current band would reject the outstanding limit.
-                Fill::default()
+                (Fill::default(), Some(pending.expiry_gate))
             } else {
-                sweep(
-                    book,
-                    &self.planner.config.legs[i],
-                    order.side,
-                    order.limit_price,
-                    order.base_quantity,
-                    self.planner.rules.participation,
-                )?
+                let waiting = if self.planner.session_end(frame).is_err() {
+                    Some(PaperIocGate::DeadlineSession)
+                } else if !self.planner.usable_book(frame, i) {
+                    Some(PaperIocGate::DeadlineBookUnavailable)
+                } else if book.timestamp_ms < pending.submitted_at_ms.saturating_add(self.latency) {
+                    Some(PaperIocGate::DeadlineBookBeforeArrival)
+                } else if self
+                    .planner
+                    .config
+                    .legs
+                    .iter()
+                    .any(|leg| leg.funding.near_payment(now, self.funding_guard_ms))
+                {
+                    self.report.funding_guard_blocked_fills += 1;
+                    Some(PaperIocGate::DeadlineFundingGuard)
+                } else {
+                    None
+                };
+                if let Some(gate) = waiting {
+                    pending.expiry_gate = gate;
+                    execution.pending = Some(pending);
+                    return Ok(Advance::Working);
+                }
+                let touch = book.side(order.side)[0].price;
+                let marketable = match order.side {
+                    HedgeSide::Buy => touch <= order.limit_price,
+                    HedgeSide::Sell => touch >= order.limit_price,
+                };
+                if !book.in_bounds(order.limit_price) || !book.in_bounds(touch) {
+                    (Fill::default(), Some(PaperIocGate::PriceBand))
+                } else if !marketable {
+                    (Fill::default(), Some(PaperIocGate::LimitNotMarketable))
+                } else {
+                    let fill = sweep(
+                        book,
+                        &self.planner.config.legs[i],
+                        order.side,
+                        order.limit_price,
+                        order.base_quantity,
+                        self.planner.rules.participation,
+                    )?;
+                    let gate = fill.base.is_zero().then_some(PaperIocGate::DepthBelowLot);
+                    (fill, gate)
+                }
             };
+            let order = pending.order;
             let stats = self.report.execution(opening, i);
             let status = if fill.base == order.base_quantity {
                 stats.ioc_filled += 1;
@@ -447,6 +512,9 @@ impl Runner {
                     stats.ioc_partial += 1;
                 } else {
                     stats.ioc_unfilled += 1;
+                    if let Some(gate) = unfilled_gate {
+                        *stats.unfilled_by_gate.entry(gate).or_default() += 1;
+                    }
                 }
                 OrderStatus::Canceled
             };
@@ -509,6 +577,7 @@ impl Runner {
                     order,
                     submitted_at_ms: now,
                     submit_touch,
+                    expiry_gate: PaperIocGate::DeadlineNoFrame,
                 });
                 Ok(Advance::Working)
             }
@@ -694,7 +763,7 @@ impl Runner {
 
     fn start(&mut self, plan: Plan, frame: &Frame) -> Result<()> {
         if plan.hedge.deadline_ms <= frame.now_ms.saturating_add(self.latency.saturating_mul(2)) {
-            *self.report.rejected.entry(Rejection::Book).or_default() += 1;
+            self.report.reject(EntryGate::LatencyWindow.into());
             return Ok(());
         }
         if self.funding_guard_ms > 0
@@ -711,6 +780,7 @@ impl Runner {
             })
         {
             self.report.funding_guard_skipped_entries += 1;
+            self.report.reject(EntryGate::FundingGuard.into());
             return Ok(());
         }
         let mut exec = Execution::new(&plan.hedge)?;
@@ -822,7 +892,7 @@ impl Runner {
             self.report.frames += 1;
             ensure!(self.report.frames <= MAX_FRAMES, "too many paper frames");
             let sample = self.planner.sample(frame)?;
-            if matches!(sample, Ok(_) | Err(Rejection::Warmup)) {
+            if sample.is_ok() || sample.is_err_and(|blocked| blocked.gate == EntryGate::Warmup) {
                 self.report.basis_samples += 1;
                 self.report.max_basis_samples = self
                     .report
@@ -846,12 +916,25 @@ impl Runner {
                     self.active = Some(active);
                 }
             } else {
-                match sample.and_then(|(signal, cutoff)| self.planner.plan(frame, signal, cutoff)) {
+                let diagnostics = &mut self.report.entry_diagnostics;
+                diagnostics.idle_frames += 1;
+                let plan = sample.and_then(|(signal, cutoff)| {
+                    let abs_z = signal.z.abs();
+                    diagnostics.max_abs_z =
+                        Some(diagnostics.max_abs_z.map_or(abs_z, |max| max.max(abs_z)));
+                    self.planner.plan(
+                        frame,
+                        signal,
+                        cutoff,
+                        Some(&mut diagnostics.best_net_edge_bps),
+                    )
+                });
+                match plan {
                     Ok(plan) => {
                         self.report.entry_signals += 1;
                         self.start(plan, frame)?;
                     }
-                    Err(reason) => *self.report.rejected.entry(reason).or_default() += 1,
+                    Err(blocked) => self.report.reject(blocked),
                 }
             }
             self.record_risk(frame)?;
@@ -920,6 +1003,12 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
         ledger: Ledger::default(),
         report: PaperReport {
             funding_guard_ms,
+            entry_diagnostics: PaperEntryDiagnostics {
+                entry_z: pair.basis.entry_z,
+                stop_z: pair.basis.stop_z,
+                min_net_edge_bps: pair.planner.min_net_edge_bps,
+                ..Default::default()
+            },
             ..Default::default()
         },
         peak_pnl: Decimal::ZERO,
