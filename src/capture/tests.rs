@@ -128,7 +128,7 @@ fn lighter_clock_uses_only_available_connection_evidence() {
     update["payload"]["timestamp"] = json!(T + 220);
     let mut expired = lighter(T + 400, T + 415, 13, 12, false);
     expired["payload"]["timestamp"] = json!(T + 420);
-    let disconnect = json!({"source":"lighter","event":"disconnect","received_at_ms":T+500,"available_at_ms":T+500});
+    let refresh = json!({"source":"lighter","event":"clock_refresh","received_at_ms":T+500,"available_at_ms":T+500});
     let mut reconnected = lighter(T + 600, T + 599, 20, 0, true);
     reconnected["payload"]["timestamp"] = json!(T + 600);
     let (coverage, frames) = replay(
@@ -138,7 +138,7 @@ fn lighter_clock_uses_only_available_connection_evidence() {
             ack,
             update,
             expired,
-            disconnect,
+            refresh,
             reconnected,
             footer(T + 700),
         ],
@@ -160,6 +160,8 @@ fn lighter_clock_uses_only_available_connection_evidence() {
     );
     assert_eq!(coverage.clock_unavailable, [3, 0]);
     assert_eq!(coverage.clock_rejections, [0, 0]);
+    assert_eq!(coverage.lighter_clock_refreshes, 1);
+    assert!(coverage.disconnects.is_empty());
     assert_eq!(coverage.lighter_clock[0].unwrap().probes, 0);
 }
 

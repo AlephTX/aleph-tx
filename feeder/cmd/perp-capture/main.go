@@ -40,11 +40,14 @@ type lighterSubscription struct {
 }
 
 type subscription struct {
-	source, url string
-	requests    []any
-	coins       []string
-	interval    time.Duration
+	source, url  string
+	requests     []any
+	coins        []string
+	interval     time.Duration
+	clockRefresh time.Duration
 }
+
+var errClockRefresh = errors.New("refresh Lighter subscription clock evidence")
 
 func symbols(raw string) ([]string, error) {
 	if raw == "" {
@@ -64,9 +67,9 @@ func symbols(raw string) ([]string, error) {
 	return items, nil
 }
 
-func subscriptions(lighter, hl, coinbase string, snapshotInterval time.Duration) ([]subscription, error) {
+func subscriptions(lighter, hl, coinbase string, snapshotInterval, clockRefresh time.Duration, hlFastBook bool) ([]subscription, error) {
 	sources := []subscription{
-		{source: "lighter", url: "wss://mainnet.zklighter.elliot.ai/stream"},
+		{source: "lighter", url: "wss://mainnet.zklighter.elliot.ai/stream", clockRefresh: clockRefresh},
 		{source: "hyperliquid", url: "wss://api.hyperliquid.xyz/ws"},
 		{source: "coinbase", url: "wss://ws-feed.exchange.coinbase.com"},
 	}
@@ -93,8 +96,12 @@ func subscriptions(lighter, hl, coinbase string, snapshotInterval time.Duration)
 				}
 			case "hyperliquid":
 				for _, channel := range []string{"l2Book", "activeAssetCtx"} {
+					request := map[string]any{"type": channel, "coin": item}
+					if channel == "l2Book" && hlFastBook {
+						request["fast"] = true
+					}
 					source.requests = append(source.requests, map[string]any{
-						"method": "subscribe", "subscription": map[string]string{"type": channel, "coin": item},
+						"method": "subscribe", "subscription": request,
 					})
 				}
 			case "coinbase":
@@ -135,42 +142,53 @@ func pollSnapshots(ctx context.Context, source subscription, emit func(record) e
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var workers sync.WaitGroup
+	for _, coin := range source.coins {
+		workers.Go(func() {
+			cancel(pollSnapshotCoin(ctx, source, coin, client, emit))
+		})
+	}
+	workers.Wait()
+	return context.Cause(ctx)
+}
+
+func pollSnapshotCoin(ctx context.Context, source subscription, coin string, client *http.Client, emit func(record) error) error {
+	query, err := json.Marshal(map[string]string{"type": "l2Book", "coin": coin})
+	if err != nil {
+		return err
+	}
 	ticker := time.NewTicker(source.interval)
 	defer ticker.Stop()
 	for {
-		for _, coin := range source.coins {
-			query, err := json.Marshal(map[string]string{"type": "l2Book", "coin": coin})
-			if err != nil {
-				return err
-			}
-			request, err := http.NewRequestWithContext(ctx, http.MethodPost, source.url, bytes.NewReader(query))
-			if err != nil {
-				return err
-			}
-			request.Header.Set("Content-Type", "application/json")
-			response, err := client.Do(request)
-			if err != nil {
-				return err
-			}
-			body, readErr := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
-			received := time.Now().UnixMilli()
-			closeErr := response.Body.Close()
-			if err := errors.Join(readErr, closeErr); err != nil {
-				return err
-			}
-			if response.StatusCode != http.StatusOK || len(body) > 1<<20 {
-				return fmt.Errorf("invalid Hyperliquid snapshot response: HTTP %d", response.StatusCode)
-			}
-			payload, err := json.Marshal(struct {
-				Channel string          `json:"channel"`
-				Data    json.RawMessage `json:"data"`
-			}{"l2Book", body})
-			if err != nil {
-				return err
-			}
-			if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: payload}); err != nil {
-				return err
-			}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, source.url, bytes.NewReader(query))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			return fmt.Errorf("snapshot %s: %w", coin, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+		received := time.Now().UnixMilli()
+		closeErr := response.Body.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return err
+		}
+		if response.StatusCode != http.StatusOK || len(body) > 1<<20 {
+			return fmt.Errorf("invalid Hyperliquid snapshot for %s: HTTP %d", coin, response.StatusCode)
+		}
+		payload, err := json.Marshal(struct {
+			Channel string          `json:"channel"`
+			Data    json.RawMessage `json:"data"`
+		}{"l2Book", body})
+		if err != nil {
+			return err
+		}
+		if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: payload}); err != nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -276,6 +294,22 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	}
 }
 
+func runSource(ctx context.Context, source subscription, emit func(record) error) error {
+	if source.interval > 0 {
+		return pollSnapshots(ctx, source, emit)
+	}
+	if source.clockRefresh == 0 {
+		return connect(ctx, source, emit)
+	}
+	ctx, cancel := context.WithTimeoutCause(ctx, source.clockRefresh, errClockRefresh)
+	defer cancel()
+	err := connect(ctx, source, emit)
+	if errors.Is(context.Cause(ctx), errClockRefresh) {
+		return errClockRefresh
+	}
+	return err
+}
+
 func capture(ctx context.Context, sources []subscription, out *os.File) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -298,18 +332,21 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 			backoff := time.Second
 			for ctx.Err() == nil {
 				start := time.Now()
-				var err error
-				if source.interval > 0 {
-					err = pollSnapshots(ctx, source, emit)
-				} else {
-					err = connect(ctx, source, emit)
-				}
+				err := runSource(ctx, source, emit)
 				if ctx.Err() != nil {
 					return
 				}
 				log.Printf("%s: %v", source.source, err)
-				if emit(record{Source: source.source, Event: "disconnect", ReceivedAt: time.Now().UnixMilli()}) != nil {
+				event := "disconnect"
+				if errors.Is(err, errClockRefresh) {
+					event = "clock_refresh"
+				}
+				if emit(record{Source: source.source, Event: event, ReceivedAt: time.Now().UnixMilli()}) != nil {
 					return
+				}
+				if event == "clock_refresh" {
+					backoff = time.Second
+					continue
 				}
 				if time.Since(start) > 30*time.Second {
 					backoff = time.Second
@@ -375,13 +412,21 @@ func run() error {
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")
+	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
+	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
 	duration := flag.Duration("duration", time.Minute, "recording duration")
 	path := flag.String("output", "", "new output NDJSON file")
 	flag.Parse()
 	if *path == "" || *duration < time.Second || *duration > 24*time.Hour {
 		return errors.New("provide -output and a duration from 1s to 24h")
 	}
-	sources, err := subscriptions(*lighter, *hl, *coinbase, *snapshotInterval)
+	if *clockRefresh != 0 && (*lighter == "" || *clockRefresh < 30*time.Second || *clockRefresh > 9*time.Minute) {
+		return errors.New("clock refresh needs Lighter markets and an interval from 30s to 9m")
+	}
+	if *hlFastBook && *hl == "" {
+		return errors.New("fast books need Hyperliquid markets")
+	}
+	sources, err := subscriptions(*lighter, *hl, *coinbase, *snapshotInterval, *clockRefresh, *hlFastBook)
 	if err != nil {
 		return err
 	}

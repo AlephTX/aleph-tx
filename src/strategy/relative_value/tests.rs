@@ -62,6 +62,43 @@ fn equity_uses_prior_basis_and_picks_the_net_profitable_depth_band() {
 }
 
 #[test]
+fn aged_equity_minute_reference_allows_hedged_fills_and_accounts_for_slippage() {
+    let mut scenario = equity();
+    let minute = scenario.frames[0].now_ms;
+    scenario.pair.equity_minute_reference_max_age_ms = Some(120_000);
+    for frame in &mut scenario.frames {
+        frame.equity_session.as_mut().unwrap().opens_at_ms = minute - 120_000;
+        frame.reference.mode = OracleMode::EquityMinuteClose;
+        frame.reference.timestamp_ms = minute - 60_000;
+    }
+    let plan = first_plan(&scenario).unwrap();
+    let primary = usize::from(plan.hedge.primary.venue == scenario.pair.legs[1].venue);
+    let tick = scenario.pair.legs[primary].tick;
+    let arrival = &mut scenario.frames[4].legs[primary].book;
+    match plan.hedge.primary.side {
+        HedgeSide::Buy => arrival.asks[0].price -= tick,
+        HedgeSide::Sell => arrival.bids[0].price += tick,
+    }
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert_eq!(report.entry_signals, 1);
+    assert_eq!(report.paired_entries, 1);
+    assert_eq!(report.trades.len(), 1);
+    assert_eq!(report.ioc_filled, 4);
+    assert!(
+        report
+            .opening_execution
+            .iter()
+            .all(|leg| leg.filled_base == d("0.5"))
+    );
+    let primary_execution = &report.opening_execution[primary];
+    assert_eq!(primary_execution.slippage_quote, d("-0.005"));
+    assert_eq!(primary_execution.depth_impact_quote, Decimal::ZERO);
+    assert_eq!(primary_execution.max_fill_elapsed_ms, 100);
+    assert_eq!(report.max_unhedged_ms, 100);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+}
+
+#[test]
 fn unused_depth_cannot_raise_the_notional_reserved_for_a_shallower_band() {
     let mut scenario = equity();
     scenario.pair.planner.max_unhedged_notional_usd = 50.06;
@@ -193,6 +230,37 @@ fn short_book_skew_rejects_the_frame_without_starving_the_estimator() {
     ));
     let plan = engine.observe(&scenario.frames[4]).unwrap().unwrap();
     assert_eq!(plan.basis.prior_samples, 3);
+}
+
+#[test]
+fn stale_oracle_preserves_warmup_but_session_halt_clears_it() {
+    let scenario = equity();
+    let mut engine = RelativeValue::new(scenario.pair.clone(), &VenueRegistry::default()).unwrap();
+    for frame in &scenario.frames[..3] {
+        assert!(matches!(
+            engine.observe(frame).unwrap(),
+            Err(Rejection::Warmup)
+        ));
+    }
+    let mut stale = scenario.frames[3].clone();
+    stale.legs[0].oracle.timestamp_ms = stale.now_ms - scenario.pair.oracle_max_age_ms - 1;
+    assert!(matches!(
+        engine.observe(&stale).unwrap(),
+        Err(Rejection::OracleStale)
+    ));
+    let plan = engine.observe(&scenario.frames[4]).unwrap().unwrap();
+    assert_eq!(plan.basis.prior_samples, 3);
+    let mut halt = scenario.frames[5].clone();
+    halt.equity_session.as_mut().unwrap().halted = true;
+    halt.legs[0].book.tradable = false;
+    assert!(matches!(
+        engine.observe(&halt).unwrap(),
+        Err(Rejection::Session)
+    ));
+    assert!(matches!(
+        engine.observe(&scenario.frames[6]).unwrap(),
+        Err(Rejection::Warmup)
+    ));
 }
 
 #[test]

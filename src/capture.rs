@@ -155,6 +155,7 @@ pub struct Coverage {
     pub clock_rejections: [usize; 2],
     pub clock_unavailable: [usize; 2],
     pub lighter_clock: [Option<LighterClockAudit>; 2],
+    pub lighter_clock_refreshes: usize,
     pub max_rejected_clock_lead_ms: [u64; 2],
     pub lighter_nonce_gaps: [usize; 2],
     pub fresh_book_pair_frames: usize,
@@ -372,12 +373,17 @@ impl<'a> Compiler<'a> {
             "unsupported capture source"
         );
         match (row.event.as_str(), row.payload) {
-            ("disconnect", None) => {
-                *self
-                    .coverage
-                    .disconnects
-                    .entry(row.source.clone())
-                    .or_default() += 1;
+            ("disconnect" | "clock_refresh", None) => {
+                if row.event == "clock_refresh" {
+                    ensure!(row.source == "lighter", "unexpected clock refresh source");
+                    self.coverage.lighter_clock_refreshes += 1;
+                } else {
+                    *self
+                        .coverage
+                        .disconnects
+                        .entry(row.source.clone())
+                        .or_default() += 1;
+                }
                 for leg in &mut self.legs {
                     leg.disconnect(&row.source);
                 }

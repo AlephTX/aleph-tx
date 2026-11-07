@@ -51,17 +51,46 @@ pub struct PaperTrade {
 }
 
 #[derive(Debug, Default, Serialize)]
+pub struct PaperLegExecution {
+    pub ioc_submitted: usize,
+    pub ioc_filled: usize,
+    pub ioc_partial: usize,
+    pub ioc_unfilled: usize,
+    pub fills_without_submit_touch: usize,
+    pub max_fill_elapsed_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub filled_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub filled_notional_quote: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub submit_touch_notional_quote: Decimal,
+    /// Signed cost relative to the same-side touch at submission.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub slippage_quote: Decimal,
+    /// Cost of sweeping levels beyond the arrival book's same-side touch.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub depth_impact_quote: Decimal,
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct PaperReport {
     pub frames: usize,
     pub training_frames: usize,
+    pub basis_samples: usize,
+    pub max_basis_samples: u32,
+    pub holdout_basis_ready_frames: usize,
     pub rejected: BTreeMap<Rejection, usize>,
+    pub entry_signals: usize,
     pub entries_submitted: usize,
     pub entries_unfilled: usize,
+    pub paired_entries: usize,
     pub ioc_submitted: usize,
     pub ioc_filled: usize,
     pub ioc_partial: usize,
     pub ioc_unfilled: usize,
     pub ioc_expired_without_book: usize,
+    pub opening_execution: [PaperLegExecution; 2],
+    pub closing_execution: [PaperLegExecution; 2],
     pub funding_guard_ms: u64,
     pub funding_guard_blocked_fills: usize,
     pub funding_guard_skipped_entries: usize,
@@ -94,6 +123,16 @@ pub struct PaperReport {
     pub halted: Option<String>,
     pub active_plan: Option<Plan>,
     pub open_phase: Option<&'static str>,
+}
+
+impl PaperReport {
+    fn execution(&mut self, opening: bool, leg: usize) -> &mut PaperLegExecution {
+        if opening {
+            &mut self.opening_execution[leg]
+        } else {
+            &mut self.closing_execution[leg]
+        }
+    }
 }
 
 fn serialize_positions<S: serde::Serializer>(
@@ -241,7 +280,8 @@ impl FundingEvent<'_> {
 
 struct Pending {
     order: OrderIntent,
-    available_after: u64,
+    submitted_at_ms: u64,
+    submit_touch: Option<Decimal>,
 }
 
 struct Execution {
@@ -369,7 +409,7 @@ impl Runner {
                 // before their deadline. It has no exchange-side order in flight.
                 self.report.ioc_expired_without_book += 1;
                 Fill::default()
-            } else if book.timestamp_ms < pending.available_after
+            } else if book.timestamp_ms < pending.submitted_at_ms.saturating_add(self.latency)
                 || !self.planner.usable_book(frame, i)
                 || self.planner.session_end(frame).is_err()
             {
@@ -398,14 +438,15 @@ impl Runner {
                     self.planner.rules.participation,
                 )?
             };
+            let stats = self.report.execution(opening, i);
             let status = if fill.base == order.base_quantity {
-                self.report.ioc_filled += 1;
+                stats.ioc_filled += 1;
                 OrderStatus::Filled
             } else {
                 if fill.base > Decimal::ZERO {
-                    self.report.ioc_partial += 1;
+                    stats.ioc_partial += 1;
                 } else {
-                    self.report.ioc_unfilled += 1;
+                    stats.ioc_unfilled += 1;
                 }
                 OrderStatus::Canceled
             };
@@ -418,6 +459,24 @@ impl Runner {
             })?;
             if fill.base > Decimal::ZERO {
                 self.consumed[i] = Some((book.timestamp_ms, order.side));
+                let side_sign = if order.side == HedgeSide::Buy {
+                    Decimal::ONE
+                } else {
+                    -Decimal::ONE
+                };
+                stats.filled_base += fill.base;
+                stats.filled_notional_quote += fill.notional;
+                stats.max_fill_elapsed_ms =
+                    stats.max_fill_elapsed_ms.max(now - pending.submitted_at_ms);
+                let arrival_touch = book.side(order.side)[0].price;
+                stats.depth_impact_quote += side_sign * (fill.notional - fill.base * arrival_touch);
+                if let Some(touch) = pending.submit_touch {
+                    let submit_notional = fill.base * touch;
+                    stats.submit_touch_notional_quote += submit_notional;
+                    stats.slippage_quote += side_sign * (fill.notional - submit_notional);
+                } else {
+                    stats.fills_without_submit_touch += 1;
+                }
             }
             self.ledger.trade(
                 i,
@@ -440,10 +499,16 @@ impl Runner {
         }
         match execution.machine.next_action(now)? {
             HedgeAction::Submit { order } => {
-                self.report.ioc_submitted += 1;
+                let i = usize::from(order.venue == self.planner.config.legs[1].venue);
+                self.report.execution(opening, i).ioc_submitted += 1;
+                let submit_touch = self
+                    .planner
+                    .usable_book(frame, i)
+                    .then(|| frame.legs[i].book.side(order.side)[0].price);
                 execution.pending = Some(Pending {
                     order,
-                    available_after: now.saturating_add(self.latency),
+                    submitted_at_ms: now,
+                    submit_touch,
                 });
                 Ok(Advance::Working)
             }
@@ -551,6 +616,7 @@ impl Runner {
             Phase::Opening(exec) => match self.advance(exec, frame, true)? {
                 Advance::Working => {}
                 Advance::Complete => {
+                    self.report.paired_entries += 1;
                     active.base_opened = self.ledger.positions[0].abs();
                     active.opened_at = frame.now_ms;
                     active.phase = Phase::Holding;
@@ -567,6 +633,7 @@ impl Runner {
                         && a + self.ledger.positions[1] == Decimal::ZERO
                         && a.abs() % self.planner.step == Decimal::ZERO
                     {
+                        self.report.paired_entries += 1;
                         active.base_opened = a.abs();
                         active.opened_at = frame.now_ms;
                         active.phase = Phase::Holding;
@@ -755,6 +822,13 @@ impl Runner {
             self.report.frames += 1;
             ensure!(self.report.frames <= MAX_FRAMES, "too many paper frames");
             let sample = self.planner.sample(frame)?;
+            if matches!(sample, Ok(_) | Err(Rejection::Warmup)) {
+                self.report.basis_samples += 1;
+                self.report.max_basis_samples = self
+                    .report
+                    .max_basis_samples
+                    .max(self.planner.basis.samples);
+            }
             self.ledger.book_funding(
                 frame,
                 previous,
@@ -766,13 +840,17 @@ impl Runner {
                 self.report.training_frames += 1;
                 continue;
             }
+            self.report.holdout_basis_ready_frames += usize::from(sample.is_ok());
             if let Some(mut active) = self.active.take() {
                 if !self.advance_active(&mut active, frame)? {
                     self.active = Some(active);
                 }
             } else {
                 match sample.and_then(|(signal, cutoff)| self.planner.plan(frame, signal, cutoff)) {
-                    Ok(plan) => self.start(plan, frame)?,
+                    Ok(plan) => {
+                        self.report.entry_signals += 1;
+                        self.start(plan, frame)?;
+                    }
                     Err(reason) => *self.report.rejected.entry(reason).or_default() += 1,
                 }
             }
@@ -788,6 +866,17 @@ impl Runner {
         self.report.funding = self.ledger.funding;
         self.report.funding_upper_bound = self.ledger.funding_upper;
         self.report.witnessed_funding_payments = self.ledger.witnessed_funding_payments;
+        for stats in self
+            .report
+            .opening_execution
+            .iter()
+            .chain(&self.report.closing_execution)
+        {
+            self.report.ioc_submitted += stats.ioc_submitted;
+            self.report.ioc_filled += stats.ioc_filled;
+            self.report.ioc_partial += stats.ioc_partial;
+            self.report.ioc_unfilled += stats.ioc_unfilled;
+        }
         if let Some(active) = self.active {
             self.report.open_phase = Some(active.phase.label());
             self.report.active_plan = Some(active.plan);

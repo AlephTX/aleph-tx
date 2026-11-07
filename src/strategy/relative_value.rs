@@ -2,7 +2,10 @@
 //! The planner emits bounded IOC intents for research. No transport runs here.
 
 mod paper;
-pub use paper::{ExitReason, PaperReport, PaperScenario, PaperTrade, run_paper, run_paper_frames};
+pub use paper::{
+    ExitReason, PaperLegExecution, PaperReport, PaperScenario, PaperTrade, run_paper,
+    run_paper_frames,
+};
 
 use crate::{
     hedging::{HedgePlan, HedgeSide, LegSpec, common_quantity_step, floor_step},
@@ -362,8 +365,10 @@ pub enum Rejection {
     Book,
     #[error("equity session is closed, halted, or too short for the hold and unwind")]
     Session,
-    #[error("oracle is stale, non-external, or diverges from the common reference")]
+    #[error("oracle is invalid, non-external, or diverges from the common reference")]
     Oracle,
+    #[error("an external oracle is temporarily unavailable or stale")]
+    OracleStale,
     #[error("paired sample did not advance")]
     SampleCadence,
     #[error("basis estimator has insufficient prior observations")]
@@ -440,6 +445,25 @@ fn fresh(timestamp: u64, now: u64, age: u64) -> bool {
     timestamp > 0 && now.checked_sub(timestamp).is_some_and(|delta| delta <= age)
 }
 
+fn invalid_oracle_mode(oracle: Oracle) -> Rejection {
+    if oracle.timestamp_ms == 0 && oracle.price.is_zero() {
+        Rejection::OracleStale
+    } else {
+        Rejection::Oracle
+    }
+}
+
+fn oracle_deadline_ms(oracle: Oracle, now: u64, earliest: u64, max_age: u64) -> Decision<u64> {
+    if !price(oracle.price) || oracle.timestamp_ms == 0 || oracle.timestamp_ms > now {
+        return Err(invalid_oracle_mode(oracle));
+    }
+    let expiry = oracle.timestamp_ms.saturating_add(max_age);
+    if oracle.timestamp_ms < earliest || now > expiry {
+        return Err(Rejection::OracleStale);
+    }
+    Ok(expiry)
+}
+
 impl PairConfig {
     pub(crate) fn usable_reference(
         &self,
@@ -447,6 +471,15 @@ impl PairConfig {
         session: Option<EquitySession>,
         now: u64,
     ) -> bool {
+        self.reference_deadline_ms(reference, session, now).is_ok()
+    }
+
+    fn reference_deadline_ms(
+        &self,
+        reference: Oracle,
+        session: Option<EquitySession>,
+        now: u64,
+    ) -> Decision<u64> {
         let (max_age, earliest) = match reference.mode {
             OracleMode::LiveExternal => (
                 self.oracle_max_age_ms,
@@ -455,18 +488,16 @@ impl PairConfig {
             OracleMode::EquityMinuteClose => {
                 let (Some(age), Some(session)) = (self.equity_minute_reference_max_age_ms, session)
                 else {
-                    return false;
+                    return Err(Rejection::Oracle);
                 };
                 if !reference.timestamp_ms.is_multiple_of(EQUITY_MINUTE_MS) {
-                    return false;
+                    return Err(Rejection::Oracle);
                 }
                 (age, session.opens_at_ms.saturating_add(EQUITY_MINUTE_MS))
             }
-            _ => return false,
+            _ => return Err(invalid_oracle_mode(reference)),
         };
-        price(reference.price)
-            && reference.timestamp_ms >= earliest
-            && fresh(reference.timestamp_ms, now, max_age)
+        oracle_deadline_ms(reference, now, earliest, max_age)
     }
 
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
@@ -854,27 +885,24 @@ impl RelativeValue {
     }
 
     fn basis_bps(&self, frame: &Frame) -> Decision<f64> {
-        let valid = |oracle: Oracle| {
-            price(oracle.price)
-                && oracle.mode == OracleMode::LiveExternal
-                && frame
-                    .equity_session
-                    .is_none_or(|session| oracle.timestamp_ms >= session.opens_at_ms)
-                && fresh(
-                    oracle.timestamp_ms,
-                    frame.now_ms,
-                    self.config.oracle_max_age_ms,
-                )
-        };
-        if !self
-            .config
-            .usable_reference(frame.reference, frame.equity_session, frame.now_ms)
-            || frame.legs.iter().any(|leg| {
-                !valid(leg.oracle)
-                    || !self.within_reference(leg.oracle.price, frame.reference.price)
-            })
-        {
-            return Err(Rejection::Oracle);
+        self.config
+            .reference_deadline_ms(frame.reference, frame.equity_session, frame.now_ms)?;
+        let earliest = frame
+            .equity_session
+            .map_or(0, |session| session.opens_at_ms);
+        for leg in &frame.legs {
+            if leg.oracle.mode != OracleMode::LiveExternal {
+                return Err(invalid_oracle_mode(leg.oracle));
+            }
+            oracle_deadline_ms(
+                leg.oracle,
+                frame.now_ms,
+                earliest,
+                self.config.oracle_max_age_ms,
+            )?;
+            if !self.within_reference(leg.oracle.price, frame.reference.price) {
+                return Err(Rejection::Oracle);
+            }
         }
         // Reject incoherent books instead of training the model on dislocations
         // caused by unit, contract or oracle mismatches.
@@ -922,8 +950,8 @@ impl RelativeValue {
         }
         self.last_frame_ms = frame.now_ms;
         let result = self.observe_inner(frame, times);
-        // A short gap between venue publications is common. The next usable
-        // sample enforces max_sample_gap_ms without training on rejected data.
+        // Short gaps in valid books or external updates do not train the model.
+        // The next usable sample enforces the configured maximum gap.
         if regressed || matches!(result, Err(Rejection::Session | Rejection::Oracle)) {
             self.basis = BasisModel::default();
         }
@@ -931,10 +959,10 @@ impl RelativeValue {
     }
 
     fn observe_inner(&mut self, frame: &Frame, times: [u64; 2]) -> Decision<(BasisSignal, u64)> {
+        let cutoff = self.cutoff(frame)?;
         if !self.usable_books(frame) {
             return Err(Rejection::Book);
         }
-        let cutoff = self.cutoff(frame)?;
         let basis = self.basis_bps(frame)?;
         let signal = self.basis.update(
             &self.config.basis,
@@ -958,10 +986,8 @@ impl RelativeValue {
             return Err(Rejection::Session);
         }
         let inputs_expire = frame.legs.iter().fold(
-            frame
-                .reference
-                .timestamp_ms
-                .saturating_add(self.config.oracle_max_age_ms),
+            self.config
+                .reference_deadline_ms(frame.reference, frame.equity_session, now)?,
             |time, leg| {
                 time.min(
                     leg.book

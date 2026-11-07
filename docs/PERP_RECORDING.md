@@ -304,3 +304,45 @@ books and oracle coverage limited estimator warmup in the equity holdouts.
 Contract equivalence and fees retain the replay configurations' research
 assumptions. The local `recordings/2026-11-07-rwa/manifest.json` preserves
 the chart and session sources, clock replies, configurations and reports.
+
+## Longer RWA capture and execution checks
+
+Choose the recording window from the reviewed underlying session. For an
+hourly funding schedule, a 57-minute window from 10:01 to 10:58 New York time
+fits between payments. Keep a fixed training cutoff and apply it through
+`trade_from_ms`. The example below records the two equity markets with
+independent per-market REST polling and the five-level WebSocket feed.
+
+```sh
+feeder/perp-capture -lighter 110,112 -lighter-clock-refresh 4m \
+  -hyperliquid xyz:NVDA,xyz:TSLA -hl-fast-book -hl-snapshot-interval 1s \
+  -duration 57m -output recordings/equity-session.ndjson
+```
+
+Use `hyperliquid_book_mode: "freshest"` on the Hyperliquid leg. An accepted
+WebSocket book contributes its five displayed levels and a REST book
+contributes the levels in that snapshot. The recorder polls the two REST
+books concurrently. On Lighter, use a calibration lifetime longer than the
+refresh interval. Each planned reconnect is counted in
+`lighter_clock_refreshes` and invalidates the previous book and calibration
+until new subscription evidence arrives. A 125-second transport check on
+both equity markets received five-level WebSocket books about every 539 ms
+at the median. Four scheduled Lighter refreshes yielded new clock evidence.
+[Hyperliquid subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
+
+The estimator skips samples with temporarily stale external oracles. It
+resets after a gap beyond `basis.max_sample_gap_ms`, a session interruption,
+an oracle mismatch or a regressed book. A 15-second sample gap policy on the
+previous regular-session recording raised the longest uninterrupted sample
+sequence from 2 to 23 for NVDA and from 2 to 22 for TSLA. The holdout reached
+one basis-ready frame on NVDA and submitted zero paper orders on both names.
+
+`holdout_basis_ready_frames` counts scored observations after training.
+`entry_signals` counts executable plans evaluated while the runner is flat.
+`paired_entries` counts balanced opens, including partial opens retained at a
+valid close lot. The opening and closing execution arrays follow the pair's
+leg order. Slippage is the signed cost against the same-side touch at IOC
+submission. Depth impact uses the touch of the later book that simulated
+the fill. The report records fills without a valid submission touch
+separately. Unhedged size, duration and any halt remain visible beside the
+fill counts.
