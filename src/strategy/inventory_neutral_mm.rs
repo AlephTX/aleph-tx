@@ -339,6 +339,7 @@ pub struct InventoryNeutralMM {
 
     // Telemetry
     telemetry: TelemetryCollector,
+    telemetry_sink: Option<crate::telemetry_sink::TelemetrySink>,
 
     // Runtime Control
     is_running: Arc<AtomicBool>,
@@ -418,6 +419,7 @@ impl InventoryNeutralMM {
             inventory_age: InventoryAge::default(),
             position_confirmation_after_ns: None,
             telemetry: TelemetryCollector::new(),
+            telemetry_sink: None,
             is_running: Arc::new(AtomicBool::new(true)),
             shm_reader,
         }
@@ -425,6 +427,12 @@ impl InventoryNeutralMM {
 
     pub fn with_inventory_hedge(mut self, hedge: LiveInventoryHedge) -> Self {
         self.hedge = Some(hedge);
+        self
+    }
+
+    /// Export structured snapshots for remote monitoring.
+    pub fn with_telemetry_sink(mut self, sink: crate::telemetry_sink::TelemetrySink) -> Self {
+        self.telemetry_sink = Some(sink);
         self
     }
 
@@ -956,6 +964,9 @@ impl InventoryNeutralMM {
         if let Some(hedge) = &mut self.hedge {
             hedge.finish().await?;
         }
+        if let Some(sink) = &self.telemetry_sink {
+            sink.stopped();
+        }
         info!("👋 Strategy stopped cleanly.");
         Ok(())
     }
@@ -1069,6 +1080,34 @@ impl InventoryNeutralMM {
         }
 
         None
+    }
+
+    fn export_snapshot(&self, mid: f64, quote_position: f64) {
+        let Some(sink) = &self.telemetry_sink else {
+            return;
+        };
+        let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
+        sink.snapshot(crate::telemetry_sink::StrategySnapshot {
+            equity: self.account_stats.portfolio_value,
+            session_start_equity: self.session_start_balance,
+            available_balance: self.account_stats.available_balance,
+            margin_usage: self.account_stats.margin_usage,
+            exchange_position: self.account_stats.position,
+            quote_position,
+            confirmed_position: self.order_tracker.confirmed_position(),
+            pending_exposure: self.order_tracker.net_pending_exposure(),
+            worst_case_long: self.order_tracker.worst_case_long(),
+            worst_case_short: self.order_tracker.worst_case_short(),
+            mid,
+            spread_bps: self.telemetry.spread_size_bps,
+            adverse_selection: self.telemetry.adverse_selection_score,
+            trade_cash_flow: self.order_tracker.trade_cash_flow(),
+            total_fees,
+            fill_count,
+            orders_placed: self.total_orders_placed,
+            orders_rejected: self.telemetry.orders_rejected,
+            active_orders: self.order_tracker.active_order_count() as u32,
+        });
     }
 
     fn print_pnl_update(&self) {
@@ -1257,6 +1296,7 @@ impl InventoryNeutralMM {
             );
             self.telemetry.export_metrics();
             self.print_pnl_update();
+            self.export_snapshot(risk_mid, risk.position_for_quoting);
             self.last_balance_check = Instant::now();
         }
     }

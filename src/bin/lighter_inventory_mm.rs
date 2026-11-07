@@ -12,6 +12,7 @@ use aleph_tx::shm_depth_reader::ShmDepthReader;
 use aleph_tx::shm_event_reader::ShmEventReaderV2;
 use aleph_tx::shm_reader::ShmReader;
 use aleph_tx::strategy::inventory_neutral_mm::InventoryNeutralMM;
+use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
 use aleph_tx::types::events::EventType;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -40,6 +41,7 @@ async fn connect_strategy(
     mut trading: LighterTrading,
     network: Network,
     ipc: &Path,
+    telemetry: Option<TelemetrySink>,
 ) -> Result<(InventoryNeutralMM, Arc<LighterTrading>)> {
     let events = ipc.join("aleph-events-v2");
     let market = ipc.join("aleph-matrix");
@@ -62,6 +64,7 @@ async fn connect_strategy(
     event_reader.skip_to_end();
     let tracker = Arc::new(OrderTracker::new());
     let event_tracker = Arc::clone(&tracker);
+    let event_sink = telemetry.clone();
     let (exchange_id, symbol_id) = (config.exchange_id, config.symbol_id);
     tokio::spawn(async move {
         loop {
@@ -82,6 +85,9 @@ async fn connect_strategy(
                         "Private event market does not match the strategy"
                     );
                     continue;
+                }
+                if let Some(sink) = &event_sink {
+                    sink.order_event(&event);
                 }
                 if let Err(error) = event_tracker.apply_event(&event) {
                     // apply_event already marks the reconciliation epoch.
@@ -107,6 +113,9 @@ async fn connect_strategy(
         account_reader,
         depth_reader,
     );
+    if let Some(sink) = telemetry {
+        strategy = strategy.with_telemetry_sink(sink);
+    }
     if network == Network::Testnet {
         // Testnet matching engines can have unrelated price levels.
         strategy.use_local_fair_value();
@@ -181,10 +190,20 @@ async fn run_existing_feeder() -> Result<()> {
         tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
         let _ = stop.send(true);
     });
+    let account = credentials.account_index();
     let trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
     trading.validate_symbol(symbol_name(config.symbol_id))?;
     trading.validate_precision(config.tick_size, config.step_size)?;
+    let telemetry = TelemetrySink::from_env(&SessionInfo {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        network: format!("{network:?}"),
+        exchange: "lighter".into(),
+        symbol: symbol_name(config.symbol_id).into(),
+        market_id: config.market_id as u64,
+        account,
+        hedge_account: None,
+    });
     let (mut strategy, _) =
-        connect_strategy(config, trading, network, Path::new("/dev/shm")).await?;
+        connect_strategy(config, trading, network, Path::new("/dev/shm"), telemetry).await?;
     strategy.run(Some(shutdown)).await
 }

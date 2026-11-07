@@ -2,6 +2,7 @@ use aleph_tx::config::{AppConfig, EXCH_LIGHTER, InventoryNeutralMMConfig, symbol
 use aleph_tx::exchanges::hyperliquid::{HyperliquidSigner, Network, validate_hex};
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::live_hedge::{HedgeLimits, LiveInventoryHedge};
+use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -413,8 +414,23 @@ pub(super) async fn launch(
                 hedge.as_ref().map(|setup| setup.account.as_str()),
                 symbol,
             )?;
-            let (mut strategy, trading) =
-                super::connect_strategy(profile.strategy, trading, network, &session.ipc).await?;
+            let telemetry = TelemetrySink::from_env(&SessionInfo {
+                session_id: session.id.to_string(),
+                network: format!("{network:?}"),
+                exchange: "lighter".into(),
+                symbol: symbol.into(),
+                market_id: profile.strategy.market_id as u64,
+                account,
+                hedge_account: hedge.as_ref().map(|setup| setup.account.clone()),
+            });
+            let (mut strategy, trading) = super::connect_strategy(
+                profile.strategy,
+                trading,
+                network,
+                &session.ipc,
+                telemetry,
+            )
+            .await?;
             if let Some(setup) = hedge {
                 strategy = strategy.with_inventory_hedge(
                     LiveInventoryHedge::connect(

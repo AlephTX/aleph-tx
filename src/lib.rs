@@ -15,6 +15,7 @@ pub mod shm_event_reader;
 pub mod shm_reader;
 pub mod strategy;
 pub mod telemetry;
+pub mod telemetry_sink;
 pub mod types;
 pub mod venues;
 
