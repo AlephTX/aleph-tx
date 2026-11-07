@@ -1,4 +1,4 @@
-use super::{HyperliquidBookMode, LegConfig};
+use super::{HyperliquidBookMode, LegConfig, LighterClockAudit};
 use crate::strategy::relative_value::{Book, Level, MarketTerms, Oracle, OracleMode};
 use anyhow::{Context, Result, ensure};
 use rust_decimal::Decimal;
@@ -13,6 +13,7 @@ pub(super) enum Change {
     Book,
     Gap,
     Clock(u64),
+    ClockUnavailable,
     Other,
 }
 
@@ -32,6 +33,7 @@ pub(super) struct LegFeed {
     book_from_snapshot: bool,
     latest_hyperliquid_book_ms: u64,
     context: Option<ContextTick>,
+    lighter_clock: LighterClockAudit,
 }
 
 impl LegFeed {
@@ -44,6 +46,7 @@ impl LegFeed {
             book_from_snapshot: false,
             latest_hyperliquid_book_ms: 0,
             context: None,
+            lighter_clock: LighterClockAudit::default(),
         }
     }
 
@@ -66,6 +69,7 @@ impl LegFeed {
                 self.depth = LighterDepth::default();
                 self.book = None;
                 self.context = None;
+                self.lighter_clock = LighterClockAudit::default();
             }
             "hyperliquid_snapshot" => self.invalidate_hyperliquid_book(true),
             _ => {
@@ -89,15 +93,31 @@ impl LegFeed {
         self.context
     }
 
-    pub fn apply(&mut self, payload: &Value, received: u64, source: &str) -> Result<Change> {
+    pub fn clock_audit(&self) -> Option<LighterClockAudit> {
+        self.config.lighter_clock.map(|_| self.lighter_clock)
+    }
+
+    pub fn apply(
+        &mut self,
+        payload: &Value,
+        received: u64,
+        request_sent: Option<u64>,
+        source: &str,
+    ) -> Result<Change> {
         if let Some(id) = self.config.lighter_market_id {
-            self.apply_lighter(payload, received, id)
+            self.apply_lighter(payload, received, request_sent, id)
         } else {
             self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot")
         }
     }
 
-    fn apply_lighter(&mut self, payload: &Value, received: u64, market_id: u16) -> Result<Change> {
+    fn apply_lighter(
+        &mut self,
+        payload: &Value,
+        received: u64,
+        request_sent: Option<u64>,
+        market_id: u16,
+    ) -> Result<Change> {
         let channel = payload["channel"].as_str().unwrap_or_default();
         if channel
             .split_once(':')
@@ -107,18 +127,43 @@ impl LegFeed {
         {
             return Ok(Change::Other);
         }
-        match payload["type"].as_str().unwrap_or_default() {
+        let kind = payload["type"].as_str().unwrap_or_default();
+        if let (Some(policy), Some(sent)) = (self.config.lighter_clock, request_sent)
+            && matches!(kind, "subscribed/order_book" | "subscribed/market_stats")
+        {
+            let published = payload["timestamp"]
+                .as_u64()
+                .context("missing Lighter subscription time")?;
+            self.lighter_clock
+                .observe(policy, sent, received, published);
+            if self.lighter_clock.conflicting {
+                self.book = None;
+                self.context = None;
+            }
+        }
+        match kind {
             "subscribed/order_book" | "update/order_book" => {
                 let snapshot = payload["type"] == "subscribed/order_book";
                 let update = LighterUpdate::deserialize(&payload["order_book"])?;
                 let raw_time = update.last_updated_at / 1_000;
                 ensure!(raw_time > 0, "missing Lighter book source time");
+                let checked_time = if self.config.lighter_clock.is_some() {
+                    payload["timestamp"]
+                        .as_u64()
+                        .filter(|published| raw_time <= *published)
+                        .context("Lighter book commit exceeds or lacks publication time")?
+                } else {
+                    raw_time
+                };
                 let change = self.depth.apply(update, raw_time, snapshot)?;
                 match change {
                     Change::Book => {
-                        let Some(time) = self.source_time(raw_time, received) else {
-                            self.book = None;
-                            return Ok(Change::Clock(raw_time.saturating_sub(received)));
+                        let time = match self.lighter_time(raw_time, checked_time, received) {
+                            Ok(time) => time,
+                            Err(change) => {
+                                self.book = None;
+                                return Ok(change);
+                            }
                         };
                         let [bids, asks] = self.depth.levels();
                         self.set_book(time, bids, asks);
@@ -146,9 +191,12 @@ impl LegFeed {
                 let raw_time = payload["timestamp"]
                     .as_u64()
                     .context("missing Lighter context time")?;
-                let Some(time) = self.source_time(raw_time, received) else {
-                    self.context = None;
-                    return Ok(Change::Clock(raw_time.saturating_sub(received)));
+                let time = match self.lighter_time(raw_time, raw_time, received) {
+                    Ok(time) => time,
+                    Err(change) => {
+                        self.context = None;
+                        return Ok(change);
+                    }
                 };
                 self.set_context(
                     time,
@@ -229,7 +277,29 @@ impl LegFeed {
     }
 
     fn source_time(&self, raw: u64, received: u64) -> Option<u64> {
-        let earliest = raw.checked_sub(self.config.source_clock_ahead_bound_ms)?;
+        Self::adjusted_time(raw, received, self.config.source_clock_ahead_bound_ms)
+    }
+
+    fn lighter_time(
+        &self,
+        raw: u64,
+        checked_time: u64,
+        received: u64,
+    ) -> std::result::Result<u64, Change> {
+        let correction = match self.config.lighter_clock {
+            Some(policy) => self
+                .lighter_clock
+                .correction(policy, received)
+                .ok_or(Change::ClockUnavailable)?,
+            None => self.config.source_clock_ahead_bound_ms,
+        };
+        Self::adjusted_time(checked_time, received, correction)
+            .and_then(|_| raw.checked_sub(correction).filter(|time| *time > 0))
+            .ok_or_else(|| Change::Clock(checked_time.saturating_sub(received)))
+    }
+
+    fn adjusted_time(raw: u64, received: u64, correction: u64) -> Option<u64> {
+        let earliest = raw.checked_sub(correction)?;
         (earliest > 0 && earliest <= received).then_some(earliest)
     }
 

@@ -1,17 +1,19 @@
 //! Compile public market recordings into causal paper replay frames.
 
+mod clock;
 mod feeds;
 mod timing;
 
 use crate::{
     strategy::relative_value::{
-        AssetClass, Book, EquitySession, Frame, FundingForecast, FundingPoint, FundingSettlement,
-        MarketFrame, Oracle, OracleMode, PairConfig, RelativeValue, WitnessedSettlement,
-        validate_funding_guard,
+        AssetClass, Book, EQUITY_MINUTE_MS, EquitySession, Frame, FundingForecast, FundingPoint,
+        FundingSettlement, MarketFrame, Oracle, OracleMode, PairConfig, RelativeValue,
+        WitnessedSettlement, validate_funding_guard,
     },
     venues::VenueRegistry,
 };
 use anyhow::{Context, Result, ensure};
+pub use clock::{LighterClockAudit, LighterClockPolicy};
 use feeds::{ContextTick, LegFeed};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -61,6 +63,7 @@ pub struct LegConfig {
     /// leads the recorder. Subtract it from every source publication time.
     #[serde(default)]
     pub source_clock_ahead_bound_ms: u64,
+    pub lighter_clock: Option<LighterClockPolicy>,
     pub funding: Option<FundingRule>,
 }
 
@@ -101,7 +104,20 @@ pub enum ReferenceFeed {
     External {
         observations: Vec<ReferenceObservation>,
     },
+    EquityMinuteBars {
+        underlying_id: String,
+        publication_delay_ms: u64,
+        bars: Vec<EquityMinuteBar>,
+    },
     Missing,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EquityMinuteBar {
+    pub ends_at_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub close: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +134,7 @@ pub struct Record {
     event: String,
     received_at_ms: u64,
     available_at_ms: u64,
+    request_sent_at_ms: Option<u64>,
     payload: Option<serde_json::Value>,
 }
 
@@ -136,6 +153,8 @@ pub struct Coverage {
     pub fresh_book_skew_ms: TimingSummary,
     pub rejected_publications: [usize; 2],
     pub clock_rejections: [usize; 2],
+    pub clock_unavailable: [usize; 2],
+    pub lighter_clock: [Option<LighterClockAudit>; 2],
     pub max_rejected_clock_lead_ms: [u64; 2],
     pub lighter_nonce_gaps: [usize; 2],
     pub fresh_book_pair_frames: usize,
@@ -212,6 +231,11 @@ impl CaptureConfig {
             );
             ensure!(
                 leg.source_clock_ahead_bound_ms <= 1_000
+                    && leg.lighter_clock.is_none_or(|policy| {
+                        leg.lighter_market_id.is_some()
+                            && leg.source_clock_ahead_bound_ms == 0
+                            && policy.valid()
+                    })
                     && (!(leg.use_hyperliquid_snapshots || leg.hyperliquid_book_mode.is_some())
                         || venue.hyperliquid_dex.is_some())
                     && !(leg.use_hyperliquid_snapshots && leg.hyperliquid_book_mode.is_some()),
@@ -272,15 +296,40 @@ impl CaptureConfig {
                     .all(|w| w[0].available_at_ms < w[1].available_at_ms)
                     && observations.iter().all(|o| o.oracle.timestamp_ms > 0
                         && o.oracle.timestamp_ms <= o.available_at_ms
-                        && o.oracle.price > Decimal::ZERO),
+                        && o.oracle.price > Decimal::ZERO
+                        && o.oracle.mode != OracleMode::EquityMinuteClose),
                 "invalid external reference observations"
+            ),
+            ReferenceFeed::EquityMinuteBars {
+                underlying_id,
+                publication_delay_ms,
+                bars,
+            } => ensure!(
+                self.pair.asset_class == AssetClass::Equity
+                    && *underlying_id == self.pair.legs[0].underlying_id
+                    && (1..=EQUITY_MINUTE_MS).contains(publication_delay_ms)
+                    && self
+                        .pair
+                        .equity_minute_reference_max_age_ms
+                        .is_some_and(|age| age >= *publication_delay_ms)
+                    && !bars.is_empty()
+                    && bars.windows(2).all(|w| w[0].ends_at_ms < w[1].ends_at_ms)
+                    && bars.iter().all(|bar| bar.ends_at_ms >= EQUITY_MINUTE_MS
+                        && bar.ends_at_ms.is_multiple_of(EQUITY_MINUTE_MS)
+                        && bar.ends_at_ms.checked_add(*publication_delay_ms).is_some()
+                        && bar.close > Decimal::ZERO),
+                "invalid equity minute reference, underlying or publication policy"
             ),
             ReferenceFeed::Missing => {}
         }
         if self.paper_entries && self.pair.asset_class == AssetClass::Equity {
+            let has_reference = match &self.reference {
+                ReferenceFeed::External { observations } => !observations.is_empty(),
+                ReferenceFeed::EquityMinuteBars { .. } => true,
+                _ => false,
+            };
             ensure!(
-                matches!(&self.reference, ReferenceFeed::External { observations } if !observations.is_empty())
-                    && !self.equity_sessions.is_empty(),
+                has_reference && !self.equity_sessions.is_empty(),
                 "equity paper entries require external reference and session data"
             );
         }
@@ -357,7 +406,12 @@ impl<'a> Compiler<'a> {
                         if !leg.accepts(&row.source) {
                             continue;
                         }
-                        match leg.apply(&payload, row.received_at_ms, &row.source) {
+                        match leg.apply(
+                            &payload,
+                            row.received_at_ms,
+                            row.request_sent_at_ms,
+                            &row.source,
+                        ) {
                             Ok(feeds::Change::Book) => {
                                 self.coverage.leg_book_updates[i] += 1;
                                 self.coverage.leg_snapshot_updates[i] +=
@@ -372,6 +426,9 @@ impl<'a> Compiler<'a> {
                                 self.coverage.clock_rejections[i] += 1;
                                 self.coverage.max_rejected_clock_lead_ms[i] =
                                     self.coverage.max_rejected_clock_lead_ms[i].max(ahead);
+                            }
+                            Ok(feeds::Change::ClockUnavailable) => {
+                                self.coverage.clock_unavailable[i] += 1;
                             }
                             Ok(feeds::Change::Other) => {}
                             Err(_) => {
@@ -404,6 +461,20 @@ impl<'a> Compiler<'a> {
                 .get(..observations.partition_point(|o| o.available_at_ms <= now))
                 .and_then(|slice| slice.last())
                 .map(|o| o.oracle),
+            ReferenceFeed::EquityMinuteBars {
+                publication_delay_ms,
+                bars,
+                ..
+            } => {
+                let visible_end = now.saturating_sub(*publication_delay_ms);
+                bars.get(..bars.partition_point(|bar| bar.ends_at_ms <= visible_end))
+                    .and_then(|slice| slice.last())
+                    .map(|bar| Oracle {
+                        price: bar.close,
+                        timestamp_ms: bar.ends_at_ms,
+                        mode: OracleMode::EquityMinuteClose,
+                    })
+            }
             ReferenceFeed::Missing => None,
         }
         .unwrap_or_else(missing_oracle);
@@ -528,7 +599,7 @@ impl<'a> Compiler<'a> {
             oracle.mode == OracleMode::LiveExternal
                 && fresh(oracle.timestamp_ms, now, pair.oracle_max_age_ms)
         };
-        let reference = is_reference(frame.reference);
+        let reference = pair.usable_reference(frame.reference, frame.equity_session, now);
         let oracles = frame.legs.iter().all(|leg| is_reference(leg.oracle));
         let session = frame.equity_session.is_some_and(|s| {
             !s.halted && now >= s.opens_at_ms && now < s.closes_at_ms.min(s.clear_until_ms)
@@ -582,7 +653,15 @@ pub fn compile(
         ensure!(!ended, "data after capture footer");
         let now = row.available_at_ms;
         ensure!(
-            row.received_at_ms > 0 && now >= row.received_at_ms && now >= group,
+            row.received_at_ms > 0
+                && now >= row.received_at_ms
+                && now >= group
+                && row.request_sent_at_ms.is_none_or(|sent| {
+                    row.source == "lighter"
+                        && row.event == "message"
+                        && sent > 0
+                        && sent <= row.received_at_ms
+                }),
             "invalid capture arrival order"
         );
         compiler.coverage.records += 1;
@@ -605,6 +684,7 @@ pub fn compile(
     compiler.coverage.book_age_at_availability_ms =
         compiler.book_availability.map(TimingHistogram::summarize);
     compiler.coverage.fresh_book_skew_ms = compiler.fresh_book_skew.summarize();
+    compiler.coverage.lighter_clock = compiler.legs.each_ref().map(LegFeed::clock_audit);
     Ok(compiler.coverage)
 }
 

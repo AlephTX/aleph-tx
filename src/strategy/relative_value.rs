@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const MAX_VALUE: Decimal = Decimal::from_parts(1_000_000_000, 0, 0, false, 0);
 const DAY_MS: u64 = 86_400_000;
+pub(crate) const EQUITY_MINUTE_MS: u64 = 60_000;
 const MAX_LEVELS: usize = 20;
 const MAX_FUNDING_POINTS: usize = 1024;
 const MIN_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 12);
@@ -50,6 +51,9 @@ pub struct PairConfig {
     /// Time allowed for both legs to fill. Also reserved for the close.
     pub execution_window_ms: u64,
     pub oracle_max_age_ms: u64,
+    /// Explicit paper research policy for completed underlying equity bars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equity_minute_reference_max_age_ms: Option<u64>,
     pub max_oracle_deviation_bps: f64,
     pub equity_close_buffer_ms: u64,
     /// Max distance from the touch, including the protective limit buffer.
@@ -178,6 +182,7 @@ pub enum OracleMode {
     LiveExternal,
     Internal,
     LastClose,
+    EquityMinuteClose,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -436,6 +441,34 @@ fn fresh(timestamp: u64, now: u64, age: u64) -> bool {
 }
 
 impl PairConfig {
+    pub(crate) fn usable_reference(
+        &self,
+        reference: Oracle,
+        session: Option<EquitySession>,
+        now: u64,
+    ) -> bool {
+        let (max_age, earliest) = match reference.mode {
+            OracleMode::LiveExternal => (
+                self.oracle_max_age_ms,
+                session.map_or(0, |session| session.opens_at_ms),
+            ),
+            OracleMode::EquityMinuteClose => {
+                let (Some(age), Some(session)) = (self.equity_minute_reference_max_age_ms, session)
+                else {
+                    return false;
+                };
+                if !reference.timestamp_ms.is_multiple_of(EQUITY_MINUTE_MS) {
+                    return false;
+                }
+                (age, session.opens_at_ms.saturating_add(EQUITY_MINUTE_MS))
+            }
+            _ => return false,
+        };
+        price(reference.price)
+            && reference.timestamp_ms >= earliest
+            && fresh(reference.timestamp_ms, now, max_age)
+    }
+
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
         self.planner.validate()?;
         ensure!(
@@ -450,6 +483,10 @@ impl PairConfig {
             (1..=DAY_MS).contains(&self.execution_window_ms)
                 && self.execution_window_ms < self.planner.funding_horizon_ms
                 && (1..=DAY_MS).contains(&self.oracle_max_age_ms)
+                && self.equity_minute_reference_max_age_ms.is_none_or(|age| {
+                    self.asset_class == AssetClass::Equity
+                        && (1..=3 * EQUITY_MINUTE_MS).contains(&age)
+                })
                 && self.equity_close_buffer_ms <= DAY_MS
                 && (self.asset_class == AssetClass::Crypto || self.equity_close_buffer_ms > 0)
                 && finite_between(self.max_oracle_deviation_bps, 0.01, 1_000.0)
@@ -829,7 +866,9 @@ impl RelativeValue {
                     self.config.oracle_max_age_ms,
                 )
         };
-        if !valid(frame.reference)
+        if !self
+            .config
+            .usable_reference(frame.reference, frame.equity_session, frame.now_ms)
             || frame.legs.iter().any(|leg| {
                 !valid(leg.oracle)
                     || !self.within_reference(leg.oracle.price, frame.reference.price)

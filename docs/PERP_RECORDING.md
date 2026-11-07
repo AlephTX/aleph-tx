@@ -71,6 +71,72 @@ target/release/cross_venue perp-compile examples/nvda_capture.json \
   availability time of each calendar or halt update and the checked company
   action window. A later publication cannot refresh an earlier frame.
 
+## Lighter subscription clock evidence
+
+New Lighter recordings include `request_sent_at_ms` on matched subscription
+replies. With local send time `s`, receipt time `r`, and the venue publication
+time `p`, the publication clock offset lies between `p - r` and `p - s`,
+assuming the reply is stamped after the matching request. The compiler
+expands each interval for millisecond precision and `drift_margin_ms`, then
+intersects the eligible intervals for that leg and connection. It subtracts
+the positive upper bound from the venue timestamp. The policy applies only
+after the evidence arrives and expires after `valid_for_ms`. Missing or
+conflicting evidence makes that leg unavailable, and disconnects reset it.
+
+Set `legs[i].lighter_clock` on a Lighter leg to opt in. The measured run used
+`{"max_rtt_ms":750,"valid_for_ms":360000,"drift_margin_ms":10}`. The compiler
+checks that the committer stamp precedes the publication stamp and retains
+that observed lag when shifting the book. This uses the assumption that the
+publication clock bound also covers the committer clock. The request bounds
+the publication clock directly. Older recordings without the probe field can
+still use the strict clock policy or an explicit sensitivity bound.
+[Lighter timestamp update](https://t.me/s/lighter_api_updates?before=119)
+
+## Archived equity reference and sessions
+
+For paper research, `scripts/prepare_equity_replay.py` attaches an archived
+Nasdaq intraday chart and a reviewed session to a capture configuration.
+It checks the equity and date, converts the chart's New York wall times to
+UTC, and filters the regular session. Supply the open and close for the
+specific day, including any early close, and review the Nasdaq holiday,
+halt, dividend and split records for the proposed coverage window.
+[Nasdaq market hours](https://www.nasdaqtrader.com/content/technicalsupport/nasdaq_sys_hours.pdf),
+[trading calendar](https://nasdaqtrader.com/Trader.aspx?id=Calendar),
+[halt RSS](https://www.nasdaqtrader.com/Trader.aspx?id=TradeHaltRSS),
+[market data and corporate actions](https://www.nasdaq.com/market-activity/economic-calendar)
+
+```json
+{
+  "underlying_id": "NASDAQ:NVDA",
+  "trade_date": "2026-11-06",
+  "opens_et": "09:30",
+  "closes_et": "16:00",
+  "actions_clear_through_et": "16:00",
+  "halts": []
+}
+```
+
+An entry in `halts` has `starts_et` and `resumes_et` local time strings.
+Use `null` for a halt without an observed resumption. The compiler applies
+each halt or resumption at its effective time in a historical run.
+
+```sh
+python3 scripts/prepare_equity_replay.py examples/nvda_capture.json \
+  recordings/nasdaq-nvda-chart.json recordings/nvda-session.json recordings/nvda-reviewed.json
+target/release/cross_venue perp-compile recordings/nvda-reviewed.json \
+  recordings/nvda-raw.ndjson recordings/nvda-reviewed.ndjson
+target/release/cross_venue perp-replay recordings/nvda-reviewed.ndjson
+```
+
+The importer keeps the base config's paper order policy and venue oracle
+settings. Each minute price becomes an `equity_minute_close` only after the
+minute ends and the modeled publication delay elapses. The default delay is
+60 seconds. The separate reference age allows one minute between updates.
+Venue book and oracle limits still apply. Archived charts carry trade-minute
+labels, so the delay is a research assumption. Point-in-time quote archives
+can use the `external` reference path with their observed arrival times.
+[Nasdaq market data](https://www.nasdaq.com/market-activity)
+
 ## Research orders and funding
 
 Review each venue's native market, contract multiplier, payout convention,
@@ -206,3 +272,35 @@ and edge thresholds. NVDA was a book coverage check pending independent
 equity reference and session data. The local manifest at
 `recordings/2026-11-07-heartbeat/manifest.json` indexes the capture and all 18
 replays by SHA-256.
+
+## Measured clock and equity session replays
+
+The five-minute clock capture on November 7 used the same Hyperliquid dual
+book source and strategy settings across both clock policies. Two Lighter
+replies per market gave padded publication clock intervals of −267 to 188 ms
+for ETH and −266 to 190 ms for BTC. The compiler used the conservative upper
+end of each interval. All 629 ETH and 985 BTC Lighter clock rejections seen
+under the strict policy cleared with these connection-specific bounds.
+
+| Market | Frames | Strict joined | Joined with subscription evidence |
+| --- | ---: | ---: | ---: |
+| ETH | 1,034 | 238 | 538 |
+| BTC | 1,034 | 189 | 545 |
+
+For the earlier November 6 equity capture, Nasdaq and the archived stock
+charts put the regular session at 14:30–21:00 UTC. The halt, ex-dividend and
+split records reviewed for that day did not list NVDA or TSLA. Each chart
+supplied 390 regular-session minute prices. The older venue recording lacks
+subscription probes, so its primary results use the strict clock policy.
+
+| Market | Frames | Strict joined | Joined with a 50 ms sensitivity bound |
+| --- | ---: | ---: | ---: |
+| NVDA | 1,085 | 39 | 91 |
+| TSLA | 1,085 | 40 | 101 |
+
+The real after-hours NVDA control contributed zero eligible session frames
+out of 1,323. Paper entries remained zero across all samples. Sparse equity
+books and oracle coverage limited estimator warmup in the equity holdouts.
+Contract equivalence and fees retain the replay configurations' research
+assumptions. The local `recordings/2026-11-07-rwa/manifest.json` preserves
+the chart and session sources, clock replies, configurations and reports.

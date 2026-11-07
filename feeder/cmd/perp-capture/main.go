@@ -26,11 +26,17 @@ import (
 )
 
 type record struct {
-	Source      string          `json:"source"`
-	Event       string          `json:"event"`
-	ReceivedAt  int64           `json:"received_at_ms"`
-	AvailableAt int64           `json:"available_at_ms"`
-	Payload     json.RawMessage `json:"payload,omitempty"`
+	Source        string          `json:"source"`
+	Event         string          `json:"event"`
+	ReceivedAt    int64           `json:"received_at_ms"`
+	AvailableAt   int64           `json:"available_at_ms"`
+	RequestSentAt int64           `json:"request_sent_at_ms,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+}
+
+type lighterSubscription struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
 }
 
 type subscription struct {
@@ -81,8 +87,8 @@ func subscriptions(lighter, hl, coinbase string, snapshotInterval time.Duration)
 					return nil, fmt.Errorf("lighter market ID %q: %w", item, err)
 				}
 				for _, channel := range []string{"order_book", "market_stats"} {
-					source.requests = append(source.requests, map[string]string{
-						"type": "subscribe", "channel": fmt.Sprintf("%s/%d", channel, id),
+					source.requests = append(source.requests, lighterSubscription{
+						Type: "subscribe", Channel: fmt.Sprintf("%s/%d", channel, id),
 					})
 				}
 			case "hyperliquid":
@@ -183,7 +189,11 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
+	subscriptionSends := make(map[string]time.Time)
 	for _, request := range source.requests {
+		if sub, ok := request.(lighterSubscription); ok {
+			subscriptionSends[sub.Channel] = time.Now()
+		}
 		if err := wsjson.Write(ctx, conn, request); err != nil {
 			return fmt.Errorf("subscribe: %w", err)
 		}
@@ -199,7 +209,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	for {
 		readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		_, raw, err := conn.Read(readCtx)
-		received := time.Now().UnixMilli()
+		received := time.Now()
 		cancel()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
@@ -231,7 +241,20 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				continue
 			}
 		}
-		if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: raw}); err != nil {
+		row := record{Source: source.source, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
+		if source.source == "lighter" && strings.HasPrefix(header.Type, "subscribed/") {
+			channel := strings.Replace(header.Channel, ":", "/", 1)
+			if sent, ok := subscriptionSends[channel]; ok {
+				delete(subscriptionSends, channel)
+				// A clock step between send and receive invalidates the bracket.
+				wallElapsed := received.UnixMilli() - sent.UnixMilli()
+				monotonicElapsed := received.Sub(sent).Milliseconds()
+				if wallElapsed >= 0 && wallElapsed >= monotonicElapsed-1 && wallElapsed <= monotonicElapsed+1 {
+					row.RequestSentAt = sent.UnixMilli()
+				}
+			}
+		}
+		if err := emit(row); err != nil {
 			return err
 		}
 		// Record the gap before reconnecting so the compiler invalidates the

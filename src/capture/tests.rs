@@ -112,6 +112,122 @@ fn l2_deletions_and_receipt_time_bounds_preserve_exact_levels() {
 }
 
 #[test]
+fn lighter_clock_uses_only_available_connection_evidence() {
+    let mut config = config();
+    config.legs[0].lighter_clock = Some(LighterClockPolicy {
+        max_rtt_ms: 50,
+        valid_for_ms: 250,
+        drift_margin_ms: 2,
+    });
+    let mut before = lighter(T, T + 5, 10, 0, true);
+    before["payload"]["timestamp"] = json!(T + 10);
+    let mut ack = lighter(T + 100, T + 110, 11, 0, true);
+    ack["payload"]["timestamp"] = json!(T + 120);
+    ack["request_sent_at_ms"] = json!(T + 80);
+    let mut update = lighter(T + 200, T + 215, 12, 11, false);
+    update["payload"]["timestamp"] = json!(T + 220);
+    let mut expired = lighter(T + 400, T + 415, 13, 12, false);
+    expired["payload"]["timestamp"] = json!(T + 420);
+    let disconnect = json!({"source":"lighter","event":"disconnect","received_at_ms":T+500,"available_at_ms":T+500});
+    let mut reconnected = lighter(T + 600, T + 599, 20, 0, true);
+    reconnected["payload"]["timestamp"] = json!(T + 600);
+    let (coverage, frames) = replay(
+        &config,
+        &[
+            before,
+            ack,
+            update,
+            expired,
+            disconnect,
+            reconnected,
+            footer(T + 700),
+        ],
+    );
+    let times: Vec<_> = frames
+        .iter()
+        .map(|frame| &frame["legs"][0]["book"]["timestamp_ms"])
+        .collect();
+    assert_eq!(
+        times,
+        [
+            &json!(0),
+            &json!(T + 67),
+            &json!(T + 172),
+            &json!(0),
+            &json!(0),
+            &json!(0)
+        ]
+    );
+    assert_eq!(coverage.clock_unavailable, [3, 0]);
+    assert_eq!(coverage.clock_rejections, [0, 0]);
+    assert_eq!(coverage.lighter_clock[0].unwrap().probes, 0);
+}
+
+#[test]
+fn disjoint_subscription_clock_intervals_invalidate_the_connection() {
+    let policy = LighterClockPolicy {
+        max_rtt_ms: 50,
+        valid_for_ms: 1_000,
+        drift_margin_ms: 2,
+    };
+    let mut audit = LighterClockAudit::default();
+    audit.observe(policy, T, T + 20, T + 30);
+    assert_eq!(audit.correction(policy, T + 20), Some(33));
+    audit.observe(policy, T + 100, T + 105, T + 113);
+    assert_eq!(audit.correction(policy, T + 105), Some(16));
+    audit.observe(policy, T + 200, T + 210, T + 240);
+    assert!(audit.conflicting);
+    assert_eq!(audit.correction(policy, T + 210), None);
+}
+
+#[test]
+fn equity_minutes_use_completed_regular_session_bars_after_publication_delay() {
+    let mut config: CaptureConfig =
+        serde_json::from_str(include_str!("../../examples/nvda_capture.json")).unwrap();
+    config.sample_ms = 100;
+    config.paper_entries = true;
+    config.pair.equity_minute_reference_max_age_ms = Some(61_000);
+    config.reference = ReferenceFeed::EquityMinuteBars {
+        underlying_id: "NASDAQ:NVDA".into(),
+        publication_delay_ms: 1_000,
+        bars: [T, T + 60_000, T + 120_000]
+            .into_iter()
+            .map(|ends_at_ms| EquityMinuteBar {
+                ends_at_ms,
+                close: Decimal::from(200),
+            })
+            .collect(),
+    };
+    let session = EquitySession {
+        observed_at_ms: T,
+        opens_at_ms: T,
+        closes_at_ms: T + 180_000,
+        clear_until_ms: T + 180_000,
+        halted: false,
+    };
+    config.equity_sessions = vec![
+        session,
+        EquitySession {
+            observed_at_ms: T + 121_000,
+            halted: true,
+            ..session
+        },
+    ];
+    let mut rows: Vec<_> = [1_000, 60_900, 61_000, 121_000]
+        .into_iter()
+        .map(|delta| row("coinbase", T + delta, json!({})))
+        .collect();
+    rows.push(footer(T + 121_100));
+    let (coverage, frames) = replay(&config, &rows);
+    assert_eq!(frames[1]["reference"]["timestamp_ms"], T);
+    assert_eq!(frames[2]["reference"]["timestamp_ms"], T + 60_000);
+    assert_eq!(frames[2]["reference"]["mode"], "equity_minute_close");
+    assert_eq!(frames[3]["equity_session"]["halted"], true);
+    assert_eq!(coverage.fresh_reference_frames, 2);
+    assert_eq!(coverage.equity_session_frames, 3);
+}
+
+#[test]
 fn receipt_order_and_context_policy_prevent_reference_lookahead() {
     let mut config = config();
     config.reference = ReferenceFeed::External {
