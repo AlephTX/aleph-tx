@@ -199,6 +199,12 @@ fn default_momentum_skew_scale() -> f64 {
 fn default_external_staleness_ms() -> u64 {
     2000
 }
+fn default_basis_tau_secs() -> f64 {
+    300.0
+}
+fn default_max_basis_bps() -> f64 {
+    20.0
+}
 fn default_reference_portfolio_value() -> f64 {
     100.0
 }
@@ -287,6 +293,12 @@ pub struct InventoryNeutralMMConfig {
     // External fair value anchor (v6.0.0)
     #[serde(default = "default_external_staleness_ms")]
     pub external_staleness_ms: u64, // default: 2000 (max age for external BBO in ms)
+    /// EWMA time constant for the Lighter-vs-external basis correction.
+    #[serde(default = "default_basis_tau_secs")]
+    pub basis_tau_secs: f64, // default: 300
+    /// Clamp on the applied basis; 0 disables the correction.
+    #[serde(default = "default_max_basis_bps")]
+    pub max_basis_bps: f64, // default: 20
     // Avellaneda-Stoikov 定价参数 (v5.1.0)
     #[serde(default = "default_as_gamma")]
     pub as_gamma: f64, // default: 5000.0 (风险厌恶系数，fractional σ 下需要大值)
@@ -398,6 +410,7 @@ impl InventoryNeutralMMConfig {
                 self.as_gamma,
                 self.as_kappa,
                 self.as_time_horizon_sec,
+                self.basis_tau_secs,
                 self.max_spread_bps,
                 self.max_leverage,
                 self.sigmoid_steepness,
@@ -419,6 +432,7 @@ impl InventoryNeutralMMConfig {
                 self.adverse_selection_threshold,
                 self.requote_threshold_bps,
                 self.min_available_balance,
+                self.max_basis_bps,
             ],
         )?;
         anyhow::ensure!(
@@ -507,6 +521,8 @@ impl Default for InventoryNeutralMMConfig {
             vol_spread_scale: 0.5,
             momentum_skew_scale: 0.3,
             external_staleness_ms: 2000,
+            basis_tau_secs: default_basis_tau_secs(),
+            max_basis_bps: default_max_basis_bps(),
             as_gamma: 5000.0,
             as_time_horizon_sec: 1.0,
             as_kappa: 2000.0,

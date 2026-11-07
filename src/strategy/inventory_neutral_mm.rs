@@ -46,7 +46,7 @@ use execution::{
 };
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    MarketState, StaleBboAction, build_market_state, classify_stale_bbo, data_age_ms,
+    BasisTracker, MarketState, StaleBboAction, build_market_state, classify_stale_bbo, data_age_ms,
     external_fair_value_mid,
 };
 use pricing::{
@@ -385,6 +385,7 @@ pub struct InventoryNeutralMM {
     account_stats: AccountStats,
     micro: MicrostructureTracker,
     sigma: TimeScaledVolatility,
+    basis: BasisTracker,
 
     // Order tracking (multi-level grid)
     active_orders: Vec<ActiveOrder>,
@@ -466,6 +467,7 @@ impl InventoryNeutralMM {
                 config.ema_slow_period,
             ),
             sigma: TimeScaledVolatility::new(),
+            basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             config,
             trading,
             order_tracker,
@@ -1521,8 +1523,21 @@ impl InventoryNeutralMM {
         };
 
         let (pricing_mid, using_external, mid) = if let Some(fair_mid) = external_fair {
-            // External exchanges drive fair value; local mid is only for touch
-            (fair_mid, true, local_mid)
+            // Learn the venue basis only from a fresh two-sided local book.
+            if bbo.bid_price > 0.0
+                && bbo.ask_price > bbo.bid_price
+                && !market_state::is_stale_bbo(
+                    bbo.timestamp_ns,
+                    now_ns,
+                    DATA_STALENESS_THRESHOLD_MS,
+                )
+            {
+                self.basis
+                    .observe(bbo.bid_price * 0.5 + bbo.ask_price * 0.5, fair_mid, now_ns);
+            }
+            // External exchanges drive fair value, shifted onto the Lighter
+            // price level; local mid is only for touch.
+            (self.basis.correct(fair_mid), true, local_mid)
         } else {
             // Fallback: use local VWMicro or simple mid when no external data
             let vw_mid = if self.config.use_depth_pricing {

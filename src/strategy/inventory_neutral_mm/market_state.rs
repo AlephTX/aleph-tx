@@ -45,6 +45,69 @@ fn valid_quoteable_book(bbo: &ShmBboMessage) -> bool {
         && (bbo.bid_price == 0.0 || bbo.ask_price == 0.0 || bbo.bid_price < bbo.ask_price)
 }
 
+/// Slow EWMA of the venue basis `local_mid / external_mid - 1`.
+///
+/// Lighter persistently trades at a premium or discount to the Binance/HL
+/// median (funding and index differences). Quoting around the raw external
+/// median therefore skews fills to one side. The basis is clamped and, until
+/// enough time has been observed, shrunk toward zero.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BasisTracker {
+    tau_secs: f64,
+    max_basis: f64,
+    basis: f64,
+    weight: f64,
+    last_ns: u64,
+}
+
+impl BasisTracker {
+    /// Gaps longer than this do not count as observed time.
+    const MAX_DT_SECS: f64 = 10.0;
+
+    pub(super) fn new(tau_secs: f64, max_basis_bps: f64) -> Self {
+        Self {
+            tau_secs: tau_secs.max(1.0),
+            max_basis: (max_basis_bps / 10_000.0).max(0.0),
+            basis: 0.0,
+            weight: 0.0,
+            last_ns: 0,
+        }
+    }
+
+    /// Record a fresh two-sided local mid against the external median.
+    pub(super) fn observe(&mut self, local_mid: f64, external_mid: f64, now_ns: u64) {
+        if !(local_mid.is_finite() && external_mid.is_finite())
+            || local_mid <= 0.0
+            || external_mid <= 0.0
+        {
+            return;
+        }
+        let sample = (local_mid / external_mid - 1.0).clamp(-self.max_basis, self.max_basis);
+        if self.last_ns == 0 || now_ns <= self.last_ns {
+            self.last_ns = self.last_ns.max(now_ns);
+            if self.weight == 0.0 {
+                self.basis = sample;
+            }
+            return;
+        }
+        let dt = ((now_ns - self.last_ns) as f64 / 1e9).min(Self::MAX_DT_SECS);
+        self.last_ns = now_ns;
+        let alpha = 1.0 - (-dt / self.tau_secs).exp();
+        self.basis += alpha * (sample - self.basis);
+        self.weight += alpha * (1.0 - self.weight);
+    }
+
+    /// Basis to apply, shrunk toward zero while the estimate is young.
+    pub(super) fn applied_basis(&self) -> f64 {
+        (self.basis * self.weight).clamp(-self.max_basis, self.max_basis)
+    }
+
+    /// External median shifted onto the local venue's price level.
+    pub(super) fn correct(&self, external_mid: f64) -> f64 {
+        external_mid * (1.0 + self.applied_basis())
+    }
+}
+
 pub(super) fn classify_stale_bbo(
     bbo: &ShmBboMessage,
     now_ns: u64,
@@ -121,6 +184,54 @@ pub(super) fn external_fair_value_mid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basis_tracker_converges_to_persistent_premium() {
+        let mut basis = BasisTracker::new(60.0, 20.0);
+        let external = 2000.0;
+        let local = external * (1.0 + 5e-4); // 5 bps premium
+        for i in 0..1_200u64 {
+            basis.observe(local, external, 1 + i * 500_000_000); // 2 Hz for 10 min
+        }
+        assert!((basis.applied_basis() - 5e-4).abs() < 1e-5);
+        assert!((basis.correct(external) - local).abs() < 0.02);
+    }
+
+    #[test]
+    fn basis_tracker_is_shrunk_while_young_and_clamped() {
+        let mut basis = BasisTracker::new(300.0, 20.0);
+        let external = 2000.0;
+        basis.observe(external * 1.0005, external, 1);
+        basis.observe(external * 1.0005, external, 1_000_000_001);
+        // One second of history against a 300 s time constant applies ~0.3%.
+        assert!(basis.applied_basis() > 0.0 && basis.applied_basis() < 1e-5);
+
+        // A 1% dislocation is clamped to the 20 bps cap.
+        for i in 2..10_000u64 {
+            basis.observe(external * 1.01, external, i * 1_000_000_000);
+        }
+        assert!((basis.applied_basis() - 20e-4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn basis_tracker_disabled_and_invalid_inputs() {
+        let mut off = BasisTracker::new(300.0, 0.0);
+        for i in 1..100u64 {
+            off.observe(2001.0, 2000.0, i * 1_000_000_000);
+        }
+        assert_eq!(off.correct(2000.0), 2000.0);
+
+        let mut basis = BasisTracker::new(60.0, 20.0);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            basis.observe(bad, 2000.0, 1_000_000_000);
+            basis.observe(2000.0, bad, 2_000_000_000);
+        }
+        assert_eq!(basis.applied_basis(), 0.0);
+        // Non-monotonic clock must not produce a negative dt.
+        basis.observe(2001.0, 2000.0, 5_000_000_000);
+        basis.observe(2001.0, 2000.0, 4_000_000_000);
+        assert!(basis.applied_basis().is_finite());
+    }
 
     fn msg(bid_price: f64, ask_price: f64, timestamp_ns: u64) -> ShmBboMessage {
         ShmBboMessage {
