@@ -390,6 +390,9 @@ pub struct InventoryNeutralMM {
     session_start_balance: f64,
     daily_loss_state: Option<std::path::PathBuf>,
     daily_loss: Option<crate::daily_loss::DailyLossGuard>,
+    /// Set when low margin hits while hedged; the loop then stops so shutdown
+    /// unwinds both legs together instead of flattening Lighter alone.
+    hedged_low_margin: bool,
     total_orders_placed: u64,
     last_balance_check: Instant,
     reconcile_failures: u32,
@@ -477,6 +480,7 @@ impl InventoryNeutralMM {
             session_start_balance: 0.0,
             daily_loss_state: None,
             daily_loss: None,
+            hedged_low_margin: false,
             total_orders_placed: 0,
             last_balance_check: Instant::now(),
             reconcile_failures: 0,
@@ -672,6 +676,11 @@ impl InventoryNeutralMM {
             {
                 self.execute_quoting_cycle(our_bid, our_ask, bounds, inputs.mid, shutdown)
                     .await;
+                if self.hedged_low_margin {
+                    // perform_graceful_shutdown cleans Lighter, then
+                    // hedge.finish() closes Hyperliquid against it.
+                    anyhow::bail!("Low margin while hedged; unwinding both legs");
+                }
             } else {
                 self.cancel_all_orders().await;
             }
@@ -1930,6 +1939,12 @@ impl InventoryNeutralMM {
 
     async fn handle_low_margin_flatten(&mut self, mid: f64) {
         if !self.cancel_all_and_sync("low-margin flatten").await {
+            return;
+        }
+        if self.hedge.is_some() {
+            // A single-leg taker close would leave the Hyperliquid hedge naked
+            // and trip the cross-venue limit before it could be unwound.
+            self.hedged_low_margin = true;
             return;
         }
 
