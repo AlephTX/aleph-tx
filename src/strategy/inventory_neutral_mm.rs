@@ -512,14 +512,14 @@ impl InventoryNeutralMM {
             self.perform_periodic_housekeeping().await;
 
             // Daily PnL circuit breaker: baseline and breach persist across restarts.
-            if let Some(guard) = &mut self.daily_loss {
-                if let Err(error) = guard.check(
+            if let Some(guard) = &mut self.daily_loss
+                && let Err(error) = guard.check(
                     self.account_stats.portfolio_value,
                     crate::daily_loss::utc_day_now(),
-                ) {
-                    tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
-                    return Err(error.context("Lighter daily loss limit breached"));
-                }
+                )
+            {
+                tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
+                return Err(error.context("Lighter daily loss limit breached"));
             }
 
             // Margin cooldown check
