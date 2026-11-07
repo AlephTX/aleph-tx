@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 6: Connect to BBO Matrix
     tracing::info!("📡 Connecting to BBO matrix...");
-    let mut shm_reader = ShmReader::open("/dev/shm/aleph-matrix", 2048)?;
+    let mut shm_reader = ShmReader::open(&aleph_tx::shm_path::shm_path("aleph-matrix")?, 2048)?;
 
     // Step 7: Setup graceful shutdown
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

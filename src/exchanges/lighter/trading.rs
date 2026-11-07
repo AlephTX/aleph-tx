@@ -312,8 +312,9 @@ impl Exchange for LighterTrading {
     async fn get_account_stats(
         &self,
     ) -> Result<crate::strategy::inventory_neutral_mm::AccountStats> {
-        let mut reader =
-            crate::account_stats_reader::AccountStatsReader::open("/dev/shm/aleph-account-stats")?;
+        let mut reader = crate::account_stats_reader::AccountStatsReader::open(
+            &crate::shm_path::shm_path("aleph-account-stats")?,
+        )?;
         let snapshot = reader.read();
         let stats: crate::strategy::inventory_neutral_mm::AccountStats = snapshot.into();
         anyhow::ensure!(

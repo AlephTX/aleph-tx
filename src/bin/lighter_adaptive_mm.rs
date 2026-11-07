@@ -31,8 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _consumer_handle = ledger_manager.spawn_consumer(event_reader);
 
     // Connect to shared memory
-    let shm_reader = ShmReader::open("/dev/shm/aleph-matrix", 2048)?;
-    let account_stats_reader = AccountStatsReader::open("/dev/shm/aleph-account-stats")?;
+    let shm_reader = ShmReader::open(&aleph_tx::shm_path::shm_path("aleph-matrix")?, 2048)?;
+    let account_stats_reader =
+        AccountStatsReader::open(&aleph_tx::shm_path::shm_path("aleph-account-stats")?)?;
 
     // Initialize LighterTrading (market_id=0 = ETH perps)
     let trading = Arc::new(LighterTrading::new(0).await?);

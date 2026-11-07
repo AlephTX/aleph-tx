@@ -411,9 +411,9 @@ func (rb *EventRingBuffer) GetWriteIdx() uint64 {
 }
 
 func RemoveShm() error {
-	return os.Remove("/dev/shm/aleph-events")
+	return os.Remove(Path("aleph-events"))
 }
 
 func RemoveShmV2() error {
-	return os.Remove("/dev/shm/aleph-events-v2")
+	return os.Remove(Path("aleph-events-v2"))
 }

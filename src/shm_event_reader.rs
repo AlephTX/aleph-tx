@@ -95,9 +95,9 @@ impl ShmEventReader {
         })
     }
 
-    /// Open the event ring buffer at the default path `/dev/shm/aleph-events`
+    /// Open the event ring buffer at the `aleph-events` in the session SHM directory
     pub fn new_default() -> Result<Self> {
-        Self::new("/dev/shm/aleph-events")
+        Self::new(crate::shm_path::shm_dir().join("aleph-events"))
     }
 
     /// Read the current write index using proper atomic load (Acquire ordering)
@@ -249,7 +249,7 @@ impl ShmEventReaderV2 {
 
     /// Open the V2 event ring buffer at the default path
     pub fn new_default() -> Result<Self> {
-        Self::new("/dev/shm/aleph-events-v2")
+        Self::new(crate::shm_path::shm_dir().join("aleph-events-v2"))
     }
 
     /// Skip all existing events, only consume events written after this call

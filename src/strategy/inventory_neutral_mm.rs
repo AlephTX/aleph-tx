@@ -364,8 +364,9 @@ impl InventoryNeutralMM {
         shm_reader: ShmReader,
         account_stats_reader: AccountStatsReader,
     ) -> Self {
-        let shm_depth_reader =
-            crate::shm_depth_reader::ShmDepthReader::open("/dev/shm/aleph-depth", 2048).ok();
+        let shm_depth_reader = crate::shm_path::shm_path("aleph-depth")
+            .ok()
+            .and_then(|path| crate::shm_depth_reader::ShmDepthReader::open(&path, 2048).ok());
         Self::with_data_sources(
             config,
             trading,

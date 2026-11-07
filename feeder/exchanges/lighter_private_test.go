@@ -29,7 +29,7 @@ func (r *eventRecorder) PushOrderFilledV2(ex uint8, sym uint16, order uint64, cl
 }
 func privateForTest() (*LighterPrivate, *eventRecorder) {
 	r := &eventRecorder{}
-	return &LighterPrivate{eventBuffer: r, auth: &LighterAuth{accountIndex: 42}, mktMap: map[int]uint16{0: 1002}, orderSizes: map[uint64]float64{}, orderDetails: map[uint64]orderDetail{}, seenTradeIDs: map[uint64]struct{}{}}, r
+	return &LighterPrivate{eventBuffer: r, auth: &LighterAuth{accountIndex: 42}, mktMap: map[int]uint16{0: 1002}, orderSizes: map[uint64]float64{}, orderDetails: map[uint64]orderDetail{}, seenTradeIDs: newTradeIDSet(tradeIDCapacity)}, r
 }
 func TestPrivateTradeIdentifiesTakerAndFees(t *testing.T) {
 	lp, r := privateForTest()

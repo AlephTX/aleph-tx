@@ -10,6 +10,7 @@ use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
 use aleph_tx::shm_depth_reader::ShmDepthReader;
 use aleph_tx::shm_event_reader::ShmEventReaderV2;
+use aleph_tx::shm_path::shm_dir;
 use aleph_tx::shm_reader::ShmReader;
 use aleph_tx::strategy::inventory_neutral_mm::InventoryNeutralMM;
 use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
@@ -204,6 +205,6 @@ async fn run_existing_feeder() -> Result<()> {
         hedge_account: None,
     });
     let (mut strategy, _) =
-        connect_strategy(config, trading, network, Path::new("/dev/shm"), telemetry).await?;
+        connect_strategy(config, trading, network, &shm_dir(), telemetry).await?;
     strategy.run(Some(shutdown)).await
 }

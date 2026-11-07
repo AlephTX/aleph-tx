@@ -27,7 +27,7 @@ type LighterPrivate struct {
 	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
 	orderSizes   map[uint64]float64      // order_id -> remaining_base_amount
 	orderDetails map[uint64]orderDetail  // order_id -> full order details
-	seenTradeIDs map[uint64]struct{}     // trade_id -> seen (dedupe duplicate WS payloads)
+	seenTradeIDs *tradeIDSet             // bounded trade_id dedupe for duplicate WS payloads
 }
 
 // privateEventSink permits deterministic replay without mmap or credentials.
@@ -80,7 +80,7 @@ func NewLighterPrivate(
 		statsWriter:  statsWriter,
 		orderSizes:   make(map[uint64]float64),
 		orderDetails: make(map[uint64]orderDetail),
-		seenTradeIDs: make(map[uint64]struct{}),
+		seenTradeIDs: newTradeIDSet(tradeIDCapacity),
 	}, nil
 }
 
@@ -419,7 +419,7 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		return
 	}
 	tradeIDu64 := uint64(tradeID)
-	if _, seen := lp.seenTradeIDs[tradeIDu64]; seen {
+	if lp.seenTradeIDs.Contains(tradeIDu64) {
 		return
 	}
 
@@ -483,7 +483,7 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 	if math.IsNaN(feePaid) || math.IsInf(feePaid, 0) {
 		return
 	}
-	lp.seenTradeIDs[tradeIDu64] = struct{}{}
+	lp.seenTradeIDs.Add(tradeIDu64)
 
 	// Calculate remaining size from order tracking
 	remainingSize := 0.0

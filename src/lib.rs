@@ -12,6 +12,7 @@ pub mod order_tracker;
 pub mod shadow_ledger;
 pub mod shm_depth_reader;
 pub mod shm_event_reader;
+pub mod shm_path;
 pub mod shm_reader;
 pub mod strategy;
 pub mod telemetry;

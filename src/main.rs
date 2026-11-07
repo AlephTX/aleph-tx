@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Spawn dedicated data plane thread (decoupled from Tokio)
     let bbo_rx = data_plane::spawn_data_plane_thread(
-        "/dev/shm/aleph-matrix",
+        &aleph_tx::shm_path::shm_path("aleph-matrix")?,
         2048,
         Some(2), // Pin to CPU core 2
     );
