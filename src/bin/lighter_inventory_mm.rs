@@ -16,7 +16,7 @@ use aleph_tx::strategy::inventory_neutral_mm::InventoryNeutralMM;
 use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
 use aleph_tx::types::events::EventType;
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
@@ -44,6 +44,11 @@ async fn connect_strategy(
     ipc: &Path,
     telemetry: Option<TelemetrySink>,
 ) -> Result<(InventoryNeutralMM, Arc<LighterTrading>)> {
+    let daily_loss_state = PathBuf::from(format!(
+        "pids/daily-loss-{network:?}-{}-{}.json",
+        trading.account_index(),
+        config.market_id
+    ));
     let events = ipc.join("aleph-events-v2");
     let market = ipc.join("aleph-matrix");
     let stats = ipc.join("aleph-account-stats");
@@ -113,7 +118,8 @@ async fn connect_strategy(
         shm_reader,
         account_reader,
         depth_reader,
-    );
+    )
+    .with_daily_loss_state(daily_loss_state);
     if let Some(sink) = telemetry {
         strategy = strategy.with_telemetry_sink(sink);
     }

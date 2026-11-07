@@ -326,6 +326,8 @@ pub struct InventoryNeutralMM {
     active_orders: Vec<ActiveOrder>,
 
     session_start_balance: f64,
+    daily_loss_state: Option<std::path::PathBuf>,
+    daily_loss: Option<crate::daily_loss::DailyLossGuard>,
     total_orders_placed: u64,
     last_balance_check: Instant,
     reconcile_failures: u32,
@@ -409,6 +411,8 @@ impl InventoryNeutralMM {
             account_stats: AccountStats::default(),
             active_orders: Vec::new(),
             session_start_balance: 0.0,
+            daily_loss_state: None,
+            daily_loss: None,
             total_orders_placed: 0,
             last_balance_check: Instant::now(),
             reconcile_failures: 0,
@@ -434,6 +438,13 @@ impl InventoryNeutralMM {
     /// Export structured snapshots for remote monitoring.
     pub fn with_telemetry_sink(mut self, sink: crate::telemetry_sink::TelemetrySink) -> Self {
         self.telemetry_sink = Some(sink);
+        self
+    }
+
+    /// Persist the daily loss baseline and breach flag at `path` so restarts
+    /// cannot re-arm the loss budget within the same UTC day.
+    pub fn with_daily_loss_state(mut self, path: std::path::PathBuf) -> Self {
+        self.daily_loss_state = Some(path);
         self
     }
 
@@ -500,19 +511,14 @@ impl InventoryNeutralMM {
             // Phase 1: Institutional Housekeeping
             self.perform_periodic_housekeeping().await;
 
-            // Daily PnL circuit breaker (v6.0.2): shutdown if loss exceeds 5% of session start balance
-            if self.session_start_balance > 0.0 {
-                let daily_pnl_pct = (self.account_stats.portfolio_value
-                    - self.session_start_balance)
-                    / self.session_start_balance;
-                if daily_pnl_pct < -0.05 {
-                    tracing::error!(
-                        "🚨 Daily loss limit breached: {:.2}% (${:.2} → ${:.2}), shutting down",
-                        daily_pnl_pct * 100.0,
-                        self.session_start_balance,
-                        self.account_stats.portfolio_value
-                    );
-                    anyhow::bail!("Lighter session loss limit breached");
+            // Daily PnL circuit breaker: baseline and breach persist across restarts.
+            if let Some(guard) = &mut self.daily_loss {
+                if let Err(error) = guard.check(
+                    self.account_stats.portfolio_value,
+                    crate::daily_loss::utc_day_now(),
+                ) {
+                    tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
+                    return Err(error.context("Lighter daily loss limit breached"));
                 }
             }
 
@@ -647,6 +653,12 @@ impl InventoryNeutralMM {
         self.clean_exchange_state("startup").await?;
 
         self.session_start_balance = self.account_stats.portfolio_value;
+        self.daily_loss = Some(crate::daily_loss::DailyLossGuard::open(
+            self.daily_loss_state.clone(),
+            self.config.max_daily_loss_pct,
+            self.account_stats.portfolio_value,
+            crate::daily_loss::utc_day_now(),
+        )?);
 
         info!(
             "✅ Startup complete: pos={:.4} bal=${:.2}",

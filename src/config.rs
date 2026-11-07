@@ -160,6 +160,9 @@ fn default_poll_interval_ms() -> u64 {
 fn default_margin_cooldown_secs() -> u64 {
     5
 }
+fn default_max_daily_loss_pct() -> f64 {
+    0.05
+}
 fn default_grid_levels() -> u8 {
     3
 }
@@ -301,6 +304,10 @@ pub struct InventoryNeutralMMConfig {
     pub min_available_balance: f64,       // default: 2.0
     #[serde(default = "default_margin_cooldown_secs")]
     pub margin_cooldown_secs: u64, // default: 5
+    /// Fraction of the UTC-day starting equity that may be lost before the
+    /// strategy halts. The baseline and breach persist across restarts.
+    #[serde(default = "default_max_daily_loss_pct")]
+    pub max_daily_loss_pct: f64, // default: 0.05
     // Post-Only: use ALO (Add Liquidity Only) to guarantee maker fees
     #[serde(default)]
     pub use_post_only: bool, // default: false (GTC), true = Post-Only
@@ -419,6 +426,12 @@ impl InventoryNeutralMMConfig {
             "{name}: maker fee must be finite"
         );
         anyhow::ensure!(
+            self.max_daily_loss_pct.is_finite()
+                && self.max_daily_loss_pct > 0.0
+                && self.max_daily_loss_pct < 1.0,
+            "{name}: max_daily_loss_pct must be in (0, 1)"
+        );
+        anyhow::ensure!(
             self.min_portfolio_scale <= self.max_portfolio_scale,
             "{name}: portfolio scale bounds reversed"
         );
@@ -514,6 +527,7 @@ impl Default for InventoryNeutralMMConfig {
             max_leverage: 10.0,
             min_available_balance: 2.0,
             margin_cooldown_secs: 5,
+            max_daily_loss_pct: default_max_daily_loss_pct(),
             use_post_only: false,
             poll_interval_ms: 100,
         }

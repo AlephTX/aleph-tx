@@ -328,6 +328,10 @@ impl Exchange for LighterTrading {
 }
 
 impl LighterTrading {
+    pub fn account_index(&self) -> i64 {
+        self.account_index
+    }
+
     #[cfg(test)]
     pub(crate) fn offline_test_client(base_url: &str) -> Self {
         Self {
