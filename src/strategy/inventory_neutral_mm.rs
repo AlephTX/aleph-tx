@@ -585,9 +585,12 @@ impl InventoryNeutralMM {
             );
             let now = Instant::now();
             self.inventory_age.observe(quoting_position, deadband, now);
-            if self
-                .inventory_age
-                .is_expired(now, Duration::from_secs(POSITION_TIMEOUT_SECS))
+            // With a live hedge, Lighter inventory is offset on Hyperliquid;
+            // a single-leg taker flatten would pay twice and unbalance the pair.
+            if self.hedge.is_none()
+                && self
+                    .inventory_age
+                    .is_expired(now, Duration::from_secs(POSITION_TIMEOUT_SECS))
             {
                 if self.inventory_age.can_retry(now) {
                     self.inventory_age.last_attempt = Some(now);

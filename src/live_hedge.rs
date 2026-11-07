@@ -24,6 +24,8 @@ const POLL: Duration = Duration::from_secs(1);
 const MAX_BLOCKED: Duration = Duration::from_secs(20);
 const MAX_QUOTE_AGE_MS: u64 = 3_000;
 const MAX_ACCOUNT_AGE_MS: u64 = 5_000;
+const CLOCK_TOLERANCE_MS: u64 = 2_000;
+const FINISH_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,7 +332,9 @@ impl LiveInventoryHedge {
 
     /// Called only after Lighter's own cleanup has confirmed canceled orders.
     pub(crate) async fn finish(&mut self) -> Result<()> {
-        for _ in 0..5 {
+        // Allow terminal lookups and account snapshots time to converge.
+        let deadline = Instant::now() + FINISH_DEADLINE;
+        while Instant::now() < deadline {
             if let Some(observed) = self.observe(true).await? {
                 ensure!(
                     observed.primary.is_zero(),
@@ -386,11 +390,7 @@ impl LiveInventoryHedge {
         );
         if !closing {
             ensure!(
-                primary.abs() <= self.limits.max_unhedged_base
-                    && hedge.abs() <= self.limits.max_unhedged_base
-                    && primary
-                        .checked_add(hedge)
-                        .is_some_and(|net| net.abs() <= self.limits.max_unhedged_base),
+                within_limits(&self.limits, primary, hedge),
                 "Cross-venue position exceeds hedge limits"
             );
             ensure!(
@@ -512,12 +512,18 @@ impl LiveInventoryHedge {
         let Some(pending) = self.pending.as_mut().filter(|p| p.terminal.is_none()) else {
             return Ok(());
         };
-        let OrderLookup::Found(located) = self
+        let located = match self
             .info
             .order_by_client_id(&self.account, &pending.id)
             .await?
-        else {
-            return Ok(());
+        {
+            OrderLookup::Found(located) => located,
+            OrderLookup::Unknown => {
+                // Intent time is before journal fsync and signing, so it does
+                // not establish the request's expiry. Absence from a lookup
+                // must not release exposure or prevent later reconciliation.
+                return Ok(());
+            }
         };
         let order = located.order;
         ensure!(
@@ -533,14 +539,11 @@ impl LiveInventoryHedge {
                 && located.status_timestamp >= pending.sent_at_ms.saturating_sub(1_000),
             "Hyperliquid lookup disagrees with the journaled IOC"
         );
+        let remaining = order.sz.parse::<Decimal>()?;
         let fill = match located.status.as_str() {
-            "filled" => pending.order.size,
-            "canceled" | "marginCanceled" | "reduceOnlyCanceled" => bail!(
-                "Terminal status {} cannot prove IOC fill quantity for {} (order {})",
-                located.status,
-                pending.id,
-                order.oid
-            ),
+            "filled" | "canceled" | "marginCanceled" | "reduceOnlyCanceled" => {
+                terminal_fill(&located.status, pending.order.size, remaining)?
+            }
             "rejected" | "iocCancelRejected" | "minTradeNtlRejected" | "reduceOnlyRejected" => {
                 Decimal::ZERO
             }
@@ -643,8 +646,29 @@ fn unix_ms() -> Result<u64> {
     )?)
 }
 
+/// Fill quantity of a terminal IOC from its original and remaining size.
+/// A partially filled IOC ends as `canceled` with the unfilled `sz` left.
+fn terminal_fill(status: &str, original: Decimal, remaining: Decimal) -> Result<Decimal> {
+    ensure!(
+        remaining >= Decimal::ZERO && remaining <= original,
+        "Hyperliquid {status} IOC reports remaining {remaining} outside 0..={original}"
+    );
+    Ok(original - remaining)
+}
+
+/// The configured absolute cap applies to each leg and the combined position.
+fn within_limits(limits: &HedgeLimits, primary: Decimal, hedge: Decimal) -> bool {
+    primary.abs() <= limits.max_unhedged_base
+        && hedge.abs() <= limits.max_unhedged_base
+        && primary
+            .checked_add(hedge)
+            .is_some_and(|net| net.abs() <= limits.max_unhedged_base)
+}
+
 fn fresh(now: u64, timestamp: u64, max_age: u64) -> bool {
-    timestamp > 0 && timestamp <= now && now - timestamp <= max_age
+    timestamp > 0
+        && timestamp <= now.saturating_add(CLOCK_TOLERANCE_MS)
+        && now.saturating_sub(timestamp) <= max_age
 }
 
 #[cfg(test)]

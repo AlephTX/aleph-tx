@@ -158,7 +158,7 @@ fn ack_and_timeout_reserve_exposure_until_terminal_and_account_agree() {
 #[tokio::test]
 async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_order() {
     use std::fs::OpenOptions;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
@@ -173,8 +173,11 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         .unwrap();
     let captured = Arc::new(AtomicUsize::new(0));
     let orders = Arc::clone(&captured);
+    let lookup_ready = Arc::new(AtomicBool::new(false));
+    let server_lookup_ready = Arc::clone(&lookup_ready);
     let server_journal = journal_path.clone();
     let server = tokio::spawn(async move {
+        let mut lost_order: Option<serde_json::Value> = None;
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
@@ -206,6 +209,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
                 assert!(action["signature"]["r"].is_string());
                 if orders.fetch_add(1, Ordering::AcqRel) > 0 {
                     // The POST reached the venue, but no acknowledgment reached the engine.
+                    lost_order = Some(wire.clone());
                     continue;
                 }
                 json!({"status":"ok","response":{"type":"order","data":{"statuses":[
@@ -219,12 +223,23 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
             } else {
                 let now = unix_ms().unwrap();
                 let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let recovered = server_lookup_ready.load(Ordering::Acquire);
                 match query["type"].as_str().unwrap() {
                     "clearinghouseState" => json!({"time":now,"withdrawable":"100","marginSummary":{
                         "accountValue":"100","totalNtlPos":"14","totalMarginUsed":"1"},
-                        "assetPositions":[{"position":{"coin":"ETH","szi":"-0.007","unrealizedPnl":"0"}}]}),
+                        "assetPositions":[{"position":{"coin":"ETH","szi":if recovered {"-0.011"} else {"-0.007"},"unrealizedPnl":"0"}}]}),
                     "l2Book" => json!({"coin":"ETH","time":now,
                         "levels":[[{"px":"2000","sz":"0.08"}],[{"px":"2001","sz":"0.12"}]]}),
+                    "orderStatus" if recovered => {
+                        let order = lost_order.as_ref().unwrap();
+                        let remaining = d(order["s"].as_str().unwrap()) - d("0.004");
+                        json!({"status":"order", "order":{
+                            "status":"canceled", "statusTimestamp":now,
+                            "order":{"coin":"ETH", "cloid":order["c"], "side":"A",
+                                "limitPx":order["p"], "origSz":order["s"],
+                                "sz":remaining.to_string(), "oid":8, "timestamp":now}
+                        }})
+                    }
                     "orderStatus" => json!({"status":"unknownOid"}),
                     kind => panic!("unexpected info request {kind}"),
                 }
@@ -266,16 +281,70 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     assert!(hedge.pending.is_none());
     hedge.execute(observed, false).await.unwrap();
     let unresolved = hedge.pending.as_ref().unwrap().id.clone();
+    // Intent time precedes journal fsync and signing. Even a much older
+    // intent cannot turn an unknown lookup into proof of a zero fill.
+    hedge.pending.as_mut().unwrap().sent_at_ms -= 60_000;
     assert!(hedge.observe(false).await.unwrap().is_none());
     hedge.rebalance().await.unwrap();
     assert_eq!(hedge.pending.as_ref().unwrap().id, unresolved);
     assert_eq!(captured.load(Ordering::Acquire), 2);
+    // A delayed terminal response must still be queried and its partial fill
+    // matched to the account before releasing the existing reservation.
+    lookup_ready.store(true, Ordering::Release);
+    let recovered = hedge.observe(false).await.unwrap().unwrap();
+    assert_eq!(recovered.hedge, d("-0.011"));
+    assert!(hedge.pending.is_none());
+    assert_eq!(captured.load(Ordering::Acquire), 2);
     let log = std::fs::read_to_string(&journal_path).unwrap();
     assert_eq!(log.matches("hedge_intent").count(), 2);
-    assert_eq!(log.matches("hedge_terminal").count(), 1);
+    assert_eq!(log.matches("hedge_terminal").count(), 2);
     drop(hedge);
     server.abort();
     let error = server.await.unwrap_err();
     assert!(error.is_cancelled());
     std::fs::remove_file(journal_path).unwrap();
+}
+
+#[test]
+fn freshness_tolerates_bounded_future_skew_only() {
+    assert!(fresh(10_000, 10_500, 3_000));
+    assert!(fresh(10_000, 10_000 + CLOCK_TOLERANCE_MS, 3_000));
+    assert!(!fresh(10_000, 10_001 + CLOCK_TOLERANCE_MS, 3_000));
+    assert!(!fresh(10_000, 6_999, 3_000));
+    assert!(!fresh(10_000, 0, 3_000));
+}
+
+#[test]
+fn partial_ioc_cancel_reports_the_filled_quantity() {
+    assert_eq!(
+        terminal_fill("canceled", d("0.015"), d("0.004")).unwrap(),
+        d("0.011")
+    );
+    assert_eq!(
+        terminal_fill("filled", d("0.015"), Decimal::ZERO).unwrap(),
+        d("0.015")
+    );
+    assert_eq!(
+        terminal_fill("canceled", d("0.015"), d("0.015")).unwrap(),
+        Decimal::ZERO
+    );
+    assert!(terminal_fill("canceled", d("0.015"), d("0.016")).is_err());
+    assert!(terminal_fill("canceled", d("0.015"), d("-0.001")).is_err());
+}
+
+#[test]
+fn configured_limits_bound_each_leg_and_net_exposure() {
+    let limits = limits();
+    assert!(within_limits(&limits, d("0.05"), d("-0.05")));
+    assert!(within_limits(&limits, d("0.03"), d("0.02")));
+    assert!(!within_limits(&limits, d("0.051"), d("-0.05")));
+    assert!(!within_limits(&limits, d("0.05"), d("-0.051")));
+    assert!(!within_limits(&limits, d("0.03"), d("0.03")));
+    assert!(!within_limits(&limits, d("-0.03"), d("-0.03")));
+
+    let order = plan_ioc(&market(), &limits, &observation("0.04", "-0.02"), false)
+        .unwrap()
+        .unwrap();
+    assert!(!order.is_buy && !order.reduce_only);
+    assert!(order.size > Decimal::ZERO && order.size <= d("0.02"));
 }
