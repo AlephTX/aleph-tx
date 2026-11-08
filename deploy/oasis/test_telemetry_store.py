@@ -187,6 +187,20 @@ class StoreTest(unittest.TestCase):
         self.assertAlmostEqual(session["combined_pnl"], 1.0 - 0.7 - fees)
         self.assertEqual(len(self.store.hedge_fills()), 2)
 
+    def test_snapshot_markout_fields_are_stored_with_null_until_warm(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   {"type": "snapshot", "ts_ms": 1100, "equity": 1.0, "markout_marked": 0,
+                    "markout_expired": 2, "markout_ewma_bps": None},
+                   {"type": "snapshot", "ts_ms": 1200, "equity": 1.0, "markout_marked": 9,
+                    "markout_expired": 2, "markout_last_delay_ms": 120.5,
+                    "markout_ewma_bps": -1.25})
+        self.store.ingest()
+        rows = self.store.db.execute("SELECT ts_ms, markout_marked, markout_expired,"
+                                     " markout_last_delay_ms, markout_ewma_bps FROM snapshots"
+                                     " ORDER BY ts_ms").fetchall()
+        self.assertEqual(tuple(rows[0]), (1100, 0, 2, None, None))
+        self.assertEqual(tuple(rows[1]), (1200, 9, 2, 120.5, -1.25))
+
     def test_old_database_gains_hedge_columns(self):
         import sqlite3
         path = self.dir / "old.sqlite3"

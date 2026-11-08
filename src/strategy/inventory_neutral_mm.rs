@@ -1184,6 +1184,7 @@ impl InventoryNeutralMM {
             return;
         };
         let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
+        let markout = self.markout.stats();
         sink.snapshot(crate::telemetry_sink::StrategySnapshot {
             equity: self.account_stats.portfolio_value,
             session_start_equity: self.session_start_balance,
@@ -1204,6 +1205,12 @@ impl InventoryNeutralMM {
             orders_placed: self.total_orders_placed,
             orders_rejected: self.telemetry.orders_rejected,
             active_orders: self.order_tracker.active_order_count() as u32,
+            markout_marked: markout.marked,
+            markout_expired: markout.expired,
+            markout_overwritten: markout.overwritten,
+            markout_missed: markout.missed,
+            markout_last_delay_ms: markout.last_delay_ms,
+            markout_ewma_bps: markout.ewma_bps,
         });
     }
 
@@ -1592,7 +1599,15 @@ impl InventoryNeutralMM {
         }
         let vol_bps = self.micro.volatility_bps();
         self.sigma.update(pricing_mid, now);
-        self.markout.update(&self.order_tracker, pricing_mid, now);
+        // Mark only against an independent fresh external fair value; the
+        // local fallback mid reflects our own quotes. NaN lets due fills wait
+        // within tolerance or expire.
+        let markout_fair = if using_external {
+            pricing_mid
+        } else {
+            f64::NAN
+        };
+        self.markout.update(&self.order_tracker, markout_fair, now);
         // Until the time-scaled estimate warms up, fall back to the per-sample
         // figure; both are ~1e-4 for liquid perps at sub-second sampling.
         let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);

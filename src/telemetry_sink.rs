@@ -55,6 +55,14 @@ pub struct StrategySnapshot {
     pub orders_placed: u64,
     pub orders_rejected: u64,
     pub active_orders: u32,
+    /// Fill markout accounting (observational; see strategy markout module).
+    pub markout_marked: u64,
+    pub markout_expired: u64,
+    pub markout_overwritten: u64,
+    pub markout_missed: u64,
+    pub markout_last_delay_ms: f64,
+    /// Bias-corrected EWMA markout in bps; null until warm.
+    pub markout_ewma_bps: Option<f64>,
 }
 
 /// One private order or fill event, copied from the V2 ring.

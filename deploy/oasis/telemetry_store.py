@@ -77,6 +77,10 @@ SNAPSHOT_FIELDS = ("equity", "session_start_equity", "available_balance", "margi
                    "fill_count", "orders_placed", "orders_rejected", "active_orders", "dropped")
 
 
+# Snapshot columns added after the first release, ingested when present.
+SNAPSHOT_MIGRATIONS = (("markout_marked", "INTEGER"), ("markout_expired", "INTEGER"),
+                       ("markout_overwritten", "INTEGER"), ("markout_missed", "INTEGER"),
+                       ("markout_last_delay_ms", "REAL"), ("markout_ewma_bps", "REAL"))
 # Columns added after the first release; created on demand for old databases.
 SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_avg_cost", "REAL NOT NULL DEFAULT 0"),
@@ -143,6 +147,10 @@ class TelemetryStore:
         for name, ddl in SESSION_MIGRATIONS:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(snapshots)")}
+        for name, ddl in SNAPSHOT_MIGRATIONS:
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE snapshots ADD COLUMN {name} {ddl}")
         self.db.execute("PRAGMA synchronous=NORMAL")
 
     # ── ingest ──────────────────────────────────────────────────────────
@@ -219,8 +227,13 @@ class TelemetryStore:
                         (sid, ts, ts))
         if kind == "snapshot":
             values = [finite(record.get(name)) for name in SNAPSHOT_FIELDS]
-            self.db.execute(f"INSERT OR REPLACE INTO snapshots (session_id, ts_ms, {', '.join(SNAPSHOT_FIELDS)})"
-                            f" VALUES (?,?{',?' * len(SNAPSHOT_FIELDS)})", (sid, ts, *values))
+            # Optional markout fields: null stays null (estimate not warm yet).
+            extra = [name for name, _ in SNAPSHOT_MIGRATIONS]
+            values += [None if record.get(name) is None else finite(record.get(name))
+                       for name in extra]
+            fields = (*SNAPSHOT_FIELDS, *extra)
+            self.db.execute(f"INSERT OR REPLACE INTO snapshots (session_id, ts_ms, {', '.join(fields)})"
+                            f" VALUES (?,?{',?' * len(fields)})", (sid, ts, *values))
         elif kind == "stopped":
             self.db.execute("UPDATE sessions SET stopped_ms=? WHERE session_id=?", (ts, sid))
         elif kind == "order":
