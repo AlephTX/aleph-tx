@@ -383,6 +383,21 @@ const RECONCILE_INTERVAL_SEC: u64 = 30;
 const ACTIVE_POSITION_RECONCILE_INTERVAL_SEC: u64 = 3;
 const GC_INTERVAL_SEC: u64 = 300;
 const LOCAL_FALLBACK_SPREAD_TICKS: f64 = 2.0;
+
+/// Where the latest accepted price sample came from and when. Set only where
+/// the sample is taken, so exporting or re-reading never makes it newer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PriceEvidence {
+    mid: f64,
+    /// `external_median` (basis-corrected), `lighter_book` or `lighter_depth`.
+    source: &'static str,
+    /// Local wall clock (ms since epoch) when the strategy took the sample.
+    sampled_ms: u64,
+    /// Oldest SHM feed timestamp (ms since epoch) among the books used. The
+    /// feeder writes venue time for Binance/Hyperliquid, receipt time for
+    /// EdgeX, and venue time with a receipt-time fallback for Lighter.
+    feed_ms: Option<u64>,
+}
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -426,6 +441,7 @@ pub struct InventoryNeutralMM {
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
+    price_evidence: Option<PriceEvidence>,
     markout: markout::MarkoutTracker,
     /// Fill count captured before this cycle read any inventory state. The
     /// wait compares against it, so a fill landing mid-cycle still wakes the
@@ -517,6 +533,7 @@ impl InventoryNeutralMM {
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             last_micro_sample: None,
+            price_evidence: None,
             cycle_fill_baseline: 0,
             markout: markout::MarkoutTracker::new(
                 config.markout_horizon_secs,
@@ -1221,13 +1238,7 @@ impl InventoryNeutralMM {
         };
         // The risk path falls back to 1.0 without a price sample; that is not
         // a mark. Export 0 so consumers treat the valuation as missing.
-        let mid = self
-            .micro
-            .price_samples
-            .back()
-            .copied()
-            .filter(|mid| mid.is_finite() && *mid > 0.0)
-            .unwrap_or(0.0);
+        let evidence = self.price_evidence;
         let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
         let markout = self.markout.stats();
         sink.snapshot(crate::telemetry_sink::StrategySnapshot {
@@ -1241,7 +1252,10 @@ impl InventoryNeutralMM {
             pending_exposure: self.order_tracker.net_pending_exposure(),
             worst_case_long: self.order_tracker.worst_case_long(),
             worst_case_short: self.order_tracker.worst_case_short(),
-            mid,
+            mid: evidence.map_or(0.0, |e| e.mid),
+            mark_source: evidence.map(|e| e.source),
+            mark_sampled_ms: evidence.map(|e| e.sampled_ms),
+            mark_feed_ms: evidence.and_then(|e| e.feed_ms),
             spread_bps: self.telemetry.spread_size_bps,
             adverse_selection: self.telemetry.adverse_selection_score,
             trade_cash_flow: self.order_tracker.trade_cash_flow(),
@@ -1587,48 +1601,60 @@ impl InventoryNeutralMM {
             None
         };
 
-        let (pricing_mid, using_external, mid) = if let Some(fair_mid) = external_fair {
-            // Learn the venue basis only from a fresh two-sided local book.
-            if bbo.bid_price > 0.0
-                && bbo.ask_price > bbo.bid_price
-                && !market_state::is_stale_bbo(
-                    bbo.timestamp_ns,
-                    now_ns,
-                    self.config.local_staleness_ms,
-                )
-            {
-                self.basis
-                    .observe(bbo.bid_price * 0.5 + bbo.ask_price * 0.5, fair_mid, now_ns);
-            }
-            // External exchanges drive fair value, shifted onto the Lighter
-            // price level; local mid is only for touch.
-            (self.basis.correct(fair_mid), true, local_mid)
-        } else {
-            // Fallback: use local VWMicro or simple mid when no external data
-            let vw_mid = if self.config.use_depth_pricing {
-                if let Some(depth) = self
-                    .shm_depth_reader
-                    .as_ref()
-                    .and_then(|reader| {
-                        reader.read_depth(self.config.symbol_id, self.config.exchange_id)
-                    })
-                    .filter(|depth| {
-                        !market_state::is_stale_bbo(
-                            depth.timestamp_ns,
-                            now_ns,
-                            self.config.local_staleness_ms,
-                        )
-                    })
+        let feed_ms = |ts_ns: u64| (ts_ns > 0).then_some(ts_ns / 1_000_000);
+        let (pricing_mid, using_external, mid, source, source_ts_ns) =
+            if let Some((fair_mid, fair_ts_ns)) = external_fair {
+                // Learn the venue basis only from a fresh two-sided local book.
+                if bbo.bid_price > 0.0
+                    && bbo.ask_price > bbo.bid_price
+                    && !market_state::is_stale_bbo(
+                        bbo.timestamp_ns,
+                        now_ns,
+                        self.config.local_staleness_ms,
+                    )
                 {
-                    self.calculate_vw_micro_price(&depth, bid_touch, ask_touch)
-                } else {
-                    local_mid
+                    self.basis
+                        .observe(bbo.bid_price * 0.5 + bbo.ask_price * 0.5, fair_mid, now_ns);
                 }
+                // External exchanges drive fair value, shifted onto the Lighter
+                // price level; local mid is only for touch.
+                (
+                    self.basis.correct(fair_mid),
+                    true,
+                    local_mid,
+                    "external_median",
+                    fair_ts_ns,
+                )
             } else {
-                local_mid
+                // Fallback: use local VWMicro or simple mid when no external data
+                let (vw_mid, source, source_ts_ns) = if self.config.use_depth_pricing {
+                    if let Some(depth) = self
+                        .shm_depth_reader
+                        .as_ref()
+                        .and_then(|reader| {
+                            reader.read_depth(self.config.symbol_id, self.config.exchange_id)
+                        })
+                        .filter(|depth| {
+                            !market_state::is_stale_bbo(
+                                depth.timestamp_ns,
+                                now_ns,
+                                self.config.local_staleness_ms,
+                            )
+                        })
+                    {
+                        (
+                            self.calculate_vw_micro_price(&depth, bid_touch, ask_touch),
+                            "lighter_depth",
+                            depth.timestamp_ns,
+                        )
+                    } else {
+                        (local_mid, "lighter_book", bbo.timestamp_ns)
+                    }
+                } else {
+                    (local_mid, "lighter_book", bbo.timestamp_ns)
+                };
+                (vw_mid, false, local_mid, source, source_ts_ns)
             };
-            (vw_mid, false, local_mid)
-        };
 
         // Update microstructure tracker with pricing_mid (now driven by external exchanges)
         // Per-sample signals (EMA periods, per-sample vol, toxicity) were
@@ -1640,6 +1666,15 @@ impl InventoryNeutralMM {
         }) {
             self.micro.update(pricing_mid);
             self.last_micro_sample = Some(now);
+            // Mirror the tracker: only an accepted sample becomes evidence.
+            if pricing_mid.is_finite() && pricing_mid > 0.0 {
+                self.price_evidence = Some(PriceEvidence {
+                    mid: pricing_mid,
+                    source,
+                    sampled_ms: now_ns / 1_000_000,
+                    feed_ms: feed_ms(source_ts_ns),
+                });
+            }
         }
         let vol_bps = self.micro.volatility_bps();
         self.sigma.update(pricing_mid, now);

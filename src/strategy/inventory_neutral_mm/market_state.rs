@@ -142,7 +142,8 @@ pub(super) fn build_market_state(
 /// Takes ALL non-local exchange BBOs (exchange_id != local AND != 0),
 /// filters stale data (> staleness_ms), calculates mid for each valid
 /// exchange, and returns the median (robust against single-exchange outlier).
-/// Returns None if no valid external data is available.
+/// Returns None if no valid external data is available; otherwise the
+/// median and the oldest feed timestamp (ns) among the books it used.
 ///
 /// v6.0.1: Added DEBUG logging to track staleness and fallback behavior.
 pub(super) fn external_fair_value_mid(
@@ -150,11 +151,12 @@ pub(super) fn external_fair_value_mid(
     local_exchange_id: u8,
     now_ns: u64,
     staleness_ms: u64,
-) -> Option<f64> {
+) -> Option<(f64, u64)> {
     // Exchange count is fixed by the SHM ABI: keep the fair-value hot path
     // on the stack, including median sorting.
     let mut valid_mids = [0.0_f64; NUM_EXCHANGES];
     let mut count = 0;
+    let mut oldest_ns = u64::MAX;
     for (exchange_id, bbo) in exchanges {
         if *exchange_id == local_exchange_id
             || *exchange_id == 0
@@ -167,6 +169,7 @@ pub(super) fn external_fair_value_mid(
         }
         // Halve before adding to avoid overflow on otherwise finite prices.
         valid_mids[count] = bbo.bid_price * 0.5 + bbo.ask_price * 0.5;
+        oldest_ns = oldest_ns.min(bbo.timestamp_ns);
         count += 1;
     }
     if count == 0 {
@@ -174,11 +177,12 @@ pub(super) fn external_fair_value_mid(
     }
     valid_mids[..count].sort_unstable_by(f64::total_cmp);
     let middle = count / 2;
-    Some(if count % 2 == 1 {
+    let mid = if count % 2 == 1 {
         valid_mids[middle]
     } else {
         valid_mids[middle - 1] * 0.5 + valid_mids[middle] * 0.5
-    })
+    };
+    Some((mid, oldest_ns))
 }
 
 #[cfg(test)]
@@ -337,7 +341,9 @@ mod tests {
         let external_mid =
             external_fair_value_mid(&exchanges, 2, now_ns, 500).expect("external mid");
 
-        assert!((external_mid - 2150.5).abs() < 1e-9);
+        assert!((external_mid.0 - 2150.5).abs() < 1e-9);
+        // Oldest book actually used (exchange 5 was stale and skipped).
+        assert_eq!(external_mid.1, 9_999_000_000);
     }
 
     #[test]
@@ -357,7 +363,7 @@ mod tests {
         let external_mid =
             external_fair_value_mid(&exchanges, 0, now_ns, 500).expect("external mid");
 
-        assert!((external_mid - 2100.5).abs() < 1e-9);
+        assert!((external_mid.0 - 2100.5).abs() < 1e-9);
     }
 
     #[test]

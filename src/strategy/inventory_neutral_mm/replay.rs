@@ -630,6 +630,19 @@ pub(super) async fn run(
     equity: f64,
     after_cycle: impl Fn(usize, &SimVenue, &OrderTracker),
 ) -> Outcome {
+    run_with(config, frames, equity, None, after_cycle, |_, _| {}).await
+}
+
+/// `run` with an optional telemetry sink on the strategy and a hook that
+/// sees the strategy itself after each cycle (e.g. to export snapshots).
+pub(super) async fn run_with(
+    config: InventoryNeutralMMConfig,
+    frames: &[Frame],
+    equity: f64,
+    telemetry: Option<crate::telemetry_sink::TelemetrySink>,
+    after_cycle: impl Fn(usize, &SimVenue, &OrderTracker),
+    mut inspect: impl FnMut(usize, &mut InventoryNeutralMM),
+) -> Outcome {
     let mut shm = ShmFiles::create();
     let tracker = Arc::new(OrderTracker::new());
     let venue = Arc::new(SimVenue::new(Arc::clone(&tracker), config.maker_fee_bps));
@@ -646,6 +659,9 @@ pub(super) async fn run(
         account,
         None,
     );
+    if let Some(sink) = telemetry {
+        strategy = strategy.with_telemetry_sink(sink);
+    }
     strategy.config.validate().unwrap();
     strategy.perform_startup_initialization().await.unwrap();
     let mut cycles = Vec::with_capacity(frames.len());
@@ -693,6 +709,7 @@ pub(super) async fn run(
             }
         }
         after_cycle(index, &venue, &tracker);
+        inspect(index, &mut strategy);
         states.push((
             venue.now_ms(),
             e8(venue.net_position()),
@@ -1291,5 +1308,103 @@ mod tests {
         assert_eq!(first.actions, second.actions);
         assert_eq!(first.states, second.states);
         assert_eq!(first, second);
+    }
+
+    /// Real sample → export → sink path: snapshots written later re-export
+    /// the same price evidence; only a new accepted sample changes it.
+    #[tokio::test(start_paused = true)]
+    async fn exported_mark_evidence_ages_instead_of_refreshing() {
+        let cfg = config();
+        let dir = std::env::temp_dir().join(format!("aleph-mark-{}", uuid::Uuid::new_v4()));
+        let info = crate::telemetry_sink::SessionInfo {
+            session_id: "mark".into(),
+            network: "Testnet".into(),
+            exchange: "lighter".into(),
+            symbol: "ETH".into(),
+            market_id: 0,
+            account: 7,
+            hedge_account: None,
+        };
+        let sink = crate::telemetry_sink::TelemetrySink::open(&dir, &info).unwrap();
+        let silent = Frame {
+            bbo_live: false,
+            ..quiet(1_000)
+        };
+        // t=1 s live; silent until past local staleness; then a new book.
+        let mut frames = vec![quiet(1_000)];
+        frames.extend(vec![silent; 8]);
+        frames.push(Frame {
+            external_mid: 2003.0,
+            ..quiet(1_000)
+        });
+        let mut published = Vec::new();
+        let outcome = run_with(
+            cfg.clone(),
+            &frames,
+            1_000.0,
+            Some(sink.clone()),
+            check,
+            |index, strategy| {
+                // Two exports per cycle: writing must not refresh evidence.
+                strategy.export_snapshot(0.0);
+                strategy.export_snapshot(0.0);
+                published.push((index, wall_ns() / 1_000_000));
+            },
+        )
+        .await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        sink.stopped().await.unwrap();
+        let text = std::fs::read_to_string(dir.join("mark.jsonl")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let snapshots: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|value| value["type"] == "snapshot")
+            .collect();
+        assert_eq!(snapshots.len(), 2 * frames.len());
+        let mark = |i: usize| {
+            let s = &snapshots[2 * i];
+            assert_eq!(s["mid"], snapshots[2 * i + 1]["mid"]);
+            assert_eq!(
+                s["mark_sampled_ms"],
+                snapshots[2 * i + 1]["mark_sampled_ms"]
+            );
+            assert_eq!(s["mark_feed_ms"], snapshots[2 * i + 1]["mark_feed_ms"]);
+            (
+                s["mid"].as_f64().unwrap(),
+                s["mark_source"].as_str().unwrap().to_owned(),
+                s["mark_sampled_ms"].as_u64().unwrap(),
+                s["mark_feed_ms"].as_u64().unwrap(),
+            )
+        };
+        let (mid0, source0, sampled0, feed0) = mark(0);
+        assert_eq!(source0, "external_median");
+        assert!((mid0 - 2000.0).abs() < 1.0, "{mid0}");
+        // Feed time is the published book time, never later than the sample.
+        assert!(feed0 <= sampled0 && sampled0 <= published[0].1);
+        // External books age out after external_staleness_ms (2 s): the
+        // strategy falls back to the silent local book. Samples are newer,
+        // the underlying book is not.
+        let fallback = (1..frames.len() - 1)
+            .find(|&i| mark(i).1 == "lighter_book")
+            .expect("local fallback sample");
+        let (_, _, sampled_fb, feed_fb) = mark(fallback);
+        assert!(sampled_fb > sampled0);
+        assert_eq!(feed_fb, feed0, "silent feed must keep its timestamp");
+        // Past local staleness quoting freezes: no new sample, so the
+        // exported evidence stays identical while snapshots keep coming.
+        let frozen = frames.len() - 2;
+        let (mid_frozen, _, sampled_frozen, feed_frozen) = mark(frozen);
+        assert_eq!(feed_frozen, feed0);
+        // The book behind the exported mark is older than the freeze age.
+        assert!(published[frozen].1 - feed_frozen > cfg.local_staleness_ms);
+        assert!(published[frozen].1 > sampled_frozen);
+        assert_eq!(mark(frozen - 1), mark(frozen), "frozen evidence refreshed");
+        assert!(mid_frozen > 0.0);
+        // A new live book is a new sample with new feed time and source.
+        let (mid_new, source_new, sampled_new, feed_new) = mark(frames.len() - 1);
+        assert_eq!(source_new, "external_median");
+        assert!(feed_new > feed0 && sampled_new > sampled_frozen);
+        assert!(mid_new > mid0);
     }
 }

@@ -1,0 +1,173 @@
+{
+ "session": {
+  "account": 7,
+  "avg_cost": 2000.0,
+  "buy_volume": 200.0,
+  "combined_pnl": 0.5,
+  "equity_change": 0.0,
+  "exchange": "lighter",
+  "fees": 0.0,
+  "fills": 1,
+  "hedge_account": "0xaa",
+  "hedge_avg_cost": 0.0,
+  "hedge_fees": 0.0,
+  "hedge_fills": 0,
+  "hedge_net_pnl": 0.0,
+  "hedge_position": 0.0,
+  "hedge_realized": 0.0,
+  "hedge_total_pnl": 0.0,
+  "hedge_unrealized": 0.0,
+  "hedge_volume": 0.0,
+  "last_ms": 1200,
+  "market_id": null,
+  "net_pnl": 0.0,
+  "network": "Testnet",
+  "open_orders": 0,
+  "position": 0.1,
+  "realized": 0.0,
+  "rejected": 0,
+  "sell_volume": 0.0,
+  "session_id": "s",
+  "started_ms": 1000,
+  "stopped_ms": null,
+  "stream_lost": 0,
+  "symbol": "ETH",
+  "total_pnl": 0.5,
+  "unrealized": 0.5,
+  "valuation": {
+   "combined_quality": "estimated",
+   "excluded": [
+    "funding"
+   ],
+   "hedge": {
+    "fee_sources": {
+     "configured_rate": 0,
+     "unknown": 0
+    },
+    "fees": "none",
+    "price_sources": {
+     "fill": 0,
+     "limit": 0,
+     "unknown": 0
+    },
+    "quality": "reported",
+    "realized": "none",
+    "unrealized": "flat"
+   },
+   "lighter": {
+    "fees": "reported",
+    "quality": "estimated",
+    "realized": "reported",
+    "unrealized": "estimated"
+   },
+   "mark": {
+    "feed_age_ms": null,
+    "feed_ms": null,
+    "freshness": "unknown",
+    "price": 2005.0,
+    "sample_age_ms": null,
+    "sampled_ms": null,
+    "scope": "both legs marked to the strategy reference mid",
+    "snapshot_ms": 1200,
+    "source": "unknown"
+   },
+   "missing": [
+    "mark_time",
+    "funding"
+   ],
+   "scope": "strategy session trades, not account equity"
+  },
+  "volume": 200.0
+ },
+ "snapshot": {
+  "active_orders": 0,
+  "adverse_selection": 0.0,
+  "available_balance": 0.0,
+  "confirmed_position": 0.0,
+  "dropped": 0,
+  "equity": 1000.0,
+  "exchange_position": 0.0,
+  "fill_count": 0,
+  "margin_usage": 0.0,
+  "mark_feed_ms": null,
+  "mark_sampled_ms": null,
+  "mark_source": null,
+  "markout_ewma_bps": null,
+  "markout_expired": null,
+  "markout_last_delay_ms": null,
+  "markout_marked": null,
+  "markout_missed": null,
+  "markout_overwritten": null,
+  "mid": 2005.0,
+  "orders_placed": 0,
+  "orders_rejected": 0,
+  "pending_exposure": 0.0,
+  "quote_position": 0.0,
+  "session_id": "s",
+  "session_start_equity": 1000.0,
+  "spread_bps": 0.0,
+  "total_fees": 0.0,
+  "trade_cash_flow": 0.0,
+  "ts_ms": 1200,
+  "worst_case_long": 0.0,
+  "worst_case_short": 0.0
+ },
+ "windows": {
+  "24h": {
+   "buy_volume": 200.0,
+   "fees": 0.0,
+   "fills": 1,
+   "losing": 0,
+   "net_bps": 0.0,
+   "net_pnl": 0.0,
+   "realized": 0.0,
+   "rebates": 0,
+   "sell_volume": 0,
+   "volume": 200.0,
+   "win_rate": null,
+   "winning": 0
+  },
+  "7d": {
+   "buy_volume": 200.0,
+   "fees": 0.0,
+   "fills": 1,
+   "losing": 0,
+   "net_bps": 0.0,
+   "net_pnl": 0.0,
+   "realized": 0.0,
+   "rebates": 0,
+   "sell_volume": 0,
+   "volume": 200.0,
+   "win_rate": null,
+   "winning": 0
+  },
+  "all": {
+   "buy_volume": 200.0,
+   "fees": 0.0,
+   "fills": 1,
+   "losing": 0,
+   "net_bps": 0.0,
+   "net_pnl": 0.0,
+   "realized": 0.0,
+   "rebates": 0,
+   "sell_volume": 0,
+   "volume": 200.0,
+   "win_rate": null,
+   "winning": 0
+  },
+  "today": {
+   "buy_volume": 200.0,
+   "fees": 0.0,
+   "fills": 1,
+   "losing": 0,
+   "net_bps": 0.0,
+   "net_pnl": 0.0,
+   "realized": 0.0,
+   "rebates": 0,
+   "sell_volume": 0,
+   "volume": 200.0,
+   "win_rate": null,
+   "winning": 0
+  }
+ }
+}

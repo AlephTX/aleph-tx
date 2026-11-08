@@ -45,9 +45,17 @@ pub struct StrategySnapshot {
     pub pending_exposure: f64,
     pub worst_case_long: f64,
     pub worst_case_short: f64,
-    /// Latest strategy price sample used to mark positions; 0 when no valid
-    /// sample exists yet (never a placeholder).
+    /// Latest accepted strategy price sample used to mark positions; 0 when
+    /// no valid sample exists yet (never a placeholder). Repeated snapshots
+    /// re-export the same sample; the record `ts_ms` is write time only.
     pub mid: f64,
+    /// Origin of `mid`: `external_median`, `lighter_book` or `lighter_depth`.
+    pub mark_source: Option<&'static str>,
+    /// Local wall clock (ms since epoch) when `mid` was sampled.
+    pub mark_sampled_ms: Option<u64>,
+    /// Oldest SHM feed timestamp (ms since epoch) behind `mid`; feeder-defined
+    /// (venue time for most venues, receipt time for EdgeX). None if unknown.
+    pub mark_feed_ms: Option<u64>,
     pub spread_bps: f64,
     pub adverse_selection: f64,
     /// Signed trade cash flow less fees since session start.
@@ -427,29 +435,65 @@ mod tests {
             ..Default::default()
         });
         sink.stopped().await.unwrap();
-        let produced = std::fs::read_to_string(dir.join("cost.jsonl")).unwrap();
+        check_fixture(&dir, "cost", "cost_session.jsonl");
+    }
+
+    /// An open Lighter position marked by one external sample, re-exported
+    /// by a later snapshot: the evidence fields must not move.
+    #[tokio::test]
+    async fn mark_fixture_matches_the_writer() {
+        let dir = std::env::temp_dir().join(format!("aleph-mark-{}", uuid::Uuid::new_v4()));
+        let sink = TelemetrySink::open(&dir, &session("mark")).unwrap();
+        sink.order_event(&ShmPrivateEventV2::order_filled(
+            1, 2, 1, 51, 101, 7, 2000.0, 0.1, 0.0, -0.002, false, 0, 11,
+        ));
+        let marked = StrategySnapshot {
+            equity: 1000.0,
+            session_start_equity: 1000.0,
+            exchange_position: 0.1,
+            mid: 2005.0,
+            mark_source: Some("external_median"),
+            mark_sampled_ms: Some(1_500),
+            mark_feed_ms: Some(1_400),
+            ..Default::default()
+        };
+        sink.snapshot(marked);
+        sink.snapshot(marked);
+        sink.stopped().await.unwrap();
+        check_fixture(&dir, "mark", "mark_session.jsonl");
+    }
+
+    /// Compare a writer-produced session with its checked-in fixture.
+    /// Normalization rule: record `ts_ms` (wall write time) becomes
+    /// 1000 * (line number); every other field, including mark evidence
+    /// times, is kept as written. `ALEPH_WRITE_FIXTURES=1` regenerates.
+    fn check_fixture(dir: &Path, session_id: &str, fixture: &str) {
+        let produced = std::fs::read_to_string(dir.join(format!("{session_id}.jsonl"))).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
-        // Timestamps differ per run; compare everything else.
         let normalize = |text: &str| -> Vec<serde_json::Value> {
             text.lines()
-                .map(|line| {
+                .enumerate()
+                .map(|(i, line)| {
                     let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
-                    value["ts_ms"] = 0.into();
+                    value["ts_ms"] = (1_000 * (i as u64 + 1)).into();
                     value
                 })
                 .collect()
         };
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/oasis/fixtures/cost_session.jsonl");
-        if std::env::var_os("ALEPH_WRITE_COST_FIXTURE").is_some() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("deploy/oasis/fixtures")
+            .join(fixture);
+        if std::env::var_os("ALEPH_WRITE_FIXTURES").is_some() {
             let lines: Vec<String> = normalize(&produced)
                 .iter()
                 .map(|value| serde_json::to_string(value).unwrap())
                 .collect();
-            std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
-            std::fs::write(&fixture, lines.join("\n") + "\n").unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         }
-        let expected = std::fs::read_to_string(&fixture).expect("cost fixture missing");
+        let expected = std::fs::read_to_string(&path).expect("writer fixture missing");
+        // Expected lines already carry normalized ts_ms; normalizing again is
+        // idempotent.
         assert_eq!(normalize(&produced), normalize(&expected));
     }
 

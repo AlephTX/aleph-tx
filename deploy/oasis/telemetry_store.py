@@ -89,6 +89,10 @@ SNAPSHOT_FIELDS = ("equity", "session_start_equity", "available_balance", "margi
 SNAPSHOT_MIGRATIONS = (("markout_marked", "INTEGER"), ("markout_expired", "INTEGER"),
                        ("markout_overwritten", "INTEGER"), ("markout_missed", "INTEGER"),
                        ("markout_last_delay_ms", "REAL"), ("markout_ewma_bps", "REAL"))
+# Price evidence behind `mid`; NULL on legacy rows (time and source unknown).
+MARK_MIGRATIONS = (("mark_source", "TEXT"), ("mark_sampled_ms", "INTEGER"),
+                   ("mark_feed_ms", "INTEGER"))
+MARK_SOURCES = ("external_median", "lighter_book", "lighter_depth")
 # Columns added after the first release; created on demand for old databases.
 SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_avg_cost", "REAL NOT NULL DEFAULT 0"),
@@ -110,6 +114,13 @@ def finite(value, default=0.0):
     except (TypeError, ValueError):
         return default
     return value if math.isfinite(value) else default
+
+
+def positive_int(value):
+    """Epoch-ms evidence time, or None when absent or not a positive integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 def integer(value, default=0):
@@ -161,7 +172,7 @@ class TelemetryStore:
         for name, ddl in SESSION_MIGRATIONS:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
-        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS),
+        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS),
                                   ("hedge_fills", HEDGE_FILL_MIGRATIONS)):
             columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
             for name, ddl in migrations:
@@ -247,7 +258,11 @@ class TelemetryStore:
             extra = [name for name, _ in SNAPSHOT_MIGRATIONS]
             values += [None if record.get(name) is None else finite(record.get(name))
                        for name in extra]
-            fields = (*SNAPSHOT_FIELDS, *extra)
+            source = record.get("mark_source")
+            values += [source if source in MARK_SOURCES else None,
+                       positive_int(record.get("mark_sampled_ms")),
+                       positive_int(record.get("mark_feed_ms"))]
+            fields = (*SNAPSHOT_FIELDS, *extra, *(name for name, _ in MARK_MIGRATIONS))
             self.db.execute(f"INSERT OR REPLACE INTO snapshots (session_id, ts_ms, {', '.join(fields)})"
                             f" VALUES (?,?{',?' * len(fields)})", (sid, ts, *values))
         elif kind == "stopped":
@@ -398,7 +413,36 @@ class TelemetryStore:
             fee[row["fee_source"] if row["fee_source"] in HEDGE_FEE_SOURCES else "unknown"] += 1
         return price, fee
 
-    def _session_pnl(self, session, snapshot):
+    @staticmethod
+    def _mark(session, snapshot, mid, now_ms):
+        """Where the mark came from and how old its evidence is.
+
+        `snapshot_ms` is only when the record was written; a later snapshot
+        can carry an old price. Ages are wall-clock differences against
+        `now_ms` and stay None when the evidence time is unknown or ahead of
+        `now_ms` (a different clock is never reported as fresh).
+        """
+        if mid is None:
+            return {"price": None, "source": None, "snapshot_ms": snapshot["ts_ms"] if snapshot else None,
+                    "sampled_ms": None, "feed_ms": None, "sample_age_ms": None,
+                    "feed_age_ms": None, "freshness": "none",
+                    "scope": "both legs marked to the strategy reference mid"}
+        sampled, feed = snapshot.get("mark_sampled_ms"), snapshot.get("mark_feed_ms")
+        age = lambda ts: now_ms - ts if ts is not None and ts <= now_ms else None
+        if feed is None:
+            freshness = "unknown"  # legacy record or no feed time behind the sample
+        elif feed > now_ms or (sampled is not None and feed > sampled):
+            freshness = "clock_mismatch"
+        elif session.get("stopped_ms"):
+            freshness = "historical"  # last mark of a stopped session
+        else:
+            freshness = "observed"  # evidence time known; see the ages
+        return {"price": mid, "source": snapshot.get("mark_source") or "unknown",
+                "snapshot_ms": snapshot["ts_ms"], "sampled_ms": sampled, "feed_ms": feed,
+                "sample_age_ms": age(sampled), "feed_age_ms": age(feed), "freshness": freshness,
+                "scope": "both legs marked to the strategy reference mid"}
+
+    def _session_pnl(self, session, snapshot, now_ms):
         """PnL fields plus `valuation`, which labels where each number came from.
 
         A nonzero position without a valid mark has unknown unrealized PnL, so
@@ -441,8 +485,11 @@ class TelemetryStore:
                  "price_sources": price, "fee_sources": fee,
                  "quality": worst(hedge_realized, hedge_fees, hedge_mark)}
 
+        mark_info = self._mark(session, snapshot, mid, now_ms)
         if "missing" in (lighter_mark, hedge_mark):
             missing.append("mark_price")
+        elif "estimated" in (lighter_mark, hedge_mark) and mark_info["feed_ms"] is None:
+            missing.append("mark_time")
         if price["limit"]:
             missing.append("hedge_fill_price")
         if price["unknown"]:
@@ -461,9 +508,7 @@ class TelemetryStore:
             "equity_change": (snapshot["equity"] - start_equity
                               if snapshot and start_equity and start_equity > 0 else None),
             "valuation": {
-                "mark": {"price": mid, "source": "strategy_mid" if mid else None,
-                         "ts_ms": snapshot["ts_ms"] if mid else None,
-                         "scope": "both legs marked to the strategy reference mid"},
+                "mark": mark_info,
                 "lighter": lighter, "hedge": hedge,
                 "combined_quality": worst(lighter["quality"], hedge["quality"]),
                 "missing": missing, "excluded": ["funding"],
@@ -478,7 +523,7 @@ class TelemetryStore:
         snapshot = self.latest_snapshot(session["session_id"]) if session else None
         current = None
         if session:
-            current = {**session, **self._session_pnl(session, snapshot),
+            current = {**session, **self._session_pnl(session, snapshot, now_ms),
                        "open_orders": self.db.execute(
                            "SELECT count(*) FROM orders WHERE session_id=? AND status IN ('open','partial')",
                            (session["session_id"],)).fetchone()[0]}

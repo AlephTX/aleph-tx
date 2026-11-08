@@ -114,8 +114,31 @@ export interface HedgeValuation extends LegValuation {
   fee_sources: { configured_rate: number; unknown: number }
 }
 
+/** observed: feed time known · historical: last mark of a stopped session ·
+ * unknown: legacy or no feed time · clock_mismatch: evidence time ahead of
+ * the server clock or of its own sample · none: no mark. */
+export type Freshness = 'observed' | 'historical' | 'unknown' | 'clock_mismatch' | 'none'
+
+/** Times are epoch ms on the strategy/server wall clocks; ages are computed by
+ * the server at summary time and are null when the evidence time is unknown. */
+export interface Mark {
+  price: number | null
+  /** external_median · lighter_book · lighter_depth · unknown (legacy). */
+  source: string | null
+  /** When the snapshot record was written; not when the price was observed. */
+  snapshot_ms: number | null
+  /** When the strategy accepted this price sample. */
+  sampled_ms: number | null
+  /** Oldest feed timestamp behind the sample (venue time for most venues). */
+  feed_ms: number | null
+  sample_age_ms: number | null
+  feed_age_ms: number | null
+  freshness: Freshness
+  scope: string
+}
+
 export interface Valuation {
-  mark: { price: number | null; source: string | null; ts_ms: number | null; scope: string }
+  mark: Mark
   lighter: LegValuation
   hedge: HedgeValuation
   combined_quality: Quality

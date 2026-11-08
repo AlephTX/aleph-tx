@@ -68,7 +68,7 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         label={`持仓 ${s?.symbol ?? ''}`}
         value={size(position)}
         valueClass={toneClass[tone(position)]}
-        sub={<>均价 {price(s?.avg_cost)} · 标记 {price(snap?.mid)}</>}
+        sub={<>均价 {price(s?.avg_cost)} · 标记 {price(s?.valuation?.mark.price ?? snap?.mid)}</>}
       />
       <Stat
         label="会话成交额"
@@ -81,8 +81,11 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         sub={<>报价价差 {bps(snap?.spread_bps)}</>}
       />
     </div>
-    {valuation && valuation.notes.length > 0 && (
-      <div className="text-xs text-muted">盈亏口径：{valuation.notes.join(' · ')}</div>
+    {valuation && (
+      <div className="text-xs text-muted" data-testid="valuation-notes">
+        {valuation.mark && <>{valuation.mark}。</>}
+        盈亏口径：{valuation.notes.join(' · ')}
+      </div>
     )}
     </div>
   )

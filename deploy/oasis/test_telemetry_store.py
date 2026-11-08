@@ -288,9 +288,13 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(v["lighter"]["unrealized"], "estimated")
         self.assertEqual(v["hedge"]["quality"], "reported")  # no hedge fills: nothing estimated
         self.assertEqual(v["hedge"]["realized"], "none")
-        self.assertEqual(v["mark"], {"price": 2005.0, "source": "strategy_mid", "ts_ms": 1200,
-                                     "scope": "both legs marked to the strategy reference mid"})
+        # Hand-written legacy snapshot: only its write time is known.
+        self.assertEqual((v["mark"]["price"], v["mark"]["source"], v["mark"]["snapshot_ms"]),
+                         (2005.0, "unknown", 1200))
+        self.assertEqual((v["mark"]["sampled_ms"], v["mark"]["feed_ms"], v["mark"]["feed_age_ms"],
+                          v["mark"]["freshness"]), (None, None, None, "unknown"))
         self.assertNotIn("mark_price", v["missing"])
+        self.assertIn("mark_time", v["missing"])
         self.write(fill(1300, "sell", 2010.0, 0.1, 0.0, 702, coid=2),
                    {"type": "snapshot", "ts_ms": 1400, "mid": 0.0})
         self.store.ingest()
@@ -347,6 +351,115 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(session["valuation"]["hedge"]["fees"], "unknown")
         finally:
             store.db.close()
+    def load_fixture(self, name):
+        # Produced by the Rust TelemetrySink (see check_fixture in telemetry_sink.rs).
+        self.file.write_text((Path(__file__).parent / "fixtures" / name).read_text())
+        self.store.ingest()
+
+    def test_writer_mark_evidence_ages_across_repeated_snapshots(self):
+        self.load_fixture("mark_session.jsonl")
+        early = self.store.summary(now_ms=6_000)["session"]
+        late = self.store.summary(now_ms=3_606_000)["session"]
+        for session in (early, late):
+            self.assertAlmostEqual(session["unrealized"], 0.5)
+            mark = session["valuation"]["mark"]
+            # The newest snapshot (written at 4000) re-exported the 1400 sample.
+            self.assertEqual((mark["source"], mark["snapshot_ms"], mark["sampled_ms"],
+                              mark["feed_ms"]), ("external_median", 4000, 1500, 1400))
+            self.assertEqual(mark["freshness"], "historical")  # session stopped
+            self.assertNotIn("mark_time", session["valuation"]["missing"])
+        self.assertEqual(early["valuation"]["mark"]["feed_age_ms"], 4_600)
+        self.assertEqual(late["valuation"]["mark"]["feed_age_ms"], 3_604_600)
+        self.assertEqual(late["valuation"]["mark"]["sample_age_ms"], 3_604_500)
+
+    def test_mark_evidence_clock_mismatch_and_garbage_are_never_fresh(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.0, 801),
+                   {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0,
+                    "mark_source": "external_median", "mark_sampled_ms": 1150,
+                    "mark_feed_ms": 9_000})
+        self.store.ingest()
+        mark = self.store.summary(now_ms=5_000)["session"]["valuation"]["mark"]
+        self.assertEqual((mark["freshness"], mark["feed_age_ms"]), ("clock_mismatch", None))
+        self.write({"type": "snapshot", "ts_ms": 1300, "mid": 2005.0, "mark_source": "made_up",
+                    "mark_sampled_ms": "1200", "mark_feed_ms": -5})
+        self.store.ingest()
+        mark = self.store.summary(now_ms=5_000)["session"]["valuation"]["mark"]
+        self.assertEqual((mark["source"], mark["sampled_ms"], mark["feed_ms"], mark["freshness"]),
+                         ("unknown", None, None, "unknown"))
+        self.write({"type": "snapshot", "ts_ms": 1400, "mid": 2005.0,
+                    "mark_source": "lighter_book", "mark_sampled_ms": 1350, "mark_feed_ms": 1300})
+        self.store.ingest()
+        mark = self.store.summary(now_ms=5_000)["session"]["valuation"]["mark"]
+        self.assertEqual((mark["source"], mark["freshness"], mark["feed_age_ms"]),
+                         ("lighter_book", "observed", 3_700))
+
+    def test_old_snapshot_table_gains_mark_columns_as_unknown(self):
+        import sqlite3
+        path = self.dir / "old_mark.sqlite3"
+        old = TelemetryStore(str(path), self.dir)
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.0, 901),
+                   {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0})
+        old.ingest()
+        old.db.close()
+        db = sqlite3.connect(path)
+        for name in ("mark_source", "mark_sampled_ms", "mark_feed_ms"):
+            db.execute(f"ALTER TABLE snapshots DROP COLUMN {name}")
+        db.commit()
+        db.close()
+        store = TelemetryStore(str(path), self.dir)
+        try:
+            session = store.summary(now_ms=2_000)["session"]
+            mark = session["valuation"]["mark"]
+            self.assertEqual((mark["snapshot_ms"], mark["feed_ms"], mark["freshness"]),
+                             (1200, None, "unknown"))
+            self.assertAlmostEqual(session["unrealized"], 0.5)
+            self.assertIn("mark_time", session["valuation"]["missing"])
+        finally:
+            store.db.close()
+
+DASHBOARD_FIXTURES = Path(__file__).resolve().parents[2] / "dashboard" / "src" / "fixtures"
+
+
+class DashboardContractTest(unittest.TestCase):
+    """Real summaries the React tests consume; regenerate with ALEPH_WRITE_FIXTURES=1.
+
+    Inputs are the Rust-written session fixtures (plus one legacy session
+    without mark evidence); `now_ms` is fixed so ages are deterministic.
+    """
+    LEGACY = [{"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH",
+               "account": 7, "network": "Testnet", "hedge_account": "0xaa"},
+              fill(1100, "buy", 2000.0, 0.1, 0.0, 1),
+              {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0, "equity": 1000.0,
+               "session_start_equity": 1000.0}]
+    CASES = {"cost": ("cost_session.jsonl", 10_000), "mark": ("mark_session.jsonl", 3_606_000),
+             "legacy": (LEGACY, 10_000)}
+
+    def summary(self, source, now_ms):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            if isinstance(source, str):
+                path.write_text((Path(__file__).parent / "fixtures" / source).read_text())
+            else:
+                path.write_text("".join(json.dumps(r) + "\n" for r in source))
+            store = TelemetryStore(":memory:", Path(tmp))
+            try:
+                store.ingest()
+                return store.summary(now_ms=now_ms)
+            finally:
+                store.db.close()
+
+    def test_dashboard_fixtures_match_the_store(self):
+        import os
+        for name, (source, now_ms) in self.CASES.items():
+            produced = json.loads(json.dumps(self.summary(source, now_ms)))
+            path = DASHBOARD_FIXTURES / f"summary_{name}.json"
+            if os.environ.get("ALEPH_WRITE_FIXTURES"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(produced, indent=1, sort_keys=True) + "\n")
+            with self.subTest(name):
+                self.assertEqual(produced, json.loads(path.read_text()))
 
 
 if __name__ == "__main__":
