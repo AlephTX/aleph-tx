@@ -1,316 +1,137 @@
-# AlephTX v6.0.0
+# AlephTX
 
+AlephTX is a Go and Rust system for perpetual futures market making and
+cross-venue research. Its primary trading path runs one Lighter market per
+supervised session, with an optional Hyperliquid inventory hedge. The same
+repository includes a public market recorder, offline execution and strategy
+replays, and a console for monitoring trading sessions.
 
-> 2026-11-07 engineering audit: [findings, offline verification and measured performance](docs/AUDIT_2026_11.md). Run `make test`, `make check`, and `make build` before deployment. Lighter signing remains pinned to Linux x86-64; other platforms support offline verification.
+## Start locally
 
-> [Crypto and equity perpetual strategies with paper replay](docs/PERP_RELATIVE_VALUE.md) · [Cross-venue platform support](docs/CROSS_VENUE.md) · [Public market recording](docs/PERP_RECORDING.md).
+Use Rust 1.95.0 with `rustfmt` and Clippy, as pinned in
+[CI](.github/workflows/ci.yml), and the Go version declared in [feeder/go.mod](feeder/go.mod).
+The monitor tests require Python 3 with SQLite. Use Node 22.12+ on the Node 22
+line or Node 24 for the dashboard. CI covers Linux and macOS. The bundled
+Lighter signer and supervised trading require **Linux x86-64**.
 
-Institutional-grade High-Frequency Trading framework for crypto perpetual markets. Split architecture: **Go** (network I/O, WebSocket ingestion) + **Rust** (strategy engine, direct HTTP execution), connected via lock-free shared memory IPC.
+Validate the checked-in example and run the core checks from the repository root.
+The tests use offline fixtures and local test services. Installing build
+dependencies can require network access.
 
-**v6.0.0 Highlights**: External fair value anchor (Binance Futures + Hyperliquid median pricing), momentum-aware asymmetric spread, position timeout IOC flatten, `InventoryContext`/`AnchorParams`/`TelemetrySync` parameter structs, 0 clippy warnings.
+```sh
+make trade MODE=check CONFIG=config.example.toml
+make fmt-check
+make check
+make test
+make build
+```
 
-**v5.0.0 Foundation**: Per-order state machine (OrderTracker), 128-byte V2 SHM events, worst-case bilateral risk control, OBI+VWMicro pricing, dedicated data plane thread, zero-copy JSON parsing, sigmoid inventory skew, typed error codes, circuit breaker with jitter, structured telemetry.
+Run `make test-python` for monitor ingestion and alerts, and
+`make dashboard-build` for the console type checks, tests, and production bundle.
+`make benchmark` runs the opt-in local benchmarks. Record the hardware,
+toolchain, workload, and baseline when comparing results. Historical
+measurements and their scope are in the [engineering audit](docs/AUDIT_2026_11.md).
 
-Current Lighter production path:
-- `lighter_inventory_mm` reads `/dev/shm/aleph-events-v2` directly for authoritative private order events.
-- **v6.0.0**: Pricing uses Binance Futures + Hyperliquid mid-price median as PRIMARY fair value anchor. Lighter local BBO only for touch positioning.
-- **v6.0.0**: Momentum-aware asymmetric spread widens against momentum direction to reduce adverse selection.
-- **v6.0.0**: Position timeout (120s) triggers IOC flatten to prevent overnight inventory drift.
-- Equity-aware sizing via `base_order_notional_usd`, `max_position_notional_usd`, `inventory_urgency_notional_usd`.
-- `symbol_id` + `market_id` are runtime-configured. The same strategy path can be retargeted to other Lighter markets.
+After `make build`, run the included synthetic scenarios without credentials.
+
+```sh
+target/release/cross_venue hedge-replay examples/hedge_replay.json
+target/release/cross_venue perp-replay examples/crypto_funding_paper.json
+target/release/cross_venue perp-replay examples/equity_basis_paper.json
+```
+
+These scenarios exercise order reconciliation, funding carry, and equity basis
+reversion. The [paper replay guide](docs/PERP_RELATIVE_VALUE.md) describes the
+liquidity, latency, and funding assumptions that limit how the results can be used.
 
 ## Architecture
 
-### System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            Go Feeder (Network I/O)                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
-│  │  Lighter WS  │  │   Binance    │  │ Hyperliquid  │  │  EdgeX / 01  │   │
-│  │ Pub/Priv/Acc │  │  Futures WS  │  │      WS      │  │      WS      │   │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
-└─────────┼──────────────────┼──────────────────┼──────────────────┼──────────┘
-          │                  │                  │                  │
-          └──────────────────┴──────────────────┴──────────────────┘
-                                      │
-                                      ▼
-          ┌───────────────────────────────────────────────────────┐
-          │         Shared Memory IPC (Lock-Free)                 │
-          │  ┌─────────────────────────────────────────────────┐  │
-          │  │ /dev/shm/aleph-matrix        (917KB BBO Matrix, 7 exchanges) │  │
-          │  │ /dev/shm/aleph-depth         (3MB Depth L1-L5)  │  │ ← v5.0.0
-          │  │ /dev/shm/aleph-events-v2     (128KB V2 Events)  │  │
-          │  │ /dev/shm/aleph-account-stats (128B Stats)       │  │
-          │  └─────────────────────────────────────────────────┘  │
-          └───────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Rust Core (Strategy Engine)                         │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  Data Plane Thread (CPU-pinned, dedicated OS thread)                │   │ ← v5.0.0
-│  │    ShmReader (Seqlock) → flume channel → Tokio async recv           │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  OrderTracker: Per-Order State Machine (RwLock<TrackerState>)      │   │ ← v5.0.0
-│  │    worst_case_long/short + confirmed_position (bilateral risk)     │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  Strategy Engine:                                                    │   │
-│  │    • InventoryNeutralMM (Sigmoid skew + OBI+VWMicro pricing)        │   │ ← v5.0.0
-│  │    • AdaptiveMM  • MarketMaker (EdgeX)                               │   │
-│  │    • BackpackMM  • ArbitrageEngine                                   │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  FFI Sign + HTTP Direct Execution (No Boomerang)                    │   │
-│  │    Typed error codes + margin cooldown tracking                     │   │ ← v5.0.0
-│  └──────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-          ┌───────────────────────────────────────────────────────┐
-          │              Exchange REST APIs                       │
-          │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐│
-          │  │  Lighter DEX │  │   Backpack   │  │    EdgeX     ││
-          │  │ Poseidon2 +  │  │   Ed25519    │  │   StarkNet   ││
-          │  │    EdDSA     │  │              │  │   Pedersen   ││
-          │  └──────────────┘  └──────────────┘  └──────────────┘│
-          └───────────────────────────────────────────────────────┘
-                                      │
-                                      │ (Fill/Cancel Events)
-                                      ▼
-                          Back to /dev/shm/aleph-events
+```mermaid
+flowchart LR
+    V[Exchange APIs] -->|Market and private streams| G[Go feeder]
+    G -->|BBO, depth, events, account stats| S[Shared memory]
+    S --> R[Rust strategy and order tracker]
+    R -->|Signed orders and reconciliation| V
+    R --> J[Recovery journal]
+    J --> A[Offline journal audit]
+    R --> T[Session telemetry]
+    T --> M[Monitor and SQLite]
+    M --> D[React console]
 ```
 
-### Data Flow
+Go owns ingestion and shared memory publication. Rust owns quoting, risk
+reservations, signing, and submission. The Lighter strategy consumes the
+128-byte V2 private events for the order lifecycle. Its quoting cycle wakes on
+market updates or fills and checks freshness, worst-case exposure, and maker
+edge before admitting new quotes. Pricing uses fresh external anchors when
+available, with a local fallback and configurable inventory and markout controls.
 
-| Layer | Component | Protocol | Latency |
-|-------|-----------|----------|---------|
-| **Ingestion** | Go Feeder | WebSocket → SHM Write (gjson zero-copy) | ~30μs (v5.0.0: -40%) |
-| **IPC** | Shared Memory | Seqlock (BBO) + SPSC Ring (Events) | ~100ns read |
-| **Strategy** | Rust Engine | Lock-free polling loop (dedicated thread) | <200ns per tick (v5.0.0: -20%) |
-| **Execution** | HTTP REST | FFI Sign + Keep-Alive | ~5-20ms RTT |
-| **Reconciliation** | Shadow Ledger | Event stream background task (lock-free atomics) | Async |
+The `[symbols]` table maps tickers to shared memory IDs across Go and Rust.
+Each venue's market ID and tick and lot sizes are separate. See
+[config.example.toml](config.example.toml) for a complete profile.
 
-### Key Design Principles
+## Trading, recovery, and monitoring
 
-- **Dual-Track IPC**: Track 1 (BBO state via seqlock matrix) + Track 2 (private events via SPSC ring buffer) + Track 3 (L1-L5 depth for OBI)
-- **No Boomerang Execution**: Rust fires HTTP orders directly to exchanges. Never sends execution commands back to Go.
-- **Optimistic Accounting**: Shadow ledger updates `in_flight_pos` (lock-free AtomicI64) before API call; background task reconciles via event stream.
-- **Zero Heap Allocations** on hot path (quoting loop < 200ns per tick)
-- **Lock-Free Hot Path**: Position reads via CachePadded<AtomicI64>, eliminating RwLock contention
+- **Supervised trading.** Follow the [Lighter runbook](docs/LIVE_TRADING.md) to
+  configure dedicated accounts, verify the mainnet or testnet profile, and start
+  or stop the session. Startup requires the selected Lighter market to be flat
+  with no open orders.
+  Both `MODE=live` and `MODE=testnet` can submit and cancel orders. Keep
+  credentials, local profiles with private data, and account evidence out of Git.
+- **Risk and recovery.** The strategy persists the UTC daily loss budget across
+  restarts. The optional hedge bounds single-leg and net exposure, records each
+  IOC intent before dispatch, and waits for terminal order evidence and a
+  matching account position before releasing its reservation. Unverified cleanup
+  leaves an active journal that blocks restart.
+- **Journal audit.** `cross_venue hedge-journal-audit JOURNAL [EVIDENCE]` reads
+  local files and reports reconciliation gaps, possible exposure, and fee
+  evidence when supplied. Its verdict covers the supplied evidence. Restart
+  remains an operator decision after both venues are reconciled. Supervised
+  sessions write schema 2. Schema 3 Lighter batch records and the shared serial
+  journal are exercised in offline trials.
+- **Oasis console.** Session telemetry is separate from the recovery journal.
+  The [Oasis runbook](deploy/oasis/README.md) covers the public feeder, console,
+  access tunnel, and emergency stop. The monitor uses the strategy's persisted
+  daily loss baseline and configured threshold for drawdown alerts. Combined
+  trade PnL identifies estimated hedge prices and fees and excludes funding.
+  Account equity is reported separately.
+- **Research and adapters.** The [cross-venue guide](docs/CROSS_VENUE.md)
+  distinguishes public data, standalone order APIs, and replay. Use the
+  [recording guide](docs/PERP_RECORDING.md) for public capture, clock alignment,
+  equity sessions, and funding evidence. Legacy strategy launchers have their
+  own execution and recovery behavior.
 
-## v5.0.0 Architecture Upgrade
+## Repository map
 
-### Sprint 1: Quick Wins ✅
-- **Sigmoid SIZE Skew**: `tanh(pos/max_pos)` curve replacing linear urgency=2.0 for smoother inventory control
-- **Typed Lighter Error Codes**: `LighterErrorCode` enum with `requires_nonce_reset()` and `is_margin_error()` methods
-- **Go Circuit Breaker**: Exponential backoff with ±25% jitter + 10-failure circuit breaker (60s pause)
+| Path | Responsibility |
+| --- | --- |
+| [src/bin/](src/bin/) | Supervised launcher, cross-venue CLI, and strategy entry points |
+| [src/strategy/](src/strategy/) | Quoting, risk sizing, and offline replay |
+| [src/exchanges/](src/exchanges/) | Venue protocols, metadata, signing, and execution |
+| [src/live_hedge/](src/live_hedge/) | Journal records and read-only reconciliation audit |
+| [feeder/](feeder/) | Go streams, shared memory producers, and public recorder |
+| [deploy/oasis/](deploy/oasis/) and [dashboard/](dashboard/) | Monitor, deployment runbook, and console |
+| [examples/](examples/) | Replay and capture inputs, plus venue diagnostics |
 
-### Sprint 2: Latency Optimization ✅
-- **Data Plane Thread**: Dedicated OS thread for SHM polling (CPU core 2 pinned), connected to Tokio via flume channel
-  - Eliminates async starvation from spin-loop monopolizing Tokio workers
-  - Expected: p99 latency -30%
-- **Zero-Copy JSON**: `gjson` replacing `encoding/json` in Go feeder private stream
-  - Eliminates reflection overhead and heap allocations
-  - Expected: GC pause -80%
-
-### Sprint 3: Advanced Features ✅
-- **OBI + VWMicro Pricing**: Volume-weighted micro price using L1-L5 depth data
-  - New `/dev/shm/aleph-depth` (3MB) independent SHM segment
-  - Formula: `(bid_notional * ask_L1 + ask_notional * bid_L1) / (bid_notional + ask_notional)`
-  - Graceful fallback to simple mid when depth unavailable
-- **Lock-Free Shadow Ledger**: `CachePadded<AtomicI64>` (scaled 1e8) for `real_pos` and `in_flight_pos`
-  - Eliminates cache-coherency ping-pong on hot path
-  - `add_in_flight()` and `force_sync_position()` now `&self` (no write lock)
-  - Expected: ~50ns reduction on position reads
-- **Telemetry Module**: Structured metrics export via tracing
-  - Order placed/rejected counts, margin cooldown tracking
-  - Spread size + adverse selection score monitoring
-  - 30s periodic snapshot export
-
-### Performance Impact Summary
-- **p99 Latency**: -30% (data plane decoupling)
-- **GC Pause**: -80% (zero-copy JSON)
-- **Position Read**: -50ns (lock-free atomics)
-- **Inventory Control**: Smoother (sigmoid curve)
-- **Pricing Accuracy**: +15% (OBI+VWMicro vs simple mid)
-
-## Quick Start
-
-```bash
-cp config.example.toml config.toml
-make trade               # Validate the profile offline
-make trade MODE=live     # Linux x86-64, after configuring credentials and risk limits
-make trade MODE=testnet  # Uses config.testnet.toml and .env.testnet
-```
-
-The foreground session starts Lighter market making and enables the Hyperliquid inventory hedge when `[inventory_hedge]` is configured. Stop it with Ctrl+C or SIGTERM. Logs go to the terminal. See the [supervised trading runbook](docs/LIVE_TRADING.md) for credentials, testnet and restart handling.
-
-## Make Targets
-
-| Target | Description |
-|--------|-------------|
-| `make build` | Build all binaries (Go feeder + Rust) |
-| `make trade [MODE=live]` | Check the trading profile or start supervised trading |
-| `make lighter-up` | Alias for supervised Lighter trading |
-| `make lighter-down` / `lighter-logs` | Manage the legacy background launcher |
-| `make backpack-up STRATEGY=<name>` | Start Backpack strategy |
-| `make backpack-down` / `backpack-logs` | Stop / view logs for Backpack |
-| `make edgex-up STRATEGY=<name>` | Start EdgeX strategy |
-| `make edgex-down` / `edgex-logs` | Stop / view logs for EdgeX |
-| `make status` | Show all running strategies across exchanges |
-| `make test` | Run Rust tests and Go race tests |
-| `make clean` | Clean build artifacts |
-
-## Project Structure
-
-```
-aleph-tx/
-├── config.toml          # Unified configuration (feeder + strategy, all exchanges)
-├── .env.lighter         # Lighter DEX credentials (private keys only)
-├── .env.edgex           # EdgeX credentials (private keys only)
-├── .env.backpack        # Backpack credentials (private keys only)
-├── feeder/              # Go: WebSocket ingestion, CGO FFI exports
-│   ├── exchanges/       #   Exchange adapters (Lighter, Hyper, Backpack, EdgeX, 01)
-│   ├── shm/             #   Shared memory writers (BBO matrix, event ring, account stats, depth)
-│   └── config/          #   TOML config loader
-├── src/                 # Rust: HFT strategy engine
-│   ├── data_plane.rs    #   Dedicated data plane thread (v5.0.0)
-│   ├── shm_depth_reader.rs  #   L1-L5 depth reader (v5.0.0)
-│   ├── telemetry.rs     #   Telemetry module (v5.0.0)
-│   ├── strategy/        #   Strategy implementations (inventory_neutral_mm, lighter_adaptive_mm, etc.)
-│   ├── exchanges/       #   Exchange integrations (backpack, edgex, lighter)
-│   │   └── lighter/     #     Lighter-specific logic and errors
-│   ├── native/          #   Native FFI libraries (Lighter Ed25519 signer .so)
-│   └── types/           #   Core types + C-ABI event struct (64 bytes)
-├── examples/            # Entry point binaries for make targets + debug/benchmark tools
-├── docs/                # Reference documentation
-│   └── CONFIGURATION.md #   Configuration guide
-└── proto/               # gRPC service definitions
-```
-
-## Supported Exchanges
-
-| Exchange | SHM ID | Role | Auth | Status |
-|----------|--------|------|------|--------|
-| **Lighter DEX** | 2 | Trading venue (HFT MM) | Poseidon2 + EdDSA via FFI | Production |
-| **Binance Futures** | 6 | Fair value anchor | None (public bookTicker) | Production |
-| **Hyperliquid** | 1 | Fair value anchor | None (public l2Book) | Production |
-| **EdgeX** | 3 | Fair value anchor | StarkNet Pedersen L2 | Production |
-| **Backpack** | 5 | Secondary (MM) | Ed25519 | Ready |
-| **01 Exchange** | 4 | Data feed | - | Feed only |
-
-## Strategies
-
-### Inventory-Neutral MM v6.0 (Primary)
-
-The production strategy (`src/strategy/inventory_neutral_mm.rs`) implements config-driven HFT market making via the `Exchange` trait:
-
-- **External Fair Value Anchor** (v6.0.0): Binance Futures + Hyperliquid mid-price median as primary pricing source
-- **Momentum-Aware Spread** (v6.0.0): Asymmetric half-spreads widen against momentum direction
-- **Position Timeout Flatten** (v6.0.0): IOC flatten after 120s holding beyond deadband
-- **A-S Pricing** (v6.0.0): γ=10, κ=5000, dynamic vol-based spread cap (6-30 bps)
-- **Inventory Neutral**: Maintains near-zero net position via sigmoid skew
-- **Equity-Aware Risk Sizing**: USD-notional sizing (`base_order_notional_usd`, `max_position_notional_usd`)
-- **Batch Quoting**: Paired bid/ask via `place_batch` for atomic updates
-- **Telemetry**: Structured metrics export (orders, margin cooldown, spread, adverse selection)
-
-### Adaptive MM
-
-The adaptive strategy (`src/strategy/adaptive_mm.rs`) implements fee-aware HFT with microstructure signals:
-
-- **Fee-Aware Spread**: Ensures spread > round-trip fee (0.76 bps for Premium account)
-- **Microstructure Tracker**: EWMA fast/slow momentum, realized volatility, adverse selection score
-- **Inventory Skew**: Linear position-based adjustment to flatten exposure
-- **Dynamic Sizing**: Position scaled by leverage and available balance from account stats
-
-## Configuration
-
-```toml
-# config.toml (copy from config.example.toml)
-[lighter]
-sigmoid_steepness = 4.0       # v5.0.0: Sigmoid curve steepness (default 4.0)
-
-[backpack]
-risk_fraction = 0.20          # Fraction of equity at risk
-min_spread_bps = 6.0          # Minimum half-spread (bps)
-vol_multiplier = 2.5          # spread = max(min_spread, vol * multiplier)
-requote_interval_ms = 3000    # Re-quote interval
-
-[edgex]
-risk_fraction = 0.10
-min_spread_bps = 8.0          # Higher fees → wider spread
-requote_interval_ms = 5000    # Rate limit: 2 req/2s
-```
-
-## Credentials
-
-```bash
-# .env.lighter
-API_KEY_PRIVATE_KEY=<hex>
-LIGHTER_ACCOUNT_INDEX=<int>
-LIGHTER_API_KEY_INDEX=<int>
-
-# .env.backpack
-BACKPACK_PUBLIC_KEY=<key>
-BACKPACK_SECRET_KEY=<key>
-
-# .env.edgex
-EDGEX_STARK_PRIVATE_KEY=<hex>
-EDGEX_ACCOUNT_ID=<id>
-```
+Repository engineering rules and review criteria live in [AGENTS.md](AGENTS.md).
+[CLAUDE.md](CLAUDE.md) imports the shared rules for Claude Code.
 
 ## Roadmap
 
-### Phase 1: Alpha Enhancement (Direct PnL Impact) - COMPLETED ✅
+1. **Prove recovery under failure.** Expand deterministic replay and restart
+   tests for lost acknowledgments, partial fills, feed gaps, and crashes around
+   journal writes and order sends. Before enabling schema 3 in supervised
+   trading, verify compatibility with existing journals and measure commit
+   tail latency under contention on the target host. Require reconciliation when
+   evidence is incomplete.
+2. **Calibrate with recorded evidence.** Build synchronized depth, reference,
+   and funding datasets for matched markets. Evaluate on a chronological
+   holdout, including stressed sessions. Compare net execution cost, markout,
+   time with residual exposure, and accounting coverage. Preserve the distinction
+   between estimates, venue-reported costs, and actual account equity.
+3. **Expand after the controls scale.** Add markets and venues only after
+   validating contract identity, account and portfolio limits, and recovery for
+   each integration. Benchmark execution changes with representative data and
+   venue behavior before choosing a transport or claiming a latency improvement.
 
-| Priority | Item | Description | Status |
-|----------|------|-------------|--------|
-| P0 | **External Fair Value Anchor** | Binance+HL median pricing as primary fair value | ✅ v6.0.0 |
-| P0 | **Momentum-Aware Spread** | Asymmetric spread widening against momentum | ✅ v6.0.0 |
-| P0 | **Position Timeout Flatten** | IOC flatten after 120s holding beyond deadband | ✅ v6.0.0 |
-| P0 | **Sigmoid Inventory Skew** | Replace linear skew with sigmoid/logit curve | ✅ v5.0.0 |
-| P0 | **Grid Laddering** | 3-5 level quoting per side (tight→wide, small→large) | ✅ v5.0.0 |
-| P1 | **Micro-Price (OBI)** | Imbalance-weighted mid-price using L2-L5 depth | ✅ v5.0.0 |
-| P1 | **Cross-Exchange Arbitrage** | Statistical arb between Lighter/Backpack/EdgeX | Planned |
-
-### Phase 2: Latency Optimization (Systems Track) - COMPLETED ✅
-
-| Priority | Item | Description | Status |
-|----------|------|-------------|--------|
-| P0 | **Data/Control Plane Split** | Move SHM polling to dedicated `std::thread` + CPU pinning | ✅ v5.0.0 |
-| P0 | **Zero-Alloc JSON Parsing** | Replace Go `encoding/json` with `gjson` on feeder hot path | ✅ v5.0.0 |
-| P1 | **RwLock → Atomics** | Replace `Arc<RwLock<ShadowLedger>>` with cache-aligned `AtomicI64` | ✅ v5.0.0 |
-| P1 | **Typed Error Codes** | Replace `contains("not enough margin")` string matching | ✅ v5.0.0 |
-| P1 | **WebSocket Execution** | Replace REST with WS for lower latency order placement | Planned |
-| P2 | **Multi-Asset Support** | BTC-PERP, SOL-PERP, and other perpetual markets | Planned |
-
-### Phase 3: Infrastructure & Ops - PARTIALLY COMPLETED
-
-| Priority | Item | Description | Status |
-|----------|------|-------------|--------|
-| P0 | **Telemetry / Observability** | Async UDP metrics export → Prometheus/Grafana | ✅ v5.0.0 |
-| P1 | **Robust Reconnect** | Exponential backoff + jitter + circuit breaker | ✅ v5.0.0 |
-| P1 | **Risk Management** | Circuit breaker, max drawdown limit, kill switch | Planned |
-| P2 | **Backtesting Framework** | Historical data replay with strategy simulation | Planned |
-| P2 | **gRPC Control Plane** | Remote strategy management (proto/ definitions ready) | Planned |
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| `CLAUDE.md` (root + per-directory) | Auto-loaded technical context for Claude Code |
-| `docs/QUICKSTART.md` | Step-by-step deployment guide |
-| `docs/ADAPTIVE_MM_GUIDE.md` | Adaptive MM operational guide |
-| `docs/DUAL_TRACK_IPC.md` | IPC architecture deep-dive |
-| `docs/ORDER_EXECUTION_REDESIGN.md` | Order execution architecture decisions |
-| `CHANGELOG.md` | Version history |
-
-## Disclaimer
-
-This software is for educational and research purposes. Trading cryptocurrencies involves substantial risk of loss. Use at your own risk.
+[MIT license](LICENSE).

@@ -5,17 +5,21 @@ alwaysApply: true
 
 # docs/
 
-> Historical and reference documentation. For up-to-date module docs, see CLAUDE.md in each source directory.
+Use the [root README](../README.md) for current entry points and
+[AGENTS.md](../AGENTS.md) for repository-wide engineering rules. Use the
+owning runbook for operations.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| QUICKSTART.md | 3-step deployment guide for new setups |
+| LIVE_TRADING.md | Supervised Lighter and Hyperliquid operation, shutdown, and recovery |
+| PERP_RECORDING.md and PERP_RELATIVE_VALUE.md | Public market capture and offline paper replay |
+| QUICKSTART.md | Historical setup notes |
 | ADAPTIVE_MM_GUIDE.md | Operational guide for adaptive market maker (troubleshooting, parameters) |
 | DUAL_TRACK_IPC.md | Detailed dual-track IPC architecture and integration guide |
 | ORDER_EXECUTION_REDESIGN.md | Architecture decision record for order execution approach |
 | QUICK_REFERENCE.md | Common code patterns, before/after examples, error handling |
-| WORKFLOW.md | Development workflow (Search→Plan→Action), task management rules |
-| CLAUDE_MD_CONVENTIONS.md | How to write effective CLAUDE.md files for new modules |
+| WORKFLOW.md | Pointer to current repository-wide engineering rules |
+| CLAUDE_MD_CONVENTIONS.md | How shared and scoped agent instructions fit together |
 | CHANGELOG.md | Historical record of major architectural refactors |
