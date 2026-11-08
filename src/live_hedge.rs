@@ -434,7 +434,11 @@ impl LiveInventoryHedge {
     }
 
     pub(crate) fn allowance(&self) -> Option<QuoteAllowance> {
-        self.allowance.filter(|a| Instant::now() < a.expires)
+        self.allowance_at(Instant::now())
+    }
+
+    fn allowance_at(&self, now: Instant) -> Option<QuoteAllowance> {
+        self.allowance.filter(|a| now < a.expires)
     }
 
     pub(crate) fn check_blocked(&mut self, blocked: bool) -> Result<()> {

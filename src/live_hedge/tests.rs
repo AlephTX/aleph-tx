@@ -511,6 +511,9 @@ struct DelayedVenue {
     lighter_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     hyperliquid_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     lighter_position: Arc<parking_lot::Mutex<String>>,
+    /// When the server received the latest Lighter account request; the
+    /// client's request start is no later than this.
+    lighter_seen: Arc<parking_lot::Mutex<Option<Instant>>>,
     orders: Arc<std::sync::atomic::AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -525,20 +528,23 @@ impl DelayedVenue {
         let hyperliquid_delay_ms = Arc::new(AtomicU64::new(0));
         let lighter_position = Arc::new(parking_lot::Mutex::new("0".to_owned()));
         let orders = Arc::new(AtomicUsize::new(0));
-        let (ld, hd, lp, counted) = (
+        let lighter_seen = Arc::new(parking_lot::Mutex::new(None));
+        let (ld, hd, lp, counted, seen) = (
             Arc::clone(&lighter_delay_ms),
             Arc::clone(&hyperliquid_delay_ms),
             Arc::clone(&lighter_position),
             Arc::clone(&orders),
+            Arc::clone(&lighter_seen),
         );
         let server = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
-                let (ld, hd, lp, counted) = (
+                let (ld, hd, lp, counted, seen) = (
                     Arc::clone(&ld),
                     Arc::clone(&hd),
                     Arc::clone(&lp),
                     Arc::clone(&counted),
+                    Arc::clone(&seen),
                 );
                 tokio::spawn(async move {
                     let mut socket = BufReader::new(socket);
@@ -560,6 +566,7 @@ impl DelayedVenue {
                     let mut body = vec![0; size];
                     socket.read_exact(&mut body).await.unwrap();
                     let (delay, response) = if request.starts_with("GET /api/v1/account?") {
+                        *seen.lock() = Some(Instant::now());
                         let size = lp.lock().clone();
                         (
                             ld.load(Ordering::Acquire),
@@ -569,6 +576,9 @@ impl DelayedVenue {
                             "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"}]}]}),
                         )
                     } else if request.starts_with("POST /exchange ") {
+                        let action: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(action["signature"]["r"], "0x0", "test submits unsigned");
+                        assert_eq!(action["action"]["orders"][0]["t"]["limit"]["tif"], "Ioc");
                         counted.fetch_add(1, Ordering::AcqRel);
                         (
                             0,
@@ -606,6 +616,7 @@ impl DelayedVenue {
             lighter_delay_ms,
             hyperliquid_delay_ms,
             lighter_position,
+            lighter_seen,
             orders,
             server,
         }
@@ -623,8 +634,9 @@ impl DelayedVenue {
         let info = HyperliquidInfo::new(Network::Testnet)
             .unwrap()
             .with_test_url(self.url.clone());
-        let signer = HyperliquidSigner::from_private_key(&format!("{:064x}", 1)).unwrap();
-        let trading = HyperliquidTrading::new(info.clone(), signer, None).unwrap();
+        // No signing key: only the L1 signature is replaced, the production
+        // execute/journal/submit path and response parsing still run.
+        let trading = HyperliquidTrading::unsigned_for_test(info.clone());
         let hedge = LiveInventoryHedge {
             limits: limits(),
             primary: Arc::new(LighterTrading::offline_test_client(&self.url)),
@@ -669,14 +681,30 @@ async fn stale_primary_observation_blocks_allowance_and_new_intents() {
             .count()
     };
     // Fresh flat control: allowance granted and bounded by the primary age.
+    // Hyperliquid answers after 100 ms, so a deadline taken after the joined
+    // reply (or after poll) would be ~100 ms later than the primary's.
+    let limit = Duration::from_millis(200);
+    venue.delays(0, 100);
     let before = Instant::now();
     hedge.poll().await.unwrap();
     let after = Instant::now();
+    let seen = venue.lighter_seen.lock().expect("Lighter request served");
     let allowance = hedge
-        .allowance()
+        .allowance_at(seen)
         .expect("fresh flat observation grants an allowance");
-    // Bounded by primary request start + 200 ms, well before POLL * 2.
-    assert!(allowance.expires > before && allowance.expires <= after + Duration::from_millis(200));
+    // Deadline = primary request start + limit; start lies in [before, seen].
+    assert!(before + limit <= allowance.expires && allowance.expires <= seen + limit);
+    assert!(
+        allowance.expires < after + limit,
+        "not measured from poll end"
+    );
+    // Exactly at the deadline it is unusable; just inside it is usable.
+    assert!(hedge.allowance_at(allowance.expires).is_none());
+    assert!(
+        hedge
+            .allowance_at(allowance.expires - Duration::from_nanos(1))
+            .is_some()
+    );
     // Lighter answers at once but Hyperliquid is slow: the joined primary
     // value is older than the limit when consumed.
     venue.delays(0, 300);

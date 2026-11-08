@@ -225,10 +225,17 @@ struct SignedRequest<'a, T> {
 /// Requests are never retried automatically, including transport failures.
 pub struct HyperliquidTrading {
     info: HyperliquidInfo,
-    signer: HyperliquidSigner,
+    signer: ActionSigner,
     vault_address: Option<String>,
     nonce: AtomicU64,
     submission: Mutex<()>,
+}
+
+/// Production always signs; the unsigned variant exists only in test builds.
+enum ActionSigner {
+    Key(HyperliquidSigner),
+    #[cfg(test)]
+    UnsignedTest,
 }
 
 impl HyperliquidTrading {
@@ -242,11 +249,25 @@ impl HyperliquidTrading {
         }
         Ok(Self {
             info,
-            signer,
+            signer: ActionSigner::Key(signer),
             vault_address,
             nonce: AtomicU64::new(0),
             submission: Mutex::new(()),
         })
+    }
+
+    /// Test client that skips only the L1 signature (a fixed placeholder is
+    /// sent); validation, nonce, journaling callers and response parsing run
+    /// as in production. Never constructible outside tests.
+    #[cfg(test)]
+    pub(crate) fn unsigned_for_test(info: HyperliquidInfo) -> Self {
+        Self {
+            info,
+            signer: ActionSigner::UnsignedTest,
+            vault_address: None,
+            nonce: AtomicU64::new(0),
+            submission: Mutex::new(()),
+        }
     }
 
     /// Caller must durably reserve exposure and persist IDs before awaiting this.
@@ -295,13 +316,21 @@ impl HyperliquidTrading {
             nonce < expires_after,
             "Nonce clock drift exceeds request lifetime"
         );
-        let signature = self.signer.sign_action(
-            action,
-            self.info.network,
-            nonce,
-            self.vault_address.as_deref(),
-            Some(expires_after),
-        )?;
+        let signature = match &self.signer {
+            ActionSigner::Key(signer) => signer.sign_action(
+                action,
+                self.info.network,
+                nonce,
+                self.vault_address.as_deref(),
+                Some(expires_after),
+            )?,
+            #[cfg(test)]
+            ActionSigner::UnsignedTest => super::signing::L1Signature {
+                r: "0x0".into(),
+                s: "0x0".into(),
+                v: 0,
+            },
+        };
         let request = SignedRequest {
             action,
             nonce,

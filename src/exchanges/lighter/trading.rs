@@ -125,10 +125,12 @@ pub struct PositionEvidence {
     /// units as order `transaction_time`); None when absent or 0. It says
     /// which trades the snapshot includes, not when it was generated.
     pub transaction_time: Option<u64>,
-    /// Local monotonic time just before the request was sent. Bounds the
-    /// age of the observation from below: the venue state is no older than
-    /// the request, but the venue's own generation time is not proven.
+    /// Local monotonic time just before the request was sent. Consumers
+    /// spend a local elapsed-time budget from here (request + wait +
+    /// consumption). It does not prove when the venue generated the state or
+    /// that the response is authentic; `transaction_time` is independent.
     pub requested_at: Instant,
+    /// Local monotonic time after the body was parsed.
     pub received_at: Instant,
 }
 
@@ -274,6 +276,10 @@ pub struct LighterTrading {
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
     quote_expiry: Option<Duration>,
+    /// Test builds only: a fixed read-auth token for loopback fixtures, so
+    /// REST reads run without the platform signer. Absent in production.
+    #[cfg(test)]
+    test_auth_token: Option<&'static str>,
 }
 
 #[async_trait]
@@ -391,6 +397,7 @@ impl LighterTrading {
             order_tracker: None,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
+            test_auth_token: None,
         }
     }
 
@@ -489,6 +496,8 @@ impl LighterTrading {
             order_tracker: None,
             limit_order_type: OrderType::Limit,
             quote_expiry: None,
+            #[cfg(test)]
+            test_auth_token: None,
         })
     }
 
@@ -619,6 +628,10 @@ impl LighterTrading {
     /// 创建认证 token（用于查询需要认证的 API）
     /// Go feeder 用 deadline.Unix()（秒级绝对时间戳）
     async fn create_auth_token(&self) -> Result<String> {
+        #[cfg(test)]
+        if let Some(token) = self.test_auth_token {
+            return Ok(token.to_owned());
+        }
         let deadline_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("System clock error: {}", e))?

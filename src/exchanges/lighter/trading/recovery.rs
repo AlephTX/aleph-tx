@@ -232,6 +232,135 @@ mod tests {
         assert!(terminal_fill_time(&[order], &[123], 7, 4095).is_err());
     }
 
+    /// Loopback Lighter for the real recover_flat loop: no open orders, one
+    /// terminal maker order (client id 123) filled at watermark 30, and a
+    /// scripted sequence of account responses. Returns the account request
+    /// count when the client gives up or succeeds.
+    async fn recovery_venue(
+        accounts: Vec<serde_json::Value>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                socket.read_line(&mut request).await.unwrap();
+                let mut authorized = false;
+                loop {
+                    let mut header = String::new();
+                    socket.read_line(&mut header).await.unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    authorized |=
+                        header.eq_ignore_ascii_case("authorization: fixture-read-auth\r\n");
+                }
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                let response = match path.split('?').next().unwrap() {
+                    "/api/v1/accountActiveOrders" => {
+                        assert!(authorized && path.contains("account_index=0&market_id=0"));
+                        json!({"code":200,"orders":[]})
+                    }
+                    "/api/v1/accountOrders" => {
+                        assert!(authorized && path.contains("client_order_indexes=123"));
+                        json!({"code":200,"orders":[{"client_order_index":123,"market_index":0,
+                            "owner_account_index":0,"status":"canceled","filled_base_amount":"0.02",
+                            "transaction_time":30}]})
+                    }
+                    "/api/v1/account" => {
+                        let index = count.fetch_add(1, Ordering::AcqRel);
+                        accounts[index.min(accounts.len() - 1)].clone()
+                    }
+                    other => panic!("recovery must not sign or send: {other}"),
+                }
+                .to_string();
+                socket
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (url, served, server)
+    }
+
+    fn account(time: Option<u64>, size: &str) -> serde_json::Value {
+        let mut account = serde_json::json!({"index":0,"positions":[{"market_id":0,
+            "symbol":"ETH","sign":1,"position":size,"avg_entry_price":"2000",
+            "unrealized_pnl":"0","liquidation_price":"0"}]});
+        if let Some(time) = time {
+            account["transaction_time"] = time.into();
+        }
+        serde_json::json!({"code":200,"accounts":[account]})
+    }
+
+    async fn recover(accounts: Vec<serde_json::Value>) -> (Result<()>, usize, bool) {
+        let (url, served, server) = recovery_venue(accounts).await;
+        let mut trading = LighterTrading::offline_test_client(&url);
+        trading.test_auth_token = Some("fixture-read-auth");
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.start_tracking(123, TrackerSide::Buy, 2000.0, 0.02));
+        trading.set_order_tracker(Arc::clone(&tracker));
+        let result = trading.recover_flat().await;
+        server.abort();
+        (
+            result,
+            served.load(std::sync::atomic::Ordering::Acquire),
+            tracker.needs_reconciliation(),
+        )
+    }
+
+    /// The real recovery loop, without signing: a flat account older than
+    /// the fill watermark, or one without a watermark, cannot end recovery;
+    /// it keeps polling until a covering snapshot arrives. Real clock: the
+    /// HTTP client timeout must not fire on a paused one (~6 s total).
+    #[tokio::test]
+    async fn recovery_waits_for_an_account_watermark_covering_the_fill() {
+        let (result, requests, _) = recover(vec![
+            account(Some(20), "0"),
+            account(None, "0"),
+            account(Some(29), "0"),
+            account(Some(30), "0"),
+        ])
+        .await;
+        result.unwrap();
+        assert_eq!(requests, 4, "succeeded before the covering snapshot");
+        // Never covered: recovery gives up after its 10 rounds and the
+        // tracker still requires reconciliation.
+        let (result, requests, unreconciled) =
+            recover(vec![account(Some(20), "0"), account(None, "0")]).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("could not prove zero position"),);
+        assert_eq!(requests, 10);
+        assert!(unreconciled);
+        // Ambiguous account evidence fails outright, never as flat.
+        let duplicate = serde_json::json!({"code":200,"accounts":[
+            account(Some(40), "0")["accounts"][0].clone(),
+            account(Some(40), "0")["accounts"][0].clone(),
+        ]});
+        let (result, requests, unreconciled) = recover(vec![duplicate]).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("more than once"));
+        assert_eq!(requests, 1);
+        assert!(unreconciled);
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[tokio::test]
     async fn signed_maker_partial_fill_can_be_canceled_and_closed_without_the_feeder() {
