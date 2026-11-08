@@ -487,7 +487,7 @@ impl InventoryNeutralMM {
             shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
-            active_orders: Vec::new(),
+            active_orders: Vec::with_capacity(32),
             session_start_balance: 0.0,
             daily_loss_state: None,
             daily_loss: None,
@@ -1390,22 +1390,24 @@ impl InventoryNeutralMM {
         }
     }
 
+    /// Runs every cycle: reuse the buffer and avoid cloning tracked orders
+    /// (each carries a fill Vec), so the steady state performs no allocation.
     fn refresh_active_orders_from_tracker(&mut self) {
-        self.active_orders = self
-            .order_tracker
-            .active_orders_snapshot()
-            .into_iter()
-            .filter(|order| !order.lifecycle.is_terminal())
-            .map(|order| ActiveOrder {
-                client_order_id: order.client_order_id,
-                order_index: order.order_index,
-                lifecycle: order.lifecycle,
-                side: order.side,
-                price: order.price,
-                size: order.remaining_size(),
-                placed_at: order.created_at,
-            })
-            .collect();
+        let active = &mut self.active_orders;
+        active.clear();
+        self.order_tracker.for_each_active_order(|order| {
+            if !order.lifecycle.is_terminal() {
+                active.push(ActiveOrder {
+                    client_order_id: order.client_order_id,
+                    order_index: order.order_index,
+                    lifecycle: order.lifecycle,
+                    side: order.side,
+                    price: order.price,
+                    size: order.remaining_size(),
+                    placed_at: order.created_at,
+                });
+            }
+        });
     }
 
     async fn reconcile_after_new_fill_if_needed(&mut self) {

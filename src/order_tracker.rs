@@ -477,6 +477,14 @@ impl OrderTracker {
     }
 
     /// Snapshot all currently tracked active orders for strategy-side reconciliation.
+    /// Visit active orders under one read lock without cloning them.
+    /// Hot-path alternative to `active_orders_snapshot`.
+    pub fn for_each_active_order(&self, mut visit: impl FnMut(&TrackedOrder)) {
+        for order in self.state.read().active_orders.values() {
+            visit(order);
+        }
+    }
+
     pub fn active_orders_snapshot(&self) -> Vec<TrackedOrder> {
         self.state.read().active_orders.values().cloned().collect()
     }
