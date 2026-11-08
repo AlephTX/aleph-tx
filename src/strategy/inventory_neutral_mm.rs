@@ -1439,6 +1439,11 @@ impl InventoryNeutralMM {
             self.order_tracker.debug_verify_exposure();
             // Sync fill stats from OrderTracker → Telemetry
             let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
+            // Housekeeping runs before execution in the same cycle; consuming
+            // a new fill here must still start the post-fill cooldown.
+            if fill_count > self.last_reconciled_fill_count {
+                self.last_fill_at = Some(Instant::now());
+            }
             self.last_reconciled_fill_count = fill_count;
             let risk_mid = self
                 .micro

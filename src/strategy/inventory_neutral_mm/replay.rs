@@ -612,6 +612,32 @@ pub(super) struct Outcome {
     pub actions: Vec<Action>,
     /// Per-cycle (replay ms at cycle end, position e8, cash e8, resting count).
     pub states: Vec<(u64, i64, i64, usize)>,
+    /// Number of input frames; a complete run has one cycle per frame.
+    pub frames: usize,
+}
+
+impl Outcome {
+    /// A successful replay consumed every frame: no error, one cycle outcome
+    /// and one state per input frame. Use for every success scenario; the
+    /// cycle outcomes themselves are checked separately.
+    #[track_caller]
+    pub fn assert_complete(&self) {
+        assert!(self.frames > 0, "replay without frames");
+        assert_eq!(self.error, None, "replay stopped early");
+        assert_eq!(self.cycles.len(), self.frames, "cycles != frames");
+        assert_eq!(self.states.len(), self.frames, "states != frames");
+    }
+
+    /// An expected failure: `quote_cycle` failed on frame `at` (0-based)
+    /// after `at` completed cycles, with an error containing `reason`.
+    #[track_caller]
+    pub fn assert_failed_at(&self, at: usize, reason: &str) {
+        assert!(at < self.frames, "failure frame outside input");
+        let error = self.error.as_deref().expect("replay did not fail");
+        assert!(error.contains(reason), "unexpected error: {error}");
+        assert_eq!(self.cycles.len(), at, "completed prefix");
+        assert_eq!(self.states.len(), at, "completed prefix states");
+    }
 }
 
 pub(super) fn wall_ns() -> u64 {
@@ -743,6 +769,7 @@ pub(super) async fn run_with(
         needs_reconciliation: tracker.needs_reconciliation(),
         actions: venue.actions.lock().clone(),
         states,
+        frames: frames.len(),
     };
     drop(strategy);
     outcome
@@ -846,6 +873,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn production_strategy_replay_conserves_inventory_and_cash() {
         let outcome = run(config(), &frames(), 1_000.0, check).await;
+        outcome.assert_complete();
         assert!(
             outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted),
             "{:?}",
@@ -869,7 +897,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn replay_is_deterministic_for_identical_input() {
         let first = run(config(), &frames(), 1_000.0, check).await;
+        first.assert_complete();
         let second = run(config(), &frames(), 1_000.0, check).await;
+        second.assert_complete();
         assert_eq!(first, second);
     }
 
@@ -954,6 +984,7 @@ mod tests {
             redelivered.set(events.len());
         })
         .await;
+        outcome.assert_complete();
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert!(partials.get() >= 2 && terminals.get() >= 2);
         // Venue ledger (each real fill once) still equals the tracker's.
@@ -972,6 +1003,7 @@ mod tests {
             }
         })
         .await;
+        outcome.assert_complete();
         assert!(outcome.cancel_misses > 0, "no cancel raced a fill");
         assert!(outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
     }
@@ -990,6 +1022,7 @@ mod tests {
             }
         })
         .await;
+        outcome.assert_complete();
         // Cleanup confirmed a flat, empty book and quoting resumed.
         assert!(outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
         assert!(outcome.fills.is_empty());
@@ -1000,6 +1033,7 @@ mod tests {
     async fn quiet_book_quotes_both_sides_without_fills() {
         let quiet: Vec<Frame> = frames().into_iter().take(4).collect();
         let outcome = run(config(), &quiet, 1_000.0, check).await;
+        outcome.assert_complete();
         assert!(outcome.fills.is_empty());
         let bids = outcome.resting.iter().filter(|(a, _, _)| !a).count();
         let asks = outcome.resting.iter().filter(|(a, _, _)| *a).count();
@@ -1059,6 +1093,7 @@ mod tests {
             ..frame(2000.7, 1.0)
         });
         let before = run(config(), &frames, 1_000.0, check).await;
+        before.assert_complete();
         assert!(before.error.is_none(), "{:?}", before.error);
         assert!(cancels(&before.actions).is_empty(), "{:?}", before.actions);
         // One more millisecond reaches the boundary and the requote happens.
@@ -1067,11 +1102,13 @@ mod tests {
             ..frame(2000.7, 1.0)
         });
         let after = run(config(), &frames, 1_000.0, check).await;
+        after.assert_complete();
         assert_eq!(cancels(&after.actions).first(), Some(&9_000));
         // A shorter configured lifetime does not undercut the calm 8 s floor.
         let mut short_ttl = config();
         short_ttl.order_ttl_secs = 1;
         let floor = run(short_ttl, &frames[..3], 1_000.0, check).await;
+        floor.assert_complete();
         assert!(cancels(&floor.actions).is_empty());
     }
 
@@ -1106,6 +1143,7 @@ mod tests {
         let mut before = frames.clone();
         before.push(hold(opened_ms + timeout_ms - 1, added_ms));
         let early = run(config(), &before, 1_000.0, check).await;
+        early.assert_complete();
         assert!(early.error.is_none(), "{:?}", early.error);
         // Both gaps really filled bids: the episode started at 2 s and grew at 12 s.
         let fill_times: Vec<u64> = early
@@ -1136,6 +1174,7 @@ mod tests {
         let mut at = frames.clone();
         at.push(hold(opened_ms + timeout_ms, added_ms));
         let flat = run(config(), &at, 1_000.0, check).await;
+        flat.assert_complete();
         let ioc = flat
             .actions
             .iter()
@@ -1179,6 +1218,7 @@ mod tests {
         let quiet_secs = cfg.stale_bbo_cancel_ms / 1_000 - 2;
         frames.extend(vec![silent; quiet_secs as usize]);
         let frozen = run(cfg.clone(), &frames, 1_000.0, check).await;
+        frozen.assert_complete();
         assert!(frozen.error.is_none(), "{:?}", frozen.error);
         assert!(
             cancels(&frozen.actions).is_empty(),
@@ -1195,6 +1235,7 @@ mod tests {
         // Keep the feed silent past the cancel age: every quote is pulled.
         frames.extend(vec![silent; 4]);
         let pulled = run(cfg.clone(), &frames, 1_000.0, check).await;
+        pulled.assert_complete();
         let pulled_at = cancels(&pulled.actions);
         assert_eq!(pulled_at.len(), 4);
         assert!(
@@ -1207,6 +1248,7 @@ mod tests {
         // Recovery: a fresh BBO restores two-sided quoting.
         frames.push(quiet(1_000));
         let recovered = run(cfg, &frames, 1_000.0, check).await;
+        recovered.assert_complete();
         assert_eq!(places(&recovered.actions).len(), 8);
         assert_eq!(recovered.cycles.last(), Some(&CycleOutcome::Quoted));
         assert_eq!(recovered.resting.len(), 4);
@@ -1223,10 +1265,12 @@ mod tests {
         let mut frames = vec![quiet(1_000)];
         frames.extend(vec![silent; 29]); // last snapshot at t=1 s, now t=30 s
         let aging = run(config(), &frames, 1_000.0, check).await;
+        aging.assert_complete();
         assert!(aging.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
         assert_eq!(aging.resting.len(), 4);
         frames.extend(vec![silent; 2]); // age crosses 30 s
         let stale = run(config(), &frames, 1_000.0, check).await;
+        stale.assert_complete();
         assert!(stale.resting.is_empty(), "stale account kept quotes");
         assert_eq!(
             stale.cycles.last(),
@@ -1234,6 +1278,7 @@ mod tests {
         );
         frames.push(quiet(1_000));
         let fresh = run(config(), &frames, 1_000.0, check).await;
+        fresh.assert_complete();
         assert_eq!(fresh.cycles.last(), Some(&CycleOutcome::Quoted));
         assert_eq!(fresh.resting.len(), 4);
 
@@ -1244,6 +1289,7 @@ mod tests {
             ..quiet(1_000)
         });
         let skewed = run(config(), &future, 1_000.0, check).await;
+        skewed.assert_complete();
         assert!(skewed.resting.is_empty());
         assert_eq!(
             skewed.cycles.last(),
@@ -1274,6 +1320,8 @@ mod tests {
             },
         ];
         let blocked = run(config(), &blocked_frames, 1_000.0, gap).await;
+        // Recovery cycle (frame 1) fails closed; frame 0 completed.
+        blocked.assert_failed_at(1, "fresh equity and position snapshot");
         let error = blocked
             .error
             .expect("cleanup released without a fresh snapshot");
@@ -1286,6 +1334,7 @@ mod tests {
         // Same gap with the feed running: a post-cancel snapshot arrives and
         // cleanup confirms, then quoting resumes.
         let live = run(config(), &[quiet(1_000), quiet(1_000)], 1_000.0, gap).await;
+        live.assert_complete();
         assert!(live.error.is_none(), "{:?}", live.error);
         assert!(!live.needs_reconciliation);
         assert_eq!(live.cycles.last(), Some(&CycleOutcome::Quoted));
@@ -1298,7 +1347,9 @@ mod tests {
         let mut frames = vec![quiet(1_000), frame(1993.0, 0.5), frame(1993.0, 1.0)];
         frames.extend(vec![frame(1993.0, 1.0); 70]);
         let first = run(config(), &frames, 1_000.0, check).await;
+        first.assert_complete();
         let second = run(config(), &frames, 1_000.0, check).await;
+        second.assert_complete();
         assert!(
             first
                 .actions
@@ -1420,6 +1471,167 @@ mod tests {
         assert!(again.sampled_ms >= stale.sampled_ms);
     }
 
+    // ─── Execution guards on the production path ────────────────────────
+
+    /// Wide inventory deadband (0.1 base at 2000) so a single top-of-book
+    /// fill stays inside the guards' inventory limit (1.5 x deadband).
+    fn guard_config() -> InventoryNeutralMMConfig {
+        InventoryNeutralMMConfig {
+            max_position: 1.0,
+            inventory_urgency_threshold: 0.5,
+            min_inventory_notional_usd: 200.0,
+            ..config()
+        }
+    }
+
+    fn fast(advance_ms: u64) -> Frame {
+        Frame {
+            advance_ms,
+            ..frame(2000.0, 1.0)
+        }
+    }
+
+    /// Quiet two-sided book for 6 s, then only the Lighter book dips through
+    /// the top bid (fair value unchanged), then `tail` fast frames.
+    fn post_fill_frames(tail: &[u64]) -> Vec<Frame> {
+        let mut frames = vec![quiet(1_000); 6];
+        frames.push(Frame {
+            lighter_bid: 1995.3,
+            lighter_ask: 1995.8,
+            ..quiet(1_000)
+        });
+        frames.extend(tail.iter().map(|ms| fast(*ms)));
+        frames
+    }
+
+    /// A real maker fill must hold small same-side replenishment for the
+    /// 500 ms cooldown (boundary inclusive) and release it right after.
+    #[tokio::test(start_paused = true)]
+    async fn post_fill_replenishment_waits_for_the_cooldown() {
+        let frames = post_fill_frames(&[100, 100, 100, 100, 100, 100, 100]);
+        let outcome = run(guard_config(), &frames, 100.0, check).await;
+        outcome.assert_complete();
+        assert!(outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
+        let fills: Vec<_> = outcome
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 1, "one maker fill at 7 s: {fills:?}");
+        assert!(matches!(
+            fills[0],
+            Action::Fill {
+                at_ms: 7_000,
+                is_ask: false,
+                taker: false,
+                ..
+            }
+        ));
+        // Replenishment of the filled bid: no placement at 7.0-7.5 s
+        // (elapsed <= 500 ms), then exactly one at 7.6 s.
+        let after_fill: Vec<u64> = places(&outcome.actions)
+            .into_iter()
+            .filter(|t| *t >= 7_000)
+            .collect();
+        assert_eq!(after_fill, vec![7_600], "{:?}", outcome.actions);
+        assert!(cancels(&outcome.actions).is_empty());
+        // Inventory stays the single fill; three quotes rest until refill.
+        let (_, position, _, _) = outcome.states[6];
+        assert_eq!(position, 4_570_000);
+        let resting: Vec<usize> = outcome.states.iter().map(|s| s.3).collect();
+        assert_eq!(resting, vec![4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 4, 4]);
+    }
+
+    /// After a real batch (1 s) and a real fill (2 s) with three quotes
+    /// still resting, the one-order refill is a micro-refresh: held until
+    /// 4 s after the batch (boundary inclusive), long after the 500 ms
+    /// post-fill window, then placed on the next cycle.
+    #[tokio::test(start_paused = true)]
+    async fn micro_refresh_waits_for_the_batch_cooldown() {
+        let mut frames = vec![
+            quiet(1_000),
+            Frame {
+                lighter_bid: 1995.3,
+                lighter_ask: 1995.8,
+                ..quiet(1_000)
+            },
+        ];
+        frames.extend(vec![fast(100); 40]);
+        let outcome = run(guard_config(), &frames, 100.0, check).await;
+        outcome.assert_complete();
+        assert!(outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
+        assert_eq!(
+            places(&outcome.actions),
+            vec![1_000, 1_000, 1_000, 1_000, 5_100],
+            "{:?}",
+            outcome.actions
+        );
+        assert!(cancels(&outcome.actions).is_empty());
+        // Three quotes rest from the fill (2 s) through the 5 s boundary.
+        for (at, _, _, resting) in &outcome.states {
+            let expected = match *at {
+                ..2_000 => 4,
+                2_000..=5_000 => 3,
+                _ => 4,
+            };
+            assert_eq!(*resting, expected, "resting at {at} ms");
+        }
+        assert!(outcome.states.iter().skip(1).all(|s| s.1 == 4_570_000));
+    }
+
+    /// The guards are inventory-bounded optimisations: the same fill with a
+    /// narrow deadband (default 10 USD) is rebalanced in the fill cycle.
+    #[tokio::test(start_paused = true)]
+    async fn inventory_outside_the_guard_limit_is_requoted_immediately() {
+        let frames = post_fill_frames(&[100, 100]);
+        let outcome = run(config(), &frames, 100.0, check).await;
+        outcome.assert_complete();
+        let after_fill: Vec<u64> = places(&outcome.actions)
+            .into_iter()
+            .filter(|t| *t >= 7_000)
+            .collect();
+        assert!(
+            !after_fill.is_empty() && after_fill.iter().all(|t| *t == 7_000),
+            "{:?}",
+            outcome.actions
+        );
+        assert!(cancels(&outcome.actions).iter().all(|t| *t == 7_000));
+        assert!(!cancels(&outcome.actions).is_empty());
+    }
+
+    /// Inside the post-fill window a fair-value jump that leaves resting
+    /// quotes below the maker edge floor still cancels them at once.
+    #[tokio::test(start_paused = true)]
+    async fn edge_floor_cancels_during_the_post_fill_window() {
+        let mut frames = post_fill_frames(&[100]);
+        let jump = Frame {
+            external_mid: 2012.0,
+            lighter_bid: 2011.5,
+            lighter_ask: 2012.5,
+            advance_ms: 100,
+            ..frame(2000.0, 0.0)
+        };
+        frames.extend([jump, jump]);
+        let outcome = run(guard_config(), &frames, 100.0, check).await;
+        outcome.assert_complete();
+        // Fill at 7.0 s; the jump arrives at 7.2 s, inside the 500 ms window.
+        assert_eq!(cancels(&outcome.actions), vec![7_200; 3]);
+        assert_eq!(outcome.states[8].3, 0, "all quotes pulled at 7.2 s");
+        assert_eq!(outcome.states[8].1, 4_570_000, "inventory unchanged");
+    }
+
+    /// Frozen input → identical trace, fills, cash and position, guards on.
+    #[tokio::test(start_paused = true)]
+    async fn guard_scenarios_replay_identically() {
+        let mut frames = post_fill_frames(&[100, 100, 100, 100, 100, 100, 100]);
+        frames.extend(vec![fast(500); 10]);
+        let first = run(guard_config(), &frames, 100.0, check).await;
+        let second = run(guard_config(), &frames, 100.0, check).await;
+        first.assert_complete();
+        second.assert_complete();
+        assert_eq!(first, second);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exported_mark_evidence_ages_instead_of_refreshing() {
         let cfg = config();
@@ -1460,6 +1672,7 @@ mod tests {
             },
         )
         .await;
+        outcome.assert_complete();
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         sink.stopped().await.unwrap();
         let text = std::fs::read_to_string(dir.join("mark.jsonl")).unwrap();
