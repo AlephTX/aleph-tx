@@ -85,6 +85,7 @@ fn evidence(lookups: Vec<LookupEvidence>, account: Option<SnapshotEvidence>) -> 
         lookups,
         account_snapshot: account,
         lighter: None,
+        fills: Vec::new(),
     }
 }
 
@@ -889,4 +890,275 @@ fn inflated_primary_budget_is_invalid() {
         case(MAX_PRIMARY_AGE_US, MAX_PRIMARY_AGE_US).status,
         AuditStatus::Invalid
     );
+}
+
+// ─── Venue-declared fees ─────────────────────────────────────────────────
+
+fn fill(tid: u64, oid: u64, sz: &str, fee: &str, token: &str, time: u64) -> serde_json::Value {
+    json!({"coin": "ETH", "px": "1999", "sz": sz, "side": "A", "time": time,
+        "startPosition": "0", "dir": "Open Short", "closedPnl": "0", "hash": "0xabc",
+        "oid": oid, "crossed": true, "fee": fee, "tid": tid, "feeToken": token})
+}
+
+fn fills(entries: Vec<serde_json::Value>) -> FillsEvidence {
+    FillsEvidence {
+        observed_at_ms: 2_000,
+        response: serde_json::Value::Array(entries),
+    }
+}
+
+/// A recorded IOC (filled 0.004) with an agreeing lookup binding oid 8.
+fn fee_report(captures: Vec<FillsEvidence>) -> Report {
+    let recorded = journal(&[
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+    ]);
+    let mut evidence = evidence(
+        vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+        None,
+    );
+    evidence.fills = captures;
+    audit(&recorded, Some(&evidence))
+}
+
+/// Several partial fills of the bound oid that exactly cover the
+/// reconciled quantity are summed per fee token, with rebates kept signed.
+#[test]
+fn bound_fills_covering_the_reconciled_fill_attribute_fees_per_token() {
+    let report = fee_report(vec![fills(vec![
+        fill(3, 8, "0.001", "0.0009", "USDC", 1_400),
+        fill(1, 8, "0.002", "-0.0002", "USDC", 1_400),
+        fill(2, 8, "0.001", "0.05", "HYPE", 1_450),
+        fill(9, 99, "0.5", "1", "USDC", 1_450), // another order: ignored
+    ])]);
+    let fee = &report.orders[0].fee;
+    assert_eq!(report.orders[0].status, OrderStatus::Recorded);
+    assert_eq!(fee.status, "attributed", "{:?}", fee.reasons);
+    assert_eq!(fee.source, "frozen_venue_fills");
+    assert_eq!((fee.oid, fee.tids.clone()), (Some(8), vec![1, 2, 3]));
+    assert_eq!(
+        (fee.matched_size, fee.reconciled_size),
+        (Some(d("0.004")), Some(d("0.004")))
+    );
+    let per: Vec<_> = fee.fees.iter().map(|f| (f.token.as_str(), f.fee)).collect();
+    assert_eq!(per, [("HYPE", d("0.05")), ("USDC", d("0.0007"))]);
+    assert_eq!(
+        report.status,
+        AuditStatus::JournalRecorded,
+        "{:?}",
+        report.issues
+    );
+    assert!(!report.restart_permitted);
+    // A zero fee is a legal, attributed zero.
+    let zero = fee_report(vec![fills(vec![fill(1, 8, "0.004", "0", "USDC", 1_400)])]);
+    assert_eq!(zero.orders[0].fee.status, "attributed");
+    assert_eq!(zero.orders[0].fee.fees[0].fee, Decimal::ZERO);
+    // builderFee is already inside fee: reported, never added.
+    let mut built = fill(1, 8, "0.004", "0.003", "USDC", 1_400);
+    built["builderFee"] = json!("0.001");
+    let builder = fee_report(vec![fills(vec![built])]);
+    let asset = &builder.orders[0].fee.fees[0];
+    assert_eq!(
+        (asset.fee, asset.builder_fee),
+        (d("0.003"), Some(d("0.001")))
+    );
+    // Overlapping captures repeating the same fill do not double it.
+    let twice = fee_report(vec![
+        fills(vec![fill(1, 8, "0.004", "0.002", "USDC", 1_400)]),
+        fills(vec![fill(1, 8, "0.004", "0.002", "USDC", 1_400)]),
+    ]);
+    assert_eq!(twice.orders[0].fee.fees[0].fee, d("0.002"));
+    assert_eq!(twice.orders[0].fee.matched_size, Some(d("0.004")));
+}
+
+/// Short, excess, foreign or contradictory fills are never shown as an
+/// attributed fee, and each case is distinct and traceable.
+#[test]
+fn incomplete_or_contradictory_fills_are_not_attributed() {
+    let status = |captures| {
+        let report = fee_report(captures);
+        let fee = report.orders[0].fee.clone();
+        (fee.status, fee.reasons.join("; "), report.status)
+    };
+    let short = status(vec![fills(vec![fill(
+        1, 8, "0.003", "0.001", "USDC", 1_400,
+    )])]);
+    assert_eq!(short.0, "unattributed");
+    assert!(
+        short.1.contains("cover 0.003 of the reconciled 0.004"),
+        "{}",
+        short.1
+    );
+    assert_eq!(
+        short.2,
+        AuditStatus::JournalRecorded,
+        "missing fills are not a contradiction"
+    );
+    let missing = status(vec![fills(vec![fill(
+        9, 99, "0.004", "0.001", "USDC", 1_400,
+    )])]);
+    assert_eq!(missing.0, "unattributed");
+    let excess = status(vec![fills(vec![
+        fill(1, 8, "0.004", "0.001", "USDC", 1_400),
+        fill(2, 8, "0.001", "0.001", "USDC", 1_400),
+    ])]);
+    assert_eq!((excess.0, excess.2), ("invalid", AuditStatus::Invalid));
+    assert!(excess.1.contains("more than the reconciled"));
+    let mut buy = fill(1, 8, "0.004", "0.001", "USDC", 1_400);
+    buy["side"] = json!("B");
+    let wrong_side = status(vec![fills(vec![buy])]);
+    assert_eq!(wrong_side.0, "invalid");
+    assert!(wrong_side.1.contains("the IOC is A ETH"));
+    // Within LOOKUP_SKEW_MS of the 1000 ms intent is tolerated; earlier is not.
+    let skewed = status(vec![fills(vec![fill(1, 8, "0.004", "0.001", "USDC", 0)])]);
+    assert_eq!(skewed.0, "attributed");
+    let recorded = journal(&[
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+    ]);
+    let mut late_intent = recorded.clone();
+    let text = String::from_utf8(late_intent)
+        .unwrap()
+        .replace("\"submitted_at_ms\":1000", "\"submitted_at_ms\":1400");
+    late_intent = text.into_bytes();
+    let mut early_evidence = evidence(
+        vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+        None,
+    );
+    early_evidence.fills = vec![fills(vec![fill(1, 8, "0.004", "0.001", "USDC", 399)])];
+    let early = audit(&late_intent, Some(&early_evidence));
+    assert_eq!(
+        early.orders[0].fee.status, "invalid",
+        "{:?}",
+        early.orders[0].fee
+    );
+    assert!(early.orders[0].fee.reasons[0].contains("precedes the intent time"));
+    let conflicting = status(vec![
+        fills(vec![fill(1, 8, "0.004", "0.001", "USDC", 1_400)]),
+        fills(vec![fill(1, 8, "0.004", "0.002", "USDC", 1_400)]),
+    ]);
+    assert_eq!(
+        (conflicting.0, conflicting.2),
+        ("invalid", AuditStatus::Invalid)
+    );
+    assert!(conflicting.1.contains("conflicting fields"));
+    let after_capture = status(vec![fills(vec![fill(
+        1, 8, "0.004", "0.001", "USDC", 2_500,
+    )])]);
+    assert_eq!(after_capture.0, "invalid");
+    let malformed = status(vec![FillsEvidence {
+        observed_at_ms: 2_000,
+        response: json!({"error": "rate limited"}),
+    }]);
+    assert_eq!(malformed.0, "invalid");
+    // Another coin in an account-wide window is not this session's.
+    let mut btc = fill(1, 8, "0.004", "0.001", "USDC", 1_400);
+    btc["coin"] = json!("BTC");
+    assert_eq!(status(vec![fills(vec![btc])]).0, "unattributed");
+}
+
+/// Without a reconciled fill, a bound oid, or a unique binding, fees stay
+/// unknown; without fills evidence the order report is unchanged.
+#[test]
+fn fees_need_a_reconciled_fill_and_a_unique_oid_binding() {
+    let bound = || vec![fills(vec![fill(1, 8, "0.004", "0.001", "USDC", 1_400)])];
+    // Pending IOC: an unknown lookup, no terminal, so the fill is unknown.
+    let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let mut pending = evidence(vec![lookup(json!({"status": "unknownOid"}), 1_200)], None);
+    pending.fills = bound();
+    let report = audit(&crashed, Some(&pending));
+    assert_eq!(report.orders[0].status, OrderStatus::Pending);
+    assert_eq!(report.orders[0].fee.status, "unattributed");
+    assert!(report.orders[0].fee.reasons[0].contains("binds this cloid to an oid"));
+    // ACK-like open lookup: oid known, fill not reconciled.
+    let mut open = evidence(
+        vec![lookup(lookup_response("open", "0.01", 1_100), 1_150)],
+        None,
+    );
+    open.fills = bound();
+    let report = audit(&crashed, Some(&open));
+    assert_eq!(report.orders[0].fee.oid, Some(8));
+    assert!(report.orders[0].fee.reasons[0].contains("not reconciled"));
+    // Recorded IOC but no lookup supplied: no oid binding.
+    let recorded = journal(&[
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+    ]);
+    let mut no_lookup = evidence(Vec::new(), None);
+    no_lookup.fills = bound();
+    assert_eq!(
+        audit(&recorded, Some(&no_lookup)).orders[0].fee.status,
+        "unattributed"
+    );
+    // Lookups for one cloid naming two oids are a lookup conflict.
+    let mut other = lookup_response("canceled", "0.006", 1_500);
+    other["order"]["order"]["oid"] = json!(9);
+    let mut split = evidence(
+        vec![
+            lookup(lookup_response("canceled", "0.006", 1_500), 1_510),
+            lookup(other, 1_520),
+        ],
+        None,
+    );
+    split.fills = bound();
+    let report = audit(&recorded, Some(&split));
+    assert_eq!(report.orders[0].status, OrderStatus::Invalid);
+    assert_eq!(report.orders[0].fee.status, "unattributed");
+    // Old evidence without fills: fee not_provided, report otherwise equal.
+    let plain = evidence(
+        vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+        None,
+    );
+    let without = audit(&recorded, Some(&plain));
+    assert_eq!(without.orders[0].fee, FeeReport::not_provided());
+    let with = fee_report(bound());
+    assert_eq!(without.status, with.status);
+    assert_eq!(without.orders[0].status, with.orders[0].status);
+    assert_eq!(without.hedge_position, with.hedge_position);
+    assert!(!with.restart_permitted && !without.restart_permitted);
+    // Evidence for another account: fees invalid, nothing attributed.
+    let mut foreign = evidence(
+        vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+        None,
+    );
+    foreign.hyperliquid_account = format!("0x{}", "bb".repeat(20));
+    foreign.fills = bound();
+    let report = audit(&recorded, Some(&foreign));
+    assert_eq!(report.orders[0].fee.status, "invalid");
+    assert!(report.orders[0].fee.fees.is_empty());
+}
+
+/// Two IOCs whose lookups name the same oid cannot share fills.
+#[test]
+fn one_oid_never_binds_two_iocs() {
+    let recorded = journal(&[
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+        intent(OTHER, "-0.004"),
+        terminal(OTHER, "0.004", "-0.008"),
+    ]);
+    let mut second = lookup_response("canceled", "0.006", 1_500);
+    second["order"]["order"]["cloid"] = json!(OTHER);
+    let mut evidence = evidence(
+        vec![
+            lookup(lookup_response("canceled", "0.006", 1_500), 1_510),
+            LookupEvidence {
+                cloid: OTHER.into(),
+                observed_at_ms: 1_520,
+                response: second,
+            },
+        ],
+        None,
+    );
+    evidence.fills = vec![fills(vec![fill(1, 8, "0.004", "0.001", "USDC", 1_400)])];
+    let report = audit(&recorded, Some(&evidence));
+    for order in &report.orders {
+        assert_eq!(order.fee.status, "invalid", "{}", order.cloid);
+        assert!(order.fee.fees.is_empty());
+    }
+    assert!(kinds(&report).contains(&"invalid_fee_evidence"));
 }

@@ -34,7 +34,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod fees;
 mod lighter;
+pub use fees::{AssetFee, FeeReport, FillsEvidence};
 pub use lighter::{LighterEvidence, LighterOrderReport, PrimaryLegReport, RawResponse};
 
 /// Operator-supplied, frozen venue observations for one hedge account.
@@ -52,6 +54,10 @@ pub struct Evidence {
     /// Frozen Lighter order histories and account sample; optional.
     #[serde(default)]
     pub lighter: Option<LighterEvidence>,
+    /// Raw `userFills` / `userFillsByTime` responses for this account;
+    /// optional. Used only for per-IOC venue-declared fees.
+    #[serde(default)]
+    pub fills: Vec<FillsEvidence>,
 }
 
 /// One raw `{"type":"orderStatus"}` response and when it was captured.
@@ -158,6 +164,9 @@ pub struct OrderReport {
     #[serde(with = "rust_decimal::serde::str_option")]
     pub possible_position_max: Option<Decimal>,
     pub primary: PrimaryReport,
+    /// Venue-declared fee from frozen fills, when supplied. The telemetry
+    /// estimate (configured rate) is separate and unchanged.
+    pub fee: FeeReport,
     pub reasons: Vec<String>,
 }
 
@@ -887,7 +896,7 @@ enum LookupView {
 fn evaluate_lookups(
     intent: &IntentRecord,
     lookups: &[&LookupEvidence],
-) -> std::result::Result<LookupView, String> {
+) -> std::result::Result<(LookupView, Option<u64>), String> {
     let identity = IocIdentity {
         cloid: &intent.cloid,
         coin: &intent.coin,
@@ -899,6 +908,7 @@ fn evaluate_lookups(
     let mut terminal: Option<(u64, u64, Decimal)> = None; // (captured, status at, filled)
     let mut last_open: Option<u64> = None;
     let mut unknown = false;
+    let mut oid: Option<u64> = None;
     for lookup in lookups {
         let parsed = OrderLookup::from_response(lookup.response.clone())
             .map_err(|e| format!("lookup at {}: {e:#}", lookup.observed_at_ms))?;
@@ -915,6 +925,15 @@ fn evaluate_lookups(
                 located.status_timestamp, lookup.observed_at_ms
             ));
         }
+        // Every located view must name the same venue order.
+        if oid.is_some_and(|seen| seen != located.order.oid) {
+            return Err(format!(
+                "lookups for one cloid name oid {} and {}",
+                oid.unwrap_or_default(),
+                located.order.oid
+            ));
+        }
+        oid = Some(located.order.oid);
         match classify_lookup(&identity, &located)
             .map_err(|e| format!("lookup at {}: {e:#}", lookup.observed_at_ms))?
         {
@@ -940,12 +959,13 @@ fn evaluate_lookups(
     {
         return Err("an open lookup was captured after a terminal one".into());
     }
-    Ok(match (terminal, last_open, unknown) {
+    let view = match (terminal, last_open, unknown) {
         (Some((_, at_ms, filled)), _, _) => LookupView::Terminal { at_ms, filled },
         (None, Some(_), _) => LookupView::Open,
         (None, None, true) => LookupView::Unknown,
         (None, None, false) => LookupView::None,
-    })
+    };
+    Ok((view, oid))
 }
 
 // ─── Report ──────────────────────────────────────────────────────────────
@@ -1023,13 +1043,16 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         possible_max: Some(state.confirmed),
         snapshot: snapshot.as_ref().map(|s| s.position),
     };
+    let mut oids: Vec<Option<u64>> = Vec::with_capacity(state.iocs.len());
     for (index, ioc) in state.iocs.iter().enumerate() {
         let lookups: Vec<&LookupEvidence> = usable_lookups
             .iter()
             .copied()
             .filter(|l| l.cloid == ioc.intent.cloid)
             .collect();
-        let view = evaluate_lookups(&ioc.intent, &lookups);
+        let evaluated = evaluate_lookups(&ioc.intent, &lookups);
+        oids.push(evaluated.as_ref().ok().and_then(|(_, oid)| *oid));
+        let view = evaluated.map(|(view, _)| view);
         let order = order_report(
             ioc,
             view,
@@ -1048,6 +1071,7 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
     {
         check_snapshot_against_journal(&mut state, snapshot);
     }
+    attribute_fees(&mut state, evidence, &oids, &mut orders);
     // Lighter findings only add issues; Hyperliquid order results stay as is.
     let journaled = std::mem::take(&mut state.lighter_batches);
     let gaps: Vec<lighter::JournalGap> = state
@@ -1221,6 +1245,82 @@ fn read_lines(journal: &[u8], state: &mut State) -> usize {
     count
 }
 
+/// Venue-declared fees per IOC from usable fills evidence. Only adds
+/// issues and the per-order `fee` view; order results stay as they are.
+fn attribute_fees(
+    state: &mut State,
+    evidence: Option<(&Evidence, bool)>,
+    oids: &[Option<u64>],
+    orders: &mut [OrderReport],
+) {
+    let Some((evidence, usable)) = evidence.filter(|(e, _)| !e.fills.is_empty()) else {
+        return;
+    };
+    if !usable {
+        for order in orders.iter_mut() {
+            order.fee = FeeReport {
+                status: "invalid",
+                source: "frozen_venue_fills",
+                reasons: vec!["fills evidence names another network, account or coin".into()],
+                ..FeeReport::not_provided()
+            };
+        }
+        return;
+    }
+    let fills = match fees::load(&evidence.fills, &evidence.coin) {
+        Ok(fills) => fills,
+        Err(errors) => {
+            for error in &errors {
+                state.issue(None, Severity::Invalid, "invalid_fills", error.clone());
+            }
+            for order in orders.iter_mut() {
+                order.fee = FeeReport {
+                    status: "invalid",
+                    source: "frozen_venue_fills",
+                    reasons: errors.clone(),
+                    ..FeeReport::not_provided()
+                };
+            }
+            return;
+        }
+    };
+    let mut found = Vec::new();
+    for (index, (ioc, order)) in state.iocs.iter().zip(orders.iter_mut()).enumerate() {
+        let oid = oids[index];
+        let shared = oid.is_some()
+            && oids
+                .iter()
+                .enumerate()
+                .any(|(other, o)| other != index && *o == oid);
+        let filled = matches!(order.status, OrderStatus::Recorded | OrderStatus::Matched)
+            .then_some(order.filled)
+            .flatten();
+        order.fee = fees::attribute(
+            &fills,
+            &fees::IocFacts {
+                coin: &ioc.intent.coin,
+                is_buy: ioc.intent.is_buy,
+                submitted_at_ms: ioc.intent.submitted_at_ms,
+                oid,
+                oid_shared: shared,
+                filled,
+            },
+            LOOKUP_SKEW_MS,
+        );
+        if order.fee.status == "invalid" {
+            for reason in &order.fee.reasons {
+                found.push(Issue {
+                    line: Some(ioc.intent_line),
+                    severity: Severity::Invalid,
+                    kind: "invalid_fee_evidence",
+                    detail: format!("{}: {reason}", ioc.intent.cloid),
+                });
+            }
+        }
+    }
+    state.issues.extend(found);
+}
+
 fn check_evidence_identity(state: &mut State, evidence: &Evidence) -> bool {
     let Some(start) = &state.start else {
         return false;
@@ -1340,6 +1440,7 @@ fn order_report(
         possible_position_min: None,
         possible_position_max: None,
         primary: ioc.primary.clone(),
+        fee: FeeReport::not_provided(),
         reasons: Vec::new(),
     };
     let view = match view {

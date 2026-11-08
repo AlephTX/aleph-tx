@@ -115,6 +115,15 @@ the strategy's normal shorter cancellation timer.
   (`cloid`, `observed_at_ms`, `response`) and `account_snapshot`
   (`observed_at_ms`, `state`). An `unknownOid` lookup does not prove the IOC
   was never accepted.
+- To check the venue's fee for a reconciled IOC, add `fills`: raw
+  `userFills` or `userFillsByTime` responses (`observed_at_ms`,
+  `response`). Each order's `fee` view binds fills only through the oid its
+  own `orderStatus` lookups name, and sums `fee` per `feeToken` only when
+  those fills cover exactly the reconciled size. Builder fees are already
+  included and are shown, not added. Short coverage leaves the fee
+  unattributed. Excess, conflicting or foreign fills are invalid. This is
+  the venue's frozen declaration, separate from the configured-rate
+  estimate in telemetry.
 - For the Lighter leg of a schema 2 journal, an optional `lighter` section
   in the same evidence file takes `account_index`, `market_id`, `symbol`,
   the session's `client_order_ids`, raw `accountOrders` responses in
