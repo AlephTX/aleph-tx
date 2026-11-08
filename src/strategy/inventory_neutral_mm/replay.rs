@@ -1682,6 +1682,9 @@ mod tests {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .filter(|value| value["type"] == "snapshot")
             .collect();
+        let (startup, snapshots) = snapshots.split_first().expect("startup snapshot");
+        assert_eq!(startup["daily_loss_start_equity"], 1_000.0);
+        assert_eq!(startup["daily_loss_limit_pct"], cfg.max_daily_loss_pct);
         assert_eq!(snapshots.len(), 2 * frames.len());
         let mark = |i: usize| {
             let s = &snapshots[2 * i];

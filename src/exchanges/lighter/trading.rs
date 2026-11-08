@@ -1598,7 +1598,7 @@ fn account_position(
     let position = match unique_position(account.positions, market_id)? {
         None => Decimal::ZERO,
         Some(position) => {
-            let size: Decimal = position.position.parse()?;
+            let size = Decimal::from_str_exact(&position.position)?;
             anyhow::ensure!(
                 position.symbol == symbol
                     && size >= Decimal::ZERO
@@ -1763,6 +1763,7 @@ mod tests {
             one(Some(30), &[eth(2, "0.03")]),
             one(Some(30), &[eth(0, "0.03")]),
             one(Some(30), &[eth(1, "-0.03")]),
+            one(Some(30), &[eth(1, "0.00000000000000000000000000001")]),
             one(Some(30), &[eth(1, "1e400")]),
             one(Some(30), &[eth(1, "not-a-number")]),
         ];

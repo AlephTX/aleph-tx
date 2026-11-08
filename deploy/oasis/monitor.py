@@ -37,7 +37,6 @@ DB_PATH = os.environ.get("ALEPH_MONITOR_DB", "/var/lib/aleph-tx-monitor/telemetr
 CONTROL_TOKEN = os.environ.get("ALEPH_MONITOR_CONTROL_TOKEN", "")
 ALERT_WEBHOOK = os.environ.get("ALEPH_MONITOR_ALERT_WEBHOOK", "").strip()
 ALERT_INTERVAL = 15
-MAX_DAILY_LOSS_PCT = float(os.environ.get("ALEPH_MONITOR_MAX_DAILY_LOSS_PCT", "0.05"))
 LIVE_UNIT = "aleph-tx-live.service"
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
@@ -220,8 +219,8 @@ def alert_loop(store, alerter):
     while True:
         try:
             status = {"services": services(), "markets": markets()}
-            alerter.update(evaluate(status, store.summary(), int(time.time() * 1000),
-                                    MAX_DAILY_LOSS_PCT))
+            now_ms = int(time.time() * 1000)
+            alerter.update(evaluate(status, store.summary(now_ms=now_ms), now_ms))
         except Exception as exc:  # keep serving; the next pass retries
             print(f"alert evaluation failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(ALERT_INTERVAL)

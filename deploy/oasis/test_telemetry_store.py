@@ -427,7 +427,7 @@ class StoreTest(unittest.TestCase):
                 self.assertEqual((mark["sampled_ms"], mark["feed_ms"]), (sampled, feed))
                 self.assertAlmostEqual(session["unrealized"], 0.5)
 
-    def test_old_snapshot_table_gains_mark_columns_as_unknown(self):
+    def test_old_snapshot_table_gains_mark_and_daily_loss_columns_as_unknown(self):
         import sqlite3
         path = self.dir / "old_mark.sqlite3"
         old = TelemetryStore(str(path), self.dir)
@@ -437,13 +437,16 @@ class StoreTest(unittest.TestCase):
         old.ingest()
         old.db.close()
         db = sqlite3.connect(path)
-        for name in ("mark_source", "mark_sampled_ms", "mark_feed_ms"):
+        daily_loss = ("daily_loss_day_start_ms", "daily_loss_start_equity", "daily_loss_limit_pct")
+        for name in ("mark_source", "mark_sampled_ms", "mark_feed_ms", *daily_loss):
             db.execute(f"ALTER TABLE snapshots DROP COLUMN {name}")
         db.commit()
         db.close()
         store = TelemetryStore(str(path), self.dir)
         try:
-            session = store.summary(now_ms=2_000)["session"]
+            summary = store.summary(now_ms=2_000)
+            session = summary["session"]
+            self.assertTrue(all(summary["snapshot"][name] is None for name in daily_loss))
             mark = session["valuation"]["mark"]
             self.assertEqual((mark["snapshot_ms"], mark["feed_ms"], mark["freshness"]),
                              (1200, None, "unknown"))

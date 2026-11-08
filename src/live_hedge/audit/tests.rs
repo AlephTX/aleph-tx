@@ -204,6 +204,50 @@ fn evidence_releases_an_ioc_only_with_a_terminal_and_a_later_matching_account() 
 }
 
 #[test]
+fn later_terminal_capture_cannot_hide_a_return_to_open() {
+    let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let terminal = lookup_response("canceled", "0.006", 1_500);
+    let report = audit(
+        &crashed,
+        Some(&evidence(
+            vec![
+                lookup(terminal.clone(), 1_800),
+                lookup(lookup_response("open", "0.01", 1_100), 1_700),
+                lookup(terminal, 1_510),
+            ],
+            Some(snapshot("-0.004", 1_900)),
+        )),
+    );
+    assert_eq!(report.status, AuditStatus::Invalid);
+    assert_eq!(report.orders[0].evidence, "conflict");
+}
+
+#[test]
+fn excess_precision_in_positions_and_order_sizes_cannot_be_rounded_into_a_match() {
+    let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let canceled = lookup_response("canceled", "0.006", 1_500);
+    let wrong_position = evidence(
+        vec![lookup(canceled.clone(), 1_510)],
+        Some(snapshot("-0.00400000000000000000000000001", 1_600)),
+    );
+    assert_eq!(
+        audit(&crashed, Some(&wrong_position)).status,
+        AuditStatus::Invalid
+    );
+
+    let mut wrong_size = canceled;
+    wrong_size["order"]["order"]["origSz"] = json!("0.01000000000000000000000000001");
+    let wrong_size = evidence(
+        vec![lookup(wrong_size, 1_510)],
+        Some(snapshot("-0.004", 1_600)),
+    );
+    assert_eq!(
+        audit(&crashed, Some(&wrong_size)).status,
+        AuditStatus::Invalid
+    );
+}
+
+#[test]
 fn single_field_evidence_mismatches_are_rejected_not_matched() {
     let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
     let good = || {

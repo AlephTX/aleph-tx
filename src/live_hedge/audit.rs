@@ -945,7 +945,9 @@ fn evaluate_lookups(
                         "terminal lookups disagree: filled {seen} vs {filled}"
                     ));
                 }
-                if terminal.is_none_or(|(captured, _, _)| lookup.observed_at_ms > captured) {
+                // Keep the first terminal capture. A later repeat must not
+                // hide an open response captured after this one.
+                if terminal.is_none_or(|(captured, _, _)| lookup.observed_at_ms < captured) {
                     terminal = Some((lookup.observed_at_ms, at_ms, filled));
                 }
             }

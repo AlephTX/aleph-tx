@@ -194,16 +194,16 @@ pub(crate) fn classify_lookup(
         order.coin == intent.coin
             && order.cloid.as_deref() == Some(intent.cloid)
             && order.side == if intent.is_buy { "B" } else { "A" }
-            && order.limit_px.parse::<Decimal>()? == intent.limit_price
+            && Decimal::from_str_exact(&order.limit_px)? == intent.limit_price
             && order
                 .original_size
                 .as_deref()
-                .and_then(|size| size.parse::<Decimal>().ok())
+                .and_then(|size| Decimal::from_str_exact(size).ok())
                 == Some(intent.size)
             && located.status_timestamp >= intent.sent_at_ms.saturating_sub(LOOKUP_SKEW_MS),
         "Hyperliquid lookup disagrees with the journaled IOC"
     );
-    let remaining = order.sz.parse::<Decimal>()?;
+    let remaining = Decimal::from_str_exact(&order.sz)?;
     let filled = match located.status.as_str() {
         "filled" | "canceled" | "marginCanceled" | "reduceOnlyCanceled" => {
             terminal_fill(&located.status, intent.size, remaining)?
@@ -253,7 +253,7 @@ pub(crate) fn account_confirmed_fill(
 pub(crate) fn dedicated_position(state: &AccountState, coin: &str) -> Result<Decimal> {
     let mut position = None;
     for entry in &state.asset_positions {
-        let size = entry.position.szi.parse::<Decimal>()?;
+        let size = Decimal::from_str_exact(&entry.position.szi)?;
         if entry.position.coin == coin {
             ensure!(
                 position.replace(size).is_none(),
@@ -331,10 +331,7 @@ impl LiveInventoryHedge {
             .account_value
             .parse::<Decimal>()?;
         ensure!(
-            account_state
-                .asset_positions
-                .iter()
-                .all(|p| p.position.szi.parse::<Decimal>() == Ok(Decimal::ZERO))
+            dedicated_position(&account_state, symbol)?.is_zero()
                 && open.is_empty()
                 && equity > Decimal::ZERO
                 && account_state.withdrawable.parse::<Decimal>()? >= limits.min_available_usd,

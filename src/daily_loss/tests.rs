@@ -43,6 +43,19 @@ fn utc_midnight_rolls_the_baseline() {
 }
 
 #[test]
+fn a_backward_clock_cannot_rearm_a_breached_budget() {
+    let path = temp_path();
+    let mut guard = DailyLossGuard::open(Some(path.clone()), 0.05, 1000.0, 10).unwrap();
+    assert!(guard.check(940.0, 9).is_err());
+    assert_eq!(guard.start_equity(), 1000.0);
+    assert!(guard.check(940.0, 10).is_err());
+    assert!(guard.check(1000.0, 10).is_err());
+    assert!(DailyLossGuard::open(Some(path.clone()), 0.05, 940.0, 9).is_err());
+    assert!(DailyLossGuard::open(Some(path.clone()), 0.05, 940.0, 10).is_err());
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn corrupt_state_refuses_to_reset_budget() {
     let path = temp_path();
     fs::create_dir_all(path.parent().unwrap()).unwrap();

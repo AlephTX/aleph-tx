@@ -27,11 +27,13 @@ or restored to new inodes, and deduplicates each record before updating totals.
 
 The monitor evaluates alert rules every 15 seconds: feeder down, live unit
 failed, stale or missing quotes while live, stale telemetry, private-stream
-gaps, dropped telemetry records, session drawdown approaching the daily loss
-breaker (warning at 60%, critical at 90% of `ALEPH_MONITOR_MAX_DAILY_LOSS_PCT`,
-default `0.05`), and a cross-venue imbalance while hedged. Active alerts appear
+gaps, dropped telemetry records, daily drawdown approaching the loss breaker,
+and a cross-venue imbalance while hedged. Daily drawdown uses the strategy's
+persisted UTC-day equity baseline and configured `max_daily_loss_pct` from
+telemetry. It warns at 60% and turns critical at 90% of that limit. Snapshots
+without a baseline for the current UTC day cannot drive this alert. Active alerts appear
 as banners in the console and at `/api/alerts`. To also receive a JSON
-`{"text": ...}` POST when an alert is raised or resolved, set
+`{"text": ...}` POST when an alert is raised, changes severity, or resolves, set
 `ALEPH_MONITOR_ALERT_WEBHOOK` in `/etc/aleph-tx/monitor.env` and restart the
 monitor. Alerts never act on trading.
 

@@ -37,6 +37,8 @@ pub struct SessionInfo {
 pub struct StrategySnapshot {
     pub equity: f64,
     pub session_start_equity: f64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub daily_loss: Option<crate::daily_loss::DailyLossSnapshot>,
     pub available_balance: f64,
     pub margin_usage: f64,
     pub exchange_position: f64,
@@ -461,6 +463,33 @@ mod tests {
         sink.snapshot(marked);
         sink.stopped().await.unwrap();
         check_fixture(&dir, "mark", "mark_session.jsonl");
+    }
+
+    #[tokio::test]
+    async fn restarted_daily_loss_fixture_matches_the_writer() {
+        use crate::daily_loss::DailyLossGuard;
+        use chrono::Datelike;
+
+        let dir = std::env::temp_dir().join(format!("aleph-daily-{}", uuid::Uuid::new_v4()));
+        let state = dir.join("daily-loss.json");
+        let day = chrono::DateTime::UNIX_EPOCH.date_naive().num_days_from_ce() + 20_000;
+        let mut first = DailyLossGuard::open(Some(state.clone()), 0.047, 1000.0, day).unwrap();
+        first.check(968.0, day).unwrap();
+        drop(first);
+
+        let mut restarted = DailyLossGuard::open(Some(state), 0.047, 968.0, day).unwrap();
+        let sink = TelemetrySink::open(&dir, &session("restarted_daily_loss")).unwrap();
+        for equity in [968.0, 957.0] {
+            restarted.check(equity, day).unwrap();
+            sink.snapshot(StrategySnapshot {
+                equity,
+                session_start_equity: 968.0,
+                daily_loss: Some(restarted.snapshot()),
+                ..Default::default()
+            });
+        }
+        sink.stopped().await.unwrap();
+        check_fixture(&dir, "restarted_daily_loss", "restarted_daily_loss.jsonl");
     }
 
     /// Compare a writer-produced session with its checked-in fixture.

@@ -154,6 +154,9 @@ export interface Valuation {
 export interface Snapshot {
   equity: number
   session_start_equity: number
+  daily_loss_day_start_ms?: number | null
+  daily_loss_start_equity?: number | null
+  daily_loss_limit_pct?: number | null
   available_balance: number
   margin_usage: number
   exchange_position: number

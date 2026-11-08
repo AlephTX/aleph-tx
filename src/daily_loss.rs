@@ -27,6 +27,14 @@ pub struct DailyLossGuard {
     state: DailyLossState,
 }
 
+/// The baseline and limit used by the strategy's daily loss check.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DailyLossSnapshot {
+    pub daily_loss_day_start_ms: i64,
+    pub daily_loss_start_equity: f64,
+    pub daily_loss_limit_pct: f64,
+}
+
 /// Current UTC day as days since CE. Allocation-free.
 pub fn utc_day_now() -> i32 {
     Utc::now().date_naive().num_days_from_ce()
@@ -50,6 +58,10 @@ impl DailyLossGuard {
             Some(path) => load(path)?,
             None => None,
         };
+        anyhow::ensure!(
+            stored.is_none_or(|state| state.utc_day <= today),
+            "daily loss state is from a later UTC day; refusing to reset the budget"
+        );
         let state = match stored {
             Some(state) if state.utc_day == today => {
                 anyhow::ensure!(
@@ -80,13 +92,31 @@ impl DailyLossGuard {
         self.state.start_equity
     }
 
+    pub fn snapshot(&self) -> DailyLossSnapshot {
+        let epoch_day = chrono::DateTime::UNIX_EPOCH.date_naive().num_days_from_ce();
+        DailyLossSnapshot {
+            daily_loss_day_start_ms: (i64::from(self.state.utc_day) - i64::from(epoch_day))
+                * 86_400_000,
+            daily_loss_start_equity: self.start_equity(),
+            daily_loss_limit_pct: self.limit_pct,
+        }
+    }
+
     /// Check `equity` against today's baseline, rolling it at UTC midnight.
     /// Returns the fractional PnL; errors once the loss limit is breached.
     pub fn check(&mut self, equity: f64, today: i32) -> Result<f64> {
+        anyhow::ensure!(
+            today >= self.state.utc_day,
+            "UTC day moved backward; refusing to reset the daily loss budget"
+        );
+        anyhow::ensure!(
+            today > self.state.utc_day || !self.state.breached,
+            "daily loss limit already breached today"
+        );
         if !equity.is_finite() || equity <= 0.0 {
             return Ok(0.0); // Unusable snapshots are rejected upstream.
         }
-        if today != self.state.utc_day {
+        if today > self.state.utc_day {
             self.state = DailyLossState {
                 utc_day: today,
                 start_equity: equity,

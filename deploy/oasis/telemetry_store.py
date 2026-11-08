@@ -92,6 +92,9 @@ SNAPSHOT_MIGRATIONS = (("markout_marked", "INTEGER"), ("markout_expired", "INTEG
 # Price evidence behind `mid`; NULL on legacy rows (time and source unknown).
 MARK_MIGRATIONS = (("mark_source", "TEXT"), ("mark_sampled_ms", "INTEGER"),
                    ("mark_feed_ms", "INTEGER"))
+# Legacy snapshots have no evidence of the persisted daily loss budget.
+DAILY_LOSS_MIGRATIONS = (("daily_loss_day_start_ms", "INTEGER"),
+                         ("daily_loss_start_equity", "REAL"), ("daily_loss_limit_pct", "REAL"))
 MARK_SOURCES = ("external_median", "lighter_book", "lighter_depth")
 # Columns added after the first release; created on demand for old databases.
 SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
@@ -172,7 +175,7 @@ class TelemetryStore:
         for name, ddl in SESSION_MIGRATIONS:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
-        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS),
+        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS),
                                   ("hedge_fills", HEDGE_FILL_MIGRATIONS)):
             columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
             for name, ddl in migrations:
@@ -262,7 +265,11 @@ class TelemetryStore:
             values += [source if source in MARK_SOURCES else None,
                        positive_int(record.get("mark_sampled_ms")),
                        positive_int(record.get("mark_feed_ms"))]
-            fields = (*SNAPSHOT_FIELDS, *extra, *(name for name, _ in MARK_MIGRATIONS))
+            values += [integer(record.get("daily_loss_day_start_ms"), None),
+                       finite(record.get("daily_loss_start_equity"), None),
+                       finite(record.get("daily_loss_limit_pct"), None)]
+            fields = (*SNAPSHOT_FIELDS, *extra,
+                      *(name for name, _ in MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS))
             self.db.execute(f"INSERT OR REPLACE INTO snapshots (session_id, ts_ms, {', '.join(fields)})"
                             f" VALUES (?,?{',?' * len(fields)})", (sid, ts, *values))
         elif kind == "stopped":

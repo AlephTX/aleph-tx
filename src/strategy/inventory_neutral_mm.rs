@@ -19,6 +19,7 @@ use crate::live_hedge::{LiveInventoryHedge, QuoteAllowance};
 use crate::order_tracker::{OrderLifecycle, OrderSide, OrderTracker};
 use crate::shm_reader::{NUM_EXCHANGES, ShmBboMessage, ShmReader};
 use crate::telemetry::TelemetryCollector;
+use anyhow::Context;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -664,23 +665,13 @@ impl InventoryNeutralMM {
             }
             return Ok(CycleOutcome::Backoff(Duration::from_secs(1)));
         }
+        self.check_daily_loss()?;
         if !self.prepare_inventory_hedge().await? {
             return Ok(CycleOutcome::Backoff(Duration::from_millis(500)));
         }
 
         // Phase 1: Institutional Housekeeping
-        self.perform_periodic_housekeeping().await;
-
-        // Daily PnL circuit breaker: baseline and breach persist across restarts.
-        if let Some(guard) = &mut self.daily_loss
-            && let Err(error) = guard.check(
-                self.account_stats.portfolio_value,
-                crate::daily_loss::utc_day_now(),
-            )
-        {
-            tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
-            return Err(error.context("Lighter daily loss limit breached"));
-        }
+        self.perform_periodic_housekeeping().await?;
 
         // Margin cooldown check
         if Instant::now() < self.margin_cooldown_until {
@@ -766,6 +757,18 @@ impl InventoryNeutralMM {
         Ok(CycleOutcome::Quoted)
     }
 
+    fn check_daily_loss(&mut self) -> anyhow::Result<()> {
+        if let Some(guard) = &mut self.daily_loss {
+            guard
+                .check(
+                    self.account_stats.portfolio_value,
+                    crate::daily_loss::utc_day_now(),
+                )
+                .context("Lighter daily loss check failed")?;
+        }
+        Ok(())
+    }
+
     fn quote_allowance(&self, confirmed: f64, short: f64, long: f64) -> Option<QuoteAllowance> {
         let allowance = self.hedge.as_ref()?.allowance()?;
         let tolerance = 0.5e-8; // Half of the order tracker's base-unit precision.
@@ -807,6 +810,9 @@ impl InventoryNeutralMM {
             self.account_stats.portfolio_value,
             crate::daily_loss::utc_day_now(),
         )?);
+        // A restart can already be near the daily limit. Publish immediately,
+        // including while the quote loop is waiting for hedge reconciliation.
+        self.export_snapshot(self.account_stats.position);
 
         info!(
             "✅ Startup complete: pos={:.4} bal=${:.2}",
@@ -1246,6 +1252,7 @@ impl InventoryNeutralMM {
         sink.snapshot(crate::telemetry_sink::StrategySnapshot {
             equity: self.account_stats.portfolio_value,
             session_start_equity: self.session_start_balance,
+            daily_loss: self.daily_loss.as_ref().map(|guard| guard.snapshot()),
             available_balance: self.account_stats.available_balance,
             margin_usage: self.account_stats.margin_usage,
             exchange_position: self.account_stats.position,
@@ -1382,7 +1389,7 @@ impl InventoryNeutralMM {
     }
 
     /// Periodic tasks: reconciliation, GC, PnL reporting, and telemetry export
-    async fn perform_periodic_housekeeping(&mut self) {
+    async fn perform_periodic_housekeeping(&mut self) -> anyhow::Result<()> {
         let base_interval = if self.account_stats.position.abs() >= self.config.step_size {
             ACTIVE_POSITION_RECONCILE_INTERVAL_SEC
         } else {
@@ -1394,6 +1401,7 @@ impl InventoryNeutralMM {
             // fallback API here because LighterTrading currently returns placeholders.
             if let Some(stats) = self.account_stats_reader.read_if_updated() {
                 self.account_stats = stats.into();
+                self.check_daily_loss()?;
             }
 
             // Phase 1: Reconcile active orders from OrderTracker with actual open orders
@@ -1470,6 +1478,7 @@ impl InventoryNeutralMM {
             self.export_snapshot(risk.position_for_quoting);
             self.last_balance_check = Instant::now();
         }
+        Ok(())
     }
 
     /// Runs every cycle: reuse the buffer and avoid cloning tracked orders

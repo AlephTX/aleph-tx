@@ -2,8 +2,8 @@
 
 `evaluate` is a pure function of the status payload, telemetry summary and
 clock, so every rule is unit-testable without systemd, SHM or the network.
-`Alerter` re-evaluates periodically and, only when ALEPH_MONITOR_ALERT_WEBHOOK
-is set, POSTs a JSON message when an alert is raised or resolved.
+`Alerter` tracks each evaluation and can notify on new, changed-severity,
+or resolved alerts when ALEPH_MONITOR_ALERT_WEBHOOK is set.
 """
 
 import json
@@ -21,7 +21,7 @@ def _alert(key, severity, message):
     return {"key": key, "severity": severity, "message": message}
 
 
-def evaluate(status, summary, now_ms, max_daily_loss_pct=0.05):
+def evaluate(status, summary, now_ms):
     """Active alerts, most severe first. Inputs are the /api payload dicts."""
     alerts = []
     services = (status or {}).get("services", {})
@@ -36,10 +36,10 @@ def evaluate(status, summary, now_ms, max_daily_loss_pct=0.05):
                              f"实盘策略异常退出 ({live.get('Result', 'unknown')})"))
 
     for market in (status or {}).get("markets", []):
-        state, venue = market.get("state"), market.get("venue")
+        state, venue, symbol = market.get("state"), market.get("venue"), market.get("symbol")
         if live_active and state in ("stale", "waiting"):
-            alerts.append(_alert(f"quote_{venue}", WARNING,
-                                 f"{venue} {market.get('symbol')} 行情{('过期' if state == 'stale' else '缺失')}"))
+            alerts.append(_alert(f"quote_{venue}_{symbol}", WARNING,
+                                 f"{venue} {symbol} 行情{('过期' if state == 'stale' else '缺失')}"))
 
     session = (summary or {}).get("session") or {}
     snapshot = (summary or {}).get("snapshot") or {}
@@ -56,20 +56,26 @@ def evaluate(status, summary, now_ms, max_daily_loss_pct=0.05):
         alerts.append(_alert("telemetry_dropped", WARNING,
                              f"遥测丢弃 {int(snapshot['dropped'])} 条"))
 
-    start, equity = snapshot.get("session_start_equity") or 0, snapshot.get("equity") or 0
-    if running and start > 0 and equity > 0:
-        drawdown = (start - equity) / start
-        if drawdown >= max_daily_loss_pct * LOSS_WARN_FRACTION:
-            severity = CRITICAL if drawdown >= max_daily_loss_pct * 0.9 else WARNING
+    start = snapshot.get("daily_loss_start_equity") or 0
+    limit = snapshot.get("daily_loss_limit_pct") or 0
+    equity = snapshot.get("equity") or 0
+    utc_day_start = now_ms - now_ms % 86_400_000
+    if (running and snapshot.get("daily_loss_day_start_ms") == utc_day_start
+            and start > 0 and equity > 0 and 0 < limit < 1):
+        budget = start * limit
+        if equity <= start - budget * LOSS_WARN_FRACTION:
+            severity = CRITICAL if equity <= start - budget * 0.9 else WARNING
+            drawdown = (start - equity) / start
             alerts.append(_alert("drawdown", severity,
-                                 f"会话回撤 {drawdown * 100:.2f}%（熔断 {max_daily_loss_pct * 100:.1f}%）"))
+                                 f"当日回撤 {drawdown * 100:.2f}%（UTC 日亏熔断 {limit * 100:g}%）"))
 
-    if session.get("hedge_account"):
-        net = (snapshot.get("exchange_position") or 0) + (session.get("hedge_position") or 0)
-        gross = abs(snapshot.get("exchange_position") or 0)
-        if running and gross > 0 and abs(net) > gross * 0.5:
+    if running and snapshot and session.get("hedge_account"):
+        primary = snapshot.get("exchange_position") or 0.0
+        hedge = session.get("hedge_position") or 0.0
+        net = primary + hedge
+        if abs(net) > max(abs(primary) * 0.5, 1e-12):
             alerts.append(_alert("hedge_imbalance", WARNING,
-                                 f"两腿净敞口 {net:+.4f}（Lighter {snapshot.get('exchange_position', 0):+.4f}）"))
+                                 f"两腿净敞口 {net:+.4f}（Lighter {primary:+.4f}）"))
 
     order = {CRITICAL: 0, WARNING: 1}
     return sorted(alerts, key=lambda a: (order[a["severity"]], a["key"]))
@@ -88,17 +94,21 @@ class Alerter:
     def update(self, alerts):
         now = int(self.clock() * 1000)
         with self.lock:
-            current = {a["key"]: a for a in alerts}
-            raised = [a for key, a in current.items() if key not in self.active]
+            current = {}
+            changed = []
+            for alert in alerts:
+                key = alert["key"]
+                previous = self.active.get(key)
+                since = previous["since_ms"] if previous else now
+                current[key] = {**alert, "since_ms": since}
+                if previous is None or previous["severity"] != alert["severity"]:
+                    changed.append(alert)
             resolved = [a for key, a in self.active.items() if key not in current]
-            for alert in raised:
-                self.active[alert["key"]] = {**alert, "since_ms": now}
-            for alert in resolved:
-                del self.active[alert["key"]]
+            self.active = current
             snapshot = sorted(self.active.values(),
                               key=lambda a: (a["severity"] != CRITICAL, a["key"]))
-        if self.webhook and (raised or resolved):
-            lines = [f"[{a['severity']}] {a['message']}" for a in raised]
+        if self.webhook and (changed or resolved):
+            lines = [f"[{a['severity']}] {a['message']}" for a in changed]
             lines += [f"[resolved] {a['message']}" for a in resolved]
             try:
                 self.post(self.webhook, {"text": "AlephTX\n" + "\n".join(lines)})
