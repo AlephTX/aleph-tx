@@ -1312,6 +1312,114 @@ mod tests {
 
     /// Real sample → export → sink path: snapshots written later re-export
     /// the same price evidence; only a new accepted sample changes it.
+    /// Real `calculate_pricing_inputs` over SHM BBO and depth slots whose
+    /// timestamps disagree: depth-weighted marks carry the older of both
+    /// inputs, missing depth falls back to the book with its own time.
+    #[test]
+    fn depth_mark_evidence_covers_every_input_it_used() {
+        use crate::shm_depth_reader::ShmDepthReader;
+        let shm = ShmFiles::create();
+        let depth_path = shm.path("depth");
+        std::fs::write(
+            &depth_path,
+            vec![0u8; NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 256],
+        )
+        .unwrap();
+        let write_depth = |ts_ns: u64, size: f64| {
+            let mut slot = [0u8; 256];
+            slot[0..4].copy_from_slice(&2u32.to_le_bytes());
+            slot[4] = LIGHTER;
+            // repr(C) layout: symbol_id at 6, timestamp_ns at 16.
+            slot[6..8].copy_from_slice(&SYMBOL.to_le_bytes());
+            slot[16..24].copy_from_slice(&ts_ns.to_le_bytes());
+            for level in 0..5 {
+                let bid = 24 + level * 16;
+                let ask = 104 + level * 16;
+                slot[bid..bid + 8].copy_from_slice(&(1999.5 - level as f64).to_le_bytes());
+                // Thin bids, heavy asks: VWMicro leans toward the bid.
+                slot[bid + 8..bid + 16].copy_from_slice(&size.to_le_bytes());
+                slot[ask..ask + 8].copy_from_slice(&(2000.5 + level as f64).to_le_bytes());
+                slot[ask + 8..ask + 16].copy_from_slice(&(3.0 * size).to_le_bytes());
+            }
+            let offset = (NUM_SYMBOLS * 8) as u64
+                + (SYMBOL as u64 * NUM_EXCHANGES as u64 + LIGHTER as u64) * 256;
+            ShmFiles::write_at(&depth_path, offset, &slot);
+        };
+        let reader = ShmReader::open(shm.path("matrix").to_str().unwrap(), NUM_SYMBOLS).unwrap();
+        let account = AccountStatsReader::open(shm.path("account").to_str().unwrap()).unwrap();
+        let depth = ShmDepthReader::open(depth_path.to_str().unwrap(), NUM_SYMBOLS).unwrap();
+        let tracker = Arc::new(OrderTracker::new());
+        let venue = Arc::new(SimVenue::new(Arc::clone(&tracker), 0.0));
+        let mut strategy = InventoryNeutralMM::with_data_sources(
+            InventoryNeutralMMConfig {
+                use_depth_pricing: true,
+                poll_interval_ms: 0, // accept every sample
+                ..config()
+            },
+            venue as Arc<dyn Exchange>,
+            tracker,
+            reader,
+            account,
+            Some(depth),
+        );
+        strategy.use_local_fair_value();
+        let now = wall_ns();
+        let ms = |ns: u64| ns / 1_000_000;
+        let bbo = |ts_ns: u64| ShmBboMessage {
+            bid_price: 1999.5,
+            ask_price: 2000.5,
+            bid_size: 5.0,
+            ask_size: 5.0,
+            timestamp_ns: ts_ns,
+            ..Default::default()
+        };
+        let none = [(0u8, ShmBboMessage::default()); NUM_EXCHANGES];
+        let mut sample = |book: ShmBboMessage| {
+            let inputs = strategy.calculate_pricing_inputs(&none, &book);
+            let evidence = strategy.price_evidence.expect("sample accepted");
+            assert_eq!(evidence.mid, inputs.pricing_mid);
+            evidence
+        };
+        // Depth newer than the BBO: the BBO touches bound the age.
+        write_depth(now - 100_000_000, 1.0);
+        let older_bbo = sample(bbo(now - 2_000_000_000));
+        assert_eq!(older_bbo.source, "lighter_depth");
+        assert!(
+            older_bbo.mid < 2000.0,
+            "depth weighting applied: {}",
+            older_bbo.mid
+        );
+        assert_eq!(older_bbo.feed_ms, Some(ms(now - 2_000_000_000)));
+        // BBO newer than the depth: the depth snapshot bounds the age.
+        write_depth(now - 3_000_000_000, 1.0);
+        let older_depth = sample(bbo(now - 100_000_000));
+        assert_eq!(older_depth.source, "lighter_depth");
+        assert_eq!(older_depth.mid, older_bbo.mid, "price math unchanged");
+        assert_eq!(older_depth.feed_ms, Some(ms(now - 3_000_000_000)));
+        // BBO time unknown (0): depth time alone cannot make it known.
+        write_depth(now - 100_000_000, 1.0);
+        let unknown = sample(bbo(0));
+        assert_eq!(unknown.source, "lighter_depth");
+        assert_eq!(unknown.feed_ms, None);
+        // Depth present but without notional: the real fallback is the
+        // touch mid, labelled as the book with the BBO time.
+        write_depth(now - 100_000_000, 0.0);
+        let fallback = sample(bbo(now - 500_000_000));
+        assert_eq!((fallback.source, fallback.mid), ("lighter_book", 2000.0));
+        assert_eq!(fallback.feed_ms, Some(ms(now - 500_000_000)));
+        // Stale depth is skipped entirely: book source and BBO time.
+        write_depth(now - 60_000_000_000, 1.0);
+        let stale = sample(bbo(now - 200_000_000));
+        assert_eq!(
+            (stale.source, stale.feed_ms),
+            ("lighter_book", Some(ms(now - 200_000_000)))
+        );
+        // Re-sampling the same inputs later never makes them newer.
+        let again = sample(bbo(now - 200_000_000));
+        assert_eq!(again.feed_ms, stale.feed_ms);
+        assert!(again.sampled_ms >= stale.sampled_ms);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exported_mark_evidence_ages_instead_of_refreshing() {
         let cfg = config();

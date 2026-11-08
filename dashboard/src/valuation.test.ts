@@ -8,12 +8,14 @@ import { Headline } from './components/Kpis'
 import costSummary from './fixtures/summary_cost.json'
 import legacySummary from './fixtures/summary_legacy.json'
 import markSummary from './fixtures/summary_mark.json'
+import skewedSummary from './fixtures/summary_skewed.json'
 import type { Session, SummaryResp } from './types'
 import { markLine, qualityBadge, sessionValuation } from './valuation'
 
 const cost = costSummary as unknown as SummaryResp
 const mark = markSummary as unknown as SummaryResp
 const legacy = legacySummary as unknown as SummaryResp
+const skewed = skewedSummary as unknown as SummaryResp
 
 const render = (summary: SummaryResp) =>
   renderToStaticMarkup(createElement(Headline, { summary })).replace(/<[^>]+>/g, '|')
@@ -68,6 +70,18 @@ describe('valuation', () => {
     expect(html).toContain('标记 来源未知 · 观测时间未知')
     expect(html).toContain('标记价观测时间未知，仅知快照写入时间')
     expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+估算\|/)
+  })
+
+  it('shows a sample ahead of the monitor clock as a clock mismatch', () => {
+    // Store output for feed 4000 <= now 5000 < sample 6000.
+    const m = (skewed.session as Session).valuation?.mark
+    expect([m?.freshness, m?.feed_age_ms, m?.sample_age_ms]).toEqual(['clock_mismatch', null, null])
+    expect([m?.sampled_ms, m?.feed_ms]).toEqual([6000, 4000])
+    const html = render(skewed)
+    expect(html).toContain('标记 Lighter 盘口 · 时钟不一致，新鲜度未知')
+    expect(html).not.toMatch(/行情 \S+前/)
+    // Valuation stays an estimate with its own number; only freshness is unknown.
+    expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+估算\|+\+\$0\.50\|/)
   })
 
   it('never reports a clock mismatch as fresh', () => {

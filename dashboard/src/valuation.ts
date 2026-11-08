@@ -46,7 +46,8 @@ const SOURCES: Record<string, string> = {
   lighter_depth: 'Lighter 深度',
 }
 
-/** Ages come from the server at summary time, so both clocks match. */
+/** Ages compare evidence from the feeder and strategy clocks with the
+ * monitor clock; a contradiction is shown as such, never as an age. */
 export function markLine(m: Mark | undefined): string | null {
   if (!m || m.price === null) return null
   const source = SOURCES[m.source ?? ''] ?? '来源未知'

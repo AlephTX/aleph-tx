@@ -393,9 +393,11 @@ struct PriceEvidence {
     source: &'static str,
     /// Local wall clock (ms since epoch) when the strategy took the sample.
     sampled_ms: u64,
-    /// Oldest SHM feed timestamp (ms since epoch) among the books used. The
-    /// feeder writes venue time for Binance/Hyperliquid, receipt time for
-    /// EdgeX, and venue time with a receipt-time fallback for Lighter.
+    /// Oldest SHM feed timestamp (ms since epoch) among all inputs of `mid`
+    /// (for `lighter_depth`: the depth snapshot and the BBO touch prices).
+    /// None when any input lacks a timestamp. The feeder writes venue time
+    /// for Binance/Hyperliquid, receipt time for EdgeX, and venue time with a
+    /// receipt-time fallback for Lighter.
     feed_ms: Option<u64>,
 }
 // ─── Inventory-Neutral Market Maker ──────────────────────────────────────────
@@ -1349,7 +1351,7 @@ impl InventoryNeutralMM {
         depth: &crate::shm_depth_reader::ShmDepthSnapshot,
         bid_l1: f64,
         ask_l1: f64,
-    ) -> f64 {
+    ) -> Option<f64> {
         // Calculate total notional value on bid side (L1-L5)
         let bid_notional: f64 = depth
             .bids
@@ -1368,14 +1370,15 @@ impl InventoryNeutralMM {
             .map(|l| l.price * l.size)
             .sum();
 
-        // Avoid division by zero
+        // Avoid division by zero: no usable depth, the caller falls back to
+        // the touch mid.
         if !(bid_notional + ask_notional).is_finite() || bid_notional + ask_notional < 0.001 {
-            return (bid_l1 + ask_l1) / 2.0; // Fallback to simple mid
+            return None;
         }
 
         // VWMicro formula: weight L1 prices by opposite side notional
         let bid_weight = bid_notional / (bid_notional + ask_notional);
-        bid_weight * ask_l1 + (1.0 - bid_weight) * bid_l1
+        Some(bid_weight * ask_l1 + (1.0 - bid_weight) * bid_l1)
     }
 
     /// Periodic tasks: reconciliation, GC, PnL reporting, and telemetry export
@@ -1601,7 +1604,8 @@ impl InventoryNeutralMM {
             None
         };
 
-        let feed_ms = |ts_ns: u64| (ts_ns > 0).then_some(ts_ns / 1_000_000);
+        // A timestamp of 0 means unknown; it must not win a min() as "oldest".
+        let known = |ts_ns: u64| (ts_ns > 0).then_some(ts_ns);
         let (pricing_mid, using_external, mid, source, source_ts_ns) =
             if let Some((fair_mid, fair_ts_ns)) = external_fair {
                 // Learn the venue basis only from a fresh two-sided local book.
@@ -1623,7 +1627,7 @@ impl InventoryNeutralMM {
                     true,
                     local_mid,
                     "external_median",
-                    fair_ts_ns,
+                    known(fair_ts_ns),
                 )
             } else {
                 // Fallback: use local VWMicro or simple mid when no external data
@@ -1642,16 +1646,27 @@ impl InventoryNeutralMM {
                             )
                         })
                     {
-                        (
-                            self.calculate_vw_micro_price(&depth, bid_touch, ask_touch),
-                            "lighter_depth",
-                            depth.timestamp_ns,
-                        )
+                        match self.calculate_vw_micro_price(&depth, bid_touch, ask_touch) {
+                            // Depth weights applied to the BBO touches: both
+                            // inputs bound the evidence age.
+                            Some(price) => (
+                                price,
+                                "lighter_depth",
+                                known(depth.timestamp_ns)
+                                    .zip(known(bbo.timestamp_ns))
+                                    .map(|(depth_ns, bbo_ns)| depth_ns.min(bbo_ns)),
+                            ),
+                            None => (
+                                (bid_touch + ask_touch) / 2.0,
+                                "lighter_book",
+                                known(bbo.timestamp_ns),
+                            ),
+                        }
                     } else {
-                        (local_mid, "lighter_book", bbo.timestamp_ns)
+                        (local_mid, "lighter_book", known(bbo.timestamp_ns))
                     }
                 } else {
-                    (local_mid, "lighter_book", bbo.timestamp_ns)
+                    (local_mid, "lighter_book", known(bbo.timestamp_ns))
                 };
                 (vw_mid, false, local_mid, source, source_ts_ns)
             };
@@ -1672,7 +1687,7 @@ impl InventoryNeutralMM {
                     mid: pricing_mid,
                     source,
                     sampled_ms: now_ns / 1_000_000,
-                    feed_ms: feed_ms(source_ts_ns),
+                    feed_ms: source_ts_ns.map(|ts_ns| ts_ns / 1_000_000),
                 });
             }
         }

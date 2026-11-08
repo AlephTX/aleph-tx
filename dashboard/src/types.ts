@@ -114,13 +114,17 @@ export interface HedgeValuation extends LegValuation {
   fee_sources: { configured_rate: number; unknown: number }
 }
 
-/** observed: feed time known · historical: last mark of a stopped session ·
- * unknown: legacy or no feed time · clock_mismatch: evidence time ahead of
- * the server clock or of its own sample · none: no mark. */
+/** observed: feed <= sample <= now holds · historical: same, for the last
+ * mark of a stopped session · unknown: a sample or feed time is missing
+ * (legacy) · clock_mismatch: the known times break that order, so ages are
+ * null · none: no mark. */
 export type Freshness = 'observed' | 'historical' | 'unknown' | 'clock_mismatch' | 'none'
 
-/** Times are epoch ms on the strategy/server wall clocks; ages are computed by
- * the server at summary time and are null when the evidence time is unknown. */
+/** Epoch ms from three clocks: feed_ms from the feeder's SHM timestamp
+ * (mostly venue time), sampled_ms from the strategy host, ages against the
+ * monitor host at summary time. Ages are null when a time is missing or the
+ * clocks contradict each other; skew that keeps their order is undetectable,
+ * so an age is a best estimate, not proof the hosts are synchronized. */
 export interface Mark {
   price: number | null
   /** external_median · lighter_book · lighter_depth · unknown (legacy). */

@@ -417,10 +417,15 @@ class TelemetryStore:
     def _mark(session, snapshot, mid, now_ms):
         """Where the mark came from and how old its evidence is.
 
-        `snapshot_ms` is only when the record was written; a later snapshot
-        can carry an old price. Ages are wall-clock differences against
-        `now_ms` and stay None when the evidence time is unknown or ahead of
-        `now_ms` (a different clock is never reported as fresh).
+        Three clocks meet here: `feed_ms` is the feeder's SHM timestamp
+        (mostly venue time), `sampled_ms` the strategy host's wall clock and
+        `now_ms` the monitor's. `snapshot_ms` is only when the record was
+        written; a later snapshot can carry an old price.
+
+        Freshness is `clock_mismatch` when the known times contradict the
+        required order feed <= sampled <= now; ages are then None, never
+        clamped, and the raw times stay for diagnosis. `unknown` means a time
+        is missing. Skew that keeps that order is not detectable here.
         """
         if mid is None:
             return {"price": None, "source": None, "snapshot_ms": snapshot["ts_ms"] if snapshot else None,
@@ -428,15 +433,18 @@ class TelemetryStore:
                     "feed_age_ms": None, "freshness": "none",
                     "scope": "both legs marked to the strategy reference mid"}
         sampled, feed = snapshot.get("mark_sampled_ms"), snapshot.get("mark_feed_ms")
-        age = lambda ts: now_ms - ts if ts is not None and ts <= now_ms else None
-        if feed is None:
-            freshness = "unknown"  # legacy record or no feed time behind the sample
-        elif feed > now_ms or (sampled is not None and feed > sampled):
+        known = [t for t in (feed, sampled) if t is not None]
+        mismatch = (any(t > now_ms for t in known)
+                    or (feed is not None and sampled is not None and feed > sampled))
+        if mismatch:
             freshness = "clock_mismatch"
+        elif feed is None or sampled is None:
+            freshness = "unknown"  # legacy record or no feed time behind the sample
         elif session.get("stopped_ms"):
             freshness = "historical"  # last mark of a stopped session
         else:
-            freshness = "observed"  # evidence time known; see the ages
+            freshness = "observed"  # times consistent; see the ages
+        age = lambda ts: None if mismatch or ts is None else now_ms - ts
         return {"price": mid, "source": snapshot.get("mark_source") or "unknown",
                 "snapshot_ms": snapshot["ts_ms"], "sampled_ms": sampled, "feed_ms": feed,
                 "sample_age_ms": age(sampled), "feed_age_ms": age(feed), "freshness": freshness,

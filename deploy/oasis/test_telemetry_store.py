@@ -394,6 +394,39 @@ class StoreTest(unittest.TestCase):
         self.assertEqual((mark["source"], mark["freshness"], mark["feed_age_ms"]),
                          ("lighter_book", "observed", 3_700))
 
+    def test_every_contradicting_clock_order_is_a_mismatch_without_ages(self):
+        now = 5_000
+        cases = [  # (sampled, feed, stopped) -> freshness, sample age, feed age
+            ((6_000, 4_000, False), ("clock_mismatch", None, None)),  # feed <= now < sample
+            ((4_000, 4_500, False), ("clock_mismatch", None, None)),  # feed > sample
+            ((4_000, 9_000, False), ("clock_mismatch", None, None)),  # feed > now
+            ((9_000, 9_500, True), ("clock_mismatch", None, None)),   # stopped still checked
+            ((None, 4_000, False), ("unknown", None, 1_000)),          # sample time missing
+            ((4_500, None, False), ("unknown", 500, None)),            # feed time missing
+            ((4_500, 4_000, False), ("observed", 500, 1_000)),
+            ((4_500, 4_000, True), ("historical", 500, 1_000)),
+            ((5_000, 5_000, False), ("observed", 0, 0)),               # equal is consistent
+        ]
+        for (sampled, feed, stopped), expected in cases:
+            with self.subTest(sampled=sampled, feed=feed, stopped=stopped):
+                self.tearDown(); self.setUp()
+                records = [{"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                           fill(1100, "buy", 2000.0, 0.1, 0.0, 811),
+                           {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0,
+                            "mark_source": "lighter_book", "mark_sampled_ms": sampled,
+                            "mark_feed_ms": feed}]
+                if stopped:
+                    records.append({"type": "stopped", "ts_ms": 1300})
+                self.write(*records)
+                self.store.ingest()
+                session = self.store.summary(now_ms=now)["session"]
+                mark = session["valuation"]["mark"]
+                self.assertEqual((mark["freshness"], mark["sample_age_ms"], mark["feed_age_ms"]),
+                                 expected)
+                # Raw evidence is kept for diagnosis; valuation is unchanged.
+                self.assertEqual((mark["sampled_ms"], mark["feed_ms"]), (sampled, feed))
+                self.assertAlmostEqual(session["unrealized"], 0.5)
+
     def test_old_snapshot_table_gains_mark_columns_as_unknown(self):
         import sqlite3
         path = self.dir / "old_mark.sqlite3"
@@ -433,8 +466,12 @@ class DashboardContractTest(unittest.TestCase):
               fill(1100, "buy", 2000.0, 0.1, 0.0, 1),
               {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0, "equity": 1000.0,
                "session_start_equity": 1000.0}]
+    # Strategy clock ahead of the monitor: feed 4000 <= now 5000 < sample 6000.
+    SKEWED = LEGACY[:2] + [{"type": "snapshot", "ts_ms": 6_100, "mid": 2005.0, "equity": 1000.0,
+                            "session_start_equity": 1000.0, "mark_source": "lighter_book",
+                            "mark_sampled_ms": 6_000, "mark_feed_ms": 4_000}]
     CASES = {"cost": ("cost_session.jsonl", 10_000), "mark": ("mark_session.jsonl", 3_606_000),
-             "legacy": (LEGACY, 10_000)}
+             "legacy": (LEGACY, 10_000), "skewed": (SKEWED, 5_000)}
 
     def summary(self, source, now_ms):
         with tempfile.TemporaryDirectory() as tmp:
