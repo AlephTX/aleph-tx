@@ -29,6 +29,7 @@ mod components;
 mod execution;
 mod housekeeping;
 mod market_state;
+mod markout;
 mod pricing;
 use components::{
     QuoteCycleDecision, QuoteTarget, RiskSnapshot, apply_risk_limits, decide_quote_cycle,
@@ -386,6 +387,7 @@ pub struct InventoryNeutralMM {
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
+    markout: markout::MarkoutTracker,
 
     // Order tracking (multi-level grid)
     active_orders: Vec<ActiveOrder>,
@@ -472,6 +474,11 @@ impl InventoryNeutralMM {
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             last_micro_sample: None,
+            markout: markout::MarkoutTracker::new(
+                config.markout_horizon_secs,
+                config.markout_halflife_fills,
+                config.markout_threshold_bps,
+            ),
             config,
             trading,
             order_tracker,
@@ -1575,6 +1582,7 @@ impl InventoryNeutralMM {
         }
         let vol_bps = self.micro.volatility_bps();
         self.sigma.update(pricing_mid, now);
+        self.markout.update(&self.order_tracker, pricing_mid, now);
         // Until the time-scaled estimate warms up, fall back to the per-sample
         // figure; both are ~1e-4 for liquid perps at sub-second sampling.
         let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);
@@ -1618,8 +1626,14 @@ impl InventoryNeutralMM {
             self.config.min_profit_bps,
             self.config.tick_size,
         )?;
+        let markout_mult = if self.config.use_markout_spread {
+            self.markout.spread_multiplier()
+        } else {
+            1.0
+        };
         let toxicity_spread_mult =
-            toxicity_spread_multiplier(inputs.as_score, self.config.adverse_selection_threshold);
+            toxicity_spread_multiplier(inputs.as_score, self.config.adverse_selection_threshold)
+                .max(markout_mult);
         if toxicity_spread_mult > 1.0 {
             debug!(
                 "AS soft filter active: score={:.2} spread_mult={:.2}",

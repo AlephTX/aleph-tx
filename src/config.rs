@@ -165,6 +165,15 @@ fn default_time_horizon() -> f64 {
 fn default_requote_threshold() -> f64 {
     2.0 // 2 bps deviation threshold
 }
+fn default_markout_horizon_secs() -> f64 {
+    5.0
+}
+fn default_markout_halflife_fills() -> f64 {
+    30.0
+}
+fn default_markout_threshold_bps() -> f64 {
+    -1.0
+}
 fn default_min_cycle_interval_ms() -> u64 {
     50
 }
@@ -369,6 +378,17 @@ pub struct InventoryNeutralMMConfig {
     /// loop wakes after `poll_interval_ms`. Set >= poll_interval_ms to disable.
     #[serde(default = "default_min_cycle_interval_ms")]
     pub min_cycle_interval_ms: u64, // default: 50
+    /// Widen spreads when realized fill markouts show adverse selection.
+    /// The multiplier is in [1, 1.5] and never tightens quotes.
+    #[serde(default)]
+    pub use_markout_spread: bool, // default: false
+    #[serde(default = "default_markout_horizon_secs")]
+    pub markout_horizon_secs: f64, // default: 5
+    #[serde(default = "default_markout_halflife_fills")]
+    pub markout_halflife_fills: f64, // default: 30
+    /// Average markout (bps) tolerated before widening; negative = adverse.
+    #[serde(default = "default_markout_threshold_bps")]
+    pub markout_threshold_bps: f64, // default: -1
 }
 
 fn positive(name: &str, values: &[f64]) -> anyhow::Result<()> {
@@ -454,6 +474,8 @@ impl InventoryNeutralMMConfig {
                 self.as_kappa,
                 self.as_time_horizon_sec,
                 self.basis_tau_secs,
+                self.markout_horizon_secs,
+                self.markout_halflife_fills,
                 self.max_spread_bps,
                 self.max_leverage,
                 self.sigmoid_steepness,
@@ -487,6 +509,10 @@ impl InventoryNeutralMMConfig {
                 && self.max_daily_loss_pct > 0.0
                 && self.max_daily_loss_pct < 1.0,
             "{name}: max_daily_loss_pct must be in (0, 1)"
+        );
+        anyhow::ensure!(
+            self.markout_threshold_bps.is_finite(),
+            "{name}: markout_threshold_bps must be finite"
         );
         anyhow::ensure!(
             self.min_portfolio_scale <= self.max_portfolio_scale,
@@ -608,6 +634,10 @@ impl Default for InventoryNeutralMMConfig {
             use_post_only: false,
             poll_interval_ms: 100,
             min_cycle_interval_ms: default_min_cycle_interval_ms(),
+            use_markout_spread: false,
+            markout_horizon_secs: default_markout_horizon_secs(),
+            markout_halflife_fills: default_markout_halflife_fills(),
+            markout_threshold_bps: default_markout_threshold_bps(),
         }
     }
 }

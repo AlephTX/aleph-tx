@@ -164,16 +164,40 @@ pub struct TrackerState {
     pub completed_orders: HashMap<i64, TrackedOrder>,
     total_fill_count: u64,
     total_fees: f64,
+    /// Ring of the most recent fills, indexed by `total_fill_count % len`.
+    recent_fills: [FillPrint; RECENT_FILLS],
+}
+
+/// Capacity of the recent-fill ring used by fill-quality analytics.
+pub const RECENT_FILLS: usize = 256;
+
+/// One applied fill, for markout and other fill-quality analytics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FillPrint {
+    /// 1-based lifetime fill sequence (equals `total_fill_count` after it).
+    pub sequence: u64,
+    pub side: OrderSide,
+    pub price: f64,
+    pub size: f64,
+    pub at: Instant,
 }
 
 impl TrackerState {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
             active_orders: HashMap::with_capacity(64),
             exchange_to_client: HashMap::with_capacity(64),
             completed_orders: HashMap::with_capacity(128),
             total_fill_count: 0,
             total_fees: 0.0,
+            recent_fills: [FillPrint {
+                sequence: 0,
+                side: OrderSide::Buy,
+                price: 0.0,
+                size: 0.0,
+                at: now,
+            }; RECENT_FILLS],
         }
     }
 }
@@ -430,6 +454,14 @@ impl OrderTracker {
     /// Number of active orders
     pub fn active_order_count(&self) -> usize {
         self.state.read().active_orders.len()
+    }
+
+    /// Fill with lifetime sequence `sequence`, if still retained in the ring.
+    /// Allocation-free; callers iterate `after+1..=total_fill_count`.
+    pub fn fill_at(&self, sequence: u64) -> Option<FillPrint> {
+        let state = self.state.read();
+        let print = state.recent_fills[(sequence % RECENT_FILLS as u64) as usize];
+        (sequence > 0 && print.sequence == sequence).then_some(print)
     }
 
     /// Lifetime fill count and fees, independent of completed-order TTL retention.
@@ -1114,6 +1146,14 @@ impl OrderTracker {
         }
         state.total_fill_count += 1;
         state.total_fees += event.fee_paid;
+        let sequence = state.total_fill_count;
+        state.recent_fills[(sequence % RECENT_FILLS as u64) as usize] = FillPrint {
+            sequence,
+            side,
+            price: event.fill_price,
+            size: event.fill_size,
+            at: now,
+        };
         self.confirmed_position
             .store(new_position, Ordering::Release);
         self.realized_pnl.store(new_cash, Ordering::Release);

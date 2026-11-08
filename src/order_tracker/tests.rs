@@ -1017,3 +1017,27 @@ fn cleanup_commit_is_atomic_and_preserves_risk_when_epoch_changed() {
     tracker.require_reconciliation();
     assert!(tracker.needs_reconciliation());
 }
+
+#[test]
+fn recent_fill_ring_exposes_side_price_and_sequence() {
+    let tracker = OrderTracker::new();
+    assert!(tracker.fill_at(0).is_none());
+    assert!(tracker.fill_at(1).is_none());
+    tracker.start_tracking(41, OrderSide::Sell, 2500.0, 0.02);
+    let created = ShmPrivateEventV2::order_created(1, 2, 1, 777, 41, 5, 2500.0, 0.02, true, 0);
+    tracker.apply_event(&created).unwrap();
+    let fill =
+        ShmPrivateEventV2::order_filled(2, 2, 1, 777, 41, 5, 2500.5, 0.02, 0.0, 0.0, true, 0, 9901);
+    tracker.apply_event(&fill).unwrap();
+    let print = tracker.fill_at(1).expect("first fill retained");
+    assert_eq!(print.sequence, 1);
+    assert_eq!(print.side, OrderSide::Sell);
+    assert_eq!(print.price, 2500.5);
+    assert!(tracker.fill_at(2).is_none());
+    // A sequence that aliases into the same slot but was overwritten is rejected.
+    assert!(
+        tracker
+            .fill_at(1 + crate::order_tracker::RECENT_FILLS as u64)
+            .is_none()
+    );
+}
