@@ -303,3 +303,97 @@ impl LighterBatchJournal {
         Ok(())
     }
 }
+
+/// Serial, fail-stop committer shared by every producer of one journal
+/// (offline trials only). Each `commit` writes one line and syncs it under
+/// a single lock; it returns Ok only when that line is durable. The first
+/// write or sync error poisons the journal for every producer: no later
+/// record is appended, so a failure leaves at most one damaged tail and
+/// never a damaged middle line. Records written before the failure stay.
+pub struct SerialJournal {
+    inner: parking_lot::Mutex<SerialInner>,
+}
+
+struct SerialInner {
+    file: Box<dyn JournalSink>,
+    poisoned: Option<String>,
+    /// Records that returned Ok, in commit order.
+    committed: u64,
+}
+
+/// The byte sink behind a `SerialJournal`; a file, or a fault injector.
+pub trait JournalSink: Send {
+    fn write_line(&mut self, line: &[u8]) -> std::io::Result<()>;
+    fn sync(&mut self) -> std::io::Result<()>;
+}
+
+impl JournalSink for std::fs::File {
+    fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(self, line)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+}
+
+/// Time spent in one commit, split at the lock.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitTiming {
+    /// Waiting for another producer's commit.
+    pub queued: std::time::Duration,
+    /// Encode, write and sync of this record.
+    pub durable: std::time::Duration,
+}
+
+impl SerialJournal {
+    pub fn new(sink: Box<dyn JournalSink>) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(SerialInner {
+                file: sink,
+                poisoned: None,
+                committed: 0,
+            }),
+        }
+    }
+
+    /// Append `record` and sync it; Ok only once it is durable.
+    pub fn commit(&self, record: &JournalRecord) -> Result<CommitTiming> {
+        let line = record.to_line()?;
+        let waited = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+        let queued = waited.elapsed();
+        if let Some(reason) = &inner.poisoned {
+            anyhow::bail!("journal stopped after an earlier failure: {reason}");
+        }
+        let started = std::time::Instant::now();
+        let result = inner
+            .file
+            .write_line(&line)
+            .context("journal write failed")
+            .and_then(|()| inner.file.sync().context("journal sync failed"));
+        if let Err(error) = result {
+            inner.poisoned = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        inner.committed += 1;
+        Ok(CommitTiming {
+            queued,
+            durable: started.elapsed(),
+        })
+    }
+
+    /// The failure that stopped this journal, if any.
+    pub fn poisoned(&self) -> Option<String> {
+        self.inner.lock().poisoned.clone()
+    }
+
+    pub fn committed(&self) -> u64 {
+        self.inner.lock().committed
+    }
+
+    /// Test builds only: hold the commit lock, as a slow producer would.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> impl Drop + '_ {
+        self.inner.lock()
+    }
+}

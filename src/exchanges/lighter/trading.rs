@@ -24,6 +24,8 @@ use tokio::sync::Mutex as TokioMutex;
 #[cfg(test)]
 mod batch_journal_tests;
 pub(crate) mod recovery;
+#[cfg(test)]
+mod serial_journal_trial;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
