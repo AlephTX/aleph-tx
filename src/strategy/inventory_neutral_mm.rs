@@ -31,6 +31,8 @@ mod housekeeping;
 mod market_state;
 mod markout;
 mod pricing;
+#[cfg(test)]
+mod replay;
 use components::{
     QuoteCycleDecision, QuoteTarget, RiskSnapshot, apply_risk_limits, decide_quote_cycle,
     inventory_deadband_size, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
@@ -370,6 +372,17 @@ struct PricingInputs {
     using_external_fair_value: bool,
 }
 
+/// Result of one quoting-loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleOutcome {
+    /// Shutdown requested; leave the loop.
+    Stop,
+    /// A guard withheld quoting; retry after this delay.
+    Backoff(Duration),
+    /// Quotes were evaluated; wait for the next market or fill event.
+    Quoted,
+}
+
 pub struct InventoryNeutralMM {
     config: InventoryNeutralMMConfig,
 
@@ -563,152 +576,149 @@ impl InventoryNeutralMM {
     ) -> anyhow::Result<()> {
         info!("🚀 Starting main execution loop...");
         while self.is_running.load(Ordering::SeqCst) {
-            if shutdown_requested(shutdown) {
-                return Ok(());
+            match self.quote_cycle(shutdown).await? {
+                CycleOutcome::Stop => return Ok(()),
+                CycleOutcome::Backoff(delay) => tokio::time::sleep(delay).await,
+                CycleOutcome::Quoted => self.wait_for_next_cycle(shutdown).await,
             }
-
-            // Capture before any inventory read: fills after this point are
-            // unconsumed by this cycle and must wake the next one.
-            self.cycle_fill_baseline = self.order_tracker.total_fill_stats().0;
-            self.refresh_active_orders_from_tracker();
-            if let Some(stats) = self.account_stats_reader.read_if_updated() {
-                self.account_stats = stats.into();
-            }
-
-            if self.order_tracker.needs_reconciliation() {
-                anyhow::ensure!(
-                    self.hedge.is_none(),
-                    "Lighter event stream requires reconciliation"
-                );
-                self.clean_exchange_state("event-stream recovery").await?;
-            }
-            if !self.account_stats.is_usable() {
-                warn!("Account equity/position snapshot unavailable or stale; withdrawing quotes");
-                self.cancel_all_and_sync("stale account snapshot").await;
-                if let Some(hedge) = &mut self.hedge {
-                    hedge.check_blocked(true)?;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-            if !self.prepare_inventory_hedge().await? {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
-            // Phase 1: Institutional Housekeeping
-            self.perform_periodic_housekeeping().await;
-
-            // Daily PnL circuit breaker: baseline and breach persist across restarts.
-            if let Some(guard) = &mut self.daily_loss
-                && let Err(error) = guard.check(
-                    self.account_stats.portfolio_value,
-                    crate::daily_loss::utc_day_now(),
-                )
-            {
-                tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
-                return Err(error.context("Lighter daily loss limit breached"));
-            }
-
-            // Margin cooldown check
-            if Instant::now() < self.margin_cooldown_until {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-
-            // Phase 2: Market Data Acquisition & Staleness Check
-            let market_state = match self.fetch_market_state().await {
-                Some(state) => state,
-                None => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
-            // Phase 3: Signal Processing & Fair Price Determination
-            let inputs = self.calculate_pricing_inputs(&market_state.exchanges, &market_state.bbo);
-
-            if inputs.mid <= 0.0 || inputs.mid.is_nan() || inputs.mid.is_infinite() {
-                tracing::warn!("⚠️ Invalid mid price: {:.4}, skipping cycle", inputs.mid);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-
-            let quoting_position = {
-                let max_position = scaled_max_position(
-                    &self.config,
-                    self.account_stats.portfolio_value,
-                    inputs.mid,
-                )
-                .max(self.config.step_size);
-                let mut runtime_config = self.config.clone();
-                runtime_config.max_position = max_position;
-                runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
-                    &self.config,
-                    self.account_stats.portfolio_value,
-                    inputs.mid,
-                    max_position,
-                );
-                position_for_quoting(
-                    &runtime_config,
-                    self.account_stats.position,
-                    self.order_tracker.confirmed_position(),
-                )
-            };
-
-            // Inventory age follows the exposure episode, not the last fill.
-            // Adding to a stuck position must never renew its timeout.
-            let deadband = inventory_deadband_size(
-                &self.config,
-                scaled_base_order_size(
-                    &self.config,
-                    self.account_stats.portfolio_value,
-                    inputs.mid,
-                )
-                .max(self.config.step_size),
-                scaled_inventory_urgency_threshold(
-                    &self.config,
-                    self.account_stats.portfolio_value,
-                    inputs.mid,
-                    scaled_max_position(
-                        &self.config,
-                        self.account_stats.portfolio_value,
-                        inputs.mid,
-                    ),
-                ),
-                inputs.mid,
-            );
-            let now = Instant::now();
-            self.inventory_age.observe(quoting_position, deadband, now);
-            // With a live hedge, Lighter inventory is offset on Hyperliquid;
-            // a single-leg taker flatten would pay twice and unbalance the pair.
-            if self.hedge.is_none()
-                && self
-                    .inventory_age
-                    .is_expired(now, Duration::from_secs(self.config.position_timeout_secs))
-            {
-                if self.inventory_age.can_retry(now) {
-                    self.inventory_age.last_attempt = Some(now);
-                    self.execute_timeout_flatten(inputs.mid).await;
-                }
-            } else if let Some((our_bid, our_ask, bounds)) =
-                self.calculate_optimal_quotes(&inputs, quoting_position)
-            {
-                self.execute_quoting_cycle(our_bid, our_ask, bounds, inputs.mid, shutdown)
-                    .await;
-                if self.hedged_low_margin {
-                    // perform_graceful_shutdown cleans Lighter, then
-                    // hedge.finish() closes Hyperliquid against it.
-                    anyhow::bail!("Low margin while hedged; unwinding both legs");
-                }
-            } else {
-                self.cancel_all_orders().await;
-            }
-
-            self.wait_for_next_cycle(shutdown).await;
         }
 
         Ok(())
+    }
+
+    /// One iteration of the quoting loop. Pacing is left to the caller so the
+    /// same production logic can be driven step by step by offline replay.
+    pub(crate) async fn quote_cycle(
+        &mut self,
+        shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> anyhow::Result<CycleOutcome> {
+        if shutdown_requested(shutdown) {
+            return Ok(CycleOutcome::Stop);
+        }
+
+        // Capture before any inventory read: fills after this point are
+        // unconsumed by this cycle and must wake the next one.
+        self.cycle_fill_baseline = self.order_tracker.total_fill_stats().0;
+        self.refresh_active_orders_from_tracker();
+        if let Some(stats) = self.account_stats_reader.read_if_updated() {
+            self.account_stats = stats.into();
+        }
+
+        if self.order_tracker.needs_reconciliation() {
+            anyhow::ensure!(
+                self.hedge.is_none(),
+                "Lighter event stream requires reconciliation"
+            );
+            self.clean_exchange_state("event-stream recovery").await?;
+        }
+        if !self.account_stats.is_usable() {
+            warn!("Account equity/position snapshot unavailable or stale; withdrawing quotes");
+            self.cancel_all_and_sync("stale account snapshot").await;
+            if let Some(hedge) = &mut self.hedge {
+                hedge.check_blocked(true)?;
+            }
+            return Ok(CycleOutcome::Backoff(Duration::from_secs(1)));
+        }
+        if !self.prepare_inventory_hedge().await? {
+            return Ok(CycleOutcome::Backoff(Duration::from_millis(500)));
+        }
+
+        // Phase 1: Institutional Housekeeping
+        self.perform_periodic_housekeeping().await;
+
+        // Daily PnL circuit breaker: baseline and breach persist across restarts.
+        if let Some(guard) = &mut self.daily_loss
+            && let Err(error) = guard.check(
+                self.account_stats.portfolio_value,
+                crate::daily_loss::utc_day_now(),
+            )
+        {
+            tracing::error!(%error, "🚨 Daily loss limit breached, shutting down");
+            return Err(error.context("Lighter daily loss limit breached"));
+        }
+
+        // Margin cooldown check
+        if Instant::now() < self.margin_cooldown_until {
+            return Ok(CycleOutcome::Backoff(Duration::from_millis(100)));
+        }
+
+        // Phase 2: Market Data Acquisition & Staleness Check
+        let market_state = match self.fetch_market_state().await {
+            Some(state) => state,
+            None => {
+                return Ok(CycleOutcome::Backoff(Duration::from_millis(100)));
+            }
+        };
+
+        // Phase 3: Signal Processing & Fair Price Determination
+        let inputs = self.calculate_pricing_inputs(&market_state.exchanges, &market_state.bbo);
+
+        if inputs.mid <= 0.0 || inputs.mid.is_nan() || inputs.mid.is_infinite() {
+            tracing::warn!("⚠️ Invalid mid price: {:.4}, skipping cycle", inputs.mid);
+            return Ok(CycleOutcome::Backoff(Duration::from_millis(100)));
+        }
+
+        let quoting_position = {
+            let max_position =
+                scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid)
+                    .max(self.config.step_size);
+            let mut runtime_config = self.config.clone();
+            runtime_config.max_position = max_position;
+            runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
+                &self.config,
+                self.account_stats.portfolio_value,
+                inputs.mid,
+                max_position,
+            );
+            position_for_quoting(
+                &runtime_config,
+                self.account_stats.position,
+                self.order_tracker.confirmed_position(),
+            )
+        };
+
+        // Inventory age follows the exposure episode, not the last fill.
+        // Adding to a stuck position must never renew its timeout.
+        let deadband = inventory_deadband_size(
+            &self.config,
+            scaled_base_order_size(&self.config, self.account_stats.portfolio_value, inputs.mid)
+                .max(self.config.step_size),
+            scaled_inventory_urgency_threshold(
+                &self.config,
+                self.account_stats.portfolio_value,
+                inputs.mid,
+                scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid),
+            ),
+            inputs.mid,
+        );
+        let now = Instant::now();
+        self.inventory_age.observe(quoting_position, deadband, now);
+        // With a live hedge, Lighter inventory is offset on Hyperliquid;
+        // a single-leg taker flatten would pay twice and unbalance the pair.
+        if self.hedge.is_none()
+            && self
+                .inventory_age
+                .is_expired(now, Duration::from_secs(self.config.position_timeout_secs))
+        {
+            if self.inventory_age.can_retry(now) {
+                self.inventory_age.last_attempt = Some(now);
+                self.execute_timeout_flatten(inputs.mid).await;
+            }
+        } else if let Some((our_bid, our_ask, bounds)) =
+            self.calculate_optimal_quotes(&inputs, quoting_position)
+        {
+            self.execute_quoting_cycle(our_bid, our_ask, bounds, inputs.mid, shutdown)
+                .await;
+            if self.hedged_low_margin {
+                // perform_graceful_shutdown cleans Lighter, then
+                // hedge.finish() closes Hyperliquid against it.
+                anyhow::bail!("Low margin while hedged; unwinding both legs");
+            }
+        } else {
+            self.cancel_all_orders().await;
+        }
+
+        Ok(CycleOutcome::Quoted)
     }
 
     fn quote_allowance(&self, confirmed: f64, short: f64, long: f64) -> Option<QuoteAllowance> {

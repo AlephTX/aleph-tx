@@ -280,6 +280,7 @@ mod tests {
     }
 
     /// Real tracker path: OrderCreated + OrderFilled through apply_event.
+    #[allow(clippy::too_many_arguments)]
     fn apply_fill(
         tracker: &OrderTracker,
         coid: i64,
