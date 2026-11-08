@@ -19,8 +19,8 @@
 //! account sample (see `lighter`); it never changes a Hyperliquid result.
 
 use super::journal::{
-    IntentRecord, JournalRecord, MAX_PRIMARY_AGE_US, ParseError, PrimaryObservation, StartRecord,
-    TerminalRecord,
+    IntentRecord, JournalRecord, LighterBatchRecord, MAX_PRIMARY_AGE_US, ParseError,
+    PrimaryObservation, StartRecord, TerminalRecord,
 };
 use super::{
     CLOCK_TOLERANCE_MS, IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill,
@@ -284,6 +284,9 @@ struct State {
     by_cloid: BTreeMap<String, usize>,
     confirmed: Decimal,
     verified_flat: Option<usize>,
+    /// Client order IDs from consistent `lighter_create_batch` records, with
+    /// their journal line, in journal order.
+    lighter_batches: Vec<(usize, i64)>,
 }
 
 impl State {
@@ -326,6 +329,7 @@ impl State {
             ),
             JournalRecord::Intent(intent) => self.apply_intent(line, intent),
             JournalRecord::Terminal(terminal) => self.apply_terminal(line, terminal),
+            JournalRecord::LighterBatch(batch) => self.apply_lighter_batch(line, batch),
             JournalRecord::VerifiedFlat => self.apply_verified_flat(line),
         }
     }
@@ -353,6 +357,7 @@ impl State {
             }
             Some(1) => "v1",
             Some(2) => "v2",
+            Some(3) => "v3",
             Some(other) => {
                 self.issue(
                     Some(line),
@@ -383,11 +388,13 @@ impl State {
             invalid.push("empty symbol".into());
         }
         match (start.journal_schema, start.lighter_market_id) {
-            (Some(2), None) => invalid.push("schema 2 start lacks lighter_market_id".into()),
-            (Some(2), Some(id)) if id < 0 => {
+            (Some(2 | 3), None) => {
+                invalid.push("schema 2 or later start lacks lighter_market_id".into())
+            }
+            (Some(2 | 3), Some(id)) if id < 0 => {
                 invalid.push(format!("lighter_market_id {id} is negative"))
             }
-            (Some(2), Some(_)) | (_, None) => {}
+            (Some(2 | 3), Some(_)) | (_, None) => {}
             (_, Some(_)) => invalid.push("lighter_market_id before schema 2".into()),
         }
         for reason in invalid {
@@ -412,7 +419,7 @@ impl State {
     fn primary_contract(&self, intent: &IntentRecord) -> (&'static str, Vec<String>) {
         let mut invalid = Vec::new();
         let Some(observation) = &intent.primary_observation else {
-            return if self.schema == "v2" {
+            return if binds_lighter(self.schema) {
                 (
                     "invalid",
                     vec!["schema 2 intent lacks primary_observation".into()],
@@ -421,7 +428,7 @@ impl State {
                 ("unavailable", invalid)
             };
         };
-        if self.schema != "v2" {
+        if !binds_lighter(self.schema) {
             invalid.push(format!("primary_observation in a {} journal", self.schema));
         }
         if let Some(start) = &self.start {
@@ -657,6 +664,65 @@ impl State {
         ioc.terminal = Some(terminal);
     }
 
+    /// A schema 3 batch record must name this session, its account and
+    /// market, and at least one positive client order ID not journaled
+    /// before. Any violation drops the whole record from the recorded set.
+    fn apply_lighter_batch(&mut self, line: usize, batch: LighterBatchRecord) {
+        let mut invalid = Vec::new();
+        if self.schema != "v3" {
+            invalid.push(format!("lighter_create_batch in a {} journal", self.schema));
+        }
+        if let Some(start) = &self.start {
+            if batch.session_id != start.session_id {
+                invalid.push("session_id differs from the journal start".into());
+            }
+            if batch.network != start.network {
+                invalid.push(format!(
+                    "network {} vs journal {}",
+                    batch.network, start.network
+                ));
+            }
+            if batch.lighter_account_index != start.lighter_account_index {
+                invalid.push(format!(
+                    "account {} vs journal {}",
+                    batch.lighter_account_index, start.lighter_account_index
+                ));
+            }
+            if start.lighter_market_id != Some(batch.lighter_market_id) {
+                invalid.push(format!(
+                    "market {} vs journal {:?}",
+                    batch.lighter_market_id, start.lighter_market_id
+                ));
+            }
+        }
+        if batch.client_order_ids.is_empty() {
+            invalid.push("a create batch lists no client order ID".into());
+        }
+        if batch.client_order_ids.len() + batch.cancels > 50 {
+            invalid.push("more actions than one Lighter batch carries".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for &id in &batch.client_order_ids {
+            if id <= 0 {
+                invalid.push(format!("client order ID {id} is not positive"));
+            } else if !seen.insert(id) || self.lighter_batches.iter().any(|(_, j)| *j == id) {
+                invalid.push(format!("client order ID {id} is journaled more than once"));
+            }
+        }
+        if invalid.is_empty() {
+            self.lighter_batches
+                .extend(batch.client_order_ids.iter().map(|&id| (line, id)));
+        }
+        for reason in invalid {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "invalid_lighter_batch",
+                reason,
+            );
+        }
+    }
+
     fn apply_verified_flat(&mut self, line: usize) {
         if let Some(open) = self.pending() {
             self.issue(
@@ -694,6 +760,12 @@ impl State {
 /// In both cases the confirming account time is at or after the terminal.
 /// v1 must carry all three fields; legacy may carry none and is reported as
 /// unproven timing elsewhere, but fields it does carry are still checked.
+/// Schema 2 and later bind the Lighter account and market on `start` and a
+/// primary observation on every intent.
+fn binds_lighter(schema: &str) -> bool {
+    matches!(schema, "v2" | "v3")
+}
+
 fn terminal_time_contract(
     schema: &str,
     intent: &IntentRecord,
@@ -705,7 +777,7 @@ fn terminal_time_contract(
         terminal.terminal_at_ms,
         terminal.account_time_ms,
     );
-    if matches!(schema, "v1" | "v2") {
+    if matches!(schema, "v1" | "v2" | "v3") {
         for (name, missing) in [
             ("terminal_source", fields.0.is_none()),
             ("terminal_at_ms", fields.1.is_none()),
@@ -861,6 +933,7 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         by_cloid: BTreeMap::new(),
         confirmed: Decimal::ZERO,
         verified_flat: None,
+        lighter_batches: Vec::new(),
     };
     let lines = read_lines(journal, &mut state);
     if state.start.is_none() {
@@ -947,11 +1020,25 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         check_snapshot_against_journal(&mut state, snapshot);
     }
     // Lighter findings only add issues; Hyperliquid order results stay as is.
+    let journaled = std::mem::take(&mut state.lighter_batches);
     let primary_leg = match evidence.and_then(|(e, usable)| Some((e.lighter.as_ref()?, usable))) {
-        None => PrimaryLegReport::not_provided(),
+        None if journaled.is_empty() => PrimaryLegReport::not_provided(),
+        None => {
+            // Journaled creates with no venue evidence: each one is open.
+            state.issue(
+                None,
+                Severity::Unresolved,
+                "lighter_missing_evidence",
+                format!(
+                    "{} journaled Lighter create(s) have no order history or account sample",
+                    journaled.len()
+                ),
+            );
+            PrimaryLegReport::journal_only(&journaled)
+        }
         Some((lighter, usable)) => {
-            let bound = state.start.as_ref().filter(|_| state.schema == "v2");
-            let (report, findings) = lighter::evaluate(bound, usable, lighter);
+            let bound = state.start.as_ref().filter(|_| binds_lighter(state.schema));
+            let (report, findings) = lighter::evaluate(bound, usable, lighter, &journaled);
             for f in findings {
                 let severity = if f.invalid {
                     Severity::Invalid

@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
+#[cfg(test)]
+mod batch_journal_tests;
 pub(crate) mod recovery;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -1119,6 +1121,39 @@ impl LighterTrading {
             }
         }
 
+        let cancels = txs.len() - place_results.len();
+        self.submit_prepared(
+            txs,
+            place_results,
+            cancels,
+            opens_risk,
+            |_, _| std::future::ready(Ok(())),
+            |txs| async move { self.send_tx_batch(&txs).await },
+        )
+        .await
+    }
+
+    /// The part of `execute_batch` after every action has signed: reserve
+    /// risk, then `record` the creates, then `send`. `record` runs only for
+    /// batches with creates; until it completes nothing is sent. A record
+    /// error releases the reservations because nothing left this process.
+    /// Once `record` starts, a dropped future or an uncertain send keeps every
+    /// create reserved and requires reconciliation, as for a lost send.
+    async fn submit_prepared<R, RFut, S, SFut>(
+        &self,
+        txs: Vec<(u8, String)>,
+        place_results: Vec<PlaceResult>,
+        cancels: usize,
+        opens_risk: bool,
+        record: R,
+        send: S,
+    ) -> Result<BatchResult>
+    where
+        R: FnOnce(&[PlaceResult], usize) -> RFut,
+        RFut: std::future::Future<Output = Result<()>>,
+        S: FnOnce(Vec<(u8, String)>) -> SFut,
+        SFut: std::future::Future<Output = Result<SendTxBatchResponse>>,
+    {
         if opens_risk {
             self.ensure_open_risk_allowed()?;
         }
@@ -1145,10 +1180,22 @@ impl LighterTrading {
             }
         }
 
-        tracing::info!("Submitting batch of {} mixed actions", txs.len());
-
         let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
-        match self.send_tx_batch(&txs).await {
+        if !place_results.is_empty()
+            && let Err(error) = record(&place_results, cancels).await
+        {
+            // Nothing was sent: release the reservations and the guard.
+            if let Some(tracker) = &self.order_tracker {
+                for order in &place_results {
+                    tracker.mark_failed(order.client_order_index);
+                }
+            }
+            guard.disarm();
+            return Err(error.context("Lighter batch record failed; batch not sent"));
+        }
+
+        tracing::info!("Submitting batch of {} mixed actions", txs.len());
+        match send(txs).await {
             Ok(resp) => {
                 guard.disarm();
                 let hashes = resp.tx_hash.unwrap_or_default();

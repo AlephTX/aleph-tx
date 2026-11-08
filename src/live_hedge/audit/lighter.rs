@@ -47,6 +47,11 @@ pub struct RawResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LighterOrderReport {
     pub client_order_id: i64,
+    /// `journal_and_caller`, `journal_only` (recorded but not declared) or
+    /// `caller_only` (declared but never recorded).
+    pub source: &'static str,
+    /// Journal line of the `lighter_create_batch` record, when recorded.
+    pub journal_line: Option<usize>,
     /// `terminal`, `live`, `missing` or `invalid`.
     pub state: &'static str,
     pub venue_status: Option<String>,
@@ -65,8 +70,12 @@ pub struct PrimaryLegReport {
     /// `unresolved` or `explained` (all declared orders terminal, the account
     /// covers their fills and is flat).
     pub status: &'static str,
-    /// Always `caller_declared_order_ids`: not proven to be every order.
+    /// `caller_declared_order_ids` (no batch records) or
+    /// `journal_and_caller_order_ids`. Neither is proven to be every order.
     pub scope: &'static str,
+    /// IDs from `lighter_create_batch` records: this process prepared to send
+    /// them, not that the venue received them.
+    pub journal_order_ids: Vec<i64>,
     pub account_index: Option<i64>,
     pub market_id: Option<i64>,
     pub orders: Vec<LighterOrderReport>,
@@ -105,10 +114,20 @@ impl PrimaryLegReport {
         Self::empty("not_provided")
     }
 
+    /// Journaled creates without Lighter evidence: listed, none explained.
+    pub(super) fn journal_only(journaled: &[(usize, i64)]) -> Self {
+        Self {
+            scope: "journal_and_caller_order_ids",
+            journal_order_ids: journaled.iter().map(|(_, id)| *id).collect(),
+            ..Self::empty("missing_evidence")
+        }
+    }
+
     fn empty(status: &'static str) -> Self {
         Self {
             status,
             scope: "caller_declared_order_ids",
+            journal_order_ids: Vec::new(),
             account_index: None,
             market_id: None,
             orders: Vec::new(),
@@ -121,13 +140,16 @@ impl PrimaryLegReport {
     }
 }
 
-/// Explain the declared orders and account sample against the session.
-/// `start` is the journal's start record when its schema binds a Lighter
-/// market; `usable` is false when the evidence names another session.
+/// Explain the orders and account sample against the session. `start` is
+/// the journal's start record when its schema binds a Lighter market;
+/// `usable` is false when the evidence names another session; `journaled`
+/// holds the (line, client order ID) pairs of consistent batch records. The
+/// checked set is the union of journaled and declared IDs.
 pub(super) fn evaluate(
     start: Option<&StartRecord>,
     usable: bool,
     evidence: &LighterEvidence,
+    journaled: &[(usize, i64)],
 ) -> (PrimaryLegReport, Vec<Finding>) {
     let mut findings = Vec::new();
     let Some((start, market_id)) = start.and_then(|start| Some((start, start.lighter_market_id?)))
@@ -148,8 +170,12 @@ pub(super) fn evaluate(
     let mut report = PrimaryLegReport {
         account_index: Some(evidence.account_index),
         market_id: Some(evidence.market_id),
+        journal_order_ids: journaled.iter().map(|(_, id)| *id).collect(),
         ..PrimaryLegReport::empty("unresolved")
     };
+    if !journaled.is_empty() {
+        report.scope = "journal_and_caller_order_ids";
+    }
     let mut identity = Vec::new();
     if evidence.account_index != start.lighter_account_index {
         identity.push(format!(
@@ -178,7 +204,7 @@ pub(super) fn evaluate(
         report.status = "invalid";
         return (report, findings);
     }
-    evaluate_orders(evidence, &mut report, &mut findings);
+    evaluate_orders(evidence, journaled, &mut report, &mut findings);
     evaluate_account(evidence, &mut report, &mut findings);
     report.status = if findings.iter().any(|f| f.invalid) {
         "invalid"
@@ -198,14 +224,16 @@ const MISSING: &[&str] = &["lighter_missing_order_ids", "lighter_missing_account
 
 fn evaluate_orders(
     evidence: &LighterEvidence,
+    journaled: &[(usize, i64)],
     report: &mut PrimaryLegReport,
     findings: &mut Vec<Finding>,
 ) {
-    if evidence.client_order_ids.is_empty() {
+    if evidence.client_order_ids.is_empty() && journaled.is_empty() {
         findings.push(finding(
             false,
             "lighter_missing_order_ids",
-            "no client order IDs declared; an empty set proves no order was placed".into(),
+            "no client order IDs declared or journaled; an empty set proves no order was placed"
+                .into(),
         ));
         return;
     }
@@ -222,6 +250,7 @@ fn evaluate_orders(
     }
     let mut seen = BTreeSet::new();
     let mut required = Some(0);
+    let mut declared = Vec::new();
     for &id in &evidence.client_order_ids {
         if id <= 0 || !seen.insert(id) {
             findings.push(finding(
@@ -230,7 +259,40 @@ fn evaluate_orders(
                 format!("client order ID {id} is not positive or is declared twice"),
             ));
             required = None;
-            continue;
+        } else {
+            declared.push(id);
+        }
+    }
+    // Journaled IDs first, in journal order, then declared-only IDs. A
+    // journaled ID the caller left out is still checked.
+    let mut checked: Vec<(i64, Option<usize>)> = journaled
+        .iter()
+        .map(|&(line, id)| (id, Some(line)))
+        .collect();
+    checked.extend(
+        declared
+            .iter()
+            .filter(|id| !journaled.iter().any(|(_, j)| j == *id))
+            .map(|&id| (id, None)),
+    );
+    for (id, journal_line) in checked {
+        let source = match (journal_line.is_some(), declared.contains(&id)) {
+            (true, true) => "journal_and_caller",
+            (true, false) => "journal_only",
+            (false, _) => "caller_only",
+        };
+        match source {
+            "journal_only" => findings.push(finding(
+                false,
+                "lighter_undeclared_journal_id",
+                format!("{id} is journaled but the caller did not declare it; checked anyway"),
+            )),
+            "caller_only" if !journaled.is_empty() => findings.push(finding(
+                false,
+                "lighter_unjournaled_declared_id",
+                format!("{id} is declared but no batch record names it"),
+            )),
+            _ => {}
         }
         let (order, reason) =
             match order_state(&records, id, evidence.account_index, evidence.market_id) {
@@ -280,6 +342,8 @@ fn evaluate_orders(
                 }
             };
         let mut order = order;
+        order.source = source;
+        order.journal_line = journal_line;
         if let Some((invalid, kind, detail)) = reason {
             order.reason = Some(detail.clone());
             findings.push(finding(invalid, kind, detail));
@@ -297,6 +361,8 @@ fn lighter_order(
 ) -> LighterOrderReport {
     LighterOrderReport {
         client_order_id: id,
+        source: "caller_only",
+        journal_line: None,
         state,
         venue_status: order.map(|o| o.status.clone()),
         filled: order.map(|o| o.filled_base_amount),

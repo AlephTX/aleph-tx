@@ -371,3 +371,181 @@ fn missing_lighter_evidence_is_explicit_and_old_files_still_parse() {
     evidence["lighter"]["complete"] = json!(true);
     assert!(serde_json::from_value::<super::super::Evidence>(evidence).is_err());
 }
+
+fn v3_start() -> JournalRecord {
+    start(3, Some(4095))
+}
+
+fn batch(ids: &[i64]) -> JournalRecord {
+    JournalRecord::LighterBatch(crate::live_hedge::journal::LighterBatchRecord {
+        session_id: "s-1".into(),
+        network: "Testnet".into(),
+        lighter_account_index: 7,
+        lighter_market_id: 4095,
+        client_order_ids: ids.to_vec(),
+        cancels: 1,
+        prepared_at_ms: 1_000,
+    })
+}
+
+/// Journaled IDs are checked even when the caller leaves them out; extra
+/// declared IDs are flagged; each order carries its source and line.
+#[test]
+fn journaled_ids_are_checked_and_sources_kept_apart() {
+    let flat = || Some(account(80, None));
+    let orders = || {
+        vec![
+            order(11, "filled", "0.01", 40),
+            order(12, "canceled", "0", 0),
+        ]
+    };
+    let records = [v3_start(), batch(&[11, 12])];
+    // Caller declares both: explained, both journal_and_caller.
+    let both = run(&records, Some(lighter(json!([11, 12]), orders(), flat())));
+    assert_eq!(both.journal.schema, "v3");
+    assert_eq!(both.primary_leg.status, "explained", "{:?}", both.issues);
+    assert_eq!(both.primary_leg.scope, "journal_and_caller_order_ids");
+    let src: Vec<_> = both
+        .primary_leg
+        .orders
+        .iter()
+        .map(|o| (o.client_order_id, o.source, o.journal_line))
+        .collect();
+    assert_eq!(
+        src,
+        [
+            (11, "journal_and_caller", Some(2)),
+            (12, "journal_and_caller", Some(2))
+        ]
+    );
+    // Caller omits 12: it is still checked, flagged journal_only.
+    let omitted = run(&records, Some(lighter(json!([11]), orders(), flat())));
+    assert_eq!(omitted.primary_leg.orders.len(), 2);
+    assert_eq!(omitted.primary_leg.orders[1].source, "journal_only");
+    assert!(kinds(&omitted).contains(&"lighter_undeclared_journal_id"));
+    assert_eq!(omitted.primary_leg.status, "unresolved");
+    // Caller omits 12 and the history lacks it: missing, not covered.
+    let lost = run(
+        &records,
+        Some(lighter(
+            json!([11]),
+            vec![order(11, "filled", "0.01", 40)],
+            flat(),
+        )),
+    );
+    assert_eq!(lost.primary_leg.orders[1].state, "missing");
+    assert_eq!(lost.primary_leg.residual, "unproven");
+    // Empty declaration still checks the journaled IDs.
+    let empty = run(&records, Some(lighter(json!([]), orders(), flat())));
+    assert!(!kinds(&empty).contains(&"lighter_missing_order_ids"));
+    assert_eq!(empty.primary_leg.orders.len(), 2);
+    // An extra declared ID is caller_only and flagged.
+    let extra = run(
+        &records,
+        Some(lighter(json!([11, 12, 13]), orders(), flat())),
+    );
+    assert_eq!(extra.primary_leg.orders[2].source, "caller_only");
+    assert!(kinds(&extra).contains(&"lighter_unjournaled_declared_id"));
+    for report in [&both, &omitted, &lost, &empty, &extra] {
+        assert!(!report.restart_permitted);
+        assert_eq!(
+            report.orders.len(),
+            0,
+            "no Hyperliquid IOC in these journals"
+        );
+    }
+}
+
+/// Bad batch records are invalid and never contribute IDs; a torn record
+/// is not written; batch records in a v2 journal are rejected.
+#[test]
+fn bad_batch_records_never_count_as_recorded() {
+    let JournalRecord::LighterBatch(base) = batch(&[11]) else {
+        unreachable!()
+    };
+    let mut cases = Vec::new();
+    for (name, edit) in [
+        (
+            "session",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.session_id = "other".into()
+            }) as Box<dyn Fn(&mut _)>,
+        ),
+        (
+            "network",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.network = "Mainnet".into()
+            }),
+        ),
+        (
+            "account",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.lighter_account_index = 8
+            }),
+        ),
+        (
+            "market",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.lighter_market_id = 4096
+            }),
+        ),
+        (
+            "empty",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.client_order_ids.clear()
+            }),
+        ),
+        (
+            "non-positive",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.client_order_ids = vec![0]
+            }),
+        ),
+        (
+            "duplicate",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| {
+                b.client_order_ids = vec![11, 11]
+            }),
+        ),
+        (
+            "oversize",
+            Box::new(|b: &mut crate::live_hedge::journal::LighterBatchRecord| b.cancels = 50),
+        ),
+    ] {
+        let mut record = base.clone();
+        edit(&mut record);
+        cases.push((name, vec![v3_start(), JournalRecord::LighterBatch(record)]));
+    }
+    cases.push((
+        "repeat across records",
+        vec![v3_start(), batch(&[11]), batch(&[11])],
+    ));
+    cases.push(("v2 journal", vec![start(2, Some(4095)), batch(&[11])]));
+    for (name, records) in cases {
+        let report = audit(&journal(&records), None);
+        assert_eq!(report.status, AuditStatus::Invalid, "{name}");
+        assert!(kinds(&report).contains(&"invalid_lighter_batch"), "{name}");
+        let expected: &[i64] = if name == "repeat across records" {
+            &[11]
+        } else {
+            &[]
+        };
+        assert_eq!(report.primary_leg.journal_order_ids, expected, "{name}");
+        assert!(!report.restart_permitted);
+    }
+    // Torn tail: a batch record without its newline was never synced.
+    let mut bytes = journal(&[v3_start()]);
+    let line = batch(&[11]).to_line().unwrap();
+    bytes.extend_from_slice(&line[..line.len() - 1]);
+    let torn = audit(&bytes, None);
+    assert!(kinds(&torn).contains(&"truncated_tail"));
+    assert!(torn.primary_leg.journal_order_ids.is_empty());
+    assert_eq!(torn.primary_leg.status, "not_provided");
+    // Unknown fields in a batch record are a parse error, not ignored.
+    let mut value: Value = serde_json::from_slice(&batch(&[11]).to_line().unwrap()).unwrap();
+    value["acked"] = json!(true);
+    let mut tampered = journal(&[v3_start()]);
+    tampered.extend(serde_json::to_vec(&value).unwrap());
+    tampered.push(b'\n');
+    assert_eq!(audit(&tampered, None).status, AuditStatus::Invalid);
+}

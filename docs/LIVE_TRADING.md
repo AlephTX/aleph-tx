@@ -125,7 +125,12 @@ the strategy's normal shorter cancellation timer.
   fill watermark before its position counts. It shows each order's state,
   the required and observed watermarks and the residual position. It covers
   only the IDs given, never every order on the account, and it does not
-  change any Hyperliquid result.
+  change any Hyperliquid result. Schema 3 journals, written so far only by
+  offline trials, also carry `lighter_create_batch` records synced before
+  each batch with creates is sent. Their IDs are checked even when not
+  declared, and each order shows whether it came from the journal, the
+  caller or both. A record proves only that the batch was prepared, not
+  that it reached the venue.
 - When the authenticated Lighter equity stream is quiet, the feeder refreshes
   balances from the account REST endpoint. Position freshness remains
   independent, and an older REST request cannot overwrite a newer WS update.

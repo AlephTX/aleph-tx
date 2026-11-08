@@ -9,6 +9,9 @@
 //! fields are optional here so legacy journals still parse; the audit reports
 //! them as legacy instead of assuming values. Schema 1 has no Lighter market
 //! on `start` and no primary observation on intents; schema 2 requires both.
+//! Schema 3 adds `lighter_create_batch`: the client order IDs of one Lighter
+//! batch, written and synced before the batch is sent. Only offline trials
+//! write schema 3; the supervised launcher still writes schema 2.
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -16,6 +19,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Schema written by this version on the `start` record.
 pub const JOURNAL_SCHEMA: u32 = 2;
+
+/// Schema whose journals may carry `lighter_create_batch` records.
+pub const LIGHTER_BATCH_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,11 +128,31 @@ pub struct TerminalRecord {
     pub account_time_ms: Option<u64>,
 }
 
+/// The creates of one Lighter batch, written and synced before the batch is
+/// sent. It proves only that this process prepared to try them: a crash can
+/// fall between sync and send, and a send can be partly accepted or lost.
+/// Cancel-only batches and batches that fail before this point write none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LighterBatchRecord {
+    pub session_id: String,
+    pub network: String,
+    pub lighter_account_index: i64,
+    pub lighter_market_id: i64,
+    /// Client order IDs of every create in the batch, in batch order.
+    pub client_order_ids: Vec<i64>,
+    /// Number of cancels in the same batch (diagnostic only).
+    pub cancels: usize,
+    /// Local wall-clock time when the record was formed (diagnostic only).
+    pub prepared_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JournalRecord {
     Start(StartRecord),
     Intent(IntentRecord),
     Terminal(TerminalRecord),
+    LighterBatch(LighterBatchRecord),
     VerifiedFlat,
 }
 
@@ -156,6 +182,7 @@ impl JournalRecord {
             Self::Start(_) => "start",
             Self::Intent(_) => "hedge_intent",
             Self::Terminal(_) => "hedge_terminal",
+            Self::LighterBatch(_) => "lighter_create_batch",
             Self::VerifiedFlat => "verified_flat",
         }
     }
@@ -166,6 +193,7 @@ impl JournalRecord {
             Self::Start(record) => serde_json::to_value(record)?,
             Self::Intent(record) => serde_json::to_value(record)?,
             Self::Terminal(record) => serde_json::to_value(record)?,
+            Self::LighterBatch(record) => serde_json::to_value(record)?,
             Self::VerifiedFlat => serde_json::Value::Object(Default::default()),
         };
         value
@@ -205,6 +233,7 @@ impl JournalRecord {
             "start" => fields(&event, body).map(Self::Start),
             "hedge_intent" => fields(&event, body).map(Self::Intent),
             "hedge_terminal" => fields(&event, body).map(Self::Terminal),
+            "lighter_create_batch" => fields(&event, body).map(Self::LighterBatch),
             "verified_flat" => {
                 if body.as_object().is_some_and(|o| o.is_empty()) {
                     Ok(Self::VerifiedFlat)
@@ -217,5 +246,60 @@ impl JournalRecord {
             }
             _ => Err(ParseError::UnknownEvent(event)),
         }
+    }
+}
+
+/// Append-and-sync writer for `lighter_create_batch` records in a schema 3
+/// journal. Offline trials only; the supervised launcher does not create it.
+pub struct LighterBatchJournal {
+    file: std::fs::File,
+    session_id: String,
+    network: String,
+    account_index: i64,
+    market_id: i64,
+}
+
+impl LighterBatchJournal {
+    /// Wrap a journal whose `start` declares schema 3 with this identity.
+    pub fn new(file: std::fs::File, start: &StartRecord) -> Result<Self> {
+        anyhow::ensure!(
+            start.journal_schema == Some(LIGHTER_BATCH_SCHEMA),
+            "Lighter batch records need a schema {LIGHTER_BATCH_SCHEMA} journal"
+        );
+        Ok(Self {
+            file,
+            session_id: start.session_id.clone(),
+            network: start.network.clone(),
+            account_index: start.lighter_account_index,
+            market_id: start
+                .lighter_market_id
+                .context("Schema 3 start lacks lighter_market_id")?,
+        })
+    }
+
+    /// The record for one batch's creates.
+    pub fn record(&self, client_order_ids: Vec<i64>, cancels: usize) -> Result<JournalRecord> {
+        let prepared_at_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        Ok(JournalRecord::LighterBatch(LighterBatchRecord {
+            session_id: self.session_id.clone(),
+            network: self.network.clone(),
+            lighter_account_index: self.account_index,
+            lighter_market_id: self.market_id,
+            client_order_ids,
+            cancels,
+            prepared_at_ms,
+        }))
+    }
+
+    /// One write, then `sync_data`; returns only once the line is durable.
+    pub fn append(&mut self, record: &JournalRecord) -> Result<()> {
+        use std::io::Write;
+        self.file.write_all(&record.to_line()?)?;
+        self.file.sync_data()?;
+        Ok(())
     }
 }

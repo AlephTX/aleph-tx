@@ -854,7 +854,7 @@ fn primary_observation_is_required_in_v2_and_unavailable_before() {
     }
     // An unsupported future schema is reported, not parsed as v2.
     assert_eq!(
-        audit(&journal(&[start(Some(3))]), None).journal.schema,
+        audit(&journal(&[start(Some(4))]), None).journal.schema,
         "unknown"
     );
 }
