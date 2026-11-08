@@ -373,6 +373,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
                 "totalNtlPos": "14", "totalMarginUsed": "1"},
                 "assetPositions": [{"position": {"coin": "ETH", "szi": szi, "unrealizedPnl": "0"}}]}),
         }),
+        lighter: None,
     }
     };
     let unknown = frozen(json!({"status": "unknownOid"}), Some("-0.007"), now);

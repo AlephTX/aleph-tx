@@ -11,10 +11,12 @@
 //! The audit never contacts a venue, never reads credentials, never cancels
 //! or resubmits, and never touches the session file or lock. A matched
 //! result is only "offline evidence matches"; it does not permit restart.
-//! Lighter (primary leg) orders and inventory are not journaled and are
-//! outside this report. Schema 2 intents carry the single Lighter position
-//! read each IOC was planned against; the report checks it for identity and
-//! internal consistency only, as a local claim.
+//! Lighter (primary leg) orders and inventory are not journaled. Schema 2
+//! intents carry the single Lighter position read each IOC was planned
+//! against; the report checks it for identity and internal consistency only,
+//! as a local claim. An optional `lighter` evidence section replays the
+//! production recovery judgement for caller-declared client orders and one
+//! account sample (see `lighter`); it never changes a Hyperliquid result.
 
 use super::journal::{
     IntentRecord, JournalRecord, MAX_PRIMARY_AGE_US, ParseError, PrimaryObservation, StartRecord,
@@ -32,6 +34,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod lighter;
+pub use lighter::{LighterEvidence, LighterOrderReport, PrimaryLegReport, RawResponse};
+
 /// Operator-supplied, frozen venue observations for one hedge account.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +49,9 @@ pub struct Evidence {
     pub lookups: Vec<LookupEvidence>,
     #[serde(default)]
     pub account_snapshot: Option<SnapshotEvidence>,
+    /// Frozen Lighter order histories and account sample; optional.
+    #[serde(default)]
+    pub lighter: Option<LighterEvidence>,
 }
 
 /// One raw `{"type":"orderStatus"}` response and when it was captured.
@@ -212,6 +220,8 @@ pub struct Report {
     pub evidence: Option<EvidenceSummary>,
     pub hedge_position: PositionSummary,
     pub orders: Vec<OrderReport>,
+    /// Caller-declared Lighter orders and account sample, when supplied.
+    pub primary_leg: PrimaryLegReport,
     pub issues: Vec<Issue>,
     pub boundaries: Vec<&'static str>,
 }
@@ -221,6 +231,7 @@ const BOUNDARIES: &[&str] = &[
     "Journal records are this process's durable claims, not venue confirmations.",
     "Evidence authenticity is outside this audit; it checks consistency only.",
     "Lighter (primary leg) orders and inventory are not journaled; check them on the venue.",
+    "Lighter evidence covers only the client order IDs the caller declared, not every order on the account; an absent order proves nothing.",
     "A primary observation is this process's local record of one Lighter read: not venue-signed, not proof of venue state time, and not an order or account ledger.",
     "An unknown or absent lookup never proves an IOC was not accepted or filled.",
     "The active journal and account lock are untouched; this report never permits restart.",
@@ -935,6 +946,23 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
     {
         check_snapshot_against_journal(&mut state, snapshot);
     }
+    // Lighter findings only add issues; Hyperliquid order results stay as is.
+    let primary_leg = match evidence.and_then(|(e, usable)| Some((e.lighter.as_ref()?, usable))) {
+        None => PrimaryLegReport::not_provided(),
+        Some((lighter, usable)) => {
+            let bound = state.start.as_ref().filter(|_| state.schema == "v2");
+            let (report, findings) = lighter::evaluate(bound, usable, lighter);
+            for f in findings {
+                let severity = if f.invalid {
+                    Severity::Invalid
+                } else {
+                    Severity::Unresolved
+                };
+                state.issue(None, severity, f.kind, f.detail);
+            }
+            report
+        }
+    };
 
     let worst = state.issues.iter().map(|i| i.severity).max();
     let status = if worst == Some(Severity::Invalid)
@@ -975,6 +1003,7 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         }),
         hedge_position: position,
         orders,
+        primary_leg,
         issues: state.issues,
         boundaries: BOUNDARIES.to_vec(),
     }

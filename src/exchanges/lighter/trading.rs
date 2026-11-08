@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
-mod recovery;
+pub(crate) mod recovery;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -139,13 +139,20 @@ impl PositionEvidence {
     /// order `transaction_time`; 0 = no fills to cover). An unknown account
     /// watermark covers nothing but "no fills"; receipt time never stands in.
     pub fn covers(&self, fill_watermark: u64) -> bool {
-        fill_watermark == 0 || self.transaction_time.is_some_and(|t| t >= fill_watermark)
+        watermark_covers(self.transaction_time, fill_watermark)
     }
 
     /// Local age bound: from request start, so a slow request counts.
     pub fn age(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.requested_at)
     }
+}
+
+/// The coverage rule behind `PositionEvidence::covers`, shared with the
+/// offline audit: an account watermark covers a fill watermark only when it
+/// is known and not older. 0 means there are no fills to cover.
+pub(crate) fn watermark_covers(transaction_time: Option<u64>, fill_watermark: u64) -> bool {
+    fill_watermark == 0 || transaction_time.is_some_and(|t| t >= fill_watermark)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1326,25 +1333,12 @@ impl LighterTrading {
     /// The production position read: unique account and market identity,
     /// exact signed size, trade watermark and local request/receipt times.
     pub async fn position_evidence(&self) -> Result<PositionEvidence> {
-        use rust_decimal::Decimal;
         let (account, requested_at, received_at) = self.fetch_account().await?;
-        let transaction_time = (account.transaction_time > 0).then_some(account.transaction_time);
-        let position = match unique_position(account.positions, self.market_id)? {
-            None => Decimal::ZERO,
-            Some(position) => {
-                let size: Decimal = position.position.parse()?;
-                anyhow::ensure!(
-                    position.symbol == self.market_symbol
-                        && size >= Decimal::ZERO
-                        && (matches!(position.sign, -1 | 1)
-                            || (position.sign == 0 && size.is_zero())),
-                    "Invalid Lighter position snapshot"
-                );
-                size * Decimal::from(position.sign)
-            }
-        };
+        let account_index = account.index;
+        let (position, transaction_time) =
+            account_position(account, self.market_id, &self.market_symbol)?;
         Ok(PositionEvidence {
-            account_index: account.index,
+            account_index,
             market_id: self.market_id,
             position,
             transaction_time,
@@ -1539,6 +1533,56 @@ fn unique_position(positions: Vec<Position>, market_id: i64) -> Result<Option<Po
         "Position response lists the Lighter market more than once"
     );
     Ok(position)
+}
+
+/// Exact signed position and trade watermark for `market_id` in one account,
+/// by the production rules: unique market entry, matching symbol, valid sign
+/// and a non-negative size. A missing entry is a zero position; a 0
+/// watermark is unknown.
+fn account_position(
+    account: AccountInfo,
+    market_id: i64,
+    symbol: &str,
+) -> Result<(rust_decimal::Decimal, Option<u64>)> {
+    use rust_decimal::Decimal;
+    let transaction_time = (account.transaction_time > 0).then_some(account.transaction_time);
+    let position = match unique_position(account.positions, market_id)? {
+        None => Decimal::ZERO,
+        Some(position) => {
+            let size: Decimal = position.position.parse()?;
+            anyhow::ensure!(
+                position.symbol == symbol
+                    && size >= Decimal::ZERO
+                    && (matches!(position.sign, -1 | 1) || (position.sign == 0 && size.is_zero())),
+                "Invalid Lighter position snapshot"
+            );
+            size * Decimal::from(position.sign)
+        }
+    };
+    Ok((position, transaction_time))
+}
+
+/// Offline form of `position_evidence` for a frozen raw
+/// `/api/v1/account?by=index` response: the same code check, unique account,
+/// unique market and position rules. Returns the signed position and the
+/// account trade watermark.
+pub(crate) fn account_response_position(
+    response: &serde_json::Value,
+    account_index: i64,
+    market_id: i64,
+    symbol: &str,
+) -> Result<(rust_decimal::Decimal, Option<u64>)> {
+    let response = AccountsResponse::deserialize(response)?;
+    anyhow::ensure!(
+        response.code == 200,
+        "get_position: account response code {}",
+        response.code
+    );
+    account_position(
+        unique_account(response.accounts, account_index)?,
+        market_id,
+        symbol,
+    )
 }
 
 #[cfg(test)]

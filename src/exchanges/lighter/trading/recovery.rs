@@ -11,14 +11,82 @@ struct OrderHistory {
     orders: Vec<HistoricalOrder>,
 }
 
-#[derive(Deserialize)]
-struct HistoricalOrder {
-    client_order_index: i64,
-    market_index: i64,
-    owner_account_index: i64,
-    status: String,
-    filled_base_amount: Decimal,
-    transaction_time: u64,
+/// One `accountOrders` entry, as recovery and the offline audit read it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct HistoricalOrder {
+    pub(crate) client_order_index: i64,
+    pub(crate) market_index: i64,
+    pub(crate) owner_account_index: i64,
+    pub(crate) status: String,
+    pub(crate) filled_base_amount: Decimal,
+    pub(crate) transaction_time: u64,
+}
+
+/// Where one known client order stands in an order history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OrderState<'a> {
+    /// Not in the history: neither terminal nor absent is proven.
+    Missing,
+    /// Listed but not terminal.
+    Live(&'a HistoricalOrder),
+    /// Terminal; `fill_watermark` is the order's `transaction_time` when it
+    /// filled anything and 0 when it filled nothing.
+    Terminal {
+        order: &'a HistoricalOrder,
+        fill_watermark: u64,
+    },
+}
+
+/// Why a history entry for a known client order contradicts recovery's
+/// identity and quantity rules; never a pending state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderContradiction {
+    Duplicate,
+    ForeignAccount,
+    ForeignMarket,
+    NegativeFill,
+    FillWithoutWatermark,
+    FilledWithoutQuantity,
+}
+
+impl OrderContradiction {
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::ForeignAccount => "foreign_account",
+            Self::ForeignMarket => "foreign_market",
+            Self::NegativeFill => "negative_fill",
+            Self::FillWithoutWatermark => "fill_without_watermark",
+            Self::FilledWithoutQuantity => "filled_without_quantity",
+        }
+    }
+}
+
+impl std::fmt::Display for OrderContradiction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Duplicate => "Lighter historical order is listed more than once",
+            Self::ForeignAccount => "Lighter historical order belongs to another account",
+            Self::ForeignMarket => "Lighter historical order is for another market",
+            Self::NegativeFill => "Lighter historical order reports a negative fill",
+            Self::FillWithoutWatermark => "Lighter fill has no transaction watermark",
+            Self::FilledWithoutQuantity => "Lighter filled order reports zero quantity",
+        })
+    }
+}
+
+impl std::error::Error for OrderContradiction {}
+
+/// Offline form of the `accountOrders` read: the same code check and
+/// entries as recovery parses them.
+pub(crate) fn order_history(response: &serde_json::Value) -> Result<Vec<HistoricalOrder>> {
+    let response = OrderHistory::deserialize(response)?;
+    ensure!(
+        response.code == 200,
+        "Lighter order reconciliation failed with code {}",
+        response.code
+    );
+    Ok(response.orders)
 }
 
 impl LighterTrading {
@@ -166,40 +234,58 @@ fn terminal_fill_time(
 ) -> Result<Option<u64>> {
     let mut watermark = 0;
     for id in client_ids {
-        let mut matched = records
-            .iter()
-            .filter(|order| order.client_order_index == *id);
-        let Some(order) = matched.next() else {
-            return Ok(None);
-        };
-        ensure!(
-            order.owner_account_index == account_index
-                && order.market_index == market_id
-                && matched.next().is_none()
-                && order.filled_base_amount >= Decimal::ZERO,
-            "Lighter historical order identity or quantity mismatch"
-        );
-        if !(matches!(
-            order.status.as_str(),
-            "filled" | "canceled" | "rejected" | "expired"
-        ) || order.status.starts_with("canceled-"))
-        {
-            return Ok(None);
-        }
-        if order.filled_base_amount > Decimal::ZERO {
-            ensure!(
-                order.transaction_time > 0,
-                "Lighter fill has no transaction watermark"
-            );
-            watermark = watermark.max(order.transaction_time);
-        } else {
-            ensure!(
-                order.status != "filled",
-                "Lighter filled order reports zero quantity"
-            );
+        match order_state(records, *id, account_index, market_id)? {
+            OrderState::Missing | OrderState::Live(_) => return Ok(None),
+            OrderState::Terminal { fill_watermark, .. } => {
+                watermark = watermark.max(fill_watermark);
+            }
         }
     }
     Ok(Some(watermark))
+}
+
+/// The recovery rule for one client order, shared with the offline audit:
+/// a unique entry for the exact account and market with a non-negative fill,
+/// a terminal status, and a trade watermark on any fill.
+pub(crate) fn order_state<'a>(
+    records: &'a [HistoricalOrder],
+    id: i64,
+    account_index: i64,
+    market_id: i64,
+) -> std::result::Result<OrderState<'a>, OrderContradiction> {
+    use OrderContradiction as C;
+    let mut matched = records
+        .iter()
+        .filter(|order| order.client_order_index == id);
+    let Some(order) = matched.next() else {
+        return Ok(OrderState::Missing);
+    };
+    let check = |ok: bool, contradiction| if ok { Ok(()) } else { Err(contradiction) };
+    check(matched.next().is_none(), C::Duplicate)?;
+    check(
+        order.owner_account_index == account_index,
+        C::ForeignAccount,
+    )?;
+    check(order.market_index == market_id, C::ForeignMarket)?;
+    check(order.filled_base_amount >= Decimal::ZERO, C::NegativeFill)?;
+    if !(matches!(
+        order.status.as_str(),
+        "filled" | "canceled" | "rejected" | "expired"
+    ) || order.status.starts_with("canceled-"))
+    {
+        return Ok(OrderState::Live(order));
+    }
+    let fill_watermark = if order.filled_base_amount > Decimal::ZERO {
+        check(order.transaction_time > 0, C::FillWithoutWatermark)?;
+        order.transaction_time
+    } else {
+        check(order.status != "filled", C::FilledWithoutQuantity)?;
+        0
+    };
+    Ok(OrderState::Terminal {
+        order,
+        fill_watermark,
+    })
 }
 
 #[cfg(test)]

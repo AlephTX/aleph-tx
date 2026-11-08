@@ -84,6 +84,7 @@ fn evidence(lookups: Vec<LookupEvidence>, account: Option<SnapshotEvidence>) -> 
         coin: "ETH".into(),
         lookups,
         account_snapshot: account,
+        lighter: None,
     }
 }
 

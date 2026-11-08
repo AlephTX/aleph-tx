@@ -106,14 +106,26 @@ the strategy's normal shorter cancellation timer.
   live process never journals a record the audit rejects. The report shows
   this per IOC as `journal_claim`, `unavailable` (older journals) or
   `invalid`. It is this process's own record, not venue-signed proof of
-  Lighter state or time. The report never permits restart. It does not
-  cover Lighter orders or inventory, and it never changes the active journal.
+  Lighter state or time. The report never permits restart. Without Lighter
+  evidence it does not cover Lighter orders or inventory, and it never
+  changes the active journal.
 - For a `pending` IOC, capture the raw Hyperliquid `orderStatus` response
   for its `cloid` and a later `clearinghouseState` response. Put them in an
   evidence file with `network`, `hyperliquid_account`, `coin`, `lookups`
   (`cloid`, `observed_at_ms`, `response`) and `account_snapshot`
   (`observed_at_ms`, `state`). An `unknownOid` lookup does not prove the IOC
   was never accepted.
+- For the Lighter leg of a schema 2 journal, an optional `lighter` section
+  in the same evidence file takes `account_index`, `market_id`, `symbol`,
+  the session's `client_order_ids`, raw `accountOrders` responses in
+  `order_histories` (`observed_at_ms`, `response`) and a later raw
+  `account?by=index` response in `account`. The report's `primary_leg`
+  applies the REST recovery rules: each order must be terminal for that
+  account and market, and the account watermark must cover the highest
+  fill watermark before its position counts. It shows each order's state,
+  the required and observed watermarks and the residual position. It covers
+  only the IDs given, never every order on the account, and it does not
+  change any Hyperliquid result.
 - When the authenticated Lighter equity stream is quiet, the feeder refreshes
   balances from the account REST endpoint. Position freshness remains
   independent, and an older REST request cannot overwrite a newer WS update.
