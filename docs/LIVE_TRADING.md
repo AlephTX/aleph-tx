@@ -98,7 +98,13 @@ the strategy's normal shorter cancellation timer.
   evidence is inconsistent, including a session start without a session
   ID, a positive Lighter account index or a symbol, v1 terminal timing that
   the live writer could not have produced, or a position range outside the
-  decimal range (reported as null). The report never permits restart. It does not
+  decimal range (reported as null). Schema 2 journals record the Lighter
+  market on session start and, with each IOC intent, the Lighter account read
+  it was planned from: account, market, position, transaction time, request
+  duration and age against the freshness budget. The report shows this per IOC
+  as `journal_claim`, `unavailable` (older journals) or `invalid`. It is this
+  process's own record, not venue-signed proof of Lighter state or time.
+  The report never permits restart. It does not
   cover Lighter orders or inventory, and it never changes the active journal.
 - For a `pending` IOC, capture the raw Hyperliquid `orderStatus` response
   for its `cloid` and a later `clearinghouseState` response. Put them in an

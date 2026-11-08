@@ -7,14 +7,15 @@
 //! Compatibility: journals written before `journal_schema` existed carry no
 //! schema field on `start` and no timestamps on `hedge_terminal`. Those
 //! fields are optional here so legacy journals still parse; the audit reports
-//! them as legacy instead of assuming values.
+//! them as legacy instead of assuming values. Schema 1 has no Lighter market
+//! on `start` and no primary observation on intents; schema 2 requires both.
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Schema written by this version on the `start` record.
-pub const JOURNAL_SCHEMA: u32 = 1;
+pub const JOURNAL_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +29,32 @@ pub struct StartRecord {
     pub symbol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_schema: Option<u32>,
+    /// Configured Lighter market index. Schema 2 and later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighter_market_id: Option<i64>,
+}
+
+/// The Lighter position read an intent was planned against, as this process
+/// observed it. A local claim: it does not prove the venue's state, its
+/// generation time or the response's authenticity. Schema 2 and later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryObservation {
+    pub account_index: i64,
+    pub market_id: i64,
+    /// Signed base position; equals the intent's `primary_position`.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub position: Decimal,
+    /// Account `transaction_time` trade watermark; None when the response
+    /// carried none. Not a wall-clock time.
+    pub transaction_time: Option<u64>,
+    /// Local monotonic microseconds from request start to parsed response.
+    pub request_us: u64,
+    /// Local monotonic microseconds from request start to forming this
+    /// intent (rounded up), before fsync, signing and dispatch.
+    pub age_us: u64,
+    /// The age budget the live check enforced, in microseconds.
+    pub max_age_us: u64,
 }
 
 /// Written and fsynced before the IOC is signed and dispatched.
@@ -49,6 +76,9 @@ pub struct IntentRecord {
     /// Reconciled Hyperliquid position the IOC was planned against.
     #[serde(with = "rust_decimal::serde::str")]
     pub hedge_position: Decimal,
+    /// Schema 2: the Lighter observation behind `primary_position`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_observation: Option<PrimaryObservation>,
 }
 
 /// Written once a terminal result and a later account snapshot agree.

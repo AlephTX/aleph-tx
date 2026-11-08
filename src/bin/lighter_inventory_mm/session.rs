@@ -266,6 +266,7 @@ impl Session {
         &mut self,
         network: Network,
         account: i64,
+        market_id: i64,
         hedge_account: Option<&str>,
         symbol: &str,
     ) -> Result<()> {
@@ -276,6 +277,7 @@ impl Session {
             hyperliquid_account: hedge_account.map(str::to_owned),
             symbol: symbol.to_owned(),
             journal_schema: Some(JOURNAL_SCHEMA),
+            lighter_market_id: Some(market_id),
         });
         self.journal.write_all(&record.to_line()?)?;
         self.journal.sync_all()?;
@@ -418,6 +420,7 @@ pub(super) async fn launch(
             session.write_start(
                 network,
                 account,
+                profile.strategy.market_id,
                 hedge.as_ref().map(|setup| setup.account.as_str()),
                 symbol,
             )?;
@@ -579,7 +582,7 @@ mod tests {
         let state = root.join("pids");
         let mut session = Session::new(&state, &root).unwrap();
         session
-            .write_start(Network::Testnet, 1, None, "ETH")
+            .write_start(Network::Testnet, 1, 4095, None, "ETH")
             .unwrap();
         let ipc = session.ipc.clone();
         // The offline audit reads the interrupted journal without releasing it.
@@ -587,7 +590,7 @@ mod tests {
         let before = fs::read(&active).unwrap();
         let report = aleph_tx::live_hedge::audit::audit_files(&active, None).unwrap();
         assert!(!report.restart_permitted);
-        assert_eq!(report.journal.schema, "v1");
+        assert_eq!(report.journal.schema, "v2");
         assert_eq!(report.journal.session_cleanup, "unverified");
         assert_eq!(fs::read(&active).unwrap(), before);
         assert!(Session::new(&state, &root).is_err());

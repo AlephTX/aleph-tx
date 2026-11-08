@@ -12,10 +12,12 @@
 //! or resubmits, and never touches the session file or lock. A matched
 //! result is only "offline evidence matches"; it does not permit restart.
 //! Lighter (primary leg) orders and inventory are not journaled and are
-//! outside this report.
+//! outside this report. Schema 2 intents carry the single Lighter position
+//! read each IOC was planned against; the report checks it for identity and
+//! internal consistency only, as a local claim.
 
 use super::journal::{
-    IntentRecord, JOURNAL_SCHEMA, JournalRecord, ParseError, StartRecord, TerminalRecord,
+    IntentRecord, JournalRecord, ParseError, PrimaryObservation, StartRecord, TerminalRecord,
 };
 use super::{
     CLOCK_TOLERANCE_MS, IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill,
@@ -146,6 +148,19 @@ pub struct OrderReport {
     pub possible_position_min: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str_option")]
     pub possible_position_max: Option<Decimal>,
+    pub primary: PrimaryReport,
+    pub reasons: Vec<String>,
+}
+
+/// The Lighter observation an IOC was planned against, as journaled.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PrimaryReport {
+    /// `journal_claim` (schema 2, consistent), `unavailable` (schema 1 or
+    /// legacy: never recorded) or `invalid` (missing or contradictory).
+    pub status: &'static str,
+    pub observation: Option<PrimaryObservation>,
+    /// `known` or `unknown`; an unknown watermark proves nothing either way.
+    pub watermark: &'static str,
     pub reasons: Vec<String>,
 }
 
@@ -154,7 +169,8 @@ pub struct JournalSummary {
     pub path: Option<String>,
     pub sha256: Option<String>,
     pub lines: usize,
-    /// `v1`, `legacy` (no schema on `start`) or `unknown` (no readable start).
+    /// `v2`, `v1`, `legacy` (no schema on `start`) or `unknown` (no
+    /// readable start or an unsupported schema).
     pub schema: &'static str,
     pub session: Option<StartRecord>,
     /// `verified_flat` or `unverified`.
@@ -204,6 +220,7 @@ const BOUNDARIES: &[&str] = &[
     "Journal records are this process's durable claims, not venue confirmations.",
     "Evidence authenticity is outside this audit; it checks consistency only.",
     "Lighter (primary leg) orders and inventory are not journaled; check them on the venue.",
+    "A primary observation is this process's local record of one Lighter read: not venue-signed, not proof of venue state time, and not an order or account ledger.",
     "An unknown or absent lookup never proves an IOC was not accepted or filled.",
     "The active journal and account lock are untouched; this report never permits restart.",
 ];
@@ -241,6 +258,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct Ioc {
     intent: IntentRecord,
     intent_line: usize,
+    primary: PrimaryReport,
     terminal: Option<TerminalRecord>,
     terminal_lines: Vec<usize>,
     invalid: Vec<String>,
@@ -321,7 +339,8 @@ impl State {
                 );
                 "legacy"
             }
-            Some(JOURNAL_SCHEMA) => "v1",
+            Some(1) => "v1",
+            Some(2) => "v2",
             Some(other) => {
                 self.issue(
                     Some(line),
@@ -351,6 +370,14 @@ impl State {
         if start.symbol.trim().is_empty() {
             invalid.push("empty symbol".into());
         }
+        match (start.journal_schema, start.lighter_market_id) {
+            (Some(2), None) => invalid.push("schema 2 start lacks lighter_market_id".into()),
+            (Some(2), Some(id)) if id < 0 => {
+                invalid.push(format!("lighter_market_id {id} is negative"))
+            }
+            (Some(2), Some(_)) | (_, None) => {}
+            (_, Some(_)) => invalid.push("lighter_market_id before schema 2".into()),
+        }
         for reason in invalid {
             self.issue(Some(line), Severity::Invalid, "invalid_start", reason);
         }
@@ -365,6 +392,69 @@ impl State {
             );
         }
         self.start = Some(start);
+    }
+
+    /// Schema 2 intents must carry a primary observation that matches the
+    /// session identity and the planned position, with ordered local times
+    /// inside the enforced budget. Earlier schemas never carry one.
+    fn primary_contract(&self, intent: &IntentRecord) -> (&'static str, Vec<String>) {
+        let mut invalid = Vec::new();
+        let Some(observation) = &intent.primary_observation else {
+            return if self.schema == "v2" {
+                (
+                    "invalid",
+                    vec!["schema 2 intent lacks primary_observation".into()],
+                )
+            } else {
+                ("unavailable", invalid)
+            };
+        };
+        if self.schema != "v2" {
+            invalid.push(format!("primary_observation in a {} journal", self.schema));
+        }
+        if let Some(start) = &self.start {
+            if observation.account_index != start.lighter_account_index {
+                invalid.push(format!(
+                    "account {} differs from session account {}",
+                    observation.account_index, start.lighter_account_index
+                ));
+            }
+            if start
+                .lighter_market_id
+                .is_some_and(|id| id != observation.market_id)
+            {
+                invalid.push(format!(
+                    "market {} differs from session market {:?}",
+                    observation.market_id, start.lighter_market_id
+                ));
+            }
+        }
+        if observation.position != intent.primary_position {
+            invalid.push(format!(
+                "position {} differs from intent primary_position {}",
+                observation.position, intent.primary_position
+            ));
+        }
+        if observation.transaction_time == Some(0) {
+            invalid.push("transaction_time 0 must be recorded as unknown".into());
+        }
+        if observation.request_us > observation.age_us {
+            invalid.push(format!(
+                "request took {} us but the intent formed {} us after its start",
+                observation.request_us, observation.age_us
+            ));
+        }
+        if observation.max_age_us == 0 || observation.age_us >= observation.max_age_us {
+            invalid.push(format!(
+                "age {} us is not within the enforced budget {} us",
+                observation.age_us, observation.max_age_us
+            ));
+        }
+        if invalid.is_empty() {
+            ("journal_claim", invalid)
+        } else {
+            ("invalid", invalid)
+        }
     }
 
     fn apply_intent(&mut self, line: usize, intent: IntentRecord) {
@@ -410,6 +500,30 @@ impl State {
         if intent.size <= Decimal::ZERO || intent.limit_price <= Decimal::ZERO {
             invalid.push("non-positive size or limit price".into());
         }
+        let (primary_status, primary_reasons) = self.primary_contract(&intent);
+        if primary_status == "invalid" {
+            invalid.extend(
+                primary_reasons
+                    .iter()
+                    .map(|r| format!("primary observation: {r}")),
+            );
+        }
+        let primary = PrimaryReport {
+            status: primary_status,
+            observation: intent.primary_observation.clone(),
+            watermark: match &intent.primary_observation {
+                Some(o) if o.transaction_time.is_some() => "known",
+                _ => "unknown",
+            },
+            reasons: if primary_status == "unavailable" {
+                vec![format!(
+                    "{} journal: the Lighter observation behind this IOC was not recorded",
+                    self.schema
+                )]
+            } else {
+                primary_reasons
+            },
+        };
         if let Some(open) = self.pending() {
             // The live hedge refuses a second IOC while one is unresolved.
             invalid.push(format!(
@@ -434,6 +548,7 @@ impl State {
         self.iocs.push(Ioc {
             intent,
             intent_line: line,
+            primary,
             terminal: None,
             terminal_lines: Vec::new(),
             invalid,
@@ -573,7 +688,7 @@ fn terminal_time_contract(
         terminal.terminal_at_ms,
         terminal.account_time_ms,
     );
-    if schema == "v1" {
+    if matches!(schema, "v1" | "v2") {
         for (name, missing) in [
             ("terminal_source", fields.0.is_none()),
             ("terminal_at_ms", fields.1.is_none()),
@@ -1038,6 +1153,7 @@ fn order_report(
         position_after: None,
         possible_position_min: None,
         possible_position_max: None,
+        primary: ioc.primary.clone(),
         reasons: Vec::new(),
     };
     let view = match view {

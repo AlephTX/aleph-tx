@@ -373,6 +373,13 @@ impl LighterTrading {
         self.account_index
     }
 
+    /// Test builds only: trade a different (loopback) Lighter account.
+    #[cfg(test)]
+    pub(crate) fn with_test_account(mut self, account_index: i64) -> Self {
+        self.account_index = account_index;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn offline_test_client(base_url: &str) -> Self {
         Self {

@@ -42,6 +42,15 @@ fn observation(primary: &str, hedge: &str) -> Observation {
     Observation {
         primary: d(primary),
         primary_requested_at: Instant::now(),
+        primary_evidence: crate::lighter_trading::PositionEvidence {
+            // Matches the loopback session's Lighter account.
+            account_index: 1,
+            market_id: 0,
+            position: d(primary),
+            transaction_time: None,
+            requested_at: Instant::now(),
+            received_at: Instant::now(),
+        },
         hedge: d(hedge),
         book: BestBidAsk {
             coin: "ETH".into(),
@@ -185,6 +194,8 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
                 hyperliquid_account: Some(hedge_account.clone()),
                 symbol: "ETH".into(),
                 journal_schema: Some(journal::JOURNAL_SCHEMA),
+                // The test client trades Lighter account 1, market 0.
+                lighter_market_id: Some(0),
             })
             .to_line()
             .unwrap(),
@@ -239,7 +250,8 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
                     {"filled":{"oid":7,"totalSz":"0.007","avgPx":"2000"}}
                 ]}}})
             } else if request.starts_with("GET /api/v1/account?") {
-                json!({"code":200,"accounts":[{"index":0,"positions":[{
+                assert!(request.starts_with("GET /api/v1/account?by=index&value=1 "));
+                json!({"code":200,"accounts":[{"index":1,"positions":[{
                     "market_id":0,"symbol":"ETH","sign":1,"position":"0.03",
                     "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"
                 }]}]})
@@ -281,7 +293,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     let trading = HyperliquidTrading::new(info.clone(), signer, None).unwrap();
     let mut hedge = LiveInventoryHedge {
         limits: limits(),
-        primary: Arc::new(LighterTrading::offline_test_client(&base_url)),
+        primary: Arc::new(LighterTrading::offline_test_client(&base_url).with_test_account(1)),
         info,
         trading,
         market: market(),
@@ -571,7 +583,7 @@ impl DelayedVenue {
                         (
                             ld.load(Ordering::Acquire),
                             json!({"code":200,"accounts":[{
-                            "index":0,"transaction_time":30,"positions":[{
+                            "index":1,"transaction_time":30,"positions":[{
                             "market_id":0,"symbol":"ETH","sign":1,"position":size,
                             "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"}]}]}),
                         )
@@ -637,9 +649,20 @@ impl DelayedVenue {
         // No signing key: only the L1 signature is replaced, the production
         // execute/journal/submit path and response parsing still run.
         let trading = HyperliquidTrading::unsigned_for_test(info.clone());
+        let start = JournalRecord::Start(journal::StartRecord {
+            session_id: "delayed".into(),
+            network: "Testnet".into(),
+            lighter_account_index: 1,
+            hyperliquid_account: Some(format!("0x{:040x}", 2)),
+            symbol: "ETH".into(),
+            journal_schema: Some(journal::JOURNAL_SCHEMA),
+            lighter_market_id: Some(0),
+        });
+        let mut journal = journal;
+        journal.write_all(&start.to_line().unwrap()).unwrap();
         let hedge = LiveInventoryHedge {
             limits: limits(),
-            primary: Arc::new(LighterTrading::offline_test_client(&self.url)),
+            primary: Arc::new(LighterTrading::offline_test_client(&self.url).with_test_account(1)),
             info,
             trading,
             market: market(),
@@ -762,5 +785,116 @@ async fn stale_primary_observation_blocks_allowance_and_new_intents() {
     assert_eq!((intents(), venue.orders.load(Ordering::Acquire)), (1, 1));
     drop(hedge);
     venue.server.abort();
+    audit_primary_observation(&journal_path);
     std::fs::remove_file(journal_path).unwrap();
+}
+
+/// The journal the real execute wrote: the existing offline audit reports
+/// the Lighter observation behind the IOC, and edits to it are rejected.
+fn audit_primary_observation(journal_path: &std::path::Path) {
+    let report = audit::audit_files(journal_path, None).unwrap();
+    assert_eq!(report.journal.schema, "v2");
+    assert!(!report.restart_permitted);
+    let order = &report.orders[0];
+    // The rejection is journaled only by the next observe, so the durable
+    // file holds the intent alone: still pending exposure.
+    assert_eq!(
+        order.status,
+        audit::OrderStatus::Pending,
+        "{:?}",
+        report.issues
+    );
+    assert_eq!(report.status, audit::AuditStatus::Unresolved);
+    let primary = &order.primary;
+    assert_eq!(
+        (primary.status, primary.watermark),
+        ("journal_claim", "known")
+    );
+    let observation = primary.observation.as_ref().unwrap();
+    // Values come from the loopback Lighter response, not from the test.
+    assert_eq!(
+        (
+            observation.account_index,
+            observation.market_id,
+            observation.position
+        ),
+        (1, 0, d("0.03"))
+    );
+    assert_eq!(observation.transaction_time, Some(30));
+    assert!(observation.request_us <= observation.age_us);
+    assert!(observation.age_us < observation.max_age_us);
+    assert_eq!(observation.max_age_us, 200_000);
+    // Tampered copies of the same journal.
+    let text = std::fs::read_to_string(journal_path).unwrap();
+    let intent_line = text
+        .lines()
+        .position(|l| l.contains("hedge_intent"))
+        .unwrap();
+    let edit = |change: &dyn Fn(&mut serde_json::Value)| {
+        let lines: Vec<String> = text
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i != intent_line {
+                    return line.to_owned();
+                }
+                let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                change(&mut value);
+                value.to_string()
+            })
+            .collect();
+        audit::audit((lines.join("\n") + "\n").as_bytes(), None)
+    };
+    let invalid = |name: &str, change: &dyn Fn(&mut serde_json::Value)| {
+        let report = edit(change);
+        assert_eq!(report.status, audit::AuditStatus::Invalid, "{name}");
+        assert_eq!(report.orders[0].primary.status, "invalid", "{name}");
+    };
+    invalid("missing", &|v| {
+        v.as_object_mut().unwrap().remove("primary_observation");
+    });
+    invalid("account", &|v| {
+        v["primary_observation"]["account_index"] = 7.into()
+    });
+    invalid("market", &|v| {
+        v["primary_observation"]["market_id"] = 4.into()
+    });
+    invalid("quantity", &|v| {
+        v["primary_observation"]["position"] = "0.02".into()
+    });
+    invalid("request after intent", &|v| {
+        v["primary_observation"]["request_us"] = 999_999.into()
+    });
+    invalid("over budget", &|v| {
+        v["primary_observation"]["age_us"] = 200_000.into()
+    });
+    invalid("zero watermark", &|v| {
+        v["primary_observation"]["transaction_time"] = 0.into()
+    });
+    // A malformed field is a parse error on that line, never a legacy intent.
+    let report = edit(&|v| v["primary_observation"]["age_us"] = "soon".into());
+    assert_eq!(report.status, audit::AuditStatus::Invalid);
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.kind == "malformed_line" || i.kind == "invalid_record"),
+        "{:?}",
+        report.issues
+    );
+    // Unknown watermark stays unknown and is not by itself a contradiction.
+    let report = edit(&|v| v["primary_observation"]["transaction_time"] = serde_json::Value::Null);
+    assert_eq!(report.orders[0].primary.watermark, "unknown");
+    assert_eq!(report.orders[0].primary.status, "journal_claim");
+    assert_eq!(report.status, audit::AuditStatus::Unresolved);
+    // Truncated tail after the intent: the IOC is still reported pending.
+    let torn = text
+        .lines()
+        .take(intent_line + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n{\"event\":\"hedge_terminal\",\"cl";
+    let report = audit::audit(torn.as_bytes(), None);
+    assert_eq!(report.orders[0].status, audit::OrderStatus::Pending);
+    assert_eq!(report.orders[0].primary.status, "journal_claim");
 }

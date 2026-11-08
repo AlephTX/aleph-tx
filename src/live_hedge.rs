@@ -12,7 +12,7 @@ use crate::exchanges::hyperliquid::{
 };
 use crate::lighter_trading::LighterTrading;
 use anyhow::{Context, Result, bail, ensure};
-use journal::{IntentRecord, JournalRecord, TerminalRecord};
+use journal::{IntentRecord, JournalRecord, PrimaryObservation, TerminalRecord};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
 use std::fs::File;
@@ -118,6 +118,8 @@ struct Observation {
     primary: Decimal,
     /// Local start of the Lighter position request this value came from.
     primary_requested_at: Instant,
+    /// The full Lighter read behind `primary`, journaled with any intent.
+    primary_evidence: crate::lighter_trading::PositionEvidence,
     hedge: Decimal,
     book: BestBidAsk,
 }
@@ -572,6 +574,7 @@ impl LiveInventoryHedge {
         Ok(Some(Observation {
             primary,
             primary_requested_at: primary_evidence.requested_at,
+            primary_evidence,
             hedge,
             book,
         }))
@@ -601,6 +604,15 @@ impl LiveInventoryHedge {
             tracing::warn!("Lighter position aged out before hedge dispatch; re-observing");
             return Ok(());
         }
+        let primary_observation = primary_observation(
+            &observed.primary_evidence,
+            self.max_primary_age,
+            Instant::now(),
+        )?;
+        ensure!(
+            primary_observation.position == observed.primary,
+            "Lighter observation does not match the planned position"
+        );
         let id = format!("0x{}", uuid::Uuid::new_v4().simple());
         order.client_order_id = Some(id.clone());
         let action = OrderAction::new(vec![OrderWire::new(
@@ -618,6 +630,7 @@ impl LiveInventoryHedge {
             reduce_only: order.reduce_only,
             primary_position: observed.primary,
             hedge_position: observed.hedge,
+            primary_observation: Some(primary_observation),
         }))?;
         self.pending = Some(PendingIoc {
             id,
@@ -731,6 +744,32 @@ impl LiveInventoryHedge {
         self.journal.sync_data()?;
         Ok(())
     }
+}
+
+/// Journal form of the Lighter read behind an intent. Durations are local
+/// monotonic microseconds; the age is rounded up so truncation can never make
+/// an observation look younger than it was.
+fn primary_observation(
+    evidence: &crate::lighter_trading::PositionEvidence,
+    max_age: Duration,
+    now: Instant,
+) -> Result<PrimaryObservation> {
+    let micros = |d: Duration| u64::try_from(d.as_micros()).context("Duration overflow");
+    let age = now.saturating_duration_since(evidence.requested_at);
+    let age_us = micros(age)? + u64::from(!age.subsec_nanos().is_multiple_of(1_000));
+    Ok(PrimaryObservation {
+        account_index: evidence.account_index,
+        market_id: evidence.market_id,
+        position: evidence.position,
+        transaction_time: evidence.transaction_time,
+        request_us: micros(
+            evidence
+                .received_at
+                .saturating_duration_since(evidence.requested_at),
+        )?,
+        age_us,
+        max_age_us: micros(max_age)?,
+    })
 }
 
 fn plan_ioc(

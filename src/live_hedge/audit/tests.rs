@@ -18,6 +18,7 @@ fn start(schema: Option<u32>) -> JournalRecord {
         hyperliquid_account: Some(ACCOUNT.into()),
         symbol: "ETH".into(),
         journal_schema: schema,
+        lighter_market_id: None,
     })
 }
 
@@ -33,6 +34,7 @@ fn intent(cloid: &str, before: &str) -> JournalRecord {
         reduce_only: false,
         primary_position: d("0.01"),
         hedge_position: d(before),
+        primary_observation: None,
     })
 }
 
@@ -744,4 +746,114 @@ fn unrepresentable_position_ranges_are_rejected_without_panicking() {
         assert_eq!(report.orders[1].status, OrderStatus::Pending);
         assert!(report.orders[1].possible_position_min.is_some());
     }
+}
+
+fn v2_start(market: Option<i64>) -> JournalRecord {
+    let JournalRecord::Start(mut s) = start(Some(2)) else {
+        unreachable!()
+    };
+    s.lighter_market_id = market;
+    JournalRecord::Start(s)
+}
+
+fn observed_intent(observation: Option<PrimaryObservation>) -> JournalRecord {
+    let JournalRecord::Intent(mut i) = intent(CLOID, "0") else {
+        unreachable!()
+    };
+    i.primary_observation = observation;
+    JournalRecord::Intent(i)
+}
+
+fn observation() -> PrimaryObservation {
+    PrimaryObservation {
+        account_index: 7,
+        market_id: 4095,
+        position: d("0.01"),
+        transaction_time: None,
+        request_us: 12_000,
+        age_us: 15_000,
+        max_age_us: 5_000_000,
+    }
+}
+
+/// Schema 1 and legacy journals stay auditable with the primary observation
+/// labelled unavailable; schema 2 requires the market on start and an
+/// observation on every intent; schema 1 may not carry either.
+#[test]
+fn primary_observation_is_required_in_v2_and_unavailable_before() {
+    for (schema, label) in [(Some(1), "v1"), (None, "legacy")] {
+        let report = audit(&journal(&[start(schema), intent(CLOID, "0")]), None);
+        assert_eq!(report.journal.schema, label);
+        assert_eq!(report.status, AuditStatus::Unresolved, "{label}");
+        let primary = &report.orders[0].primary;
+        assert_eq!(
+            (primary.status, primary.watermark),
+            ("unavailable", "unknown")
+        );
+        assert!(
+            primary.reasons[0].contains("not recorded"),
+            "{:?}",
+            primary.reasons
+        );
+    }
+    let ok = audit(
+        &journal(&[v2_start(Some(4095)), observed_intent(Some(observation()))]),
+        None,
+    );
+    assert_eq!(ok.journal.schema, "v2");
+    assert_eq!(ok.status, AuditStatus::Unresolved, "{:?}", ok.issues);
+    assert_eq!(ok.orders[0].primary.status, "journal_claim");
+    assert_eq!(ok.orders[0].primary.watermark, "unknown");
+    let known = PrimaryObservation {
+        transaction_time: Some(30),
+        ..observation()
+    };
+    let report = audit(
+        &journal(&[v2_start(Some(4095)), observed_intent(Some(known))]),
+        None,
+    );
+    assert_eq!(report.orders[0].primary.watermark, "known");
+    // Contract violations: each makes the journal invalid.
+    let JournalRecord::Start(mut v1_with_market) = start(Some(1)) else {
+        unreachable!()
+    };
+    v1_with_market.lighter_market_id = Some(4095);
+    let cases: Vec<(&str, Vec<JournalRecord>)> = vec![
+        ("v2 start without market", vec![v2_start(None)]),
+        ("v2 negative market", vec![v2_start(Some(-1))]),
+        (
+            "v1 start with market",
+            vec![JournalRecord::Start(v1_with_market)],
+        ),
+        (
+            "v2 intent without observation",
+            vec![v2_start(Some(4095)), observed_intent(None)],
+        ),
+        (
+            "v1 intent with observation",
+            vec![start(Some(1)), observed_intent(Some(observation()))],
+        ),
+        (
+            "max age zero",
+            vec![
+                v2_start(Some(4095)),
+                observed_intent(Some(PrimaryObservation {
+                    max_age_us: 0,
+                    age_us: 0,
+                    request_us: 0,
+                    ..observation()
+                })),
+            ],
+        ),
+    ];
+    for (name, records) in cases {
+        let report = audit(&journal(&records), None);
+        assert_eq!(report.status, AuditStatus::Invalid, "{name}");
+        assert!(!report.restart_permitted);
+    }
+    // An unsupported future schema is reported, not parsed as v2.
+    assert_eq!(
+        audit(&journal(&[start(Some(3))]), None).journal.schema,
+        "unknown"
+    );
 }
