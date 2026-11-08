@@ -18,7 +18,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
 mod recovery;
@@ -107,8 +107,43 @@ pub struct Position {
 struct AccountInfo {
     index: i64,
     positions: Vec<Position>,
+    /// Absent in some responses; 0 is treated as unknown, never as a time.
     #[serde(default)]
     transaction_time: u64,
+}
+
+/// Exact Lighter position for the configured account and market, with the
+/// evidence it rests on. Built only from one unambiguous account response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionEvidence {
+    pub account_index: i64,
+    pub market_id: i64,
+    /// Signed base quantity; zero only when the account lists no position
+    /// (or a zero position) for this market.
+    pub position: rust_decimal::Decimal,
+    /// The account's `transaction_time` (Lighter's trade watermark, same
+    /// units as order `transaction_time`); None when absent or 0. It says
+    /// which trades the snapshot includes, not when it was generated.
+    pub transaction_time: Option<u64>,
+    /// Local monotonic time just before the request was sent. Bounds the
+    /// age of the observation from below: the venue state is no older than
+    /// the request, but the venue's own generation time is not proven.
+    pub requested_at: Instant,
+    pub received_at: Instant,
+}
+
+impl PositionEvidence {
+    /// Whether this snapshot includes trades up to `fill_watermark` (an
+    /// order `transaction_time`; 0 = no fills to cover). An unknown account
+    /// watermark covers nothing but "no fills"; receipt time never stands in.
+    pub fn covers(&self, fill_watermark: u64) -> bool {
+        fill_watermark == 0 || self.transaction_time.is_some_and(|t| t >= fill_watermark)
+    }
+
+    /// Local age bound: from request start, so a slow request counts.
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.requested_at)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1237,50 +1272,65 @@ impl LighterTrading {
     }
 
     async fn position_snapshot(&self) -> Result<(Option<Position>, u64)> {
+        let (account, _, _) = self.fetch_account().await?;
+        let position = unique_position(account.positions, self.market_id)?;
+        Ok((position, account.transaction_time))
+    }
+
+    async fn fetch_account(&self) -> Result<(AccountInfo, Instant, Instant)> {
         let url = format!(
             "{}/api/v1/account?by=index&value={}",
             self.base_url, self.account_index
         );
+        let requested_at = Instant::now();
         let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("get_position HTTP {}", resp.status());
         }
         let acct_resp: AccountsResponse = resp.json().await?;
-        if acct_resp.code != 200 || acct_resp.accounts.is_empty() {
-            anyhow::bail!("get_position: no account data");
+        let received_at = Instant::now();
+        if acct_resp.code != 200 {
+            anyhow::bail!("get_position: account response code {}", acct_resp.code);
         }
-        let account = acct_resp
-            .accounts
-            .into_iter()
-            .find(|account| account.index == self.account_index)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Position response does not match the Lighter account")
-            })?;
-        let pos = account
-            .positions
-            .into_iter()
-            .find(|p| p.market_id == self.market_id);
-        Ok((pos, account.transaction_time))
+        Ok((
+            unique_account(acct_resp.accounts, self.account_index)?,
+            requested_at,
+            received_at,
+        ))
     }
 
     pub async fn signed_position(&self) -> Result<rust_decimal::Decimal> {
-        Ok(self.signed_position_snapshot().await?.0)
+        Ok(self.position_evidence().await?.position)
     }
 
-    async fn signed_position_snapshot(&self) -> Result<(rust_decimal::Decimal, u64)> {
+    /// The production position read: unique account and market identity,
+    /// exact signed size, trade watermark and local request/receipt times.
+    pub async fn position_evidence(&self) -> Result<PositionEvidence> {
         use rust_decimal::Decimal;
-        let (position, transaction_time) = self.position_snapshot().await?;
-        let Some(position) = position else {
-            return Ok((Decimal::ZERO, transaction_time));
+        let (account, requested_at, received_at) = self.fetch_account().await?;
+        let transaction_time = (account.transaction_time > 0).then_some(account.transaction_time);
+        let position = match unique_position(account.positions, self.market_id)? {
+            None => Decimal::ZERO,
+            Some(position) => {
+                let size: Decimal = position.position.parse()?;
+                anyhow::ensure!(
+                    position.symbol == self.market_symbol
+                        && size >= Decimal::ZERO
+                        && (matches!(position.sign, -1 | 1)
+                            || (position.sign == 0 && size.is_zero())),
+                    "Invalid Lighter position snapshot"
+                );
+                size * Decimal::from(position.sign)
+            }
         };
-        let size: Decimal = position.position.parse()?;
-        anyhow::ensure!(
-            position.symbol == self.market_symbol
-                && size >= Decimal::ZERO
-                && (matches!(position.sign, -1 | 1) || (position.sign == 0 && size.is_zero())),
-            "Invalid Lighter position snapshot"
-        );
-        Ok((size * Decimal::from(position.sign), transaction_time))
+        Ok(PositionEvidence {
+            account_index: account.index,
+            market_id: self.market_id,
+            position,
+            transaction_time,
+            requested_at,
+            received_at,
+        })
     }
 
     /// 关闭所有仓位：先撤销所有订单，再用市价单平仓
@@ -1443,9 +1493,217 @@ fn validate_submission_response(status: reqwest::StatusCode, body: &str) -> Resu
     )
 }
 
+/// Exactly one account with `index`; an empty, foreign or duplicated list
+/// is not evidence of anything, even when the duplicates agree.
+fn unique_account(accounts: Vec<AccountInfo>, index: i64) -> Result<AccountInfo> {
+    let mut matching = accounts
+        .into_iter()
+        .filter(|account| account.index == index);
+    let account = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Position response does not match the Lighter account"))?;
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "Position response lists the Lighter account more than once"
+    );
+    Ok(account)
+}
+
+/// At most one position for `market_id`; other markets keep the existing
+/// account scope and are ignored.
+fn unique_position(positions: Vec<Position>, market_id: i64) -> Result<Option<Position>> {
+    let mut matching = positions.into_iter().filter(|p| p.market_id == market_id);
+    let position = matching.next();
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "Position response lists the Lighter market more than once"
+    );
+    Ok(position)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve each `(status, body)` once per request on a loopback port.
+    async fn account_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let line = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    line.starts_with("GET /api/v1/account?by=index&value=0 "),
+                    "{line}"
+                );
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn position_json(market: i64, symbol: &str, sign: i64, size: &str) -> serde_json::Value {
+        serde_json::json!({"market_id": market, "symbol": symbol, "sign": sign,
+            "position": size, "avg_entry_price": "2000", "unrealized_pnl": "0",
+            "liquidation_price": "0"})
+    }
+
+    fn accounts_json(accounts: &[serde_json::Value]) -> String {
+        serde_json::json!({"code": 200, "accounts": accounts}).to_string()
+    }
+
+    fn account_json(
+        index: i64,
+        time: Option<u64>,
+        positions: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let mut account = serde_json::json!({"index": index, "positions": positions});
+        if let Some(time) = time {
+            account["transaction_time"] = time.into();
+        }
+        account
+    }
+
+    /// The real client parses each response into exact, uniquely identified
+    /// evidence or rejects it; nothing ambiguous or missing becomes flat.
+    #[tokio::test]
+    async fn position_evidence_requires_unique_identity_and_exact_values() {
+        use rust_decimal::Decimal;
+        let eth = |sign, size| position_json(0, "ETH", sign, size);
+        let other = position_json(1, "BTC", 1, "0.5");
+        let one = |time, positions: &[serde_json::Value]| {
+            (200, accounts_json(&[account_json(0, time, positions)]))
+        };
+        let valid: Vec<((u16, String), Decimal, Option<u64>)> = vec![
+            (
+                one(Some(30), &[eth(1, "0.0300")]),
+                Decimal::new(3, 2),
+                Some(30),
+            ),
+            (
+                one(Some(31), &[other.clone(), eth(-1, "0.02")]),
+                Decimal::new(-2, 2),
+                Some(31),
+            ),
+            (one(Some(32), &[eth(0, "0")]), Decimal::ZERO, Some(32)),
+            // Unique account without this market: flat, other markets ignored.
+            (
+                one(Some(33), std::slice::from_ref(&other)),
+                Decimal::ZERO,
+                Some(33),
+            ),
+            (one(None, &[eth(1, "0.01")]), Decimal::new(1, 2), None),
+            (one(Some(0), &[]), Decimal::ZERO, None),
+        ];
+        let duplicate_account = accounts_json(&[
+            account_json(0, Some(30), &[eth(1, "0.03")]),
+            account_json(0, Some(30), &[eth(1, "0.03")]),
+        ]);
+        let conflicting_accounts = |first_flat: bool| {
+            let flat = account_json(0, Some(30), &[]);
+            let long = account_json(0, Some(30), &[eth(1, "0.03")]);
+            accounts_json(&if first_flat {
+                [flat, long]
+            } else {
+                [long, flat]
+            })
+        };
+        let invalid: Vec<(u16, String)> = vec![
+            (500, "{}".into()),
+            (
+                200,
+                serde_json::json!({"code": 21100, "accounts": []}).to_string(),
+            ),
+            (200, accounts_json(&[])),
+            (
+                200,
+                accounts_json(&[account_json(7, Some(30), &[eth(1, "0.03")])]),
+            ),
+            (
+                200,
+                serde_json::json!({"code": 200, "accounts": [{"index": 0}]}).to_string(),
+            ),
+            (200, "truncated".into()),
+            (200, duplicate_account),
+            (200, conflicting_accounts(true)),
+            (200, conflicting_accounts(false)),
+            one(Some(30), &[eth(1, "0.03"), eth(1, "0.03")]),
+            one(Some(30), &[eth(0, "0"), eth(1, "0.03")]),
+            one(Some(30), &[eth(1, "0.03"), eth(0, "0")]),
+            one(Some(30), &[position_json(0, "BTC", 1, "0.03")]),
+            one(Some(30), &[eth(2, "0.03")]),
+            one(Some(30), &[eth(0, "0.03")]),
+            one(Some(30), &[eth(1, "-0.03")]),
+            one(Some(30), &[eth(1, "1e400")]),
+            one(Some(30), &[eth(1, "not-a-number")]),
+        ];
+        let responses = valid
+            .iter()
+            .map(|(response, _, _)| response.clone())
+            .chain(invalid.iter().cloned())
+            .collect();
+        let (url, server) = account_server(responses).await;
+        let trading = LighterTrading::offline_test_client(&url);
+        for (response, position, watermark) in &valid {
+            let before = Instant::now();
+            let evidence = trading.position_evidence().await.unwrap();
+            assert_eq!(
+                (
+                    evidence.account_index,
+                    evidence.market_id,
+                    evidence.position,
+                    evidence.transaction_time
+                ),
+                (0, 0, *position, *watermark),
+                "{}",
+                response.1
+            );
+            assert!(
+                before <= evidence.requested_at && evidence.requested_at <= evidence.received_at
+            );
+        }
+        for (status, body) in &invalid {
+            assert!(
+                trading.position_evidence().await.is_err(),
+                "accepted {status} {body}"
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn fill_watermark_coverage_never_uses_unknown_or_receipt_time() {
+        let now = Instant::now();
+        let evidence = |transaction_time| PositionEvidence {
+            account_index: 0,
+            market_id: 0,
+            position: rust_decimal::Decimal::ZERO,
+            transaction_time,
+            requested_at: now,
+            received_at: now,
+        };
+        assert!(evidence(None).covers(0), "no fills to cover");
+        assert!(!evidence(None).covers(30));
+        assert!(!evidence(Some(29)).covers(30));
+        assert!(evidence(Some(30)).covers(30));
+        assert!(evidence(Some(31)).covers(30));
+    }
 
     #[tokio::test]
     async fn transport_failure_invalidates_nonce_without_releasing_reservation() {

@@ -41,6 +41,7 @@ fn limits() -> HedgeLimits {
 fn observation(primary: &str, hedge: &str) -> Observation {
     Observation {
         primary: d(primary),
+        primary_requested_at: Instant::now(),
         hedge: d(hedge),
         book: BestBidAsk {
             coin: "ETH".into(),
@@ -294,6 +295,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         allowance: None,
         blocked_since: None,
         telemetry: None,
+        max_primary_age: Duration::from_millis(MAX_ACCOUNT_AGE_MS),
     };
     let telemetry_dir =
         std::env::temp_dir().join(format!("aleph-hedge-telemetry-{}", uuid::Uuid::new_v4()));
@@ -499,4 +501,238 @@ fn configured_limits_bound_each_leg_and_net_exposure() {
         .unwrap();
     assert!(!order.is_buy && !order.reduce_only);
     assert!(order.size > Decimal::ZERO && order.size <= d("0.02"));
+}
+
+/// Loopback venue for the stale-primary scenarios. Each Lighter account and
+/// Hyperliquid info reply waits for its configured delay; order posts are
+/// counted and answered as an empty fill.
+struct DelayedVenue {
+    url: String,
+    lighter_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    hyperliquid_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    lighter_position: Arc<parking_lot::Mutex<String>>,
+    orders: Arc<std::sync::atomic::AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedVenue {
+    async fn start() -> Self {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let lighter_delay_ms = Arc::new(AtomicU64::new(0));
+        let hyperliquid_delay_ms = Arc::new(AtomicU64::new(0));
+        let lighter_position = Arc::new(parking_lot::Mutex::new("0".to_owned()));
+        let orders = Arc::new(AtomicUsize::new(0));
+        let (ld, hd, lp, counted) = (
+            Arc::clone(&lighter_delay_ms),
+            Arc::clone(&hyperliquid_delay_ms),
+            Arc::clone(&lighter_position),
+            Arc::clone(&orders),
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (ld, hd, lp, counted) = (
+                    Arc::clone(&ld),
+                    Arc::clone(&hd),
+                    Arc::clone(&lp),
+                    Arc::clone(&counted),
+                );
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    socket.read_line(&mut request).await.unwrap();
+                    let mut size = 0;
+                    loop {
+                        let mut header = String::new();
+                        socket.read_line(&mut header).await.unwrap();
+                        if header.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = header.split_once(':')
+                            && name.eq_ignore_ascii_case("Content-Length")
+                        {
+                            size = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; size];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let (delay, response) = if request.starts_with("GET /api/v1/account?") {
+                        let size = lp.lock().clone();
+                        (
+                            ld.load(Ordering::Acquire),
+                            json!({"code":200,"accounts":[{
+                            "index":0,"transaction_time":30,"positions":[{
+                            "market_id":0,"symbol":"ETH","sign":1,"position":size,
+                            "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"}]}]}),
+                        )
+                    } else if request.starts_with("POST /exchange ") {
+                        counted.fetch_add(1, Ordering::AcqRel);
+                        (
+                            0,
+                            json!({"status":"ok","response":{"type":"order","data":{"statuses":[
+                            {"error":"fixture rejects every order"}]}}}),
+                        )
+                    } else {
+                        let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let delay = hd.load(Ordering::Acquire);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        // Hyperliquid times are taken after its own delay, so
+                        // its snapshots stay fresh however slow the reply is.
+                        let now = unix_ms().unwrap();
+                        let reply = match query["type"].as_str().unwrap() {
+                            "clearinghouseState" => json!({"time":now,"withdrawable":"100",
+                                "marginSummary":{"accountValue":"100","totalNtlPos":"0","totalMarginUsed":"0"},
+                                "assetPositions":[]}),
+                            "l2Book" => json!({"coin":"ETH","time":now,
+                                "levels":[[{"px":"2000","sz":"0.08"}],[{"px":"2001","sz":"0.12"}]]}),
+                            kind => panic!("unexpected info request {kind}"),
+                        };
+                        (0, reply)
+                    };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let response = response.to_string();
+                    let _ = socket.get_mut().write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                        response.len()
+                    ).as_bytes()).await;
+                });
+            }
+        });
+        Self {
+            url,
+            lighter_delay_ms,
+            hyperliquid_delay_ms,
+            lighter_position,
+            orders,
+            server,
+        }
+    }
+
+    fn hedge(&self, max_primary_age: Duration) -> (LiveInventoryHedge, std::path::PathBuf) {
+        use std::fs::OpenOptions;
+        let journal_path =
+            std::env::temp_dir().join(format!("aleph-stale-{}.jsonl", uuid::Uuid::new_v4()));
+        let journal = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        let info = HyperliquidInfo::new(Network::Testnet)
+            .unwrap()
+            .with_test_url(self.url.clone());
+        let signer = HyperliquidSigner::from_private_key(&format!("{:064x}", 1)).unwrap();
+        let trading = HyperliquidTrading::new(info.clone(), signer, None).unwrap();
+        let hedge = LiveInventoryHedge {
+            limits: limits(),
+            primary: Arc::new(LighterTrading::offline_test_client(&self.url)),
+            info,
+            trading,
+            market: market(),
+            account: format!("0x{:040x}", 2),
+            start_equity: d("100"),
+            confirmed: Decimal::ZERO,
+            pending: None,
+            journal,
+            last_poll: None,
+            last_rebalance: None,
+            allowance: None,
+            blocked_since: None,
+            telemetry: None,
+            max_primary_age,
+        };
+        (hedge, journal_path)
+    }
+
+    fn delays(&self, lighter_ms: u64, hyperliquid_ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.lighter_delay_ms.store(lighter_ms, Ordering::Release);
+        self.hyperliquid_delay_ms
+            .store(hyperliquid_ms, Ordering::Release);
+    }
+}
+
+/// The real poll/rebalance/execute path with a 200 ms primary age limit
+/// (production: MAX_ACCOUNT_AGE_MS). Hyperliquid data is always fresh here,
+/// so only the Lighter observation age can block.
+#[tokio::test]
+async fn stale_primary_observation_blocks_allowance_and_new_intents() {
+    use std::sync::atomic::Ordering;
+    let venue = DelayedVenue::start().await;
+    let (mut hedge, journal_path) = venue.hedge(Duration::from_millis(200));
+    let intents = || {
+        std::fs::read_to_string(&journal_path)
+            .unwrap()
+            .matches("hedge_intent")
+            .count()
+    };
+    // Fresh flat control: allowance granted and bounded by the primary age.
+    let before = Instant::now();
+    hedge.poll().await.unwrap();
+    let after = Instant::now();
+    let allowance = hedge
+        .allowance()
+        .expect("fresh flat observation grants an allowance");
+    // Bounded by primary request start + 200 ms, well before POLL * 2.
+    assert!(allowance.expires > before && allowance.expires <= after + Duration::from_millis(200));
+    // Lighter answers at once but Hyperliquid is slow: the joined primary
+    // value is older than the limit when consumed.
+    venue.delays(0, 300);
+    hedge.last_poll = None;
+    hedge.poll().await.unwrap();
+    assert!(hedge.allowance().is_none(), "slow Hyperliquid reply");
+    // observe itself yields nothing, also when closing: finish() must not
+    // read a stale zero as a flat Lighter leg.
+    for closing in [false, true] {
+        assert!(
+            hedge.observe(closing).await.unwrap().is_none(),
+            "closing={closing}"
+        );
+    }
+    // Lighter's own request is slow: request start, not receipt, counts.
+    venue.delays(300, 0);
+    hedge.last_poll = None;
+    hedge.poll().await.unwrap();
+    assert!(hedge.allowance().is_none(), "slow Lighter request");
+    // Just inside the limit still works.
+    venue.delays(50, 50);
+    hedge.last_poll = None;
+    hedge.poll().await.unwrap();
+    assert!(hedge.allowance().is_some(), "within the limit");
+    // An allowance never outlives its primary evidence.
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    assert!(
+        hedge.allowance().is_none(),
+        "allowance expired with the evidence"
+    );
+    // Unhedged Lighter inventory: a stale observation must not journal or
+    // submit a new IOC; a fresh one does.
+    *venue.lighter_position.lock() = "0.03".into();
+    venue.delays(0, 300);
+    hedge.rebalance().await.unwrap();
+    assert_eq!((intents(), venue.orders.load(Ordering::Acquire)), (0, 0));
+    venue.delays(300, 0);
+    hedge.last_rebalance = None;
+    hedge.rebalance().await.unwrap();
+    assert_eq!((intents(), venue.orders.load(Ordering::Acquire)), (0, 0));
+    // Observation fresh, but consumed after the limit: execute re-checks.
+    venue.delays(0, 0);
+    let observed = hedge
+        .observe(false)
+        .await
+        .unwrap()
+        .expect("fresh observation");
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    hedge.execute(observed, false).await.unwrap();
+    assert_eq!((intents(), venue.orders.load(Ordering::Acquire)), (0, 0));
+    assert!(hedge.pending.is_none());
+    // Fresh control: the same inventory now journals and submits one IOC.
+    hedge.last_rebalance = None;
+    hedge.rebalance().await.unwrap();
+    assert_eq!((intents(), venue.orders.load(Ordering::Acquire)), (1, 1));
+    drop(hedge);
+    venue.server.abort();
+    std::fs::remove_file(journal_path).unwrap();
 }

@@ -116,6 +116,8 @@ impl QuoteAllowance {
 
 struct Observation {
     primary: Decimal,
+    /// Local start of the Lighter position request this value came from.
+    primary_requested_at: Instant,
     hedge: Decimal,
     book: BestBidAsk,
 }
@@ -281,6 +283,9 @@ pub struct LiveInventoryHedge {
     allowance: Option<QuoteAllowance>,
     blocked_since: Option<Instant>,
     telemetry: Option<crate::telemetry_sink::TelemetrySink>,
+    /// Upper bound on the local age of the Lighter position behind any
+    /// allowance or new intent (MAX_ACCOUNT_AGE_MS; tests inject less).
+    max_primary_age: Duration,
 }
 
 impl LiveInventoryHedge {
@@ -368,7 +373,16 @@ impl LiveInventoryHedge {
             allowance: None,
             blocked_since: None,
             telemetry: None,
+            max_primary_age: Duration::from_millis(MAX_ACCOUNT_AGE_MS),
         })
+    }
+
+    /// Time left before the primary observation from `requested_at` is too
+    /// old to act on; None once expired.
+    fn primary_validity(&self, requested_at: Instant) -> Option<Duration> {
+        self.max_primary_age
+            .checked_sub(Instant::now().saturating_duration_since(requested_at))
+            .filter(|left| !left.is_zero())
     }
 
     pub(crate) async fn poll(&mut self) -> Result<()> {
@@ -379,6 +393,9 @@ impl LiveInventoryHedge {
         self.allowance = None;
         if let Some(observed) = self.observe(false).await?
             && (observed.primary + observed.hedge).abs() <= self.limits.deadband_base
+            && self
+                .primary_validity(observed.primary_requested_at)
+                .is_some()
         {
             let fee = self.limits.taker_fee_bps / 10_000.0;
             let sell_limit = hedge_price_limit(observed.book.bid, self.limits.slippage_bps, false)?
@@ -403,11 +420,14 @@ impl LiveInventoryHedge {
                     .max_unhedged_base
                     .to_f64()
                     .context("Invalid net exposure cap")?,
-                expires: Instant::now()
+                // Never outlive the book or the Lighter position behind it;
+                // the primary deadline is absolute, from its request start.
+                expires: (Instant::now()
                     + (POLL * 2)
                         .min(Duration::from_millis(MAX_QUOTE_AGE_MS.saturating_sub(
                             unix_ms()?.saturating_sub(observed.book.timestamp_ms),
-                        ))),
+                        ))))
+                .min(observed.primary_requested_at + self.max_primary_age),
             });
         }
         Ok(())
@@ -471,11 +491,12 @@ impl LiveInventoryHedge {
 
     async fn observe(&mut self, closing: bool) -> Result<Option<Observation>> {
         self.refresh_terminal().await?;
-        let (primary, state, book) = tokio::try_join!(
-            self.primary.signed_position(),
+        let (primary_evidence, state, book) = tokio::try_join!(
+            self.primary.position_evidence(),
             self.info.account_state(&self.account),
             self.info.bbo(&self.market.asset.name),
         )?;
+        let primary = primary_evidence.position;
         let now = unix_ms()?;
         ensure!(
             fresh(now, state.time, MAX_ACCOUNT_AGE_MS),
@@ -518,6 +539,16 @@ impl LiveInventoryHedge {
             hedge == self.confirmed,
             "Unexplained Hyperliquid position change"
         );
+        // The joined requests finish together; a primary value that waited
+        // on slower Hyperliquid replies (or was slow itself) is too old to
+        // plan against. No observation: callers retry, blocked deadlines run.
+        if self
+            .primary_validity(primary_evidence.requested_at)
+            .is_none()
+        {
+            tracing::warn!("Lighter position observation is older than the account age limit");
+            return Ok(None);
+        }
         if !closing {
             ensure!(
                 within_limits(&self.limits, primary, hedge),
@@ -536,6 +567,7 @@ impl LiveInventoryHedge {
         }
         Ok(Some(Observation {
             primary,
+            primary_requested_at: primary_evidence.requested_at,
             hedge,
             book,
         }))
@@ -558,6 +590,13 @@ impl LiveInventoryHedge {
             fresh(sent_at_ms, observed.book.timestamp_ms, MAX_QUOTE_AGE_MS),
             "Hyperliquid book is stale at hedge dispatch"
         );
+        if self
+            .primary_validity(observed.primary_requested_at)
+            .is_none()
+        {
+            tracing::warn!("Lighter position aged out before hedge dispatch; re-observing");
+            return Ok(());
+        }
         let id = format!("0x{}", uuid::Uuid::new_v4().simple());
         order.client_order_id = Some(id.clone());
         let action = OrderAction::new(vec![OrderWire::new(

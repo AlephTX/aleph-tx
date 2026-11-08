@@ -44,8 +44,9 @@ impl LighterTrading {
                     self.execute_batch(chunk.to_vec()).await?;
                 }
             } else if let Some(fill_time) = self.terminal_fill_time(&orders).await? {
-                let (position, account_time) = self.signed_position_snapshot().await?;
-                if account_time >= fill_time {
+                let account = self.position_evidence().await?;
+                let position = account.position;
+                if account.covers(fill_time) {
                     if position.is_zero() {
                         tracing::info!(
                             "Lighter REST recovery confirmed zero position and terminal orders"
