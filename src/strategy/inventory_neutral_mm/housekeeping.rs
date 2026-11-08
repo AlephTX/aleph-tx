@@ -39,7 +39,7 @@ pub(super) fn sync_telemetry_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use tokio::time::Instant;
 
     #[test]
     fn reconcile_interval_exponentially_backs_off_and_caps() {

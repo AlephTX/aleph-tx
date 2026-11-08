@@ -422,7 +422,7 @@ impl Exchange for EdgeXGateway {
             position: stats.position,
             leverage: stats.leverage,
             margin_usage: stats.margin_usage,
-            last_update: std::time::Instant::now(),
+            last_update: tokio::time::Instant::now(),
         })
     }
 

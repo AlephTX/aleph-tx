@@ -24,7 +24,8 @@ use crossbeam::utils::CachePadded;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::types::ShmPrivateEventV2;
 

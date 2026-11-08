@@ -7,7 +7,8 @@ use crate::error::TradingError;
 use crate::exchange::{BatchResult, OrderParams, OrderType, Side};
 use crate::order_tracker::{OrderLifecycle, OrderSide};
 use crate::telemetry::TelemetryCollector;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
 const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
@@ -316,7 +317,6 @@ pub(super) fn should_defer_micro_refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn config() -> InventoryNeutralMMConfig {
         InventoryNeutralMMConfig {

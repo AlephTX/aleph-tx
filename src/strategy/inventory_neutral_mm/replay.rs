@@ -16,7 +16,13 @@
 //! - Order acknowledgements and cancels are synchronous within a step; one
 //!   step = one strategy cycle. Network latency is not modelled.
 //! - Scenario hooks inject cancel/fill races (`fill_before_cancel`), event
-//!   gaps (`skip_sequence`) and duplicate deliveries (`replay_duplicate_fill`).
+//!   gaps (`skip_sequence`) and identity-preserving duplicate deliveries
+//!   (`redeliver` with the stale sequence, `republish` with a fresh one).
+//! - Timeout flatten IOCs match against the current touch at a simulated
+//!   taker fee (`SIM_TAKER_FEE_BPS`); reduce-only caps them at the position.
+//! - Time: runs on a paused Tokio clock; strategy, tracker and SHM source
+//!   timestamps share that domain and advance only via `Frame::advance_ms`
+//!   and the strategy's own sleeps.
 //!
 //! Scope: correctness of the production decision path and accounting. It
 //! does not estimate live fill rates or PnL; no recorded dataset is used.
@@ -45,6 +51,46 @@ pub(super) struct Resting {
     pub remaining: f64,
 }
 
+/// Taker fee for offline IOC fills (timeout flatten). Assumption, not a quote.
+const SIM_TAKER_FEE_BPS: f64 = 2.0;
+
+/// Venue action as observed by the simulated exchange, in scaled integers so
+/// traces compare exactly. `at_ms` is replay time since the run started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Action {
+    Place {
+        at_ms: u64,
+        is_ask: bool,
+        price: i64,
+        size: i64,
+        ioc: bool,
+    },
+    Cancel {
+        at_ms: u64,
+        exchange_order_id: u64,
+    },
+    CancelMiss {
+        at_ms: u64,
+        order_index: i64,
+    },
+    Fill {
+        at_ms: u64,
+        is_ask: bool,
+        price: i64,
+        size: i64,
+        fee: i64,
+        taker: bool,
+    },
+}
+
+fn e4(v: f64) -> i64 {
+    (v * 1e4).round() as i64
+}
+
+fn e8(v: f64) -> i64 {
+    (v * 1e8).round() as i64
+}
+
 /// Simulated Lighter venue. Holds resting orders and emits tracker events.
 pub(super) struct SimVenue {
     tracker: Arc<OrderTracker>,
@@ -60,6 +106,13 @@ pub(super) struct SimVenue {
     /// When set, a cancel request loses the race: the order fills first and
     /// the cancel finds nothing, as with Lighter's "order not found".
     pub fill_before_cancel: std::sync::atomic::AtomicBool,
+    /// Fill events exactly as published, for identity-preserving redelivery.
+    pub fill_events: PlMutex<Vec<ShmPrivateEventV2>>,
+    /// Every venue action with its replay time.
+    pub actions: PlMutex<Vec<Action>>,
+    /// Current visible touch, used to match IOC orders.
+    touch: PlMutex<(f64, f64)>,
+    started: Instant,
 }
 
 impl SimVenue {
@@ -74,7 +127,19 @@ impl SimVenue {
             fills: PlMutex::new(Vec::new()),
             cancel_misses: std::sync::atomic::AtomicU64::new(0),
             fill_before_cancel: std::sync::atomic::AtomicBool::new(false),
+            fill_events: PlMutex::new(Vec::new()),
+            actions: PlMutex::new(Vec::new()),
+            touch: PlMutex::new((0.0, 0.0)),
+            started: Instant::now(),
         }
+    }
+
+    fn now_ms(&self) -> u64 {
+        Instant::now().duration_since(self.started).as_millis() as u64
+    }
+
+    fn record(&self, action: Action) {
+        self.actions.lock().push(action);
     }
 
     fn next_sequence(&self) -> u64 {
@@ -93,7 +158,7 @@ impl SimVenue {
 
     /// Register an order the strategy placed, as LighterTrading would before
     /// submission, then acknowledge it as the private stream would.
-    fn place(&self, side: Side, price: f64, size: f64) -> PlaceResult {
+    fn place(&self, side: Side, price: f64, size: f64, ioc: bool) -> PlaceResult {
         let coid = self
             .next_coid
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -106,6 +171,13 @@ impl SimVenue {
         };
         assert!(self.tracker.start_tracking(coid, tracker_side, price, size));
         let is_ask = side == Side::Sell;
+        self.record(Action::Place {
+            at_ms: self.now_ms(),
+            is_ask,
+            price: e4(price),
+            size: e8(size),
+            ioc,
+        });
         self.apply(ShmPrivateEventV2::order_created(
             self.next_sequence(),
             LIGHTER,
@@ -143,22 +215,32 @@ impl SimVenue {
         {
             let racing = self.book.lock().get(&order_index).copied();
             if let Some(order) = racing {
-                self.fill(order, order.remaining);
+                self.fill(order, order.price, order.remaining, false);
             }
         }
         let removed = self.book.lock().remove(&order_index);
         match removed {
-            Some(order) => self.apply(ShmPrivateEventV2::order_canceled(
-                self.next_sequence(),
-                LIGHTER,
-                SYMBOL,
-                order.exchange_order_id,
-                order.client_order_id,
-                order_index,
-                order.remaining,
-                0,
-            )),
+            Some(order) => {
+                self.record(Action::Cancel {
+                    at_ms: self.now_ms(),
+                    exchange_order_id: order.exchange_order_id,
+                });
+                self.apply(ShmPrivateEventV2::order_canceled(
+                    self.next_sequence(),
+                    LIGHTER,
+                    SYMBOL,
+                    order.exchange_order_id,
+                    order.client_order_id,
+                    order_index,
+                    order.remaining,
+                    0,
+                ))
+            }
             None => {
+                self.record(Action::CancelMiss {
+                    at_ms: self.now_ms(),
+                    order_index,
+                });
                 self.cancel_misses
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -168,6 +250,7 @@ impl SimVenue {
     /// Fill resting orders the frame trades through. `fraction` < 1 leaves a
     /// partial remainder resting.
     pub fn settle(&self, bid: f64, ask: f64, fraction: f64) {
+        *self.touch.lock() = (bid, ask);
         let crossing: Vec<Resting> = self
             .book
             .lock()
@@ -191,33 +274,47 @@ impl SimVenue {
             if size <= 0.0 {
                 continue;
             }
-            self.fill(order, size);
+            self.fill(order, order.price, size, false);
         }
     }
 
-    /// Fill `size` of a resting order at its limit price and emit the event.
-    fn fill(&self, order: Resting, size: f64) {
+    /// Fill `size` of a booked order at `price` and emit the event. Makers
+    /// fill at their limit; takers at the touch they cross.
+    fn fill(&self, order: Resting, price: f64, size: f64, taker: bool) {
         let remaining = ((order.remaining - size) * 1e8).round() / 1e8;
-        let fee = order.price * size * self.fee_bps / 10_000.0;
+        let fee_bps = if taker {
+            SIM_TAKER_FEE_BPS
+        } else {
+            self.fee_bps
+        };
+        let fee = price * size * fee_bps / 10_000.0;
         let sequence = self.next_sequence();
-        self.apply(ShmPrivateEventV2::order_filled(
+        let event = ShmPrivateEventV2::order_filled(
             sequence,
             LIGHTER,
             SYMBOL,
             order.exchange_order_id,
             order.client_order_id,
             order.exchange_order_id as i64,
-            order.price,
+            price,
             size,
             remaining,
             fee,
             order.is_ask,
             0,
             sequence + 1_000_000, // unique trade id per fill
-        ));
-        self.fills
-            .lock()
-            .push((order.is_ask, order.price, size, fee));
+        );
+        self.apply(event);
+        self.fill_events.lock().push(event);
+        self.record(Action::Fill {
+            at_ms: self.now_ms(),
+            is_ask: order.is_ask,
+            price: e4(price),
+            size: e8(size),
+            fee: e8(fee),
+            taker,
+        });
+        self.fills.lock().push((order.is_ask, price, size, fee));
         let mut book = self.book.lock();
         if remaining > 0.0 {
             if let Some(entry) = book.get_mut(&(order.exchange_order_id as i64)) {
@@ -228,21 +325,70 @@ impl SimVenue {
         }
     }
 
+    /// Offline IOC: book, take against the current touch if it crosses, then
+    /// cancel any remainder. `reduce_only` caps size at the open position.
+    /// No network or signing; this exists only so timeout flatten settles
+    /// through the real tracker.
+    fn place_ioc(&self, order: &crate::exchange::OrderParams) -> PlaceResult {
+        let position = self.net_position();
+        let mut size = order.size;
+        if order.reduce_only {
+            let reducible = match order.side {
+                Side::Sell => position.max(0.0),
+                Side::Buy => (-position).max(0.0),
+            };
+            size = size.min(reducible);
+        }
+        let result = self.place(order.side, order.price, size, true);
+        let booked = self
+            .book
+            .lock()
+            .values()
+            .find(|o| o.client_order_id == result.client_order_index)
+            .copied();
+        let Some(booked) = booked else {
+            return result;
+        };
+        let (bid, ask) = *self.touch.lock();
+        let crosses = match order.side {
+            Side::Buy => ask > 0.0 && order.price >= ask,
+            Side::Sell => bid > 0.0 && order.price <= bid,
+        };
+        if crosses && size > 0.0 {
+            let price = if order.side == Side::Buy { ask } else { bid };
+            self.fill(booked, price, size, true);
+        }
+        if self
+            .book
+            .lock()
+            .contains_key(&(booked.exchange_order_id as i64))
+        {
+            self.cancel(booked.exchange_order_id as i64);
+        }
+        result
+    }
+
     /// Burn one sequence number so the next event arrives after a gap.
     pub fn skip_sequence(&self) {
         self.next_sequence();
     }
 
-    /// Re-deliver the last event sequence to exercise duplicate handling.
-    pub fn replay_duplicate_fill(&self) {
-        let fill = self.fills.lock().last().copied();
-        if let Some((is_ask, price, size, fee)) = fill {
-            // Same trade id and an old sequence: the tracker must ignore it.
-            let event = ShmPrivateEventV2::order_filled(
-                1, LIGHTER, SYMBOL, 1, 1, 1, price, size, 0.0, fee, is_ask, 0, 1,
-            );
-            let _ = self.tracker.apply_event(&event);
-        }
+    /// Re-apply a previously published event verbatim: same order, client,
+    /// exchange and trade identity and its original (now stale) sequence, as
+    /// when a ring reader re-reads a slot.
+    pub fn redeliver(&self, event: &ShmPrivateEventV2) -> anyhow::Result<()> {
+        self.tracker.apply_event(event)
+    }
+
+    /// Re-publish a previously published fill under a fresh sequence. The Go
+    /// feeder dedupes trade ids only within one process and a bounded window
+    /// (feeder/exchanges/trade_dedupe.go), so after a feeder restart or window
+    /// eviction a websocket replay reaches the ring as a new sequence with an
+    /// already-applied trade id.
+    pub fn republish(&self, event: &ShmPrivateEventV2) -> anyhow::Result<()> {
+        let mut event = *event;
+        event.sequence = self.next_sequence();
+        self.tracker.apply_event(&event)
     }
 
     pub fn net_position(&self) -> f64 {
@@ -315,7 +461,11 @@ impl Exchange for SimVenue {
                         order.size > 0.0 && order.price > 0.0,
                         "strategy placed a non-positive order"
                     );
-                    place_results.push(self.place(order.side, order.price, order.size));
+                    if order.order_type == OrderType::Ioc {
+                        place_results.push(self.place_ioc(&order));
+                    } else {
+                        place_results.push(self.place(order.side, order.price, order.size, false));
+                    }
                 }
                 BatchAction::Cancel(order_index) => self.cancel(order_index),
             }
@@ -340,6 +490,17 @@ pub(super) struct Frame {
     pub lighter_ask: f64,
     pub external_mid: f64,
     pub fill_fraction: f64,
+    /// Replay time advanced before this frame is published.
+    pub advance_ms: u64,
+    /// When false the BBO feed is silent: prices and source timestamps keep
+    /// their previous values and only time moves.
+    pub bbo_live: bool,
+    /// When false no account snapshot is published for this frame or while
+    /// its cycle runs, so the last snapshot ages.
+    pub account_live: bool,
+    /// Publish this frame's account snapshot this far in the future
+    /// (a clock-skewed source); 0 for a normal snapshot.
+    pub account_ahead_ms: u64,
 }
 
 /// Temp SHM segments the strategy reads like production.
@@ -443,6 +604,14 @@ pub(super) struct Outcome {
     pub resting: Vec<(bool, i64, i64)>,
     pub cycles: Vec<CycleOutcome>,
     pub cancel_misses: u64,
+    /// First `quote_cycle` error; the replay stops there.
+    pub error: Option<String>,
+    /// Whether the tracker still holds unconfirmed exposure at the end.
+    pub needs_reconciliation: bool,
+    /// Full venue action trace with replay timestamps.
+    pub actions: Vec<Action>,
+    /// Per-cycle (replay ms at cycle end, position e8, cash e8, resting count).
+    pub states: Vec<(u64, i64, i64, usize)>,
 }
 
 pub(super) fn wall_ns() -> u64 {
@@ -450,6 +619,11 @@ pub(super) fn wall_ns() -> u64 {
 }
 
 /// Drive the production strategy over `frames`, one quote_cycle per frame.
+///
+/// Must run on a paused Tokio clock (`#[tokio::test(start_paused = true)]`):
+/// the strategy, `OrderTracker` and SHM timestamps then share one replay
+/// time domain that advances only via `Frame::advance_ms` and the strategy's
+/// own sleeps, so time-gated branches replay identically.
 pub(super) async fn run(
     config: InventoryNeutralMMConfig,
     frames: &[Frame],
@@ -475,11 +649,21 @@ pub(super) async fn run(
     strategy.config.validate().unwrap();
     strategy.perform_startup_initialization().await.unwrap();
     let mut cycles = Vec::with_capacity(frames.len());
+    let mut states = Vec::with_capacity(frames.len());
+    let mut book = frames[0];
+    let mut error = None;
     for (index, frame) in frames.iter().enumerate() {
+        tokio::time::advance(Duration::from_millis(frame.advance_ms)).await;
         let ts = wall_ns();
-        shm.publish(frame, ts);
-        venue.settle(frame.lighter_bid, frame.lighter_ask, frame.fill_fraction);
-        shm.publish_account(equity, venue.net_position(), ts);
+        if frame.bbo_live {
+            book = *frame;
+            shm.publish(frame, ts);
+        }
+        venue.settle(book.lighter_bid, book.lighter_ask, frame.fill_fraction);
+        if frame.account_live {
+            let account_ts = ts + frame.account_ahead_ms * 1_000_000;
+            shm.publish_account(equity, venue.net_position(), account_ts);
+        }
         // Like the Go feeder, keep account snapshots flowing while the cycle
         // runs so cleanup barriers (snapshot newer than cancel) can resolve.
         let done = tokio::sync::Notify::new();
@@ -493,14 +677,28 @@ pub(super) async fn run(
                 tokio::select! {
                     _ = done.notified() => break,
                     _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                        shm.publish_account(equity, venue.net_position(), wall_ns());
+                        if frame.account_live {
+                            shm.publish_account(equity, venue.net_position(), wall_ns());
+                        }
                     }
                 }
             }
         };
         let (outcome, ()) = tokio::join!(cycle, feeder);
-        cycles.push(outcome.expect("quote_cycle failed"));
+        match outcome {
+            Ok(outcome) => cycles.push(outcome),
+            Err(err) => {
+                error = Some(format!("{err:#}"));
+                break;
+            }
+        }
         after_cycle(index, &venue, &tracker);
+        states.push((
+            venue.now_ms(),
+            e8(venue.net_position()),
+            e8(venue.cash_flow()),
+            venue.book.lock().len(),
+        ));
     }
     let scale = |v: f64, s: f64| (v * s).round() as i64;
     let fills = venue
@@ -524,6 +722,10 @@ pub(super) async fn run(
         cancel_misses: venue
             .cancel_misses
             .load(std::sync::atomic::Ordering::SeqCst),
+        error,
+        needs_reconciliation: tracker.needs_reconciliation(),
+        actions: venue.actions.lock().clone(),
+        states,
     };
     drop(strategy);
     outcome
@@ -545,20 +747,23 @@ mod tests {
             grid_spacing_bps: 2.0,
             use_post_only: true,
             use_depth_pricing: false,
-            // Keep cycles free of wall-clock gated paths that replay cannot
-            // drive deterministically (timeout flatten, TTL requotes).
-            position_timeout_secs: 3_600,
-            order_ttl_secs: 3_600,
+            // Production timing defaults (order_ttl_secs = min lifetime 5 s,
+            // position_timeout_secs = 60 s) apply on the replay clock.
             ..Default::default()
         }
     }
 
+    /// Live frame one second after the previous one.
     fn frame(mid: f64, fill_fraction: f64) -> Frame {
         Frame {
             lighter_bid: mid - 0.5,
             lighter_ask: mid + 0.5,
             external_mid: mid,
             fill_fraction,
+            advance_ms: 1_000,
+            bbo_live: true,
+            account_live: true,
+            account_ahead_ms: 0,
         }
     }
 
@@ -621,7 +826,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn production_strategy_replay_conserves_inventory_and_cash() {
         let outcome = run(config(), &frames(), 1_000.0, check).await;
         assert!(
@@ -644,30 +849,101 @@ mod tests {
         assert!(outcome.resting.iter().any(|(is_ask, _, _)| *is_ask));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn replay_is_deterministic_for_identical_input() {
         let first = run(config(), &frames(), 1_000.0, check).await;
         let second = run(config(), &frames(), 1_000.0, check).await;
         assert_eq!(first, second);
     }
 
-    #[tokio::test]
-    async fn duplicate_and_stale_events_do_not_double_count() {
-        let outcome = run(config(), &frames(), 1_000.0, |index, venue, tracker| {
-            let before = (tracker.confirmed_position(), tracker.total_fill_stats().0);
-            venue.replay_duplicate_fill();
-            assert_eq!(
-                before,
-                (tracker.confirmed_position(), tracker.total_fill_stats().0),
-                "cycle {index}: duplicate event changed state"
-            );
-            check(index, venue, tracker);
-        })
-        .await;
-        assert!(outcome.position > 0);
+    /// Everything a duplicate fill could corrupt, compared exactly.
+    fn ledger(tracker: &OrderTracker) -> (u64, f64, f64, f64, (f64, f64, f64)) {
+        let (fills, fees) = tracker.total_fill_stats();
+        (
+            fills,
+            fees,
+            tracker.confirmed_position(),
+            tracker.trade_cash_flow(),
+            tracker.exposure_bounds(),
+        )
     }
 
-    #[tokio::test]
+    /// Duplicates keep the original order/client/exchange/trade identity.
+    /// A stale-sequence redelivery and a fresh-sequence republish of both a
+    /// partial and a terminal fill change nothing; a genuine second partial
+    /// of the same order with a new trade id is counted exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn redelivered_fills_keep_identity_and_never_double_count() {
+        use std::cell::Cell;
+        let redelivered = Cell::new(0usize);
+        let (partials, terminals) = (Cell::new(0u32), Cell::new(0u32));
+        let control_done = Cell::new(false);
+        // The control partials the top bid twice; the gap then trades through
+        // both bids, completing the top one and fully filling the second.
+        let mut frames = vec![quiet(1_000)];
+        frames.push(frame(1993.0, 1.0));
+        frames.extend(vec![frame(1993.0, 1.0); 2]);
+        let outcome = run(config(), &frames, 1_000.0, |index, venue, tracker| {
+            check(index, venue, tracker);
+            if !control_done.get() {
+                control_done.set(true);
+                // Control: two real partials of one resting bid, distinct trades.
+                let order = *venue
+                    .book
+                    .lock()
+                    .values()
+                    .find(|o| !o.is_ask)
+                    .expect("resting bid");
+                let first = ((order.remaining * 0.4) * 1e8).floor() / 1e8;
+                let before = ledger(tracker);
+                venue.fill(order, order.price, first, false);
+                let after_first = ledger(tracker);
+                assert_eq!(after_first.0, before.0 + 1);
+                assert!((after_first.2 - before.2 - first).abs() < 1e-9);
+                let rest = *venue
+                    .book
+                    .lock()
+                    .get(&(order.exchange_order_id as i64))
+                    .expect("partial remainder rests");
+                let second = ((rest.remaining * 0.5) * 1e8).floor() / 1e8;
+                venue.fill(rest, rest.price, second, false);
+                let after_second = ledger(tracker);
+                assert_eq!(after_second.0, before.0 + 2, "second partial dropped");
+                assert!((after_second.2 - before.2 - first - second).abs() < 1e-9);
+                // Reserved buy exposure shrinks by exactly what filled.
+                let reserved = |l: &(u64, f64, f64, f64, (f64, f64, f64))| l.4.2 - l.2;
+                assert!(
+                    (reserved(&before) - reserved(&after_second) - first - second).abs() < 1e-9
+                );
+            }
+            let events = venue.fill_events.lock().clone();
+            for event in &events[redelivered.get()..] {
+                let before = ledger(tracker);
+                venue
+                    .redeliver(event)
+                    .expect("stale redelivery rejected as invalid");
+                assert_eq!(ledger(tracker), before, "cycle {index}: stale redelivery");
+                venue
+                    .republish(event)
+                    .expect("trade-id duplicate rejected as invalid");
+                assert_eq!(ledger(tracker), before, "cycle {index}: republished trade");
+                assert!(!tracker.needs_reconciliation(), "duplicate forced recovery");
+                if event.remaining_size > 0.0 {
+                    partials.set(partials.get() + 1);
+                } else {
+                    terminals.set(terminals.get() + 1);
+                }
+            }
+            redelivered.set(events.len());
+        })
+        .await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert!(partials.get() >= 2 && terminals.get() >= 2);
+        // Venue ledger (each real fill once) still equals the tracker's.
+        assert_eq!(outcome.fills.len(), redelivered.get());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancel_losing_race_to_fill_keeps_accounting_exact() {
         let outcome = run(config(), &frames(), 1_000.0, |index, venue, tracker| {
             check(index, venue, tracker);
@@ -683,7 +959,7 @@ mod tests {
         assert!(outcome.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn event_gap_forces_confirmed_cleanup_before_requoting() {
         let quiet: Vec<Frame> = frames().into_iter().take(4).collect();
         let outcome = run(config(), &quiet, 1_000.0, |index, venue, tracker| {
@@ -703,7 +979,7 @@ mod tests {
         assert!(!outcome.resting.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn quiet_book_quotes_both_sides_without_fills() {
         let quiet: Vec<Frame> = frames().into_iter().take(4).collect();
         let outcome = run(config(), &quiet, 1_000.0, check).await;
@@ -719,5 +995,301 @@ mod tests {
                 assert!((*price as f64 / 1e4) < 2000.5);
             }
         }
+    }
+
+    // ─── Time-axis scenarios on the paused replay clock ─────────────────
+
+    fn quiet(advance_ms: u64) -> Frame {
+        Frame {
+            advance_ms,
+            ..frame(2000.0, 1.0)
+        }
+    }
+
+    fn places(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Place { at_ms, .. } => Some(*at_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cancels(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Cancel { at_ms, .. } => Some(*at_ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Calm requotes wait for max(order_ttl_secs, 8 s) of resting time:
+    /// the same drifted signal is held before the boundary and replaced at it.
+    #[tokio::test(start_paused = true)]
+    async fn requote_waits_for_minimum_resting_lifetime() {
+        // Quotes placed at t=1 s; then the fair value moves 3.5 bps.
+        let mut frames = vec![quiet(1_000)];
+        frames.push(Frame {
+            advance_ms: 1_000,
+            ..frame(2000.7, 1.0)
+        });
+        // Hold the moved signal, stepping to just before 1 s + 8 s.
+        frames.push(Frame {
+            advance_ms: 6_999,
+            ..frame(2000.7, 1.0)
+        });
+        let before = run(config(), &frames, 1_000.0, check).await;
+        assert!(before.error.is_none(), "{:?}", before.error);
+        assert!(cancels(&before.actions).is_empty(), "{:?}", before.actions);
+        // One more millisecond reaches the boundary and the requote happens.
+        frames.push(Frame {
+            advance_ms: 1,
+            ..frame(2000.7, 1.0)
+        });
+        let after = run(config(), &frames, 1_000.0, check).await;
+        assert_eq!(cancels(&after.actions).first(), Some(&9_000));
+        // A shorter configured lifetime does not undercut the calm 8 s floor.
+        let mut short_ttl = config();
+        short_ttl.order_ttl_secs = 1;
+        let floor = run(short_ttl, &frames[..3], 1_000.0, check).await;
+        assert!(cancels(&floor.actions).is_empty());
+    }
+
+    /// Inventory older than position_timeout_secs is flattened by a
+    /// reduce-only IOC; adding to the position does not renew the clock.
+    #[tokio::test(start_paused = true)]
+    async fn position_timeout_flattens_at_the_boundary_and_is_not_renewed() {
+        let timeout_ms = config().position_timeout_secs * 1_000;
+        // Gap through both bids at t=2 s, filling 30% so the position stays
+        // under its cap; the strategy then requotes bids lower.
+        let mut frames = vec![quiet(1_000)];
+        frames.push(Frame {
+            advance_ms: 1_000,
+            ..frame(1993.0, 0.3)
+        });
+        let opened_ms = 2_000;
+        frames.push(Frame {
+            advance_ms: 10_000,
+            ..frame(1985.0, 1.0)
+        });
+        // A second gap at t=13 s fills the re-placed bids: same-side
+        // inventory is added 11 s into the episode.
+        frames.push(Frame {
+            advance_ms: 1_000,
+            ..frame(1978.0, 1.0)
+        });
+        let added_ms = 13_000;
+        let hold = |until_ms: u64, at_ms: u64| Frame {
+            advance_ms: until_ms - at_ms,
+            ..frame(1978.0, 1.0)
+        };
+        let mut before = frames.clone();
+        before.push(hold(opened_ms + timeout_ms - 1, added_ms));
+        let early = run(config(), &before, 1_000.0, check).await;
+        assert!(early.error.is_none(), "{:?}", early.error);
+        // Both gaps really filled bids: the episode started at 2 s and grew at 12 s.
+        let fill_times: Vec<u64> = early
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Fill {
+                    at_ms,
+                    is_ask: false,
+                    ..
+                } => Some(*at_ms),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fill_times.contains(&opened_ms) && fill_times.contains(&added_ms),
+            "{fill_times:?}"
+        );
+        assert!(
+            !early
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Place { ioc: true, .. })),
+            "flattened before timeout"
+        );
+        assert!(early.position > 0);
+        // At the boundary measured from the first fill, not the added one.
+        let mut at = frames.clone();
+        at.push(hold(opened_ms + timeout_ms, added_ms));
+        let flat = run(config(), &at, 1_000.0, check).await;
+        let ioc = flat
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Place {
+                    at_ms,
+                    is_ask,
+                    ioc: true,
+                    ..
+                } => Some((*at_ms, *is_ask)),
+                _ => None,
+            })
+            .expect("no timeout flatten");
+        assert_eq!(ioc, (opened_ms + timeout_ms, true));
+        assert!(
+            flat.actions
+                .iter()
+                .any(|a| matches!(a, Action::Fill { taker: true, .. }))
+        );
+        // IOC size is rounded down to step_size; only a sub-step dust remains.
+        let step_e8 = e8(config().step_size);
+        assert!(
+            flat.position.abs() < step_e8,
+            "reduce-only IOC left {} (e-8)",
+            flat.position
+        );
+        assert!(!flat.needs_reconciliation);
+    }
+
+    /// Source-timestamp aging: fresh → frozen (quotes kept, no new orders) →
+    /// cancel at stale_bbo_cancel_ms → requote only after the feed recovers.
+    #[tokio::test(start_paused = true)]
+    async fn stale_bbo_freezes_then_cancels_and_recovers() {
+        let cfg = config();
+        let silent = Frame {
+            bbo_live: false,
+            ..quiet(1_000)
+        };
+        // Last BBO published at t=1 s; silence until just under the cancel age.
+        let mut frames = vec![quiet(1_000)];
+        let quiet_secs = cfg.stale_bbo_cancel_ms / 1_000 - 2;
+        frames.extend(vec![silent; quiet_secs as usize]);
+        let frozen = run(cfg.clone(), &frames, 1_000.0, check).await;
+        assert!(frozen.error.is_none(), "{:?}", frozen.error);
+        assert!(
+            cancels(&frozen.actions).is_empty(),
+            "freeze must not cancel"
+        );
+        assert_eq!(places(&frozen.actions), vec![1_000; 4]);
+        assert!(
+            frozen
+                .cycles
+                .iter()
+                .any(|c| matches!(c, CycleOutcome::Backoff(_))),
+            "freeze path not reached"
+        );
+        // Keep the feed silent past the cancel age: every quote is pulled.
+        frames.extend(vec![silent; 4]);
+        let pulled = run(cfg.clone(), &frames, 1_000.0, check).await;
+        let pulled_at = cancels(&pulled.actions);
+        assert_eq!(pulled_at.len(), 4);
+        assert!(
+            pulled_at
+                .iter()
+                .all(|t| *t >= 1_000 + cfg.stale_bbo_cancel_ms)
+        );
+        assert!(pulled.resting.is_empty());
+        assert_eq!(places(&pulled.actions).len(), 4, "no quotes while stale");
+        // Recovery: a fresh BBO restores two-sided quoting.
+        frames.push(quiet(1_000));
+        let recovered = run(cfg, &frames, 1_000.0, check).await;
+        assert_eq!(places(&recovered.actions).len(), 8);
+        assert_eq!(recovered.cycles.last(), Some(&CycleOutcome::Quoted));
+        assert_eq!(recovered.resting.len(), 4);
+    }
+
+    /// Account snapshots older than 30 s, or stamped in the future, withdraw
+    /// all quotes; quoting resumes only with a fresh in-domain snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn stale_or_future_account_snapshot_withdraws_quotes() {
+        let silent = Frame {
+            account_live: false,
+            ..quiet(1_000)
+        };
+        let mut frames = vec![quiet(1_000)];
+        frames.extend(vec![silent; 29]); // last snapshot at t=1 s, now t=30 s
+        let aging = run(config(), &frames, 1_000.0, check).await;
+        assert!(aging.cycles.iter().all(|c| *c == CycleOutcome::Quoted));
+        assert_eq!(aging.resting.len(), 4);
+        frames.extend(vec![silent; 2]); // age crosses 30 s
+        let stale = run(config(), &frames, 1_000.0, check).await;
+        assert!(stale.resting.is_empty(), "stale account kept quotes");
+        assert_eq!(
+            stale.cycles.last(),
+            Some(&CycleOutcome::Backoff(Duration::from_secs(1)))
+        );
+        frames.push(quiet(1_000));
+        let fresh = run(config(), &frames, 1_000.0, check).await;
+        assert_eq!(fresh.cycles.last(), Some(&CycleOutcome::Quoted));
+        assert_eq!(fresh.resting.len(), 4);
+
+        // A snapshot from the future is not "fresher": it is rejected.
+        let mut future = vec![quiet(1_000), quiet(1_000)];
+        future.push(Frame {
+            account_ahead_ms: 5_000,
+            ..quiet(1_000)
+        });
+        let skewed = run(config(), &future, 1_000.0, check).await;
+        assert!(skewed.resting.is_empty());
+        assert_eq!(
+            skewed.cycles.last(),
+            Some(&CycleOutcome::Backoff(Duration::from_secs(1)))
+        );
+    }
+
+    /// After an event gap, cleanup cancels everything but may release
+    /// reserved exposure only once an account snapshot newer than the cancel
+    /// arrives. Without one it fails closed and keeps the reservation.
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_barrier_requires_snapshot_newer_than_cancel() {
+        let gap = |index: usize, venue: &SimVenue, tracker: &OrderTracker| {
+            check(index, venue, tracker);
+            if index == 0 {
+                venue.skip_sequence();
+                let id = *venue.book.lock().keys().next().expect("resting quote");
+                venue.cancel(id);
+            }
+        };
+        // Account feed silent during the recovery cycle: only the snapshot
+        // published before the cancel exists, so the barrier must hold.
+        let blocked_frames = vec![
+            quiet(1_000),
+            Frame {
+                account_live: false,
+                ..quiet(1_000)
+            },
+        ];
+        let blocked = run(config(), &blocked_frames, 1_000.0, gap).await;
+        let error = blocked
+            .error
+            .expect("cleanup released without a fresh snapshot");
+        assert!(
+            error.contains("fresh equity and position snapshot"),
+            "{error}"
+        );
+        assert!(blocked.needs_reconciliation, "reservation released");
+        assert!(blocked.resting.is_empty(), "cleanup still pulled quotes");
+        // Same gap with the feed running: a post-cancel snapshot arrives and
+        // cleanup confirms, then quoting resumes.
+        let live = run(config(), &[quiet(1_000), quiet(1_000)], 1_000.0, gap).await;
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert!(!live.needs_reconciliation);
+        assert_eq!(live.cycles.last(), Some(&CycleOutcome::Quoted));
+        assert_eq!(live.resting.len(), 4);
+    }
+
+    /// Same timed input → identical action trace and per-cycle state track.
+    #[tokio::test(start_paused = true)]
+    async fn timed_replay_trace_is_reproducible() {
+        let mut frames = vec![quiet(1_000), frame(1993.0, 0.5), frame(1993.0, 1.0)];
+        frames.extend(vec![frame(1993.0, 1.0); 70]);
+        let first = run(config(), &frames, 1_000.0, check).await;
+        let second = run(config(), &frames, 1_000.0, check).await;
+        assert!(
+            first
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Fill { taker: true, .. }))
+        );
+        assert_eq!(first.actions, second.actions);
+        assert_eq!(first.states, second.states);
+        assert_eq!(first, second);
     }
 }

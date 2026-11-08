@@ -13,7 +13,8 @@
 //! size: this measures how often fills are picked off, not notional loss.
 
 use crate::order_tracker::{FillPrint, OrderSide, OrderTracker, RECENT_FILLS};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Pending fills awaiting their horizon. Fixed so the hot path never allocates.
 const PENDING: usize = 64;

@@ -664,7 +664,7 @@ async fn test_reconcile_absent_pending_create_preserves_exposure_and_requests_cl
             .active_orders
             .get_mut(&8101)
             .expect("pending create should exist");
-        order.created_at = std::time::Instant::now() - Duration::from_secs(5);
+        order.created_at = tokio::time::Instant::now() - Duration::from_secs(5);
         order.last_update = order.created_at;
     }
 
@@ -703,7 +703,7 @@ async fn test_reconcile_with_exchange_rebinds_pending_create_and_reverts_stuck_p
             .active_orders
             .get_mut(&8202)
             .expect("pending cancel should exist");
-        order.last_update = std::time::Instant::now() - Duration::from_secs(5);
+        order.last_update = tokio::time::Instant::now() - Duration::from_secs(5);
     }
 
     let exchange = MockExchange {

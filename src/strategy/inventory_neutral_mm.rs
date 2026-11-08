@@ -22,7 +22,8 @@ use crate::telemetry::TelemetryCollector;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 mod components;
@@ -100,11 +101,36 @@ impl AccountStats {
     }
 }
 
+/// Wall-clock nanoseconds, the time domain of SHM source timestamps.
+///
+/// Monotonic time in this strategy and `OrderTracker` is `tokio::time::Instant`,
+/// which is the system monotonic clock in production. Under a paused Tokio
+/// clock in tests, wall time is derived from that same monotonic clock via a
+/// fixed anchor so advancing time moves both domains together; production
+/// always reads the system wall clock.
+#[cfg(not(test))]
 fn wall_time_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+#[cfg(test)]
+fn wall_time_ns() -> u64 {
+    static ANCHOR: std::sync::OnceLock<(std::time::Instant, u64)> = std::sync::OnceLock::new();
+    let (anchor, anchor_ns) = *ANCHOR.get_or_init(|| {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        (std::time::Instant::now(), wall)
+    });
+    let now = Instant::now().into_std();
+    match now.checked_duration_since(anchor) {
+        Some(ahead) => anchor_ns + ahead.as_nanos() as u64,
+        None => anchor_ns - anchor.duration_since(now).as_nanos() as u64,
+    }
 }
 
 fn account_source_age(snapshot: &AccountStatsSnapshot, now_ns: u64) -> Duration {
@@ -1433,6 +1459,11 @@ impl InventoryNeutralMM {
                 });
             }
         });
+        // Tracker storage is a HashMap with per-instance iteration order.
+        // Client ids are assigned monotonically, so this fixes plan order and
+        // makes capped replacements cancel the oldest order first. In place,
+        // no allocation.
+        active.sort_unstable_by_key(|order| order.client_order_id);
     }
 
     async fn reconcile_after_new_fill_if_needed(&mut self) {
@@ -1481,10 +1512,7 @@ impl InventoryNeutralMM {
 
         // Staleness check
         {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
+            let now_ns = wall_time_ns();
             let action = classify_stale_bbo(
                 &market_state.bbo,
                 now_ns,
@@ -1538,10 +1566,7 @@ impl InventoryNeutralMM {
         let (bid_touch, ask_touch) = fallback_bbo_prices(local_mid, bbo, self.config.tick_size);
 
         // External fair value: primary pricing anchor
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now_ns = wall_time_ns();
         let external_fair = if self.use_external_fair_value {
             external_fair_value_mid(
                 exchanges,
