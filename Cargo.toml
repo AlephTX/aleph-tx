@@ -39,6 +39,10 @@ flume = "0.11"
 core_affinity = "0.8"
 crossbeam = "0.8"
 
+[dev-dependencies]
+# Paused clock for deterministic async timing tests; no new crate.
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [lib]
 name = "aleph_tx"
 path = "src/lib.rs"

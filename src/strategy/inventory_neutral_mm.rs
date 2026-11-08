@@ -388,6 +388,10 @@ pub struct InventoryNeutralMM {
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
     markout: markout::MarkoutTracker,
+    /// Fill count captured before this cycle read any inventory state. The
+    /// wait compares against it, so a fill landing mid-cycle still wakes the
+    /// next cycle instead of being folded into the wait's own baseline.
+    cycle_fill_baseline: u64,
 
     // Order tracking (multi-level grid)
     active_orders: Vec<ActiveOrder>,
@@ -474,6 +478,7 @@ impl InventoryNeutralMM {
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             last_micro_sample: None,
+            cycle_fill_baseline: 0,
             markout: markout::MarkoutTracker::new(
                 config.markout_horizon_secs,
                 config.markout_halflife_fills,
@@ -562,6 +567,9 @@ impl InventoryNeutralMM {
                 return Ok(());
             }
 
+            // Capture before any inventory read: fills after this point are
+            // unconsumed by this cycle and must wake the next one.
+            self.cycle_fill_baseline = self.order_tracker.total_fill_stats().0;
             self.refresh_active_orders_from_tracker();
             if let Some(stats) = self.account_stats_reader.read_if_updated() {
                 self.account_stats = stats.into();
@@ -2123,11 +2131,12 @@ impl InventoryNeutralMM {
     /// Wait until new BBO data for the symbol, a new fill, shutdown, or the
     /// poll interval. Replaces a fixed sleep so requotes follow the market.
     async fn wait_for_next_cycle(&self, shutdown: Option<&tokio::sync::watch::Receiver<bool>>) {
-        let start = Instant::now();
+        // tokio's clock so tests can drive time deterministically.
+        let start = tokio::time::Instant::now();
         let max = Duration::from_millis(self.config.poll_interval_ms);
         let min = Duration::from_millis(self.config.min_cycle_interval_ms).min(max);
         let symbol = self.config.symbol_id;
-        let fills = self.order_tracker.total_fill_stats().0;
+        let fills = self.cycle_fill_baseline;
         tokio::time::sleep(min).await;
         loop {
             let elapsed = start.elapsed();

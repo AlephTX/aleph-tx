@@ -1760,3 +1760,277 @@ fn cycle_wake_respects_floor_ceiling_and_events() {
     // Without events the old fixed interval still applies.
     assert!(cycle_wake_due(ms(250), min, max, false));
 }
+
+/// Offline strategy over temp SHM files for timing tests. Symbol 0 so the
+/// one-symbol matrix covers it; the exchange is never called.
+fn wake_test_strategy(
+    poll_ms: u64,
+    min_ms: u64,
+) -> (InventoryNeutralMM, Arc<OrderTracker>, std::path::PathBuf) {
+    use crate::exchange::{
+        BatchOrderParams, BatchOrderResult, BatchResult, OrderInfo, OrderResult,
+    };
+    struct Offline;
+    #[async_trait::async_trait]
+    impl Exchange for Offline {
+        async fn buy(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn sell(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn place_batch(&self, _: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn cancel_order(&self, _: i64) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
+        async fn cancel_all(&self) -> anyhow::Result<u32> {
+            anyhow::bail!("offline")
+        }
+        async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+            anyhow::bail!("offline")
+        }
+        async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
+        async fn execute_batch(&self, _: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+            anyhow::bail!("offline")
+        }
+        async fn get_account_stats(&self) -> anyhow::Result<AccountStats> {
+            anyhow::bail!("offline")
+        }
+        fn limit_order_type(&self) -> OrderType {
+            OrderType::PostOnly
+        }
+    }
+    let directory = std::env::temp_dir().join(format!("aleph-wake-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let matrix_path = directory.join("matrix");
+    let account_path = directory.join("account");
+    std::fs::write(&matrix_path, vec![0u8; 2048 * 8 + 7 * 64]).unwrap();
+    std::fs::write(&account_path, [0u8; 128]).unwrap();
+    let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
+    let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();
+    let tracker = Arc::new(OrderTracker::new());
+    let config = InventoryNeutralMMConfig {
+        symbol_id: 0,
+        poll_interval_ms: poll_ms,
+        min_cycle_interval_ms: min_ms,
+        ..test_config()
+    };
+    let strategy = InventoryNeutralMM::new(
+        config,
+        Arc::new(Offline),
+        Arc::clone(&tracker),
+        shm,
+        account,
+    );
+    (strategy, tracker, directory)
+}
+
+/// Apply one owned fill to the tracker (client order `coid`).
+fn apply_test_fill(tracker: &OrderTracker, coid: i64, sequence: u64) {
+    use crate::types::ShmPrivateEventV2;
+    tracker.start_tracking(coid, OrderSide::Buy, 2000.0, 0.01);
+    let exchange_id = 10_000 + coid as u64;
+    let created = ShmPrivateEventV2::order_created(
+        sequence,
+        2,
+        0,
+        exchange_id,
+        coid,
+        coid,
+        2000.0,
+        0.01,
+        false,
+        0,
+    );
+    tracker.apply_event(&created).unwrap();
+    let fill = ShmPrivateEventV2::order_filled(
+        sequence + 1,
+        2,
+        0,
+        exchange_id,
+        coid,
+        coid,
+        2000.0,
+        0.01,
+        0.0,
+        0.0,
+        false,
+        0,
+        90_000 + coid as u64,
+    );
+    tracker.apply_event(&fill).unwrap();
+}
+
+/// Bump the symbol-0 SHM version, as the feeder does after a BBO write.
+fn bump_bbo_version(directory: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join("matrix"))
+        .unwrap();
+    let mut version = [0u8; 8];
+    file.read_exact(&mut version).unwrap();
+    let next = u64::from_le_bytes(version) + 1;
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&next.to_le_bytes()).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn fill_between_inventory_read_and_wait_wakes_at_the_floor() {
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    // Cycle start: baseline captured before reading inventory.
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    // A fill lands after this cycle consumed inventory but before it waits.
+    apply_test_fill(&tracker, 1, 1);
+    let start = tokio::time::Instant::now();
+    strategy.wait_for_next_cycle(None).await;
+    // With the old wait-entry baseline this took the full 250 ms poll.
+    assert_eq!(start.elapsed(), Duration::from_millis(50));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn quiet_market_waits_for_the_poll_interval() {
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    let start = tokio::time::Instant::now();
+    strategy.wait_for_next_cycle(None).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(250));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn continuous_bbo_updates_never_beat_the_minimum_cycle() {
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    bump_bbo_version(&directory); // already pending at wait entry
+    let start = tokio::time::Instant::now();
+    strategy.wait_for_next_cycle(None).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(50));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn bbo_update_mid_wait_wakes_within_one_check_interval() {
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    let start = tokio::time::Instant::now();
+    let wait = strategy.wait_for_next_cycle(None);
+    let bump = async {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        bump_bbo_version(&directory);
+    };
+    tokio::join!(wait, bump);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(120) && elapsed <= Duration::from_millis(125),
+        "woke after {elapsed:?}"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_wakes_after_the_floor() {
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    stop.send(true).unwrap();
+    let start = tokio::time::Instant::now();
+    strategy.wait_for_next_cycle(Some(&shutdown)).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(50));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[ignore = "manual release-mode performance benchmark"]
+fn benchmark_wake_check_cost() {
+    // One wake check = SHM version load + local version + tracker read lock.
+    // At WAKE_CHECK_INTERVAL (5 ms) this bounds the idle polling CPU cost.
+    use std::hint::black_box;
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    for coid in 1..=32 {
+        apply_test_fill(&tracker, coid, coid as u64 * 2);
+    }
+    strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+    let symbol = strategy.config.symbol_id;
+    let iterations = 2_000_000u32;
+    let start = Instant::now();
+    let mut changed = 0u32;
+    for _ in 0..iterations {
+        let c = strategy.shm_reader.shared_version(symbol)
+            != strategy.shm_reader.local_version(symbol)
+            || black_box(&tracker).total_fill_stats().0 != strategy.cycle_fill_baseline;
+        changed += u32::from(black_box(c));
+    }
+    let per_check = start.elapsed() / iterations;
+    let checks_per_sec = 1.0 / WAKE_CHECK_INTERVAL.as_secs_f64();
+    println!(
+        "wake check: {per_check:?}/check; idle CPU at {checks_per_sec:.0} checks/s ≈ {:.4}% of one core (changed={changed})",
+        per_check.as_secs_f64() * checks_per_sec * 100.0
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn wake_latency_distribution_vs_fixed_sleep() {
+    // Deterministic virtual-time model of the pacing layer only: a BBO lands
+    // at a pseudo-random offset after the previous cycle ended (cycle work is
+    // treated as instantaneous). Network, signing and order I/O are excluded,
+    // so these are scheduler latencies, not end-to-end guarantees.
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut event_driven = Vec::new();
+    for _ in 0..400 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let arrival = Duration::from_micros(seed % 250_000);
+        strategy.cycle_fill_baseline = tracker.total_fill_stats().0;
+        let begin = tokio::time::Instant::now();
+        let wait = strategy.wait_for_next_cycle(None);
+        let bump = async {
+            tokio::time::sleep(arrival).await;
+            bump_bbo_version(&directory);
+        };
+        tokio::join!(wait, bump);
+        let woke = begin.elapsed();
+        event_driven.push(woke.saturating_sub(arrival));
+        // Consume the update as the next cycle's read_all_exchanges would.
+        let _ = strategy.shm_reader.read_all_exchanges(0);
+        // Fixed 250 ms sleep would have reacted at 250 ms.
+    }
+    let fixed: Vec<Duration> = {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..400)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                Duration::from_millis(250) - Duration::from_micros(seed % 250_000)
+            })
+            .collect()
+    };
+    let pct = |samples: &[Duration], p: f64| {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+    };
+    let (e50, e95, e99) = (
+        pct(&event_driven, 0.5),
+        pct(&event_driven, 0.95),
+        pct(&event_driven, 0.99),
+    );
+    let (f50, f95, f99) = (pct(&fixed, 0.5), pct(&fixed, 0.95), pct(&fixed, 0.99));
+    println!(
+        "pacing latency event-driven p50={e50:?} p95={e95:?} p99={e99:?}; fixed-250ms p50={f50:?} p95={f95:?} p99={f99:?}"
+    );
+    // Bounded by the 50 ms floor plus one 5 ms check interval.
+    assert!(e99 <= Duration::from_millis(55), "p99={e99:?}");
+    assert!(e50 < f50);
+    std::fs::remove_dir_all(directory).unwrap();
+}
