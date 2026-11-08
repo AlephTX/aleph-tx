@@ -70,4 +70,3 @@ graph TD
 - `lighter_mm.rs` has been deleted. `inventory_neutral_mm.rs` is the production replacement.
 - `adaptive_mm.rs`: Uses `MicrostructureTracker` (EWMA fast/slow, realized vol, adverse selection).
 - Order TTL: Stale orders canceled after 6s to prevent position drift.
-- `inventory_adjusted_half_spreads` is dead code (kept for reference, replaced by momentum spread).

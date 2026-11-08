@@ -8,8 +8,7 @@ use super::components::{
 use super::execution::InventoryContext;
 use super::pricing::{
     AnchorParams, anchor_quotes_to_touch, cleanup_reference_mid, effective_penny_ticks,
-    fallback_bbo_prices, inventory_adjusted_half_spreads, local_reference_mid,
-    stabilize_crossed_quotes,
+    fallback_bbo_prices, local_reference_mid, stabilize_crossed_quotes,
 };
 use super::*;
 use crate::exchange::{OrderType, Side};
@@ -1132,19 +1131,6 @@ fn effective_penny_ticks_widens_with_toxicity_and_inventory() {
     assert_eq!(calm, 1.0);
     assert!(toxic > calm);
     assert!(inventory > calm);
-}
-
-#[test]
-fn inventory_adjusted_half_spreads_tighten_flatten_side() {
-    let (flat_bid, flat_ask) = inventory_adjusted_half_spreads(10.0, 0.0);
-    let (long_bid, long_ask) = inventory_adjusted_half_spreads(10.0, 1.0);
-    let (short_bid, short_ask) = inventory_adjusted_half_spreads(10.0, -1.0);
-
-    assert_eq!((flat_bid, flat_ask), (10.0, 10.0));
-    assert!(long_bid > 10.0);
-    assert!(long_ask < 10.0);
-    assert!(short_bid < 10.0);
-    assert!(short_ask > 10.0);
 }
 
 #[test]

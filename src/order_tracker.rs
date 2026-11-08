@@ -432,16 +432,6 @@ impl OrderTracker {
         self.state.read().active_orders.len()
     }
 
-    /// Count of filled orders within a given duration (for fill rate estimation)
-    pub fn filled_count_since(&self, duration: Duration) -> usize {
-        let state = self.state.read();
-        state
-            .completed_orders
-            .values()
-            .filter(|o| o.lifecycle == OrderLifecycle::Filled && o.last_update.elapsed() < duration)
-            .count()
-    }
-
     /// Lifetime fill count and fees, independent of completed-order TTL retention.
     /// O(1): telemetry no longer traverses every fill-bearing order on each tick.
     pub fn total_fill_stats(&self) -> (u64, f64) {

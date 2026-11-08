@@ -745,20 +745,6 @@ impl InventoryNeutralMM {
         Ok(())
     }
 
-    /// Estimate fill rate κ for A-S model from recent order fills
-    /// Higher κ → tighter spread (fills are easy to get)
-    /// Lower κ → wider spread (fills are scarce, need more edge)
-    /// Returns fills per second (matching T's time unit)
-    #[allow(dead_code)]
-    fn estimate_fill_rate(&self) -> f64 {
-        let recent_fills = self
-            .order_tracker
-            .filled_count_since(Duration::from_secs(300));
-        // κ = fills per second, floored at 0.01 to prevent ln(1) = 0
-        let fills_per_sec = recent_fills as f64 / 300.0;
-        fills_per_sec.max(0.01)
-    }
-
     fn build_risk_snapshot(&self, mid: f64) -> RiskSnapshot {
         let exchange_position = self.account_stats.position;
         // Quote direction should follow confirmed inventory, not pending-order imbalance.
@@ -1610,7 +1596,7 @@ impl InventoryNeutralMM {
     ///
     /// Uses external fair value as pricing_mid. Kappa is used directly from config
     /// (no fill-rate scaling). Spread cap is dynamic vol-based instead of hard clamp.
-    /// Momentum-aware asymmetric spread replaces old inventory_adjusted_half_spreads.
+    /// Momentum-aware asymmetric spread.
     fn calculate_optimal_quotes(
         &self,
         inputs: &PricingInputs,
