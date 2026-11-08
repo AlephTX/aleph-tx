@@ -223,6 +223,131 @@ class StoreTest(unittest.TestCase):
         finally:
             store.db.close()
 
+    def hedge(self, ts, side, price, size, cloid, price_source="fill", fee_source="configured_rate"):
+        record = {"type": "hedge_fill", "ts_ms": ts, "venue": "hyperliquid",
+                  "client_order_id": cloid, "side": side, "size": size, "price": price,
+                  "fee": price * size * 4.5e-4, "position_after": 0.0}
+        if price_source is not None:
+            record["price_source"] = price_source
+        if fee_source is not None:
+            record["fee_source"] = fee_source
+        return record
+
+    def test_writer_fixture_labels_every_cost_and_keeps_missing_mark_unknown(self):
+        # Produced by the Rust TelemetrySink (cost_fixture_matches_the_writer).
+        fixture = Path(__file__).parent / "fixtures" / "cost_session.jsonl"
+        self.file.write_text(fixture.read_text())
+        self.store.ingest()
+        self.store.ingest()  # duplicate ingest changes nothing
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertEqual(session["fills"], 2)
+        self.assertAlmostEqual(session["net_pnl"], 1.004)
+        self.assertEqual(session["unrealized"], 0.0)  # flat, so exact
+        self.assertAlmostEqual(session["total_pnl"], 1.004)
+        self.assertEqual(session["hedge_fills"], 3)
+        self.assertAlmostEqual(session["hedge_position"], -0.05)
+        self.assertAlmostEqual(session["hedge_realized"], -1.1)
+        self.assertAlmostEqual(session["hedge_fees"], 0.2257875)
+        # Open hedge with mid 0: valuation is unknown, never zero.
+        self.assertIsNone(session["hedge_unrealized"])
+        self.assertIsNone(session["hedge_total_pnl"])
+        self.assertIsNone(session["combined_pnl"])
+        self.assertAlmostEqual(session["hedge_net_pnl"], -1.1 - 0.2257875)
+        v = session["valuation"]
+        self.assertEqual(v["lighter"]["quality"], "reported")
+        self.assertEqual(v["hedge"]["price_sources"], {"fill": 2, "limit": 1, "unknown": 0})
+        self.assertEqual(v["hedge"]["fee_sources"], {"configured_rate": 3, "unknown": 0})
+        self.assertEqual((v["hedge"]["realized"], v["hedge"]["fees"], v["hedge"]["unrealized"]),
+                         ("estimated", "estimated", "missing"))
+        self.assertEqual(v["combined_quality"], "missing")
+        self.assertIsNone(v["mark"]["price"])
+        self.assertEqual(v["missing"], ["mark_price", "hedge_fill_price", "hedge_actual_fee", "funding"])
+        sources = [(r["price_source"], r["fee_source"]) for r in self.store.hedge_fills()]
+        self.assertEqual(sorted(sources), [("fill", "configured_rate"), ("fill", "configured_rate"),
+                                           ("limit", "configured_rate")])
+
+    def test_open_hedge_without_snapshot_has_no_combined_value(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   self.hedge(1100, "sell", 2000.0, 0.1, "0xa"))
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertIsNone(session["combined_pnl"])
+        self.assertIsNone(session["hedge_unrealized"])
+        self.assertEqual(session["total_pnl"], 0.0)  # Lighter leg is flat
+        self.assertIn("mark_price", session["valuation"]["missing"])
+
+    def test_marked_open_position_is_estimated_and_flat_control_is_exact(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.0, 701),
+                   {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0})
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertAlmostEqual(session["unrealized"], 0.5)
+        self.assertAlmostEqual(session["combined_pnl"], 0.5)
+        v = session["valuation"]
+        self.assertEqual(v["lighter"]["unrealized"], "estimated")
+        self.assertEqual(v["hedge"]["quality"], "reported")  # no hedge fills: nothing estimated
+        self.assertEqual(v["hedge"]["realized"], "none")
+        self.assertEqual(v["mark"], {"price": 2005.0, "source": "strategy_mid", "ts_ms": 1200,
+                                     "scope": "both legs marked to the strategy reference mid"})
+        self.assertNotIn("mark_price", v["missing"])
+        self.write(fill(1300, "sell", 2010.0, 0.1, 0.0, 702, coid=2),
+                   {"type": "snapshot", "ts_ms": 1400, "mid": 0.0})
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertEqual(session["unrealized"], 0.0)  # flat: no mark needed
+        self.assertAlmostEqual(session["combined_pnl"], 1.0)
+        self.assertEqual(session["valuation"]["combined_quality"], "reported")
+
+    def test_hedge_reversal_with_mixed_and_legacy_sources_is_never_reported(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   self.hedge(1100, "buy", 2000.0, 0.1, "0xa"),
+                   self.hedge(1200, "buy", 2004.0, 0.1, "0xb"),          # add
+                   self.hedge(1300, "sell", 2010.0, 0.3, "0xc", price_source="limit"),  # reverse
+                   {"type": "snapshot", "ts_ms": 1400, "mid": 2008.0})
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertAlmostEqual(session["hedge_realized"], (2010.0 - 2002.0) * 0.2)
+        self.assertAlmostEqual(session["hedge_position"], -0.1)
+        self.assertAlmostEqual(session["hedge_unrealized"], -0.1 * (2008.0 - 2010.0))
+        v = session["valuation"]["hedge"]
+        self.assertEqual((v["realized"], v["quality"]), ("estimated", "estimated"))
+        # Legacy lines without provenance (and unrecognized labels) are unknown.
+        self.write(self.hedge(1500, "buy", 2008.0, 0.1, "0xd", price_source=None, fee_source=None),
+                   self.hedge(1600, "buy", 2008.0, 0.1, "0xe", price_source="venue",
+                              fee_source="exact"))
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        v = session["valuation"]
+        self.assertEqual(v["hedge"]["price_sources"], {"fill": 2, "limit": 1, "unknown": 2})
+        self.assertEqual(v["hedge"]["fee_sources"], {"configured_rate": 3, "unknown": 2})
+        self.assertEqual((v["hedge"]["realized"], v["hedge"]["fees"]), ("unknown", "unknown"))
+        self.assertEqual(v["combined_quality"], "unknown")
+        self.assertIn("hedge_price_source", v["missing"])
+        self.assertIn("hedge_fee_source", v["missing"])
+
+    def test_old_hedge_fill_table_gains_fee_source_as_unknown(self):
+        import sqlite3
+        path = self.dir / "old_hedge.sqlite3"
+        old = TelemetryStore(str(path), self.dir)
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   self.hedge(1100, "sell", 2000.0, 0.1, "0xa"))
+        old.ingest()
+        old.db.close()
+        db = sqlite3.connect(path)
+        db.execute("ALTER TABLE hedge_fills DROP COLUMN fee_source")
+        db.commit()
+        db.close()
+        store = TelemetryStore(str(path), self.dir)
+        try:
+            store.ingest()
+            self.assertIsNone(store.hedge_fills()[0]["fee_source"])
+            session = store.summary(now_ms=2000)["session"]
+            self.assertEqual(session["hedge_fills"], 1)
+            self.assertEqual(session["valuation"]["hedge"]["fees"], "unknown")
+        finally:
+            store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

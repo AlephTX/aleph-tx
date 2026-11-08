@@ -1215,10 +1215,19 @@ impl InventoryNeutralMM {
         None
     }
 
-    fn export_snapshot(&self, mid: f64, quote_position: f64) {
+    fn export_snapshot(&self, quote_position: f64) {
         let Some(sink) = &self.telemetry_sink else {
             return;
         };
+        // The risk path falls back to 1.0 without a price sample; that is not
+        // a mark. Export 0 so consumers treat the valuation as missing.
+        let mid = self
+            .micro
+            .price_samples
+            .back()
+            .copied()
+            .filter(|mid| mid.is_finite() && *mid > 0.0)
+            .unwrap_or(0.0);
         let (fill_count, total_fees) = self.order_tracker.total_fill_stats();
         let markout = self.markout.stats();
         sink.snapshot(crate::telemetry_sink::StrategySnapshot {
@@ -1436,7 +1445,7 @@ impl InventoryNeutralMM {
             );
             self.telemetry.export_metrics();
             self.print_pnl_update();
-            self.export_snapshot(risk_mid, risk.position_for_quoting);
+            self.export_snapshot(risk.position_for_quoting);
             self.last_balance_check = Instant::now();
         }
     }

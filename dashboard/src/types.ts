@@ -73,9 +73,11 @@ export interface Session {
   sell_volume: number
   stream_lost: number
   rejected: number
-  unrealized: number
+  /** null when an open position has no valid mark. */
+  unrealized: number | null
   net_pnl: number
-  total_pnl: number
+  /** null when an open position has no valid mark. */
+  total_pnl: number | null
   equity_change: number | null
   open_orders: number
   hedge_position: number
@@ -84,10 +86,42 @@ export interface Session {
   hedge_fees: number
   hedge_volume: number
   hedge_fills: number
-  hedge_unrealized: number
+  /** null when an open position has no valid mark. */
+  hedge_unrealized: number | null
   hedge_net_pnl: number
-  hedge_total_pnl: number
-  combined_pnl: number
+  /** null when an open position has no valid mark. */
+  hedge_total_pnl: number | null
+  /** null when an open position has no valid mark. */
+  combined_pnl: number | null
+  /** Absent on servers older than the cost provenance contract. */
+  valuation?: Valuation
+}
+
+/** reported: venue-reported · estimated: limit price, configured fee or mark
+ * · unknown: legacy record without provenance · missing: no mark for an open
+ * position · flat / none: nothing to value. */
+export type Quality = 'reported' | 'estimated' | 'unknown' | 'missing' | 'flat' | 'none'
+
+export interface LegValuation {
+  realized: Quality
+  fees: Quality
+  unrealized: Quality
+  quality: Quality
+}
+
+export interface HedgeValuation extends LegValuation {
+  price_sources: { fill: number; limit: number; unknown: number }
+  fee_sources: { configured_rate: number; unknown: number }
+}
+
+export interface Valuation {
+  mark: { price: number | null; source: string | null; ts_ms: number | null; scope: string }
+  lighter: LegValuation
+  hedge: HedgeValuation
+  combined_quality: Quality
+  missing: string[]
+  excluded: string[]
+  scope: string
 }
 
 export interface Snapshot {

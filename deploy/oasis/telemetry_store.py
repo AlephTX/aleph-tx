@@ -9,6 +9,14 @@ Trade PnL uses the average-cost method, updated incrementally per fill.
 Fees are positive costs; negative fees are maker rebates. Hedge-venue IOC
 fills (`hedge_fill` lines) are tracked as a separate leg with their own
 average cost; funding payments are not included.
+
+The summary labels each PnL component (see `valuation`): Lighter fills and
+fees are venue-reported; hedge prices are reported (`fill`), a worst-case
+IOC bound (`limit`) or of unknown origin (legacy), and hedge fees are always
+estimated from the configured rate. Open positions are marked to the latest
+strategy mid; without one the unrealized part and every total that depends
+on it is null, never zero. Figures cover this session's trades, not account
+equity.
 """
 
 import json
@@ -57,7 +65,7 @@ CREATE TABLE IF NOT EXISTS hedge_fills (
   venue TEXT NOT NULL, client_order_id TEXT NOT NULL, side TEXT NOT NULL,
   price REAL NOT NULL, price_source TEXT, size REAL NOT NULL, notional REAL NOT NULL,
   fee REAL NOT NULL, realized_delta REAL NOT NULL, position_after REAL NOT NULL,
-  PRIMARY KEY (session_id, offset));
+  fee_source TEXT, PRIMARY KEY (session_id, offset));
 CREATE UNIQUE INDEX IF NOT EXISTS hedge_fills_cloid ON hedge_fills (session_id, client_order_id);
 CREATE INDEX IF NOT EXISTS hedge_fills_ts ON hedge_fills (ts_ms);
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -88,6 +96,12 @@ SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_fees", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_volume", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_fills", "INTEGER NOT NULL DEFAULT 0"))
+# Hedge fill columns added later; legacy rows keep NULL (= unknown source).
+HEDGE_FILL_MIGRATIONS = (("fee_source", "TEXT"),)
+HEDGE_PRICE_SOURCES = ("fill", "limit")
+HEDGE_FEE_SOURCES = ("configured_rate",)
+# Worst component quality wins: missing > unknown > estimated > exact kinds.
+QUALITY_RANK = {"none": 0, "flat": 0, "reported": 0, "estimated": 1, "unknown": 2, "missing": 3}
 
 
 def finite(value, default=0.0):
@@ -147,10 +161,12 @@ class TelemetryStore:
         for name, ddl in SESSION_MIGRATIONS:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(snapshots)")}
-        for name, ddl in SNAPSHOT_MIGRATIONS:
-            if name not in columns:
-                self.db.execute(f"ALTER TABLE snapshots ADD COLUMN {name} {ddl}")
+        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS),
+                                  ("hedge_fills", HEDGE_FILL_MIGRATIONS)):
+            columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in migrations:
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         self.db.execute("PRAGMA synchronous=NORMAL")
 
     # ── ingest ──────────────────────────────────────────────────────────
@@ -252,10 +268,15 @@ class TelemetryStore:
         position, avg_cost, delta = apply_fill(s["hedge_position"], s["hedge_avg_cost"],
                                                1 if side == "buy" else -1, price, qty)
         notional = price * qty
+        # Unrecognized provenance is stored as NULL: unknown, never promoted.
+        price_source = r.get("price_source") if r.get("price_source") in HEDGE_PRICE_SOURCES else None
+        fee_source = r.get("fee_source") if r.get("fee_source") in HEDGE_FEE_SOURCES else None
         inserted = self.db.execute(
-            "INSERT OR IGNORE INTO hedge_fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO hedge_fills (session_id, offset, ts_ms, venue, client_order_id,"
+            " side, price, price_source, size, notional, fee, realized_delta, position_after,"
+            " fee_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, offset, ts, str(r.get("venue") or "hyperliquid"), cloid, side, price,
-             r.get("price_source"), qty, notional, fee, delta, finite(r.get("position_after"))))
+             price_source, qty, notional, fee, delta, finite(r.get("position_after")), fee_source))
         if inserted.rowcount == 0:
             return
         self.db.execute(
@@ -368,6 +389,87 @@ class TelemetryStore:
         result["net_bps"] = result["net_pnl"] / result["volume"] * 1e4 if result["volume"] > 0 else None
         return result
 
+    def _hedge_sources(self, session_id):
+        price = {"fill": 0, "limit": 0, "unknown": 0}
+        fee = {"configured_rate": 0, "unknown": 0}
+        for row in self.db.execute(
+                "SELECT price_source, fee_source FROM hedge_fills WHERE session_id=?", (session_id,)):
+            price[row["price_source"] if row["price_source"] in HEDGE_PRICE_SOURCES else "unknown"] += 1
+            fee[row["fee_source"] if row["fee_source"] in HEDGE_FEE_SOURCES else "unknown"] += 1
+        return price, fee
+
+    def _session_pnl(self, session, snapshot):
+        """PnL fields plus `valuation`, which labels where each number came from.
+
+        A nonzero position without a valid mark has unknown unrealized PnL, so
+        it and every total built on it are None. A flat position is exactly 0.
+        """
+        mid = snapshot["mid"] if snapshot and (snapshot["mid"] or 0) > 0 else None
+        missing = []
+
+        def mark(position, avg_cost):
+            if abs(position) <= EPS:
+                return 0.0, "flat"
+            if mid is None:
+                return None, "missing"
+            return position * (mid - avg_cost), "estimated"
+
+        def worst(*labels):
+            label = max(labels, key=QUALITY_RANK.__getitem__)
+            return "reported" if QUALITY_RANK[label] == 0 else label
+
+        net = session["realized"] - session["fees"]
+        unrealized, lighter_mark = mark(session["position"], session["avg_cost"])
+        total = None if unrealized is None else net + unrealized
+        # Lighter fills and fees come from venue events.
+        lighter = {"realized": "reported", "fees": "reported", "unrealized": lighter_mark,
+                   "quality": worst("reported", lighter_mark)}
+
+        price, fee = self._hedge_sources(session["session_id"])
+        # Average cost carries every earlier price into later realized PnL, so
+        # one limit or unknown price taints the whole leg.
+        hedge_realized = ("none" if not sum(price.values()) else "unknown" if price["unknown"]
+                          else "estimated" if price["limit"] else "reported")
+        hedge_fees = ("none" if not sum(fee.values()) else "unknown" if fee["unknown"]
+                      else "estimated")
+        hedge_net = session["hedge_realized"] - session["hedge_fees"]
+        # The hedge is marked to the same reference mid as Lighter; venue basis
+        # makes this approximate.
+        hedge_unrealized, hedge_mark = mark(session["hedge_position"], session["hedge_avg_cost"])
+        hedge_total = None if hedge_unrealized is None else hedge_net + hedge_unrealized
+        hedge = {"realized": hedge_realized, "fees": hedge_fees, "unrealized": hedge_mark,
+                 "price_sources": price, "fee_sources": fee,
+                 "quality": worst(hedge_realized, hedge_fees, hedge_mark)}
+
+        if "missing" in (lighter_mark, hedge_mark):
+            missing.append("mark_price")
+        if price["limit"]:
+            missing.append("hedge_fill_price")
+        if price["unknown"]:
+            missing.append("hedge_price_source")
+        if fee["configured_rate"]:
+            missing.append("hedge_actual_fee")
+        if fee["unknown"]:
+            missing.append("hedge_fee_source")
+        missing.append("funding")
+        start_equity = snapshot["session_start_equity"] if snapshot else 0.0
+        return {
+            "unrealized": unrealized, "net_pnl": net, "total_pnl": total,
+            "hedge_unrealized": hedge_unrealized, "hedge_net_pnl": hedge_net,
+            "hedge_total_pnl": hedge_total,
+            "combined_pnl": None if total is None or hedge_total is None else total + hedge_total,
+            "equity_change": (snapshot["equity"] - start_equity
+                              if snapshot and start_equity and start_equity > 0 else None),
+            "valuation": {
+                "mark": {"price": mid, "source": "strategy_mid" if mid else None,
+                         "ts_ms": snapshot["ts_ms"] if mid else None,
+                         "scope": "both legs marked to the strategy reference mid"},
+                "lighter": lighter, "hedge": hedge,
+                "combined_quality": worst(lighter["quality"], hedge["quality"]),
+                "missing": missing, "excluded": ["funding"],
+                "scope": "strategy session trades, not account equity"},
+        }
+
     @locked
     def summary(self, now_ms=None):
         now_ms = now_ms or int(time.time() * 1000)
@@ -376,25 +478,7 @@ class TelemetryStore:
         snapshot = self.latest_snapshot(session["session_id"]) if session else None
         current = None
         if session:
-            mid = snapshot["mid"] if snapshot and snapshot["mid"] > 0 else None
-            unrealized = (session["position"] * (mid - session["avg_cost"])
-                          if mid and abs(session["position"]) > EPS else 0.0)
-            # The hedge leg is marked to the same reference mid; venue basis
-            # makes this approximate, and funding is not included.
-            hedge_unrealized = (session["hedge_position"] * (mid - session["hedge_avg_cost"])
-                                if mid and abs(session["hedge_position"]) > EPS else 0.0)
-            hedge_net = session["hedge_realized"] - session["hedge_fees"]
-            start_equity = snapshot["session_start_equity"] if snapshot else 0.0
-            total = session["realized"] - session["fees"] + unrealized
-            current = {**session, "unrealized": unrealized,
-                       "net_pnl": session["realized"] - session["fees"],
-                       "total_pnl": total,
-                       "hedge_unrealized": hedge_unrealized,
-                       "hedge_net_pnl": hedge_net,
-                       "hedge_total_pnl": hedge_net + hedge_unrealized,
-                       "combined_pnl": total + hedge_net + hedge_unrealized,
-                       "equity_change": (snapshot["equity"] - start_equity
-                                         if snapshot and start_equity > 0 else None),
+            current = {**session, **self._session_pnl(session, snapshot),
                        "open_orders": self.db.execute(
                            "SELECT count(*) FROM orders WHERE session_id=? AND status IN ('open','partial')",
                            (session["session_id"],)).fetchone()[0]}

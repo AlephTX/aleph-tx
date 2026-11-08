@@ -1,12 +1,28 @@
 import { useState, type ReactNode } from 'react'
 import type { SummaryResp, Window } from '../types'
 import { bps, compactUsd, num, pct, price, signedUsd, size, tone, toneClass, usd } from '../format'
-import { Card } from './ui'
+import { sessionValuation, type QualityBadge } from '../valuation'
+import { Badge, Card } from './ui'
 
-function Stat({ label, value, sub, valueClass = '' }: { label: string; value: ReactNode; sub?: ReactNode; valueClass?: string }) {
+function Stat({
+  label,
+  value,
+  sub,
+  valueClass = '',
+  badge,
+}: {
+  label: string
+  value: ReactNode
+  sub?: ReactNode
+  valueClass?: string
+  badge?: QualityBadge | null
+}) {
   return (
     <div className="card min-w-0 px-4 py-3">
-      <div className="text-[11px] uppercase tracking-wider text-muted">{label}</div>
+      <div className="flex items-center justify-between gap-2 text-[11px] uppercase tracking-wider text-muted">
+        <span className="truncate">{label}</span>
+        {badge && <Badge tone={badge.tone}>{badge.label}</Badge>}
+      </div>
       <div className={`num mt-1 truncate text-xl font-semibold ${valueClass}`}>{value}</div>
       {sub && <div className="num mt-0.5 truncate text-xs text-muted">{sub}</div>}
     </div>
@@ -17,7 +33,9 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
   const s = summary?.session
   const snap = summary?.snapshot
   const position = snap?.exchange_position ?? s?.position
+  const valuation = sessionValuation(s)
   return (
+    <div className="space-y-2">
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
       <Stat
         label="账户权益"
@@ -28,6 +46,7 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         label="Lighter 会话盈亏"
         value={signedUsd(s?.total_pnl)}
         valueClass={toneClass[tone(s?.total_pnl)]}
+        badge={valuation?.lighter}
         sub={<>已实现 {signedUsd(s?.net_pnl)} · 浮动 {signedUsd(s?.unrealized)}</>}
       />
       {s?.hedge_account && (
@@ -35,6 +54,7 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
           label="组合盈亏（含对冲）"
           value={signedUsd(s?.combined_pnl)}
           valueClass={toneClass[tone(s?.combined_pnl)]}
+          badge={valuation?.combined}
           sub={<>对冲 {signedUsd(s?.hedge_total_pnl)} · {num(s?.hedge_fills, 0)} 笔 · 持仓 {size(s?.hedge_position)}</>}
         />
       )}
@@ -60,6 +80,10 @@ export function Headline({ summary }: { summary: SummaryResp | undefined }) {
         value={<>{num(snap?.active_orders ?? s?.open_orders, 0)}<span className="text-sm text-muted"> 单</span></>}
         sub={<>报价价差 {bps(snap?.spread_bps)}</>}
       />
+    </div>
+    {valuation && valuation.notes.length > 0 && (
+      <div className="text-xs text-muted">盈亏口径：{valuation.notes.join(' · ')}</div>
+    )}
     </div>
   )
 }

@@ -768,6 +768,7 @@ fn hedge_fill_record(
         price,
         price_source,
         fee: size * price * limits.taker_fee_bps / 10_000.0,
+        fee_source: "configured_rate",
         position_after: position_after.to_f64()?,
     })
 }

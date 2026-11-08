@@ -45,6 +45,8 @@ pub struct StrategySnapshot {
     pub pending_exposure: f64,
     pub worst_case_long: f64,
     pub worst_case_short: f64,
+    /// Latest strategy price sample used to mark positions; 0 when no valid
+    /// sample exists yet (never a placeholder).
     pub mid: f64,
     pub spread_bps: f64,
     pub adverse_selection: f64,
@@ -123,8 +125,11 @@ pub struct HedgeFillRecord {
     /// `fill` when the venue reported the average price, otherwise `limit`
     /// (the journaled worst-case IOC price, a conservative bound).
     pub price_source: &'static str,
-    /// Estimated taker fee from the configured fee rate.
+    /// Taker fee. Hyperliquid's IOC response does not report the charged
+    /// fee, so this is `size * price * configured rate`.
     pub fee: f64,
+    /// Always `configured_rate` today: an estimate, not the venue charge.
+    pub fee_source: &'static str,
     pub position_after: f64,
 }
 
@@ -345,6 +350,7 @@ mod tests {
             price: 2501.0,
             price_source: "fill",
             fee: 0.0225,
+            fee_source: "configured_rate",
             position_after: 0.02,
         });
         sink.stopped().await.unwrap();
@@ -363,8 +369,88 @@ mod tests {
         assert_eq!(lines[3]["venue"], "hyperliquid");
         assert_eq!(lines[3]["side"], "buy");
         assert_eq!(lines[3]["price_source"], "fill");
+        assert_eq!(lines[3]["fee_source"], "configured_rate");
         assert_eq!(lines[4]["type"], "stopped");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The cost fixture ingested by deploy/oasis/test_telemetry_store.py is
+    /// produced by this writer, so both sides share one record format. Set
+    /// ALEPH_WRITE_COST_FIXTURE=1 to regenerate it after a format change.
+    #[tokio::test]
+    async fn cost_fixture_matches_the_writer() {
+        let dir = std::env::temp_dir().join(format!("aleph-cost-{}", uuid::Uuid::new_v4()));
+        let mut info = session("cost");
+        info.hedge_account = Some("0x00000000000000000000000000000000000000aa".into());
+        let sink = TelemetrySink::open(&dir, &info).unwrap();
+        // Lighter buys 0.1 @ 2000 and sells it @ 2010 (maker rebate).
+        for (seq, is_ask, price, trade) in [(1, false, 2000.0, 11), (2, true, 2010.0, 12)] {
+            sink.order_event(&ShmPrivateEventV2::order_filled(
+                seq,
+                2,
+                1,
+                50 + seq,
+                100 + seq as i64,
+                7,
+                price,
+                0.1,
+                0.0,
+                -0.002,
+                is_ask,
+                0,
+                trade,
+            ));
+        }
+        // Hedge: sell 0.1 with a reported fill price, buy back at the IOC
+        // limit bound, then open 0.05 that stays unmarked.
+        for (cloid, side, price, source, size, after) in [
+            ("0x01", "sell", 2001.0, "fill", 0.1, -0.1),
+            ("0x02", "buy", 2012.0, "limit", 0.1, 0.0),
+            ("0x03", "sell", 2009.0, "fill", 0.05, -0.05),
+        ] {
+            sink.hedge_fill(HedgeFillRecord {
+                venue: "hyperliquid",
+                client_order_id: cloid.into(),
+                side,
+                size,
+                price,
+                price_source: source,
+                fee: size * price * 4.5 / 10_000.0,
+                fee_source: "configured_rate",
+                position_after: after,
+            });
+        }
+        // No valid price sample yet: exported mid is 0, not a placeholder.
+        sink.snapshot(StrategySnapshot {
+            equity: 1000.0,
+            session_start_equity: 1000.0,
+            ..Default::default()
+        });
+        sink.stopped().await.unwrap();
+        let produced = std::fs::read_to_string(dir.join("cost.jsonl")).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        // Timestamps differ per run; compare everything else.
+        let normalize = |text: &str| -> Vec<serde_json::Value> {
+            text.lines()
+                .map(|line| {
+                    let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    value["ts_ms"] = 0.into();
+                    value
+                })
+                .collect()
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/oasis/fixtures/cost_session.jsonl");
+        if std::env::var_os("ALEPH_WRITE_COST_FIXTURE").is_some() {
+            let lines: Vec<String> = normalize(&produced)
+                .iter()
+                .map(|value| serde_json::to_string(value).unwrap())
+                .collect();
+            std::fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+            std::fs::write(&fixture, lines.join("\n") + "\n").unwrap();
+        }
+        let expected = std::fs::read_to_string(&fixture).expect("cost fixture missing");
+        assert_eq!(normalize(&produced), normalize(&expected));
     }
 
     #[tokio::test]
