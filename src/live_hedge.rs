@@ -156,6 +156,10 @@ impl PendingIoc {
 
 // ─── Reconciliation contract shared with the offline journal audit ──────
 
+/// A lookup status may predate the local intent time by this much: the
+/// intent is stamped before fsync and signing, on an unsynchronized clock.
+pub(crate) const LOOKUP_SKEW_MS: u64 = 1_000;
+
 /// Identity of a journaled IOC that a venue lookup must reproduce.
 pub(crate) struct IocIdentity<'a> {
     pub cloid: &'a str,
@@ -192,7 +196,7 @@ pub(crate) fn classify_lookup(
                 .as_deref()
                 .and_then(|size| size.parse::<Decimal>().ok())
                 == Some(intent.size)
-            && located.status_timestamp >= intent.sent_at_ms.saturating_sub(1_000),
+            && located.status_timestamp >= intent.sent_at_ms.saturating_sub(LOOKUP_SKEW_MS),
         "Hyperliquid lookup disagrees with the journaled IOC"
     );
     let remaining = order.sz.parse::<Decimal>()?;

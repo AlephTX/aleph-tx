@@ -95,7 +95,10 @@ the strategy's normal shorter cancellation timer.
   `pending` or `invalid`, with line numbers, the possible hedge position
   range and the evidence still needed. Exit code 0 means every journaled IOC
   is explained, 2 means some remain unresolved and 3 means the journal or
-  evidence is inconsistent. The report never permits restart. It does not
+  evidence is inconsistent, including a session start without a session
+  ID, a positive Lighter account index or a symbol, v1 terminal timing that
+  the live writer could not have produced, or a position range outside the
+  decimal range (reported as null). The report never permits restart. It does not
   cover Lighter orders or inventory, and it never changes the active journal.
 - For a `pending` IOC, capture the raw Hyperliquid `orderStatus` response
   for its `cloid` and a later `clearinghouseState` response. Put them in an

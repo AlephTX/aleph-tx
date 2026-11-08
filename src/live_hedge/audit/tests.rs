@@ -103,9 +103,9 @@ fn intent_without_terminal_keeps_the_full_ioc_as_possible_exposure() {
     // A sell of up to 0.01 from flat: anywhere in [-0.01, 0].
     assert_eq!(
         (order.possible_position_min, order.possible_position_max),
-        (d("-0.01"), d("0"))
+        (Some(d("-0.01")), Some(d("0")))
     );
-    assert_eq!(report.hedge_position.possible_min, d("-0.01"));
+    assert_eq!(report.hedge_position.possible_min, Some(d("-0.01")));
     assert_eq!(report.journal.session_cleanup, "unverified");
     assert!(kinds(&report).contains(&"primary_leg_unverified"));
 }
@@ -178,8 +178,8 @@ fn evidence_releases_an_ioc_only_with_a_terminal_and_a_later_matching_account() 
         (order.filled, order.position_after),
         (Some(d("0.004")), Some(d("-0.004")))
     );
-    assert_eq!(report.hedge_position.possible_min, d("-0.004"));
-    assert_eq!(report.hedge_position.possible_max, d("-0.004"));
+    assert_eq!(report.hedge_position.possible_min, Some(d("-0.004")));
+    assert_eq!(report.hedge_position.possible_max, Some(d("-0.004")));
     // Later snapshot still at the planned position: account not caught up.
     assert_eq!(
         step(
@@ -533,4 +533,215 @@ fn file_audit_is_deterministic_and_leaves_inputs_unchanged() {
     .unwrap();
     assert!(audit_files(&journal_path, Some(&evidence_path)).is_err());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn with_terminal(edit: impl FnOnce(&mut TerminalRecord)) -> JournalRecord {
+    let JournalRecord::Terminal(mut t) = terminal(CLOID, "0.004", "-0.004") else {
+        unreachable!()
+    };
+    edit(&mut t);
+    JournalRecord::Terminal(t)
+}
+
+fn with_start(edit: impl FnOnce(&mut StartRecord)) -> JournalRecord {
+    let JournalRecord::Start(mut s) = start(Some(1)) else {
+        unreachable!()
+    };
+    edit(&mut s);
+    JournalRecord::Start(s)
+}
+
+fn recorded(records: &[JournalRecord]) -> AuditStatus {
+    audit(&journal(records), None).status
+}
+
+#[test]
+fn v1_terminal_timing_follows_its_source_and_legacy_stays_labelled() {
+    let ok = |t: JournalRecord| recorded(&[start(Some(1)), intent(CLOID, "0"), t]);
+    // Control: lookup at intent time, account later.
+    assert_eq!(ok(with_terminal(|_| {})), AuditStatus::JournalRecorded);
+    // Lookup: live accepts a status up to LOOKUP_SKEW_MS before the intent.
+    let late = |terminal_at: u64| {
+        let JournalRecord::Intent(mut i) = intent(CLOID, "0") else {
+            unreachable!()
+        };
+        i.submitted_at_ms = 5_000;
+        recorded(&[
+            start(Some(1)),
+            JournalRecord::Intent(i),
+            with_terminal(|t| {
+                t.terminal_at_ms = Some(terminal_at);
+                t.account_time_ms = Some(9_000);
+            }),
+        ])
+    };
+    assert_eq!(late(5_000 - LOOKUP_SKEW_MS), AuditStatus::JournalRecorded);
+    assert_eq!(late(5_000 - LOOKUP_SKEW_MS - 1), AuditStatus::Invalid);
+    // The reviewed counterexample: terminal at 1 ms for an intent at 5 s.
+    assert_eq!(late(1), AuditStatus::Invalid);
+    // Response: live stamps the local intent time, nothing else.
+    let response = |at: u64| {
+        ok(with_terminal(|t| {
+            t.terminal_source = Some("response".into());
+            t.terminal_at_ms = Some(at);
+            t.account_time_ms = Some(1_600);
+        }))
+    };
+    assert_eq!(response(1_000), AuditStatus::JournalRecorded);
+    assert_eq!(response(999), AuditStatus::Invalid);
+    assert_eq!(response(1_001), AuditStatus::Invalid);
+    // Account confirmation at the terminal time is allowed; earlier is not.
+    assert_eq!(
+        ok(with_terminal(|t| t.account_time_ms = Some(1_500))),
+        AuditStatus::JournalRecorded
+    );
+    assert_eq!(
+        ok(with_terminal(|t| t.account_time_ms = Some(1_499))),
+        AuditStatus::Invalid
+    );
+    // Each production-written v1 field is required.
+    for edit in [
+        (|t: &mut TerminalRecord| t.terminal_source = None) as fn(&mut TerminalRecord),
+        |t| t.terminal_at_ms = None,
+        |t| t.account_time_ms = None,
+        |t| t.terminal_source = Some("venue".into()),
+    ] {
+        let report = audit(
+            &journal(&[start(Some(1)), intent(CLOID, "0"), with_terminal(edit)]),
+            None,
+        );
+        assert_eq!(report.status, AuditStatus::Invalid);
+        assert_eq!(report.status.exit_code(), 3);
+        assert!(kinds(&report).contains(&"invalid_terminal"));
+    }
+    // Legacy: no times is honest legacy; partial fields are still checked.
+    let legacy = |t: JournalRecord| recorded(&[start(None), intent(CLOID, "0"), t]);
+    let bare = |t: &mut TerminalRecord| {
+        t.terminal_source = None;
+        t.terminal_at_ms = None;
+        t.account_time_ms = None;
+    };
+    assert_eq!(legacy(with_terminal(bare)), AuditStatus::JournalRecorded);
+    assert_eq!(
+        legacy(with_terminal(|t| {
+            bare(t);
+            t.account_time_ms = Some(5);
+        })),
+        AuditStatus::Invalid
+    );
+    // Fields a legacy record does carry must still be consistent.
+    assert_eq!(
+        legacy(with_terminal(|t| t.terminal_at_ms = Some(1_700))),
+        AuditStatus::Invalid
+    );
+}
+
+#[test]
+fn session_identity_must_match_what_the_supervised_writer_emits() {
+    let run =
+        |s: JournalRecord| recorded(&[s, intent(CLOID, "0"), terminal(CLOID, "0.004", "-0.004")]);
+    assert_eq!(run(with_start(|_| {})), AuditStatus::JournalRecorded);
+    // Legacy session ids need not be UUIDs.
+    assert_eq!(
+        run(with_start(|s| s.session_id = "pre-uuid-session".into())),
+        AuditStatus::JournalRecorded
+    );
+    assert_eq!(
+        run(with_start(|s| s.lighter_account_index = 1)),
+        AuditStatus::JournalRecorded
+    );
+    for (name, edit) in [
+        (
+            "empty session",
+            (|s: &mut StartRecord| s.session_id = String::new()) as fn(&mut StartRecord),
+        ),
+        ("blank session", |s| s.session_id = "  ".into()),
+        ("zero account", |s| s.lighter_account_index = 0),
+        ("negative account", |s| s.lighter_account_index = -1),
+        ("empty symbol", |s| s.symbol = String::new()),
+        ("network", |s| s.network = "Devnet".into()),
+        ("hl account", |s| s.hyperliquid_account = Some("0x1".into())),
+        ("no hl account", |s| s.hyperliquid_account = None),
+    ] {
+        let report = audit(
+            &journal(&[
+                with_start(edit),
+                intent(CLOID, "0"),
+                terminal(CLOID, "0.004", "-0.004"),
+            ]),
+            None,
+        );
+        assert_eq!(report.status, AuditStatus::Invalid, "{name}");
+    }
+    // A session without IOCs needs no Hyperliquid account.
+    assert_eq!(
+        recorded(&[with_start(|s| s.hyperliquid_account = None)]),
+        AuditStatus::JournalRecorded
+    );
+}
+
+#[test]
+fn unrepresentable_position_ranges_are_rejected_without_panicking() {
+    let max = Decimal::MAX.to_string();
+    let edit_intent = |cloid: &str, is_buy: bool, before: &str, size: &str| {
+        let JournalRecord::Intent(mut i) = intent(cloid, before) else {
+            unreachable!()
+        };
+        i.is_buy = is_buy;
+        i.size = d(size);
+        i.limit_price = if is_buy { d("2002") } else { d("1998") };
+        JournalRecord::Intent(i)
+    };
+    let fill = |cloid: &str, filled: &str, position: &str| {
+        JournalRecord::Terminal(TerminalRecord {
+            average_price: Some(d("2000")),
+            ..match terminal(cloid, filled, position) {
+                JournalRecord::Terminal(t) => t,
+                _ => unreachable!(),
+            }
+        })
+    };
+    let neg_max = format!("-{max}");
+    // Recorded to ±MAX, then an unknown IOC that would push past it.
+    for (is_buy, edge) in [(true, max.as_str()), (false, neg_max.as_str())] {
+        let records = [
+            start(Some(1)),
+            edit_intent(CLOID, is_buy, "0", &max),
+            fill(CLOID, &max, edge),
+            edit_intent(OTHER, is_buy, edge, "1"),
+        ];
+        let report = audit(&journal(&records), None);
+        assert_eq!(
+            report.orders[0].status,
+            OrderStatus::Recorded,
+            "edge reachable"
+        );
+        assert_eq!(report.orders[0].possible_position_max, Some(d(edge)));
+        let open = &report.orders[1];
+        assert_eq!(open.status, OrderStatus::Invalid);
+        assert_eq!(
+            (open.possible_position_min, open.possible_position_max),
+            (None, None)
+        );
+        assert!(open.reasons.iter().any(|r| r.contains("representable")));
+        assert_eq!(report.status, AuditStatus::Invalid);
+        assert_eq!(
+            (
+                report.hedge_position.possible_min,
+                report.hedge_position.possible_max
+            ),
+            (None, None)
+        );
+        assert!(serde_json::to_string(&report).is_ok());
+        // Same edge, reducing direction: representable and still pending.
+        let reducing = [
+            start(Some(1)),
+            edit_intent(CLOID, is_buy, "0", &max),
+            fill(CLOID, &max, edge),
+            edit_intent(OTHER, !is_buy, edge, "1"),
+        ];
+        let report = audit(&journal(&reducing), None);
+        assert_eq!(report.orders[1].status, OrderStatus::Pending);
+        assert!(report.orders[1].possible_position_min.is_some());
+    }
 }

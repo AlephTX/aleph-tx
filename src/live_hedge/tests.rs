@@ -179,7 +179,8 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
             &JournalRecord::Start(journal::StartRecord {
                 session_id: "loopback".into(),
                 network: "Testnet".into(),
-                lighter_account_index: 0,
+                // LighterCredentials only accepts positive account indices.
+                lighter_account_index: 1,
                 hyperliquid_account: Some(hedge_account.clone()),
                 symbol: "ETH".into(),
                 journal_schema: Some(journal::JOURNAL_SCHEMA),
@@ -336,8 +337,8 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         (unresolved.as_str(), audit::OrderStatus::Pending)
     );
     assert_eq!(open.before_position, d("-0.007"));
-    assert_eq!(open.possible_position_max, d("-0.007"));
-    assert_eq!(open.possible_position_min, d("-0.007") - open.size);
+    assert_eq!(open.possible_position_max, Some(d("-0.007")));
+    assert_eq!(open.possible_position_min, Some(d("-0.007") - open.size));
     // Frozen venue evidence in the raw wire format, as an operator captures it.
     let (size, limit) = (open.size, open.limit_price);
     let now = unix_ms().unwrap();

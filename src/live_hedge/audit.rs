@@ -18,8 +18,8 @@ use super::journal::{
     IntentRecord, JOURNAL_SCHEMA, JournalRecord, ParseError, StartRecord, TerminalRecord,
 };
 use super::{
-    CLOCK_TOLERANCE_MS, IocIdentity, LookupOutcome, account_confirmed_fill, classify_lookup,
-    dedicated_position,
+    CLOCK_TOLERANCE_MS, IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill,
+    classify_lookup, dedicated_position,
 };
 use crate::exchanges::hyperliquid::{AccountState, OrderLookup, validate_hex};
 use anyhow::{Context, Result};
@@ -140,11 +140,12 @@ pub struct OrderReport {
     pub filled: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str_option")]
     pub position_after: Option<Decimal>,
-    /// Bounds on the Hyperliquid position this IOC can have produced.
-    #[serde(with = "rust_decimal::serde::str")]
-    pub possible_position_min: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub possible_position_max: Decimal,
+    /// Bounds on the Hyperliquid position this IOC can have produced;
+    /// null when the bound is not representable (the order is then invalid).
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub possible_position_min: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub possible_position_max: Option<Decimal>,
     pub reasons: Vec<String>,
 }
 
@@ -175,10 +176,11 @@ pub struct PositionSummary {
     /// Last position confirmed by a consistent journaled terminal.
     #[serde(with = "rust_decimal::serde::str")]
     pub journal_confirmed: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub possible_min: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub possible_max: Decimal,
+    /// Null when an order's bound is not representable.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub possible_min: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub possible_max: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str_option")]
     pub snapshot: Option<Decimal>,
 }
@@ -330,13 +332,27 @@ impl State {
                 "unknown"
             }
         };
+        // Identity the supervised writer always emits (session.rs); a legacy
+        // session_id is only required to be present, not a UUID.
+        let mut invalid = Vec::new();
         if !matches!(start.network.as_str(), "Mainnet" | "Testnet") {
-            self.issue(
-                Some(line),
-                Severity::Invalid,
-                "invalid_start",
-                format!("unknown network `{}`", start.network),
-            );
+            invalid.push(format!("unknown network `{}`", start.network));
+        }
+        if start.session_id.trim().is_empty() {
+            invalid.push("empty session_id".into());
+        }
+        if start.lighter_account_index <= 0 {
+            // LighterCredentials rejects non-positive account indices.
+            invalid.push(format!(
+                "lighter_account_index {} is not a valid Lighter account",
+                start.lighter_account_index
+            ));
+        }
+        if start.symbol.trim().is_empty() {
+            invalid.push("empty symbol".into());
+        }
+        for reason in invalid {
+            self.issue(Some(line), Severity::Invalid, "invalid_start", reason);
         }
         if let Some(account) = &start.hyperliquid_account
             && validate_hex(account, 20).is_err()
@@ -494,22 +510,7 @@ impl State {
                 ));
             }
         }
-        match (terminal.terminal_at_ms, terminal.account_time_ms) {
-            (Some(at), Some(account)) if account < at => {
-                invalid.push(format!(
-                    "account time {account} precedes terminal time {at}"
-                ));
-            }
-            (None, _) | (_, None) if self.schema == "v1" => {
-                invalid.push("v1 terminal lacks terminal_at_ms or account_time_ms".into());
-            }
-            _ => {}
-        }
-        if let Some(source) = terminal.terminal_source.as_deref()
-            && !matches!(source, "response" | "lookup")
-        {
-            invalid.push(format!("unknown terminal_source `{source}`"));
-        }
+        invalid.extend(terminal_time_contract(self.schema, intent, &terminal));
         for reason in &invalid {
             self.issue(
                 Some(line),
@@ -549,6 +550,69 @@ impl State {
         }
         self.verified_flat = Some(line);
     }
+}
+
+/// Version- and source-specific timing of a journaled terminal, mirroring
+/// what the live writer can produce:
+/// - `response`: the synchronous order reply carries no venue time; live
+///   stamps the terminal with the intent's local `submitted_at_ms`.
+/// - `lookup`: venue status time, accepted live when no earlier than
+///   `submitted_at_ms - LOOKUP_SKEW_MS`.
+///
+/// In both cases the confirming account time is at or after the terminal.
+/// v1 must carry all three fields; legacy may carry none and is reported as
+/// unproven timing elsewhere, but fields it does carry are still checked.
+fn terminal_time_contract(
+    schema: &str,
+    intent: &IntentRecord,
+    terminal: &TerminalRecord,
+) -> Vec<String> {
+    let mut invalid = Vec::new();
+    let fields = (
+        terminal.terminal_source.as_deref(),
+        terminal.terminal_at_ms,
+        terminal.account_time_ms,
+    );
+    if schema == "v1" {
+        for (name, missing) in [
+            ("terminal_source", fields.0.is_none()),
+            ("terminal_at_ms", fields.1.is_none()),
+            ("account_time_ms", fields.2.is_none()),
+        ] {
+            if missing {
+                invalid.push(format!("v1 terminal lacks {name}"));
+            }
+        }
+    }
+    match (fields.0, fields.1) {
+        (Some("response"), Some(at)) if at != intent.submitted_at_ms => invalid.push(format!(
+            "response terminal time {at} is not the intent time {}",
+            intent.submitted_at_ms
+        )),
+        (Some("lookup"), Some(at))
+            if at < intent.submitted_at_ms.saturating_sub(LOOKUP_SKEW_MS) =>
+        {
+            invalid.push(format!(
+                "lookup terminal time {at} is more than {LOOKUP_SKEW_MS} ms before the intent time {}",
+                intent.submitted_at_ms
+            ))
+        }
+        (Some("response" | "lookup"), _) => {}
+        (Some(source), _) => invalid.push(format!("unknown terminal_source `{source}`")),
+        (None, Some(_)) => invalid.push("terminal_at_ms without terminal_source".into()),
+        (None, None) => {}
+    }
+    if let (Some(at), Some(account)) = (fields.1, fields.2)
+        && account < at
+    {
+        invalid.push(format!(
+            "account time {account} precedes terminal time {at}"
+        ));
+    }
+    if fields.2.is_some() && fields.1.is_none() {
+        invalid.push("account_time_ms without terminal_at_ms".into());
+    }
+    invalid
 }
 
 // ─── Frozen evidence ─────────────────────────────────────────────────────
@@ -721,8 +785,8 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
     let mut orders = Vec::with_capacity(state.iocs.len());
     let mut position = PositionSummary {
         journal_confirmed: state.confirmed,
-        possible_min: state.confirmed,
-        possible_max: state.confirmed,
+        possible_min: Some(state.confirmed),
+        possible_max: Some(state.confirmed),
         snapshot: snapshot.as_ref().map(|s| s.position),
     };
     for (index, ioc) in state.iocs.iter().enumerate() {
@@ -737,7 +801,9 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
             view,
             snapshot.as_ref().filter(|_| Some(index) == last_index),
         );
-        if order.status == OrderStatus::Pending || order.status == OrderStatus::Matched {
+        let unbounded = order.possible_position_min.is_none();
+        if unbounded || order.status == OrderStatus::Pending || order.status == OrderStatus::Matched
+        {
             position.possible_min = order.possible_position_min;
             position.possible_max = order.possible_position_max;
         }
@@ -917,11 +983,12 @@ fn check_snapshot_against_journal(state: &mut State, snapshot: &Snapshot) {
     }
 }
 
-fn signed(is_buy: bool, before: Decimal, filled: Decimal) -> Decimal {
+/// Position after `filled` from `before`; None when not representable.
+fn signed(is_buy: bool, before: Decimal, filled: Decimal) -> Option<Decimal> {
     if is_buy {
-        before + filled
+        before.checked_add(filled)
     } else {
-        before - filled
+        before.checked_sub(filled)
     }
 }
 
@@ -931,18 +998,27 @@ fn order_report(
     snapshot: Option<&Snapshot>,
 ) -> OrderReport {
     let intent = &ioc.intent;
-    let range = |filled: Option<Decimal>| match filled {
-        Some(f) => (
-            signed(intent.is_buy, intent.hedge_position, f),
-            signed(intent.is_buy, intent.hedge_position, f),
-        ),
-        None => {
-            let full = signed(intent.is_buy, intent.hedge_position, intent.size);
-            (
-                intent.hedge_position.min(full),
-                intent.hedge_position.max(full),
-            )
-        }
+    // Known fill: a point. Unknown: anywhere between no fill and full size.
+    let range = |filled: Option<Decimal>| -> Option<(Decimal, Decimal)> {
+        let end = signed(
+            intent.is_buy,
+            intent.hedge_position,
+            filled.unwrap_or(intent.size),
+        )?;
+        let start = if filled.is_some() {
+            end
+        } else {
+            intent.hedge_position
+        };
+        Some((start.min(end), start.max(end)))
+    };
+    let overflow = || {
+        format!(
+            "position range from {} {} {} exceeds the representable decimal range",
+            intent.hedge_position,
+            if intent.is_buy { "+" } else { "-" },
+            intent.size
+        )
     };
     let mut reasons = ioc.invalid.clone();
     let mut report = OrderReport {
@@ -960,8 +1036,8 @@ fn order_report(
         evidence: "none",
         filled: None,
         position_after: None,
-        possible_position_min: Decimal::ZERO,
-        possible_position_max: Decimal::ZERO,
+        possible_position_min: None,
+        possible_position_max: None,
         reasons: Vec::new(),
     };
     let view = match view {
@@ -995,12 +1071,17 @@ fn order_report(
             report.evidence = "conflict";
             reasons.push("journal records a terminal but the venue shows the IOC open".into());
         }
+        let bounds = range(Some(terminal.filled));
+        if bounds.is_none() {
+            reasons.push(overflow());
+        }
         report.status = if reasons.is_empty() {
             OrderStatus::Recorded
         } else {
             OrderStatus::Invalid
         };
-        (report.possible_position_min, report.possible_position_max) = range(Some(terminal.filled));
+        report.possible_position_min = bounds.map(|b| b.0);
+        report.possible_position_max = bounds.map(|b| b.1);
         report.reasons = reasons;
         return report;
     }
@@ -1066,7 +1147,15 @@ fn order_report(
             },
         },
     }
-    let invalid = !ioc.invalid.is_empty() || report.evidence == "conflict";
+    let bounds = range(if report.evidence == "matched" {
+        report.filled
+    } else {
+        None
+    });
+    if bounds.is_none() {
+        reasons.push(overflow());
+    }
+    let invalid = !ioc.invalid.is_empty() || report.evidence == "conflict" || bounds.is_none();
     report.status = if invalid {
         OrderStatus::Invalid
     } else if report.evidence == "matched" {
@@ -1074,12 +1163,8 @@ fn order_report(
     } else {
         OrderStatus::Pending
     };
-    (report.possible_position_min, report.possible_position_max) =
-        range(if report.status == OrderStatus::Matched {
-            report.filled
-        } else {
-            None
-        });
+    report.possible_position_min = bounds.map(|b| b.0);
+    report.possible_position_max = bounds.map(|b| b.1);
     report.reasons = reasons;
     report
 }
