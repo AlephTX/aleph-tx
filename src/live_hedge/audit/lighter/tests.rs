@@ -540,7 +540,10 @@ fn bad_batch_records_never_count_as_recorded() {
     let torn = audit(&bytes, None);
     assert!(kinds(&torn).contains(&"truncated_tail"));
     assert!(torn.primary_leg.journal_order_ids.is_empty());
-    assert_eq!(torn.primary_leg.status, "not_provided");
+    // The tail may have been a batch record: a prefix, never complete.
+    assert_eq!(torn.primary_leg.status, "unresolved");
+    assert_eq!(torn.primary_leg.journal_coverage, "prefix");
+    assert_eq!(torn.primary_leg.journal_gaps, [2]);
     // Unknown fields in a batch record are a parse error, not ignored.
     let mut value: Value = serde_json::from_slice(&batch(&[11]).to_line().unwrap()).unwrap();
     value["acked"] = json!(true);
@@ -548,4 +551,166 @@ fn bad_batch_records_never_count_as_recorded() {
     tampered.extend(serde_json::to_vec(&value).unwrap());
     tampered.push(b'\n');
     assert_eq!(audit(&tampered, None).status, AuditStatus::Invalid);
+}
+
+fn batch_counts(ids: &[i64], cancels: usize) -> JournalRecord {
+    let JournalRecord::LighterBatch(mut record) = batch(ids) else {
+        unreachable!()
+    };
+    record.cancels = cancels;
+    JournalRecord::LighterBatch(record)
+}
+
+/// The action count is checked arithmetic: 50 is accepted, 51 and any
+/// wrapping count are rejected in every build, and a rejected batch
+/// contributes no ID and leaves a prefix.
+#[test]
+fn batch_action_count_is_checked_and_never_wraps() {
+    let evidence = || {
+        Some(lighter(
+            json!([101]),
+            vec![order(101, "canceled", "0", 0)],
+            Some(account(80, None)),
+        ))
+    };
+    let ok = run(&[v3_start(), batch_counts(&[101], 49)], evidence());
+    assert_eq!(ok.status, AuditStatus::JournalRecorded, "{:?}", ok.issues);
+    assert_eq!(ok.primary_leg.journal_order_ids, [101]);
+    assert_eq!(
+        (ok.primary_leg.status, ok.primary_leg.journal_coverage),
+        ("explained", "complete")
+    );
+    assert_eq!(ok.status.exit_code(), 0);
+    let fifty: Vec<i64> = (1..=50).collect();
+    let full = audit(&journal(&[v3_start(), batch_counts(&fifty, 0)]), None);
+    assert_eq!(full.primary_leg.journal_order_ids.len(), 50);
+    assert!(!kinds(&full).contains(&"invalid_lighter_batch"));
+    for cancels in [50, usize::MAX, usize::MAX - 1] {
+        let report = run(&[v3_start(), batch_counts(&[101], cancels)], evidence());
+        assert_eq!(report.status, AuditStatus::Invalid, "{cancels}");
+        assert_eq!(report.status.exit_code(), 3);
+        assert!(kinds(&report).contains(&"invalid_lighter_batch"));
+        assert!(report.primary_leg.journal_order_ids.is_empty(), "{cancels}");
+        assert_eq!(report.primary_leg.status, "invalid", "{cancels}");
+        assert_eq!(report.primary_leg.journal_coverage, "prefix");
+        assert_eq!(report.primary_leg.journal_gaps, [2]);
+        assert_eq!(report.primary_leg.residual, "unproven");
+        // The declared order is still diagnosed, as caller_only.
+        assert_eq!(report.primary_leg.orders[0].source, "caller_only");
+        assert_eq!(report.primary_leg.orders[0].state, "terminal");
+    }
+}
+
+/// A good batch followed by a rejected, unreadable or torn line: the good
+/// batch is still diagnosed, the account fields stay visible, but the
+/// primary leg is never explained or proven flat.
+#[test]
+fn a_damaged_journal_reports_a_prefix_never_a_complete_leg() {
+    let JournalRecord::LighterBatch(mut foreign) = batch(&[102]) else {
+        unreachable!()
+    };
+    foreign.lighter_account_index = 8;
+    let good = batch(&[101]);
+    let torn = {
+        let line = batch(&[102]).to_line().unwrap();
+        line[..line.len() - 1].to_vec()
+    };
+    let half_json = b"{\"event\":\"lighter_create_batch\",\"client_ord".to_vec();
+    let cases: Vec<(&str, Vec<u8>, &str, AuditStatus)> = vec![
+        (
+            "duplicate",
+            journal(&[v3_start(), good.clone(), batch(&[101])]),
+            "invalid",
+            AuditStatus::Invalid,
+        ),
+        (
+            "foreign",
+            journal(&[
+                v3_start(),
+                good.clone(),
+                JournalRecord::LighterBatch(foreign),
+            ]),
+            "invalid",
+            AuditStatus::Invalid,
+        ),
+        (
+            "torn",
+            [journal(&[v3_start(), good.clone()]), torn].concat(),
+            "unresolved",
+            AuditStatus::Unresolved,
+        ),
+        (
+            "half json",
+            [journal(&[v3_start(), good.clone()]), half_json.clone()].concat(),
+            "unresolved",
+            AuditStatus::Unresolved,
+        ),
+        (
+            "half json line",
+            [
+                journal(&[v3_start(), good.clone()]),
+                half_json,
+                b"\n".to_vec(),
+            ]
+            .concat(),
+            "invalid",
+            AuditStatus::Invalid,
+        ),
+    ];
+    for (name, bytes, leg, overall) in cases {
+        let evidence: super::super::Evidence = serde_json::from_value(json!({
+            "network": "Testnet", "hyperliquid_account": HL, "coin": "ETH",
+            "lighter": lighter(json!([101]), vec![order(101, "filled", "0.01", 40)], Some(account(41, None)))}))
+        .unwrap();
+        for with_evidence in [true, false] {
+            let report = audit(&bytes, with_evidence.then_some(&evidence));
+            let leg_report = &report.primary_leg;
+            assert_eq!(
+                report.status, overall,
+                "{name} {with_evidence}: {:?}",
+                report.issues
+            );
+            assert_eq!(leg_report.journal_coverage, "prefix", "{name}");
+            assert_eq!(leg_report.journal_gaps, [3], "{name}");
+            assert_eq!(leg_report.journal_order_ids, [101], "{name}");
+            assert_ne!(leg_report.status, "explained", "{name}");
+            assert_eq!(leg_report.residual, "unproven", "{name}");
+            assert!(kinds(&report).contains(&"lighter_journal_prefix"), "{name}");
+            assert!(!report.restart_permitted);
+            if with_evidence {
+                assert_eq!(leg_report.status, leg, "{name}");
+                // Per-order diagnosis and the raw sample stay visible.
+                assert_eq!(leg_report.orders[0].state, "terminal", "{name}");
+                assert_eq!(leg_report.watermark, "prefix_covered", "{name}");
+                assert_eq!(leg_report.position, Some(Decimal::ZERO), "{name}");
+            } else {
+                assert_ne!(leg_report.status, "not_provided", "{name}");
+            }
+        }
+    }
+}
+
+/// Without batch records (v1, v2) coverage is `not_recorded`, and a
+/// damaged older journal does not invent a Lighter prefix.
+#[test]
+fn older_schemas_never_claim_batch_coverage() {
+    let evidence = || {
+        Some(lighter(
+            json!([11]),
+            vec![order(11, "canceled", "0", 0)],
+            Some(account(41, None)),
+        ))
+    };
+    let v2 = run(&[start(2, Some(4095)), pending_intent()], evidence());
+    assert_eq!(v2.primary_leg.journal_coverage, "not_recorded");
+    assert_eq!(v2.primary_leg.status, "explained");
+    let mut torn = journal(&[start(2, Some(4095))]);
+    torn.extend_from_slice(b"{\"event\":\"hedge_int");
+    let torn_v2 = audit(&torn, None);
+    assert_eq!(torn_v2.primary_leg.journal_coverage, "not_recorded");
+    assert_eq!(torn_v2.primary_leg.status, "not_provided");
+    assert!(!kinds(&torn_v2).contains(&"lighter_journal_prefix"));
+    let v1 = run(&[start(1, None)], evidence());
+    assert_eq!(v1.primary_leg.journal_coverage, "not_recorded");
+    assert_eq!(v1.primary_leg.status, "missing_evidence");
 }

@@ -76,6 +76,13 @@ pub struct PrimaryLegReport {
     /// IDs from `lighter_create_batch` records: this process prepared to send
     /// them, not that the venue received them.
     pub journal_order_ids: Vec<i64>,
+    /// `complete` (schema 3, every line read and every batch accepted),
+    /// `prefix` (some line may hold creates that are not listed; the orders
+    /// and account fields describe that subset only) or `not_recorded`
+    /// (schema before 3: the journal holds no batch records).
+    pub journal_coverage: &'static str,
+    /// Journal lines behind a `prefix` coverage.
+    pub journal_gaps: Vec<usize>,
     pub account_index: Option<i64>,
     pub market_id: Option<i64>,
     pub orders: Vec<LighterOrderReport>,
@@ -83,14 +90,15 @@ pub struct PrimaryLegReport {
     /// terminal.
     pub required_watermark: Option<u64>,
     pub account_watermark: Option<u64>,
-    /// `covered`, `stale`, `unknown` (no account watermark),
+    /// `covered`, `prefix_covered` (covers only the listed orders of an
+    /// incomplete journal), `stale`, `unknown` (no account watermark),
     /// `orders_unresolved` or `no_account_sample`.
     pub watermark: &'static str,
     /// Signed position in the account sample, whether or not it counts.
     #[serde(with = "rust_decimal::serde::str_option")]
     pub position: Option<Decimal>,
-    /// `flat` or `nonzero` once the sample covers every declared fill;
-    /// otherwise `unproven`.
+    /// `flat` or `nonzero` once the sample covers every listed fill of a
+    /// complete set; otherwise `unproven`.
     pub residual: &'static str,
 }
 
@@ -128,6 +136,8 @@ impl PrimaryLegReport {
             status,
             scope: "caller_declared_order_ids",
             journal_order_ids: Vec::new(),
+            journal_coverage: "not_recorded",
+            journal_gaps: Vec::new(),
             account_index: None,
             market_id: None,
             orders: Vec::new(),
@@ -138,6 +148,46 @@ impl PrimaryLegReport {
             residual: "unproven",
         }
     }
+}
+
+/// A journal line that may have held creates the report does not list.
+pub(super) struct JournalGap {
+    pub line: usize,
+    /// `invalid_lighter_batch`, `malformed_line`, `unknown_event` or
+    /// `truncated_tail`.
+    pub kind: &'static str,
+}
+
+/// Fold journal completeness into the verdict. With any gap the journaled
+/// set is a prefix: the verdict is at best unresolved (invalid for a
+/// rejected or unreadable complete line), a covering sample covers only the
+/// listed orders, and no residual counts as proven. Per-order diagnostics
+/// and the raw account fields stay. Returns whether a gap is invalid.
+pub(super) fn apply_journal_gaps(
+    report: &mut PrimaryLegReport,
+    schema_records_batches: bool,
+    gaps: &[JournalGap],
+) -> bool {
+    report.journal_gaps = gaps.iter().map(|gap| gap.line).collect();
+    report.journal_coverage = match (gaps.is_empty(), schema_records_batches) {
+        (false, _) => "prefix",
+        (true, true) => "complete",
+        (true, false) => "not_recorded",
+    };
+    if gaps.is_empty() {
+        return false;
+    }
+    let invalid = gaps.iter().any(|gap| gap.kind != "truncated_tail");
+    report.status = match report.status {
+        _ if invalid => "invalid",
+        "explained" | "not_provided" => "unresolved",
+        other => other,
+    };
+    if report.watermark == "covered" {
+        report.watermark = "prefix_covered";
+    }
+    report.residual = "unproven";
+    invalid
 }
 
 /// Explain the orders and account sample against the session. `start` is

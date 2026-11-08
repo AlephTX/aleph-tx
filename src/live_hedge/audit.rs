@@ -287,6 +287,12 @@ struct State {
     /// Client order IDs from consistent `lighter_create_batch` records, with
     /// their journal line, in journal order.
     lighter_batches: Vec<(usize, i64)>,
+    /// Lines whose `lighter_create_batch` was rejected: its creates are not
+    /// journal evidence and the journaled set is incomplete.
+    lighter_batch_gaps: Vec<usize>,
+    /// Unreadable or torn lines: any of them may have been a batch record,
+    /// so the journaled set cannot be shown complete.
+    unreadable_lines: Vec<(usize, &'static str)>,
 }
 
 impl State {
@@ -310,6 +316,12 @@ impl State {
     }
 
     fn apply(&mut self, line: usize, record: JournalRecord) {
+        if matches!(record, JournalRecord::LighterBatch(_))
+            && (self.verified_flat.is_some() || self.start.is_none())
+        {
+            // Rejected below; its creates are not journal evidence.
+            self.lighter_batch_gaps.push(line);
+        }
         if let Some(flat) = self.verified_flat {
             self.issue(
                 Some(line),
@@ -698,8 +710,18 @@ impl State {
         if batch.client_order_ids.is_empty() {
             invalid.push("a create batch lists no client order ID".into());
         }
-        if batch.client_order_ids.len() + batch.cancels > 50 {
-            invalid.push("more actions than one Lighter batch carries".into());
+        // Journal-supplied counts: checked, so no build can wrap them.
+        if batch
+            .client_order_ids
+            .len()
+            .checked_add(batch.cancels)
+            .is_none_or(|actions| actions > MAX_BATCH_ACTIONS)
+        {
+            invalid.push(format!(
+                "{} creates and {} cancels exceed the {MAX_BATCH_ACTIONS}-action Lighter batch",
+                batch.client_order_ids.len(),
+                batch.cancels
+            ));
         }
         let mut seen = std::collections::BTreeSet::new();
         for &id in &batch.client_order_ids {
@@ -712,6 +734,8 @@ impl State {
         if invalid.is_empty() {
             self.lighter_batches
                 .extend(batch.client_order_ids.iter().map(|&id| (line, id)));
+        } else {
+            self.lighter_batch_gaps.push(line);
         }
         for reason in invalid {
             self.issue(
@@ -760,6 +784,9 @@ impl State {
 /// In both cases the confirming account time is at or after the terminal.
 /// v1 must carry all three fields; legacy may carry none and is reported as
 /// unproven timing elsewhere, but fields it does carry are still checked.
+/// Actions one Lighter `sendTxBatch` carries (`execute_batch` enforces it).
+const MAX_BATCH_ACTIONS: usize = 50;
+
 /// Schema 2 and later bind the Lighter account and market on `start` and a
 /// primary observation on every intent.
 fn binds_lighter(schema: &str) -> bool {
@@ -934,6 +961,8 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         confirmed: Decimal::ZERO,
         verified_flat: None,
         lighter_batches: Vec::new(),
+        lighter_batch_gaps: Vec::new(),
+        unreadable_lines: Vec::new(),
     };
     let lines = read_lines(journal, &mut state);
     if state.start.is_none() {
@@ -1021,6 +1050,20 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
     }
     // Lighter findings only add issues; Hyperliquid order results stay as is.
     let journaled = std::mem::take(&mut state.lighter_batches);
+    let gaps: Vec<lighter::JournalGap> = state
+        .lighter_batch_gaps
+        .iter()
+        .map(|&line| lighter::JournalGap {
+            line,
+            kind: "invalid_lighter_batch",
+        })
+        .chain(
+            state
+                .unreadable_lines
+                .iter()
+                .map(|&(line, kind)| lighter::JournalGap { line, kind }),
+        )
+        .collect();
     let primary_leg = match evidence.and_then(|(e, usable)| Some((e.lighter.as_ref()?, usable))) {
         None if journaled.is_empty() => PrimaryLegReport::not_provided(),
         None => {
@@ -1050,6 +1093,25 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
             report
         }
     };
+    let mut primary_leg = primary_leg;
+    // Only schema 3 records batches; older journals keep their verdict.
+    let v3 = state.schema == "v3";
+    let gaps = if v3 { gaps } else { Vec::new() };
+    if lighter::apply_journal_gaps(&mut primary_leg, v3, &gaps) {
+        // Rejected or unreadable lines already carry their own issue.
+        debug_assert!(state.issues.iter().any(|i| i.severity == Severity::Invalid));
+    }
+    if !gaps.is_empty() {
+        state.issue(
+            None,
+            Severity::Unresolved,
+            "lighter_journal_prefix",
+            format!(
+                "journal lines {:?} may hold Lighter creates not listed; primary_leg covers a prefix only",
+                primary_leg.journal_gaps
+            ),
+        );
+    }
 
     let worst = state.issues.iter().map(|i| i.severity).max();
     let status = if worst == Some(Severity::Invalid)
@@ -1131,27 +1193,29 @@ fn read_lines(journal: &[u8], state: &mut State) -> usize {
                 );
                 state.apply(count, JournalRecord::Intent(intent));
             }
-            (parsed, false) => state.issue(
-                Some(count),
-                Severity::Unresolved,
-                "truncated_tail",
-                match parsed {
-                    Ok(record) => format!(
-                        "`{}` lacks its newline; treated as not written",
-                        record.event()
-                    ),
-                    Err(error) => format!("partial final line ignored ({error})"),
-                },
-            ),
-            (Err(error), true) => state.issue(
-                Some(count),
-                Severity::Invalid,
-                match error {
+            (parsed, false) => {
+                state.unreadable_lines.push((count, "truncated_tail"));
+                state.issue(
+                    Some(count),
+                    Severity::Unresolved,
+                    "truncated_tail",
+                    match parsed {
+                        Ok(record) => format!(
+                            "`{}` lacks its newline; treated as not written",
+                            record.event()
+                        ),
+                        Err(error) => format!("partial final line ignored ({error})"),
+                    },
+                )
+            }
+            (Err(error), true) => {
+                let kind = match error {
                     ParseError::UnknownEvent(_) => "unknown_event",
                     _ => "malformed_line",
-                },
-                error.to_string(),
-            ),
+                };
+                state.unreadable_lines.push((count, kind));
+                state.issue(Some(count), Severity::Invalid, kind, error.to_string());
+            }
         }
     }
     count
