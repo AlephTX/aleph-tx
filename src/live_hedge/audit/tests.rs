@@ -1,0 +1,536 @@
+use super::*;
+use serde_json::json;
+use std::str::FromStr;
+
+const CLOID: &str = "0x0123456789abcdef0123456789abcdef";
+const OTHER: &str = "0xfedcba9876543210fedcba9876543210";
+const ACCOUNT: &str = "0x00000000000000000000000000000000000000aa";
+
+fn d(value: &str) -> Decimal {
+    Decimal::from_str(value).unwrap()
+}
+
+fn start(schema: Option<u32>) -> JournalRecord {
+    JournalRecord::Start(StartRecord {
+        session_id: "s-1".into(),
+        network: "Testnet".into(),
+        lighter_account_index: 7,
+        hyperliquid_account: Some(ACCOUNT.into()),
+        symbol: "ETH".into(),
+        journal_schema: schema,
+    })
+}
+
+/// Sell 0.01 ETH IOC planned against a flat hedge.
+fn intent(cloid: &str, before: &str) -> JournalRecord {
+    JournalRecord::Intent(IntentRecord {
+        cloid: cloid.into(),
+        coin: "ETH".into(),
+        submitted_at_ms: 1_000,
+        is_buy: false,
+        size: d("0.01"),
+        limit_price: d("1998"),
+        reduce_only: false,
+        primary_position: d("0.01"),
+        hedge_position: d(before),
+    })
+}
+
+fn terminal(cloid: &str, filled: &str, position: &str) -> JournalRecord {
+    JournalRecord::Terminal(TerminalRecord {
+        cloid: cloid.into(),
+        filled: d(filled),
+        average_price: Some(d("1999")),
+        position: d(position),
+        terminal_source: Some("lookup".into()),
+        terminal_at_ms: Some(1_500),
+        account_time_ms: Some(1_600),
+    })
+}
+
+fn journal(records: &[JournalRecord]) -> Vec<u8> {
+    records.iter().flat_map(|r| r.to_line().unwrap()).collect()
+}
+
+fn lookup_response(status: &str, remaining: &str, status_at: u64) -> serde_json::Value {
+    json!({"status": "order", "order": {"status": status, "statusTimestamp": status_at,
+        "order": {"coin": "ETH", "cloid": CLOID, "side": "A", "limitPx": "1998",
+            "origSz": "0.01", "sz": remaining, "oid": 8, "timestamp": 1_000}}})
+}
+
+fn lookup(response: serde_json::Value, observed_at_ms: u64) -> LookupEvidence {
+    LookupEvidence {
+        cloid: CLOID.into(),
+        observed_at_ms,
+        response,
+    }
+}
+
+fn snapshot(position: &str, time: u64) -> SnapshotEvidence {
+    SnapshotEvidence {
+        observed_at_ms: time + 10,
+        state: json!({"time": time, "withdrawable": "100",
+            "marginSummary": {"accountValue": "100", "totalNtlPos": "0", "totalMarginUsed": "0"},
+            "assetPositions": [{"position": {"coin": "ETH", "szi": position, "unrealizedPnl": "0"}}]}),
+    }
+}
+
+fn evidence(lookups: Vec<LookupEvidence>, account: Option<SnapshotEvidence>) -> Evidence {
+    Evidence {
+        network: "Testnet".into(),
+        hyperliquid_account: ACCOUNT.into(),
+        coin: "ETH".into(),
+        lookups,
+        account_snapshot: account,
+    }
+}
+
+fn kinds(report: &Report) -> Vec<&'static str> {
+    report.issues.iter().map(|i| i.kind).collect()
+}
+
+#[test]
+fn intent_without_terminal_keeps_the_full_ioc_as_possible_exposure() {
+    let report = audit(&journal(&[start(Some(1)), intent(CLOID, "0")]), None);
+    assert_eq!(report.status, AuditStatus::Unresolved);
+    assert!(!report.restart_permitted);
+    let order = &report.orders[0];
+    assert_eq!(
+        (order.status, order.journal, order.evidence),
+        (OrderStatus::Pending, "intent_only", "none")
+    );
+    assert_eq!(order.filled, None);
+    // A sell of up to 0.01 from flat: anywhere in [-0.01, 0].
+    assert_eq!(
+        (order.possible_position_min, order.possible_position_max),
+        (d("-0.01"), d("0"))
+    );
+    assert_eq!(report.hedge_position.possible_min, d("-0.01"));
+    assert_eq!(report.journal.session_cleanup, "unverified");
+    assert!(kinds(&report).contains(&"primary_leg_unverified"));
+}
+
+#[test]
+fn evidence_releases_an_ioc_only_with_a_terminal_and_a_later_matching_account() {
+    let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let terminal_lookup = lookup(lookup_response("canceled", "0.006", 1_500), 1_510);
+    let step = |lookups, account| {
+        let report = audit(&crashed, Some(&evidence(lookups, account)));
+        let order = report.orders[0].clone();
+        (report.status, order.status, order.evidence)
+    };
+    // Unknown lookup: never proof of a zero fill.
+    let unknown = lookup(json!({"status": "unknownOid"}), 1_200);
+    assert_eq!(
+        step(vec![unknown.clone()], None),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_unknown"
+        )
+    );
+    // Still resting at the venue.
+    assert_eq!(
+        step(
+            vec![lookup(lookup_response("open", "0.01", 1_100), 1_150)],
+            None
+        ),
+        (AuditStatus::Unresolved, OrderStatus::Pending, "lookup_open")
+    );
+    // Terminal without an account snapshot.
+    assert_eq!(
+        step(vec![terminal_lookup.clone()], None),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_terminal"
+        )
+    );
+    // Snapshot older than the terminal does not release it.
+    assert_eq!(
+        step(
+            vec![terminal_lookup.clone()],
+            Some(snapshot("-0.004", 1_400))
+        ),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_terminal"
+        )
+    );
+    // Later snapshot with exactly the terminal's fill: matched once.
+    let report = audit(
+        &crashed,
+        Some(&evidence(
+            vec![unknown, terminal_lookup.clone()],
+            Some(snapshot("-0.004", 1_600)),
+        )),
+    );
+    assert_eq!(report.status, AuditStatus::EvidenceMatched);
+    assert_eq!(report.status.exit_code(), 0);
+    assert!(!report.restart_permitted);
+    let order = &report.orders[0];
+    assert_eq!(
+        (order.status, order.evidence),
+        (OrderStatus::Matched, "matched")
+    );
+    assert_eq!(
+        (order.filled, order.position_after),
+        (Some(d("0.004")), Some(d("-0.004")))
+    );
+    assert_eq!(report.hedge_position.possible_min, d("-0.004"));
+    assert_eq!(report.hedge_position.possible_max, d("-0.004"));
+    // Later snapshot still at the planned position: account not caught up.
+    assert_eq!(
+        step(
+            vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+            Some(snapshot("0", 1_600))
+        ),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_terminal"
+        )
+    );
+    // Later snapshot that moved by a different amount is a conflict.
+    assert_eq!(
+        step(vec![terminal_lookup], Some(snapshot("-0.005", 1_600))),
+        (AuditStatus::Invalid, OrderStatus::Invalid, "conflict")
+    );
+}
+
+#[test]
+fn single_field_evidence_mismatches_are_rejected_not_matched() {
+    let crashed = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let good = || {
+        evidence(
+            vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+            Some(snapshot("-0.004", 1_600)),
+        )
+    };
+    assert_eq!(
+        audit(&crashed, Some(&good())).status,
+        AuditStatus::EvidenceMatched
+    );
+
+    let mut wrong = Vec::new();
+    let mut e = good();
+    e.network = "Mainnet".into();
+    wrong.push(("network", e));
+    let mut e = good();
+    e.hyperliquid_account = "0x00000000000000000000000000000000000000bb".into();
+    wrong.push(("account", e));
+    let mut e = good();
+    e.coin = "BTC".into();
+    wrong.push(("coin", e));
+    let mut e = good();
+    e.lookups[0].response["order"]["order"]["cloid"] = OTHER.into();
+    wrong.push(("response cloid", e));
+    let mut e = good();
+    e.lookups[0].response["order"]["order"]["origSz"] = "0.02".into();
+    wrong.push(("size", e));
+    let mut e = good();
+    e.lookups[0].response["order"]["order"]["side"] = "B".into();
+    wrong.push(("side", e));
+    let mut e = good();
+    // Captured more than CLOCK_TOLERANCE_MS before its own status time.
+    e.lookups[0].response["order"]["statusTimestamp"] = 5_000.into();
+    e.lookups[0].observed_at_ms = 2_999;
+    wrong.push(("capture time", e));
+    let mut e = good();
+    e.lookups[0].cloid = OTHER.into();
+    wrong.push(("evidence cloid", e));
+    let mut e = good();
+    e.account_snapshot.as_mut().unwrap().state["assetPositions"][0]["position"]["coin"] =
+        "BTC".into();
+    wrong.push(("snapshot instrument", e));
+    // Live tolerance: a status up to 1 s before the intent time still binds
+    // (intent time precedes fsync and signing); earlier than that does not.
+    let late_intent = journal(&[
+        start(Some(1)),
+        JournalRecord::Intent(IntentRecord {
+            submitted_at_ms: 2_501,
+            ..match intent(CLOID, "0") {
+                JournalRecord::Intent(i) => i,
+                _ => unreachable!(),
+            }
+        }),
+    ]);
+    let edge = JournalRecord::Intent(IntentRecord {
+        submitted_at_ms: 2_500,
+        ..match intent(CLOID, "0") {
+            JournalRecord::Intent(i) => i,
+            _ => unreachable!(),
+        }
+    });
+    assert_eq!(
+        audit(&journal(&[start(Some(1)), edge]), Some(&good())).status,
+        AuditStatus::EvidenceMatched
+    );
+    let report = audit(&late_intent, Some(&good()));
+    assert_eq!(report.status, AuditStatus::Invalid, "status before intent");
+    for (field, evidence) in wrong {
+        let report = audit(&crashed, Some(&evidence));
+        assert_ne!(
+            report.status,
+            AuditStatus::EvidenceMatched,
+            "{field} still matched"
+        );
+        assert!(
+            report.orders[0].status != OrderStatus::Matched,
+            "{field}: order released"
+        );
+    }
+}
+
+#[test]
+fn journaled_terminals_are_recorded_and_contradicting_evidence_is_flagged() {
+    let complete = journal(&[
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+    ]);
+    let report = audit(&complete, None);
+    assert_eq!(report.status, AuditStatus::JournalRecorded);
+    assert_eq!(report.orders[0].journal, "recorded");
+    assert_eq!(report.hedge_position.journal_confirmed, d("-0.004"));
+    let agrees = evidence(
+        vec![lookup(lookup_response("canceled", "0.006", 1_500), 1_510)],
+        None,
+    );
+    assert_eq!(
+        audit(&complete, Some(&agrees)).orders[0].evidence,
+        "lookup_agrees"
+    );
+    let disagrees = evidence(
+        vec![lookup(lookup_response("canceled", "0.005", 1_500), 1_510)],
+        None,
+    );
+    assert_eq!(
+        audit(&complete, Some(&disagrees)).status,
+        AuditStatus::Invalid
+    );
+    // A later account snapshot that moved without a journaled IOC.
+    let moved = evidence(vec![], Some(snapshot("-0.009", 2_000)));
+    let report = audit(&complete, Some(&moved));
+    assert_eq!(report.status, AuditStatus::Invalid);
+    assert!(kinds(&report).contains(&"unexplained_position"));
+}
+
+#[test]
+fn duplicates_are_idempotent_but_conflicts_and_orphans_are_invalid() {
+    let base = [
+        start(Some(1)),
+        intent(CLOID, "0"),
+        terminal(CLOID, "0.004", "-0.004"),
+    ];
+    let mut exact = base.to_vec();
+    exact.push(terminal(CLOID, "0.004", "-0.004"));
+    exact.insert(2, intent(CLOID, "0"));
+    let report = audit(&journal(&exact), None);
+    assert_eq!(report.status, AuditStatus::JournalRecorded);
+    assert_eq!(report.orders.len(), 1);
+    assert_eq!(report.orders[0].terminal_lines, vec![4, 5]);
+
+    let cases: Vec<(&str, Vec<JournalRecord>)> = vec![
+        ("conflicting_terminal", {
+            let mut r = base.to_vec();
+            r.push(terminal(CLOID, "0.005", "-0.005"));
+            r
+        }),
+        (
+            "orphan_terminal",
+            vec![start(Some(1)), terminal(OTHER, "0.004", "-0.004")],
+        ),
+        (
+            "invalid_terminal",
+            vec![
+                start(Some(1)),
+                intent(CLOID, "0"),
+                terminal(CLOID, "0.02", "-0.02"),
+            ],
+        ),
+        (
+            "invalid_terminal",
+            vec![
+                start(Some(1)),
+                intent(CLOID, "0"),
+                terminal(CLOID, "0.004", "-0.003"),
+            ],
+        ),
+        (
+            "invalid_intent",
+            vec![start(Some(1)), intent(CLOID, "0"), intent(OTHER, "0")],
+        ),
+        (
+            "invalid_intent",
+            vec![start(Some(1)), intent(CLOID, "-0.001")],
+        ),
+        ("record_before_start", vec![intent(CLOID, "0")]),
+        ("misplaced_start", vec![start(Some(1)), start(Some(1))]),
+        (
+            "flat_with_pending_ioc",
+            vec![
+                start(Some(1)),
+                intent(CLOID, "0"),
+                JournalRecord::VerifiedFlat,
+            ],
+        ),
+        ("flat_with_position", {
+            let mut r = base.to_vec();
+            r.push(JournalRecord::VerifiedFlat);
+            r
+        }),
+    ];
+    for (kind, records) in cases {
+        let report = audit(&journal(&records), None);
+        assert_eq!(report.status, AuditStatus::Invalid, "{kind}");
+        assert!(
+            kinds(&report).contains(&kind),
+            "{kind}: {:?}",
+            kinds(&report)
+        );
+    }
+}
+
+#[test]
+fn truncated_and_malformed_lines_are_reported_never_dropped() {
+    let mut bytes = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    let complete_terminal = terminal(CLOID, "0.004", "-0.004").to_line().unwrap();
+    // Crash mid-write of the terminal: the IOC stays pending.
+    bytes.extend_from_slice(&complete_terminal[..complete_terminal.len() / 2]);
+    let report = audit(&bytes, None);
+    assert_eq!(report.status, AuditStatus::Unresolved);
+    assert_eq!(report.orders[0].status, OrderStatus::Pending);
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .find(|i| i.kind == "truncated_tail")
+            .unwrap()
+            .line,
+        Some(3)
+    );
+    // A complete terminal JSON missing only its newline is also not durable.
+    let mut bytes = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    bytes.extend_from_slice(&complete_terminal[..complete_terminal.len() - 1]);
+    assert_eq!(audit(&bytes, None).orders[0].status, OrderStatus::Pending);
+    // An intent cut before its newline is still possible exposure.
+    let mut bytes = journal(&[start(Some(1))]);
+    let line = intent(CLOID, "0").to_line().unwrap();
+    bytes.extend_from_slice(&line[..line.len() - 1]);
+    let report = audit(&bytes, None);
+    assert_eq!(report.orders.len(), 1);
+    assert_eq!(report.orders[0].status, OrderStatus::Pending);
+    // Mid-file garbage, unknown events and unknown fields are invalid.
+    for bad in [
+        &b"{not json"[..],
+        br#"{"event":"hedge_cancel","cloid":"x"}"#,
+        br#"{"cloid":"x"}"#,
+        br#"{"event":"verified_flat","extra":1}"#,
+    ] {
+        let mut bytes = journal(&[start(Some(1))]);
+        bytes.extend_from_slice(bad);
+        bytes.push(b'\n');
+        bytes.extend(journal(&[intent(CLOID, "0")]));
+        let report = audit(&bytes, None);
+        assert_eq!(report.status, AuditStatus::Invalid);
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .find(|i| i.severity == Severity::Invalid)
+                .unwrap()
+                .line,
+            Some(2)
+        );
+        assert_eq!(report.orders.len(), 1, "later records are still audited");
+    }
+    let mut fields = serde_json::to_value(
+        intent(CLOID, "0")
+            .to_line()
+            .map(|l| serde_json::from_slice::<serde_json::Value>(&l).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    fields["unexpected"] = 1.into();
+    let mut bytes = journal(&[start(Some(1))]);
+    bytes.extend(serde_json::to_vec(&fields).unwrap());
+    bytes.push(b'\n');
+    assert!(kinds(&audit(&bytes, None)).contains(&"malformed_line"));
+}
+
+#[test]
+fn legacy_journals_are_labelled_and_never_given_assumed_times() {
+    let legacy_terminal = JournalRecord::Terminal(TerminalRecord {
+        cloid: CLOID.into(),
+        filled: d("0.004"),
+        average_price: None,
+        position: d("-0.004"),
+        terminal_source: None,
+        terminal_at_ms: None,
+        account_time_ms: None,
+    });
+    // Exactly what the pre-schema writer produced.
+    let legacy = format!(
+        "{}\n{}\n",
+        json!({"event":"start","session_id":"s-1","network":"Testnet","lighter_account_index":7,
+            "hyperliquid_account":ACCOUNT,"symbol":"ETH"}),
+        json!({"event":"hedge_terminal","cloid":CLOID,"filled":"0.004","average_price":null,"position":"-0.004"}),
+    );
+    let mut bytes = legacy.lines().next().unwrap().as_bytes().to_vec();
+    bytes.push(b'\n');
+    bytes.extend(journal(&[intent(CLOID, "0")]));
+    bytes.extend_from_slice(legacy.lines().nth(1).unwrap().as_bytes());
+    bytes.push(b'\n');
+    let report = audit(&bytes, None);
+    assert_eq!(report.journal.schema, "legacy");
+    assert_eq!(report.status, AuditStatus::JournalRecorded);
+    assert_eq!(report.orders[0].journal, "recorded_legacy");
+    assert!(kinds(&report).contains(&"legacy_journal"));
+    // The same timestamp-less terminal in a v1 journal is invalid.
+    let v1 = journal(&[start(Some(1)), intent(CLOID, "0"), legacy_terminal]);
+    assert_eq!(audit(&v1, None).status, AuditStatus::Invalid);
+    assert_eq!(
+        audit(&journal(&[start(Some(9))]), None).status,
+        AuditStatus::Invalid
+    );
+}
+
+#[test]
+fn file_audit_is_deterministic_and_leaves_inputs_unchanged() {
+    let dir = std::env::temp_dir().join(format!("aleph-audit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal_path = dir.join("aleph-trade.active.jsonl");
+    let evidence_path = dir.join("evidence.json");
+    let bytes = journal(&[start(Some(1)), intent(CLOID, "0")]);
+    std::fs::write(&journal_path, &bytes).unwrap();
+    let raw_evidence = json!({"network": "Testnet", "hyperliquid_account": ACCOUNT, "coin": "ETH",
+        "lookups": [{"cloid": CLOID, "observed_at_ms": 1_510,
+            "response": lookup_response("canceled", "0.006", 1_500)}],
+        "account_snapshot": {"observed_at_ms": 1_610, "state": snapshot("-0.004", 1_600).state}});
+    let evidence_bytes = serde_json::to_vec_pretty(&raw_evidence).unwrap();
+    std::fs::write(&evidence_path, &evidence_bytes).unwrap();
+    let first = audit_files(&journal_path, Some(&evidence_path)).unwrap();
+    let second = audit_files(&journal_path, Some(&evidence_path)).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        serde_json::to_string(&first).unwrap(),
+        serde_json::to_string(&second).unwrap()
+    );
+    assert_eq!(first.status, AuditStatus::EvidenceMatched);
+    assert_eq!(
+        first.journal.sha256.as_deref(),
+        Some(sha256_hex(&bytes).as_str())
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&evidence_path).unwrap(), evidence_bytes);
+    // Unknown evidence fields are rejected rather than ignored.
+    std::fs::write(
+        &evidence_path,
+        br#"{"network":"Testnet","hyperliquid_account":"x","coin":"ETH","extra":1}"#,
+    )
+    .unwrap();
+    assert!(audit_files(&journal_path, Some(&evidence_path)).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}

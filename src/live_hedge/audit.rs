@@ -1,0 +1,1088 @@
+//! Offline, read-only audit of an interrupted session journal.
+//!
+//! Rebuilds every Hyperliquid IOC from the durable journal alone and explains
+//! what is proven at three layers:
+//! 1. the journal's own claims (`hedge_terminal` written by this process),
+//! 2. frozen venue evidence supplied by the operator (raw `orderStatus` and
+//!    `clearinghouseState` responses), checked with the same identity,
+//!    terminal and account-delta rules the live hedge uses,
+//! 3. what remains unproven and which evidence would resolve it.
+//!
+//! The audit never contacts a venue, never reads credentials, never cancels
+//! or resubmits, and never touches the session file or lock. A matched
+//! result is only "offline evidence matches"; it does not permit restart.
+//! Lighter (primary leg) orders and inventory are not journaled and are
+//! outside this report.
+
+use super::journal::{
+    IntentRecord, JOURNAL_SCHEMA, JournalRecord, ParseError, StartRecord, TerminalRecord,
+};
+use super::{
+    CLOCK_TOLERANCE_MS, IocIdentity, LookupOutcome, account_confirmed_fill, classify_lookup,
+    dedicated_position,
+};
+use crate::exchanges::hyperliquid::{AccountState, OrderLookup, validate_hex};
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Operator-supplied, frozen venue observations for one hedge account.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    /// `Mainnet` or `Testnet`; must match the journal's `start`.
+    pub network: String,
+    pub hyperliquid_account: String,
+    pub coin: String,
+    #[serde(default)]
+    pub lookups: Vec<LookupEvidence>,
+    #[serde(default)]
+    pub account_snapshot: Option<SnapshotEvidence>,
+}
+
+/// One raw `{"type":"orderStatus"}` response and when it was captured.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookupEvidence {
+    pub cloid: String,
+    pub observed_at_ms: u64,
+    pub response: serde_json::Value,
+}
+
+/// One raw `{"type":"clearinghouseState"}` response and when it was captured.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotEvidence {
+    pub observed_at_ms: u64,
+    pub state: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    /// Every IOC has a consistent journaled terminal; no venue evidence used.
+    JournalRecorded,
+    /// No unresolved IOC remains and at least one was resolved by evidence.
+    EvidenceMatched,
+    /// Some IOC or record cannot be proven either way yet.
+    Unresolved,
+    /// The journal or evidence contradicts itself or the live contract.
+    Invalid,
+}
+
+impl AuditStatus {
+    /// 0 means every journaled IOC is explained. It is never permission to
+    /// restart: the session lock and the primary leg are outside the audit.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::JournalRecorded | Self::EvidenceMatched => 0,
+            Self::Unresolved => 2,
+            Self::Invalid => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Note,
+    Unresolved,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Issue {
+    /// 1-based journal line, when the issue comes from the journal.
+    pub line: Option<usize>,
+    pub severity: Severity,
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    /// Journal holds a consistent terminal record.
+    Recorded,
+    /// No journaled terminal, but venue lookup and account snapshot agree.
+    Matched,
+    /// Outcome unknown; exposure must still be assumed.
+    Pending,
+    /// Records or evidence for this IOC contradict each other.
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderReport {
+    pub cloid: String,
+    pub intent_line: usize,
+    pub terminal_lines: Vec<usize>,
+    pub side: &'static str,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub limit_price: Decimal,
+    pub reduce_only: bool,
+    pub submitted_at_ms: u64,
+    /// Hyperliquid position the IOC was planned against.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub before_position: Decimal,
+    pub status: OrderStatus,
+    /// `recorded`, `recorded_legacy` (no terminal/account times) or `intent_only`.
+    pub journal: &'static str,
+    /// `none`, `lookup_unknown`, `lookup_open`, `lookup_terminal`,
+    /// `lookup_agrees`, `matched` or `conflict`.
+    pub evidence: &'static str,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub filled: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub position_after: Option<Decimal>,
+    /// Bounds on the Hyperliquid position this IOC can have produced.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub possible_position_min: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub possible_position_max: Decimal,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JournalSummary {
+    pub path: Option<String>,
+    pub sha256: Option<String>,
+    pub lines: usize,
+    /// `v1`, `legacy` (no schema on `start`) or `unknown` (no readable start).
+    pub schema: &'static str,
+    pub session: Option<StartRecord>,
+    /// `verified_flat` or `unverified`.
+    pub session_cleanup: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvidenceSummary {
+    pub path: Option<String>,
+    pub sha256: Option<String>,
+    pub lookups: usize,
+    pub account_snapshot_time_ms: Option<u64>,
+    /// False when the evidence names another network, account or coin.
+    pub identity_matches: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionSummary {
+    /// Last position confirmed by a consistent journaled terminal.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub journal_confirmed: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub possible_min: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub possible_max: Decimal,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub snapshot: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Report {
+    pub mode: &'static str,
+    pub status: AuditStatus,
+    /// Always false: the audit never releases the session lock.
+    pub restart_permitted: bool,
+    pub journal: JournalSummary,
+    pub evidence: Option<EvidenceSummary>,
+    pub hedge_position: PositionSummary,
+    pub orders: Vec<OrderReport>,
+    pub issues: Vec<Issue>,
+    pub boundaries: Vec<&'static str>,
+}
+
+const BOUNDARIES: &[&str] = &[
+    "Offline and read-only: no venue request, credential, signature, cancel or order was made.",
+    "Journal records are this process's durable claims, not venue confirmations.",
+    "Evidence authenticity is outside this audit; it checks consistency only.",
+    "Lighter (primary leg) orders and inventory are not journaled; check them on the venue.",
+    "An unknown or absent lookup never proves an IOC was not accepted or filled.",
+    "The active journal and account lock are untouched; this report never permits restart.",
+];
+
+/// Read-only audit of files on disk; the inputs are only read.
+pub fn audit_files(journal: &Path, evidence: Option<&Path>) -> Result<Report> {
+    let journal_bytes =
+        std::fs::read(journal).with_context(|| format!("Read {}", journal.display()))?;
+    let evidence_input = evidence
+        .map(|path| -> Result<(Vec<u8>, Evidence)> {
+            let bytes = std::fs::read(path).with_context(|| format!("Read {}", path.display()))?;
+            let parsed = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Parse evidence {}", path.display()))?;
+            Ok((bytes, parsed))
+        })
+        .transpose()?;
+    let mut report = audit(&journal_bytes, evidence_input.as_ref().map(|(_, e)| e));
+    report.journal.path = Some(journal.display().to_string());
+    report.journal.sha256 = Some(sha256_hex(&journal_bytes));
+    if let (Some(summary), Some(path), Some((bytes, _))) =
+        (report.evidence.as_mut(), evidence, evidence_input.as_ref())
+    {
+        summary.path = Some(path.display().to_string());
+        summary.sha256 = Some(sha256_hex(bytes));
+    }
+    Ok(report)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+// ─── Journal reconstruction ──────────────────────────────────────────────
+
+struct Ioc {
+    intent: IntentRecord,
+    intent_line: usize,
+    terminal: Option<TerminalRecord>,
+    terminal_lines: Vec<usize>,
+    invalid: Vec<String>,
+}
+
+struct State {
+    issues: Vec<Issue>,
+    start: Option<StartRecord>,
+    schema: &'static str,
+    iocs: Vec<Ioc>,
+    by_cloid: BTreeMap<String, usize>,
+    confirmed: Decimal,
+    verified_flat: Option<usize>,
+}
+
+impl State {
+    fn issue(
+        &mut self,
+        line: Option<usize>,
+        severity: Severity,
+        kind: &'static str,
+        detail: String,
+    ) {
+        self.issues.push(Issue {
+            line,
+            severity,
+            kind,
+            detail,
+        });
+    }
+
+    fn pending(&self) -> Option<usize> {
+        self.iocs.iter().position(|ioc| ioc.terminal.is_none())
+    }
+
+    fn apply(&mut self, line: usize, record: JournalRecord) {
+        if let Some(flat) = self.verified_flat {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "record_after_verified_flat",
+                format!("`{}` follows verified_flat on line {flat}", record.event()),
+            );
+            return;
+        }
+        match record {
+            JournalRecord::Start(start) => self.apply_start(line, start),
+            _ if self.start.is_none() => self.issue(
+                Some(line),
+                Severity::Invalid,
+                "record_before_start",
+                format!("`{}` precedes the session start record", record.event()),
+            ),
+            JournalRecord::Intent(intent) => self.apply_intent(line, intent),
+            JournalRecord::Terminal(terminal) => self.apply_terminal(line, terminal),
+            JournalRecord::VerifiedFlat => self.apply_verified_flat(line),
+        }
+    }
+
+    fn apply_start(&mut self, line: usize, start: StartRecord) {
+        if self.start.is_some() || line != 1 {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "misplaced_start",
+                "a session journal has exactly one start record, on line 1".into(),
+            );
+            return;
+        }
+        self.schema = match start.journal_schema {
+            None => {
+                self.issue(
+                    Some(line),
+                    Severity::Note,
+                    "legacy_journal",
+                    "start has no journal_schema; terminal and account times are not recorded"
+                        .into(),
+                );
+                "legacy"
+            }
+            Some(JOURNAL_SCHEMA) => "v1",
+            Some(other) => {
+                self.issue(
+                    Some(line),
+                    Severity::Invalid,
+                    "unknown_schema",
+                    format!("journal_schema {other} is not supported by this audit"),
+                );
+                "unknown"
+            }
+        };
+        if !matches!(start.network.as_str(), "Mainnet" | "Testnet") {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "invalid_start",
+                format!("unknown network `{}`", start.network),
+            );
+        }
+        if let Some(account) = &start.hyperliquid_account
+            && validate_hex(account, 20).is_err()
+        {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "invalid_start",
+                "hyperliquid_account is not a 20-byte hex address".into(),
+            );
+        }
+        self.start = Some(start);
+    }
+
+    fn apply_intent(&mut self, line: usize, intent: IntentRecord) {
+        if let Some(&index) = self.by_cloid.get(&intent.cloid) {
+            if self.iocs[index].intent == intent {
+                self.issue(
+                    Some(line),
+                    Severity::Note,
+                    "duplicate_record",
+                    format!("identical intent for {} repeated", intent.cloid),
+                );
+            } else {
+                self.iocs[index].invalid.push(format!(
+                    "line {line}: conflicting intent for the same cloid"
+                ));
+                self.issue(
+                    Some(line),
+                    Severity::Invalid,
+                    "conflicting_intent",
+                    format!(
+                        "intent for {} differs from line {}",
+                        intent.cloid, self.iocs[index].intent_line
+                    ),
+                );
+            }
+            return;
+        }
+        let mut invalid = Vec::new();
+        if validate_hex(&intent.cloid, 16).is_err() {
+            invalid.push("cloid is not a 16-byte hex id".into());
+        }
+        if let Some(start) = &self.start {
+            if intent.coin != start.symbol {
+                invalid.push(format!(
+                    "coin {} differs from session symbol {}",
+                    intent.coin, start.symbol
+                ));
+            }
+            if start.hyperliquid_account.is_none() {
+                invalid.push("session start names no Hyperliquid account".into());
+            }
+        }
+        if intent.size <= Decimal::ZERO || intent.limit_price <= Decimal::ZERO {
+            invalid.push("non-positive size or limit price".into());
+        }
+        if let Some(open) = self.pending() {
+            // The live hedge refuses a second IOC while one is unresolved.
+            invalid.push(format!(
+                "dispatched while {} (line {}) had no terminal",
+                self.iocs[open].intent.cloid, self.iocs[open].intent_line
+            ));
+        } else if intent.hedge_position != self.confirmed {
+            invalid.push(format!(
+                "planned against position {} but the journal had confirmed {}",
+                intent.hedge_position, self.confirmed
+            ));
+        }
+        for reason in &invalid {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "invalid_intent",
+                format!("{}: {reason}", intent.cloid),
+            );
+        }
+        self.by_cloid.insert(intent.cloid.clone(), self.iocs.len());
+        self.iocs.push(Ioc {
+            intent,
+            intent_line: line,
+            terminal: None,
+            terminal_lines: Vec::new(),
+            invalid,
+        });
+    }
+
+    fn apply_terminal(&mut self, line: usize, terminal: TerminalRecord) {
+        let Some(&index) = self.by_cloid.get(&terminal.cloid) else {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "orphan_terminal",
+                format!("terminal for {} has no journaled intent", terminal.cloid),
+            );
+            return;
+        };
+        self.iocs[index].terminal_lines.push(line);
+        if let Some(existing) = &self.iocs[index].terminal {
+            if *existing == terminal {
+                self.issue(
+                    Some(line),
+                    Severity::Note,
+                    "duplicate_record",
+                    format!("identical terminal for {} repeated", terminal.cloid),
+                );
+            } else {
+                self.iocs[index]
+                    .invalid
+                    .push(format!("line {line}: conflicting terminal"));
+                self.issue(
+                    Some(line),
+                    Severity::Invalid,
+                    "conflicting_terminal",
+                    format!(
+                        "second terminal for {} disagrees with the first",
+                        terminal.cloid
+                    ),
+                );
+            }
+            return;
+        }
+        let intent = &self.iocs[index].intent;
+        let mut invalid = Vec::new();
+        if terminal.filled < Decimal::ZERO || terminal.filled > intent.size {
+            invalid.push(format!(
+                "filled {} outside 0..={}",
+                terminal.filled, intent.size
+            ));
+        }
+        let expected = if intent.is_buy {
+            intent.hedge_position.checked_add(terminal.filled)
+        } else {
+            intent.hedge_position.checked_sub(terminal.filled)
+        };
+        if expected != Some(terminal.position) {
+            invalid.push(format!(
+                "position {} is not {} {} {}",
+                terminal.position,
+                intent.hedge_position,
+                if intent.is_buy { "+" } else { "-" },
+                terminal.filled
+            ));
+        }
+        if let Some(price) = terminal.average_price {
+            let within = if intent.is_buy {
+                price <= intent.limit_price
+            } else {
+                price >= intent.limit_price
+            };
+            if !within || price <= Decimal::ZERO {
+                invalid.push(format!(
+                    "average price {price} violates limit {}",
+                    intent.limit_price
+                ));
+            }
+        }
+        match (terminal.terminal_at_ms, terminal.account_time_ms) {
+            (Some(at), Some(account)) if account < at => {
+                invalid.push(format!(
+                    "account time {account} precedes terminal time {at}"
+                ));
+            }
+            (None, _) | (_, None) if self.schema == "v1" => {
+                invalid.push("v1 terminal lacks terminal_at_ms or account_time_ms".into());
+            }
+            _ => {}
+        }
+        if let Some(source) = terminal.terminal_source.as_deref()
+            && !matches!(source, "response" | "lookup")
+        {
+            invalid.push(format!("unknown terminal_source `{source}`"));
+        }
+        for reason in &invalid {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "invalid_terminal",
+                format!("{}: {reason}", terminal.cloid),
+            );
+        }
+        self.confirmed = terminal.position;
+        let ioc = &mut self.iocs[index];
+        ioc.invalid.extend(invalid);
+        ioc.terminal = Some(terminal);
+    }
+
+    fn apply_verified_flat(&mut self, line: usize) {
+        if let Some(open) = self.pending() {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "flat_with_pending_ioc",
+                format!(
+                    "verified_flat while {} has no terminal",
+                    self.iocs[open].intent.cloid
+                ),
+            );
+        }
+        if !self.confirmed.is_zero() {
+            self.issue(
+                Some(line),
+                Severity::Invalid,
+                "flat_with_position",
+                format!(
+                    "verified_flat while the journaled hedge position is {}",
+                    self.confirmed
+                ),
+            );
+        }
+        self.verified_flat = Some(line);
+    }
+}
+
+// ─── Frozen evidence ─────────────────────────────────────────────────────
+
+struct Snapshot {
+    time_ms: u64,
+    position: Decimal,
+}
+
+fn load_snapshot(evidence: &SnapshotEvidence, coin: &str) -> Result<Snapshot> {
+    let state: AccountState = serde_json::from_value(evidence.state.clone())
+        .context("account_snapshot.state is not a clearinghouseState response")?;
+    anyhow::ensure!(
+        state.time > 0 && state.time <= evidence.observed_at_ms.saturating_add(CLOCK_TOLERANCE_MS),
+        "account snapshot time {} is after its capture time {}",
+        state.time,
+        evidence.observed_at_ms
+    );
+    Ok(Snapshot {
+        time_ms: state.time,
+        position: dedicated_position(&state, coin)?,
+    })
+}
+
+/// What the frozen lookups for one IOC show, by the live identity rules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LookupView {
+    None,
+    /// Only `unknownOid` responses: proves nothing about acceptance.
+    Unknown,
+    /// Latest non-terminal view is resting at the venue.
+    Open,
+    Terminal {
+        at_ms: u64,
+        filled: Decimal,
+    },
+}
+
+/// Classify every frozen lookup for `intent`. Identity mismatches,
+/// disagreeing terminals or an `open` captured after a terminal are errors.
+fn evaluate_lookups(
+    intent: &IntentRecord,
+    lookups: &[&LookupEvidence],
+) -> std::result::Result<LookupView, String> {
+    let identity = IocIdentity {
+        cloid: &intent.cloid,
+        coin: &intent.coin,
+        is_buy: intent.is_buy,
+        size: intent.size,
+        limit_price: intent.limit_price,
+        sent_at_ms: intent.submitted_at_ms,
+    };
+    let mut terminal: Option<(u64, u64, Decimal)> = None; // (captured, status at, filled)
+    let mut last_open: Option<u64> = None;
+    let mut unknown = false;
+    for lookup in lookups {
+        let parsed = OrderLookup::from_response(lookup.response.clone())
+            .map_err(|e| format!("lookup at {}: {e:#}", lookup.observed_at_ms))?;
+        let located = match parsed {
+            OrderLookup::Unknown => {
+                unknown = true;
+                continue;
+            }
+            OrderLookup::Found(located) => located,
+        };
+        if located.status_timestamp > lookup.observed_at_ms.saturating_add(CLOCK_TOLERANCE_MS) {
+            return Err(format!(
+                "lookup status time {} is after its capture time {}",
+                located.status_timestamp, lookup.observed_at_ms
+            ));
+        }
+        match classify_lookup(&identity, &located)
+            .map_err(|e| format!("lookup at {}: {e:#}", lookup.observed_at_ms))?
+        {
+            LookupOutcome::Terminal { at_ms, filled } => {
+                if let Some((_, _, seen)) = terminal
+                    && seen != filled
+                {
+                    return Err(format!(
+                        "terminal lookups disagree: filled {seen} vs {filled}"
+                    ));
+                }
+                if terminal.is_none_or(|(captured, _, _)| lookup.observed_at_ms > captured) {
+                    terminal = Some((lookup.observed_at_ms, at_ms, filled));
+                }
+            }
+            LookupOutcome::Open { .. } => {
+                last_open = last_open.max(Some(lookup.observed_at_ms));
+            }
+        }
+    }
+    if let (Some(open_at), Some((terminal_captured, _, _))) = (last_open, terminal)
+        && open_at > terminal_captured
+    {
+        return Err("an open lookup was captured after a terminal one".into());
+    }
+    Ok(match (terminal, last_open, unknown) {
+        (Some((_, at_ms, filled)), _, _) => LookupView::Terminal { at_ms, filled },
+        (None, Some(_), _) => LookupView::Open,
+        (None, None, true) => LookupView::Unknown,
+        (None, None, false) => LookupView::None,
+    })
+}
+
+// ─── Report ──────────────────────────────────────────────────────────────
+
+/// Audit journal bytes against optional frozen evidence. Pure: no I/O.
+pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
+    let mut state = State {
+        issues: Vec::new(),
+        start: None,
+        schema: "unknown",
+        iocs: Vec::new(),
+        by_cloid: BTreeMap::new(),
+        confirmed: Decimal::ZERO,
+        verified_flat: None,
+    };
+    let lines = read_lines(journal, &mut state);
+    if state.start.is_none() {
+        state.issue(
+            None,
+            Severity::Invalid,
+            "missing_start",
+            "no readable session start record on line 1".into(),
+        );
+    }
+    if state.verified_flat.is_none() {
+        // Reported, not folded into `status`: the journal cannot prove the
+        // primary leg either way, and `restart_permitted` stays false.
+        state.issue(
+            None,
+            Severity::Note,
+            "primary_leg_unverified",
+            "session ended without verified_flat; Lighter orders and inventory are unproven".into(),
+        );
+    }
+    let evidence =
+        evidence.map(|evidence| (evidence, check_evidence_identity(&mut state, evidence)));
+    let snapshot = evidence.and_then(|(evidence, usable)| {
+        let raw = evidence.account_snapshot.as_ref().filter(|_| usable)?;
+        match load_snapshot(raw, &evidence.coin) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                state.issue(
+                    None,
+                    Severity::Invalid,
+                    "invalid_snapshot",
+                    format!("{error:#}"),
+                );
+                None
+            }
+        }
+    });
+    let usable_lookups: Vec<&LookupEvidence> = evidence
+        .filter(|(_, usable)| *usable)
+        .map(|(evidence, _)| evidence.lookups.iter().collect())
+        .unwrap_or_default();
+    for lookup in &usable_lookups {
+        if !state.by_cloid.contains_key(&lookup.cloid) {
+            state.issue(
+                None,
+                Severity::Invalid,
+                "evidence_unknown_cloid",
+                format!("lookup for {} matches no journaled intent", lookup.cloid),
+            );
+        }
+    }
+
+    let last_index = state.iocs.len().checked_sub(1);
+    let mut orders = Vec::with_capacity(state.iocs.len());
+    let mut position = PositionSummary {
+        journal_confirmed: state.confirmed,
+        possible_min: state.confirmed,
+        possible_max: state.confirmed,
+        snapshot: snapshot.as_ref().map(|s| s.position),
+    };
+    for (index, ioc) in state.iocs.iter().enumerate() {
+        let lookups: Vec<&LookupEvidence> = usable_lookups
+            .iter()
+            .copied()
+            .filter(|l| l.cloid == ioc.intent.cloid)
+            .collect();
+        let view = evaluate_lookups(&ioc.intent, &lookups);
+        let order = order_report(
+            ioc,
+            view,
+            snapshot.as_ref().filter(|_| Some(index) == last_index),
+        );
+        if order.status == OrderStatus::Pending || order.status == OrderStatus::Matched {
+            position.possible_min = order.possible_position_min;
+            position.possible_max = order.possible_position_max;
+        }
+        orders.push(order);
+    }
+    if let Some(snapshot) = &snapshot
+        && orders.iter().all(|o| o.status == OrderStatus::Recorded)
+    {
+        check_snapshot_against_journal(&mut state, snapshot);
+    }
+
+    let worst = state.issues.iter().map(|i| i.severity).max();
+    let status = if worst == Some(Severity::Invalid)
+        || orders.iter().any(|o| o.status == OrderStatus::Invalid)
+    {
+        AuditStatus::Invalid
+    } else if worst == Some(Severity::Unresolved)
+        || orders.iter().any(|o| o.status == OrderStatus::Pending)
+    {
+        AuditStatus::Unresolved
+    } else if orders.iter().any(|o| o.status == OrderStatus::Matched) {
+        AuditStatus::EvidenceMatched
+    } else {
+        AuditStatus::JournalRecorded
+    };
+    Report {
+        mode: "offline-read-only",
+        status,
+        restart_permitted: false,
+        journal: JournalSummary {
+            path: None,
+            sha256: None,
+            lines,
+            schema: state.schema,
+            session: state.start.clone(),
+            session_cleanup: if state.verified_flat.is_some() {
+                "verified_flat"
+            } else {
+                "unverified"
+            },
+        },
+        evidence: evidence.map(|(evidence, usable)| EvidenceSummary {
+            path: None,
+            sha256: None,
+            lookups: evidence.lookups.len(),
+            account_snapshot_time_ms: snapshot.as_ref().map(|s| s.time_ms),
+            identity_matches: usable,
+        }),
+        hedge_position: position,
+        orders,
+        issues: state.issues,
+        boundaries: BOUNDARIES.to_vec(),
+    }
+}
+
+/// Split into lines, keeping 1-based numbers. A final line without a newline
+/// was cut mid-write: its `write_all` never returned, so the live process did
+/// not act on it. An intent there is kept as possible exposure (conservative);
+/// any other partial record is ignored, which keeps the IOC pending.
+fn read_lines(journal: &[u8], state: &mut State) -> usize {
+    let mut count = 0;
+    let mut rest = journal;
+    while !rest.is_empty() {
+        count += 1;
+        let (line, complete) = match rest.iter().position(|b| *b == b'\n') {
+            Some(end) => {
+                let line = &rest[..end];
+                rest = &rest[end + 1..];
+                (line, true)
+            }
+            None => {
+                let line = rest;
+                rest = &[];
+                (line, false)
+            }
+        };
+        match (JournalRecord::parse(line), complete) {
+            (Ok(record), true) => state.apply(count, record),
+            (Ok(JournalRecord::Intent(intent)), false) => {
+                state.issue(
+                    Some(count),
+                    Severity::Unresolved,
+                    "truncated_tail",
+                    format!(
+                        "intent for {} lacks its newline; not durably written, kept as possible exposure",
+                        intent.cloid
+                    ),
+                );
+                state.apply(count, JournalRecord::Intent(intent));
+            }
+            (parsed, false) => state.issue(
+                Some(count),
+                Severity::Unresolved,
+                "truncated_tail",
+                match parsed {
+                    Ok(record) => format!(
+                        "`{}` lacks its newline; treated as not written",
+                        record.event()
+                    ),
+                    Err(error) => format!("partial final line ignored ({error})"),
+                },
+            ),
+            (Err(error), true) => state.issue(
+                Some(count),
+                Severity::Invalid,
+                match error {
+                    ParseError::UnknownEvent(_) => "unknown_event",
+                    _ => "malformed_line",
+                },
+                error.to_string(),
+            ),
+        }
+    }
+    count
+}
+
+fn check_evidence_identity(state: &mut State, evidence: &Evidence) -> bool {
+    let Some(start) = &state.start else {
+        return false;
+    };
+    let mut mismatches = Vec::new();
+    if evidence.network != start.network {
+        mismatches.push(format!(
+            "network {} vs journal {}",
+            evidence.network, start.network
+        ));
+    }
+    let account = start.hyperliquid_account.as_deref().unwrap_or_default();
+    if !evidence.hyperliquid_account.eq_ignore_ascii_case(account) {
+        mismatches.push("hyperliquid_account differs from the journal".into());
+    }
+    if evidence.coin != start.symbol {
+        mismatches.push(format!(
+            "coin {} vs journal symbol {}",
+            evidence.coin, start.symbol
+        ));
+    }
+    for mismatch in &mismatches {
+        state.issue(
+            None,
+            Severity::Invalid,
+            "evidence_identity",
+            mismatch.clone(),
+        );
+    }
+    mismatches.is_empty()
+}
+
+/// With every IOC recorded, a later snapshot must still show the journaled
+/// position; otherwise the account changed outside this journal.
+fn check_snapshot_against_journal(state: &mut State, snapshot: &Snapshot) {
+    let last_terminal_ms = state
+        .iocs
+        .iter()
+        .filter_map(|ioc| ioc.terminal.as_ref()?.account_time_ms)
+        .max();
+    if last_terminal_ms.is_some_and(|at| snapshot.time_ms < at) {
+        state.issue(
+            None,
+            Severity::Unresolved,
+            "stale_snapshot",
+            format!(
+                "snapshot time {} precedes the last journaled confirmation",
+                snapshot.time_ms
+            ),
+        );
+    } else if snapshot.position != state.confirmed {
+        state.issue(
+            None,
+            Severity::Invalid,
+            "unexplained_position",
+            format!(
+                "snapshot position {} differs from journaled {}",
+                snapshot.position, state.confirmed
+            ),
+        );
+    }
+}
+
+fn signed(is_buy: bool, before: Decimal, filled: Decimal) -> Decimal {
+    if is_buy {
+        before + filled
+    } else {
+        before - filled
+    }
+}
+
+fn order_report(
+    ioc: &Ioc,
+    view: std::result::Result<LookupView, String>,
+    snapshot: Option<&Snapshot>,
+) -> OrderReport {
+    let intent = &ioc.intent;
+    let range = |filled: Option<Decimal>| match filled {
+        Some(f) => (
+            signed(intent.is_buy, intent.hedge_position, f),
+            signed(intent.is_buy, intent.hedge_position, f),
+        ),
+        None => {
+            let full = signed(intent.is_buy, intent.hedge_position, intent.size);
+            (
+                intent.hedge_position.min(full),
+                intent.hedge_position.max(full),
+            )
+        }
+    };
+    let mut reasons = ioc.invalid.clone();
+    let mut report = OrderReport {
+        cloid: intent.cloid.clone(),
+        intent_line: ioc.intent_line,
+        terminal_lines: ioc.terminal_lines.clone(),
+        side: if intent.is_buy { "buy" } else { "sell" },
+        size: intent.size,
+        limit_price: intent.limit_price,
+        reduce_only: intent.reduce_only,
+        submitted_at_ms: intent.submitted_at_ms,
+        before_position: intent.hedge_position,
+        status: OrderStatus::Pending,
+        journal: "intent_only",
+        evidence: "none",
+        filled: None,
+        position_after: None,
+        possible_position_min: Decimal::ZERO,
+        possible_position_max: Decimal::ZERO,
+        reasons: Vec::new(),
+    };
+    let view = match view {
+        Ok(view) => view,
+        Err(error) => {
+            reasons.push(error);
+            report.evidence = "conflict";
+            LookupView::None
+        }
+    };
+    if let Some(terminal) = &ioc.terminal {
+        report.journal = if terminal.account_time_ms.is_some() {
+            "recorded"
+        } else {
+            "recorded_legacy"
+        };
+        report.filled = Some(terminal.filled);
+        report.position_after = Some(terminal.position);
+        // Evidence about a recorded IOC may corroborate or contradict it.
+        if let LookupView::Terminal { filled, .. } = view {
+            if filled == terminal.filled {
+                report.evidence = "lookup_agrees";
+            } else {
+                report.evidence = "conflict";
+                reasons.push(format!(
+                    "venue lookup shows filled {filled}, journal {}",
+                    terminal.filled
+                ));
+            }
+        } else if view == LookupView::Open {
+            report.evidence = "conflict";
+            reasons.push("journal records a terminal but the venue shows the IOC open".into());
+        }
+        report.status = if reasons.is_empty() {
+            OrderStatus::Recorded
+        } else {
+            OrderStatus::Invalid
+        };
+        (report.possible_position_min, report.possible_position_max) = range(Some(terminal.filled));
+        report.reasons = reasons;
+        return report;
+    }
+
+    // No journaled terminal: the IOC may have reached the venue.
+    report.evidence = match (report.evidence, view) {
+        ("conflict", _) => "conflict",
+        (_, LookupView::None) => "none",
+        (_, LookupView::Unknown) => "lookup_unknown",
+        (_, LookupView::Open) => "lookup_open",
+        (_, LookupView::Terminal { .. }) => "lookup_terminal",
+    };
+    match view {
+        LookupView::None => reasons.push("no venue lookup supplied for this cloid".into()),
+        LookupView::Unknown => reasons.push(
+            "lookup returned unknownOid; this does not prove the IOC was never accepted".into(),
+        ),
+        LookupView::Open => reasons.push(
+            "venue shows the IOC open; it must reach a terminal state at the venue".into(),
+        ),
+        LookupView::Terminal { at_ms, filled } => match snapshot {
+            None => reasons.push(format!(
+                "venue terminal filled {filled}; supply an account snapshot taken at or after {at_ms}"
+            )),
+            Some(snapshot) => match account_confirmed_fill(
+                intent.is_buy,
+                intent.hedge_position,
+                intent.size,
+                at_ms,
+                filled,
+                snapshot.position,
+                snapshot.time_ms,
+            ) {
+                Err(error) => {
+                    report.evidence = "conflict";
+                    reasons.push(format!("{error:#}"));
+                }
+                Ok(None) if snapshot.time_ms < at_ms => reasons.push(format!(
+                    "account snapshot at {} precedes the terminal at {at_ms}",
+                    snapshot.time_ms
+                )),
+                // Same rule as live `observe`: an unchanged position keeps
+                // waiting for the account to catch up; a changed position
+                // that is not the terminal fill is unexplained.
+                Ok(None) if snapshot.position == intent.hedge_position => reasons.push(format!(
+                    "account snapshot at {} does not yet reflect the terminal fill {filled}",
+                    snapshot.time_ms
+                )),
+                Ok(None) => {
+                    report.evidence = "conflict";
+                    reasons.push(format!(
+                        "snapshot position {} does not equal {} {} {filled}",
+                        snapshot.position,
+                        intent.hedge_position,
+                        if intent.is_buy { "+" } else { "-" }
+                    ));
+                }
+                Ok(Some(fill)) => {
+                    report.evidence = "matched";
+                    report.filled = Some(fill);
+                    report.position_after = Some(snapshot.position);
+                }
+            },
+        },
+    }
+    let invalid = !ioc.invalid.is_empty() || report.evidence == "conflict";
+    report.status = if invalid {
+        OrderStatus::Invalid
+    } else if report.evidence == "matched" {
+        OrderStatus::Matched
+    } else {
+        OrderStatus::Pending
+    };
+    (report.possible_position_min, report.possible_position_max) =
+        range(if report.status == OrderStatus::Matched {
+            report.filled
+        } else {
+            None
+        });
+    report.reasons = reasons;
+    report
+}
+
+#[cfg(test)]
+mod tests;

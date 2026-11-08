@@ -128,12 +128,21 @@ impl HyperliquidInfo {
     ) -> Result<OrderLookup> {
         validate_hex(account_address, 20)?;
         validate_hex(client_order_id, 16)?;
-        let response: OrderLookupResponse = self
+        let response: serde_json::Value = self
             .info(json!({"type": "orderStatus", "user": account_address, "oid": client_order_id}))
             .await?;
+        OrderLookup::from_response(response)
+    }
+}
+
+impl OrderLookup {
+    /// Interpret a raw `orderStatus` info response. Shared by the live client
+    /// and offline evidence files so both read the same wire format.
+    pub fn from_response(response: serde_json::Value) -> Result<Self> {
+        let response: OrderLookupResponse = serde_json::from_value(response)?;
         match response.status.as_str() {
-            "unknownOid" => Ok(OrderLookup::Unknown),
-            "order" => Ok(OrderLookup::Found(
+            "unknownOid" => Ok(Self::Unknown),
+            "order" => Ok(Self::Found(
                 response.order.context("Missing order lookup data")?,
             )),
             _ => anyhow::bail!("Unrecognized order lookup response"),

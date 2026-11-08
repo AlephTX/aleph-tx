@@ -325,6 +325,17 @@ async fn main() -> Result<()> {
             arcus_cli::run(network, command).await
         }
         [command] if command == "venues" => print(&registry.iter().collect::<Vec<_>>()),
+        [command, journal, evidence @ ..]
+            if command == "hedge-journal-audit" && evidence.len() <= 1 =>
+        {
+            // Offline and read-only: no client, credential or network access.
+            let report = aleph_tx::live_hedge::audit::audit_files(
+                Path::new(journal),
+                evidence.first().map(Path::new),
+            )?;
+            print(&report)?;
+            std::process::exit(report.status.exit_code());
+        }
         [command, file] if command == "replay" => {
             let replay: Replay = read_replay(file)?;
             replay.config.validate()?;
@@ -468,7 +479,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }

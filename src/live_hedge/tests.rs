@@ -1,6 +1,7 @@
 use super::*;
 use crate::exchange::{OrderParams, OrderType};
 use crate::exchanges::hyperliquid::PerpAsset;
+use serde_json::json;
 use std::str::FromStr;
 
 fn d(value: &str) -> Decimal {
@@ -138,6 +139,7 @@ fn ack_and_timeout_reserve_exposure_until_terminal_and_account_agree() {
         at_ms: 124,
         filled: d("0.007"),
         price: Some(d("1999")),
+        source: "response",
     });
     assert_eq!(pending.confirmed_fill(d("-0.007"), 123).unwrap(), None);
     assert_eq!(pending.confirmed_fill(Decimal::ZERO, 125).unwrap(), None);
@@ -166,11 +168,30 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let journal_path =
         std::env::temp_dir().join(format!("aleph-hedge-{}.jsonl", uuid::Uuid::new_v4()));
-    let journal = OpenOptions::new()
+    let mut journal = OpenOptions::new()
         .create_new(true)
         .append(true)
         .open(&journal_path)
         .unwrap();
+    let hedge_account = format!("0x{:040x}", 2);
+    journal
+        .write_all(
+            &JournalRecord::Start(journal::StartRecord {
+                session_id: "loopback".into(),
+                network: "Testnet".into(),
+                lighter_account_index: 0,
+                hyperliquid_account: Some(hedge_account.clone()),
+                symbol: "ETH".into(),
+                journal_schema: Some(journal::JOURNAL_SCHEMA),
+            })
+            .to_line()
+            .unwrap(),
+        )
+        .unwrap();
+    // Offline audit of the file alone, as after a crash at this point.
+    let audit_now = |evidence: Option<&audit::Evidence>| {
+        audit::audit(&std::fs::read(&journal_path).unwrap(), evidence)
+    };
     let captured = Arc::new(AtomicUsize::new(0));
     let orders = Arc::clone(&captured);
     let lookup_ready = Arc::new(AtomicBool::new(false));
@@ -262,7 +283,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         info,
         trading,
         market: market(),
-        account: format!("0x{:040x}", 2),
+        account: hedge_account.clone(),
         start_equity: d("100"),
         confirmed: Decimal::ZERO,
         pending: None,
@@ -293,11 +314,86 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     observed.book.timestamp_ms = unix_ms().unwrap();
     hedge.execute(observed, false).await.unwrap();
     assert_eq!(hedge.confirmed, Decimal::ZERO);
+    // Crash after the intent is durable but before any terminal is known.
+    let crashed = audit_now(None);
+    assert_eq!(crashed.status, audit::AuditStatus::Unresolved);
+    assert_eq!(crashed.orders[0].status, audit::OrderStatus::Pending);
     let observed = hedge.observe(false).await.unwrap().unwrap();
     assert_eq!(observed.hedge, d("-0.007"));
     assert!(hedge.pending.is_none());
+    // Crash after the terminal is durable.
+    let recorded = audit_now(None);
+    assert_eq!(recorded.status, audit::AuditStatus::JournalRecorded);
+    assert_eq!(recorded.hedge_position.journal_confirmed, d("-0.007"));
     hedge.execute(observed, false).await.unwrap();
     let unresolved = hedge.pending.as_ref().unwrap().id.clone();
+    // Crash after the lost ACK: the second IOC may have filled up to its size.
+    let lost_ack = audit_now(None);
+    assert_eq!(lost_ack.status, audit::AuditStatus::Unresolved);
+    let open = &lost_ack.orders[1];
+    assert_eq!(
+        (open.cloid.as_str(), open.status),
+        (unresolved.as_str(), audit::OrderStatus::Pending)
+    );
+    assert_eq!(open.before_position, d("-0.007"));
+    assert_eq!(open.possible_position_max, d("-0.007"));
+    assert_eq!(open.possible_position_min, d("-0.007") - open.size);
+    // Frozen venue evidence in the raw wire format, as an operator captures it.
+    let (size, limit) = (open.size, open.limit_price);
+    let now = unix_ms().unwrap();
+    let frozen = |lookup: serde_json::Value, position: Option<&str>, at: u64| {
+        audit::Evidence {
+        network: "Testnet".into(),
+        hyperliquid_account: hedge_account.clone(),
+        coin: "ETH".into(),
+        lookups: vec![audit::LookupEvidence {
+            cloid: unresolved.clone(),
+            observed_at_ms: at + 5,
+            response: lookup,
+        }],
+        account_snapshot: position.map(|szi| audit::SnapshotEvidence {
+            observed_at_ms: at + 5,
+            state: json!({"time": at, "withdrawable": "100", "marginSummary": {"accountValue": "100",
+                "totalNtlPos": "14", "totalMarginUsed": "1"},
+                "assetPositions": [{"position": {"coin": "ETH", "szi": szi, "unrealizedPnl": "0"}}]}),
+        }),
+    }
+    };
+    let unknown = frozen(json!({"status": "unknownOid"}), Some("-0.007"), now);
+    assert_eq!(
+        audit_now(Some(&unknown)).orders[1].status,
+        audit::OrderStatus::Pending
+    );
+    let partial = json!({"status": "order", "order": {"status": "canceled", "statusTimestamp": now,
+        "order": {"coin": "ETH", "cloid": unresolved, "side": "A", "limitPx": limit.to_string(),
+            "origSz": size.to_string(), "sz": (size - d("0.004")).to_string(), "oid": 8, "timestamp": now}}});
+    // Partial fill known at the venue, account snapshot not yet updated.
+    let lagging = frozen(partial.clone(), Some("-0.007"), now);
+    assert_eq!(
+        audit_now(Some(&lagging)).orders[1].status,
+        audit::OrderStatus::Pending
+    );
+    let unexplained = frozen(partial.clone(), Some("-0.012"), now);
+    assert_eq!(
+        audit_now(Some(&unexplained)).status,
+        audit::AuditStatus::Invalid
+    );
+    let older = frozen(partial.clone(), Some("-0.011"), now - 1);
+    assert_eq!(
+        audit_now(Some(&older)).orders[1].status,
+        audit::OrderStatus::Pending
+    );
+    let matched = audit_now(Some(&frozen(partial.clone(), Some("-0.011"), now)));
+    assert_eq!(matched.status, audit::AuditStatus::EvidenceMatched);
+    assert_eq!(matched.orders[1].filled, Some(d("0.004")));
+    assert!(!matched.restart_permitted);
+    // Torn tail: a terminal cut mid-write leaves the IOC pending.
+    let mut torn = std::fs::read(&journal_path).unwrap();
+    torn.extend_from_slice(br#"{"event":"hedge_terminal","cloid":"#);
+    assert_eq!(
+        audit::audit(&torn, None).orders[1].status,
+        audit::OrderStatus::Pending
+    );
     // Intent time precedes journal fsync and signing. Even a much older
     // intent cannot turn an unknown lookup into proof of a zero fill.
     hedge.pending.as_mut().unwrap().sent_at_ms -= 60_000;
@@ -315,6 +411,28 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     let log = std::fs::read_to_string(&journal_path).unwrap();
     assert_eq!(log.matches("hedge_intent").count(), 2);
     assert_eq!(log.matches("hedge_terminal").count(), 2);
+    // The production writer's records parse with the shared journal types
+    // and carry the terminal/account times the offline audit relies on.
+    let records: Vec<_> = log
+        .lines()
+        .map(|line| JournalRecord::parse(line.as_bytes()).unwrap())
+        .collect();
+    let sources: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            JournalRecord::Terminal(t) => {
+                assert!(t.account_time_ms >= t.terminal_at_ms && t.account_time_ms.is_some());
+                t.terminal_source.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sources, ["response", "lookup"]);
+    // After recovery the journal alone explains both IOCs.
+    let done = audit_now(None);
+    assert_eq!(done.status, audit::AuditStatus::JournalRecorded);
+    assert_eq!(done.hedge_position.journal_confirmed, d("-0.011"));
+    assert_eq!(done.orders[1].filled, Some(d("0.004")));
     // Both reconciled fills are exported as Hyperliquid sells, after journaling.
     sink.stopped().await.unwrap();
     let exported: Vec<serde_json::Value> =

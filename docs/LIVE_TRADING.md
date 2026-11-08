@@ -88,6 +88,21 @@ the strategy's normal shorter cancellation timer.
   confirming zero open orders and zero positions, archive the active journal
   and start a fresh session. Verified cleanup archives the journal, including
   after a feeder exit that returned an error.
+- `cargo run --release --bin cross_venue -- hedge-journal-audit
+  pids/aleph-trade.active.jsonl [EVIDENCE.json]` explains the journal
+  offline. It reads only the given files, needs no credentials and makes no
+  network request. Each Hyperliquid IOC is reported as `recorded`, `matched`,
+  `pending` or `invalid`, with line numbers, the possible hedge position
+  range and the evidence still needed. Exit code 0 means every journaled IOC
+  is explained, 2 means some remain unresolved and 3 means the journal or
+  evidence is inconsistent. The report never permits restart. It does not
+  cover Lighter orders or inventory, and it never changes the active journal.
+- For a `pending` IOC, capture the raw Hyperliquid `orderStatus` response
+  for its `cloid` and a later `clearinghouseState` response. Put them in an
+  evidence file with `network`, `hyperliquid_account`, `coin`, `lookups`
+  (`cloid`, `observed_at_ms`, `response`) and `account_snapshot`
+  (`observed_at_ms`, `state`). An `unknownOid` lookup does not prove the IOC
+  was never accepted.
 - When the authenticated Lighter equity stream is quiet, the feeder refreshes
   balances from the account REST endpoint. Position freshness remains
   independent, and an older REST request cannot overwrite a newer WS update.

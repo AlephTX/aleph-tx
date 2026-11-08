@@ -1,6 +1,7 @@
 use aleph_tx::config::{AppConfig, EXCH_LIGHTER, InventoryNeutralMMConfig};
 use aleph_tx::exchanges::hyperliquid::{HyperliquidSigner, Network, validate_hex};
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
+use aleph_tx::live_hedge::journal::{JOURNAL_SCHEMA, JournalRecord, StartRecord};
 use aleph_tx::live_hedge::{HedgeLimits, LiveInventoryHedge};
 use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
 use anyhow::{Context, Result, ensure};
@@ -268,14 +269,15 @@ impl Session {
         hedge_account: Option<&str>,
         symbol: &str,
     ) -> Result<()> {
-        serde_json::to_writer(
-            &mut self.journal,
-            &serde_json::json!({
-                "event": "start", "session_id": self.id.to_string(), "network": format!("{network:?}"),
-                "lighter_account_index": account, "hyperliquid_account": hedge_account, "symbol": symbol
-            }),
-        )?;
-        self.journal.write_all(b"\n")?;
+        let record = JournalRecord::Start(StartRecord {
+            session_id: self.id.to_string(),
+            network: format!("{network:?}"),
+            lighter_account_index: account,
+            hyperliquid_account: hedge_account.map(str::to_owned),
+            symbol: symbol.to_owned(),
+            journal_schema: Some(JOURNAL_SCHEMA),
+        });
+        self.journal.write_all(&record.to_line()?)?;
         self.journal.sync_all()?;
         Ok(())
     }
@@ -475,7 +477,7 @@ pub(super) async fn launch(
     } else if verified_flat {
         session
             .journal
-            .write_all(b"{\"event\":\"verified_flat\"}\n")?;
+            .write_all(&JournalRecord::VerifiedFlat.to_line()?)?;
         session.journal.sync_all()?;
         session.archive()?;
     } else {
@@ -580,6 +582,15 @@ mod tests {
             .write_start(Network::Testnet, 1, None, "ETH")
             .unwrap();
         let ipc = session.ipc.clone();
+        // The offline audit reads the interrupted journal without releasing it.
+        let active = state.join("aleph-trade.active.jsonl");
+        let before = fs::read(&active).unwrap();
+        let report = aleph_tx::live_hedge::audit::audit_files(&active, None).unwrap();
+        assert!(!report.restart_permitted);
+        assert_eq!(report.journal.schema, "v1");
+        assert_eq!(report.journal.session_cleanup, "unverified");
+        assert_eq!(fs::read(&active).unwrap(), before);
+        assert!(Session::new(&state, &root).is_err());
         let sentinel = root.join("unrelated-feeder");
         fs::write(&sentinel, "alive").unwrap();
         assert!(Session::new(&state, &root).is_err());

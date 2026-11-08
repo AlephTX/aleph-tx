@@ -7,14 +7,14 @@
 use crate::exchange::{BatchAction, Side};
 use crate::exchanges::hyperliquid::{
     AccountState, BestBidAsk, CancelAction, CancelWire, ExecutionStatus, HyperliquidInfo,
-    HyperliquidSigner, HyperliquidTrading, Network, OrderAction, OrderLookup, OrderWire,
-    PerpMarket, PerpOrder, TimeInForce,
+    HyperliquidSigner, HyperliquidTrading, LocatedOrder, Network, OrderAction, OrderLookup,
+    OrderWire, PerpMarket, PerpOrder, TimeInForce,
 };
 use crate::lighter_trading::LighterTrading;
 use anyhow::{Context, Result, bail, ensure};
+use journal::{IntentRecord, JournalRecord, TerminalRecord};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
-use serde_json::json;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
@@ -26,6 +26,9 @@ const MAX_QUOTE_AGE_MS: u64 = 3_000;
 const MAX_ACCOUNT_AGE_MS: u64 = 5_000;
 const CLOCK_TOLERANCE_MS: u64 = 2_000;
 const FINISH_DEADLINE: Duration = Duration::from_secs(30);
+
+pub mod audit;
+pub mod journal;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,6 +133,8 @@ struct Terminal {
     at_ms: u64,
     filled: Decimal,
     price: Option<Decimal>,
+    /// `response` (synchronous order reply) or `lookup` (order status).
+    source: &'static str,
 }
 
 impl PendingIoc {
@@ -137,24 +142,123 @@ impl PendingIoc {
         let Some(terminal) = &self.terminal else {
             return Ok(None);
         };
-        if timestamp_ms < terminal.at_ms {
-            return Ok(None);
-        }
-        let fill = if self.order.is_buy {
-            position.checked_sub(self.before)
-        } else {
-            self.before.checked_sub(position)
-        }
-        .context("Invalid Hyperliquid position delta")?;
-        ensure!(
-            fill >= Decimal::ZERO && fill <= self.order.size,
-            "Hyperliquid account change exceeds the journaled IOC exposure"
-        );
-        if terminal.filled != fill {
-            return Ok(None);
-        }
-        Ok(Some(fill))
+        account_confirmed_fill(
+            self.order.is_buy,
+            self.before,
+            self.order.size,
+            terminal.at_ms,
+            terminal.filled,
+            position,
+            timestamp_ms,
+        )
     }
+}
+
+// ─── Reconciliation contract shared with the offline journal audit ──────
+
+/// Identity of a journaled IOC that a venue lookup must reproduce.
+pub(crate) struct IocIdentity<'a> {
+    pub cloid: &'a str,
+    pub coin: &'a str,
+    pub is_buy: bool,
+    pub size: Decimal,
+    pub limit_price: Decimal,
+    pub sent_at_ms: u64,
+}
+
+/// What an order-status lookup proves about a journaled IOC.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LookupOutcome {
+    /// Terminal at the venue status time with the filled quantity.
+    Terminal { at_ms: u64, filled: Decimal },
+    /// Still resting; exposure stays reserved.
+    Open { oid: u64 },
+}
+
+/// Validate a located order against the journaled IOC and classify it.
+/// Any identity disagreement is an error, never a terminal result.
+pub(crate) fn classify_lookup(
+    intent: &IocIdentity<'_>,
+    located: &LocatedOrder,
+) -> Result<LookupOutcome> {
+    let order = &located.order;
+    ensure!(
+        order.coin == intent.coin
+            && order.cloid.as_deref() == Some(intent.cloid)
+            && order.side == if intent.is_buy { "B" } else { "A" }
+            && order.limit_px.parse::<Decimal>()? == intent.limit_price
+            && order
+                .original_size
+                .as_deref()
+                .and_then(|size| size.parse::<Decimal>().ok())
+                == Some(intent.size)
+            && located.status_timestamp >= intent.sent_at_ms.saturating_sub(1_000),
+        "Hyperliquid lookup disagrees with the journaled IOC"
+    );
+    let remaining = order.sz.parse::<Decimal>()?;
+    let filled = match located.status.as_str() {
+        "filled" | "canceled" | "marginCanceled" | "reduceOnlyCanceled" => {
+            terminal_fill(&located.status, intent.size, remaining)?
+        }
+        "rejected" | "iocCancelRejected" | "minTradeNtlRejected" | "reduceOnlyRejected" => {
+            Decimal::ZERO
+        }
+        "open" => return Ok(LookupOutcome::Open { oid: order.oid }),
+        status => bail!("Unhandled Hyperliquid IOC status {status}"),
+    };
+    Ok(LookupOutcome::Terminal {
+        at_ms: located.status_timestamp,
+        filled,
+    })
+}
+
+/// A terminal result releases an IOC only when an account snapshot taken at
+/// or after it shows exactly that fill relative to the planned position.
+/// `Ok(None)` keeps the reservation; an impossible delta is an error.
+pub(crate) fn account_confirmed_fill(
+    is_buy: bool,
+    before: Decimal,
+    size: Decimal,
+    terminal_at_ms: u64,
+    terminal_filled: Decimal,
+    position: Decimal,
+    account_time_ms: u64,
+) -> Result<Option<Decimal>> {
+    if account_time_ms < terminal_at_ms {
+        return Ok(None);
+    }
+    let fill = if is_buy {
+        position.checked_sub(before)
+    } else {
+        before.checked_sub(position)
+    }
+    .context("Invalid Hyperliquid position delta")?;
+    ensure!(
+        fill >= Decimal::ZERO && fill <= size,
+        "Hyperliquid account change exceeds the journaled IOC exposure"
+    );
+    Ok((terminal_filled == fill).then_some(fill))
+}
+
+/// Position of `coin` in a dedicated hedge account; any other open
+/// instrument or a duplicate entry is an error.
+pub(crate) fn dedicated_position(state: &AccountState, coin: &str) -> Result<Decimal> {
+    let mut position = None;
+    for entry in &state.asset_positions {
+        let size = entry.position.szi.parse::<Decimal>()?;
+        if entry.position.coin == coin {
+            ensure!(
+                position.replace(size).is_none(),
+                "Duplicate Hyperliquid position"
+            );
+        } else {
+            ensure!(
+                size.is_zero(),
+                "Unexpected Hyperliquid instrument in dedicated account"
+            );
+        }
+    }
+    Ok(position.unwrap_or_default())
 }
 
 pub struct LiveInventoryHedge {
@@ -388,10 +492,16 @@ impl LiveInventoryHedge {
                 .is_some()
                 .then(|| hedge_fill_record(pending, fill, price, hedge, &self.limits))
                 .flatten();
-            self.record(
-                json!({"event": "hedge_terminal", "cloid": id, "filled": fill.to_string(),
-                "average_price": price.map(|p| p.to_string()), "position": hedge.to_string()}),
-            )?;
+            let record = JournalRecord::Terminal(TerminalRecord {
+                cloid: id.clone(),
+                filled: fill,
+                average_price: price,
+                position: hedge,
+                terminal_source: pending.terminal.as_ref().map(|t| t.source.to_owned()),
+                terminal_at_ms: pending.terminal.as_ref().map(|t| t.at_ms),
+                account_time_ms: Some(state.time),
+            });
+            self.record(&record)?;
             tracing::info!(%id, %fill, %hedge, "Hyperliquid IOC reconciled");
             // Export only after the journal has durably recorded the terminal.
             if let (Some(sink), Some(record)) = (&self.telemetry, telemetry) {
@@ -428,22 +538,7 @@ impl LiveInventoryHedge {
     }
 
     fn hedge_position(&self, state: &AccountState) -> Result<Decimal> {
-        let mut position = None;
-        for entry in &state.asset_positions {
-            let size = entry.position.szi.parse::<Decimal>()?;
-            if entry.position.coin == self.market.asset.name {
-                ensure!(
-                    position.replace(size).is_none(),
-                    "Duplicate Hyperliquid position"
-                );
-            } else {
-                ensure!(
-                    size.is_zero(),
-                    "Unexpected Hyperliquid instrument in dedicated account"
-                );
-            }
-        }
-        Ok(position.unwrap_or_default())
+        dedicated_position(state, &self.market.asset.name)
     }
 
     async fn execute(&mut self, observed: Observation, closing: bool) -> Result<()> {
@@ -466,10 +561,17 @@ impl LiveInventoryHedge {
             &self.market.asset,
             &order,
         )?])?;
-        self.record(json!({"event": "hedge_intent", "cloid": id, "coin": self.market.asset.name,
-            "submitted_at_ms": sent_at_ms, "is_buy": order.is_buy, "size": order.size.to_string(),
-            "limit_price": order.limit_price.to_string(), "reduce_only": order.reduce_only,
-            "primary_position": observed.primary.to_string(), "hedge_position": observed.hedge.to_string()}))?;
+        self.record(&JournalRecord::Intent(IntentRecord {
+            cloid: id.clone(),
+            coin: self.market.asset.name.clone(),
+            submitted_at_ms: sent_at_ms,
+            is_buy: order.is_buy,
+            size: order.size,
+            limit_price: order.limit_price,
+            reduce_only: order.reduce_only,
+            primary_position: observed.primary,
+            hedge_position: observed.hedge,
+        }))?;
         self.pending = Some(PendingIoc {
             id,
             before: observed.hedge,
@@ -504,6 +606,7 @@ impl LiveInventoryHedge {
                     at_ms: sent_at_ms,
                     filled: *total_size,
                     price: Some(*average_price),
+                    source: "response",
                 });
             }
             Ok([ExecutionStatus::Rejected { reason }]) => {
@@ -512,6 +615,7 @@ impl LiveInventoryHedge {
                     at_ms: sent_at_ms,
                     filled: Decimal::ZERO,
                     price: None,
+                    source: "response",
                 });
             }
             Err(error) => {
@@ -541,54 +645,42 @@ impl LiveInventoryHedge {
                 return Ok(());
             }
         };
-        let order = located.order;
-        ensure!(
-            order.coin == self.market.asset.name
-                && order.cloid.as_deref() == Some(&pending.id)
-                && order.side == if pending.order.is_buy { "B" } else { "A" }
-                && order.limit_px.parse::<Decimal>()? == pending.order.limit_price
-                && order
-                    .original_size
-                    .as_deref()
-                    .and_then(|size| size.parse::<Decimal>().ok())
-                    == Some(pending.order.size)
-                && located.status_timestamp >= pending.sent_at_ms.saturating_sub(1_000),
-            "Hyperliquid lookup disagrees with the journaled IOC"
-        );
-        let remaining = order.sz.parse::<Decimal>()?;
-        let fill = match located.status.as_str() {
-            "filled" | "canceled" | "marginCanceled" | "reduceOnlyCanceled" => {
-                terminal_fill(&located.status, pending.order.size, remaining)?
+        let identity = IocIdentity {
+            cloid: &pending.id,
+            coin: &self.market.asset.name,
+            is_buy: pending.order.is_buy,
+            size: pending.order.size,
+            limit_price: pending.order.limit_price,
+            sent_at_ms: pending.sent_at_ms,
+        };
+        match classify_lookup(&identity, &located)? {
+            LookupOutcome::Terminal { at_ms, filled } => {
+                pending.terminal = Some(Terminal {
+                    at_ms,
+                    filled,
+                    price: None,
+                    source: "lookup",
+                });
             }
-            "rejected" | "iocCancelRejected" | "minTradeNtlRejected" | "reduceOnlyRejected" => {
-                Decimal::ZERO
-            }
-            "open" => {
+            LookupOutcome::Open { oid } => {
                 if !pending.cancel_sent {
                     pending.cancel_sent = true;
                     let action = CancelAction::new(vec![CancelWire {
                         a: self.market.asset_id,
-                        o: order.oid,
+                        o: oid,
                     }])?;
                     if let Err(error) = self.trading.cancel_orders(&action).await {
                         tracing::warn!(cloid=%pending.id, %error, "Hyperliquid cancellation remains unconfirmed");
                     }
                 }
-                return Ok(());
             }
-            status => bail!("Unhandled Hyperliquid IOC status {status}"),
-        };
-        pending.terminal = Some(Terminal {
-            at_ms: located.status_timestamp,
-            filled: fill,
-            price: None,
-        });
+        }
         Ok(())
     }
 
-    fn record(&mut self, event: serde_json::Value) -> Result<()> {
-        serde_json::to_writer(&mut self.journal, &event)?;
-        self.journal.write_all(b"\n")?;
+    fn record(&mut self, record: &JournalRecord) -> Result<()> {
+        // One write per record so a crash leaves at most one partial tail.
+        self.journal.write_all(&record.to_line()?)?;
         self.journal.sync_data()?;
         Ok(())
     }
