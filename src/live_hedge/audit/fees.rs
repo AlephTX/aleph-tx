@@ -326,23 +326,42 @@ pub(super) fn attribute(fills: &FillSet, ioc: &IocFacts<'_>, skew_ms: u64) -> Fe
             ..FeeReport::with("invalid", Some(oid), String::new())
         };
     }
-    let matched = bound
-        .iter()
-        .try_fold(Decimal::ZERO, |sum, f| sum.checked_add(f.sz));
+    let mut size_sum = ExactSum::default();
+    for fill in &bound {
+        size_sum.add(fill.sz);
+    }
+    // Compared exactly, before any conversion back to Decimal.
+    let coverage = size_sum.cmp_to(filled);
+    let exact_size = size_sum.exact();
     let tids: Vec<u64> = bound.iter().map(|f| f.tid).collect();
     let mut report = FeeReport {
         tids,
-        matched_size: matched,
+        matched_size: exact_size.as_ref().ok().copied(),
         reconciled_size: Some(filled),
         ..FeeReport::with("unattributed", Some(oid), String::new())
     };
     report.reasons.clear();
+    let matched = exact_size.as_ref().ok().copied();
     match matched {
+        _ if coverage == std::cmp::Ordering::Greater => {
+            report.status = "invalid";
+            report.reasons.push(format!(
+                "fills for oid {oid} total {}, more than the reconciled {filled}",
+                exact_size
+                    .as_ref()
+                    .map_or_else(Clone::clone, ToString::to_string)
+            ));
+        }
+        None if coverage == std::cmp::Ordering::Less => {
+            report.reasons.push(format!(
+                "fills for oid {oid} cover less than the reconciled {filled}"
+            ));
+        }
         None => {
             report.status = "invalid";
             report
                 .reasons
-                .push("fill sizes overflow the decimal range".into());
+                .push("matched size is not exactly representable".into());
         }
         Some(_) if filled <= Decimal::ZERO => {
             if bound.is_empty() {
@@ -356,51 +375,202 @@ pub(super) fn attribute(fills: &FillSet, ioc: &IocFacts<'_>, skew_ms: u64) -> Fe
                 ));
             }
         }
-        Some(matched) if matched < filled => report.reasons.push(format!(
+        Some(matched) if coverage == std::cmp::Ordering::Less => report.reasons.push(format!(
             "fills for oid {oid} cover {matched} of the reconciled {filled}"
         )),
-        Some(matched) if matched > filled => {
-            report.status = "invalid";
-            report.reasons.push(format!(
-                "fills for oid {oid} total {matched}, more than the reconciled {filled}"
-            ));
-        }
+        // Exactly equal: only now are fees summed.
         Some(_) => match per_token(&bound) {
-            Some(fees) => {
+            Ok(fees) => {
                 report.status = "attributed";
                 report.fees = fees;
             }
-            None => {
+            Err(reason) => {
                 report.status = "invalid";
-                report
-                    .reasons
-                    .push("fees overflow the decimal range".into());
+                report.reasons.push(reason);
             }
         },
     }
     report
 }
 
-/// Signed fee per token; builder fees are reported per token, not added.
-fn per_token(fills: &[&Fill]) -> Option<Vec<AssetFee>> {
-    let mut by_token: BTreeMap<&str, (Decimal, Option<Decimal>)> = BTreeMap::new();
+/// Exact signed fee per token; builder fees are summed separately and
+/// reported, not added. A token whose total `Decimal` cannot hold exactly
+/// rejects the whole attribution, naming the token and field.
+fn per_token(fills: &[&Fill]) -> Result<Vec<AssetFee>, String> {
+    let mut by_token: BTreeMap<&str, (ExactSum, Option<ExactSum>)> = BTreeMap::new();
     for fill in fills {
         let entry = by_token
             .entry(fill.fee_token.as_str())
-            .or_insert((Decimal::ZERO, None));
-        entry.0 = entry.0.checked_add(fill.fee)?;
+            .or_insert_with(|| (ExactSum::default(), None));
+        entry.0.add(fill.fee);
         if let Some(builder) = fill.builder_fee {
-            entry.1 = Some(entry.1.unwrap_or_default().checked_add(builder)?);
+            entry.1.get_or_insert_with(ExactSum::default).add(builder);
         }
     }
-    Some(
-        by_token
-            .into_iter()
-            .map(|(token, (fee, builder_fee))| AssetFee {
+    by_token
+        .into_iter()
+        .map(|(token, (fee, builder))| {
+            let fee = fee.exact().map_err(|exact| {
+                format!("{token} fee total {exact} is not exactly representable")
+            })?;
+            let builder_fee = builder
+                .map(|b| {
+                    b.exact().map_err(|exact| {
+                        format!("{token} builderFee total {exact} is not exactly representable")
+                    })
+                })
+                .transpose()?;
+            Ok(AssetFee {
                 token: token.to_owned(),
                 fee,
                 builder_fee,
             })
-            .collect(),
-    )
+        })
+        .collect()
+}
+
+/// Exact sum of decimals: every term is aligned to the largest scale and
+/// added as an arbitrary-precision integer, so no intermediate step rounds
+/// and the order of signed terms does not matter. `Decimal::checked_add`
+/// rounds once a sum needs more than 96 bits of mantissa at its scale.
+#[derive(Debug, Clone, Default)]
+struct ExactSum {
+    /// (mantissa, scale) of every term.
+    terms: Vec<(num_bigint::BigInt, u32)>,
+}
+
+impl ExactSum {
+    fn add(&mut self, value: Decimal) {
+        self.terms
+            .push((num_bigint::BigInt::from(value.mantissa()), value.scale()));
+    }
+
+    /// The exact total as (mantissa, scale) at the largest term scale.
+    fn total(&self) -> (num_bigint::BigInt, u32) {
+        let scale = self.terms.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        let ten = num_bigint::BigInt::from(10);
+        let sum = self
+            .terms
+            .iter()
+            .map(|(m, s)| m * num_traits::Pow::pow(&ten, scale - s))
+            .sum();
+        (sum, scale)
+    }
+
+    /// The total as a `Decimal` if it fits exactly; otherwise None (the
+    /// exact digits are kept in the error text by the caller).
+    fn exact(&self) -> Result<Decimal, String> {
+        let (mut mantissa, mut scale) = self.total();
+        let ten = num_bigint::BigInt::from(10);
+        // Drop trailing zero digits the scale does not need.
+        while scale > 0 && (&mantissa % &ten) == num_bigint::BigInt::from(0) {
+            mantissa /= &ten;
+            scale -= 1;
+        }
+        i128::try_from(&mantissa)
+            .ok()
+            .and_then(|m| Decimal::try_from_i128_with_scale(m, scale).ok())
+            .ok_or_else(|| decimal_text(&mantissa, scale))
+    }
+
+    /// Compare the exact total with `other` exactly.
+    fn cmp_to(&self, other: Decimal) -> std::cmp::Ordering {
+        let mut both = self.clone();
+        both.add(-other);
+        both.total().0.cmp(&num_bigint::BigInt::from(0))
+    }
+}
+
+/// Exact decimal text for an integer mantissa and scale.
+fn decimal_text(mantissa: &num_bigint::BigInt, scale: u32) -> String {
+    let negative = mantissa.sign() == num_bigint::Sign::Minus;
+    let digits = mantissa.magnitude().to_string();
+    let scale = scale as usize;
+    let body = if scale == 0 {
+        digits
+    } else if digits.len() > scale {
+        let (int, frac) = digits.split_at(digits.len() - scale);
+        format!("{int}.{frac}")
+    } else {
+        format!("0.{}{digits}", "0".repeat(scale - digits.len()))
+    };
+    if negative { format!("-{body}") } else { body }
+}
+
+#[cfg(test)]
+mod exact_sum_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn d(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    fn sum(values: &[&str]) -> ExactSum {
+        let mut total = ExactSum::default();
+        for value in values {
+            total.add(d(value));
+        }
+        total
+    }
+
+    /// The review reproducer: Decimal::checked_add rounds 10 + 1e-28 to 10.
+    #[test]
+    fn exact_sum_never_rounds_where_decimal_does() {
+        let tiny = "0.0000000000000000000000000001";
+        assert_eq!(
+            d("10").checked_add(d(tiny)),
+            Some(d("10.000000000000000000000000000"))
+        );
+        let total = sum(&["10", tiny]);
+        assert_eq!(total.cmp_to(d("10")), std::cmp::Ordering::Greater);
+        assert_eq!(
+            total.exact().unwrap_err(),
+            "10.0000000000000000000000000001"
+        );
+        // Representable at the highest precision: kept exactly.
+        assert_eq!(
+            sum(&["0.1", tiny]).exact().unwrap(),
+            d("0.1000000000000000000000000001")
+        );
+    }
+
+    /// Signed terms cancel exactly in any order; trailing zeros normalise.
+    #[test]
+    fn exact_sum_is_order_independent_and_signed() {
+        let big = "79228162514264337593543950335"; // Decimal::MAX
+        for order in [
+            [big, "-1", "-79228162514264337593543950334"],
+            ["-1", "-79228162514264337593543950334", big],
+        ] {
+            let total = sum(&order);
+            assert_eq!(total.exact().unwrap(), Decimal::ZERO, "{order:?}");
+            assert_eq!(total.cmp_to(Decimal::ZERO), std::cmp::Ordering::Equal);
+        }
+        // An intermediate beyond Decimal::MAX that cancels back is fine.
+        assert_eq!(
+            sum(&[big, "1", "-2"]).exact().unwrap(),
+            d("79228162514264337593543950334")
+        );
+        assert_eq!(
+            sum(&["0.0010", "0.0030"]).exact().unwrap().to_string(),
+            "0.004"
+        );
+        assert_eq!(sum(&["0.0009", "-0.0002"]).exact().unwrap(), d("0.0007"));
+        assert_eq!(sum(&[]).exact().unwrap(), Decimal::ZERO);
+        assert_eq!(
+            sum(&[big, "1"]).exact().unwrap_err(),
+            "79228162514264337593543950336"
+        );
+        assert_eq!(
+            sum(&[
+                "-0.5",
+                "-0.0000000000000000000000000001",
+                "-79228162514264337593543950"
+            ])
+            .exact()
+            .unwrap_err(),
+            "-79228162514264337593543950.5000000000000000000000000001"
+        );
+    }
 }

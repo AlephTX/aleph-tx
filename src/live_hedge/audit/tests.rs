@@ -1313,3 +1313,113 @@ fn fill_amounts_must_be_exactly_representable() {
         "invalid"
     );
 }
+
+/// Sums are exact: two representable terms whose total `Decimal` would
+/// round (10 + 1e-28) can neither match a size nor report a fee, and the
+/// reason names the field and token. Exact high-precision totals, signed
+/// cancellation in any tid order, several tokens and absent builder fees
+/// still attribute.
+#[test]
+fn fee_and_size_totals_are_summed_exactly() {
+    const TINY: &str = "0.0000000000000000000000000001";
+    // Quantity: a 12 ETH IOC reconciled at 10, fills 10 and 1e-28.
+    let JournalRecord::Intent(mut big) = intent(CLOID, "0") else {
+        unreachable!()
+    };
+    big.size = d("12");
+    let JournalRecord::Terminal(mut done) = terminal(CLOID, "10", "-10") else {
+        unreachable!()
+    };
+    done.average_price = Some(d("1999"));
+    let recorded = journal(&[
+        start(Some(1)),
+        JournalRecord::Intent(big),
+        JournalRecord::Terminal(done),
+    ]);
+    let mut status = lookup_response("canceled", "2", 1_500);
+    status["order"]["order"]["origSz"] = json!("12");
+    let mut qty = evidence(vec![lookup(status, 1_510)], None);
+    qty.fills = vec![fills(vec![
+        fill(1, 8, "10", "0.002", "USDC", 1_490),
+        fill(2, 8, TINY, "0", "USDC", 1_490),
+    ])];
+    let report = audit(&recorded, Some(&qty));
+    let fee = &report.orders[0].fee;
+    assert_eq!(report.orders[0].status, OrderStatus::Recorded);
+    assert_eq!(fee.status, "invalid", "{fee:?}");
+    assert!(
+        fee.reasons[0]
+            .contains("total 10.0000000000000000000000000001, more than the reconciled 10"),
+        "{:?}",
+        fee.reasons
+    );
+    assert_eq!(report.status.exit_code(), 3);
+    // Fee and builderFee totals that do not fit exactly.
+    let mut builder_a = fill(2, 8, "0.002", "0.002", "USDC", 1_400);
+    builder_a["builderFee"] = json!("10");
+    let mut builder_b = fill(3, 8, "0.002", "0.002", "USDC", 1_400);
+    builder_b["builderFee"] = json!(TINY);
+    for (field, entries) in [
+        (
+            "USDC fee",
+            vec![
+                fill(2, 8, "0.002", "10", "USDC", 1_400),
+                fill(3, 8, "0.002", TINY, "USDC", 1_400),
+            ],
+        ),
+        ("USDC builderFee", vec![builder_a, builder_b]),
+    ] {
+        let report = fee_report(vec![fills(entries)]);
+        let fee = &report.orders[0].fee;
+        assert_eq!(fee.status, "invalid", "{field}");
+        assert!(fee.fees.is_empty(), "{field}");
+        assert!(
+            fee.reasons[0].starts_with(&format!("{field} total 10.0000000000000000000000000001")),
+            "{field}: {:?}",
+            fee.reasons
+        );
+        assert_eq!(report.status, AuditStatus::Invalid, "{field}");
+    }
+    // Legal: high precision, signed cancellation in either tid order,
+    // several tokens, builder fee on one fill only, none on the other token.
+    for tids in [(1, 2), (2, 1)] {
+        let mut with_builder = fill(tids.0, 8, "0.002", "0.5", "USDC", 1_400);
+        with_builder["builderFee"] = json!("0.0001");
+        let report = fee_report(vec![fills(vec![
+            with_builder,
+            fill(
+                tids.1,
+                8,
+                "0.001",
+                "-0.4999999999999999999999999999",
+                "USDC",
+                1_400,
+            ),
+            fill(5, 8, "0.001", "0.0000", "HYPE", 1_400),
+        ])]);
+        let fee = &report.orders[0].fee;
+        assert_eq!(fee.status, "attributed", "{tids:?}: {:?}", fee.reasons);
+        let per: Vec<_> = fee
+            .fees
+            .iter()
+            .map(|f| (f.token.as_str(), f.fee, f.builder_fee))
+            .collect();
+        assert_eq!(
+            per,
+            [
+                ("HYPE", Decimal::ZERO, None),
+                ("USDC", d(TINY), Some(d("0.0001")))
+            ],
+            "{tids:?}"
+        );
+        assert_eq!(fee.matched_size, Some(d("0.004")));
+    }
+    // An explicit zero builder fee stays distinct from an absent one.
+    let mut zero_builder = fill(1, 8, "0.004", "0.002", "USDC", 1_400);
+    zero_builder["builderFee"] = json!("0");
+    let report = fee_report(vec![fills(vec![zero_builder])]);
+    assert_eq!(
+        report.orders[0].fee.fees[0].builder_fee,
+        Some(Decimal::ZERO)
+    );
+}
