@@ -165,6 +165,9 @@ fn default_time_horizon() -> f64 {
 fn default_requote_threshold() -> f64 {
     2.0 // 2 bps deviation threshold
 }
+fn default_min_cycle_interval_ms() -> u64 {
+    50
+}
 fn default_poll_interval_ms() -> u64 {
     100
 }
@@ -361,6 +364,11 @@ pub struct InventoryNeutralMMConfig {
     // Poll interval for main loop (ms)
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64, // default: 100
+    /// Floor between quoting cycles. After it, a new BBO version for the
+    /// symbol or a new fill starts the next cycle immediately; otherwise the
+    /// loop wakes after `poll_interval_ms`. Set >= poll_interval_ms to disable.
+    #[serde(default = "default_min_cycle_interval_ms")]
+    pub min_cycle_interval_ms: u64, // default: 50
 }
 
 fn positive(name: &str, values: &[f64]) -> anyhow::Result<()> {
@@ -499,6 +507,7 @@ impl InventoryNeutralMMConfig {
         );
         anyhow::ensure!(
             self.poll_interval_ms > 0
+                && self.min_cycle_interval_ms > 0
                 && self.order_ttl_secs > 0
                 && self.external_staleness_ms > 0
                 && self.margin_cooldown_secs > 0
@@ -598,6 +607,7 @@ impl Default for InventoryNeutralMMConfig {
             target_resting_margin_utilization: default_target_resting_margin_utilization(),
             use_post_only: false,
             poll_interval_ms: 100,
+            min_cycle_interval_ms: default_min_cycle_interval_ms(),
         }
     }
 }
@@ -844,6 +854,7 @@ mod tests {
         assert_eq!(config.stale_bbo_cancel_ms, 15000);
         assert_eq!(config.target_resting_margin_utilization, 0.35);
         assert_eq!(config.max_basis_bps, 20.0);
+        assert_eq!(config.min_cycle_interval_ms, 50);
 
         let invalid = [
             InventoryNeutralMMConfig {

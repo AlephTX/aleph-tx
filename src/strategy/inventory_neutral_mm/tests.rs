@@ -1761,3 +1761,16 @@ fn time_scaled_sigma_ignores_invalid_and_stalled_samples() {
     vol.update(2100.5, start + Duration::from_millis(60_001));
     assert!(vol.sigma().is_none());
 }
+
+#[test]
+fn cycle_wake_respects_floor_ceiling_and_events() {
+    let ms = Duration::from_millis;
+    let (min, max) = (ms(50), ms(250));
+    // Never earlier than the floor, even with fresh data.
+    assert!(!cycle_wake_due(ms(10), min, max, true));
+    // After the floor, data or fills wake the loop immediately.
+    assert!(cycle_wake_due(ms(50), min, max, true));
+    assert!(!cycle_wake_due(ms(120), min, max, false));
+    // Without events the old fixed interval still applies.
+    assert!(cycle_wake_due(ms(250), min, max, false));
+}

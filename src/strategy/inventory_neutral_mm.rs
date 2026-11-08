@@ -383,6 +383,9 @@ pub struct InventoryNeutralMM {
     micro: MicrostructureTracker,
     sigma: TimeScaledVolatility,
     basis: BasisTracker,
+    /// Last per-sample microstructure update; keeps its calibration at the
+    /// poll cadence even when event-driven cycles run faster.
+    last_micro_sample: Option<Instant>,
 
     // Order tracking (multi-level grid)
     active_orders: Vec<ActiveOrder>,
@@ -468,6 +471,7 @@ impl InventoryNeutralMM {
             ),
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
+            last_micro_sample: None,
             config,
             trading,
             order_tracker,
@@ -686,7 +690,7 @@ impl InventoryNeutralMM {
                 self.cancel_all_orders().await;
             }
 
-            tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            self.wait_for_next_cycle(shutdown).await;
         }
 
         Ok(())
@@ -1573,9 +1577,18 @@ impl InventoryNeutralMM {
         };
 
         // Update microstructure tracker with pricing_mid (now driven by external exchanges)
-        self.micro.update(pricing_mid);
+        // Per-sample signals (EMA periods, per-sample vol, toxicity) were
+        // calibrated at the poll cadence; sample them at that rate only.
+        let now = Instant::now();
+        if self.last_micro_sample.is_none_or(|last| {
+            now.saturating_duration_since(last)
+                >= Duration::from_millis(self.config.poll_interval_ms)
+        }) {
+            self.micro.update(pricing_mid);
+            self.last_micro_sample = Some(now);
+        }
         let vol_bps = self.micro.volatility_bps();
-        self.sigma.update(pricing_mid, Instant::now());
+        self.sigma.update(pricing_mid, now);
         // Until the time-scaled estimate warms up, fall back to the per-sample
         // figure; both are ~1e-4 for liquid perps at sub-second sampling.
         let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);
@@ -2092,6 +2105,38 @@ impl InventoryNeutralMM {
         mid: f64,
     ) -> (f64, f64) {
         apply_risk_limits(config, risk, desired_bid_size, desired_ask_size, mid)
+    }
+}
+
+/// Granularity of the event wait; each check is one atomic load plus a read lock.
+const WAKE_CHECK_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Event-driven pacing: never before `min`, at the latest at `max`, and in
+/// between as soon as market data or fills changed.
+fn cycle_wake_due(elapsed: Duration, min: Duration, max: Duration, changed: bool) -> bool {
+    elapsed >= max || (elapsed >= min && changed)
+}
+
+impl InventoryNeutralMM {
+    /// Wait until new BBO data for the symbol, a new fill, shutdown, or the
+    /// poll interval. Replaces a fixed sleep so requotes follow the market.
+    async fn wait_for_next_cycle(&self, shutdown: Option<&tokio::sync::watch::Receiver<bool>>) {
+        let start = Instant::now();
+        let max = Duration::from_millis(self.config.poll_interval_ms);
+        let min = Duration::from_millis(self.config.min_cycle_interval_ms).min(max);
+        let symbol = self.config.symbol_id;
+        let fills = self.order_tracker.total_fill_stats().0;
+        tokio::time::sleep(min).await;
+        loop {
+            let elapsed = start.elapsed();
+            let changed = shutdown_requested(shutdown)
+                || self.shm_reader.shared_version(symbol) != self.shm_reader.local_version(symbol)
+                || self.order_tracker.total_fill_stats().0 != fills;
+            if cycle_wake_due(elapsed, min, max, changed) {
+                return;
+            }
+            tokio::time::sleep(WAKE_CHECK_INTERVAL.min(max.saturating_sub(elapsed))).await;
+        }
     }
 }
 
