@@ -101,10 +101,12 @@ the strategy's normal shorter cancellation timer.
   decimal range (reported as null). Schema 2 journals record the Lighter
   market on session start and, with each IOC intent, the Lighter account read
   it was planned from: account, market, position, transaction time, request
-  duration and age against the freshness budget. The report shows this per IOC
-  as `journal_claim`, `unavailable` (older journals) or `invalid`. It is this
-  process's own record, not venue-signed proof of Lighter state or time.
-  The report never permits restart. It does not
+  duration and age against the freshness budget, which may not exceed the
+  live 5 s limit. The writer and the audit apply the same age rule, so the
+  live process never journals a record the audit rejects. The report shows
+  this per IOC as `journal_claim`, `unavailable` (older journals) or
+  `invalid`. It is this process's own record, not venue-signed proof of
+  Lighter state or time. The report never permits restart. It does not
   cover Lighter orders or inventory, and it never changes the active journal.
 - For a `pending` IOC, capture the raw Hyperliquid `orderStatus` response
   for its `cloid` and a later `clearinghouseState` response. Put them in an

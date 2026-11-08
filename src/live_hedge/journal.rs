@@ -57,6 +57,24 @@ pub struct PrimaryObservation {
     pub max_age_us: u64,
 }
 
+/// Largest Lighter observation age budget a schema 2 writer may enforce:
+/// the live MAX_ACCOUNT_AGE_MS. A record claiming a larger budget is invalid.
+pub const MAX_PRIMARY_AGE_US: u64 = super::MAX_ACCOUNT_AGE_MS * 1_000;
+
+impl PrimaryObservation {
+    /// The single freshness rule shared by the writer and the audit: the
+    /// rounded-up age is strictly inside a positive budget no larger than
+    /// MAX_PRIMARY_AGE_US. The writer journals only records that pass.
+    pub fn within_budget(&self) -> bool {
+        self.budget_allowed() && self.age_us < self.max_age_us
+    }
+
+    /// Whether the self-reported budget is one a writer could enforce.
+    pub fn budget_allowed(&self) -> bool {
+        self.max_age_us > 0 && self.max_age_us <= MAX_PRIMARY_AGE_US
+    }
+}
+
 /// Written and fsynced before the IOC is signed and dispatched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

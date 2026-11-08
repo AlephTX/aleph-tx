@@ -597,18 +597,17 @@ impl LiveInventoryHedge {
             fresh(sent_at_ms, observed.book.timestamp_ms, MAX_QUOTE_AGE_MS),
             "Hyperliquid book is stale at hedge dispatch"
         );
-        if self
-            .primary_validity(observed.primary_requested_at)
-            .is_none()
-        {
-            tracing::warn!("Lighter position aged out before hedge dispatch; re-observing");
-            return Ok(());
-        }
+        // One decision time: the journaled age is the one checked, with the
+        // audit's own rule, so live never writes a record the audit rejects.
         let primary_observation = primary_observation(
             &observed.primary_evidence,
             self.max_primary_age,
             Instant::now(),
         )?;
+        if !primary_observation.within_budget() {
+            tracing::warn!("Lighter position aged out before hedge dispatch; re-observing");
+            return Ok(());
+        }
         ensure!(
             primary_observation.position == observed.primary,
             "Lighter observation does not match the planned position"
@@ -748,7 +747,9 @@ impl LiveInventoryHedge {
 
 /// Journal form of the Lighter read behind an intent. Durations are local
 /// monotonic microseconds; the age is rounded up so truncation can never make
-/// an observation look younger than it was.
+/// an observation look younger than it was. Under the strict `age_us <
+/// max_age_us` rule an age inside the budget's last microsecond is
+/// rejected, never an expired one accepted.
 fn primary_observation(
     evidence: &crate::lighter_trading::PositionEvidence,
     max_age: Duration,

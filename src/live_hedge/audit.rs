@@ -17,7 +17,8 @@
 //! internal consistency only, as a local claim.
 
 use super::journal::{
-    IntentRecord, JournalRecord, ParseError, PrimaryObservation, StartRecord, TerminalRecord,
+    IntentRecord, JournalRecord, MAX_PRIMARY_AGE_US, ParseError, PrimaryObservation, StartRecord,
+    TerminalRecord,
 };
 use super::{
     CLOCK_TOLERANCE_MS, IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill,
@@ -444,7 +445,12 @@ impl State {
                 observation.request_us, observation.age_us
             ));
         }
-        if observation.max_age_us == 0 || observation.age_us >= observation.max_age_us {
+        if !observation.budget_allowed() {
+            invalid.push(format!(
+                "budget {} us is not in (0, {MAX_PRIMARY_AGE_US}] us, the live limit",
+                observation.max_age_us
+            ));
+        } else if !observation.within_budget() {
             invalid.push(format!(
                 "age {} us is not within the enforced budget {} us",
                 observation.age_us, observation.max_age_us

@@ -1,3 +1,4 @@
+use super::journal::{JOURNAL_SCHEMA, StartRecord};
 use super::*;
 use crate::exchange::{OrderParams, OrderType};
 use crate::exchanges::hyperliquid::PerpAsset;
@@ -897,4 +898,71 @@ fn audit_primary_observation(journal_path: &std::path::Path) {
     let report = audit::audit(torn.as_bytes(), None);
     assert_eq!(report.orders[0].status, audit::OrderStatus::Pending);
     assert_eq!(report.orders[0].primary.status, "journal_claim");
+}
+
+/// Writer and audit share one deadline: at fixed monotonic offsets around
+/// the budget, the writer journals exactly the records the audit accepts,
+/// and nothing at or past the deadline is journaled.
+#[test]
+fn primary_age_boundary_matches_between_writer_and_audit() {
+    let requested_at = Instant::now();
+    let evidence = crate::lighter_trading::PositionEvidence {
+        account_index: 7,
+        market_id: 4095,
+        position: d("0.01"),
+        transaction_time: Some(30),
+        requested_at,
+        received_at: requested_at + Duration::from_millis(12),
+    };
+    let start = JournalRecord::Start(StartRecord {
+        session_id: "boundary".into(),
+        network: "Testnet".into(),
+        lighter_account_index: 7,
+        hyperliquid_account: Some(format!("0x{}", "11".repeat(20))),
+        symbol: "ETH".into(),
+        journal_schema: Some(JOURNAL_SCHEMA),
+        lighter_market_id: Some(4095),
+    });
+    let budget = Duration::from_millis(MAX_ACCOUNT_AGE_MS);
+    let us = Duration::from_micros(1);
+    let ns = Duration::from_nanos(1);
+    for (offset, writer_accepts) in [
+        (budget - us - ns, true),
+        (budget - us, true),
+        (budget - us + ns, false), // rounds up to the budget
+        (budget - ns, false),
+        (budget, false),
+        (budget + ns, false),
+        (budget + us, false),
+    ] {
+        let observation = primary_observation(&evidence, budget, requested_at + offset).unwrap();
+        assert_eq!(observation.within_budget(), writer_accepts, "{offset:?}");
+        let intent = JournalRecord::Intent(IntentRecord {
+            cloid: format!("0x{}", "aa".repeat(16)),
+            coin: "ETH".into(),
+            submitted_at_ms: 2_000_000_000_000,
+            is_buy: false,
+            size: d("0.01"),
+            limit_price: d("2000"),
+            reduce_only: false,
+            primary_position: d("0.01"),
+            hedge_position: Decimal::ZERO,
+            primary_observation: Some(observation),
+        });
+        // The writer's own serialization, as `record` appends it.
+        let mut bytes = start.to_line().unwrap();
+        bytes.extend(intent.to_line().unwrap());
+        let report = audit::audit(&bytes, None);
+        let primary = report.orders[0].primary.status;
+        assert_eq!(primary == "journal_claim", writer_accepts, "{offset:?}");
+        assert!(!report.restart_permitted);
+        if writer_accepts {
+            assert_eq!(report.status, audit::AuditStatus::Unresolved);
+        } else {
+            assert_eq!(report.status, audit::AuditStatus::Invalid);
+        }
+    }
+    // A writer configured above the live limit rejects its own record too.
+    let over = primary_observation(&evidence, budget + us, requested_at + budget - us).unwrap();
+    assert!(!over.budget_allowed() && !over.within_budget());
 }

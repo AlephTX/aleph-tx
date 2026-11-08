@@ -857,3 +857,35 @@ fn primary_observation_is_required_in_v2_and_unavailable_before() {
         "unknown"
     );
 }
+
+/// A self-reported budget above the live 5 s limit cannot make an old
+/// observation look fresh; small synthetic budgets stay valid.
+#[test]
+fn inflated_primary_budget_is_invalid() {
+    let case = |age_us, max_age_us| {
+        let observation = PrimaryObservation {
+            age_us,
+            max_age_us,
+            ..observation()
+        };
+        audit(
+            &journal(&[v2_start(Some(4095)), observed_intent(Some(observation))]),
+            None,
+        )
+    };
+    for (age, max) in [(6_000_000, 10_000_000), (15_000, MAX_PRIMARY_AGE_US + 1)] {
+        let report = case(age, max);
+        assert_eq!(report.status, AuditStatus::Invalid, "{age}/{max}");
+        assert_eq!(report.orders[0].primary.status, "invalid");
+        assert!(report.orders[0].primary.reasons[0].contains("live limit"));
+    }
+    for (age, max) in [(15_000, MAX_PRIMARY_AGE_US), (15_000, 200_000)] {
+        let report = case(age, max);
+        assert_eq!(report.status, AuditStatus::Unresolved, "{age}/{max}");
+        assert_eq!(report.orders[0].primary.status, "journal_claim");
+    }
+    assert_eq!(
+        case(MAX_PRIMARY_AGE_US, MAX_PRIMARY_AGE_US).status,
+        AuditStatus::Invalid
+    );
+}
