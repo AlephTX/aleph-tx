@@ -25,16 +25,61 @@ pub struct FillsEvidence {
 struct Fill {
     coin: String,
     side: String,
-    #[serde(with = "rust_decimal::serde::str")]
+    #[serde(deserialize_with = "exact")]
     sz: Decimal,
     time: u64,
     oid: u64,
     tid: u64,
-    #[serde(with = "rust_decimal::serde::str")]
+    #[serde(deserialize_with = "exact")]
     fee: Decimal,
     fee_token: String,
-    #[serde(default, with = "rust_decimal::serde::str_option")]
+    #[serde(default, deserialize_with = "exact_option")]
     builder_fee: Option<Decimal>,
+}
+
+/// A venue decimal string parsed only if `Decimal` holds it exactly: the
+/// value must print back to the same digits (trailing fractional zeros
+/// aside). `Decimal`'s parser rounds past 28 fractional digits, which
+/// would let a slightly short or long amount pass an exact comparison.
+fn parse_exact(raw: &str) -> Result<Decimal, String> {
+    let value: Decimal = raw
+        .parse()
+        .map_err(|e| format!("`{raw}` is not a decimal: {e}"))?;
+    let canonical = |text: &str| {
+        let text = text.strip_prefix('+').unwrap_or(text);
+        match text.split_once('.') {
+            Some((int, frac)) => {
+                let frac = frac.trim_end_matches('0');
+                if frac.is_empty() {
+                    int.to_owned()
+                } else {
+                    format!("{int}.{frac}")
+                }
+            }
+            None => text.to_owned(),
+        }
+    };
+    let (raw_c, value_c) = (canonical(raw), canonical(&value.to_string()));
+    // "-0" and "0" are the same amount.
+    let zero = |t: &str| t.trim_start_matches('-').chars().all(|c| c == '0');
+    if raw_c == value_c || (zero(&raw_c) && value.is_zero()) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "`{raw}` is not exactly representable (would be {value})"
+        ))
+    }
+}
+
+fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
+    let raw = String::deserialize(d)?;
+    parse_exact(&raw).map_err(serde::de::Error::custom)
+}
+
+fn exact_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Decimal>, D::Error> {
+    Option::<String>::deserialize(d)?
+        .map(|raw| parse_exact(&raw).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 /// The venue's fee claim for one IOC.
@@ -100,23 +145,43 @@ impl FeeReport {
 /// differing field is a contradiction.
 pub(super) struct FillSet {
     by_tid: BTreeMap<u64, Fill>,
+    /// Fills for other coins, kept only to catch a bound oid claimed by
+    /// another coin.
+    foreign: BTreeMap<u64, Fill>,
 }
 
 /// Parse every capture. Returns the set or the reasons it is unusable.
 pub(super) fn load(captures: &[FillsEvidence], coin: &str) -> Result<FillSet, Vec<String>> {
     let mut by_tid: BTreeMap<u64, Fill> = BTreeMap::new();
+    let mut foreign: BTreeMap<u64, Fill> = BTreeMap::new();
     let mut errors = Vec::new();
     for (index, capture) in captures.iter().enumerate() {
-        let fills: Vec<Fill> = match serde_json::from_value(capture.response.clone()) {
-            Ok(fills) => fills,
-            Err(error) => {
-                errors.push(format!("fills[{index}] is not a fills array: {error}"));
-                continue;
-            }
+        let Some(entries) = capture.response.as_array() else {
+            errors.push(format!("fills[{index}] is not a fills array"));
+            continue;
         };
-        for fill in fills {
-            // Other coins in an account-wide window are not this session's.
+        for (position, entry) in entries.iter().enumerate() {
+            let fill: Fill = match serde_json::from_value(entry.clone()) {
+                Ok(fill) => fill,
+                Err(error) => {
+                    // Located: a bad amount must not hide inside the array.
+                    let tid = entry.get("tid").map(ToString::to_string);
+                    errors.push(format!(
+                        "fills[{index}][{position}] (tid {}): {error}",
+                        tid.as_deref().unwrap_or("?")
+                    ));
+                    continue;
+                }
+            };
+            // Other coins in an account-wide window are kept by tid but only
+            // matter if they claim an oid an IOC is bound to (see attribute).
             if fill.coin != coin {
+                let tid = fill.tid;
+                if let Some(seen) = foreign.insert(tid, fill.clone())
+                    && seen != fill
+                {
+                    errors.push(format!("tid {tid} is reported with conflicting fields"));
+                }
                 continue;
             }
             if fill.time > capture.observed_at_ms {
@@ -142,8 +207,13 @@ pub(super) fn load(captures: &[FillsEvidence], coin: &str) -> Result<FillSet, Ve
             }
         }
     }
+    for tid in foreign.keys() {
+        if by_tid.contains_key(tid) {
+            errors.push(format!("tid {tid} is reported for two coins"));
+        }
+    }
     if errors.is_empty() {
-        Ok(FillSet { by_tid })
+        Ok(FillSet { by_tid, foreign })
     } else {
         Err(errors)
     }
@@ -160,6 +230,11 @@ pub(super) struct IocFacts<'a> {
     pub oid_shared: bool,
     /// Reconciled fill (journal terminal or evidence match); None if open.
     pub filled: Option<Decimal>,
+    /// Venue time of the order's terminal status from a terminal
+    /// `orderStatus` lookup. A fill after it cannot belong to the IOC. None
+    /// when no terminal lookup exists: fees then stay unattributed rather
+    /// than trusting an unbounded window.
+    pub terminal_at_ms: Option<u64>,
 }
 
 /// Attribute venue-declared fees to one IOC, or explain why not.
@@ -179,6 +254,24 @@ pub(super) fn attribute(fills: &FillSet, ioc: &IocFacts<'_>, skew_ms: u64) -> Fe
         );
     }
     let bound: Vec<&Fill> = fills.by_tid.values().filter(|f| f.oid == oid).collect();
+    // Another coin claiming the bound oid contradicts the binding itself.
+    let foreign: Vec<String> = fills
+        .foreign
+        .values()
+        .filter(|f| f.oid == oid)
+        .map(|f| {
+            format!(
+                "tid {} is {} {} on oid {oid}, the IOC is {}",
+                f.tid, f.side, f.coin, ioc.coin
+            )
+        })
+        .collect();
+    if !foreign.is_empty() {
+        return FeeReport {
+            reasons: foreign,
+            ..FeeReport::with("invalid", Some(oid), String::new())
+        };
+    }
     let Some(filled) = ioc.filled else {
         return FeeReport::with(
             "unattributed",
@@ -186,6 +279,7 @@ pub(super) fn attribute(fills: &FillSet, ioc: &IocFacts<'_>, skew_ms: u64) -> Fe
             "the IOC fill is not reconciled; its fee stays unknown".into(),
         );
     };
+
     let side = if ioc.is_buy { "B" } else { "A" };
     let mut reasons = Vec::new();
     for fill in &bound {
@@ -201,6 +295,30 @@ pub(super) fn attribute(fills: &FillSet, ioc: &IocFacts<'_>, skew_ms: u64) -> Fe
                 fill.tid, fill.time, ioc.submitted_at_ms
             ));
         }
+        // Venue times on both sides: equal is the same instant, later is
+        // after the order was already terminal.
+        if let Some(terminal) = ioc.terminal_at_ms
+            && fill.time > terminal
+        {
+            reasons.push(format!(
+                "tid {} at {} is after the order's venue terminal time {terminal}",
+                fill.tid, fill.time
+            ));
+        }
+    }
+    if reasons.is_empty() && ioc.terminal_at_ms.is_none() && !bound.is_empty() {
+        // Contradictions above win; otherwise an unbounded window is not
+        // trusted with a fee.
+        return FeeReport {
+            tids: bound.iter().map(|f| f.tid).collect(),
+            reconciled_size: Some(filled),
+            ..FeeReport::with(
+                "unattributed",
+                Some(oid),
+                "no venue terminal time bounds this order's fills; supply its terminal orderStatus"
+                    .into(),
+            )
+        };
     }
     if !reasons.is_empty() {
         return FeeReport {

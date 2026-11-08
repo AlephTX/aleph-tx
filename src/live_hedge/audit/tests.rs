@@ -1053,10 +1053,14 @@ fn incomplete_or_contradictory_fills_are_not_attributed() {
         response: json!({"error": "rate limited"}),
     }]);
     assert_eq!(malformed.0, "invalid");
-    // Another coin in an account-wide window is not this session's.
-    let mut btc = fill(1, 8, "0.004", "0.001", "USDC", 1_400);
+    // Another coin on an unrelated oid is not this session's: ignored.
+    let mut btc = fill(5, 77, "0.004", "0.001", "USDC", 1_400);
     btc["coin"] = json!("BTC");
-    assert_eq!(status(vec![fills(vec![btc])]).0, "unattributed");
+    let unrelated = status(vec![fills(vec![
+        btc,
+        fill(1, 8, "0.004", "0.002", "USDC", 1_400),
+    ])]);
+    assert_eq!(unrelated.0, "attributed");
 }
 
 /// Without a reconciled fill, a bound oid, or a unique binding, fees stay
@@ -1161,4 +1165,151 @@ fn one_oid_never_binds_two_iocs() {
         assert!(order.fee.fees.is_empty());
     }
     assert!(kinds(&report).contains(&"invalid_fee_evidence"));
+}
+
+/// Fills are bounded by the order's venue terminal time: the same instant
+/// is attributed, later is invalid; a local-only terminal time (response
+/// source, no lookup) bounds nothing and leaves the fee unattributed.
+#[test]
+fn fills_after_the_venue_terminal_time_are_rejected() {
+    // fee_report: lookup terminal at 1500, journal terminal (lookup) 1500,
+    // account time 1600.
+    let at = |time| {
+        let report = fee_report(vec![fills(vec![fill(
+            1, 8, "0.004", "0.002", "USDC", time,
+        )])]);
+        (report.orders[0].fee.clone(), report.status)
+    };
+    assert_eq!(at(1_500).0.status, "attributed", "same venue instant");
+    for time in [1_501, 1_650] {
+        let (fee, status) = at(time);
+        assert_eq!(fee.status, "invalid", "{time}");
+        assert!(
+            fee.reasons[0].contains("after the order's venue terminal time 1500"),
+            "{:?}",
+            fee.reasons
+        );
+        assert!(fee.fees.is_empty());
+        assert_eq!(status, AuditStatus::Invalid);
+    }
+    // A partial fill in two parts, the last exactly at the terminal time.
+    let split = fee_report(vec![fills(vec![
+        fill(1, 8, "0.001", "0.0005", "USDC", 1_100),
+        fill(2, 8, "0.003", "0.0015", "USDC", 1_500),
+    ])]);
+    assert_eq!(split.orders[0].fee.status, "attributed");
+    assert_eq!(split.orders[0].fee.fees[0].fee, d("0.002"));
+    // Without a venue terminal time (only local times known) the fee is
+    // never attributed. Through `audit` an oid always comes from a located
+    // lookup, so this unit-checks the attribution rule directly.
+    let set = fees::load(
+        &[fills(vec![fill(1, 8, "0.004", "0.002", "USDC", 1_400)])],
+        "ETH",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let facts = |terminal_at_ms| fees::IocFacts {
+        coin: "ETH",
+        is_buy: false,
+        submitted_at_ms: 1_000,
+        oid: Some(8),
+        oid_shared: false,
+        filled: Some(d("0.004")),
+        terminal_at_ms,
+    };
+    let unbounded = fees::attribute(&set, &facts(None), 1_000);
+    assert_eq!(unbounded.status, "unattributed");
+    assert!(unbounded.reasons[0].contains("no venue terminal time"));
+    assert!(unbounded.fees.is_empty());
+    assert_eq!(
+        fees::attribute(&set, &facts(Some(1_400)), 1_000).status,
+        "attributed"
+    );
+}
+
+/// A bound oid claimed by another coin invalidates that IOC's fee, even
+/// beside a fill that alone would cover it; other coins on other oids do
+/// not touch it, and a tid reported for two coins is a contradiction.
+#[test]
+fn a_bound_oid_claimed_by_another_coin_is_invalid() {
+    let btc = |tid, oid| {
+        let mut entry = fill(tid, oid, "0.004", "0.001", "USDC", 1_400);
+        entry["coin"] = json!("BTC");
+        entry
+    };
+    let good = || fill(1, 8, "0.004", "0.002", "USDC", 1_400);
+    for (name, entries) in [
+        ("alone", vec![btc(7, 8)]),
+        ("beside a covering fill", vec![btc(7, 8), good()]),
+    ] {
+        let report = fee_report(vec![fills(entries)]);
+        let fee = &report.orders[0].fee;
+        assert_eq!(fee.status, "invalid", "{name}");
+        assert!(
+            fee.reasons[0].contains("tid 7 is A BTC on oid 8"),
+            "{name}: {:?}",
+            fee.reasons
+        );
+        assert!(fee.fees.is_empty(), "{name}");
+        assert_eq!(report.status, AuditStatus::Invalid, "{name}");
+        assert!(kinds(&report).contains(&"invalid_fee_evidence"));
+        // The order's own reconciliation is untouched.
+        assert_eq!(report.orders[0].status, OrderStatus::Recorded);
+    }
+    assert_eq!(
+        fee_report(vec![fills(vec![btc(7, 77), good()])]).orders[0]
+            .fee
+            .status,
+        "attributed"
+    );
+    let two_coins = fee_report(vec![fills(vec![btc(1, 77), good()])]);
+    assert_eq!(two_coins.orders[0].fee.status, "invalid");
+    assert!(two_coins.orders[0].fee.reasons[0].contains("tid 1 is reported for two coins"));
+    // A conflicting repeat of another coin's tid is still a contradiction.
+    let mut changed = btc(7, 77);
+    changed["fee"] = json!("0.009");
+    let conflict = fee_report(vec![fills(vec![btc(7, 77), good()]), fills(vec![changed])]);
+    assert_eq!(conflict.orders[0].fee.status, "invalid");
+}
+
+/// Amounts that `Decimal` would round are rejected with their location;
+/// exact values (trailing zeros, zero, negative rebate, 28 digits) pass.
+#[test]
+fn fill_amounts_must_be_exactly_representable() {
+    let long = "0.00400000000000000000000000001"; // 29 fractional digits
+    for (field, value) in [
+        ("sz", long),
+        ("fee", "0.00200000000000000000000000001"),
+        ("builderFee", long),
+    ] {
+        let mut entry = fill(1, 8, "0.004", "0.002", "USDC", 1_400);
+        entry[field] = json!(value);
+        let report = fee_report(vec![fills(vec![entry])]);
+        let fee = &report.orders[0].fee;
+        assert_eq!(fee.status, "invalid", "{field}");
+        let reason = fee.reasons.join("; ");
+        assert!(
+            reason.contains("fills[0][0] (tid 1)") && reason.contains("not exactly representable"),
+            "{field}: {reason}"
+        );
+        assert!(kinds(&report).contains(&"invalid_fills"));
+        assert_eq!(report.status, AuditStatus::Invalid);
+    }
+    for (sz, fee) in [
+        ("0.0040", "0.00200"),
+        ("0.004", "0"),
+        ("0.004", "-0.0002"),
+        ("0.004", "0.0000000000000000000000000001"),
+    ] {
+        let report = fee_report(vec![fills(vec![fill(1, 8, sz, fee, "USDC", 1_400)])]);
+        assert_eq!(report.orders[0].fee.status, "attributed", "{sz} {fee}");
+        assert_eq!(report.orders[0].fee.fees[0].fee, d(fee));
+    }
+    let mut not_number = fill(1, 8, "0.004", "0.002", "USDC", 1_400);
+    not_number["fee"] = json!("1e-3");
+    assert_eq!(
+        fee_report(vec![fills(vec![not_number])]).orders[0]
+            .fee
+            .status,
+        "invalid"
+    );
 }

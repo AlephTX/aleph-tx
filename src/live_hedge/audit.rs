@@ -1044,6 +1044,7 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
         snapshot: snapshot.as_ref().map(|s| s.position),
     };
     let mut oids: Vec<Option<u64>> = Vec::with_capacity(state.iocs.len());
+    let mut venue_terminals: Vec<Option<u64>> = Vec::with_capacity(state.iocs.len());
     for (index, ioc) in state.iocs.iter().enumerate() {
         let lookups: Vec<&LookupEvidence> = usable_lookups
             .iter()
@@ -1052,6 +1053,14 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
             .collect();
         let evaluated = evaluate_lookups(&ioc.intent, &lookups);
         oids.push(evaluated.as_ref().ok().and_then(|(_, oid)| *oid));
+        // Venue terminal time comes only from a terminal `orderStatus`
+        // lookup, the same evidence that binds the oid. Journal terminal
+        // times are not used: a `response` terminal holds the local dispatch
+        // time, and without a terminal lookup no oid can be bound anyway.
+        venue_terminals.push(match evaluated.as_ref().ok().map(|(view, _)| view) {
+            Some(LookupView::Terminal { at_ms, .. }) => Some(*at_ms),
+            _ => None,
+        });
         let view = evaluated.map(|(view, _)| view);
         let order = order_report(
             ioc,
@@ -1071,7 +1080,7 @@ pub fn audit(journal: &[u8], evidence: Option<&Evidence>) -> Report {
     {
         check_snapshot_against_journal(&mut state, snapshot);
     }
-    attribute_fees(&mut state, evidence, &oids, &mut orders);
+    attribute_fees(&mut state, evidence, &oids, &venue_terminals, &mut orders);
     // Lighter findings only add issues; Hyperliquid order results stay as is.
     let journaled = std::mem::take(&mut state.lighter_batches);
     let gaps: Vec<lighter::JournalGap> = state
@@ -1251,6 +1260,7 @@ fn attribute_fees(
     state: &mut State,
     evidence: Option<(&Evidence, bool)>,
     oids: &[Option<u64>],
+    venue_terminals: &[Option<u64>],
     orders: &mut [OrderReport],
 ) {
     let Some((evidence, usable)) = evidence.filter(|(e, _)| !e.fills.is_empty()) else {
@@ -1304,6 +1314,7 @@ fn attribute_fees(
                 oid,
                 oid_shared: shared,
                 filled,
+                terminal_at_ms: venue_terminals[index],
             },
             LOOKUP_SKEW_MS,
         );
