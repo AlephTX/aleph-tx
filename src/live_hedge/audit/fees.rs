@@ -41,7 +41,7 @@ struct Fill {
 /// value must print back to the same digits (trailing fractional zeros
 /// aside). `Decimal`'s parser rounds past 28 fractional digits, which
 /// would let a slightly short or long amount pass an exact comparison.
-fn parse_exact(raw: &str) -> Result<Decimal, String> {
+pub(super) fn parse_exact(raw: &str) -> Result<Decimal, String> {
     let value: Decimal = raw
         .parse()
         .map_err(|e| format!("`{raw}` is not a decimal: {e}"))?;
@@ -71,7 +71,7 @@ fn parse_exact(raw: &str) -> Result<Decimal, String> {
     }
 }
 
-fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
+pub(super) fn exact<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
     let raw = String::deserialize(d)?;
     parse_exact(&raw).map_err(serde::de::Error::custom)
 }
@@ -434,15 +434,21 @@ fn per_token(fills: &[&Fill]) -> Result<Vec<AssetFee>, String> {
 /// and the order of signed terms does not matter. `Decimal::checked_add`
 /// rounds once a sum needs more than 96 bits of mantissa at its scale.
 #[derive(Debug, Clone, Default)]
-struct ExactSum {
+pub(super) struct ExactSum {
     /// (mantissa, scale) of every term.
     terms: Vec<(num_bigint::BigInt, u32)>,
 }
 
 impl ExactSum {
-    fn add(&mut self, value: Decimal) {
+    pub(super) fn add(&mut self, value: Decimal) {
         self.terms
             .push((num_bigint::BigInt::from(value.mantissa()), value.scale()));
+    }
+
+    /// Add `mantissa * 10^-scale`, a term no `Decimal` may hold (such as an
+    /// unrounded product).
+    pub(super) fn add_scaled(&mut self, mantissa: num_bigint::BigInt, scale: u32) {
+        self.terms.push((mantissa, scale));
     }
 
     /// The exact total as (mantissa, scale) at the largest term scale.
@@ -459,7 +465,7 @@ impl ExactSum {
 
     /// The total as a `Decimal` if it fits exactly; otherwise None (the
     /// exact digits are kept in the error text by the caller).
-    fn exact(&self) -> Result<Decimal, String> {
+    pub(super) fn exact(&self) -> Result<Decimal, String> {
         let (mut mantissa, mut scale) = self.total();
         let ten = num_bigint::BigInt::from(10);
         // Drop trailing zero digits the scale does not need.
@@ -474,7 +480,7 @@ impl ExactSum {
     }
 
     /// Compare the exact total with `other` exactly.
-    fn cmp_to(&self, other: Decimal) -> std::cmp::Ordering {
+    pub(super) fn cmp_to(&self, other: Decimal) -> std::cmp::Ordering {
         let mut both = self.clone();
         both.add(-other);
         both.total().0.cmp(&num_bigint::BigInt::from(0))

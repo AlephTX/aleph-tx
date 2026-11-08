@@ -37,7 +37,9 @@ use std::path::Path;
 mod fees;
 mod lighter;
 pub use fees::{AssetFee, FeeReport, FillsEvidence};
-pub use lighter::{LighterEvidence, LighterOrderReport, PrimaryLegReport, RawResponse};
+pub use lighter::{
+    LighterEvidence, LighterFeeReport, LighterOrderReport, PrimaryLegReport, RawResponse,
+};
 
 /// Operator-supplied, frozen venue observations for one hedge account.
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +244,7 @@ const BOUNDARIES: &[&str] = &[
     "Lighter (primary leg) orders and inventory are not journaled; check them on the venue.",
     "Lighter evidence covers only the client order IDs the caller declared, not every order on the account; an absent order proves nothing.",
     "A primary observation is this process's local record of one Lighter read: not venue-signed, not proof of venue state time, and not an order or account ledger.",
+    "A Lighter fee is estimated from the rate one trade declares for the account's role, times its price and size. It is not the amount charged and names no asset.",
     "An unknown or absent lookup never proves an IOC was not accepted or filled.",
     "The active journal and account lock are untouched; this report never permits restart.",
 ];

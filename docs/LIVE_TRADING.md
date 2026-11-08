@@ -140,6 +140,21 @@ the strategy's normal shorter cancellation timer.
   declared, and each order shows whether it came from the journal, the
   caller or both. A record proves only that the batch was prepared, not
   that it reached the venue.
+- To check the declared Lighter fee rate for a terminal order, add raw
+  `/api/v1/trades` responses to the `lighter` section as `trades`
+  (`observed_at_ms`, `response`). Each order's `fee` view binds trades only
+  through the `order_index` in that order's own history entry, and needs one
+  trade that alone covers the exact filled size. It takes the account's
+  maker or taker role from the trade's side and `is_maker_ask`, checked
+  against the order's time in force, and reads only that role's rate in
+  parts per million. `estimated_fee` is `rate / 1e6 * price * size`, exact.
+  Lighter omits zero or empty fields, so an absent or null rate is
+  `unknown` with no amount; only an explicit `0` is a verifiable zero. Wrong
+  account, market, side or client order, conflicting repeats of a trade ID
+  and fills above the order's size are invalid. A short or split fill, a
+  declared integrator fee or a liquidation trade stays `unknown`. The
+  estimate applies the declared rate, is not the amount charged and names no
+  asset.
 - When the authenticated Lighter equity stream is quiet, the feeder refreshes
   balances from the account REST endpoint. Position freshness remains
   independent, and an older REST request cannot overwrite a newer WS update.

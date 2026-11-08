@@ -17,6 +17,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+mod fees;
+pub use fees::LighterFeeReport;
+
 /// Frozen Lighter responses for the session's account and market.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +37,10 @@ pub struct LighterEvidence {
     /// Raw `/api/v1/account?by=index` response captured after the histories.
     #[serde(default)]
     pub account: Option<RawResponse>,
+    /// Raw `/api/v1/trades` responses; optional. Used only for each
+    /// terminal order's declared fee rate (see `fees`).
+    #[serde(default)]
+    pub trades: Vec<RawResponse>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +67,9 @@ pub struct LighterOrderReport {
     /// Trade watermark the account must cover; 0 when nothing filled.
     pub fill_watermark: Option<u64>,
     pub reason: Option<String>,
+    /// Declared fee rate replayed from one frozen trade; `not_provided`
+    /// without trades evidence.
+    pub fee: LighterFeeReport,
 }
 
 /// The primary leg as far as the declared orders and one account sample
@@ -256,6 +266,10 @@ pub(super) fn evaluate(
     }
     evaluate_orders(evidence, journaled, &mut report, &mut findings);
     evaluate_account(evidence, &mut report, &mut findings);
+    // Fee views only add findings; order states and the leg verdict above
+    // are computed without them.
+    let mut fee_findings = Vec::new();
+    fees::attribute(evidence, &mut report.orders, &mut fee_findings);
     report.status = if findings.iter().any(|f| f.invalid) {
         "invalid"
     } else if findings.iter().any(|f| MISSING.contains(&f.kind)) {
@@ -265,6 +279,7 @@ pub(super) fn evaluate(
     } else {
         "unresolved"
     };
+    findings.extend(fee_findings);
     (report, findings)
 }
 
@@ -418,6 +433,7 @@ fn lighter_order(
         filled: order.map(|o| o.filled_base_amount),
         fill_watermark,
         reason: None,
+        fee: LighterFeeReport::not_provided(),
     }
 }
 

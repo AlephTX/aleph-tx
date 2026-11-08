@@ -714,3 +714,5 @@ fn older_schemas_never_claim_batch_coverage() {
     assert_eq!(v1.primary_leg.journal_coverage, "not_recorded");
     assert_eq!(v1.primary_leg.status, "missing_evidence");
 }
+
+mod fees;
