@@ -138,8 +138,11 @@ the strategy's normal shorter cancellation timer.
   records for the CLOID, or a fill the journal never confirmed is invalid.
   The fees are never subtracted: the estimate names no asset, so
   `comparison` is always `not_comparable` with its reasons. Exit codes match
-  the audit: 0 when both records bind, 2 when one is missing or the file is
-  torn, 3 on contradictions. `examples/hedge_fee_view/` is a synthetic
+  the audit: 0 when both records bind, 2 when one is missing or either file
+  is torn, 3 on contradictions. A journal whose last line lacks its newline
+  never binds, even when the selected IOC's records are complete before it:
+  the cut line may have been any record. Another IOC that is still open
+  does not affect the selected one. `examples/hedge_fee_view/` is a synthetic
   example from the real writers (CLOID
   `0x0123456789abcdef0123456789abcdef`).
 - For the Lighter leg of a schema 2 journal, an optional `lighter` section

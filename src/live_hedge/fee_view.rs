@@ -511,6 +511,24 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str)
             format!("audit {}: {}", issue.kind, issue.detail),
         );
     }
+    // A torn final line was cut mid-write and may have been any record,
+    // including a later terminal or intent for this CLOID. The complete
+    // prefix cannot show the selected IOC is unaffected, so the view is at
+    // least unresolved; a contradiction above still wins.
+    for issue in report.issues.iter().filter(|i| i.kind == "truncated_tail") {
+        let at = issue
+            .line
+            .map_or_else(String::new, |line| format!(" on line {line}"));
+        flag(
+            &mut status,
+            &mut reasons,
+            ViewStatus::Unresolved,
+            format!(
+                "the journal is truncated{at}; its complete prefix cannot show this IOC is unaffected ({})",
+                issue.detail
+            ),
+        );
+    }
     if report
         .evidence
         .as_ref()

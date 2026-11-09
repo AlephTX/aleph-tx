@@ -674,3 +674,114 @@ async fn cli_example_matches_the_writers() {
     .unwrap();
     assert_eq!(view.status, ViewStatus::Bound, "{:?}", view.reasons);
 }
+
+/// A torn journal tail may hide a later record for the selected IOC, so a
+/// complete prefix never binds. Contradictions still win, and an unrelated
+/// open IOC with complete records stays its own matter.
+#[tokio::test]
+async fn a_truncated_journal_never_binds_and_contradictions_still_win() {
+    let telemetry = written(info(), vec![record(1999.0, "fill")]).await;
+    let complete = reconciled(Some("1999"));
+    let torn = |tail: &[u8]| [complete.as_slice(), tail].concat();
+    let terminal_prefix = format!(r#"{{"event":"hedge_terminal","cloid":"{CLOID}","fil"#);
+    let mut whole = JournalRecord::Terminal(terminal(CLOID, Some("1999")))
+        .to_line()
+        .unwrap();
+    assert_eq!(whole.pop(), Some(b'\n'));
+    let cases: [(&str, Vec<u8>, usize); 3] = [
+        (
+            "half a terminal for this cloid",
+            torn(terminal_prefix.as_bytes()),
+            4,
+        ),
+        ("a whole record without its newline", torn(&whole), 4),
+        ("garbage tail", torn(b"{\"ev"), 4),
+    ];
+    for (name, journal, line) in cases {
+        let view = build(&journal, &paid(), &telemetry, CLOID);
+        assert_eq!(view.status, ViewStatus::Unresolved, "{name}");
+        assert_eq!(view.status.exit_code(), 2, "{name}");
+        assert_eq!(view.audit_status, AuditStatus::Unresolved, "{name}");
+        let reason = view
+            .reasons
+            .iter()
+            .find(|r| r.contains("truncated"))
+            .unwrap();
+        assert!(reason.contains(&format!("line {line}")), "{name}: {reason}");
+        // Both costs stay visible as diagnostics; they are not bound.
+        assert_eq!(view.telemetry.status, ViewStatus::Bound, "{name}");
+        assert_eq!(
+            view.venue_fee.as_ref().unwrap().status,
+            "attributed",
+            "{name}"
+        );
+    }
+    // A torn intent for another IOC is the same: the file is incomplete.
+    let other_intent = JournalRecord::Intent(IntentRecord {
+        submitted_at_ms: 2_000,
+        ..intent(OTHER, "-0.004")
+    })
+    .to_line()
+    .unwrap();
+    let view = build(
+        &torn(&other_intent[..other_intent.len() - 1]),
+        &paid(),
+        &telemetry,
+        CLOID,
+    );
+    assert_eq!(view.status, ViewStatus::Unresolved);
+    assert!(has(&view, "truncated on line 4"), "{:?}", view.reasons);
+    // Truncation and a contradiction together: the contradiction decides.
+    let mut foreign = info();
+    foreign.session_id = "other-session".into();
+    let wrong = written(foreign, vec![record(1999.0, "fill")]).await;
+    let view = build(&torn(terminal_prefix.as_bytes()), &paid(), &wrong, CLOID);
+    assert_eq!(view.status, ViewStatus::Invalid);
+    assert_eq!(view.status.exit_code(), 3);
+    assert!(
+        has(&view, "truncated") && has(&view, "session_id"),
+        "{:?}",
+        view.reasons
+    );
+    // Truncated telemetry on top of a truncated journal stays unresolved.
+    let mut torn_telemetry = telemetry.clone();
+    torn_telemetry.extend_from_slice(b"{\"type\":\"snap");
+    let view = build(
+        &torn(terminal_prefix.as_bytes()),
+        &paid(),
+        &torn_telemetry,
+        CLOID,
+    );
+    assert_eq!(view.status, ViewStatus::Unresolved);
+    assert!(has(&view, "journal is truncated") && has(&view, "lacks its newline"));
+    // Another IOC with complete records that is still open is not
+    // truncation: this IOC binds, the audit stays unresolved for the other.
+    let open_other = [
+        complete.as_slice(),
+        &JournalRecord::Intent(IntentRecord {
+            submitted_at_ms: 2_000,
+            ..intent(OTHER, "-0.004")
+        })
+        .to_line()
+        .unwrap(),
+    ]
+    .concat();
+    let view = build(&open_other, &paid(), &telemetry, CLOID);
+    assert_eq!(view.status, ViewStatus::Bound, "{:?}", view.reasons);
+    assert_eq!(view.audit_status, AuditStatus::Unresolved);
+    // An unresolved audit issue unrelated to this IOC's records (an account
+    // snapshot older than the last confirmation) is not truncation.
+    let mut stale = paid();
+    stale.account_snapshot = Some(audit::SnapshotEvidence {
+        observed_at_ms: 1_560,
+        state: json!({"time": 1_550, "withdrawable": "100",
+            "marginSummary": {"accountValue": "100", "totalNtlPos": "0", "totalMarginUsed": "0"},
+            "assetPositions": [{"position": {"coin": "ETH", "szi": "-0.004", "unrealizedPnl": "0"}}]}),
+    });
+    let view = build(&complete, &stale, &telemetry, CLOID);
+    assert_eq!(view.status, ViewStatus::Bound, "{:?}", view.reasons);
+    assert_eq!(view.audit_status, AuditStatus::Unresolved);
+    let other = build(&open_other, &paid(), &telemetry, OTHER);
+    assert_eq!(other.status, ViewStatus::Unresolved);
+    assert!(has(&other, "not reconciled"), "{:?}", other.reasons);
+}
