@@ -97,9 +97,10 @@ export interface Session {
   valuation?: Valuation
 }
 
-/** reported: venue-reported · estimated: limit price, configured fee or mark
- * · unknown: legacy record without provenance · missing: no mark for an open
- * position · flat / none: nothing to value. */
+/** reported: venue-reported · estimated: limit price, configured or declared
+ * fee rate, or mark · unknown: legacy record without provenance, or a Lighter
+ * fill without a usable fee rate · missing: no mark for an open position ·
+ * flat / none: nothing to value. */
 export type Quality = 'reported' | 'estimated' | 'unknown' | 'missing' | 'flat' | 'none'
 
 export interface LegValuation {
@@ -113,6 +114,17 @@ export interface HedgeValuation extends LegValuation {
   price_sources: { fill: number; limit: number; unknown: number }
   fee_sources: { configured_rate: number; unknown: number }
 }
+
+/** How each Lighter fill's fee was derived (see LighterFeeSource). */
+export interface LighterValuation extends LegValuation {
+  fee_sources?: Record<LighterFeeSource | 'unknown', number>
+}
+
+/** rate_derived / explicit_zero: the trade declared a rate for the account's
+ * role (an explicit 0 is a known zero) · missing: absent or null, which
+ * Lighter also sends for zero, so not a known zero · invalid: not an integer
+ * ppm rate · role_unknown: the maker side was guessed. null: older writer. */
+export type LighterFeeSource = 'rate_derived' | 'explicit_zero' | 'missing' | 'invalid' | 'role_unknown'
 
 /** observed: feed <= sample <= now holds · historical: same, for the last
  * mark of a stopped session · unknown: a sample or feed time is missing
@@ -143,7 +155,7 @@ export interface Mark {
 
 export interface Valuation {
   mark: Mark
-  lighter: LegValuation
+  lighter: LighterValuation
   hedge: HedgeValuation
   combined_quality: Quality
   missing: string[]
@@ -214,6 +226,8 @@ export interface Fill {
   position_after: number
   avg_cost_after: number
   net_pnl_after: number
+  /** Absent from older servers; null for older writers. Both are unknown. */
+  fee_source?: LighterFeeSource | null
 }
 
 export interface Order {

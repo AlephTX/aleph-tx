@@ -1,7 +1,7 @@
 // Turns the server's cost provenance labels into display badges and notes.
 import type { BadgeTone } from './components/ui'
 import { duration } from './format'
-import type { LegValuation, Mark, Quality, Session } from './types'
+import type { LegValuation, LighterFeeSource, Mark, Quality, Session } from './types'
 
 export interface QualityBadge {
   label: string
@@ -19,11 +19,30 @@ export function qualityBadge(quality: Quality | undefined): QualityBadge | null 
   return quality ? (BADGES[quality] ?? null) : { label: '未知', tone: 'bad' }
 }
 
+const FEE_SOURCES: Record<LighterFeeSource, QualityBadge | null> = {
+  rate_derived: null,
+  explicit_zero: null,
+  missing: { label: '费率缺失', tone: 'bad' },
+  invalid: { label: '费率无效', tone: 'bad' },
+  role_unknown: { label: '角色未知', tone: 'bad' },
+}
+
+/** A fill's fee badge: none when its trade declared a rate for the account's
+ * role. Missing is shown apart from an explicit zero though both read $0. */
+export function feeSourceBadge(source: LighterFeeSource | null | undefined): QualityBadge | null {
+  return source && Object.hasOwn(FEE_SOURCES, source)
+    ? FEE_SOURCES[source]
+    : { label: '来源未知', tone: 'bad' }
+}
+
 const FUNDING_NOTE = '资金费未计入'
 
 const MISSING: Record<string, string> = {
   mark_price: '无有效标记价，浮动盈亏未知',
   mark_time: '标记价观测时间未知，仅知快照写入时间',
+  lighter_actual_fee: 'Lighter 手续费按成交声明费率估算，非实际扣款',
+  lighter_fee_rate: '部分 Lighter 成交费率缺失或无效，手续费未知',
+  lighter_fee_source: '旧记录 Lighter 手续费来源未知',
   hedge_fill_price: '部分对冲成交按 IOC 限价估算',
   hedge_price_source: '旧记录对冲价来源未知',
   hedge_actual_fee: '对冲手续费按配置费率估算',

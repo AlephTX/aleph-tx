@@ -35,7 +35,7 @@
   "total_pnl": 0.5,
   "unrealized": 0.5,
   "valuation": {
-   "combined_quality": "estimated",
+   "combined_quality": "unknown",
    "excluded": [
     "funding"
    ],
@@ -55,8 +55,16 @@
     "unrealized": "flat"
    },
    "lighter": {
-    "fees": "reported",
-    "quality": "estimated",
+    "fee_sources": {
+     "explicit_zero": 0,
+     "invalid": 0,
+     "missing": 0,
+     "rate_derived": 0,
+     "role_unknown": 0,
+     "unknown": 1
+    },
+    "fees": "unknown",
+    "quality": "unknown",
     "realized": "reported",
     "unrealized": "estimated"
    },
@@ -73,6 +81,7 @@
    },
    "missing": [
     "mark_time",
+    "lighter_fee_source",
     "funding"
    ],
    "scope": "strategy session trades, not account equity"

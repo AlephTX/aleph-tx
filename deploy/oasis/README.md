@@ -12,7 +12,15 @@ When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file
 
 API: `/api/status`, `/api/summary`, `/api/alerts`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
-Lighter trade PnL covers Lighter fills, fees and rebates. When the inventory
+Lighter trade PnL covers Lighter fills, fees and rebates. Each Lighter fee
+is the rate its trade declares for the account's role times price and size,
+so the console labels it an estimate, not the amount charged. Every fill
+records a `fee_source`: `rate_derived`, `explicit_zero`, `missing`
+(Lighter omits zero fields, so an absent rate is not a known zero),
+`invalid` or `role_unknown`. Fills from older feeders, and rows ingested
+before this field existed, are `null`. Any fill without a declared rate
+makes the session's Lighter fee total unknown; fee numbers are unchanged.
+When the inventory
 hedge is enabled, each reconciled Hyperliquid IOC is exported as a
 `hedge_fill` record after it is journaled, and tracked as a separate leg with
 its own average cost and an estimated taker fee. Its price is the venue's

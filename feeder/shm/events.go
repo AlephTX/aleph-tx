@@ -17,6 +17,17 @@ const (
 	EventTypePrivateLost   uint8 = 5
 )
 
+// Fee sources for a V2 fill, matching Rust `FeeSource`. The byte was
+// reserved (always 0) before it carried a source, so 0 must stay unknown.
+const (
+	FeeSourceUnknown      uint8 = 0 // older writer, or no fee evidence
+	FeeSourceRateDerived  uint8 = 1 // explicit nonzero rate x price x size
+	FeeSourceExplicitZero uint8 = 2 // the role's rate field was an explicit 0
+	FeeSourceMissing      uint8 = 3 // the role's rate field was absent or null
+	FeeSourceInvalid      uint8 = 4 // the role's rate field was not an integer in +-1e6 ppm
+	FeeSourceRoleUnknown  uint8 = 5 // is_maker_ask was not a boolean: the role was guessed
+)
+
 // Exchange IDs matching Rust constants
 const (
 	ExchangeHyperliquid uint8 = 1
@@ -75,7 +86,8 @@ type ShmPrivateEventV2 struct {
 	OrderPrice    float64  // 8 bytes (offset 88)  - order price
 	TimestampNs   uint64   // 8 bytes (offset 96)  - event timestamp (nanoseconds)
 	TradeID       uint64   // 8 bytes (offset 104) - trade ID (for fill dedup)
-	_reserved     [16]byte // 16 bytes (offset 112) - reserved for future use
+	FeeSource     uint8    // 1 byte  (offset 112) - FeeSource*; 0 = unknown (older writers)
+	_reserved     [15]byte // 15 bytes (offset 113) - reserved for future use
 }
 
 // Compile-time size assertion
@@ -202,7 +214,8 @@ func (rb *EventRingBufferV2) PushOrderCreatedV2(
 	})
 }
 
-// PushOrderFilledV2 writes an order filled event with trade_id for dedup
+// PushOrderFilledV2 writes an order filled event with trade_id for dedup and
+// the provenance of feePaid.
 func (rb *EventRingBufferV2) PushOrderFilledV2(
 	exchangeID uint8,
 	symbolID uint16,
@@ -213,6 +226,7 @@ func (rb *EventRingBufferV2) PushOrderFilledV2(
 	isAsk bool,
 	timestampNs uint64,
 	tradeID uint64,
+	feeSource uint8,
 ) {
 	var isAskByte uint8
 	if isAsk {
@@ -232,6 +246,7 @@ func (rb *EventRingBufferV2) PushOrderFilledV2(
 		OrderIndex:      orderIndex,
 		TimestampNs:     timestampNs,
 		TradeID:         tradeID,
+		FeeSource:       feeSource,
 	})
 }
 

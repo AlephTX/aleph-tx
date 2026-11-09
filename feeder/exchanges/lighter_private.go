@@ -33,7 +33,7 @@ type LighterPrivate struct {
 // privateEventSink permits deterministic replay without mmap or credentials.
 type privateEventSink interface {
 	PushOrderCreatedV2(uint8, uint16, uint64, int64, int64, float64, float64, bool, uint64)
-	PushOrderFilledV2(uint8, uint16, uint64, int64, int64, float64, float64, float64, float64, bool, uint64, uint64)
+	PushOrderFilledV2(uint8, uint16, uint64, int64, int64, float64, float64, float64, float64, bool, uint64, uint64, uint8)
 	PushOrderCanceledV2(uint8, uint16, uint64, int64, int64, float64, uint64)
 	PushPrivateStreamLost()
 }
@@ -128,8 +128,39 @@ type lighterTrade struct {
 	MakerFee    int    `json:"maker_fee,omitempty"`
 }
 
+// lighterFeeTick is lighter-go's txtypes.FeeTick: fee rates are parts per
+// million of notional, so a valid rate lies within +-lighterFeeTick.
+const lighterFeeTick = 1_000_000
+
 func lighterFeePaid(ratePPM float64, fillPrice float64, fillSize float64) float64 {
-	return ratePPM / 1_000_000.0 * fillPrice * fillSize
+	return ratePPM / lighterFeeTick * fillPrice * fillSize
+}
+
+// lighterFeeSource labels the rate behind feePaid without changing it:
+// feePaid keeps reading the selected field with gjson Float (absent and null
+// read as 0). Lighter omits zero or empty fields, so an absent or null rate
+// is missing, never a known zero. Only an integer within +-lighterFeeTick is
+// a rate; without a boolean is_maker_ask the selected role was a guess.
+func lighterFeeSource(makerAsk, rate gjson.Result) uint8 {
+	if makerAsk.Type != gjson.True && makerAsk.Type != gjson.False {
+		return shm.FeeSourceRoleUnknown
+	}
+	switch rate.Type {
+	case gjson.Null: // absent or JSON null
+		return shm.FeeSourceMissing
+	case gjson.Number:
+		ppm, err := strconv.ParseInt(rate.Raw, 10, 64)
+		switch {
+		case err != nil || ppm < -lighterFeeTick || ppm > lighterFeeTick:
+			return shm.FeeSourceInvalid
+		case ppm == 0:
+			return shm.FeeSourceExplicitZero
+		default:
+			return shm.FeeSourceRateDerived
+		}
+	default:
+		return shm.FeeSourceInvalid
+	}
 }
 
 func (lp *LighterPrivate) Run(ctx context.Context) error {
@@ -475,10 +506,12 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 
 	orderIsAsk := orderID == askID
 	// Fees are selected by OUR maker/taker role, not merely by maker side.
-	feeRate := trade.Get("taker_fee").Float()
+	rateField := trade.Get("taker_fee")
 	if orderIsAsk == isMakerAsk {
-		feeRate = trade.Get("maker_fee").Float()
+		rateField = trade.Get("maker_fee")
 	}
+	feeRate := rateField.Float()
+	feeSource := lighterFeeSource(trade.Get("is_maker_ask"), rateField)
 	feePaid := lighterFeePaid(feeRate, fillPrice, fillSize)
 	if math.IsNaN(feePaid) || math.IsInf(feePaid, 0) {
 		return
@@ -526,6 +559,7 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		orderIsAsk,
 		timestampNs,
 		tradeIDu64,
+		feeSource,
 	)
 }
 

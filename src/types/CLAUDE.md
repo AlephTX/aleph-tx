@@ -64,12 +64,18 @@ ShmPrivateEventV2 {
     order_price: f64,           // Order price
     timestamp_ns: u64,          // Event timestamp (nanoseconds)
     trade_id: u64,              // Trade ID (for fill dedup)
-    _reserved: [u8; 16],       // Reserved for future use
+    fee_source: u8,             // 112: FeeSource; 0 = unknown (older feeders)
+    _reserved: [u8; 15],        // 113..128: reserved, always 0
 }
 ```
 
 ## Gotchas
 
 - V2 struct MUST remain exactly 128 bytes. Verified at compile time.
+- `fee_source` was a reserved byte that every writer left 0, so 0 must stay
+  `Unknown`. `fee_paid` is unchanged: a `Missing` fill's 0 is not a known
+  zero. `events/v2_fee_sources.bin` holds real feeder bytes; the Go test
+  `TestPrivateTradeFeeSourceRingFixture` writes it and the Rust telemetry
+  test `v2_fee_source_fixture_matches_the_feeder` replays it.
 - Any field change requires updating BOTH Rust (`events.rs`) AND Go (`feeder/shm/events.go`).
 - V1 kept for backward compatibility. New code should use V2.

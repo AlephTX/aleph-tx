@@ -15,6 +15,7 @@ import {
 } from '../format'
 import { Badge, Card, ErrorNote, Side, Signed, Table, type Column } from './ui'
 import { useNow } from '../clock'
+import { feeSourceBadge } from '../valuation'
 
 function Elapsed({ since }: { since: number }) {
   return <>{duration(useNow() - since)}</>
@@ -67,6 +68,18 @@ export function OpenOrders({ orders, error }: { orders: Order[] | undefined; err
   )
 }
 
+/** The booked fee with its provenance: a missing rate reads $0 like an
+ * explicit zero, so only the badge tells them apart. */
+export function FillFee({ fill: f }: { fill: Fill }) {
+  const badge = feeSourceBadge(f.fee_source)
+  return (
+    <span className="inline-flex items-center justify-end gap-1.5">
+      {badge && <Badge tone={badge.tone}>{badge.label}</Badge>}
+      <span className={f.fee < 0 ? 'text-up' : ''}>{usd(f.fee, 4)}</span>
+    </span>
+  )
+}
+
 const fillCols: Column<Fill>[] = [
   { key: 't', label: '时间', render: (f) => <span className="num text-muted">{time(f.ts_ms)}</span> },
   { key: 'side', label: '方向', render: (f) => <Side side={f.side} /> },
@@ -77,7 +90,7 @@ const fillCols: Column<Fill>[] = [
     key: 'fee',
     label: '手续费',
     align: 'right',
-    render: (f) => <span className={f.fee < 0 ? 'text-up' : ''}>{usd(f.fee, 4)}</span>,
+    render: (f) => <FillFee fill={f} />,
   },
   {
     key: 'rpnl',

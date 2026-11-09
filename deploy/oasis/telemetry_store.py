@@ -10,8 +10,11 @@ Fees are positive costs; negative fees are maker rebates. Hedge-venue IOC
 fills (`hedge_fill` lines) are tracked as a separate leg with their own
 average cost; funding payments are not included.
 
-The summary labels each PnL component (see `valuation`): Lighter fills and
-fees are venue-reported; hedge prices are reported (`fill`), a worst-case
+The summary labels each PnL component (see `valuation`): Lighter fill prices
+and sizes are venue-reported. Each Lighter fee is estimated from the rate its
+trade declared for the account's role; a fill whose `fee_source` is missing,
+invalid, role_unknown or absent (older writers) leaves the fee total unknown,
+even when its number is 0. Hedge prices are reported (`fill`), a worst-case
 IOC bound (`limit`) or of unknown origin (legacy), and hedge fees are always
 estimated from the configured rate. Open positions are marked to the latest
 strategy mid; without one the unrealized part and every total that depends
@@ -50,7 +53,7 @@ CREATE TABLE IF NOT EXISTS fills (
   price REAL NOT NULL, size REAL NOT NULL, notional REAL NOT NULL,
   fee REAL NOT NULL, trade_id INTEGER NOT NULL, realized_delta REAL NOT NULL,
   position_after REAL NOT NULL, avg_cost_after REAL NOT NULL,
-  net_pnl_after REAL NOT NULL, PRIMARY KEY (session_id, offset));
+  net_pnl_after REAL NOT NULL, fee_source TEXT, PRIMARY KEY (session_id, offset));
 CREATE UNIQUE INDEX IF NOT EXISTS fills_trade ON fills (session_id, trade_id) WHERE trade_id > 0;
 CREATE INDEX IF NOT EXISTS fills_ts ON fills (ts_ms);
 CREATE TABLE IF NOT EXISTS orders (
@@ -107,6 +110,14 @@ SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
 HEDGE_FILL_MIGRATIONS = (("fee_source", "TEXT"),)
 HEDGE_PRICE_SOURCES = ("fill", "limit")
 HEDGE_FEE_SOURCES = ("configured_rate",)
+# Lighter fill fee provenance as the feeder labels it (FeeSource in
+# src/types/events.rs). Legacy rows, absent labels (older writers) and the
+# writer's "unknown" (older feeders) are all NULL.
+FILL_MIGRATIONS = (("fee_source", "TEXT"),)
+LIGHTER_FEE_SOURCES = ("rate_derived", "explicit_zero", "missing", "invalid", "role_unknown")
+# A fee from these is the declared rate times price and size; any other
+# source leaves the fee unknown, even when its number is 0.
+LIGHTER_RATED = ("rate_derived", "explicit_zero")
 # Worst component quality wins: missing > unknown > estimated > exact kinds.
 QUALITY_RANK = {"none": 0, "flat": 0, "reported": 0, "estimated": 1, "unknown": 2, "missing": 3}
 
@@ -176,7 +187,8 @@ class TelemetryStore:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
         for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS),
-                                  ("hedge_fills", HEDGE_FILL_MIGRATIONS)):
+                                  ("hedge_fills", HEDGE_FILL_MIGRATIONS),
+                                  ("fills", FILL_MIGRATIONS)):
             columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
             for name, ddl in migrations:
                 if name not in columns:
@@ -347,10 +359,15 @@ class TelemetryStore:
         position, avg_cost, delta = apply_fill(s["position"], s["avg_cost"],
                                                1 if side == "buy" else -1, price, qty)
         realized, fees, notional = s["realized"] + delta, s["fees"] + fee, price * qty
+        # The label only describes `fee`; the number is booked as before.
+        fee_source = r.get("fee_source") if r.get("fee_source") in LIGHTER_FEE_SOURCES else None
         inserted = self.db.execute(
-            "INSERT OR IGNORE INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO fills (session_id, offset, ts_ms, exchange_ts_ns,"
+            " client_order_id, side, price, size, notional, fee, trade_id, realized_delta,"
+            " position_after, avg_cost_after, net_pnl_after, fee_source)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, offset, ts, r.get("exchange_ts_ns"), coid, side, price, qty, notional, fee,
-             trade_id, delta, position, avg_cost, realized - fees))
+             trade_id, delta, position, avg_cost, realized - fees, fee_source))
         if inserted.rowcount == 0:
             return
         self.db.execute(
@@ -420,6 +437,14 @@ class TelemetryStore:
             fee[row["fee_source"] if row["fee_source"] in HEDGE_FEE_SOURCES else "unknown"] += 1
         return price, fee
 
+    def _lighter_fee_sources(self, session_id):
+        counts = dict.fromkeys((*LIGHTER_FEE_SOURCES, "unknown"), 0)
+        for row in self.db.execute("SELECT fee_source, count(*) AS n FROM fills WHERE session_id=?"
+                                   " GROUP BY fee_source", (session_id,)):
+            source = row["fee_source"]
+            counts[source if source in LIGHTER_FEE_SOURCES else "unknown"] += row["n"]
+        return counts
+
     @staticmethod
     def _mark(session, snapshot, mid, now_ms):
         """Where the mark came from and how old its evidence is.
@@ -480,9 +505,18 @@ class TelemetryStore:
         net = session["realized"] - session["fees"]
         unrealized, lighter_mark = mark(session["position"], session["avg_cost"])
         total = None if unrealized is None else net + unrealized
-        # Lighter fills and fees come from venue events.
-        lighter = {"realized": "reported", "fees": "reported", "unrealized": lighter_mark,
-                   "quality": worst("reported", lighter_mark)}
+        # Lighter prices and sizes come from venue fill events. Each fee is the
+        # rate its trade declared for this account's role times price and
+        # size, so even a fully rated session is an estimate of the charge.
+        # One fill without a usable rate, or from an older writer, makes the
+        # fee total unknown, even when that fill's number is 0.
+        lighter_fee = self._lighter_fee_sources(session["session_id"])
+        rated = sum(lighter_fee[name] for name in LIGHTER_RATED)
+        lighter_fees = ("none" if not sum(lighter_fee.values())
+                        else "estimated" if rated == sum(lighter_fee.values()) else "unknown")
+        lighter = {"realized": "reported", "fees": lighter_fees, "unrealized": lighter_mark,
+                   "fee_sources": lighter_fee,
+                   "quality": worst("reported", lighter_fees, lighter_mark)}
 
         price, fee = self._hedge_sources(session["session_id"])
         # Average cost carries every earlier price into later realized PnL, so
@@ -505,6 +539,12 @@ class TelemetryStore:
             missing.append("mark_price")
         elif "estimated" in (lighter_mark, hedge_mark) and mark_info["feed_ms"] is None:
             missing.append("mark_time")
+        if rated:
+            missing.append("lighter_actual_fee")
+        if lighter_fee["missing"] + lighter_fee["invalid"] + lighter_fee["role_unknown"]:
+            missing.append("lighter_fee_rate")
+        if lighter_fee["unknown"]:
+            missing.append("lighter_fee_source")
         if price["limit"]:
             missing.append("hedge_fill_price")
         if price["unknown"]:

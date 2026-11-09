@@ -103,6 +103,43 @@ func TestAccountStatsConcurrentWritersPreservePositionAndFreshness(t *testing.T)
 	}
 }
 
+// The V2 ABI shared with Rust's ShmPrivateEventV2: every offset is fixed.
+// FeeSource occupies the first byte of the formerly reserved tail.
+func TestEventV2LayoutMatchesRust(t *testing.T) {
+	var e ShmPrivateEventV2
+	offsets := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"Sequence", unsafe.Offsetof(e.Sequence), 0},
+		{"ExchangeID", unsafe.Offsetof(e.ExchangeID), 8},
+		{"EventType", unsafe.Offsetof(e.EventType), 9},
+		{"SymbolID", unsafe.Offsetof(e.SymbolID), 10},
+		{"ExchangeOrderID", unsafe.Offsetof(e.ExchangeOrderID), 16},
+		{"FillPrice", unsafe.Offsetof(e.FillPrice), 24},
+		{"FillSize", unsafe.Offsetof(e.FillSize), 32},
+		{"RemainingSize", unsafe.Offsetof(e.RemainingSize), 40},
+		{"FeePaid", unsafe.Offsetof(e.FeePaid), 48},
+		{"IsAsk", unsafe.Offsetof(e.IsAsk), 56},
+		{"ClientOrderID", unsafe.Offsetof(e.ClientOrderID), 64},
+		{"OrderIndex", unsafe.Offsetof(e.OrderIndex), 72},
+		{"OriginalSize", unsafe.Offsetof(e.OriginalSize), 80},
+		{"OrderPrice", unsafe.Offsetof(e.OrderPrice), 88},
+		{"TimestampNs", unsafe.Offsetof(e.TimestampNs), 96},
+		{"TradeID", unsafe.Offsetof(e.TradeID), 104},
+		{"FeeSource", unsafe.Offsetof(e.FeeSource), 112},
+	}
+	for _, o := range offsets {
+		if o.got != o.want {
+			t.Errorf("%s at %d, want %d", o.name, o.got, o.want)
+		}
+	}
+	if unsafe.Sizeof(e) != 128 {
+		t.Fatalf("size %d", unsafe.Sizeof(e))
+	}
+}
+
 func TestEventRingGenerationProtectsWrap(t *testing.T) {
 	var index, generation uint64
 	rb := &EventRingBufferV2{writeIdx: &index, generation: &generation, slots: make([]ShmPrivateEventV2, V2RingBufferSlots)}

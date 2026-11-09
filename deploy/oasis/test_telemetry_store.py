@@ -8,10 +8,14 @@ from pathlib import Path
 from telemetry_store import TelemetryStore, apply_fill
 
 
-def fill(ts, side, price, size, fee, trade_id, coid=1, remaining=0.0):
-    return {"type": "order", "ts_ms": ts, "kind": "filled", "client_order_id": coid,
-            "order_index": 9, "side": side, "fill_price": price, "fill_size": size,
-            "fee": fee, "trade_id": trade_id, "remaining": remaining}
+def fill(ts, side, price, size, fee, trade_id, coid=1, remaining=0.0, fee_source=None):
+    """A Lighter fill line; without `fee_source` it is a legacy writer's."""
+    record = {"type": "order", "ts_ms": ts, "kind": "filled", "client_order_id": coid,
+              "order_index": 9, "side": side, "fill_price": price, "fill_size": size,
+              "fee": fee, "trade_id": trade_id, "remaining": remaining}
+    if fee_source is not None:
+        record["fee_source"] = fee_source
+    return record
 
 
 class AverageCostTest(unittest.TestCase):
@@ -254,14 +258,19 @@ class StoreTest(unittest.TestCase):
         self.assertIsNone(session["combined_pnl"])
         self.assertAlmostEqual(session["hedge_net_pnl"], -1.1 - 0.2257875)
         v = session["valuation"]
-        self.assertEqual(v["lighter"]["quality"], "reported")
+        # Both Lighter fees are declared rates times notional: estimates.
+        self.assertEqual((v["lighter"]["fees"], v["lighter"]["quality"]), ("estimated", "estimated"))
+        self.assertEqual(v["lighter"]["fee_sources"],
+                         {"rate_derived": 2, "explicit_zero": 0, "missing": 0, "invalid": 0,
+                          "role_unknown": 0, "unknown": 0})
         self.assertEqual(v["hedge"]["price_sources"], {"fill": 2, "limit": 1, "unknown": 0})
         self.assertEqual(v["hedge"]["fee_sources"], {"configured_rate": 3, "unknown": 0})
         self.assertEqual((v["hedge"]["realized"], v["hedge"]["fees"], v["hedge"]["unrealized"]),
                          ("estimated", "estimated", "missing"))
         self.assertEqual(v["combined_quality"], "missing")
         self.assertIsNone(v["mark"]["price"])
-        self.assertEqual(v["missing"], ["mark_price", "hedge_fill_price", "hedge_actual_fee", "funding"])
+        self.assertEqual(v["missing"], ["mark_price", "lighter_actual_fee", "hedge_fill_price",
+                                        "hedge_actual_fee", "funding"])
         sources = [(r["price_source"], r["fee_source"]) for r in self.store.hedge_fills()]
         self.assertEqual(sorted(sources), [("fill", "configured_rate"), ("fill", "configured_rate"),
                                            ("limit", "configured_rate")])
@@ -301,7 +310,11 @@ class StoreTest(unittest.TestCase):
         session = self.store.summary(now_ms=2000)["session"]
         self.assertEqual(session["unrealized"], 0.0)  # flat: no mark needed
         self.assertAlmostEqual(session["combined_pnl"], 1.0)
-        self.assertEqual(session["valuation"]["combined_quality"], "reported")
+        v = session["valuation"]
+        self.assertEqual((v["lighter"]["unrealized"], v["hedge"]["unrealized"]), ("flat", "flat"))
+        self.assertNotIn("mark_price", v["missing"])
+        # The mark plays no part; only these legacy fills' fee source is unknown.
+        self.assertEqual((v["lighter"]["fees"], v["combined_quality"]), ("unknown", "unknown"))
 
     def test_hedge_reversal_with_mixed_and_legacy_sources_is_never_reported(self):
         self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
@@ -351,6 +364,86 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(session["valuation"]["hedge"]["fees"], "unknown")
         finally:
             store.db.close()
+
+    def test_writer_fee_sources_keep_missing_apart_from_explicit_zero(self):
+        # Feeder bytes from the real processTradeFast (Go fixture test), read by
+        # the Rust V2 reader and written by TelemetrySink.
+        self.load_fixture("fee_source_session.jsonl")
+        self.assertEqual(self.store.ingest(), 0)  # duplicate ingest changes nothing
+        rows = {r["trade_id"]: (r["fee"], r["fee_source"]) for r in self.store.fills()}
+        # Same fee number, different evidence: a known zero vs. no rate.
+        self.assertEqual((rows[503], rows[505], rows[508]),
+                         ((0.0, "explicit_zero"), (0.0, "missing"), (0.0, None)))
+        self.assertEqual([rows[t][1] for t in sorted(rows)],
+                         ["rate_derived", "rate_derived", "explicit_zero", "rate_derived",
+                          "missing", "invalid", "role_unknown", None])
+        session = self.store.summary(now_ms=20_000)["session"]
+        # Fees are booked as before; the label never changes a number.
+        self.assertEqual(session["fills"], 8)
+        self.assertAlmostEqual(session["fees"],
+                               0.0004001 + 0.008002 - 0.000500125 + 0.0000500125 + 0.0004001)
+        v = session["valuation"]["lighter"]
+        self.assertEqual(v["fee_sources"], {"rate_derived": 3, "explicit_zero": 1, "missing": 1,
+                                            "invalid": 1, "role_unknown": 1, "unknown": 1})
+        self.assertEqual((v["realized"], v["fees"]), ("reported", "unknown"))
+        missing = session["valuation"]["missing"]
+        for key in ("lighter_actual_fee", "lighter_fee_rate", "lighter_fee_source"):
+            self.assertIn(key, missing)
+
+    def test_lighter_fees_are_estimated_only_when_every_fill_declares_a_rate(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.008, 601, fee_source="rate_derived"),
+                   fill(1200, "sell", 2010.0, 0.1, 0.0, 602, coid=2, fee_source="explicit_zero"))
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        v = session["valuation"]
+        self.assertEqual((v["lighter"]["fees"], v["lighter"]["quality"]), ("estimated", "estimated"))
+        self.assertIn("lighter_actual_fee", v["missing"])
+        self.assertNotIn("lighter_fee_rate", v["missing"])
+        self.assertNotIn("lighter_fee_source", v["missing"])
+        # A replayed trade at a new offset neither books again nor relabels.
+        self.write(fill(1250, "buy", 2000.0, 0.1, 0.008, 601, fee_source="missing"))
+        self.store.ingest()
+        session = self.store.summary(now_ms=2000)["session"]
+        self.assertEqual(session["fills"], 2)
+        self.assertAlmostEqual(session["fees"], 0.008)
+        self.assertEqual(session["valuation"]["lighter"]["fee_sources"],
+                         {"rate_derived": 1, "explicit_zero": 1, "missing": 0, "invalid": 0,
+                          "role_unknown": 0, "unknown": 0})
+        self.assertEqual(session["valuation"]["lighter"]["fees"], "estimated")
+        # An unrecognized label is stored as unknown, never promoted.
+        self.write(fill(1300, "buy", 2000.0, 0.1, 0.0, 603, coid=3, fee_source="exact"))
+        self.store.ingest()
+        self.assertIsNone(self.store.fills()[0]["fee_source"])
+        v = self.store.summary(now_ms=2000)["session"]["valuation"]
+        self.assertEqual((v["lighter"]["fee_sources"]["unknown"], v["lighter"]["fees"]), (1, "unknown"))
+        self.assertIn("lighter_fee_source", v["missing"])
+
+    def test_old_fill_table_gains_fee_source_as_unknown(self):
+        import sqlite3
+        path = self.dir / "old_fills.sqlite3"
+        old = TelemetryStore(str(path), self.dir)
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+                   fill(1100, "buy", 2000.0, 0.1, 0.0, 951, fee_source="explicit_zero"))
+        old.ingest()
+        old.db.close()
+        db = sqlite3.connect(path)
+        db.execute("ALTER TABLE fills DROP COLUMN fee_source")
+        db.commit()
+        db.close()
+        store = TelemetryStore(str(path), self.dir)
+        try:
+            self.write(fill(1200, "sell", 2000.0, 0.1, 0.0, 952, coid=2, fee_source="explicit_zero"))
+            store.ingest()
+            self.assertEqual({r["trade_id"]: r["fee_source"] for r in store.fills()},
+                             {951: None, 952: "explicit_zero"})
+            session = store.summary(now_ms=2000)["session"]
+            self.assertEqual(session["fills"], 2)
+            lighter = session["valuation"]["lighter"]
+            self.assertEqual((lighter["fee_sources"]["unknown"], lighter["fees"]), (1, "unknown"))
+        finally:
+            store.db.close()
+
     def load_fixture(self, name):
         # Produced by the Rust TelemetrySink (see check_fixture in telemetry_sink.rs).
         self.file.write_text((Path(__file__).parent / "fixtures" / name).read_text())
@@ -470,13 +563,15 @@ class DashboardContractTest(unittest.TestCase):
               {"type": "snapshot", "ts_ms": 1200, "mid": 2005.0, "equity": 1000.0,
                "session_start_equity": 1000.0}]
     # Strategy clock ahead of the monitor: feed 4000 <= now 5000 < sample 6000.
-    SKEWED = LEGACY[:2] + [{"type": "snapshot", "ts_ms": 6_100, "mid": 2005.0, "equity": 1000.0,
-                            "session_start_equity": 1000.0, "mark_source": "lighter_book",
-                            "mark_sampled_ms": 6_000, "mark_feed_ms": 4_000}]
+    # A current writer's fill, so only the mark's freshness is unknown.
+    SKEWED = [LEGACY[0], fill(1100, "buy", 2000.0, 0.1, 0.0, 1, fee_source="explicit_zero"),
+              {"type": "snapshot", "ts_ms": 6_100, "mid": 2005.0, "equity": 1000.0,
+               "session_start_equity": 1000.0, "mark_source": "lighter_book",
+               "mark_sampled_ms": 6_000, "mark_feed_ms": 4_000}]
     CASES = {"cost": ("cost_session.jsonl", 10_000), "mark": ("mark_session.jsonl", 3_606_000),
              "legacy": (LEGACY, 10_000), "skewed": (SKEWED, 5_000)}
 
-    def summary(self, source, now_ms):
+    def query(self, source, ask):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s.jsonl"
             if isinstance(source, str):
@@ -486,20 +581,28 @@ class DashboardContractTest(unittest.TestCase):
             store = TelemetryStore(":memory:", Path(tmp))
             try:
                 store.ingest()
-                return store.summary(now_ms=now_ms)
+                return json.loads(json.dumps(ask(store)))
             finally:
                 store.db.close()
 
-    def test_dashboard_fixtures_match_the_store(self):
+    def check(self, name, produced):
         import os
+        path = DASHBOARD_FIXTURES / f"{name}.json"
+        if os.environ.get("ALEPH_WRITE_FIXTURES"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(produced, indent=1, sort_keys=True) + "\n")
+        with self.subTest(name):
+            self.assertEqual(produced, json.loads(path.read_text()))
+
+    def test_dashboard_fixtures_match_the_store(self):
         for name, (source, now_ms) in self.CASES.items():
-            produced = json.loads(json.dumps(self.summary(source, now_ms)))
-            path = DASHBOARD_FIXTURES / f"summary_{name}.json"
-            if os.environ.get("ALEPH_WRITE_FIXTURES"):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(produced, indent=1, sort_keys=True) + "\n")
-            with self.subTest(name):
-                self.assertEqual(produced, json.loads(path.read_text()))
+            self.check(f"summary_{name}",
+                       self.query(source, lambda store, now_ms=now_ms: store.summary(now_ms=now_ms)))
+
+    def test_fill_fixture_matches_the_store(self):
+        # The feeder's fee-source session as /api/fills returns it.
+        self.check("fills_fee_sources",
+                   self.query("fee_source_session.jsonl", lambda store: store.fills()))
 
 
 if __name__ == "__main__":

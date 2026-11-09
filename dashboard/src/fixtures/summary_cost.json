@@ -55,8 +55,16 @@
     "unrealized": "missing"
    },
    "lighter": {
-    "fees": "reported",
-    "quality": "reported",
+    "fee_sources": {
+     "explicit_zero": 0,
+     "invalid": 0,
+     "missing": 0,
+     "rate_derived": 2,
+     "role_unknown": 0,
+     "unknown": 0
+    },
+    "fees": "estimated",
+    "quality": "estimated",
     "realized": "reported",
     "unrealized": "flat"
    },
@@ -73,6 +81,7 @@
    },
    "missing": [
     "mark_price",
+    "lighter_actual_fee",
     "hedge_fill_price",
     "hedge_actual_fee",
     "funding"

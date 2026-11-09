@@ -5,17 +5,21 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { Headline } from './components/Kpis'
+import { FillFee } from './components/Tables'
+import feeSourceFills from './fixtures/fills_fee_sources.json'
 import costSummary from './fixtures/summary_cost.json'
 import legacySummary from './fixtures/summary_legacy.json'
 import markSummary from './fixtures/summary_mark.json'
 import skewedSummary from './fixtures/summary_skewed.json'
-import type { Session, SummaryResp } from './types'
-import { markLine, qualityBadge, sessionValuation } from './valuation'
+import type { Fill, Session, SummaryResp } from './types'
+import { feeSourceBadge, markLine, qualityBadge, sessionValuation } from './valuation'
 
 const cost = costSummary as unknown as SummaryResp
 const mark = markSummary as unknown as SummaryResp
 const legacy = legacySummary as unknown as SummaryResp
 const skewed = skewedSummary as unknown as SummaryResp
+const fills = feeSourceFills as unknown as Fill[]
+const summaryFor = (summary: SummaryResp) => summary.session as Session
 
 const render = (summary: SummaryResp) =>
   renderToStaticMarkup(createElement(Headline, { summary })).replace(/<[^>]+>/g, '|')
@@ -41,12 +45,13 @@ describe('valuation', () => {
     const s = cost.session as Session
     expect(s.combined_pnl).toBeNull()
     const html = render(cost)
-    // Lighter leg is flat and venue-reported: exact, no badge.
-    expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+\+\$1\.00\|/)
+    // Lighter leg is flat, but its fees are declared rates times notional.
+    expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+估算\|+\+\$1\.00\|/)
     const combined = card(html, '组合盈亏（含对冲）')
     expect(combined).toMatch(/^组合盈亏（含对冲）\|+不完整\|+—\|/)
     expect(combined).toContain('对冲 —')
     const notes = sessionValuation(s)?.notes ?? []
+    expect(notes).toContain('Lighter 手续费按成交声明费率估算，非实际扣款')
     expect(notes).toContain('无有效标记价，浮动盈亏未知')
     expect(notes).toContain('部分对冲成交按 IOC 限价估算')
     expect(notes).toContain('对冲手续费按配置费率估算')
@@ -69,7 +74,9 @@ describe('valuation', () => {
     const html = render(legacy)
     expect(html).toContain('标记 来源未知 · 观测时间未知')
     expect(html).toContain('标记价观测时间未知，仅知快照写入时间')
-    expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+估算\|/)
+    // A legacy fill carries no fee source: its fee is unknown, not an estimate.
+    expect(card(html, 'Lighter 会话盈亏')).toMatch(/^Lighter 会话盈亏\|+未知\|/)
+    expect(html).toContain('旧记录 Lighter 手续费来源未知')
   })
 
   it('shows a sample ahead of the monitor clock as a clock mismatch', () => {
@@ -92,6 +99,28 @@ describe('valuation', () => {
       '标记 外部中位价 · 时钟不一致，新鲜度未知',
     )
     expect(markLine({ ...m, freshness: 'observed', feed_age_ms: null })).toBe('标记 外部中位价 · 行情 未知')
+  })
+
+  it('tells a missing fee rate apart from an explicit zero in the fill table', () => {
+    // /api/fills for the feeder's fee-source session (Go -> Rust -> store).
+    const fee = (id: number) => {
+      const f = fills.find((row) => row.trade_id === id)
+      expect(f, `trade ${id}`).toBeDefined()
+      return f ? renderToStaticMarkup(createElement(FillFee, { fill: f })).replace(/<[^>]+>/g, '|') : ''
+    }
+    const strip = (s: string) => s.replace(/\|+/g, '|')
+    expect(strip(fee(501))).toBe('|$0.0004|') // declared rate: no badge
+    expect(strip(fee(503))).toBe('|$0.0000|') // explicit zero: a known zero
+    expect(strip(fee(505))).toBe('|费率缺失|$0.0000|') // same number, no rate
+    expect(strip(fee(506))).toContain('费率无效')
+    expect(strip(fee(507))).toContain('角色未知')
+    expect(strip(fee(508))).toBe('|来源未知|$0.0000|') // older writer
+    const lighter = (summaryFor(cost).valuation?.lighter.fee_sources ?? {}) as Record<string, number>
+    expect(lighter.rate_derived).toBe(2)
+    // Older servers send no source; unrecognized labels are never trusted.
+    expect(feeSourceBadge(undefined)?.label).toBe('来源未知')
+    expect(feeSourceBadge('exact' as never)?.label).toBe('来源未知')
+    expect(feeSourceBadge('toString' as never)?.label).toBe('来源未知')
   })
 
   it('flags old servers without provenance as unknown', () => {

@@ -55,7 +55,15 @@
     "unrealized": "flat"
    },
    "lighter": {
-    "fees": "reported",
+    "fee_sources": {
+     "explicit_zero": 0,
+     "invalid": 0,
+     "missing": 0,
+     "rate_derived": 1,
+     "role_unknown": 0,
+     "unknown": 0
+    },
+    "fees": "estimated",
     "quality": "estimated",
     "realized": "reported",
     "unrealized": "estimated"
@@ -72,6 +80,7 @@
     "source": "external_median"
    },
    "missing": [
+    "lighter_actual_fee",
     "funding"
    ],
    "scope": "strategy session trades, not account equity"

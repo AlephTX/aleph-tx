@@ -251,8 +251,58 @@ pub struct ShmPrivateEventV2 {
     pub timestamp_ns: u64,
     /// Trade ID (for fill deduplication, 0 if not a fill)
     pub trade_id: u64,
+    /// Provenance of `fee_paid` (see [`FeeSource`]); offset 112. This byte
+    /// was reserved and always 0 before it carried a source, so 0 stays
+    /// unknown: an older feeder's fills read as unknown, never as zero.
+    pub fee_source: u8,
     /// Reserved for future use
-    _reserved: [u8; 16],
+    _reserved: [u8; 15],
+}
+
+/// Where a V2 fill's `fee_paid` came from, as the Go feeder classifies the
+/// rate field selected for this account's role. `fee_paid` itself is
+/// unchanged; only the label is new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FeeSource {
+    /// Older writer or no evidence (byte 0).
+    Unknown = 0,
+    /// Explicit nonzero integer rate in ppm times price and size.
+    RateDerived = 1,
+    /// The role's rate field was an explicit 0.
+    ExplicitZero = 2,
+    /// The role's rate field was absent or null; Lighter omits zero or empty
+    /// fields, so this is not a known zero.
+    Missing = 3,
+    /// The role's rate field was not an integer within +-1e6 ppm.
+    Invalid = 4,
+    /// `is_maker_ask` was not a boolean, so the role was guessed.
+    RoleUnknown = 5,
+}
+
+impl FeeSource {
+    /// Unrecognized bytes (a newer writer) read as unknown.
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::RateDerived,
+            2 => Self::ExplicitZero,
+            3 => Self::Missing,
+            4 => Self::Invalid,
+            5 => Self::RoleUnknown,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::RateDerived => "rate_derived",
+            Self::ExplicitZero => "explicit_zero",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::RoleUnknown => "role_unknown",
+        }
+    }
 }
 
 impl ShmPrivateEventV2 {
@@ -289,7 +339,8 @@ impl ShmPrivateEventV2 {
             order_price: price,
             timestamp_ns,
             trade_id: 0,
-            _reserved: [0; 16],
+            fee_source: 0,
+            _reserved: [0; 15],
         }
     }
 
@@ -329,7 +380,8 @@ impl ShmPrivateEventV2 {
             order_price: 0.0,
             timestamp_ns,
             trade_id,
-            _reserved: [0; 16],
+            fee_source: FeeSource::Unknown as u8,
+            _reserved: [0; 15],
         }
     }
 
@@ -364,7 +416,8 @@ impl ShmPrivateEventV2 {
             order_price: 0.0,
             timestamp_ns,
             trade_id: 0,
-            _reserved: [0; 16],
+            fee_source: 0,
+            _reserved: [0; 15],
         }
     }
 
@@ -395,13 +448,25 @@ impl ShmPrivateEventV2 {
             order_price: 0.0,
             timestamp_ns,
             trade_id: 0,
-            _reserved: [0; 16],
+            fee_source: 0,
+            _reserved: [0; 15],
         }
     }
 
     /// Get the event type as an enum
     pub fn event_type(&self) -> Option<EventType> {
         EventType::from_u8(self.event_type)
+    }
+
+    /// Provenance of `fee_paid`; unknown for older writers.
+    pub fn fee_source(&self) -> FeeSource {
+        FeeSource::from_u8(self.fee_source)
+    }
+
+    /// The same event labeled with a fee source, as the feeder writes it.
+    pub fn with_fee_source(mut self, source: FeeSource) -> Self {
+        self.fee_source = source as u8;
+        self
     }
 }
 
@@ -426,6 +491,7 @@ impl fmt::Debug for ShmPrivateEventV2 {
             .field("original_size", &self.original_size)
             .field("order_price", &self.order_price)
             .field("trade_id", &self.trade_id)
+            .field("fee_source", &self.fee_source())
             .finish()
     }
 }
@@ -451,15 +517,25 @@ impl Default for ShmPrivateEventV2 {
             order_price: 0.0,
             timestamp_ns: 0,
             trade_id: 0,
-            _reserved: [0; 16],
+            fee_source: 0,
+            _reserved: [0; 15],
         }
     }
 }
 
-// V2 compile-time assertions: strict 128-byte, 64-byte aligned
+// V2 compile-time assertions: strict 128-byte, 64-byte aligned, and the
+// offsets the Go writer uses (feeder/shm TestEventV2LayoutMatchesRust).
 const _: () = {
+    use std::mem::offset_of;
     assert!(std::mem::size_of::<ShmPrivateEventV2>() == 128);
     assert!(std::mem::align_of::<ShmPrivateEventV2>() == 64);
+    assert!(offset_of!(ShmPrivateEventV2, fee_paid) == 48);
+    assert!(offset_of!(ShmPrivateEventV2, is_ask) == 56);
+    assert!(offset_of!(ShmPrivateEventV2, client_order_id) == 64);
+    assert!(offset_of!(ShmPrivateEventV2, timestamp_ns) == 96);
+    assert!(offset_of!(ShmPrivateEventV2, trade_id) == 104);
+    assert!(offset_of!(ShmPrivateEventV2, fee_source) == 112);
+    assert!(offset_of!(ShmPrivateEventV2, _reserved) == 113);
 };
 
 #[cfg(test)]

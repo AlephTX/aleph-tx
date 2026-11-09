@@ -64,6 +64,18 @@ Offset  Type      Field
 72..128 [56]byte  Reserved
 ```
 
+### ShmPrivateEventV2 tail (128 bytes total)
+```
+Offset    Type      Field
+96..104   uint64    TimestampNs (feeder wall clock)
+104..112  uint64    TradeID
+112       uint8     FeeSource (0 unknown, 1 rate_derived, 2 explicit_zero,
+                    3 missing, 4 invalid, 5 role_unknown)
+113..128  [15]byte  _reserved (always 0)
+```
+`TestEventV2LayoutMatchesRust` pins every offset. FeeSource was reserved and
+always 0 before, so 0 must stay unknown.
+
 ## Gotchas
 
 - **C-ABI Alignment**: `ShmPrivateEvent` MUST be exactly 64 bytes. Assert in `init()` with `unsafe.Sizeof`.

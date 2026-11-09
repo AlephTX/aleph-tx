@@ -93,6 +93,12 @@ pub struct OrderEventRecord {
     pub fill_size: f64,
     pub fee: f64,
     pub trade_id: u64,
+    /// Fills only: where `fee` came from (`rate_derived`, `explicit_zero`,
+    /// `missing`, `invalid`, `role_unknown` or `unknown` for an older
+    /// feeder). `fee` keeps its value; a `missing` fill's 0 is not a known
+    /// zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_source: Option<&'static str>,
 }
 
 impl OrderEventRecord {
@@ -119,6 +125,8 @@ impl OrderEventRecord {
             fill_size: event.fill_size,
             fee: event.fee_paid,
             trade_id: event.trade_id,
+            fee_source: (event.event_type() == Some(EventType::OrderFilled))
+                .then(|| event.fee_source().as_str()),
         }
     }
 }
@@ -393,23 +401,27 @@ mod tests {
         let mut info = session("cost");
         info.hedge_account = Some("0x00000000000000000000000000000000000000aa".into());
         let sink = TelemetrySink::open(&dir, &info).unwrap();
-        // Lighter buys 0.1 @ 2000 and sells it @ 2010 (maker rebate).
+        // Lighter buys 0.1 @ 2000 and sells it @ 2010 (maker rebate), each
+        // labeled as a current feeder labels an explicit rate.
         for (seq, is_ask, price, trade) in [(1, false, 2000.0, 11), (2, true, 2010.0, 12)] {
-            sink.order_event(&ShmPrivateEventV2::order_filled(
-                seq,
-                2,
-                1,
-                50 + seq,
-                100 + seq as i64,
-                7,
-                price,
-                0.1,
-                0.0,
-                -0.002,
-                is_ask,
-                0,
-                trade,
-            ));
+            sink.order_event(
+                &ShmPrivateEventV2::order_filled(
+                    seq,
+                    2,
+                    1,
+                    50 + seq,
+                    100 + seq as i64,
+                    7,
+                    price,
+                    0.1,
+                    0.0,
+                    -0.002,
+                    is_ask,
+                    0,
+                    trade,
+                )
+                .with_fee_source(crate::types::events::FeeSource::RateDerived),
+            );
         }
         // Hedge: sell 0.1 with a reported fill price, buy back at the IOC
         // limit bound, then open 0.05 that stays unmarked.
@@ -446,9 +458,12 @@ mod tests {
     async fn mark_fixture_matches_the_writer() {
         let dir = std::env::temp_dir().join(format!("aleph-mark-{}", uuid::Uuid::new_v4()));
         let sink = TelemetrySink::open(&dir, &session("mark")).unwrap();
-        sink.order_event(&ShmPrivateEventV2::order_filled(
-            1, 2, 1, 51, 101, 7, 2000.0, 0.1, 0.0, -0.002, false, 0, 11,
-        ));
+        sink.order_event(
+            &ShmPrivateEventV2::order_filled(
+                1, 2, 1, 51, 101, 7, 2000.0, 0.1, 0.0, -0.002, false, 0, 11,
+            )
+            .with_fee_source(crate::types::events::FeeSource::RateDerived),
+        );
         let marked = StrategySnapshot {
             equity: 1000.0,
             session_start_equity: 1000.0,
@@ -490,6 +505,69 @@ mod tests {
         }
         sink.stopped().await.unwrap();
         check_fixture(&dir, "restarted_daily_loss", "restarted_daily_loss.jsonl");
+    }
+
+    /// The Go feeder's own V2 bytes (feeder/exchanges
+    /// TestPrivateTradeFeeSourceRingFixture), read by the production ring
+    /// reader and exported by the sink. The JSONL is the store's input
+    /// fixture, so the chain Go writer -> Rust reader -> JSONL -> SQLite is
+    /// checked end to end on recorded bytes.
+    #[tokio::test]
+    async fn v2_fee_source_fixture_matches_the_feeder() {
+        use crate::shm_event_reader::ShmEventReaderV2;
+        use crate::types::events::FeeSource;
+        let slots = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/types/events/v2_fee_sources.bin"),
+        )
+        .unwrap();
+        assert_eq!(slots.len(), 8 * 128);
+        // A ring file as the feeder maps it: write_idx 8, generation even.
+        let ring = std::env::temp_dir().join(format!("aleph-v2-{}", uuid::Uuid::new_v4()));
+        let mut bytes = vec![0u8; 64 + 1024 * 128];
+        bytes[..8].copy_from_slice(&8u64.to_le_bytes());
+        bytes[64..64 + slots.len()].copy_from_slice(&slots);
+        std::fs::write(&ring, &bytes).unwrap();
+        let mut reader = ShmEventReaderV2::new(&ring).unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| reader.try_read()).collect();
+        std::fs::remove_file(&ring).unwrap();
+        assert!(!reader.take_integrity_loss());
+        let sources: Vec<_> = events.iter().map(|e| e.fee_source()).collect();
+        assert_eq!(
+            sources,
+            [
+                FeeSource::RateDerived,
+                FeeSource::RateDerived,
+                FeeSource::ExplicitZero,
+                FeeSource::RateDerived,
+                FeeSource::Missing,
+                FeeSource::Invalid,
+                FeeSource::RoleUnknown,
+                FeeSource::Unknown,
+            ]
+        );
+        // fee_paid keeps the feeder's numbers: maker 20 ppm, taker 400 ppm
+        // on 0.01 @ 2000.5; zero, missing and the older writer read as 0.
+        const WANT: [f64; 8] = [
+            0.0004001,
+            0.008002,
+            0.0,
+            -0.000500125,
+            0.0,
+            0.00005001250000000001,
+            0.0004001,
+            0.0,
+        ];
+        let fees: Vec<_> = events.iter().map(|e| e.fee_paid).collect();
+        for (fee, want) in fees.iter().zip(WANT) {
+            assert!((fee - want).abs() < 1e-15, "{fees:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("aleph-v2fee-{}", uuid::Uuid::new_v4()));
+        let sink = TelemetrySink::open(&dir, &session("fee_sources")).unwrap();
+        for event in &events {
+            sink.order_event(event);
+        }
+        sink.stopped().await.unwrap();
+        check_fixture(&dir, "fee_sources", "fee_source_session.jsonl");
     }
 
     /// Compare a writer-produced session with its checked-in fixture.
