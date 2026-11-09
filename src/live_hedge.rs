@@ -26,8 +26,12 @@ const MAX_QUOTE_AGE_MS: u64 = 3_000;
 const MAX_ACCOUNT_AGE_MS: u64 = 5_000;
 const CLOCK_TOLERANCE_MS: u64 = 2_000;
 const FINISH_DEADLINE: Duration = Duration::from_secs(30);
+/// Largest configurable `taker_fee_bps`; the offline fee view bounds a
+/// telemetry estimate by it because the configured rate is not journaled.
+pub(crate) const MAX_TAKER_FEE_BPS: f64 = 100.0;
 
 pub mod audit;
+pub mod fee_view;
 pub mod journal;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -53,7 +57,7 @@ impl HedgeLimits {
                 && self.max_order_notional_usd >= Decimal::TEN
                 && self.min_available_usd >= self.max_order_notional_usd
                 && (1..=100).contains(&self.slippage_bps)
-                && (0.0..=100.0).contains(&self.taker_fee_bps),
+                && (0.0..=MAX_TAKER_FEE_BPS).contains(&self.taker_fee_bps),
             "Invalid inventory hedge limits"
         );
         Ok(())

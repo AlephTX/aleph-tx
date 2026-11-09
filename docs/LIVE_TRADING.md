@@ -124,6 +124,24 @@ the strategy's normal shorter cancellation timer.
   unattributed. Excess, conflicting or foreign fills are invalid. This is
   the venue's frozen declaration, separate from the configured-rate
   estimate in telemetry.
+- `cargo run --release --bin cross_venue -- hedge-fee-view JOURNAL
+  EVIDENCE TELEMETRY CLOID` sets both cost records of one reconciled IOC
+  side by side, offline and read-only. It runs the same audit, takes that
+  IOC's venue `fee` view and binds the telemetry `hedge_fill` by its exact
+  CLOID. The telemetry `session` line must name the journal's session ID,
+  network, Lighter account and market, Hyperliquid account and symbol; a
+  schema 1 or legacy journal has no market and stays unresolved. The live
+  writer exports a fill only after journaling its positive terminal, so the
+  record must match that terminal's size, position and price: `fill` at its
+  average price, or `limit` at the IOC limit when the terminal came from a
+  lookup. A second session line, a record after `stopped`, two different
+  records for the CLOID, or a fill the journal never confirmed is invalid.
+  The fees are never subtracted: the estimate names no asset, so
+  `comparison` is always `not_comparable` with its reasons. Exit codes match
+  the audit: 0 when both records bind, 2 when one is missing or the file is
+  torn, 3 on contradictions. `examples/hedge_fee_view/` is a synthetic
+  example from the real writers (CLOID
+  `0x0123456789abcdef0123456789abcdef`).
 - For the Lighter leg of a schema 2 journal, an optional `lighter` section
   in the same evidence file takes `account_index`, `market_id`, `symbol`,
   the session's `client_order_ids`, raw `accountOrders` responses in

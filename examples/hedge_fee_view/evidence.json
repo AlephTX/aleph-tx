@@ -1,0 +1,51 @@
+{
+  "coin": "ETH",
+  "fills": [
+    {
+      "observed_at_ms": 2000,
+      "response": [
+        {
+          "closedPnl": "0",
+          "coin": "ETH",
+          "crossed": true,
+          "dir": "Open Short",
+          "fee": "0.0035982",
+          "feeToken": "USDC",
+          "hash": "0xabc",
+          "oid": 8,
+          "px": "1999",
+          "side": "A",
+          "startPosition": "0",
+          "sz": "0.004",
+          "tid": 1,
+          "time": 1400
+        }
+      ]
+    }
+  ],
+  "hyperliquid_account": "0x00000000000000000000000000000000000000aa",
+  "lookups": [
+    {
+      "cloid": "0x0123456789abcdef0123456789abcdef",
+      "observed_at_ms": 1510,
+      "response": {
+        "order": {
+          "order": {
+            "cloid": "0x0123456789abcdef0123456789abcdef",
+            "coin": "ETH",
+            "limitPx": "1998",
+            "oid": 8,
+            "origSz": "0.01",
+            "side": "A",
+            "sz": "0.006",
+            "timestamp": 1000
+          },
+          "status": "canceled",
+          "statusTimestamp": 1500
+        },
+        "status": "order"
+      }
+    }
+  ],
+  "network": "Testnet"
+}
