@@ -8,9 +8,13 @@
 //! another session, a journal-wide contradiction) are listed once and hold
 //! the ratio back; the rows stay as diagnostics.
 //!
-//! The denominator is every IOC with a positive fill and a known terminal,
-//! never the records that happen to be visible. Fees are listed per IOC and
-//! per asset; nothing is summed, converted or netted.
+//! The denominator is every IOC with a positive fill and a journaled
+//! terminal, never the records that happen to be visible. A positive fill
+//! reconciled only by venue evidence has no journaled terminal, so the
+//! writer exported no estimate for it: it is listed apart as
+//! `evidence_only`, with its venue fee and reasons, and withholds the ratio.
+//! Fees are listed per IOC and per asset; nothing is summed, converted or
+//! netted.
 
 use super::{Archive, Inputs, Records, ViewStatus, read_files};
 use crate::live_hedge::audit::{AuditStatus, Evidence, FeeReport, OrderReport, OrderStatus};
@@ -54,6 +58,10 @@ pub enum Class {
     Bound,
     /// A positive fill with no bound estimate or no attributed venue fee.
     MissingEvidence,
+    /// A positive fill reconciled only by venue evidence. The journal has
+    /// no terminal for it, so the writer exported no estimate to bind. It is
+    /// outside the denominator and withholds the ratio.
+    EvidenceOnly,
     /// Not reconciled: it may or may not have filled.
     UnknownOutcome,
     /// Reconciled with no fill, so there is no fee to cover.
@@ -117,6 +125,7 @@ pub struct Counts {
     pub intents: usize,
     pub bound: usize,
     pub missing_evidence: usize,
+    pub evidence_only: usize,
     pub unknown_outcome: usize,
     pub no_fill: usize,
     pub contradiction: usize,
@@ -130,11 +139,12 @@ pub struct Counts {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Coverage {
-    /// IOCs with a positive fill and a known terminal: `journaled`
-    /// (recorded) plus `evidence_only` (reconciled by venue evidence, so
-    /// the writer exported no estimate).
+    /// IOCs with a positive fill and a journaled terminal (audit status
+    /// `recorded`), whatever records survive for them.
     pub denominator: usize,
-    pub journaled: usize,
+    /// IOCs with a positive fill reconciled only by venue evidence (audit
+    /// status `matched`). Outside the denominator; any of them withholds
+    /// the ratio.
     pub evidence_only: usize,
     pub bound: usize,
     /// `bound / denominator`; null when any reason in `withheld` applies.
@@ -173,7 +183,7 @@ pub struct CoverageReport {
 const BOUNDARIES: &[&str] = &[
     "Offline and read-only: only the three files are read, each once; no venue request, credential, signature or order was made.",
     "Each IOC is judged as hedge-fee-view judges its CLOID on the same files. Findings that hold for every IOC are listed once in `archive`.",
-    "The denominator is every IOC with a positive fill and a known terminal, journaled or reconciled by evidence, never the records that happen to be visible.",
+    "The denominator is every IOC with a positive fill and a journaled terminal, never the records that happen to be visible. Positive fills reconciled only by venue evidence are listed apart and withhold the ratio.",
     "`complete` covers the supplied files only. A whole, parseable archive does not show the session ended or that no other record exists.",
     "Fees are listed per IOC and per asset as recorded. None is summed, converted or netted, and a missing fee is unknown, never zero.",
     "One Hyperliquid session only: no Lighter fee attribution, cross-leg PnL, amount charged, return or restart permission.",
@@ -192,9 +202,23 @@ fn classify(order: &OrderReport, own: ViewStatus) -> Class {
         OrderStatus::Invalid => Class::Contradiction,
         OrderStatus::Pending => Class::UnknownOutcome,
         _ if !positive(order.filled) => Class::NoFill,
+        // Filled per venue evidence, but the journal has no terminal for
+        // it, so the writer exported no estimate that could bind.
+        OrderStatus::Matched => Class::EvidenceOnly,
         _ if own == ViewStatus::Bound => Class::Bound,
         _ => Class::MissingEvidence,
     }
+}
+
+/// A positive fill with a journaled terminal: the denominator's cohort,
+/// by the audit's facts and whatever records survive.
+fn journaled_fill(order: &OrderReport) -> bool {
+    order.status == OrderStatus::Recorded && positive(order.filled)
+}
+
+/// A positive fill reconciled only by venue evidence: no local terminal.
+fn evidence_only_fill(order: &OrderReport) -> bool {
+    order.status == OrderStatus::Matched && positive(order.filled)
 }
 
 /// A telemetry CLOID no journaled IOC has, with every line naming it.
@@ -233,6 +257,7 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8]) -> CoverageR
                 counts.missing_telemetry += usize::from(fills.is_empty());
                 counts.missing_venue_fee += usize::from(order.fee.status != "attributed");
             }
+            Class::EvidenceOnly => counts.evidence_only += 1,
             Class::UnknownOutcome => counts.unknown_outcome += 1,
             Class::NoFill => counts.no_fill += 1,
             Class::Contradiction => counts.contradiction += 1,
@@ -252,9 +277,8 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8]) -> CoverageR
             audit_status: order.status,
             filled: order.filled,
             class,
-            // A known positive fill owes a fee whatever records survive.
-            in_denominator: positive(order.filled)
-                && matches!(order.status, OrderStatus::Recorded | OrderStatus::Matched),
+            // A journaled positive fill owes a fee whatever records survive.
+            in_denominator: journaled_fill(order),
             view_status: own.max(archive_status),
             reasons,
             notes: judged.notes,
@@ -278,17 +302,9 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8]) -> CoverageR
         .collect();
     counts.orphan_telemetry = orphan_telemetry.len();
 
-    let in_denominator = |status: OrderStatus| {
-        orders
-            .iter()
-            .filter(|o| o.in_denominator && o.audit_status == status)
-            .count()
-    };
-    let (journaled_fills, evidence_only) = (
-        in_denominator(OrderStatus::Recorded),
-        in_denominator(OrderStatus::Matched),
-    );
-    let denominator = journaled_fills + evidence_only;
+    let cohort =
+        |keep: fn(&OrderReport) -> bool| archive.report.orders.iter().filter(|o| keep(o)).count();
+    let (denominator, evidence_only) = (cohort(journaled_fill), cohort(evidence_only_fill));
     let mut withheld = Vec::new();
     if archive_status != ViewStatus::Bound {
         let what = if archive_status == ViewStatus::Invalid {
@@ -318,8 +334,18 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8]) -> CoverageR
             counts.unknown_outcome
         ));
     }
+    // Reconciled, not unknown: the venue shows these fills, but the journal
+    // holds no terminal for them, so the journaled cohort does not speak
+    // for every fill in the files.
+    if evidence_only > 0 {
+        withheld.push(format!(
+            "{evidence_only} IOC(s) filled per venue evidence but have no journaled terminal; the writer exported no estimate for them, so they are outside the denominator"
+        ));
+    }
     if denominator == 0 {
-        withheld.push("no IOC has a positive fill with a known terminal; nothing to cover".into());
+        withheld.push(
+            "no IOC has a positive fill with a journaled terminal; the denominator is empty".into(),
+        );
     }
     let ratio = withheld
         .is_empty()
@@ -359,7 +385,6 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8]) -> CoverageR
         },
         coverage: Coverage {
             denominator,
-            journaled: journaled_fills,
             evidence_only,
             bound: counts.bound,
             ratio,

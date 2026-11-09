@@ -48,6 +48,28 @@ fn second_record() -> crate::telemetry_sink::HedgeFillRecord {
     }
 }
 
+/// Evidence for both IOCs: each one's terminal lookup (oids 8 and 9) and
+/// fills that cover exactly its 0.004.
+fn both_paid() -> Evidence {
+    let mut both = paid();
+    both.lookups.push(audit::LookupEvidence {
+        cloid: SECOND.into(),
+        observed_at_ms: 2_510,
+        response: json!({"status": "order", "order": {"status": "canceled", "statusTimestamp": 2_000,
+            "order": {"coin": "ETH", "cloid": SECOND, "side": "A", "limitPx": "1998",
+                "origSz": "0.01", "sz": "0.006", "oid": 9, "timestamp": 2_000}}}),
+    });
+    let mut second_fill = venue_fill(2, "0.004", "0.0035982", "USDC");
+    second_fill["oid"] = json!(9);
+    second_fill["time"] = json!(2_000);
+    both.fills[0]
+        .response
+        .as_array_mut()
+        .unwrap()
+        .push(second_fill);
+    both
+}
+
 fn row<'r>(report: &'r CoverageReport, cloid: &str) -> &'r coverage::OrderCoverage {
     report.orders.iter().find(|o| o.cloid == cloid).unwrap()
 }
@@ -93,6 +115,7 @@ fn assert_rows_match_views(journal: &[u8], evidence: &Evidence, telemetry: &[u8]
         (
             n.bound,
             n.missing_evidence,
+            n.evidence_only,
             n.unknown_outcome,
             n.no_fill,
             n.contradiction
@@ -100,17 +123,39 @@ fn assert_rows_match_views(journal: &[u8], evidence: &Evidence, telemetry: &[u8]
         (
             class(Class::Bound),
             class(Class::MissingEvidence),
+            class(Class::EvidenceOnly),
             class(Class::UnknownOutcome),
             class(Class::NoFill),
             class(Class::Contradiction)
         )
     );
+    // The denominator is the positive journaled fills; evidence-only
+    // positive fills are counted apart, never in it.
+    let positive = |o: &&coverage::OrderCoverage| o.filled.is_some_and(|f| f > Decimal::ZERO);
+    let cohort = |status: OrderStatus| {
+        report
+            .orders
+            .iter()
+            .filter(positive)
+            .filter(|o| o.audit_status == status)
+            .count()
+    };
     let c = &report.coverage;
     assert_eq!(
         c.denominator,
         report.orders.iter().filter(|o| o.in_denominator).count()
     );
-    assert_eq!(c.denominator, c.journaled + c.evidence_only);
+    assert_eq!(c.denominator, cohort(OrderStatus::Recorded));
+    assert_eq!(c.evidence_only, cohort(OrderStatus::Matched));
+    for order in &report.orders {
+        assert_eq!(
+            order.in_denominator,
+            order.audit_status == OrderStatus::Recorded && positive(&order),
+            "{}",
+            order.cloid
+        );
+    }
+    assert!(c.evidence_only == 0 || c.ratio.is_none());
     assert_eq!(c.bound, n.bound);
     assert_eq!(c.ratio.is_none(), !c.withheld.is_empty());
     assert_eq!(n.orphan_telemetry, report.orphan_telemetry.len());
@@ -132,10 +177,7 @@ async fn one_of_two_positive_fills_is_bound_and_the_other_names_its_gap() {
         report.archive.reasons
     );
     let c = &report.coverage;
-    assert_eq!(
-        (c.denominator, c.journaled, c.evidence_only, c.bound),
-        (2, 2, 0, 1)
-    );
+    assert_eq!((c.denominator, c.evidence_only, c.bound), (2, 0, 1));
     assert_eq!(c.ratio, Some(0.5));
     assert!(c.withheld.is_empty(), "{:?}", c.withheld);
     let n = &report.counts;
@@ -184,22 +226,7 @@ async fn one_of_two_positive_fills_is_bound_and_the_other_names_its_gap() {
 #[tokio::test]
 async fn every_positive_fill_bound_is_complete_for_these_files_only() {
     let telemetry = written(info(), vec![record(1999.0, "fill"), second_record()]).await;
-    let mut both = paid();
-    both.lookups.push(audit::LookupEvidence {
-        cloid: SECOND.into(),
-        observed_at_ms: 2_510,
-        response: json!({"status": "order", "order": {"status": "canceled", "statusTimestamp": 2_000,
-            "order": {"coin": "ETH", "cloid": SECOND, "side": "A", "limitPx": "1998",
-                "origSz": "0.01", "sz": "0.006", "oid": 9, "timestamp": 2_000}}}),
-    });
-    let mut second_fill = venue_fill(2, "0.004", "0.0035982", "USDC");
-    second_fill["oid"] = json!(9);
-    second_fill["time"] = json!(2_000);
-    both.fills[0]
-        .response
-        .as_array_mut()
-        .unwrap()
-        .push(second_fill);
+    let both = both_paid();
     let journal = two_filled();
     let report = coverage::build(&journal, &both, &telemetry);
     assert_eq!(report.status, CoverageStatus::Complete, "{report:#?}");
@@ -266,7 +293,7 @@ async fn unknown_outcomes_zero_fills_and_an_empty_denominator_withhold_the_ratio
             .coverage
             .withheld
             .iter()
-            .any(|w| w.contains("nothing to cover"))
+            .any(|w| w.contains("the denominator is empty"))
     );
 
     // A zero fill owes no fee and is not in the denominator.
@@ -464,41 +491,130 @@ async fn truncation_or_a_foreign_session_withholds_the_ratio() {
     );
 }
 
-/// An IOC reconciled only by venue evidence owes a fee but has no journaled
-/// terminal, so the writer exported no estimate. It counts in the
-/// denominator and cannot be bound.
-#[tokio::test]
-async fn an_evidence_only_fill_counts_in_the_denominator_unbound() {
-    let empty = written(info(), vec![]).await;
-    let mut matched = paid();
-    matched.account_snapshot = Some(audit::SnapshotEvidence {
-        observed_at_ms: 1_700,
-        state: json!({"time": 1_650, "withdrawable": "100",
+/// An account sample at `time` with the hedge at `position`.
+fn snapshot(time: u64, position: &str) -> audit::SnapshotEvidence {
+    audit::SnapshotEvidence {
+        observed_at_ms: time + 50,
+        state: json!({"time": time, "withdrawable": "100",
             "marginSummary": {"accountValue": "100", "totalNtlPos": "0", "totalMarginUsed": "0"},
-            "assetPositions": [{"position": {"coin": "ETH", "szi": "-0.004", "unrealizedPnl": "0"}}]}),
-    });
+            "assetPositions": [{"position": {"coin": "ETH", "szi": position, "unrealizedPnl": "0"}}]}),
+    }
+}
+
+/// An IOC reconciled only by venue evidence has filled, but the journal has
+/// no terminal for it, so the writer exported no estimate. It is listed
+/// apart with its venue fee and reasons, outside the denominator, and it
+/// withholds the ratio. It is never called an unknown outcome.
+#[tokio::test]
+async fn an_evidence_only_fill_is_listed_apart_and_withholds_the_ratio() {
+    let empty = written(info(), vec![]).await;
+    let matched = Evidence {
+        account_snapshot: Some(snapshot(1_650, "-0.004")),
+        ..paid()
+    };
     let open = journal_with_open_intent();
     let report = coverage::build(&open, &matched, &empty);
     let one = row(&report, CLOID);
     assert_eq!(one.audit_status, OrderStatus::Matched, "{:?}", one.reasons);
-    assert_eq!(one.class, Class::MissingEvidence);
-    assert!(one.in_denominator);
+    assert_eq!(one.class, Class::EvidenceOnly);
+    assert!(!one.in_denominator);
+    assert_eq!(one.filled, Some(d("0.004")));
     assert_eq!(one.venue_fee.status, "attributed");
-    let c = &report.coverage;
-    assert_eq!(
-        (c.denominator, c.journaled, c.evidence_only, c.bound),
-        (1, 0, 1, 0)
+    assert!(
+        one.reasons
+            .iter()
+            .any(|r| r.contains("reconciled by evidence only")),
+        "{:?}",
+        one.reasons
     );
-    assert_eq!(c.ratio, Some(0.0));
+    let c = &report.coverage;
+    assert_eq!((c.denominator, c.evidence_only, c.bound), (0, 1, 0));
+    assert_eq!(c.ratio, None);
+    for expected in ["no journaled terminal", "the denominator is empty"] {
+        assert!(
+            c.withheld.iter().any(|w| w.contains(expected)),
+            "{expected}: {:?}",
+            c.withheld
+        );
+    }
+    assert!(!c.withheld.iter().any(|w| w.contains("not reconciled")));
+    let n = &report.counts;
     assert_eq!(
-        (
-            report.counts.missing_telemetry,
-            report.counts.missing_venue_fee
-        ),
-        (1, 0)
+        (n.evidence_only, n.unknown_outcome, n.missing_evidence),
+        (1, 0, 0)
     );
     assert_eq!(report.status, CoverageStatus::Incomplete);
+    assert_eq!(report.status.exit_code(), 2);
     assert_rows_match_views(&open, &matched, &empty);
+}
+
+/// The review's case: a bound journaled fill and an evidence-only fill are
+/// 1 of 1 journaled with 1 apart, and no ratio. The evidence-only row keeps
+/// its venue fee and reasons.
+#[tokio::test]
+async fn a_bound_journaled_fill_beside_an_evidence_only_fill_has_no_ratio() {
+    let telemetry = written(info(), vec![record(1999.0, "fill")]).await;
+    let journal = journal(vec![
+        JournalRecord::Start(start()),
+        JournalRecord::Intent(intent(CLOID, "0")),
+        JournalRecord::Terminal(terminal(CLOID, Some("1999"))),
+        JournalRecord::Intent(second_intent()),
+    ]);
+    let evidence = Evidence {
+        account_snapshot: Some(snapshot(2_650, "-0.008")),
+        ..both_paid()
+    };
+    let report = coverage::build(&journal, &evidence, &telemetry);
+    let second = row(&report, SECOND);
+    assert_eq!(
+        second.audit_status,
+        OrderStatus::Matched,
+        "{:?}",
+        second.reasons
+    );
+    assert_eq!(second.class, Class::EvidenceOnly);
+    assert!(!second.in_denominator);
+    assert_eq!(second.view_status, ViewStatus::Unresolved);
+    assert_eq!(second.venue_fee.status, "attributed");
+    assert_eq!(second.venue_fee.fees.len(), 1);
+    assert!(second.estimate.fee.is_none());
+    let first = row(&report, CLOID);
+    assert_eq!((first.class, first.in_denominator), (Class::Bound, true));
+    let c = &report.coverage;
+    assert_eq!((c.denominator, c.evidence_only, c.bound), (1, 1, 1));
+    assert_eq!(c.ratio, None);
+    assert_eq!(c.withheld.len(), 1, "{:?}", c.withheld);
+    assert!(c.withheld[0].contains("no journaled terminal"));
+    assert_eq!(report.status, CoverageStatus::Incomplete);
+    assert_rows_match_views(&journal, &evidence, &telemetry);
+
+    // A zero fill the venue confirms is a known zero fill, not an
+    // evidence-only one: it owes no fee and does not hold the ratio back.
+    let canceled = json!({"status": "order", "order": {"status": "canceled", "statusTimestamp": 2_000,
+        "order": {"coin": "ETH", "cloid": SECOND, "side": "A", "limitPx": "1998",
+            "origSz": "0.01", "sz": "0.01", "oid": 9, "timestamp": 2_000}}});
+    let mut unfilled = paid();
+    unfilled.lookups.push(audit::LookupEvidence {
+        cloid: SECOND.into(),
+        observed_at_ms: 2_510,
+        response: canceled,
+    });
+    unfilled.account_snapshot = Some(snapshot(2_650, "-0.004"));
+    let report = coverage::build(&journal, &unfilled, &telemetry);
+    let second = row(&report, SECOND);
+    assert_eq!(
+        (second.audit_status, second.filled),
+        (OrderStatus::Matched, Some(Decimal::ZERO)),
+        "{:?}",
+        second.reasons
+    );
+    assert_eq!(second.class, Class::NoFill);
+    assert!(!second.in_denominator);
+    let c = &report.coverage;
+    assert_eq!((c.denominator, c.evidence_only, c.bound), (1, 0, 1));
+    assert_eq!(c.ratio, Some(1.0), "{:?}", c.withheld);
+    assert_eq!(report.status, CoverageStatus::Complete);
+    assert_rows_match_views(&journal, &unfilled, &telemetry);
 }
 
 /// The file entry point reads each input once, reports its hash, leaves it
