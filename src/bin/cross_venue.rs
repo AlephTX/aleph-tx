@@ -347,6 +347,16 @@ async fn main() -> Result<()> {
             print(&view)?;
             std::process::exit(view.status.exit_code());
         }
+        [command, journal, evidence, telemetry] if command == "hedge-fee-coverage" => {
+            // Offline and read-only: every journaled IOC from one read of each file.
+            let report = aleph_tx::live_hedge::fee_view::coverage::coverage_files(
+                Path::new(journal),
+                Path::new(evidence),
+                Path::new(telemetry),
+            )?;
+            print(&report)?;
+            std::process::exit(report.status.exit_code());
+        }
         [command, file] if command == "replay" => {
             let replay: Replay = read_replay(file)?;
             replay.config.validate()?;
@@ -490,7 +500,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }

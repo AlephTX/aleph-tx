@@ -23,6 +23,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -211,16 +212,47 @@ struct Fill {
     position_after: String,
 }
 
-/// What one telemetry file says about its session and one CLOID.
+/// One CLOID's `hedge_fill` records.
+#[derive(Default)]
+struct Records {
+    /// Well-formed records, in file order.
+    fills: Vec<Fill>,
+    /// This CLOID's records with a bad number: line and reason.
+    faults: Vec<(usize, String)>,
+}
+
+/// What one telemetry file says about its session and every CLOID.
 struct Telemetry {
     session: Option<SessionLine>,
     stopped: Option<usize>,
-    /// Every `hedge_fill` for the CLOID, in file order.
-    fills: Vec<Fill>,
-    /// Contradictions anywhere in the file.
-    invalid: Vec<String>,
+    /// Contradictions in the file as a whole: line (0 for the file) and
+    /// reason, in file order.
+    faults: Vec<(usize, String)>,
+    /// Records by exact CLOID.
+    by_cloid: BTreeMap<String, Records>,
     /// Line number of a final line without its newline.
     torn: Option<usize>,
+}
+
+impl Telemetry {
+    fn fault(&mut self, line: usize, reason: String) {
+        self.faults.push((line, reason));
+    }
+
+    /// File one parsed `hedge_fill` under its exact CLOID. A bad number is
+    /// that CLOID's fault only, as it was when a view read one CLOID.
+    fn record(&mut self, line: usize, fill: &HedgeFillLine<'_>) {
+        let records = self
+            .by_cloid
+            .entry(fill.client_order_id.clone())
+            .or_default();
+        match own_fill(line, fill) {
+            Ok(own) => records.fills.push(own),
+            Err(reason) => records
+                .faults
+                .push((line, format!("line {line}: {reason}"))),
+        }
+    }
 }
 
 /// A finite JSON number token, unchanged; strings, null and the like fail.
@@ -232,12 +264,12 @@ fn number(raw: &RawValue) -> Option<String> {
     (numeric && text.parse::<f64>().is_ok_and(f64::is_finite)).then(|| text.to_owned())
 }
 
-fn read_telemetry(bytes: &[u8], cloid: &str) -> Telemetry {
+fn read_telemetry(bytes: &[u8]) -> Telemetry {
     let mut out = Telemetry {
         session: None,
         stopped: None,
-        fills: Vec::new(),
-        invalid: Vec::new(),
+        faults: Vec::new(),
+        by_cloid: BTreeMap::new(),
         torn: None,
     };
     let mut rest = bytes;
@@ -245,71 +277,70 @@ fn read_telemetry(bytes: &[u8], cloid: &str) -> Telemetry {
     while !rest.is_empty() {
         line_no += 1;
         let Some(end) = rest.iter().position(|b| *b == b'\n') else {
-            // Cut mid-record: it may have been any record, including this
+            // Cut mid-record: it may have been any record, including any
             // CLOID's, so the file cannot show a complete set.
             out.torn = Some(line_no);
             break;
         };
         let line = &rest[..end];
         rest = &rest[end + 1..];
-        read_line(&mut out, line_no, line, cloid);
+        read_line(&mut out, line_no, line);
     }
     if line_no == 0 {
-        out.invalid.push("telemetry file is empty".into());
+        out.fault(0, "telemetry file is empty".into());
     }
     out
 }
 
-fn read_line(out: &mut Telemetry, line_no: usize, line: &[u8], cloid: &str) {
+fn read_line(out: &mut Telemetry, line_no: usize, line: &[u8]) {
     let kind = match serde_json::from_slice::<Kind<'_>>(line) {
         Ok(Kind { kind: Some(kind) }) => kind.to_owned(),
         Ok(Kind { kind: None }) => {
-            out.invalid.push(format!("line {line_no}: no record type"));
+            out.fault(line_no, format!("line {line_no}: no record type"));
             return;
         }
         Err(error) => {
-            out.invalid
-                .push(format!("line {line_no}: not a JSON record ({error})"));
+            out.fault(
+                line_no,
+                format!("line {line_no}: not a JSON record ({error})"),
+            );
             return;
         }
     };
     if let Some(stopped) = out.stopped {
-        out.invalid.push(format!(
-            "line {line_no}: `{kind}` follows the stopped marker on line {stopped}"
-        ));
+        out.fault(
+            line_no,
+            format!("line {line_no}: `{kind}` follows the stopped marker on line {stopped}"),
+        );
         return;
     }
     if kind == "session" {
         if line_no != 1 {
-            out.invalid.push(format!(
-                "line {line_no}: a second session record; one file holds one session"
-            ));
+            out.fault(
+                line_no,
+                format!("line {line_no}: a second session record; one file holds one session"),
+            );
             return;
         }
         match serde_json::from_slice::<SessionLine>(line) {
             Ok(session) => out.session = Some(session),
-            Err(error) => out
-                .invalid
-                .push(format!("line 1: malformed session record ({error})")),
+            Err(error) => out.fault(1, format!("line 1: malformed session record ({error})")),
         }
         return;
     }
     if line_no == 1 {
-        out.invalid
-            .push(format!("line 1 is `{kind}`, not the session record"));
+        out.fault(1, format!("line 1 is `{kind}`, not the session record"));
         return;
     }
     match kind.as_str() {
         "stopped" => out.stopped = Some(line_no),
         "hedge_fill" => match serde_json::from_slice::<HedgeFillLine<'_>>(line) {
-            Ok(fill) if fill.client_order_id == cloid => match own_fill(line_no, &fill) {
-                Ok(fill) => out.fills.push(fill),
-                Err(reason) => out.invalid.push(format!("line {line_no}: {reason}")),
-            },
-            Ok(_) => {}
-            Err(error) => out
-                .invalid
-                .push(format!("line {line_no}: malformed hedge_fill ({error})")),
+            Ok(fill) => out.record(line_no, &fill),
+            // Unparsed, so its CLOID is unknown: a fault for every view.
+            Err(error) => out.fault(
+                line_no,
+                format!("line {line_no}: malformed hedge_fill ({error})"),
+            ),
         },
         _ => {}
     }
@@ -375,11 +406,17 @@ fn check_session(start: &StartRecord, session: &SessionLine, reasons: &mut Vec<S
     }
 }
 
+/// The journal split once at its newlines, so each IOC's terminal is read
+/// back without rescanning the file.
+fn journal_lines(journal: &[u8]) -> Vec<&[u8]> {
+    journal.split(|b| *b == b'\n').collect()
+}
+
 /// The terminal the audit accepted for this IOC, read from its first
 /// terminal line (the report omits the average price and source). Lines are
 /// numbered as the audit numbers them, and it lists only complete lines.
-fn terminal_at(journal: &[u8], line: usize) -> Option<TerminalRecord> {
-    let raw = journal.split(|b| *b == b'\n').nth(line.checked_sub(1)?)?;
+fn terminal_at(lines: &[&[u8]], line: usize) -> Option<TerminalRecord> {
+    let raw = lines.get(line.checked_sub(1)?)?;
     match JournalRecord::parse(raw).ok()? {
         JournalRecord::Terminal(terminal) => Some(terminal),
         _ => None,
@@ -460,42 +497,38 @@ fn check_fill(
 
 // ─── View ────────────────────────────────────────────────────────────────
 
-fn worse(status: &mut ViewStatus, to: ViewStatus) {
-    *status = (*status).max(to);
+/// One frozen archive read once: a single audit of the journal and
+/// evidence, the telemetry indexed by CLOID, the journal split at its
+/// newlines, and the findings that hold for every IOC. Views over it read
+/// nothing again and repeat no archive-wide work.
+struct Archive<'a> {
+    report: audit::Report,
+    lines: Vec<&'a [u8]>,
+    telemetry: Telemetry,
+    /// Findings about the journal and evidence as a whole, in view order.
+    journal: Vec<(ViewStatus, String)>,
+    /// Findings about the telemetry session and file end, in view order,
+    /// already labeled as telemetry findings.
+    file: Vec<(ViewStatus, String)>,
 }
 
-/// Raise `status` to at least `to` and record why.
-fn flag(status: &mut ViewStatus, reasons: &mut Vec<String>, to: ViewStatus, reason: String) {
-    worse(status, to);
-    reasons.push(reason);
+/// The worst status among `findings`; `Bound` when there is none.
+fn worst<'f>(findings: impl IntoIterator<Item = &'f (ViewStatus, String)>) -> ViewStatus {
+    findings
+        .into_iter()
+        .map(|(status, _)| *status)
+        .max()
+        .unwrap_or(ViewStatus::Bound)
 }
 
-/// A telemetry-side finding: raises the telemetry status and the view's.
-fn tel(reasons: &mut Vec<String>, to: ViewStatus, reason: String, status: &mut ViewStatus) {
-    flag(status, reasons, to, format!("telemetry: {reason}"));
-}
-
-/// Build the view from in-memory inputs. Pure: no I/O.
-pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str) -> FeeView {
-    let report = audit::audit(journal, Some(evidence));
-    let mut status = ViewStatus::Bound;
-    let mut reasons = Vec::new();
-    if validate_hex(cloid, 16).is_err() {
-        flag(
-            &mut status,
-            &mut reasons,
-            ViewStatus::Invalid,
-            format!("`{cloid}` is not a 16-byte hex CLOID"),
-        );
-    }
-    let start = report.journal.session.clone();
-    if start.is_none() {
-        flag(
-            &mut status,
-            &mut reasons,
+/// Findings about the journal and evidence that hold for every IOC.
+fn journal_findings(report: &audit::Report) -> Vec<(ViewStatus, String)> {
+    let mut out = Vec::new();
+    if report.journal.session.is_none() {
+        out.push((
             ViewStatus::Invalid,
             "the journal has no readable session start".into(),
-        );
+        ));
     }
     // Journal-wide contradictions make every binding suspect; unresolved
     // issues elsewhere (another IOC, the Lighter leg) do not.
@@ -504,12 +537,10 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str)
         .iter()
         .filter(|i| i.severity == Severity::Invalid)
     {
-        flag(
-            &mut status,
-            &mut reasons,
+        out.push((
             ViewStatus::Invalid,
             format!("audit {}: {}", issue.kind, issue.detail),
-        );
+        ));
     }
     // A torn final line was cut mid-write and may have been any record,
     // including a later terminal or intent for this CLOID. The complete
@@ -519,112 +550,119 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str)
         let at = issue
             .line
             .map_or_else(String::new, |line| format!(" on line {line}"));
-        flag(
-            &mut status,
-            &mut reasons,
+        out.push((
             ViewStatus::Unresolved,
             format!(
                 "the journal is truncated{at}; its complete prefix cannot show this IOC is unaffected ({})",
                 issue.detail
             ),
-        );
+        ));
     }
     if report
         .evidence
         .as_ref()
         .is_some_and(|e| !e.identity_matches)
     {
-        flag(
-            &mut status,
-            &mut reasons,
+        out.push((
             ViewStatus::Invalid,
             "the evidence names another network, account or coin".into(),
-        );
+        ));
     }
+    out
+}
 
-    let order = report.orders.iter().find(|o| o.cloid == cloid);
-    let terminal = order
-        .and_then(|o| o.terminal_lines.first())
-        .and_then(|&line| terminal_at(journal, line));
-    match order {
-        None => flag(&mut status, &mut reasons,
-            ViewStatus::Invalid,
-            format!("no journaled IOC has CLOID {cloid}"),
-        ),
-        Some(o) if o.status == OrderStatus::Invalid => {
-            flag(&mut status, &mut reasons, ViewStatus::Invalid, format!("the audit finds this IOC invalid: {:?}", o.reasons))
-        }
-        Some(o) if o.status == OrderStatus::Pending => flag(&mut status, &mut reasons,
-            ViewStatus::Unresolved,
-            "the IOC is not reconciled; neither fee can be bound to a fill".into(),
-        ),
-        // Telemetry is exported only after a journaled terminal; an
-        // evidence-matched IOC has none, so the writer emitted no record.
-        Some(o) if o.status == OrderStatus::Matched => flag(&mut status, &mut reasons,
-            ViewStatus::Unresolved,
-            "reconciled by evidence only: the journal has no terminal, so the writer exported no estimate".into(),
-        ),
-        Some(o) if o.filled.is_none_or(|f| f <= Decimal::ZERO) => flag(&mut status, &mut reasons,
-            ViewStatus::Unresolved,
-            "the IOC did not fill; there is no fee to compare".into(),
-        ),
-        Some(_) if terminal.is_none() => flag(&mut status, &mut reasons,
-            ViewStatus::Invalid,
-            "the journaled terminal cannot be read back".into(),
-        ),
-        Some(_) => {}
-    }
-
-    let parsed = read_telemetry(telemetry, cloid);
-    let mut telemetry_status = ViewStatus::Bound;
-    for reason in &parsed.invalid {
-        tel(
-            &mut reasons,
-            ViewStatus::Invalid,
-            reason.clone(),
-            &mut telemetry_status,
-        );
-    }
-    match (&parsed.session, &start) {
+/// Findings about the telemetry session and file end that hold for every
+/// IOC. Line faults stay apart so each view lists them in file order.
+fn file_findings(start: Option<&StartRecord>, telemetry: &Telemetry) -> Vec<(ViewStatus, String)> {
+    let mut out = Vec::new();
+    match (&telemetry.session, start) {
         (Some(session), Some(start)) => {
             let mut mismatches = Vec::new();
             check_session(start, session, &mut mismatches);
-            for reason in mismatches {
-                tel(
-                    &mut reasons,
-                    ViewStatus::Invalid,
-                    reason,
-                    &mut telemetry_status,
-                );
-            }
+            out.extend(mismatches.into_iter().map(|r| (ViewStatus::Invalid, r)));
             if start.lighter_market_id.is_none() {
-                tel(&mut reasons,
+                out.push((
                     ViewStatus::Unresolved,
                     "the journal records no Lighter market (schema 1 or legacy), so the market cannot be matched".into(),
-                    &mut telemetry_status,
-                );
+                ));
             }
         }
-        (None, _) if parsed.invalid.is_empty() => tel(
-            &mut reasons,
-            ViewStatus::Invalid,
-            "no session record on line 1".into(),
-            &mut telemetry_status,
-        ),
+        // A complete first line leaves a session or a fault, so neither
+        // means the file is empty of complete lines.
+        (None, _) if telemetry.faults.is_empty() => {
+            out.push((ViewStatus::Invalid, "no session record on line 1".into()))
+        }
         _ => {}
     }
-    if let Some(line) = parsed.torn {
-        tel(
-            &mut reasons,
+    if let Some(line) = telemetry.torn {
+        out.push((
             ViewStatus::Unresolved,
             format!("line {line} lacks its newline; the file may be incomplete"),
-            &mut telemetry_status,
-        );
+        ));
     }
-    let mut notes = Vec::new();
-    let fill = parsed.fills.first();
-    if let Some(first) = fill {
-        for repeat in &parsed.fills[1..] {
+    for finding in &mut out {
+        finding.1.insert_str(0, "telemetry: ");
+    }
+    out
+}
+
+/// Two fault lists, each in file order, merged back into file order. A
+/// line holds at most one fault, so lines never tie.
+fn in_file_order<'f>(a: &'f [(usize, String)], b: &'f [(usize, String)]) -> Vec<&'f str> {
+    let mut merged: Vec<&(usize, String)> = a.iter().chain(b).collect();
+    merged.sort_by_key(|fault| fault.0);
+    merged.into_iter().map(|fault| fault.1.as_str()).collect()
+}
+
+/// The audit's verdict on the IOC, as the view states it.
+fn order_finding(
+    cloid: &str,
+    order: Option<&OrderReport>,
+    terminal: Option<&TerminalRecord>,
+) -> Option<(ViewStatus, String)> {
+    match order {
+        None => Some((
+            ViewStatus::Invalid,
+            format!("no journaled IOC has CLOID {cloid}"),
+        )),
+        Some(o) if o.status == OrderStatus::Invalid => Some((
+            ViewStatus::Invalid,
+            format!("the audit finds this IOC invalid: {:?}", o.reasons),
+        )),
+        Some(o) if o.status == OrderStatus::Pending => Some((
+            ViewStatus::Unresolved,
+            "the IOC is not reconciled; neither fee can be bound to a fill".into(),
+        )),
+        // Telemetry is exported only after a journaled terminal; an
+        // evidence-matched IOC has none, so the writer emitted no record.
+        Some(o) if o.status == OrderStatus::Matched => Some((
+            ViewStatus::Unresolved,
+            "reconciled by evidence only: the journal has no terminal, so the writer exported no estimate".into(),
+        )),
+        Some(o) if o.filled.is_none_or(|f| f <= Decimal::ZERO) => Some((
+            ViewStatus::Unresolved,
+            "the IOC did not fill; there is no fee to compare".into(),
+        )),
+        Some(_) if terminal.is_none() => Some((
+            ViewStatus::Invalid,
+            "the journaled terminal cannot be read back".into(),
+        )),
+        Some(_) => None,
+    }
+}
+
+/// The CLOID's well-formed telemetry records against its journaled
+/// terminal. Labeled as telemetry findings.
+fn fill_findings(
+    order: Option<&OrderReport>,
+    terminal: Option<&TerminalRecord>,
+    fills: &[Fill],
+    notes: &mut Vec<String>,
+) -> Vec<(ViewStatus, String)> {
+    let mut out = Vec::new();
+    let mut tel = |status, reason: String| out.push((status, format!("telemetry: {reason}")));
+    if let Some((first, repeats)) = fills.split_first() {
+        for repeat in repeats {
             // The writer emits one record per reconciled IOC. An identical
             // line is a copy; anything else is a second, different claim.
             let same = Fill {
@@ -638,118 +676,279 @@ pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str)
                 ));
             } else {
                 tel(
-                    &mut reasons,
                     ViewStatus::Invalid,
                     format!(
                         "lines {} and {} disagree for this CLOID",
                         first.line, repeat.line
                     ),
-                    &mut telemetry_status,
                 );
             }
         }
-        match (order, &terminal) {
+        match (order, terminal) {
             (Some(order), Some(terminal)) => {
                 let mut wrong = Vec::new();
                 check_fill(first, order, terminal, &mut wrong);
                 for reason in wrong {
-                    tel(
-                        &mut reasons,
-                        ViewStatus::Invalid,
-                        reason,
-                        &mut telemetry_status,
-                    );
+                    tel(ViewStatus::Invalid, reason);
                 }
             }
             // Exported only after a journaled terminal for this CLOID.
             _ => tel(
-                &mut reasons,
                 ViewStatus::Invalid,
                 format!(
                     "line {} exports a fill the journal never recorded as terminal",
                     first.line
                 ),
-                &mut telemetry_status,
             ),
         }
     } else if terminal.is_some()
         && order.is_some_and(|o| o.filled.is_some_and(|f| f > Decimal::ZERO))
     {
         tel(
-            &mut reasons,
             ViewStatus::Unresolved,
             "no hedge_fill for this CLOID (telemetry disabled, dropped or written elsewhere)"
                 .into(),
-            &mut telemetry_status,
         );
     }
-    worse(&mut status, telemetry_status);
+    out
+}
 
-    let venue_fee = order.map(|o| o.fee.clone());
-    match venue_fee.as_ref().map(|f| f.status) {
-        Some("attributed") => {}
-        Some("invalid") => flag(
-            &mut status,
-            &mut reasons,
+/// The audit's venue fee attribution, as the view states it.
+fn venue_finding(fee: Option<&FeeReport>) -> Option<(ViewStatus, String)> {
+    match fee.map(|f| f.status)? {
+        "attributed" => None,
+        "invalid" => Some((
             ViewStatus::Invalid,
             "venue fills contradict this IOC; see venue_fee".into(),
-        ),
-        Some("not_provided") => flag(
-            &mut status,
-            &mut reasons,
+        )),
+        "not_provided" => Some((
             ViewStatus::Unresolved,
             "the evidence has no fills; the venue fee is unknown".into(),
-        ),
-        Some(_) => flag(
-            &mut status,
-            &mut reasons,
+        )),
+        _ => Some((
             ViewStatus::Unresolved,
             "venue fills do not cover this IOC; the venue fee is unknown".into(),
-        ),
-        None => {}
+        )),
+    }
+}
+
+/// A CLOID no telemetry line names.
+static NO_RECORDS: Records = Records {
+    fills: Vec::new(),
+    faults: Vec::new(),
+};
+
+/// One IOC's own findings, grouped by where a view lists them among the
+/// archive-wide ones.
+struct Judged<'r> {
+    terminal: Option<TerminalRecord>,
+    records: &'r Records,
+    /// Listed first: the CLOID itself.
+    cloid: Option<(ViewStatus, String)>,
+    /// After the journal findings: the audit's verdict on the IOC.
+    order_finding: Option<(ViewStatus, String)>,
+    /// After the file findings: its telemetry record against the journal.
+    telemetry: Vec<(ViewStatus, String)>,
+    /// Last: the venue fee.
+    venue: Option<(ViewStatus, String)>,
+    /// Facts that do not block binding, such as an exact repeat.
+    notes: Vec<String>,
+}
+
+impl Judged<'_> {
+    /// This CLOID's own malformed `hedge_fill` lines contradict its view.
+    fn faulted(&self) -> ViewStatus {
+        if self.records.faults.is_empty() {
+            ViewStatus::Bound
+        } else {
+            ViewStatus::Invalid
+        }
     }
 
-    let telemetry_view = TelemetryView {
-        status: telemetry_status,
-        session_line: parsed.session.as_ref().map(|_| 1),
-        stopped_line: parsed.stopped,
-        lines: parsed.fills.iter().map(|f| f.line).collect(),
-        side: fill.map(|f| f.side.clone()),
-        size: fill.map(|f| f.size.clone()),
-        price: fill.map(|f| f.price.clone()),
-        price_source: fill.map(|f| f.price_source.clone()),
-        fee: fill.map(|f| f.fee.clone()),
-        fee_source: fill.map(|f| f.fee_source.clone().unwrap_or_else(|| "unknown".into())),
-        position_after: fill.map(|f| f.position_after.clone()),
-        notes,
-    };
-    let comparison = compare(&telemetry_view, venue_fee.as_ref());
-    FeeView {
-        mode: "offline-read-only",
-        status,
-        cloid: cloid.to_owned(),
-        inputs: None,
-        session: start,
-        audit_status: report.status,
-        ioc: order.map(|o| IocView {
-            status: o.status,
-            intent_line: o.intent_line,
-            terminal_lines: o.terminal_lines.clone(),
-            side: o.side,
-            size: o.size,
-            limit_price: o.limit_price,
-            filled: o.filled,
-            average_price: terminal.as_ref().and_then(|t| t.average_price),
-            terminal_source: terminal.as_ref().and_then(|t| t.terminal_source.clone()),
-            position_after: o.position_after,
-            reasons: o.reasons.clone(),
-        }),
-        telemetry: telemetry_view,
-        venue_fee,
-        comparison,
-        reasons,
-        boundaries: BOUNDARIES.to_vec(),
+    /// The worst of its own findings; `Bound` when archive findings alone
+    /// can hold the view back.
+    fn status(&self) -> ViewStatus {
+        worst(
+            self.cloid
+                .iter()
+                .chain(&self.order_finding)
+                .chain(&self.telemetry)
+                .chain(&self.venue),
+        )
+        .max(self.faulted())
     }
+
+    /// The same for its telemetry side alone.
+    fn telemetry_status(&self) -> ViewStatus {
+        worst(&self.telemetry).max(self.faulted())
+    }
+
+    /// Its own reasons in view order, without the archive-wide ones.
+    fn reasons(&self) -> Vec<String> {
+        let text = |finding: &(ViewStatus, String)| finding.1.clone();
+        let faults = self
+            .records
+            .faults
+            .iter()
+            .map(|(_, r)| format!("telemetry: {r}"));
+        self.cloid
+            .iter()
+            .chain(&self.order_finding)
+            .map(text)
+            .chain(faults)
+            .chain(self.telemetry.iter().chain(&self.venue).map(text))
+            .collect()
+    }
+}
+
+impl<'a> Archive<'a> {
+    /// Audit once, index the telemetry once and split the journal once.
+    fn new(journal: &'a [u8], evidence: &Evidence, telemetry: &[u8]) -> Self {
+        let report = audit::audit(journal, Some(evidence));
+        let telemetry = read_telemetry(telemetry);
+        let journal_wide = journal_findings(&report);
+        let file = file_findings(report.journal.session.as_ref(), &telemetry);
+        Archive {
+            report,
+            lines: journal_lines(journal),
+            telemetry,
+            journal: journal_wide,
+            file,
+        }
+    }
+
+    /// A malformed line no CLOID owns contradicts every view.
+    fn faulted(&self) -> ViewStatus {
+        if self.telemetry.faults.is_empty() {
+            ViewStatus::Bound
+        } else {
+            ViewStatus::Invalid
+        }
+    }
+
+    /// The worst finding that holds for every IOC; `Bound` when none does.
+    fn status(&self) -> ViewStatus {
+        worst(self.journal.iter().chain(&self.file)).max(self.faulted())
+    }
+
+    /// The same for the telemetry side alone.
+    fn telemetry_status(&self) -> ViewStatus {
+        worst(&self.file).max(self.faulted())
+    }
+
+    /// Reasons that hold for every IOC, in view order.
+    fn reasons(&self) -> Vec<String> {
+        let faults = self
+            .telemetry
+            .faults
+            .iter()
+            .map(|(_, r)| format!("telemetry: {r}"));
+        self.journal
+            .iter()
+            .map(|(_, r)| r.clone())
+            .chain(faults)
+            .chain(self.file.iter().map(|(_, r)| r.clone()))
+            .collect()
+    }
+
+    /// One IOC's own findings, as `hedge-fee-view` finds them. `order` is
+    /// the audit's IOC with this exact CLOID, if any.
+    fn judge<'r>(&'r self, cloid: &str, order: Option<&'r OrderReport>) -> Judged<'r> {
+        let terminal = order
+            .and_then(|o| o.terminal_lines.first())
+            .and_then(|&line| terminal_at(&self.lines, line));
+        let records = self.telemetry.by_cloid.get(cloid).unwrap_or(&NO_RECORDS);
+        let mut notes = Vec::new();
+        let telemetry = fill_findings(order, terminal.as_ref(), &records.fills, &mut notes);
+        Judged {
+            cloid: validate_hex(cloid, 16).is_err().then(|| {
+                (
+                    ViewStatus::Invalid,
+                    format!("`{cloid}` is not a 16-byte hex CLOID"),
+                )
+            }),
+            order_finding: order_finding(cloid, order, terminal.as_ref()),
+            telemetry,
+            venue: venue_finding(order.map(|o| &o.fee)),
+            notes,
+            terminal,
+            records,
+        }
+    }
+
+    /// The `hedge-fee-view` of one CLOID.
+    fn view(&self, cloid: &str) -> FeeView {
+        let order = self.report.orders.iter().find(|o| o.cloid == cloid);
+        let judged = self.judge(cloid, order);
+        let text = |finding: &(ViewStatus, String)| finding.1.clone();
+        // Reasons in the order the view has always listed them.
+        let faults = in_file_order(&self.telemetry.faults, &judged.records.faults);
+        let reasons: Vec<String> = judged
+            .cloid
+            .iter()
+            .chain(&self.journal)
+            .chain(&judged.order_finding)
+            .map(text)
+            .chain(faults.into_iter().map(|r| format!("telemetry: {r}")))
+            .chain(
+                self.file
+                    .iter()
+                    .chain(&judged.telemetry)
+                    .chain(&judged.venue)
+                    .map(text),
+            )
+            .collect();
+        let fills = &judged.records.fills;
+        let fill = fills.first();
+        let telemetry = TelemetryView {
+            status: judged.telemetry_status().max(self.telemetry_status()),
+            session_line: self.telemetry.session.as_ref().map(|_| 1),
+            stopped_line: self.telemetry.stopped,
+            lines: fills.iter().map(|f| f.line).collect(),
+            side: fill.map(|f| f.side.clone()),
+            size: fill.map(|f| f.size.clone()),
+            price: fill.map(|f| f.price.clone()),
+            price_source: fill.map(|f| f.price_source.clone()),
+            fee: fill.map(|f| f.fee.clone()),
+            fee_source: fill.map(|f| f.fee_source.clone().unwrap_or_else(|| "unknown".into())),
+            position_after: fill.map(|f| f.position_after.clone()),
+            notes: judged.notes.clone(),
+        };
+        let venue_fee = order.map(|o| o.fee.clone());
+        let comparison = compare(&telemetry, venue_fee.as_ref());
+        let terminal = judged.terminal.as_ref();
+        FeeView {
+            mode: "offline-read-only",
+            status: judged.status().max(self.status()),
+            cloid: cloid.to_owned(),
+            inputs: None,
+            session: self.report.journal.session.clone(),
+            audit_status: self.report.status,
+            ioc: order.map(|o| IocView {
+                status: o.status,
+                intent_line: o.intent_line,
+                terminal_lines: o.terminal_lines.clone(),
+                side: o.side,
+                size: o.size,
+                limit_price: o.limit_price,
+                filled: o.filled,
+                average_price: terminal.and_then(|t| t.average_price),
+                terminal_source: terminal.and_then(|t| t.terminal_source.clone()),
+                position_after: o.position_after,
+                reasons: o.reasons.clone(),
+            }),
+            telemetry,
+            venue_fee,
+            comparison,
+            reasons,
+            boundaries: BOUNDARIES.to_vec(),
+        }
+    }
+}
+
+/// Build the view from in-memory inputs. Pure: no I/O.
+pub fn build(journal: &[u8], evidence: &Evidence, telemetry: &[u8], cloid: &str) -> FeeView {
+    Archive::new(journal, evidence, telemetry).view(cloid)
 }
 
 /// Never a difference: the estimate names no asset, and nothing here proves
@@ -805,6 +1004,33 @@ fn digest(path: &Path, bytes: &[u8]) -> InputDigest {
     }
 }
 
+/// The three files of one frozen archive, each read once and only read.
+struct Files {
+    journal: Vec<u8>,
+    evidence: Evidence,
+    telemetry: Vec<u8>,
+    inputs: Inputs,
+}
+
+fn read_files(journal: &Path, evidence: &Path, telemetry: &Path) -> Result<Files> {
+    let read =
+        |path: &Path| std::fs::read(path).with_context(|| format!("Read {}", path.display()));
+    let (journal_bytes, evidence_bytes, telemetry_bytes) =
+        (read(journal)?, read(evidence)?, read(telemetry)?);
+    let parsed: Evidence = serde_json::from_slice(&evidence_bytes)
+        .with_context(|| format!("Parse evidence {}", evidence.display()))?;
+    Ok(Files {
+        inputs: Inputs {
+            journal: digest(journal, &journal_bytes),
+            evidence: digest(evidence, &evidence_bytes),
+            telemetry: digest(telemetry, &telemetry_bytes),
+        },
+        journal: journal_bytes,
+        evidence: parsed,
+        telemetry: telemetry_bytes,
+    })
+}
+
 /// Read-only view over files on disk; the inputs are only read.
 pub fn view_files(
     journal: &Path,
@@ -812,20 +1038,13 @@ pub fn view_files(
     telemetry: &Path,
     cloid: &str,
 ) -> Result<FeeView> {
-    let read =
-        |path: &Path| std::fs::read(path).with_context(|| format!("Read {}", path.display()));
-    let (journal_bytes, evidence_bytes, telemetry_bytes) =
-        (read(journal)?, read(evidence)?, read(telemetry)?);
-    let parsed: Evidence = serde_json::from_slice(&evidence_bytes)
-        .with_context(|| format!("Parse evidence {}", evidence.display()))?;
-    let mut view = build(&journal_bytes, &parsed, &telemetry_bytes, cloid);
-    view.inputs = Some(Inputs {
-        journal: digest(journal, &journal_bytes),
-        evidence: digest(evidence, &evidence_bytes),
-        telemetry: digest(telemetry, &telemetry_bytes),
-    });
+    let files = read_files(journal, evidence, telemetry)?;
+    let mut view = build(&files.journal, &files.evidence, &files.telemetry, cloid);
+    view.inputs = Some(files.inputs);
     Ok(view)
 }
+
+pub mod coverage;
 
 #[cfg(test)]
 mod tests;

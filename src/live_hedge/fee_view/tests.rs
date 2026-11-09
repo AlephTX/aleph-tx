@@ -785,3 +785,5 @@ async fn a_truncated_journal_never_binds_and_contradictions_still_win() {
     assert_eq!(other.status, ViewStatus::Unresolved);
     assert!(has(&other, "not reconciled"), "{:?}", other.reasons);
 }
+
+mod session;

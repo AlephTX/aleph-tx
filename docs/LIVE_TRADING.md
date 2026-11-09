@@ -145,6 +145,23 @@ the strategy's normal shorter cancellation timer.
   does not affect the selected one. `examples/hedge_fee_view/` is a synthetic
   example from the real writers (CLOID
   `0x0123456789abcdef0123456789abcdef`).
+- `cargo run --release --bin cross_venue -- hedge-fee-coverage JOURNAL
+  EVIDENCE TELEMETRY` reports every journaled IOC of the session from one
+  read of each file, offline and read-only. Each row's `view_status` is
+  what `hedge-fee-view` reports for that CLOID, and each row is one of
+  `bound`, `missing_evidence`, `unknown_outcome`, `no_fill` or
+  `contradiction`. Findings that hold for every IOC, such as a torn file,
+  another session or foreign evidence, are listed once under `archive`.
+  The denominator is every IOC with a positive fill and a known terminal,
+  whether journaled or reconciled by evidence. An evidence-only IOC counts
+  but never binds, because the writer exported no estimate for it. The
+  ratio is null when an archive-wide finding, a contradiction, a
+  telemetry CLOID with no journaled IOC, an unreconciled IOC or an empty
+  denominator applies, and `withheld` gives each reason. Exact repeats
+  count once. Fees stay per IOC and per asset and are never summed.
+  Exit codes: 0 when every positive fill binds, 2 when coverage is
+  incomplete, 3 on contradictions. Exit 0 covers the supplied files only.
+  It does not show that the session ended.
 - For the Lighter leg of a schema 2 journal, an optional `lighter` section
   in the same evidence file takes `account_index`, `market_id`, `symbol`,
   the session's `client_order_ids`, raw `accountOrders` responses in
