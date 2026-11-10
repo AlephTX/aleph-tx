@@ -1,11 +1,10 @@
-//! Offline explanation of caller-declared Lighter (primary leg) orders.
+//! Offline explanation of journaled and caller-declared Lighter orders.
 //!
 //! Replays the production REST recovery judgement (`recover_flat`) against
-//! frozen responses: each declared client order must be terminal for the
+//! frozen responses: each checked client order must be terminal for the
 //! exact account and market, any fill needs a trade watermark, and the
 //! account snapshot must cover the highest fill watermark before its
-//! position counts. The declared IDs come from the caller and are never
-//! proven to be every order the account placed.
+//! position counts. The checked IDs cover the journal and caller's list.
 
 use super::super::journal::StartRecord;
 use crate::exchanges::lighter::trading::account_response_position;

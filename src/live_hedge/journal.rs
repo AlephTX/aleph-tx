@@ -341,7 +341,7 @@ impl JournalSink for std::fs::File {
 pub struct CommitTiming {
     /// Waiting for another producer's commit.
     pub queued: std::time::Duration,
-    /// Encode, write and sync of this record.
+    /// Writing and syncing the encoded record while holding the lock.
     pub durable: std::time::Duration,
 }
 

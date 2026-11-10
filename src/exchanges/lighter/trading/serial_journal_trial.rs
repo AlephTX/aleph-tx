@@ -16,6 +16,8 @@ use rust_decimal::Decimal;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
+mod recovery_tests;
+
 const HL: &str = "0x00000000000000000000000000000000000000aa";
 
 fn start() -> StartRecord {
@@ -539,7 +541,7 @@ fn scenario(name: &str, batches: usize, creates: usize, journaled: bool, contend
         samples
     });
     println!(
-        "serial_journal {name}: batches={batches} creates/batch={creates} hedge_commits={} \
+        "serial_journal {name}: batches={batches} creates/batch={creates} hedge_sends={} \
          prepare_to_send[{}] queued[{}] durable[{}]",
         hedge_sends.load(Ordering::Acquire),
         quantiles(samples.iter().map(|s| s.prepare_to_send).collect()),

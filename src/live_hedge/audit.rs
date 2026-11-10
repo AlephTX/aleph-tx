@@ -11,12 +11,12 @@
 //! The audit never contacts a venue, never reads credentials, never cancels
 //! or resubmits, and never touches the session file or lock. A matched
 //! result is only "offline evidence matches"; it does not permit restart.
-//! Lighter (primary leg) orders and inventory are not journaled. Schema 2
-//! intents carry the single Lighter position read each IOC was planned
-//! against; the report checks it for identity and internal consistency only,
-//! as a local claim. An optional `lighter` evidence section replays the
-//! production recovery judgement for caller-declared client orders and one
-//! account sample (see `lighter`); it never changes a Hyperliquid result.
+//! Schema 2 and later intents carry the single Lighter position read each
+//! IOC was planned against. The report checks it for identity and internal
+//! consistency as a local claim. Schema 3 also records Lighter create IDs
+//! before send. An optional `lighter` evidence section replays the recovery
+//! judgement for journaled and caller-declared client orders and one account
+//! sample (see `lighter`); it never changes a Hyperliquid result.
 
 use super::journal::{
     IntentRecord, JournalRecord, LighterBatchRecord, MAX_PRIMARY_AGE_US, ParseError,
@@ -241,8 +241,8 @@ const BOUNDARIES: &[&str] = &[
     "Offline and read-only: no venue request, credential, signature, cancel or order was made.",
     "Journal records are this process's durable claims, not venue confirmations.",
     "Evidence authenticity is outside this audit; it checks consistency only.",
-    "Lighter (primary leg) orders and inventory are not journaled; check them on the venue.",
-    "Lighter evidence covers only the client order IDs the caller declared, not every order on the account; an absent order proves nothing.",
+    "Schema 3 records Lighter create IDs before send. Verify order outcomes and inventory on the venue.",
+    "Lighter evidence covers only journaled and caller-declared client order IDs. An absent order leaves its outcome unknown.",
     "A primary observation is this process's local record of one Lighter read: not venue-signed, not proof of venue state time, and not an order or account ledger.",
     "A Lighter fee is estimated from the rate one trade declares for the account's role, times its price and size. It is not the amount charged and names no asset.",
     "An unknown or absent lookup never proves an IOC was not accepted or filled.",
