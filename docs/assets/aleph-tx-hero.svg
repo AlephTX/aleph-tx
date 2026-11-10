@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 304" role="img" aria-labelledby="title desc">
+  <title id="title">AlephTX</title>
+  <desc id="desc">Perpetual futures execution and research. Two paths show supervised trading from venue feeds through Go and Rust, and public L2 data through compilation to paper replay.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#0b0f14"/>
+      <stop offset="1" stop-color="#0c1d22"/>
+    </linearGradient>
+    <linearGradient id="accent">
+      <stop stop-color="#3ee6a8"/>
+      <stop offset="1" stop-color="#5ccfd3"/>
+    </linearGradient>
+    <pattern id="grid" width="22" height="22" patternUnits="userSpaceOnUse">
+      <path d="M 22 0 H 0 V 22" fill="none" stroke="#78adae" stroke-opacity=".14"/>
+    </pattern>
+    <clipPath id="frame">
+      <rect width="1120" height="304" rx="24"/>
+    </clipPath>
+    <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0 6 3 0 6Z" fill="#6ab5ae"/>
+    </marker>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1120" height="304" fill="url(#background)"/>
+    <rect x="626" width="494" height="304" fill="url(#grid)"/>
+    <path d="M626 0V304" stroke="#27454a"/>
+    <path d="M48 0H182" stroke="url(#accent)" stroke-width="4"/>
+  </g>
+  <rect x=".5" y=".5" width="1119" height="303" rx="24" fill="none" stroke="#315258"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace">
+    <rect x="48" y="42" width="46" height="46" rx="12" fill="#112621" stroke="#285d4d"/>
+    <text x="71" y="75" text-anchor="middle" font-size="32" font-weight="700" fill="#3ee6a8">α</text>
+    <text x="111" y="70" font-size="13" font-weight="600" letter-spacing="2.4" fill="#8fbbb4">PERPETUAL FUTURES ENGINE</text>
+  </g>
+  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="45" y="177" font-size="88" font-weight="700" letter-spacing="-5" fill="#f1f9f7">Aleph<tspan fill="#3ee6a8">TX</tspan></text>
+    <text x="49" y="222" font-size="24" font-weight="500" fill="#c6ded9">Execution and relative-value research</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="600" letter-spacing="1.5">
+    <circle cx="54" cy="259" r="4" fill="#3ee6a8"/>
+    <text x="68" y="263" fill="#8fbbb4">GO FEEDS</text>
+    <circle cx="175" cy="259" r="4" fill="#3ee6a8"/>
+    <text x="189" y="263" fill="#8fbbb4">RUST EXECUTION</text>
+    <circle cx="344" cy="259" r="4" fill="#5ccfd3"/>
+    <text x="358" y="263" fill="#8fbbb4">OFFLINE REPLAY</text>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace">
+    <text x="652" y="55" font-size="13" font-weight="700" letter-spacing="1.8" fill="#3ee6a8">01 / SUPERVISED</text>
+    <text x="652" y="169" font-size="13" font-weight="700" letter-spacing="1.8" fill="#5ccfd3">02 / RESEARCH</text>
+    <g fill="#132a2c" stroke="#37605d">
+      <rect x="652" y="72" width="128" height="56" rx="8"/>
+      <rect x="801" y="72" width="128" height="56" rx="8"/>
+      <rect x="950" y="72" width="128" height="56" rx="8"/>
+      <rect x="652" y="186" width="128" height="56" rx="8"/>
+      <rect x="801" y="186" width="128" height="56" rx="8"/>
+      <rect x="950" y="186" width="128" height="56" rx="8"/>
+    </g>
+    <g fill="none" stroke="#6ab5ae" stroke-width="1.4" marker-end="url(#arrow)">
+      <path d="M782 100H796"/>
+      <path d="M931 100H945"/>
+      <path d="M782 214H796"/>
+      <path d="M931 214H945"/>
+    </g>
+    <g fill="#e0f0ec" font-size="15" font-weight="600" text-anchor="middle">
+      <text x="716" y="105">Venue feeds</text>
+      <text x="865" y="105">Go / SHM</text>
+      <text x="1014" y="105">Rust orders</text>
+      <text x="716" y="219">Public L2</text>
+      <text x="865" y="219">Compile</text>
+      <text x="1014" y="219">Paper fills</text>
+    </g>
+  </g>
+</svg>

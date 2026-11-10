@@ -7,6 +7,18 @@ Use the imported guide as the shared engineering contract. Use the
 [trading runbook](docs/LIVE_TRADING.md) or [Oasis runbook](deploy/oasis/README.md)
 when working on those operations.
 
+## Sensitive data hard stop
+
+Never stage, commit, or push sensitive material, including testnet
+credentials and private account or session records. This applies to all
+branches and remotes, including private GitHub repositories.
+
+Keep sensitive records out of tool output. Use synthetic or irreversibly
+redacted fixtures. Review explicit paths before staging, staged blobs
+before committing, and every outgoing commit before pushing. Stop on
+any finding and report only its category, path, line number, or commit ID.
+Follow the repository-wide rule in [AGENTS.md](AGENTS.md#sensitive-data-and-git).
+
 ## Working in this repository
 
 - Use directory-level `CLAUDE.md` files for module orientation. Verify any

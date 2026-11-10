@@ -4,6 +4,27 @@ Applies repository-wide. Start with the [README](README.md) for current
 capabilities and priorities. Use the linked runbooks and current code for
 operational details.
 
+## Sensitive data and Git
+
+**Hard stop.** Never stage, commit, or push sensitive material. This rule
+applies to GitHub and other Git remotes, including private repositories,
+testnet work, and every branch, tag, and commit in a proposed push.
+
+- Keep keys, mnemonics, tokens, credential files, private profiles, signed
+  requests and signatures, account identifiers tied to private activity,
+  authenticated responses, and raw order, fill, balance, telemetry,
+  recovery, and debug records outside Git and tool output. Treat copies,
+  screenshots, encodings, and exports the same way.
+- Use synthetic or irreversibly redacted fixtures. Treat any artifact whose
+  contents or provenance are uncertain as sensitive until reviewed.
+- Review paths and contents before staging. Stage an explicit path list,
+  then verify staged blobs with a redacting review or scanner. Before
+  pushing, review every outgoing commit, including intermediate commits.
+  Keep findings to paths, line numbers, categories, and commit IDs.
+- If sensitive material is staged, unstage it and preserve the local
+  evidence. If an outgoing commit contains it, stop the push and report
+  the path and commit ID without reproducing the material.
+
 ## Working boundaries
 
 - Default to offline fixtures, replay, and local test services. Trading on
@@ -12,11 +33,9 @@ operational details.
   `make lighter-up` starts live trading by default. Some binaries and examples
   also submit orders. Read the [trading runbook](docs/LIVE_TRADING.md) before
   operating them.
-- Preserve local changes and runtime evidence. Keep credentials, tokens, local
-  profiles with private data, account responses, and session journals out of
-  commits and tool output. Use synthetic or redacted fixtures.
-- Commit and push when requested for the current change. Inspect the staged diff
-  and destination, and use a Conventional Commit subject.
+- Preserve local changes and runtime evidence.
+- Commit and push when requested for the current change. Verify the
+  destination and use a Conventional Commit subject.
 
 ## Entry points
 
