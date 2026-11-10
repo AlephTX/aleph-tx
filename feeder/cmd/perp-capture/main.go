@@ -1,4 +1,4 @@
-// perp-capture records public WebSocket publications with their receipt times.
+// perp-capture records public WebSocket publications and REST snapshots with their receipt times.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -67,7 +68,7 @@ func symbols(raw string) ([]string, error) {
 	return items, nil
 }
 
-func subscriptions(lighter, hl, coinbase string, snapshotInterval, clockRefresh time.Duration, hlFastBook bool) ([]subscription, error) {
+func subscriptions(lighter, hl, coinbase, arcus, bulk string, snapshotInterval, clockRefresh time.Duration, hlFastBook bool) ([]subscription, error) {
 	sources := []subscription{
 		{source: "lighter", url: "wss://mainnet.zklighter.elliot.ai/stream", clockRefresh: clockRefresh},
 		{source: "hyperliquid", url: "wss://api.hyperliquid.xyz/ws"},
@@ -130,6 +131,31 @@ func subscriptions(lighter, hl, coinbase string, snapshotInterval, clockRefresh 
 			coins: coins, interval: snapshotInterval,
 		})
 	}
+	for _, rest := range []struct{ markets, source, url string }{
+		{arcus, "arcus_snapshot", "https://api.arcus.xyz/v1/l2OrderBook"},
+		{bulk, "bulk_snapshot", "https://mainnet-api1.bulk.trade/api/v1/l2book"},
+	} {
+		coins, err := symbols(rest.markets)
+		if err != nil {
+			return nil, err
+		}
+		if len(coins) > 4 {
+			return nil, fmt.Errorf("%s supports at most four markets", rest.source)
+		}
+		for _, coin := range coins {
+			if strings.IndexFunc(coin, func(r rune) bool {
+				return !('A' <= r && r <= 'Z' || 'a' <= r && r <= 'z' ||
+					'0' <= r && r <= '9' || r == '-' || r == '_')
+			}) >= 0 {
+				return nil, fmt.Errorf("invalid %s market %q", rest.source, coin)
+			}
+		}
+		if len(coins) > 0 {
+			enabled = append(enabled, subscription{
+				source: rest.source, url: rest.url, coins: coins, interval: time.Second,
+			})
+		}
+	}
 	if len(enabled) == 0 {
 		return nil, errors.New("configure at least one public market")
 	}
@@ -154,19 +180,43 @@ func pollSnapshots(ctx context.Context, source subscription, emit func(record) e
 	return context.Cause(ctx)
 }
 
-func pollSnapshotCoin(ctx context.Context, source subscription, coin string, client *http.Client, emit func(record) error) error {
-	query, err := json.Marshal(map[string]string{"type": "l2Book", "coin": coin})
-	if err != nil {
-		return err
+func snapshotRequest(ctx context.Context, source subscription, coin string) (*http.Request, error) {
+	switch source.source {
+	case "hyperliquid_snapshot":
+		query, err := json.Marshal(map[string]string{"type": "l2Book", "coin": coin})
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, source.url, bytes.NewReader(query))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, err
+	case "arcus_snapshot":
+		endpoint := source.url + "/" + url.PathEscape(coin) + "?nLevels=20"
+		return http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	case "bulk_snapshot":
+		query := url.Values{"type": {"l2book"}, "coin": {coin}, "nlevels": {"20"}}
+		return http.NewRequestWithContext(ctx, http.MethodGet, source.url+"?"+query.Encode(), nil)
+	default:
+		return nil, fmt.Errorf("unsupported snapshot source %q", source.source)
 	}
+}
+
+type snapshotPayload struct {
+	Channel string          `json:"channel,omitempty"`
+	Market  string          `json:"market,omitempty"`
+	Data    json.RawMessage `json:"data"`
+}
+
+func pollSnapshotCoin(ctx context.Context, source subscription, coin string, client *http.Client, emit func(record) error) error {
 	ticker := time.NewTicker(source.interval)
 	defer ticker.Stop()
 	for {
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, source.url, bytes.NewReader(query))
+		request, err := snapshotRequest(ctx, source, coin)
 		if err != nil {
 			return err
 		}
-		request.Header.Set("Content-Type", "application/json")
 		response, err := client.Do(request)
 		if err != nil {
 			return fmt.Errorf("snapshot %s: %w", coin, err)
@@ -178,12 +228,16 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 			return err
 		}
 		if response.StatusCode != http.StatusOK || len(body) > 1<<20 {
-			return fmt.Errorf("invalid Hyperliquid snapshot for %s: HTTP %d", coin, response.StatusCode)
+			return fmt.Errorf("invalid %s for %s: HTTP %d", source.source, coin, response.StatusCode)
 		}
-		payload, err := json.Marshal(struct {
-			Channel string          `json:"channel"`
-			Data    json.RawMessage `json:"data"`
-		}{"l2Book", body})
+		snapshot := snapshotPayload{Data: body}
+		if source.source == "hyperliquid_snapshot" {
+			snapshot.Channel = "l2Book"
+		} else {
+			// Arcus snapshots do not echo the symbol. Archive the requested market.
+			snapshot.Market = coin
+		}
+		payload, err := json.Marshal(snapshot)
 		if err != nil {
 			return err
 		}
@@ -411,6 +465,8 @@ func run() error {
 	lighter := flag.String("lighter", "", "comma-separated Lighter market IDs")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
+	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
+	bulk := flag.String("bulk", "", "comma-separated BULK perpetuals for 1s REST snapshots")
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")
 	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
 	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
@@ -426,7 +482,7 @@ func run() error {
 	if *hlFastBook && *hl == "" {
 		return errors.New("fast books need Hyperliquid markets")
 	}
-	sources, err := subscriptions(*lighter, *hl, *coinbase, *snapshotInterval, *clockRefresh, *hlFastBook)
+	sources, err := subscriptions(*lighter, *hl, *coinbase, *arcus, *bulk, *snapshotInterval, *clockRefresh, *hlFastBook)
 	if err != nil {
 		return err
 	}

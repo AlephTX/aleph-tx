@@ -2,7 +2,8 @@ use aleph_tx::exchanges::edgex::signature::SignatureManager;
 use std::time::Instant;
 
 fn main() {
-    let private_key = "REDACTED_PRIVATE_KEY";
+    // Deterministic fixture key for this offline example.
+    let private_key = "0x1";
 
     println!("Creating SignatureManager...");
     let start = Instant::now();
@@ -18,7 +19,7 @@ fn main() {
     let amount_collateral = 15_000_000u64;
     let amount_fee = 5700u64;
     let nonce = 1234567890u64;
-    let account_id = 0u64;
+    let account_id = 0x0102_0304_0506_0708u64;
     let expire_time_hours = 493911u64;
 
     println!("\nCalculating order hash...");

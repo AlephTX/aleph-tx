@@ -51,6 +51,127 @@ fn crypto_carry_uses_explicit_funding_and_settles_four_fills() {
 }
 
 #[test]
+fn all_six_priority_routes_replay_with_explicit_terms_and_shared_risk_opt_in() {
+    let venues = [
+        ("entropy", "io:DEMO"),
+        ("arcus", "DEMO-USD"),
+        ("trade_xyz", "xyz:DEMO"),
+        ("bulk", "DEMO-USD"),
+    ];
+    let registry = VenueRegistry::default();
+    for (i, left) in venues.iter().enumerate() {
+        for right in &venues[i + 1..] {
+            let mut scenario = equity();
+            for (leg, (venue, market)) in [left, right].into_iter().enumerate() {
+                scenario.pair.legs[leg].venue = (*venue).into();
+                scenario.pair.legs[leg].market = (*market).into();
+                for frame in &mut scenario.frames {
+                    frame.legs[leg].book.market = (*market).into();
+                }
+            }
+            if registry.get(left.0).unwrap().risk_domain
+                == registry.get(right.0).unwrap().risk_domain
+            {
+                assert!(run_paper(&scenario, &registry).is_err());
+                scenario.pair.allow_shared_risk_domain = true;
+            }
+            let report = run_paper(&scenario, &registry).unwrap();
+            assert_eq!(report.paired_entries, 1, "{left:?} / {right:?}");
+            assert_eq!(report.ioc_filled, 4);
+            assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+            assert_eq!(report.halted, None);
+            assert_eq!(report.market_costs[0].venue, left.0);
+            assert_eq!(report.market_costs[1].venue, right.0);
+        }
+    }
+}
+
+#[test]
+fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
+    let mut scenario = crypto();
+    let plan = first_plan(&scenario).unwrap();
+    let registry = VenueRegistry::default();
+    let planned = (plan.modeled_turnover_quote, plan.modeled_fees_quote);
+    assert_eq!(planned, (d("320"), d("0.064")));
+    for (max_turnover_quote, max_fees_quote) in [(d("319.99"), planned.1), (planned.0, d("0.063"))]
+    {
+        scenario.pair.mode = PaperMode::Turnover {
+            max_turnover_quote,
+            max_fees_quote,
+        };
+        let report = run_paper(&scenario, &registry).unwrap();
+        assert_eq!(first_plan(&scenario).unwrap().hedge.target_base, d("0.038"));
+        assert_eq!(report.entries_submitted, 1);
+        assert_eq!(report.ioc_filled, 4);
+        assert_eq!(report.gross_turnover, d("304"));
+        assert_eq!(report.fees, d("0.0608"));
+        assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    }
+    for (max_turnover_quote, max_fees_quote) in [(d("20"), planned.1), (planned.0, d("0.001"))] {
+        scenario.pair.mode = PaperMode::Turnover {
+            max_turnover_quote,
+            max_fees_quote,
+        };
+        assert!(matches!(
+            first_plan(&scenario),
+            Err(Rejection::TurnoverBudget)
+        ));
+        let report = run_paper(&scenario, &registry).unwrap();
+        assert_eq!(report.entry_signals, 0);
+        assert_eq!(report.entries_submitted, 0);
+        assert_eq!(report.gross_turnover, Decimal::ZERO);
+        assert!(report.entry_diagnostics.blocked_by_gate[&EntryGate::TurnoverBudget] > 0);
+        assert!(report.entry_diagnostics.best_net_edge_bps.unwrap() > Decimal::ZERO);
+    }
+    scenario.pair.mode = PaperMode::Turnover {
+        max_turnover_quote: planned.0,
+        max_fees_quote: planned.1,
+    };
+    // Repeat the opportunity in the following funding interval. The first
+    // cycle spends the whole budget and the second must not reuse it.
+    const HOUR: u64 = 3_600_000;
+    let mut second = scenario.frames.clone();
+    for frame in &mut second {
+        frame.now_ms += HOUR;
+        frame.reference.timestamp_ms += HOUR;
+        for leg in &mut frame.legs {
+            leg.book.timestamp_ms += HOUR;
+            leg.oracle.timestamp_ms += HOUR;
+            if let Some(forecast) = &mut leg.forecast {
+                forecast.observed_at_ms += HOUR;
+                for point in &mut forecast.payments {
+                    point.at_ms += HOUR;
+                }
+            }
+            for payment in &mut leg.settled {
+                payment.at_ms += HOUR;
+            }
+        }
+    }
+    scenario.frames.extend(second);
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(report.entries_submitted, 1);
+    assert!(report.entry_diagnostics.blocked_by_gate[&EntryGate::TurnoverBudget] > 0);
+    assert_eq!(report.ioc_filled, 4);
+    assert_eq!(report.realized_pnl, d("0.0232"));
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+}
+
+#[test]
+fn funding_without_positive_credit_has_its_own_paper_gate() {
+    let mut scenario = crypto();
+    scenario.frames.truncate(4);
+    let forecast = scenario.frames[3].legs[0].forecast.clone();
+    scenario.frames[3].legs[1].forecast = forecast;
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert_eq!(
+        report.entry_diagnostics.blocked_by_gate[&EntryGate::FundingNoCredit],
+        1
+    );
+    assert_eq!(report.entry_diagnostics.best_net_edge_bps, None);
+}
+
+#[test]
 fn carry_can_close_after_the_next_verified_payment_with_guard_and_full_unwind() {
     let mut scenario = crypto();
     scenario.pair.planner.funding_horizon_ms = 7_200_000;
@@ -544,7 +665,7 @@ fn benchmark_relative_value_l2_plan() {
                     black_box(signal),
                     black_box(cutoff),
                     0,
-                    None,
+                    EntryOptions::default(),
                 )
                 .unwrap(),
         );

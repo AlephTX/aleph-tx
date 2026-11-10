@@ -787,3 +787,32 @@ async fn a_truncated_journal_never_binds_and_contradictions_still_win() {
 }
 
 mod session;
+
+#[tokio::test]
+async fn a_torn_first_terminal_withholds_fee_binding_without_a_contradiction() {
+    let telemetry = written(info(), vec![record(1999.0, "fill")]).await;
+    let mut torn = reconciled(Some("1999"));
+    assert_eq!(torn.pop(), Some(b'\n'));
+    let evidence = paid();
+    let view = build(&torn, &evidence, &telemetry, CLOID);
+    assert_eq!(view.status, ViewStatus::Unresolved, "{:?}", view.reasons);
+    assert_eq!(view.telemetry.status, ViewStatus::Unresolved);
+    assert!(has(&view, "terminal may be in the truncated journal tail"));
+    let coverage = coverage::build(&torn, &evidence, &telemetry);
+    assert_eq!(coverage.status.exit_code(), 2);
+    assert_eq!(coverage.coverage.ratio, None);
+    assert_eq!(coverage.counts.contradiction, 0);
+
+    let mut wrong = record(1999.0, "fill");
+    wrong.side = "buy";
+    let wrong = written(info(), vec![wrong]).await;
+    let view = build(&torn, &evidence, &wrong, CLOID);
+    assert_eq!(view.status, ViewStatus::Invalid);
+    assert!(has(&view, "side buy but the IOC is a sell"));
+
+    // A newline-terminated journal with no terminal contradicts the writer.
+    torn.truncate(torn.iter().rposition(|&b| b == b'\n').unwrap() + 1);
+    let view = build(&torn, &evidence, &telemetry, CLOID);
+    assert_eq!(view.status, ViewStatus::Invalid);
+    assert!(has(&view, "never recorded as terminal"));
+}

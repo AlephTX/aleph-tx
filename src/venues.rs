@@ -13,6 +13,13 @@ pub enum OrderSupport {
     ReadOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketDataSupport {
+    LimitOrderBook,
+    Indicative,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Venue {
     pub id: String,
@@ -20,6 +27,13 @@ pub struct Venue {
     pub risk_domain: String,
     pub hyperliquid_dex: Option<String>,
     pub order_support: OrderSupport,
+    pub market_data: MarketDataSupport,
+}
+
+impl Venue {
+    pub fn has_order_book(&self) -> bool {
+        self.market_data == MarketDataSupport::LimitOrderBook
+    }
 }
 
 #[derive(Debug)]
@@ -27,16 +41,25 @@ pub struct VenueRegistry(BTreeMap<String, Venue>);
 
 impl Default for VenueRegistry {
     fn default() -> Self {
+        use MarketDataSupport::*;
         use OrderSupport::*;
         Self(
             [
-                ("lighter", "lighter", "lighter", None, ExistingGateway),
+                (
+                    "lighter",
+                    "lighter",
+                    "lighter",
+                    None,
+                    ExistingGateway,
+                    LimitOrderBook,
+                ),
                 (
                     "hyperliquid",
                     "hyperliquid:core",
                     "hyperliquid",
                     Some(""),
                     RestClient,
+                    LimitOrderBook,
                 ),
                 (
                     "entropy",
@@ -44,6 +67,7 @@ impl Default for VenueRegistry {
                     "hyperliquid",
                     Some("io"),
                     RestClient,
+                    LimitOrderBook,
                 ),
                 (
                     "trade_xyz",
@@ -51,13 +75,21 @@ impl Default for VenueRegistry {
                     "hyperliquid",
                     Some("xyz"),
                     RestClient,
+                    LimitOrderBook,
                 ),
-                ("arcus", "arcus", "arcus", None, RestClient),
-                ("bulk", "bulk", "bulk", None, ReadOnly),
-                ("variational", "variational", "variational", None, ReadOnly),
+                ("arcus", "arcus", "arcus", None, RestClient, LimitOrderBook),
+                ("bulk", "bulk", "bulk", None, ReadOnly, LimitOrderBook),
+                (
+                    "variational",
+                    "variational",
+                    "variational",
+                    None,
+                    ReadOnly,
+                    Indicative,
+                ),
             ]
             .into_iter()
-            .map(|(id, liquidity, risk, dex, order_support)| {
+            .map(|(id, liquidity, risk, dex, order_support, market_data)| {
                 (
                     id.into(),
                     Venue {
@@ -66,6 +98,7 @@ impl Default for VenueRegistry {
                         risk_domain: risk.into(),
                         hyperliquid_dex: dex.map(str::to_owned),
                         order_support,
+                        market_data,
                     },
                 )
             })
@@ -106,6 +139,7 @@ impl VenueRegistry {
                 risk_domain: "hyperliquid".into(),
                 hyperliquid_dex: Some(dex.into()),
                 order_support: OrderSupport::RestClient,
+                market_data: MarketDataSupport::LimitOrderBook,
             },
         );
         Ok(())
@@ -119,7 +153,7 @@ impl VenueRegistry {
             venue.id,
             venue.liquidity_domain
         );
-        if matches!(venue.order_support, OrderSupport::ReadOnly) {
+        if !venue.has_order_book() {
             ensure!(
                 snapshot.quote_kind == QuoteKind::Indicative,
                 "{} only publishes indicative quotes",

@@ -106,7 +106,8 @@ const (
 // Memory layout:
 //
 //	[0-7]:     write_idx (atomic u64)
-//	[8-63]:    padding (header)
+//	[8-15]:    generation (atomic u64)
+//	[16-63]:   padding (header)
 //	[64-...]:  1024 event slots (128 bytes each)
 type EventRingBufferV2 struct {
 	mmap       []byte

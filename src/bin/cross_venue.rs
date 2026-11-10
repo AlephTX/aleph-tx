@@ -93,6 +93,8 @@ fn evaluate(
 #[serde(deny_unknown_fields)]
 struct HedgeReplay {
     plan: HedgePlan,
+    #[serde(default)]
+    allow_shared_risk_domain: bool,
     events: Vec<HedgeEvent>,
 }
 
@@ -119,13 +121,14 @@ fn replay_hedge(replay: HedgeReplay, registry: &VenueRegistry) -> Result<serde_j
         primary.liquidity_domain != hedge.liquidity_domain,
         "Hedge legs share a book"
     );
+    ensure!(
+        replay.allow_shared_risk_domain || primary.risk_domain != hedge.risk_domain,
+        "Hedge legs share an infrastructure risk domain"
+    );
     for venue in [primary, hedge] {
         ensure!(
-            !matches!(
-                venue.order_support,
-                aleph_tx::venues::OrderSupport::ReadOnly
-            ),
-            "{} cannot provide executable fills",
+            venue.has_order_book(),
+            "{} has no limit order book",
             venue.id
         );
     }

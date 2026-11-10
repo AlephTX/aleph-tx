@@ -65,6 +65,18 @@ pub struct LegConfig {
     pub source_clock_ahead_bound_ms: u64,
     pub lighter_clock: Option<LighterClockPolicy>,
     pub funding: Option<FundingRule>,
+    /// Causally archived context for Arcus or BULK REST book recordings.
+    #[serde(default)]
+    pub archived_contexts: Vec<ArchivedMarketContext>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedMarketContext {
+    pub market: String,
+    pub available_at_ms: u64,
+    pub oracle: Oracle,
+    pub forecast: Option<FundingForecast>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -225,10 +237,42 @@ impl CaptureConfig {
         );
         for (i, leg) in self.legs.iter().enumerate() {
             let venue = registry.get(&self.pair.legs[i].venue)?;
+            let rest_only = matches!(venue.id.as_str(), "arcus" | "bulk");
             ensure!(
                 (venue.id == "lighter" && leg.lighter_market_id.is_some())
-                    || (venue.hyperliquid_dex.is_some() && leg.lighter_market_id.is_none()),
-                "capture needs a Lighter market ID or a Hyperliquid/HIP-3 coin"
+                    || ((venue.hyperliquid_dex.is_some() || rest_only)
+                        && leg.lighter_market_id.is_none()),
+                "capture requires Lighter, Hyperliquid/HIP-3, Arcus or BULK market terms"
+            );
+            if rest_only {
+                ensure!(
+                    !leg.external_oracle
+                        && !leg.accept_receipt_time_for_oracle
+                        && leg.funding.is_none(),
+                    "Arcus and BULK REST books use archived_contexts for oracle and funding input"
+                );
+                ensure!(
+                    !self.paper_entries || !leg.archived_contexts.is_empty(),
+                    "Arcus and BULK paper entries require archived venue context"
+                );
+            }
+            ensure!(
+                (rest_only || leg.archived_contexts.is_empty())
+                    && leg.archived_contexts.windows(2).all(|w| {
+                        w[0].available_at_ms < w[1].available_at_ms
+                            && w[0].oracle.timestamp_ms <= w[1].oracle.timestamp_ms
+                    })
+                    && leg.archived_contexts.iter().all(|ctx| {
+                        ctx.market == self.pair.legs[i].market
+                            && ctx.oracle.timestamp_ms > 0
+                            && ctx.oracle.timestamp_ms <= ctx.available_at_ms
+                            && ctx.oracle.price > Decimal::ZERO
+                            && ctx.oracle.mode != OracleMode::EquityMinuteClose
+                            && ctx.forecast.as_ref().is_none_or(|f| {
+                                f.observed_at_ms > 0 && f.observed_at_ms <= ctx.available_at_ms
+                            })
+                    }),
+                "invalid archived venue context or publication order"
             );
             ensure!(
                 leg.source_clock_ahead_bound_ms <= 1_000
@@ -340,7 +384,7 @@ impl CaptureConfig {
 
 struct Compiler<'a> {
     config: &'a CaptureConfig,
-    legs: [LegFeed; 2],
+    legs: [LegFeed<'a>; 2],
     coinbase: Option<Oracle>,
     last_frame_ms: Option<u64>,
     coverage: Coverage,
@@ -368,7 +412,12 @@ impl<'a> Compiler<'a> {
         ensure!(
             matches!(
                 row.source.as_str(),
-                "lighter" | "hyperliquid" | "hyperliquid_snapshot" | "coinbase"
+                "lighter"
+                    | "hyperliquid"
+                    | "hyperliquid_snapshot"
+                    | "arcus_snapshot"
+                    | "bulk_snapshot"
+                    | "coinbase"
             ),
             "unsupported capture source"
         );
@@ -421,7 +470,7 @@ impl<'a> Compiler<'a> {
                             Ok(feeds::Change::Book) => {
                                 self.coverage.leg_book_updates[i] += 1;
                                 self.coverage.leg_snapshot_updates[i] +=
-                                    usize::from(row.source == "hyperliquid_snapshot");
+                                    usize::from(row.source.ends_with("_snapshot"));
                                 if let Some(book) = leg.book().filter(|book| book.tradable) {
                                     self.book_availability[i]
                                         .observe(row.available_at_ms - book.timestamp_ms);
@@ -529,10 +578,20 @@ impl<'a> Compiler<'a> {
         let witness_start =
             witnessed.partition_point(|p| p.at_ms <= self.last_frame_ms.unwrap_or(now));
         let witness_end = witnessed.partition_point(|p| p.at_ms <= now);
+        let archived = &self.config.legs[i].archived_contexts;
+        let visible = archived.partition_point(|ctx| ctx.available_at_ms <= now);
+        let (oracle, forecast) = if let Some(ctx) = archived[..visible].last() {
+            (ctx.oracle, ctx.forecast.clone())
+        } else {
+            (
+                leg.context().map_or_else(missing_oracle, |ctx| ctx.oracle),
+                leg.context().and_then(|ctx| self.forecast(i, now, ctx)),
+            )
+        };
         MarketFrame {
             book,
-            oracle: leg.context().map_or_else(missing_oracle, |ctx| ctx.oracle),
-            forecast: leg.context().and_then(|ctx| self.forecast(i, now, ctx)),
+            oracle,
+            forecast,
             settled: payments[start..end].to_vec(),
             witnessed_settlements: witnessed[witness_start..witness_end].to_vec(),
         }

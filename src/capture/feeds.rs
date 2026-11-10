@@ -25,38 +25,43 @@ pub(super) struct ContextTick {
     pub last_settled_ms: Option<u64>,
 }
 
-pub(super) struct LegFeed {
+pub(super) struct LegFeed<'a> {
+    venue: String,
     market: String,
-    config: LegConfig,
+    config: &'a LegConfig,
     depth: LighterDepth,
     book: Option<Book>,
     book_from_snapshot: bool,
-    latest_hyperliquid_book_ms: u64,
+    latest_snapshot_book_ms: u64,
     context: Option<ContextTick>,
     lighter_clock: LighterClockAudit,
 }
 
-impl LegFeed {
-    pub fn new(terms: &MarketTerms, config: &LegConfig) -> Self {
+impl<'a> LegFeed<'a> {
+    pub fn new(terms: &MarketTerms, config: &'a LegConfig) -> Self {
         Self {
+            venue: terms.venue.clone(),
             market: terms.market.clone(),
-            config: config.clone(),
+            config,
             depth: LighterDepth::default(),
             book: None,
             book_from_snapshot: false,
-            latest_hyperliquid_book_ms: 0,
+            latest_snapshot_book_ms: 0,
             context: None,
             lighter_clock: LighterClockAudit::default(),
         }
     }
 
     pub fn accepts(&self, source: &str) -> bool {
-        if self.config.lighter_market_id.is_some() {
-            source == "lighter"
-        } else {
-            source == "hyperliquid"
-                || (source == "hyperliquid_snapshot"
-                    && self.config.book_mode() != HyperliquidBookMode::Websocket)
+        match self.venue.as_str() {
+            "lighter" => source == "lighter",
+            "arcus" => source == "arcus_snapshot",
+            "bulk" => source == "bulk_snapshot",
+            _ => {
+                source == "hyperliquid"
+                    || (source == "hyperliquid_snapshot"
+                        && self.config.book_mode() != HyperliquidBookMode::Websocket)
+            }
         }
     }
 
@@ -72,6 +77,7 @@ impl LegFeed {
                 self.lighter_clock = LighterClockAudit::default();
             }
             "hyperliquid_snapshot" => self.invalidate_hyperliquid_book(true),
+            "arcus_snapshot" | "bulk_snapshot" => self.book = None,
             _ => {
                 self.context = None;
                 self.invalidate_hyperliquid_book(false);
@@ -104,10 +110,18 @@ impl LegFeed {
         request_sent: Option<u64>,
         source: &str,
     ) -> Result<Change> {
-        if let Some(id) = self.config.lighter_market_id {
-            self.apply_lighter(payload, received, request_sent, id)
-        } else {
-            self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot")
+        match source {
+            "lighter" => {
+                let id = self
+                    .config
+                    .lighter_market_id
+                    .context("missing Lighter ID")?;
+                self.apply_lighter(payload, received, request_sent, id)
+            }
+            "arcus_snapshot" | "bulk_snapshot" => {
+                self.apply_rest_snapshot(payload, received, source)
+            }
+            _ => self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot"),
         }
     }
 
@@ -241,7 +255,7 @@ impl LegFeed {
                 };
                 // Both transports use the exchange clock. Retain the last
                 // accepted publication time across transport failures.
-                if time <= self.latest_hyperliquid_book_ms {
+                if time <= self.latest_snapshot_book_ms {
                     return Ok(Change::Other);
                 }
                 let [bids, asks] = book.levels.map(|levels| {
@@ -252,7 +266,7 @@ impl LegFeed {
                         .collect::<Result<Vec<_>>>()
                 });
                 self.set_book(time, bids?, asks?);
-                self.latest_hyperliquid_book_ms = time;
+                self.latest_snapshot_book_ms = time;
                 self.book_from_snapshot = snapshot;
                 Ok(Change::Book)
             }
@@ -274,6 +288,70 @@ impl LegFeed {
             }
             _ => Ok(Change::Other),
         }
+    }
+
+    fn apply_rest_snapshot(
+        &mut self,
+        payload: &Value,
+        received: u64,
+        source: &str,
+    ) -> Result<Change> {
+        let requested = payload["market"]
+            .as_str()
+            .context("missing requested market")?;
+        if requested != self.market {
+            return Ok(Change::Other);
+        }
+        let data = &payload["data"];
+        let (raw_ms, bids, asks) = if source == "arcus_snapshot" {
+            #[derive(Deserialize)]
+            struct ArcusSnapshot {
+                timestamp: u64,
+                bids: Vec<[String; 2]>,
+                asks: Vec<[String; 2]>,
+            }
+            let book = ArcusSnapshot::deserialize(data)?;
+            let levels = |side: Vec<[String; 2]>| {
+                side.into_iter()
+                    .map(|[price, size]| parse_level(&price, &size, false))
+                    .collect::<Result<Vec<_>>>()
+            };
+            (
+                book.timestamp / 1_000,
+                levels(book.bids)?,
+                levels(book.asks)?,
+            )
+        } else {
+            let book = crate::exchanges::bulk::Snapshot::deserialize(data)?;
+            let time = book.timestamp_for(&self.market)?;
+            let [bids, asks] = book.levels.map(|side| {
+                side.into_iter()
+                    .map(|level| Level {
+                        price: level.px,
+                        contracts: level.sz,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (time, bids, asks)
+        };
+        ensure!(
+            bids.len() <= LEVELS
+                && asks.len() <= LEVELS
+                && bids.iter().chain(&asks).all(|level| {
+                    level.price > Decimal::ZERO && level.contracts > Decimal::ZERO
+                }),
+            "invalid REST snapshot depth"
+        );
+        let Some(time) = self.source_time(raw_ms, received) else {
+            self.book = None;
+            return Ok(Change::Clock(raw_ms.saturating_sub(received)));
+        };
+        if time <= self.latest_snapshot_book_ms {
+            return Ok(Change::Other);
+        }
+        self.set_book(time, bids, asks);
+        self.latest_snapshot_book_ms = time;
+        Ok(Change::Book)
     }
 
     fn source_time(&self, raw: u64, received: u64) -> Option<u64> {

@@ -37,15 +37,15 @@ pub struct BestBidAsk {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Snapshot {
+pub(crate) struct Snapshot {
     symbol: String,
     update_type: String,
     timestamp: u64,
-    levels: [Vec<Level>; 2],
+    pub(crate) levels: [Vec<Level>; 2],
 }
 
 impl Snapshot {
-    fn bbo(self, symbol: &str) -> Result<BestBidAsk> {
+    pub(crate) fn timestamp_for(&self, symbol: &str) -> Result<u64> {
         ensure!(
             self.symbol == symbol && self.update_type == "snapshot",
             "Unexpected BULK snapshot identity or type"
@@ -63,6 +63,11 @@ impl Snapshot {
             EPOCH_MS.contains(&timestamp_ms),
             "Invalid BULK snapshot timestamp"
         );
+        Ok(timestamp_ms)
+    }
+
+    fn bbo(self, symbol: &str) -> Result<BestBidAsk> {
+        let timestamp_ms = self.timestamp_for(symbol)?;
         let [bids, asks] = self.levels;
         ensure!(
             bids.len() <= 1 && asks.len() <= 1,

@@ -1,11 +1,12 @@
+use anyhow::{Result, anyhow, ensure};
 use starknet_crypto::{Felt, get_public_key};
 
-fn main() {
-    let private_key_hex = "REDACTED_PRIVATE_KEY";
-    let private_key = Felt::from_hex(private_key_hex).expect("Invalid private key");
+fn main() -> Result<()> {
+    let input = std::env::var("EDGEX_STARK_PRIVATE_KEY")
+        .map_err(|_| anyhow!("Set EDGEX_STARK_PRIVATE_KEY in the local environment"))?;
+    let private_key = Felt::from_hex(&input).map_err(|_| anyhow!("Invalid EdgeX key format"))?;
+    ensure!(private_key != Felt::ZERO, "The EdgeX key must be nonzero");
 
-    let public_key = get_public_key(&private_key);
-
-    println!("Private Key: {}", private_key_hex);
-    println!("Public Key (x): 0x{:064x}", public_key);
+    println!("Public Key (x): 0x{:064x}", get_public_key(&private_key));
+    Ok(())
 }

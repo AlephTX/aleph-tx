@@ -189,9 +189,6 @@ impl SignatureManager {
         let r_hex = format!("{:064x}", signature.r);
         let s_hex = format!("{:064x}", signature.s);
 
-        tracing::debug!("L2 signature r: {}", r_hex);
-        tracing::debug!("L2 signature s: {}", s_hex);
-
         // Verify the signature locally
         let is_valid =
             starknet_crypto::verify(&self.public_key, &hash_reduced, &signature.r, &signature.s)

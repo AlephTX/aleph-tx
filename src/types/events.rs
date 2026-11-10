@@ -219,7 +219,7 @@ pub struct ShmPrivateEventV2 {
     pub exchange_id: u8,
     /// Event type (1=Created, 2=Filled, 3=Canceled, 4=Rejected)
     pub event_type: u8,
-    /// Symbol/market ID (BTC=0, ETH=1, etc.)
+    /// Shared-memory symbol ID from the session symbol map.
     pub symbol_id: u16,
     /// Padding to align exchange_order_id to 8-byte boundary
     _pad1: u32,

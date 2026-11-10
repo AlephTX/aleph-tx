@@ -1,28 +1,34 @@
 # Cross-venue research and execution primitives
 
-For same-underlying crypto and stock perp strategies, use the
-[multi-level paper replay](PERP_RELATIVE_VALUE.md). It evaluates executable
-depth, a causal basis model, per-payment funding and equity session constraints.
+The cross-venue CLI discovers markets, inspects public books and replays
+two-leg order events. For funding carry and basis reversion on matched crypto
+or equity perpetuals, use the depth-aware [paper replay](PERP_RELATIVE_VALUE.md).
 
-The cross-venue tool evaluates price and funding opportunities and replays order
-events locally. Its market commands read public endpoints. Existing Lighter and
-Hyperliquid Go feeds keep their original shared-memory layout.
+## Venue capabilities
 
-| Venue | Market data | Order support |
-| --- | --- | --- |
-| Lighter | Existing Go BBO, depth and private feeds | Existing Linux x86-64 signer and strategy binaries |
-| Hyperliquid | Existing Go BBO plus Rust REST book and perpetual metadata | Rust REST limit orders, cancellation and status lookup |
-| Entropy | Hyperliquid HIP-3 metadata and `io:SYMBOL` books | Same Hyperliquid REST client with dynamically resolved HIP-3 asset IDs |
-| Arcus | Public REST perpetual markets, BBO, orders, fills and positions | Ed25519 REST limit orders and cancellation |
-| BULK | Public REST market metadata and BBO | Read-only |
-| Variational | Public v2 perpetual/swap statistics with source timestamps | Read-only. Public prices are indicative |
+| Venue | Data in AlephTX | Order transport | Operating scope |
+| --- | --- | --- | --- |
+| Lighter | Go BBO, depth and private events plus public L2 capture | Native signer on Linux x86-64 | Primary BTC or ETH maker |
+| Hyperliquid | Go BBO plus public WebSocket and REST L2 capture | Native REST limit orders, cancellation and order status | Native BTC or ETH inventory hedge |
+| Entropy | HIP-3 metadata and `io:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
+| TradeXYZ | HIP-3 metadata and `xyz:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
+| Arcus | Public REST metadata, BBO and L2 capture | Standalone signed Ed25519 REST, order status and fills | Offline pair replay |
+| BULK | Public REST metadata, BBO and L2 capture | Read-only integration | Offline pair replay |
+| Variational | Public v2 perpetual and swap statistics with source timestamps | Read-only indicative data | Market research |
 
-The registry separates liquidity from shared infrastructure risk. Hyperliquid
-core and Entropy have different liquidity domains and share a risk domain.
-Another frontend for the same HIP-3 book shares its liquidity domain. Use
-`VenueRegistry::register_hip3` for additional deployers. Independent venues
-supply their own adapter and registry entry. No new Go shared-memory slot is
-required for the research path.
+A liquidity domain identifies a matching book. Two frontends using the same
+book are one liquidity domain and cannot form a pair. A risk domain
+identifies shared infrastructure. Native Hyperliquid, Entropy and TradeXYZ
+have distinct books and share that risk domain. Entropy × TradeXYZ
+requires `allow_shared_risk_domain: true` on the pair.
+[Hyperliquid HIP-3](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals).
+
+A single recording can support all six pairings among Entropy, Arcus,
+TradeXYZ and BULK. Each replay has its own limits and evaluates one pair
+in isolation. Joint allocation and live reconciliation need a coordinator
+that reserves exposure across all routes. Additional HIP-3 deployers use
+`VenueRegistry::register_hip3`. An independent venue adds its own adapter
+and registry entry. Research capture runs outside the live shared-memory path. [Four-venue recording](PERP_RECORDING.md#four-venue-pair-recordings).
 
 ## Evaluate and replay
 
@@ -44,20 +50,24 @@ Both fixtures run in `make test`.
 ```sh
 target/release/cross_venue markets hyperliquid
 target/release/cross_venue markets entropy
+target/release/cross_venue markets trade_xyz
 target/release/cross_venue markets bulk
 target/release/cross_venue markets variational
 target/release/cross_venue bbo arcus BTC-USD
 target/release/cross_venue bbo bulk NVDA-USD
 ```
 
-Use an explicit contract mapping for underlying/index identity, settlement and
-base units per contract. Verify it against market metadata and the account's
-trading terms. The example's mapping, fees and capacity are synthetic.
-A settlement or index mismatch excludes the pair. FX, inverse contracts,
-spot-perpetual pairs and asymmetric swap funding require separate models.
-The existing SHM scanner accepts explicit economics and instrument metadata
-through `configure_market`. Its default instance collects BBOs without emitting
-opportunities.
+### Pair admission
+
+Verify canonical underlying, payoff adjustments, settlement asset and base
+units per contract against the venue specifications. Configure native tick,
+lot and minimums, the account's applicable fees and capacity, and each
+payment schedule. A settlement or payoff mismatch excludes a pair. FX,
+inverse contracts, spot-perpetual pairs and asymmetric swap funding require
+separate models. The included examples use synthetic terms.
+
+The SHM scanner accepts explicit economics and instrument metadata through
+`configure_market`. Without that configuration it collects BBOs only.
 
 ## Arcus REST
 
@@ -77,10 +87,11 @@ target/release/cross_venue arcus testnet positions
 `place-limit MARKET SIDE SIZE PRICE TIF CLIENT_ID [--reduce-only]` sends a
 limit order with `alo`, `ioc`, `fok`, or `gtt`. Set the price and size to the
 market's tick and step. Use a unique client ID for each intent and save it
-before submitting. HTTP 202 only confirms receipt. Use `order ORDER_ID` and
-`fills [LIMIT]` to confirm fills. If the response is lost, use `open-orders`
-and `orders` to reconcile the client ID before another submission. An order may
-appear in those views after the gateway responds.
+before submitting. HTTP 202 confirms receipt. Use `order ORDER_ID` and
+`fills [LIMIT]` to confirm fills. If the response is lost, reconcile the
+client ID through `open-orders`, `orders` and subsequent fill and position
+evidence before another submission. Allow for delayed visibility after
+the gateway responds.
 
 `cancel-order MARKET_ID ORDER_ID`, `cancel-client MARKET_ID CLIENT_ID`, and
 `cancel-all MARKET_ID` submit cancellations. Use `cancel-all all` for the whole

@@ -1,10 +1,10 @@
 # Perpetual relative value and paper execution
 
-The `relative_value` module trades a matched long and short in the same linear
-perpetual exposure. It evaluates both directions against executable book
-depth and keeps the strategy separate from the exchange transports. The
-research runner sends no orders. The existing BBO scanner and market makers
-retain their own entry points.
+The `relative_value` module simulates a matched long and short on the same
+linear perpetual exposure. The planner tests both directions against
+executable depth. The paper runner applies order latency, partial fills,
+hedge recovery and an independent cash and position ledger. Its order
+intents stay inside the simulation.
 
 | Strategy | Entry signal | Exits |
 | --- | --- | --- |
@@ -24,8 +24,8 @@ The open position keeps its entry baseline for exit decisions.
   reviewed payoff convention on each leg. For an equity, the identity includes
   share class and the payoff convention includes splits, dividends and
   adjustments. A ticker alone is insufficient. Each contract has a multiplier
-  and a native lot; the hedge balances normalized shares or coins using their
-  common lot. Quotes and cashflows must already be in the same settlement unit.
+  and a native lot. The hedge balances normalized shares or coins using
+  their common lot. Quotes and cashflows must already be in the same settlement unit.
   Cross-collateral FX and inverse or quanto payoff models need explicit adapters.
 - Supply a live external reference and each venue's oracle with source times.
   The strategy checks book and oracle deviation against the reference. Equity
@@ -63,6 +63,29 @@ adapter before onboarding.
 
 ## Replay
 
+A pair uses `"mode": {"kind": "pair_hedge"}` by default. For a session
+that measures trading activity within a budget, set `pair.mode` to
+
+```json
+{"kind":"turnover","max_turnover_quote":"10000","max_fees_quote":"10"}
+```
+
+Both caps use the common quote unit. The solver deducts filled turnover
+and simulated fees from their respective session budgets. It then
+estimates both entry and both exit IOCs at their protective limits and
+reduces the candidate to the largest affordable common lot within each
+depth band. The smaller plan must still clear both venues' minimums,
+exposure limits and the positive net-edge threshold. If the remaining
+budget cannot support a legal, profitable size, the planner reports
+`turnover_budget`. Risk exits and hedge repairs proceed even if their
+execution takes realized costs above the entry budget. Prospective
+rewards carry zero value in both modes.
+
+For carry, `funding_no_credit` means no direction has a positive funding
+lower bound for a reachable hold. `net_edge` means the priced candidate
+failed the net threshold. `best_net_edge_bps` records the best priced edge
+before turnover caps, so it can be positive in a run with zero entries.
+
 The [public recording workflow](PERP_RECORDING.md) creates this input format
 from venue data and reports timestamp and reference coverage.
 
@@ -79,21 +102,27 @@ second ask level consumes the modeled edge, then closes when the basis reverts.
 Both finish with zero position. They verify the accounting and execution path.
 
 Larger recordings can use `perp-replay recording.ndjson`. The first line is the
-same configuration object without `frames`; following lines contain one frame
-each. The reader streams in strictly increasing `now_ms` order. Capture source
+same configuration object without `frames`. Each following line contains
+one frame. The reader streams in strictly increasing `now_ms` order. Capture source
 timestamps separately from arrival time, and include every realized payment on
 held legs. An optional `trade_from_ms` lets earlier frames train the estimator
 without placing orders. Fix strategy parameters on an earlier period and
 evaluate them on a later chronological holdout.
 
+## Read the execution report
+
 An IOC can consume only a newer book generated after the configured modeled
-latency. The simulator walks displayed prices up to the order limit and then
-passes the confirmed fill to the existing hedge state machine. The hedge can
-partially fill or expire. The report separates realized PnL from the last
-estimated liquidation mark, and includes fees, funding, turnover, missing
-marks, peak observed drawdown, maximum single-leg exposure and time exposed.
-An expired intent with no usable post-arrival book is counted separately.
-Funding at a frame time is booked before simulated fills at that time.
+latency. The simulator walks displayed prices up to the order limit and
+passes confirmed fills to the hedge state machine. Funding at a frame time
+is booked before simulated fills at that time.
+
+| Question | Report fields |
+| --- | --- |
+| Was the strategy ready? | Training and holdout frames, basis samples and `entry_diagnostics.blocked_by_gate` |
+| Did the legs execute? | Entry signals and submissions, opening and closing leg execution, partial and expired IOCs |
+| What did execution cost? | Filled turnover, fees, per-market slippage and separately booked funding |
+| How much risk remained? | Maximum unhedged size and duration, observed drawdown, halt reason and final positions |
+| What value can be measured? | Simulated realized PnL, upper bounds for incomplete funding evidence, and the final liquidation estimate when the book supports it |
 
 Each `market_costs` row names the venue and contract and totals simulated
 filled turnover and fees for both directions. `execution_cost_bps` divides
@@ -105,8 +134,8 @@ spread paid at the touch.
 Paper fills still assume the discounted displayed liquidity is available to
 this order. The replay models one pair at a time and does not simulate venue
 queue priority, liquidations, collateral transfers or intraframe price paths.
-The capital charge is an entry reserve; realized PnL accounts for simulated
-fills, fees and settled funding. A time or session cutoff without sufficient
+The capital charge is an entry reserve. Realized PnL accounts for
+simulated fills, fees and settled funding. A time or session cutoff without sufficient
 depth can leave positions open. Preserve those cases when comparing strategies.
 
 ## Entropy and venue rewards
@@ -139,14 +168,18 @@ The planner values future points and airdrops at zero. Paper turnover
 measures execution economics. Reconcile live fills and any rewards posted
 by the venue separately from strategy PnL.
 
-The next validation step is synchronized venue L2, external reference, contract
-terms and funding recordings for verified matched markets. Use a chronological
-holdout across liquid and stressed sessions and check expected versus realized
-spread, hedge failures and unresolved exposure before any live integration.
+## Research acceptance
 
-References: [Perpetual Futures Pricing](https://www.nber.org/papers/w32936),
-[Fundamentals of Perpetual Futures](https://arxiv.org/abs/2212.06888),
-[Hyperliquid funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding),
-[HIP-3 market and oracle settings](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals),
-[Arcus market metadata](https://docs.arcus.xyz/api-reference/public/get-markets),
+Archive the raw file, compile profile and report, simulation input and
+report, code revision, and checksums. Freeze thresholds before the holdout.
+Compare modeled edge with simulated round-trip execution across liquid
+and stressed sessions. Include every zero-entry run and every residual
+position in the results. A fill-free coverage run establishes the quality
+of its inputs and is a separate result from strategy performance.
+
+[Perpetual Futures Pricing](https://www.nber.org/papers/w32936) ·
+[Fundamentals of Perpetual Futures](https://arxiv.org/abs/2212.06888) ·
+[Hyperliquid funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding) ·
+[HIP-3 market and oracle settings](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals) ·
+[Arcus market metadata](https://docs.arcus.xyz/api-reference/public/get-markets) ·
 [NYSE hours and holidays](https://www.nyse.com/markets/hours-calendars).

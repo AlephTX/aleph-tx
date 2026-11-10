@@ -3,6 +3,7 @@
 AlephTX can record Lighter L2 and market statistics, Hyperliquid core and
 HIP-3 L2 and asset contexts, and Coinbase spot ticker quotes. The collector
 writes public messages with their local receipt and availability times.
+Arcus and BULK REST snapshots can join the same recording.
 The compiler preserves the exchange publication time for books and joins only
 observations available at the replay clock. Both tools run without trading keys.
 
@@ -52,6 +53,77 @@ target/release/cross_venue perp-compile recordings/entropy-nvda-config.json \
 Enable Lighter calibration on the copied profile with `legs[0].lighter_clock`
 as described below. Review Entropy's contract economics and session-specific
 oracle before using the capture for paper entries.
+
+## Four-venue pair recordings
+
+Record both HIP-3 books and the two REST venues to the same file so every
+pair is evaluated against the same arrival clock.
+
+```sh
+mkdir -p recordings
+feeder/perp-capture -hyperliquid io:NVDA,xyz:NVDA -hl-snapshot-interval 1s \
+  -arcus NVDA-USD -bulk NVDA-USD -duration 2m \
+  -output recordings/nvda-four-venues-raw.ndjson
+target/release/cross_venue perp-compile examples/arcus_bulk_nvda_capture.json \
+  recordings/nvda-four-venues-raw.ndjson recordings/nvda-arcus-bulk.ndjson
+target/release/cross_venue perp-replay recordings/nvda-arcus-bulk.ndjson
+```
+
+The Arcus and BULK flags request up to 20 unaggregated levels per side.
+The default poll interval is one second, with up to four markets per venue.
+Each record retains the requested market, original response and local
+receipt and availability times. The compiler converts Arcus epoch
+microseconds and BULK epoch nanoseconds or milliseconds to milliseconds.
+It rejects future or mismatched publications and requires publication
+time to advance after a transport error.
+[Arcus L2](https://docs.arcus.xyz/api-reference/public/get-l2-orderbook-snapshot),
+[BULK L2](https://docs.bulk.trade/api-reference/getL2Book).
+
+Compile the same recording with a separate configuration for each pair.
+Select the native symbols `io:NVDA`, `xyz:NVDA` or `NVDA-USD` on the
+corresponding venue. Set `hyperliquid_book_mode` to `freshest` only on HIP-3
+legs when recording both Hyperliquid transports. Review contract identity,
+tick, lot, fees, settlement and funding schedule on both legs before enabling
+`paper_entries`. The checked-in example measures coverage with zero order
+capacity and uses placeholder settlement and funding terms. A pair with Entropy and TradeXYZ also requires
+`pair.allow_shared_risk_domain = true` in its configuration.
+
+For paper entries on an Arcus or BULK leg, supply `legs[i].archived_contexts`
+with the native `market`, `available_at_ms` and an `oracle` carrying its
+source `timestamp_ms`, price and mode. An optional `forecast` uses the same
+per-payment schema as `perp-replay`. The compiler only uses a context after
+its availability time. Supply the independent reference and, for equities,
+the session and corporate-action coverage separately. Preserve settled
+funding as separate records. Keep both source and availability times for
+each context, and record the origin and checksum of each external input.
+
+### NVDA coverage check
+
+A 75-second public capture on 2026-11-10 ran from the first receipt at
+15:45:30.109 UTC through the footer at 15:46:44.369 UTC. It contains 164
+Hyperliquid WebSocket messages, 148 Hyperliquid REST snapshots, 75 Arcus
+snapshots and 74 BULK snapshots. All six compiles used the same raw data,
+a 250 ms sample interval, a 2,200 ms maximum book age and a 750 ms maximum
+skew. Both HIP-3 legs used `freshest` when present.
+
+| Pair | Synchronized frames | Share of 153 frames |
+| --- | ---: | ---: |
+| Arcus × BULK | 51 | 33.3% |
+| Arcus × Entropy | 80 | 52.3% |
+| Arcus × TradeXYZ | 84 | 54.9% |
+| BULK × Entropy | 83 | 54.2% |
+| BULK × TradeXYZ | 86 | 56.2% |
+| Entropy × TradeXYZ | 123 | 80.4% |
+
+Strict clock checks rejected 22 Arcus publications and 18 BULK
+publications ahead of local receipt, by up to 54 ms and 84 ms,
+respectively. The HIP-3 legs had no such rejections. Each run used
+`paper_entries: false` and zero order capacity with placeholder contract
+terms. The sample measures book coverage. Entry, fills and return require
+an independent reference, verified terms and a separate execution replay.
+
+Raw archive SHA-256
+`bd3a2644f4edbc9a6bb66d9521ba674da80a329e14e6949a6d141ad76882ccb4`.
 
 ## Timing and dataset coverage
 

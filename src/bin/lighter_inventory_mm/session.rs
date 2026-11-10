@@ -27,8 +27,16 @@ struct FeederMarket {
     feeder_symbols: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StrategyMode {
+    Quant,
+    InventoryHedge,
+}
+
 #[derive(Deserialize)]
 struct Feeds {
+    strategy_mode: Option<StrategyMode>,
     lighter: FeederMarket,
     hyperliquid: Option<FeederMarket>,
     inventory_hedge: Option<HedgeLimits>,
@@ -48,6 +56,12 @@ impl Profile {
         let contents =
             fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?;
         let feeds: Feeds = toml::from_str(&contents)?;
+        if let Some(mode) = feeds.strategy_mode {
+            ensure!(
+                (mode == StrategyMode::InventoryHedge) == feeds.inventory_hedge.is_some(),
+                "strategy_mode=inventory_hedge requires [inventory_hedge]; strategy_mode=quant requires its absence"
+            );
+        }
         let (network, hedge_ws) = match feeds.lighter.feeder_ws_url.as_str() {
             "wss://mainnet.zklighter.elliot.ai/stream" => {
                 (Network::Mainnet, "wss://api.hyperliquid.xyz/ws")
@@ -131,6 +145,14 @@ impl Profile {
 
     pub fn has_hedge(&self) -> bool {
         self.feeds.inventory_hedge.is_some()
+    }
+
+    pub fn strategy_mode(&self) -> &'static str {
+        if self.has_hedge() {
+            "inventory_hedge"
+        } else {
+            "quant"
+        }
     }
 
     pub fn require_network(&self, expected: Network) -> Result<()> {
@@ -541,6 +563,46 @@ mod tests {
         fs::write(&path, example.replace("ETH = \"0\"", "ETH = \"1\"")).unwrap();
         assert!(Profile::load(&path).is_err());
         assert!(profile.require_network(Network::Testnet).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_strategy_mode_must_agree_with_hedge_settings() {
+        let example = include_str!("../../../config.example.toml");
+        let path = std::env::temp_dir().join(format!("aleph-mode-{}.toml", Uuid::new_v4()));
+        let hedge = r#"
+[inventory_hedge]
+max_unhedged_base = "0.02"
+deadband_base = "0.001"
+max_order_notional_usd = "20"
+min_available_usd = "30"
+slippage_bps = 1
+taker_fee_bps = 0
+"#;
+        fs::write(&path, format!("strategy_mode = \"quant\"\n{example}")).unwrap();
+        assert_eq!(Profile::load(&path).unwrap().strategy_mode(), "quant");
+
+        fs::write(
+            &path,
+            format!("strategy_mode = \"quant\"\n{example}{hedge}"),
+        )
+        .unwrap();
+        assert!(Profile::load(&path).is_err());
+        fs::write(
+            &path,
+            format!("strategy_mode = \"inventory_hedge\"\n{example}"),
+        )
+        .unwrap();
+        assert!(Profile::load(&path).is_err());
+        fs::write(
+            &path,
+            format!("strategy_mode = \"inventory_hedge\"\n{example}{hedge}"),
+        )
+        .unwrap();
+        assert_eq!(
+            Profile::load(&path).unwrap().strategy_mode(),
+            "inventory_hedge"
+        );
         fs::remove_file(path).unwrap();
     }
 

@@ -1,11 +1,8 @@
 use aleph_tx::exchanges::edgex::signature::SignatureManager;
-use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load private key from env
-    let private_key = env::var("EDGEX_STARK_PRIVATE_KEY").expect("EDGEX_STARK_PRIVATE_KEY not set");
-
-    let sig_mgr = SignatureManager::new(&private_key)?;
+    // Use a deterministic fixture key for this offline example.
+    let sig_mgr = SignatureManager::new("0x1")?;
 
     // Test parameters (same as before)
     let synthetic_asset_id = "0x4554482d3900000000000000000000";
@@ -16,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let amount_collateral = 15000000u64; // 15 USDC
     let amount_fee = 5700u64; // 0.0057 USDC
     let nonce = 1234567890u64;
-    let account_id = 0u64;
+    let account_id = 0x0102_0304_0506_0708u64;
     let expire_time_hours = 493911u64;
 
     println!("=== L2 Order Signature Test ===\n");

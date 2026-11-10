@@ -1,22 +1,33 @@
 # AlephTX
 
-AlephTX is a Go and Rust system for perpetual futures market making and
-cross-venue research. Its primary trading path runs one Lighter market per
-supervised session, with an optional Hyperliquid inventory hedge. The same
-repository includes a public market recorder, offline execution and strategy
-replays, and a console for monitoring trading sessions.
+AlephTX is a Go and Rust engine for perpetual futures execution and
+cross-venue research. Its supervised execution path runs inventory-aware
+market making on one Lighter perpetual per session, with an optional
+inventory hedge on native Hyperliquid. Its research path turns recorded
+order books, funding and independent reference prices into reproducible
+simulations for crypto and equity perpetuals.
 
-## Start locally
+## Operating modes
 
-Use Rust 1.95.0 with `rustfmt` and Clippy, as pinned in
-[CI](.github/workflows/ci.yml), and the Go version declared in [feeder/go.mod](feeder/go.mod).
-The monitor tests require Python 3 with SQLite. Use Node 22.12+ on the Node 22
-line or Node 24 for the dashboard. CI covers Linux and macOS. The bundled
-Lighter signer and supervised trading require **Linux x86-64**.
+| Mode | Scope | Entry point |
+| --- | --- | --- |
+| `quant` | Single-venue Lighter market making with fair-value, inventory and loss controls | Supervised profile with `strategy_mode = "quant"` |
+| `inventory_hedge` | Lighter market making with Hyperliquid IOC hedges sized from confirmed inventory | Supervised profile with `strategy_mode = "inventory_hedge"` and `[inventory_hedge]` |
+| `pair_hedge` | Offline two-leg funding carry or basis reversion, one matched market pair per run | `cross_venue perp-replay`, the default `pair.mode` |
+| `turnover` | The same offline strategies with explicit turnover and fee budgets on new entries | `cross_venue perp-replay` with `pair.mode.kind = "turnover"` |
 
-Validate the checked-in example and run the core checks from the repository root.
-The tests use offline fixtures and local test services. Installing build
-dependencies can require network access.
+The current research matrix covers the six pairings among Entropy, Arcus,
+TradeXYZ and BULK. Entropy and TradeXYZ have distinct books and share
+Hyperliquid infrastructure. A replay pairing them requires an explicit
+shared-risk opt-in. Standalone adapters and supervised routes have
+different operational guarantees. [Venue capabilities](docs/CROSS_VENUE.md).
+
+## Validate locally
+
+Use Rust 1.95.0 with rustfmt and Clippy and the Go version pinned in the
+module. The bundled Lighter signer and supervised trading require Linux
+x86-64. Offline CI runs on Linux and macOS.
+[CI workflow](.github/workflows/ci.yml) · [Go module](feeder/go.mod)
 
 ```sh
 make trade MODE=check CONFIG=config.example.toml
@@ -26,13 +37,8 @@ make test
 make build
 ```
 
-Run `make test-python` for monitor ingestion and alerts, and
-`make dashboard-build` for the console type checks, tests, and production bundle.
-`make benchmark` runs the opt-in local benchmarks. Record the hardware,
-toolchain, workload, and baseline when comparing results. Historical
-measurements and their scope are in the [engineering audit](docs/AUDIT_2026_11.md).
-
-After `make build`, run the included synthetic scenarios without credentials.
+`MODE=check` validates and resolves the profile without reading credentials.
+After building, run the included synthetic scenarios from the repository root.
 
 ```sh
 target/release/cross_venue hedge-replay examples/hedge_replay.json
@@ -40,98 +46,82 @@ target/release/cross_venue perp-replay examples/crypto_funding_paper.json
 target/release/cross_venue perp-replay examples/equity_basis_paper.json
 ```
 
-These scenarios exercise order reconciliation, funding carry, and equity basis
-reversion. The [paper replay guide](docs/PERP_RELATIVE_VALUE.md) describes the
-liquidity, latency, and funding assumptions that limit how the results can be used.
+For the monitor, use Python 3 with SQLite and run `make test-python`. For
+the console, use Node 22.12+ on the Node 22 line or Node 24 and run
+`make dashboard-build`. `make benchmark` runs opt-in local benchmarks.
+Record hardware, toolchain, workload and baseline when comparing results.
+[Engineering audit](docs/AUDIT_2026_11.md).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    V[Exchange APIs] -->|Market and private streams| G[Go feeder]
-    G -->|BBO, depth, events, account stats| S[Shared memory]
-    S --> R[Rust strategy and order tracker]
-    R -->|Signed orders and reconciliation| V
-    R --> J[Recovery journal]
-    J --> A[Offline journal audit]
-    R --> T[Session telemetry]
-    T --> M[Monitor and SQLite]
-    M --> D[React console]
+    subgraph Session["Supervised execution"]
+        V["Lighter and Hyperliquid"] -->|"Public and private feeds"| G["Go feeder"]
+        G -->|"Shared memory"| R["Rust strategy and order tracker"]
+        R -->|"Orders and reconciliation"| V
+        R --> J["Recovery journal"]
+        R --> T["Session telemetry"]
+    end
+    J --> A["Offline recovery and fee audit"]
+    T --> A
+    T --> M["Oasis monitor and console"]
+    subgraph Research["Public-data research"]
+        P["Venue market data"] --> C["Recorder and raw archive"]
+        C --> K["Causal replay compiler"]
+        E["Reference, sessions and funding"] --> K
+        K --> B["Two-leg paper execution"]
+    end
 ```
 
-Go owns ingestion and shared memory publication. Rust owns quoting, risk
-reservations, signing, and submission. The Lighter strategy consumes the
-128-byte V2 private events for the order lifecycle. Its quoting cycle wakes on
-market updates or fills and checks freshness, worst-case exposure, and maker
-edge before admitting new quotes. Pricing uses fresh external anchors when
-available, with a local fallback and configurable inventory and markout controls.
+Go owns ingestion and shared-memory publication. Rust owns pricing, risk
+reservations, signing and submission. The Lighter order tracker consumes the
+128-byte V2 private event stream. The `[symbols]` table maps tickers to
+shared-memory IDs across both languages. Venue market IDs and order
+precision are configured separately. [Example profile](config.example.toml).
 
-The `[symbols]` table maps tickers to shared memory IDs across Go and Rust.
-Each venue's market ID and tick and lot sizes are separate. See
-[config.example.toml](config.example.toml) for a complete profile.
+## Operations and evidence
 
-## Trading, recovery, and monitoring
+| Responsibility | Contract | Guide |
+| --- | --- | --- |
+| Launch and shutdown | Start from verified flat positions and no open orders in the configured scope. Both network modes can submit and cancel orders. Keep credentials, private profiles and account evidence outside Git. | [Supervised trading](docs/LIVE_TRADING.md) |
+| Exposure and recovery | Persist the UTC daily loss baseline. Record hedge intents before sending and retain reservations through ambiguous outcomes. An active journal blocks restart until both venues are reconciled. | [Execution and recovery](docs/LIVE_TRADING.md#execution-and-recovery) |
+| Audit and observability | Audit frozen journal and fee evidence offline. Keep venue-reported fees, configured-rate estimates, trade PnL and account equity separate. The monitor uses the strategy's daily loss baseline and threshold. | [Fee evidence](docs/LIVE_TRADING.md#bind-and-measure-fee-evidence) · [Oasis runbook](deploy/oasis/README.md) |
+| Market research | Preserve source and availability times. Compile reviewed contract terms and reference data, then evaluate fixed parameters on a chronological holdout. | [Recording](docs/PERP_RECORDING.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) |
 
-- **Supervised trading.** Follow the [Lighter runbook](docs/LIVE_TRADING.md) to
-  configure dedicated accounts, verify the mainnet or testnet profile, and start
-  or stop the session. Startup requires the selected Lighter market to be flat
-  with no open orders.
-  Both `MODE=live` and `MODE=testnet` can submit and cancel orders. Keep
-  credentials, local profiles with private data, and account evidence out of Git.
-- **Risk and recovery.** The strategy persists the UTC daily loss budget across
-  restarts. The optional hedge bounds single-leg and net exposure, records each
-  IOC intent before dispatch, and waits for terminal order evidence and a
-  matching account position before releasing its reservation. Unverified cleanup
-  leaves an active journal that blocks restart.
-- **Journal audit.** `cross_venue hedge-journal-audit JOURNAL [EVIDENCE]` reads
-  local files and reports reconciliation gaps, possible exposure, and fee
-  evidence when supplied. Its verdict covers the supplied evidence. Restart
-  remains an operator decision after both venues are reconciled. Supervised
-  sessions write schema 2. Schema 3 Lighter batch records and the shared serial
-  journal are exercised in offline trials.
-- **Oasis console.** Session telemetry is separate from the recovery journal.
-  The [Oasis runbook](deploy/oasis/README.md) covers the public feeder, console,
-  access tunnel, and emergency stop. The monitor uses the strategy's persisted
-  daily loss baseline and configured threshold for drawdown alerts. Combined
-  trade PnL identifies estimated hedge prices and fees and excludes funding.
-  Account equity is reported separately.
-- **Research and adapters.** The [cross-venue guide](docs/CROSS_VENUE.md)
-  distinguishes public data, standalone order APIs, and replay. Use the
-  [recording guide](docs/PERP_RECORDING.md) for public capture, clock alignment,
-  equity sessions, and funding evidence. Legacy strategy launchers have their
-  own execution and recovery behavior.
+A research run should retain the raw data and configuration hashes,
+training cutoff, source-time coverage, entry rejections, round-trip execution
+costs, maximum residual exposure and final inventory. Count settled funding
+separately from forecasts and value prospective venue rewards at zero.
+The four-venue NVDA sample establishes synchronized market-data coverage
+under its recorded settings. [Coverage report](docs/PERP_RECORDING.md#nvda-coverage-check).
 
 ## Repository map
 
 | Path | Responsibility |
 | --- | --- |
-| [src/bin/](src/bin/) | Supervised launcher, cross-venue CLI, and strategy entry points |
-| [src/strategy/](src/strategy/) | Quoting, risk sizing, and offline replay |
-| [src/exchanges/](src/exchanges/) | Venue protocols, metadata, signing, and execution |
-| [src/live_hedge/](src/live_hedge/) | Journal records and read-only reconciliation audit |
-| [feeder/](feeder/) | Go streams, shared memory producers, and public recorder |
-| [deploy/oasis/](deploy/oasis/) and [dashboard/](dashboard/) | Monitor, deployment runbook, and console |
-| [examples/](examples/) | Replay and capture inputs, plus venue diagnostics |
+| [src/bin/](src/bin/) | Supervised launcher, cross-venue CLI and strategy entry points |
+| [src/strategy/](src/strategy/) | Quoting, risk sizing and offline execution |
+| [src/exchanges/](src/exchanges/) | Venue protocols, metadata, signing and execution |
+| [src/live_hedge/](src/live_hedge/) | Recovery journal and read-only evidence tools |
+| [feeder/](feeder/) | Go feeds, shared-memory writers and public recorder |
+| [deploy/oasis/](deploy/oasis/) and [dashboard/](dashboard/) | Monitor, deployment runbook and console |
+| [examples/](examples/) | Synthetic scenarios, capture inputs and evidence fixtures |
 
-Repository engineering rules and review criteria live in [AGENTS.md](AGENTS.md).
-[CLAUDE.md](CLAUDE.md) imports the shared rules for Claude Code.
+[Quickstart](docs/QUICKSTART.md) · [Configuration reference](docs/CONFIGURATION.md) ·
+[Shared-memory ABI](docs/DUAL_TRACK_IPC.md) · [Engineering rules](AGENTS.md)
 
-## Roadmap
+## Release gates for new execution routes
 
-1. **Prove recovery under failure.** Expand deterministic replay and restart
-   tests for lost acknowledgments, partial fills, feed gaps, and crashes around
-   journal writes and order sends. Before enabling schema 3 in supervised
-   trading, verify compatibility with existing journals and measure commit
-   tail latency under contention on the target host. Require reconciliation when
-   evidence is incomplete.
-2. **Calibrate with recorded evidence.** Build synchronized depth, reference,
-   and funding datasets for matched markets. Evaluate on a chronological
-   holdout, including stressed sessions. Compare net execution cost, markout,
-   time with residual exposure, and accounting coverage. Preserve the distinction
-   between estimates, venue-reported costs, and actual account equity.
-3. **Expand after the controls scale.** Add markets and venues only after
-   validating contract identity, account and portfolio limits, and recovery for
-   each integration. Benchmark execution changes with representative data and
-   venue behavior before choosing a transport or claiming a latency improvement.
+1. **Contract and market data.** Verify payoff, settlement, funding cadence,
+   fee tier, tick and lot on both legs. Measure synchronization, depth and
+   reference coverage in ordinary and stressed sessions.
+2. **Net execution economics.** On a chronological holdout, measure realized
+   fill prices, fee and funding coverage, residual exposure and liquidation
+   marks against the modeled edge. Keep rejected and incomplete runs.
+3. **Failure recovery.** Verify partial fills, lost acknowledgments, feed
+   gaps, restart barriers and cleanup with deterministic fault injection.
+   Promoting schema 3 requires journal compatibility checks and commit tail
+   latency measurements on the target host.
 
 [MIT license](LICENSE).

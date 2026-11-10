@@ -1,13 +1,11 @@
 use aleph_tx::exchanges::edgex::signature::SignatureManager;
 use starknet_crypto::{Felt, pedersen_hash};
-use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== EdgeX L2 Signature Diagnostic Tool ===\n");
 
-    // Load private key
-    let private_key = env::var("EDGEX_STARK_PRIVATE_KEY")?;
-    let sig_mgr = SignatureManager::new(&private_key)?;
+    // Use a deterministic fixture key for this offline example.
+    let sig_mgr = SignatureManager::new("0x1")?;
 
     // Test parameters
     let synthetic_asset_id = "0x4554482d3900000000000000000000";
@@ -18,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let amount_collateral = 15000000u64;
     let amount_fee = 5700u64;
     let nonce = 1234567890u64;
-    let account_id = 0u64;
+    let account_id = 0x0102_0304_0506_0708u64;
     let expire_time_hours = 493911u64;
 
     println!("Input Parameters:");

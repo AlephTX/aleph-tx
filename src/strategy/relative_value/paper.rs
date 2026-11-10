@@ -111,13 +111,15 @@ pub struct PaperEntryDiagnostics {
     pub stop_z: f64,
     pub max_abs_z: Option<f64>,
     pub min_net_edge_bps: f64,
-    /// Best conservative edge among candidates that fit size and budget limits.
+    /// Best conservative edge after depth and exposure limits, before turnover caps.
     #[serde(with = "rust_decimal::serde::str_option")]
     pub best_net_edge_bps: Option<Decimal>,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct PaperReport {
+    #[serde(skip_serializing_if = "PaperMode::is_pair_hedge")]
+    pub mode: PaperMode,
     pub frames: usize,
     pub training_frames: usize,
     pub basis_samples: usize,
@@ -801,6 +803,16 @@ impl Runner {
             self.report.reject(EntryGate::FundingGuard.into());
             return Ok(());
         }
+        if let PaperMode::Turnover {
+            max_turnover_quote,
+            max_fees_quote,
+        } = self.planner.config.mode
+            && (self.ledger.turnover + plan.modeled_turnover_quote > max_turnover_quote
+                || self.ledger.fees + plan.modeled_fees_quote > max_fees_quote)
+        {
+            self.report.reject(EntryGate::TurnoverBudget.into());
+            return Ok(());
+        }
         let mut exec = Execution::new(&plan.hedge)?;
         self.advance(&mut exec, frame, true)?;
         self.report.entries_submitted += 1;
@@ -945,7 +957,14 @@ impl Runner {
                         signal,
                         cutoff,
                         self.funding_guard_ms,
-                        Some(&mut diagnostics.best_net_edge_bps),
+                        EntryOptions {
+                            turnover_budget: self
+                                .planner
+                                .config
+                                .mode
+                                .remaining_budget(self.ledger.turnover, self.ledger.fees),
+                            best_edge_bps: Some(&mut diagnostics.best_net_edge_bps),
+                        },
                     )
                 });
                 match plan {
@@ -1039,6 +1058,7 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
         active: None,
         ledger: Ledger::default(),
         report: PaperReport {
+            mode: pair.mode,
             funding_guard_ms,
             entry_diagnostics: PaperEntryDiagnostics {
                 entry_z: pair.basis.entry_z,

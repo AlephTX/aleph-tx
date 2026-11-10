@@ -427,13 +427,12 @@ fn exact(raw: &str) -> Option<f64> {
     raw.parse::<f64>().ok()
 }
 
-/// Check one telemetry fill against the journal, as `hedge_fill_record`
-/// derives it from the terminal: size is the fill, price the venue average
-/// (`fill`) or the IOC limit (`limit`), position the terminal's.
+/// Check the facts that survive in the journal and the audit. A torn
+/// terminal cannot establish an average price or price source.
 fn check_fill(
     fill: &Fill,
     order: &OrderReport,
-    terminal: &TerminalRecord,
+    terminal: Option<&TerminalRecord>,
     reasons: &mut Vec<String>,
 ) {
     let mut wrong = |what: String| reasons.push(format!("line {}: {what}", fill.line));
@@ -446,34 +445,72 @@ fn check_fill(
             fill.side, order.side
         ));
     }
-    let journal_f64 = |d: Decimal| d.to_f64();
-    let same = |raw: &str, d: Decimal| exact(raw).is_some() && exact(raw) == journal_f64(d);
-    if !same(&fill.size, terminal.filled) {
+    let same = |raw: &str, d: Decimal| exact(raw) == d.to_f64();
+    if let Some(filled) = terminal.map(|t| t.filled).or(order.filled) {
+        if !same(&fill.size, filled) {
+            wrong(format!(
+                "size {} is not the journaled fill {filled}",
+                fill.size
+            ));
+        }
+    } else if let Some((size, max)) = exact(&fill.size).zip(order.size.to_f64())
+        && (size <= 0.0 || size > max)
+    {
         wrong(format!(
-            "size {} is not the journaled fill {}",
-            fill.size, terminal.filled
+            "size {} is outside the IOC size {}",
+            fill.size, order.size
         ));
     }
-    if !same(&fill.position_after, terminal.position) {
+    if let Some(position) = terminal.map(|t| t.position).or(order.position_after)
+        && !same(&fill.position_after, position)
+    {
         wrong(format!(
-            "position_after {} is not the journaled position {}",
-            fill.position_after, terminal.position
+            "position_after {} is not the journaled position {position}",
+            fill.position_after
         ));
     }
-    let (expected_source, expected_price) = match terminal.average_price {
-        Some(price) => ("fill", price),
-        None => ("limit", order.limit_price),
-    };
-    if fill.price_source != expected_source {
-        wrong(format!(
-            "price_source `{}` but the journaled terminal implies `{expected_source}`",
-            fill.price_source
-        ));
-    } else if !same(&fill.price, expected_price) {
-        wrong(format!(
-            "price {} is not the journaled {expected_source} price {expected_price}",
-            fill.price
-        ));
+    if let Some(terminal) = terminal {
+        let (expected_source, expected_price) = match terminal.average_price {
+            Some(price) => ("fill", price),
+            None => ("limit", order.limit_price),
+        };
+        if fill.price_source != expected_source {
+            wrong(format!(
+                "price_source `{}` but the journaled terminal implies `{expected_source}`",
+                fill.price_source
+            ));
+        } else if !same(&fill.price, expected_price) {
+            wrong(format!(
+                "price {} is not the journaled {expected_source} price {expected_price}",
+                fill.price
+            ));
+        }
+    } else {
+        match fill.price_source.as_str() {
+            "limit" if !same(&fill.price, order.limit_price) => wrong(format!(
+                "price {} is not the journaled limit price {}",
+                fill.price, order.limit_price
+            )),
+            "fill"
+                if exact(&fill.price)
+                    .zip(order.limit_price.to_f64())
+                    .is_some_and(|(price, limit)| {
+                        price <= 0.0
+                            || if order.side == "buy" {
+                                price > limit
+                            } else {
+                                price < limit
+                            }
+                    }) =>
+            {
+                wrong(format!(
+                    "price {} violates IOC limit {}",
+                    fill.price, order.limit_price
+                ))
+            }
+            "fill" | "limit" => {}
+            source => wrong(format!("unknown price_source `{source}`")),
+        }
     }
     match fill.fee_source.as_deref() {
         Some("configured_rate") | None => {}
@@ -503,6 +540,7 @@ fn check_fill(
 /// nothing again and repeat no archive-wide work.
 struct Archive<'a> {
     report: audit::Report,
+    truncated_tail: bool,
     lines: Vec<&'a [u8]>,
     telemetry: Telemetry,
     /// Findings about the journal and evidence as a whole, in view order.
@@ -657,6 +695,7 @@ fn fill_findings(
     order: Option<&OrderReport>,
     terminal: Option<&TerminalRecord>,
     fills: &[Fill],
+    truncated_tail: bool,
     notes: &mut Vec<String>,
 ) -> Vec<(ViewStatus, String)> {
     let mut out = Vec::new();
@@ -684,12 +723,23 @@ fn fill_findings(
                 );
             }
         }
-        match (order, terminal) {
-            (Some(order), Some(terminal)) => {
+        match order {
+            Some(order)
+                if terminal.is_some() || (truncated_tail && order.terminal_lines.is_empty()) =>
+            {
                 let mut wrong = Vec::new();
                 check_fill(first, order, terminal, &mut wrong);
                 for reason in wrong {
                     tel(ViewStatus::Invalid, reason);
+                }
+                if terminal.is_none() {
+                    tel(
+                        ViewStatus::Unresolved,
+                        format!(
+                            "line {} exports a fill whose terminal may be in the truncated journal tail",
+                            first.line
+                        ),
+                    );
                 }
             }
             // Exported only after a journaled terminal for this CLOID.
@@ -809,6 +859,10 @@ impl<'a> Archive<'a> {
         let journal_wide = journal_findings(&report);
         let file = file_findings(report.journal.session.as_ref(), &telemetry);
         Archive {
+            truncated_tail: report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "truncated_tail"),
             report,
             lines: journal_lines(journal),
             telemetry,
@@ -859,7 +913,13 @@ impl<'a> Archive<'a> {
             .and_then(|&line| terminal_at(&self.lines, line));
         let records = self.telemetry.by_cloid.get(cloid).unwrap_or(&NO_RECORDS);
         let mut notes = Vec::new();
-        let telemetry = fill_findings(order, terminal.as_ref(), &records.fills, &mut notes);
+        let telemetry = fill_findings(
+            order,
+            terminal.as_ref(),
+            &records.fills,
+            self.truncated_tail,
+            &mut notes,
+        );
         Judged {
             cloid: validate_hex(cloid, 16).is_err().then(|| {
                 (

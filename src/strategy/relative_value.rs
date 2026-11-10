@@ -10,7 +10,7 @@ pub use paper::{
 use crate::{
     hedging::{HedgePlan, HedgeSide, LegSpec, common_quantity_step, floor_step},
     strategy::cross_venue::PlannerConfig,
-    venues::{OrderSupport, VenueRegistry},
+    venues::VenueRegistry,
 };
 use anyhow::{Context, Result, ensure};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -39,11 +39,77 @@ pub enum Strategy {
     BasisReversion,
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PaperMode {
+    #[default]
+    PairHedge,
+    /// Apply session budgets to the same profitable entry signals.
+    Turnover {
+        #[serde(with = "rust_decimal::serde::str")]
+        max_turnover_quote: Decimal,
+        #[serde(with = "rust_decimal::serde::str")]
+        max_fees_quote: Decimal,
+    },
+}
+
+impl PaperMode {
+    fn is_pair_hedge(&self) -> bool {
+        matches!(self, Self::PairHedge)
+    }
+
+    fn remaining_budget(
+        self,
+        used_turnover: Decimal,
+        used_fees: Decimal,
+    ) -> Option<TurnoverBudget> {
+        let Self::Turnover {
+            max_turnover_quote,
+            max_fees_quote,
+        } = self
+        else {
+            return None;
+        };
+        Some(TurnoverBudget {
+            turnover: (max_turnover_quote - used_turnover).max(Decimal::ZERO),
+            fees: (max_fees_quote - used_fees).max(Decimal::ZERO),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TurnoverBudget {
+    turnover: Decimal,
+    fees: Decimal,
+}
+
+impl TurnoverBudget {
+    fn cap(self, size: Decimal, economics: &Economics) -> Decimal {
+        let turnover = economics.turnover_per_base();
+        let mut cap = size;
+        if turnover * size > self.turnover {
+            cap = cap.min(self.turnover / turnover);
+        }
+        if economics.fees * size > self.fees {
+            cap = cap.min(self.fees / economics.fees);
+        }
+        cap
+    }
+}
+
+#[derive(Default)]
+struct EntryOptions<'a> {
+    turnover_budget: Option<TurnoverBudget>,
+    best_edge_bps: Option<&'a mut Option<Decimal>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
     pub asset_class: AssetClass,
     pub strategy: Strategy,
+    #[serde(default, skip_serializing_if = "PaperMode::is_pair_hedge")]
+    pub mode: PaperMode,
     pub legs: [MarketTerms; 2],
     #[serde(default)]
     pub planner: PlannerConfig,
@@ -384,6 +450,8 @@ pub enum Rejection {
     Capacity,
     #[error("conservative net edge is below threshold")]
     Edge,
+    #[error("no profitable common lot fits the remaining turnover and fee budget")]
+    TurnoverBudget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -406,11 +474,13 @@ pub enum EntryGate {
     BasisBelowEntry,
     BasisBeyondStop,
     EntryWindow,
+    FundingNoCredit,
     FundingForecast,
     Capacity,
     NetEdge,
     LatencyWindow,
     FundingGuard,
+    TurnoverBudget,
 }
 
 impl EntryGate {
@@ -434,7 +504,8 @@ impl EntryGate {
             Self::BasisBelowEntry | Self::BasisBeyondStop => Rejection::BasisBand,
             Self::FundingForecast | Self::FundingGuard => Rejection::Funding,
             Self::Capacity => Rejection::Capacity,
-            Self::NetEdge => Rejection::Edge,
+            Self::TurnoverBudget => Rejection::TurnoverBudget,
+            Self::FundingNoCredit | Self::NetEdge => Rejection::Edge,
         }
     }
 
@@ -491,6 +562,11 @@ pub struct Plan {
     pub net_edge: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub net_edge_bps: Decimal,
+    /// Turnover and fees at the four modeled IOC limits.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub modeled_turnover_quote: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub modeled_fees_quote: Decimal,
     pub hold_until_ms: u64,
     pub unwind_until_ms: u64,
     pub hedge: HedgePlan,
@@ -579,6 +655,18 @@ impl PairConfig {
 
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
         self.planner.validate()?;
+        if let PaperMode::Turnover {
+            max_turnover_quote,
+            max_fees_quote,
+        } = self.mode
+        {
+            ensure!(
+                max_turnover_quote > Decimal::ZERO
+                    && bounded(max_turnover_quote)
+                    && bounded(max_fees_quote),
+                "invalid turnover or fee budget"
+            );
+        }
         ensure!(
             self.planner.max_base_quantity <= 1e9
                 && self.planner.max_leg_notional_usd <= 1e9
@@ -623,8 +711,8 @@ impl PairConfig {
         for leg in &self.legs {
             let venue = registry.get(&leg.venue)?;
             ensure!(
-                !matches!(venue.order_support, OrderSupport::ReadOnly),
-                "{} has no executable order book adapter",
+                venue.has_order_book(),
+                "{} has no limit order book for paper execution",
                 leg.venue
             );
             if let Some(dex) = &venue.hyperliquid_dex {
@@ -1027,9 +1115,16 @@ impl RelativeValue {
     /// Feed every frame in availability order, including frames during holds,
     /// so the next trade's baseline is fit on observations available then.
     pub fn observe(&mut self, frame: &Frame) -> Result<Decision<Plan>> {
+        let options = EntryOptions {
+            turnover_budget: self
+                .config
+                .mode
+                .remaining_budget(Decimal::ZERO, Decimal::ZERO),
+            ..Default::default()
+        };
         Ok(self
             .sample(frame)?
-            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff, 0, None))
+            .and_then(|(signal, cutoff)| self.plan(frame, signal, cutoff, 0, options))
             .map_err(|blocked| blocked.gate.rejection()))
     }
 
@@ -1101,7 +1196,7 @@ impl RelativeValue {
         signal: BasisSignal,
         cutoff: u64,
         funding_guard_ms: u64,
-        mut best_edge_bps: Option<&mut Option<Decimal>>,
+        mut options: EntryOptions<'_>,
     ) -> EntryDecision<Plan> {
         let now = frame.now_ms;
         let max_hold = now
@@ -1109,7 +1204,7 @@ impl RelativeValue {
             .ok_or(EntryGate::Session)?;
         let mut depth = None;
         if self.config.strategy != Strategy::FundingCarry || !self.config.optimize_funding_horizon {
-            return self.plan_for_hold(frame, signal, max_hold, cutoff, &mut depth, best_edge_bps);
+            return self.plan_for_hold(frame, signal, max_hold, cutoff, &mut depth, &mut options);
         }
         let max_hold = max_hold.min(
             cutoff
@@ -1124,7 +1219,7 @@ impl RelativeValue {
             .checked_sub(after_payment)
             .filter(|last| *last > now)
         else {
-            return Err(EntryGate::NetEdge.into());
+            return Err(EntryGate::FundingNoCredit.into());
         };
         let mut holds = Vec::new();
         for (i, leg) in self.config.legs.iter().enumerate() {
@@ -1142,14 +1237,7 @@ impl RelativeValue {
         let mut best: Option<Plan> = None;
         let mut rejection: Option<BlockedEntry> = None;
         for hold in holds {
-            match self.plan_for_hold(
-                frame,
-                signal,
-                hold,
-                cutoff,
-                &mut depth,
-                best_edge_bps.as_deref_mut(),
-            ) {
+            match self.plan_for_hold(frame, signal, hold, cutoff, &mut depth, &mut options) {
                 Ok(plan)
                     if best
                         .as_ref()
@@ -1169,7 +1257,7 @@ impl RelativeValue {
                 }
             }
         }
-        best.ok_or_else(|| rejection.unwrap_or_else(|| EntryGate::NetEdge.into()))
+        best.ok_or_else(|| rejection.unwrap_or_else(|| EntryGate::FundingNoCredit.into()))
     }
 
     fn plan_for_hold(
@@ -1179,7 +1267,7 @@ impl RelativeValue {
         hold_until: u64,
         cutoff: u64,
         depth: &mut Option<[[Depth; 2]; 2]>,
-        mut best_edge_bps: Option<&mut Option<Decimal>>,
+        options: &mut EntryOptions<'_>,
     ) -> EntryDecision<Plan> {
         let now = frame.now_ms;
         let unwind_until = hold_until
@@ -1265,7 +1353,11 @@ impl RelativeValue {
             })
         });
         let mut best: Option<Plan> = None;
-        let mut rejected = Rejection::Capacity;
+        let mut rejected = if self.config.strategy == Strategy::FundingCarry {
+            EntryGate::FundingNoCredit
+        } else {
+            EntryGate::Capacity
+        };
         for buy_leg in 0..2 {
             if self.config.strategy == Strategy::BasisReversion
                 && (buy_leg == 0) != (signal.z > 0.0)
@@ -1277,7 +1369,6 @@ impl RelativeValue {
                 .funding_bound(frame, buy_leg, window)
                 .map_err(|_| EntryGate::FundingForecast)?;
             if self.config.strategy == Strategy::FundingCarry && funding <= Decimal::ZERO {
-                rejected = Rejection::Edge;
                 continue;
             }
             let score = Score {
@@ -1288,7 +1379,7 @@ impl RelativeValue {
                 reserve,
                 window,
             };
-            match self.size_plan(frame, depth, score, best_edge_bps.as_deref_mut()) {
+            match self.size_plan(frame, depth, score, options) {
                 Ok(plan)
                     if best
                         .as_ref()
@@ -1297,13 +1388,17 @@ impl RelativeValue {
                     best = Some(plan);
                 }
                 Ok(_) => {}
-                Err(reason) => rejected = rejected.max(reason),
+                Err(reason) => {
+                    let gate = match reason {
+                        Rejection::Edge => EntryGate::NetEdge,
+                        Rejection::TurnoverBudget => EntryGate::TurnoverBudget,
+                        _ => EntryGate::Capacity,
+                    };
+                    rejected = rejected.max(gate);
+                }
             }
         }
-        best.ok_or_else(|| match rejected {
-            Rejection::Edge => EntryGate::NetEdge.into(),
-            _ => EntryGate::Capacity.into(),
-        })
+        best.ok_or_else(|| rejected.into())
     }
 
     fn funding_bound(&self, frame: &Frame, buy_leg: usize, window: [u64; 3]) -> Decision<Decimal> {
@@ -1370,7 +1465,7 @@ impl RelativeValue {
         frame: &Frame,
         depth: &[[Depth; 2]; 2],
         score: Score,
-        mut best_edge_bps: Option<&mut Option<Decimal>>,
+        options: &mut EntryOptions<'_>,
     ) -> Decision<Plan> {
         let mut cap = self.rules.max_base;
         for curve in depth.iter().flatten() {
@@ -1393,6 +1488,7 @@ impl RelativeValue {
         );
         let mut best: Option<(Decimal, Economics)> = None;
         let mut sized = false;
+        let mut budget_blocked = false;
         let mids = frame.legs.each_ref().map(|leg| leg.book.mid());
         let days = Decimal::from(score.window[2] - frame.now_ms) / Decimal::from(DAY_MS);
         let budget = frame
@@ -1405,6 +1501,14 @@ impl RelativeValue {
                 .max(frame.reference.price)
                 .max(frame.legs[i].oracle.price)
         };
+        let fits = |qty: Decimal, econ: &Economics| {
+            (0..2).all(|i| {
+                qty * risk_price(i, econ) <= budget[i]
+                    && qty >= self.config.legs[i].min_base(econ.entry_limits[i])
+                    && qty >= self.config.legs[i].min_base(econ.exit_limits[i])
+            })
+        };
+        let net_bps = |net| net / frame.reference.price * BPS;
         for candidate in candidates {
             let mut qty = floor_step(candidate, self.step).map_err(|_| Rejection::Capacity)?;
             if qty <= Decimal::ZERO {
@@ -1421,33 +1525,49 @@ impl RelativeValue {
                 }
                 econ = self.economics(depth, score, qty, mids, days)?;
             }
-            if (0..2).any(|i| {
-                qty * risk_price(i, &econ) > budget[i]
-                    || qty < self.config.legs[i].min_base(econ.entry_limits[i])
-                    || qty < self.config.legs[i].min_base(econ.exit_limits[i])
-            }) {
+            if !fits(qty, &econ) {
                 continue;
             }
             sized = true;
-            let net = econ.net(score);
-            let net_bps = if net > Decimal::ZERO || best_edge_bps.is_some() {
-                net / frame.reference.price * BPS
-            } else {
-                Decimal::ZERO
-            };
-            if let Some(best) = best_edge_bps.as_deref_mut() {
-                *best = Some(best.map_or(net_bps, |previous| previous.max(net_bps)));
+            let mut net = econ.net(score);
+            if let Some(best) = options.best_edge_bps.as_deref_mut() {
+                let edge = net_bps(net);
+                *best = Some(best.map_or(edge, |previous| previous.max(edge)));
             }
-            if net > Decimal::ZERO
-                && net_bps >= self.rules.min_edge
-                && best
-                    .as_ref()
-                    .is_none_or(|(previous, old)| net * qty > old.net(score) * previous)
+            if net <= Decimal::ZERO || net_bps(net) < self.rules.min_edge {
+                continue;
+            }
+            if let Some(limit) = options.turnover_budget {
+                let affordable = limit.cap(qty, &econ);
+                if affordable < qty {
+                    qty = floor_step(affordable, self.step).map_err(|_| Rejection::Capacity)?;
+                    if qty <= Decimal::ZERO {
+                        budget_blocked = true;
+                        continue;
+                    }
+                    econ = self.economics(depth, score, qty, mids, days)?;
+                    // Repricing can cross a depth band. Check its exact costs
+                    // again; the smaller band's boundary is also enumerated.
+                    if !fits(qty, &econ) || limit.cap(qty, &econ) < qty {
+                        budget_blocked = true;
+                        continue;
+                    }
+                    net = econ.net(score);
+                    if net <= Decimal::ZERO || net_bps(net) < self.rules.min_edge {
+                        continue;
+                    }
+                }
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(previous, old)| net * qty > old.net(score) * previous)
             {
                 best = Some((qty, econ));
             }
         }
-        let (qty, econ) = best.ok_or(if sized {
+        let (qty, econ) = best.ok_or(if budget_blocked {
+            Rejection::TurnoverBudget
+        } else if sized {
             Rejection::Edge
         } else {
             Rejection::Capacity
@@ -1476,6 +1596,8 @@ impl RelativeValue {
             capital_charge: econ.capital * qty,
             net_edge: net * qty,
             net_edge_bps: net / frame.reference.price * BPS,
+            modeled_turnover_quote: econ.turnover_per_base() * qty,
+            modeled_fees_quote: econ.fees * qty,
             hold_until_ms: score.window[1],
             unwind_until_ms: score.window[2],
             hedge,
@@ -1499,8 +1621,11 @@ impl RelativeValue {
             let sign = if is_buy { Decimal::ONE } else { -Decimal::ONE };
             econ.entry_limits[i] = entry_limit;
             econ.exit_limits[i] = exit_limit;
-            econ.entry += sign * (entry_limit - mid[i]) + entry_limit * fee;
-            econ.exit += sign * (mid[i] - exit_limit) + exit_limit * fee;
+            let entry_fee = entry_limit * fee;
+            let exit_fee = exit_limit * fee;
+            econ.entry += sign * (entry_limit - mid[i]) + entry_fee;
+            econ.exit += sign * (mid[i] - exit_limit) + exit_fee;
+            econ.fees += entry_fee + exit_fee;
             econ.capital += entry_limit.max(exit_limit) * self.rules.capital_charge * days;
         }
         Ok(econ)
@@ -1568,10 +1693,15 @@ struct Economics {
     exit_limits: [Decimal; 2],
     entry: Decimal,
     exit: Decimal,
+    fees: Decimal,
     capital: Decimal,
 }
 
 impl Economics {
+    fn turnover_per_base(&self) -> Decimal {
+        self.entry_limits.iter().chain(&self.exit_limits).sum()
+    }
+
     fn net(&self, score: Score) -> Decimal {
         score.mean_reversion + score.funding - self.entry - self.exit - score.reserve - self.capital
     }

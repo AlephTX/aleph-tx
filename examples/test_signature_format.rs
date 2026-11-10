@@ -1,13 +1,13 @@
 use sha3::{Digest, Keccak256};
-use starknet_crypto::{Felt, sign};
+use starknet_crypto::{Felt, rfc6979_generate_k, sign};
 
 fn main() {
-    let private_key_hex = "REDACTED_PRIVATE_KEY";
+    // Deterministic fixture key for this offline example.
+    let private_key_hex = "0x1";
     let private_key = Felt::from_hex(private_key_hex).expect("Invalid private key");
 
     // Test message
-    let message =
-        "1772894985474GET/api/v1/private/account/getAccountAssetaccountId=0";
+    let message = "1772894985474GET/api/v1/private/account/getAccountAssetaccountId=1";
 
     // Hash with Keccak256
     let mut hasher = Keccak256::new();
@@ -25,7 +25,8 @@ fn main() {
     println!("Felt as bytes: {:?}", &hash_felt.to_bytes_be()[..8]);
 
     // Sign
-    let signature = sign(&private_key, &hash_felt, &Felt::from_hex("0x1").unwrap()).unwrap();
+    let nonce = rfc6979_generate_k(&hash_felt, &private_key, None);
+    let signature = sign(&private_key, &hash_felt, &nonce).unwrap();
 
     println!("\nSignature r: 0x{:064x}", signature.r);
     println!("Signature s: 0x{:064x}", signature.s);

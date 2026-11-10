@@ -142,15 +142,11 @@ async fn main() -> Result<()> {
         [flag, path] if flag == "--check" => {
             let profile = session::Profile::load(Path::new(path))?;
             println!(
-                "Configuration OK: {:?} Lighter {} market {}, Hyperliquid hedge {}",
+                "Configuration OK: {:?} Lighter {} market {}, strategy_mode={}",
                 profile.network,
                 profile.symbol,
                 profile.strategy.market_id,
-                if profile.has_hedge() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                profile.strategy_mode()
             );
             Ok(())
         }

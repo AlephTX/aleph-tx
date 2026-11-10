@@ -322,6 +322,69 @@ fn forecast_expires_at_the_payment_and_never_reads_settlement_as_prediction() {
 }
 
 #[test]
+fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
+    let mut config = config();
+    for (terms, venue) in config.pair.legs.iter_mut().zip(["arcus", "bulk"]) {
+        terms.venue = venue.into();
+        terms.market = "ETH-USD".into();
+    }
+    for leg in &mut config.legs {
+        leg.lighter_market_id = None;
+        leg.external_oracle = false;
+        leg.accept_receipt_time_for_oracle = false;
+        leg.funding = None;
+    }
+    config.legs[0].archived_contexts = vec![ArchivedMarketContext {
+        market: "ETH-USD".into(),
+        available_at_ms: T + 200,
+        oracle: Oracle {
+            price: Decimal::from(2000),
+            timestamp_ms: T + 50,
+            mode: OracleMode::LiveExternal,
+        },
+        forecast: None,
+    }];
+    let arcus = |at: u64, time: u64| {
+        row(
+            "arcus_snapshot",
+            at,
+            json!({"market":"ETH-USD","data":{"timestamp":time*1000+123,
+                "bids":[["1999.9","4.5"]],"asks":[["2000.1","5.25"]]}}),
+        )
+    };
+    let bulk = |at: u64, time: u64, symbol: &str| {
+        row(
+            "bulk_snapshot",
+            at,
+            json!({"market":"ETH-USD","data":{"symbol":symbol,"updateType":"snapshot",
+                "timestamp":time*1_000_000+712_345,
+                "levels":[[{"px":1999.8,"sz":4.25}],[{"px":2000.2,"sz":5.5}]]}}),
+        )
+    };
+    let rows = [
+        arcus(T, T - 3),
+        bulk(T, T - 2, "ETH-USD"),
+        bulk(T + 100, T + 99, "BTC-USD"),
+        bulk(T + 200, T - 2, "ETH-USD"),
+        bulk(T + 300, T + 299, "ETH-USD"),
+        arcus(T + 400, T + 420),
+        footer(T + 500),
+    ];
+    let (coverage, frames) = replay(&config, &rows);
+    assert_eq!(coverage.leg_snapshot_updates, [1, 2]);
+    assert_eq!(coverage.rejected_publications, [0, 1]);
+    assert_eq!(coverage.clock_rejections, [1, 0]);
+    assert_eq!(frames[0]["legs"][0]["book"]["timestamp_ms"], T - 3);
+    assert_eq!(frames[0]["legs"][1]["book"]["timestamp_ms"], T - 2);
+    assert_eq!(frames[0]["legs"][1]["book"]["bids"][0]["price"], "1999.8");
+    assert_eq!(frames[1]["legs"][0]["oracle"]["timestamp_ms"], 0);
+    assert_eq!(frames[2]["legs"][0]["oracle"]["timestamp_ms"], T + 50);
+    assert_eq!(frames[2]["legs"][1]["book"]["timestamp_ms"], 0);
+    assert_eq!(frames[3]["legs"][1]["book"]["timestamp_ms"], T + 299);
+    assert_eq!(frames[4]["legs"][0]["book"]["timestamp_ms"], 0);
+}
+
+#[test]
 fn snapshot_selection_does_not_mix_transports_or_drop_the_rest_book_on_ws_gap() {
     let mut config = config();
     config.legs[1].use_hyperliquid_snapshots = true;

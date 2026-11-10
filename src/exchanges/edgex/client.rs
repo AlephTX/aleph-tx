@@ -99,7 +99,6 @@ impl EdgeXClient {
 
         let path = "/api/v1/private/order/createOrder";
         let sign_payload = Self::build_sign_content(&timestamp, "POST", path, &body_val);
-        tracing::debug!("CreateOrder Sign Payload: {}", sign_payload);
 
         let header_signature = self.signature_manager.sign_message(&sign_payload)?;
 
@@ -202,7 +201,7 @@ impl EdgeXClient {
         let path = "/api/v1/private/order/cancelAllOrder";
 
         let sign_payload = Self::build_sign_content(&timestamp, "POST", path, &body_val);
-        tracing::debug!("CancelAllOrder Sign Payload: {}", sign_payload);
+
         let header_signature = self.signature_manager.sign_message(&sign_payload)?;
 
         let mut headers = HeaderMap::new();
@@ -251,9 +250,8 @@ impl EdgeXClient {
             .to_string();
 
         let sign_payload = format!("{}GET{}{}", timestamp, path, query_str);
-        tracing::info!("GET Sign Payload: {}", sign_payload);
+
         let header_signature = self.signature_manager.sign_message(&sign_payload)?;
-        tracing::info!("GET Signature: {}", header_signature);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -496,7 +494,6 @@ impl EdgeXClient {
             let target = data.get("dataList").unwrap_or(data);
             let fills: Vec<crate::edgex_api::model::Fill> = serde_json::from_value(target.clone())
                 .unwrap_or_else(|e| {
-                    tracing::error!("EDGEX RAW: {}", target);
                     tracing::error!("EdgeX serde error: {}", e);
                     vec![]
                 });

@@ -47,7 +47,7 @@ fn main() {
 
     // Test packed_message1
     let limit_order_type = 3u64;
-    let account_id = 0u64;
+    let account_id = 0x0102_0304_0506_0708u64;
     let expire_time = 493911u64;
 
     let mut pm1 = BigUint::from(limit_order_type);
