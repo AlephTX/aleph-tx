@@ -1019,6 +1019,45 @@ fn cleanup_commit_is_atomic_and_preserves_risk_when_epoch_changed() {
 }
 
 #[test]
+fn late_fills_cannot_change_the_rebased_position_even_after_order_gc() {
+    let tracker = make_tracker();
+    assert!(tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.1));
+    assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.0));
+    let mut late =
+        ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, 0.1, 0.0, -0.01, false, 0, 99);
+    tracker.apply_event(&late).unwrap();
+    assert_eq!(tracker.confirmed_position(), 0.0);
+    assert_eq!(tracker.total_fill_stats(), (0, 0.0));
+    assert!(tracker.needs_reconciliation());
+    assert_eq!(tracker.recovery_cois(), BTreeSet::from([1]));
+    let epoch = tracker.reconciliation_epoch();
+    assert!(!tracker.confirm_cleanup(epoch, 0.0));
+    assert!(!tracker.clear_reconciliation_if_epoch(epoch));
+    assert!(!tracker.confirm_recovered_flat(epoch, &BTreeSet::new()));
+    let proven = BTreeSet::from([1]);
+    assert!(tracker.confirm_recovered_flat(epoch, &proven));
+
+    tracker.gc_completed_orders(Duration::ZERO);
+    late.sequence = 1;
+    tracker.apply_event(&late).unwrap();
+    assert!(tracker.needs_reconciliation());
+    assert_eq!(tracker.worst_case_long(), 0.0);
+    assert!(!tracker.confirm_recovered_flat(epoch, &proven));
+    assert!(tracker.confirm_recovered_flat(tracker.reconciliation_epoch(), &proven));
+
+    // A current order still credits each fill exactly once, even before ACK.
+    assert!(tracker.start_tracking(2, OrderSide::Buy, 100.0, 0.1));
+    let mut fill =
+        ShmPrivateEventV2::order_filled(2, 2, 1, 20, 2, 20, 100.0, 0.1, 0.0, -0.01, false, 0, 100);
+    tracker.apply_event(&fill).unwrap();
+    fill.sequence = 3;
+    tracker.apply_event(&fill).unwrap();
+    assert!(!tracker.needs_reconciliation());
+    assert_eq!(tracker.confirmed_position(), 0.1);
+    assert_eq!(tracker.total_fill_stats(), (1, -0.01));
+}
+
+#[test]
 fn recent_fill_ring_exposes_side_price_and_sequence() {
     let tracker = OrderTracker::new();
     assert!(tracker.fill_at(0).is_none());

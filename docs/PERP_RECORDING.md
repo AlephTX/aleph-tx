@@ -3,7 +3,7 @@
 AlephTX can record Lighter L2 and market statistics, Hyperliquid core and
 HIP-3 L2 and asset contexts, and Coinbase spot ticker quotes. The collector
 writes public messages with their local receipt and availability times.
-Arcus and BULK REST snapshots can join the same recording.
+Arcus and BULK WebSocket books and REST snapshots can join the same recording.
 The compiler preserves the exchange publication time for books and joins only
 observations available at the replay clock. Both tools run without trading keys.
 
@@ -56,33 +56,39 @@ oracle before using the capture for paper entries.
 
 ## Four-venue pair recordings
 
-Record both HIP-3 books and the two REST venues to the same file so every
+Record all four WebSocket books to the same file so every
 pair is evaluated against the same arrival clock.
 
 ```sh
 mkdir -p recordings
 feeder/perp-capture -hyperliquid io:NVDA,xyz:NVDA -hl-snapshot-interval 1s \
-  -arcus NVDA-USD -bulk NVDA-USD -duration 2m \
+  -arcus-ws NVDA-USD -bulk-ws NVDA-USD -duration 2m \
   -output recordings/nvda-four-venues-raw.ndjson
 target/release/cross_venue perp-compile examples/arcus_bulk_nvda_capture.json \
   recordings/nvda-four-venues-raw.ndjson recordings/nvda-arcus-bulk.ndjson
 target/release/cross_venue perp-replay recordings/nvda-arcus-bulk.ndjson
 ```
 
-The Arcus and BULK flags request up to 20 unaggregated levels per side.
-The default poll interval is one second, with up to four markets per venue.
-Each record retains the requested market, original response and local
-receipt and availability times. The compiler converts Arcus epoch
-microseconds and BULK epoch nanoseconds or milliseconds to milliseconds.
-It rejects future or mismatched publications and requires publication
-time to advance after a transport error.
-[Arcus L2](https://docs.arcus.xyz/api-reference/public/get-l2-orderbook-snapshot),
-[BULK L2](https://docs.bulk.trade/api-reference/getL2Book).
+The WebSocket flags subscribe to Arcus `l2Orderbook` and BULK `l2Snapshot`,
+each with up to 20 unaggregated levels per side. The existing `-arcus` and
+`-bulk` flags still record one-second REST snapshots for up to four markets
+per venue. Use both flags for a venue to compare transports on one arrival
+clock. Each record preserves the original publication and its receipt and
+availability times. The compiler converts Arcus epoch microseconds and
+BULK epoch nanoseconds or milliseconds to milliseconds. It rejects future
+or mismatched publications. A disconnect invalidates the active book from
+that transport, and the next book must advance the publication time.
+[Arcus L2](https://docs.arcus.xyz/api-reference/public/get-l2-orderbook-snapshot) ·
+[BULK WebSocket L2](https://docs.bulk.trade/api-reference/ws-market-data)
 
 Compile the same recording with a separate configuration for each pair.
 Select the native symbols `io:NVDA`, `xyz:NVDA` or `NVDA-USD` on the
-corresponding venue. Set `hyperliquid_book_mode` to `freshest` only on HIP-3
-legs when recording both Hyperliquid transports. Review contract identity,
+corresponding venue. Arcus and BULK default to `freshest`. Set a leg's
+`book_mode` to `websocket` or `snapshot` to measure either transport
+independently. The same field works on Hyperliquid and HIP-3 legs, where
+WebSocket remains the default. Existing `hyperliquid_book_mode` and
+`use_hyperliquid_snapshots` profiles remain valid. Set one transport policy
+per leg. Review contract identity,
 tick, lot, fees, settlement and funding schedule on both legs before enabling
 `paper_entries`. The checked-in example measures coverage with zero order
 capacity and uses placeholder settlement and funding terms. A pair with Entropy and TradeXYZ also requires

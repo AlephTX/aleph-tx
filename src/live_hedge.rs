@@ -10,7 +10,7 @@ use crate::exchanges::hyperliquid::{
     HyperliquidSigner, HyperliquidTrading, LocatedOrder, Network, OrderAction, OrderLookup,
     OrderWire, PerpMarket, PerpOrder, TimeInForce,
 };
-use crate::lighter_trading::LighterTrading;
+use crate::lighter_trading::{LighterTrading, PositionEvidence};
 use anyhow::{Context, Result, bail, ensure};
 use journal::{IntentRecord, JournalRecord, PrimaryObservation, TerminalRecord};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -19,6 +19,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 const POLL: Duration = Duration::from_secs(1);
 const MAX_BLOCKED: Duration = Duration::from_secs(20);
@@ -123,9 +124,35 @@ struct Observation {
     /// Local start of the Lighter position request this value came from.
     primary_requested_at: Instant,
     /// The full Lighter read behind `primary`, journaled with any intent.
-    primary_evidence: crate::lighter_trading::PositionEvidence,
+    primary_evidence: PositionEvidence,
     hedge: Decimal,
     book: BestBidAsk,
+}
+
+struct VenueSnapshot {
+    primary: PositionEvidence,
+    account: AccountState,
+    book: BestBidAsk,
+}
+
+impl VenueSnapshot {
+    async fn read(
+        primary: &LighterTrading,
+        info: &HyperliquidInfo,
+        account: &str,
+        symbol: &str,
+    ) -> Result<Self> {
+        let (primary, account, book) = tokio::try_join!(
+            primary.position_evidence(),
+            info.account_state(account),
+            info.bbo(symbol),
+        )?;
+        Ok(Self {
+            primary,
+            account,
+            book,
+        })
+    }
 }
 
 struct PendingIoc {
@@ -285,6 +312,7 @@ pub struct LiveInventoryHedge {
     pending: Option<PendingIoc>,
     journal: File,
     last_poll: Option<Instant>,
+    quote_poll: Option<JoinHandle<Result<VenueSnapshot>>>,
     last_rebalance: Option<Instant>,
     allowance: Option<QuoteAllowance>,
     blocked_since: Option<Instant>,
@@ -372,6 +400,7 @@ impl LiveInventoryHedge {
             pending: None,
             journal,
             last_poll: None,
+            quote_poll: None,
             last_rebalance: None,
             allowance: None,
             blocked_since: None,
@@ -388,18 +417,52 @@ impl LiveInventoryHedge {
             .filter(|left| !left.is_zero())
     }
 
-    pub(crate) async fn poll(&mut self) -> Result<()> {
-        if self.last_poll.is_some_and(|time| time.elapsed() < POLL) {
-            return Ok(());
+    /// Drive a single read-only request without awaiting venue I/O in the
+    /// quote loop. A previous allowance survives only until its own deadline.
+    /// Returns whether a read is in flight.
+    pub(crate) async fn poll(&mut self) -> Result<bool> {
+        if self
+            .quote_poll
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            let task = self.quote_poll.take().expect("finished quote poll");
+            self.allowance = None;
+            let snapshot = task
+                .await
+                .context("Hedge quote observation task failed")??;
+            self.update_allowance(snapshot)?;
+            return Ok(false);
         }
-        self.last_poll = Some(Instant::now());
-        self.allowance = None;
-        if let Some(observed) = self.observe(false).await?
+        if self.quote_poll.is_none()
+            && self.pending.is_none()
+            && self.last_poll.is_none_or(|time| time.elapsed() >= POLL)
+        {
+            let primary = Arc::clone(&self.primary);
+            let info = self.info.clone();
+            let account = self.account.clone();
+            let symbol = self.market.asset.name.clone();
+            self.last_poll = Some(Instant::now());
+            self.quote_poll = Some(tokio::spawn(async move {
+                VenueSnapshot::read(&primary, &info, &account, &symbol).await
+            }));
+        }
+        Ok(self.quote_poll.is_some())
+    }
+
+    fn update_allowance(&mut self, snapshot: VenueSnapshot) -> Result<()> {
+        let account_time_ms = snapshot.account.time;
+        if let Some(observed) = self.accept_snapshot(snapshot, false)?
             && (observed.primary + observed.hedge).abs() <= self.limits.deadband_base
             && self
                 .primary_validity(observed.primary_requested_at)
                 .is_some()
         {
+            let now_ms = unix_ms()?;
+            let book_remaining =
+                MAX_QUOTE_AGE_MS.saturating_sub(now_ms.saturating_sub(observed.book.timestamp_ms));
+            let account_remaining =
+                MAX_ACCOUNT_AGE_MS.saturating_sub(now_ms.saturating_sub(account_time_ms));
             let fee = self.limits.taker_fee_bps / 10_000.0;
             let sell_limit = hedge_price_limit(observed.book.bid, self.limits.slippage_bps, false)?
                 .to_f64()
@@ -423,13 +486,9 @@ impl LiveInventoryHedge {
                     .max_unhedged_base
                     .to_f64()
                     .context("Invalid net exposure cap")?,
-                // Never outlive the book or the Lighter position behind it;
-                // the primary deadline is absolute, from its request start.
+                // The deadline is bounded by every observation used to quote.
                 expires: (Instant::now()
-                    + (POLL * 2)
-                        .min(Duration::from_millis(MAX_QUOTE_AGE_MS.saturating_sub(
-                            unix_ms()?.saturating_sub(observed.book.timestamp_ms),
-                        ))))
+                    + (POLL * 2).min(Duration::from_millis(book_remaining.min(account_remaining))))
                 .min(observed.primary_requested_at + self.max_primary_age),
             });
         }
@@ -458,6 +517,10 @@ impl LiveInventoryHedge {
     }
 
     pub(crate) async fn rebalance(&mut self) -> Result<()> {
+        ensure!(
+            self.quote_poll.is_none(),
+            "Hedge rebalance requires the quote observation to finish"
+        );
         if self
             .last_rebalance
             .is_some_and(|time| time.elapsed() < POLL)
@@ -474,6 +537,7 @@ impl LiveInventoryHedge {
 
     /// Called only after Lighter's own cleanup has confirmed canceled orders.
     pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.stop_quote_poll();
         // Allow terminal lookups and account snapshots time to converge.
         let deadline = Instant::now() + FINISH_DEADLINE;
         while Instant::now() < deadline {
@@ -498,11 +562,25 @@ impl LiveInventoryHedge {
 
     async fn observe(&mut self, closing: bool) -> Result<Option<Observation>> {
         self.refresh_terminal().await?;
-        let (primary_evidence, state, book) = tokio::try_join!(
-            self.primary.position_evidence(),
-            self.info.account_state(&self.account),
-            self.info.bbo(&self.market.asset.name),
-        )?;
+        let snapshot = VenueSnapshot::read(
+            &self.primary,
+            &self.info,
+            &self.account,
+            &self.market.asset.name,
+        )
+        .await?;
+        self.accept_snapshot(snapshot, closing)
+    }
+
+    fn accept_snapshot(
+        &mut self,
+        VenueSnapshot {
+            primary: primary_evidence,
+            account: state,
+            book,
+        }: VenueSnapshot,
+        closing: bool,
+    ) -> Result<Option<Observation>> {
         let primary = primary_evidence.position;
         let now = unix_ms()?;
         ensure!(
@@ -579,6 +657,12 @@ impl LiveInventoryHedge {
             hedge,
             book,
         }))
+    }
+
+    fn stop_quote_poll(&mut self) {
+        if let Some(task) = self.quote_poll.take() {
+            task.abort();
+        }
     }
 
     fn hedge_position(&self, state: &AccountState) -> Result<Decimal> {
@@ -751,6 +835,12 @@ impl LiveInventoryHedge {
 /// an observation look younger than it was. Under the strict `age_us <
 /// max_age_us` rule an age inside the budget's last microsecond is
 /// rejected, never an expired one accepted.
+impl Drop for LiveInventoryHedge {
+    fn drop(&mut self) {
+        self.stop_quote_poll();
+    }
+}
+
 fn primary_observation(
     evidence: &crate::lighter_trading::PositionEvidence,
     max_age: Duration,
@@ -901,3 +991,5 @@ fn fresh(now: u64, timestamp: u64, max_age: u64) -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::DelayedVenue;

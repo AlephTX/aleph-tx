@@ -304,6 +304,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
         pending: None,
         journal,
         last_poll: None,
+        quote_poll: None,
         last_rebalance: None,
         allowance: None,
         blocked_since: None,
@@ -521,7 +522,7 @@ fn configured_limits_bound_each_leg_and_net_exposure() {
 /// Loopback venue for the stale-primary scenarios. Each Lighter account and
 /// Hyperliquid info reply waits for its configured delay; order posts are
 /// counted and answered as an empty fill.
-struct DelayedVenue {
+pub(crate) struct DelayedVenue {
     url: String,
     lighter_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     hyperliquid_delay_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -534,7 +535,7 @@ struct DelayedVenue {
 }
 
 impl DelayedVenue {
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -637,7 +638,10 @@ impl DelayedVenue {
         }
     }
 
-    fn hedge(&self, max_primary_age: Duration) -> (LiveInventoryHedge, std::path::PathBuf) {
+    pub(crate) fn hedge(
+        &self,
+        max_primary_age: Duration,
+    ) -> (LiveInventoryHedge, std::path::PathBuf) {
         use std::fs::OpenOptions;
         let journal_path =
             std::env::temp_dir().join(format!("aleph-stale-{}.jsonl", uuid::Uuid::new_v4()));
@@ -675,6 +679,7 @@ impl DelayedVenue {
             pending: None,
             journal,
             last_poll: None,
+            quote_poll: None,
             last_rebalance: None,
             allowance: None,
             blocked_since: None,
@@ -684,11 +689,28 @@ impl DelayedVenue {
         (hedge, journal_path)
     }
 
-    fn delays(&self, lighter_ms: u64, hyperliquid_ms: u64) {
+    pub(crate) fn delays(&self, lighter_ms: u64, hyperliquid_ms: u64) {
         use std::sync::atomic::Ordering;
         self.lighter_delay_ms.store(lighter_ms, Ordering::Release);
         self.hyperliquid_delay_ms
             .store(hyperliquid_ms, Ordering::Release);
+    }
+
+    pub(crate) fn primary_read_started(&self) -> bool {
+        self.lighter_seen.lock().is_some()
+    }
+}
+
+impl Drop for DelayedVenue {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn poll_to_completion(hedge: &mut LiveInventoryHedge) {
+    assert!(hedge.poll().await.unwrap());
+    while hedge.poll().await.unwrap() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -712,7 +734,7 @@ async fn stale_primary_observation_blocks_allowance_and_new_intents() {
     let limit = Duration::from_millis(200);
     venue.delays(0, 100);
     let before = Instant::now();
-    hedge.poll().await.unwrap();
+    poll_to_completion(&mut hedge).await;
     let after = Instant::now();
     let seen = venue.lighter_seen.lock().expect("Lighter request served");
     let allowance = hedge
@@ -735,7 +757,7 @@ async fn stale_primary_observation_blocks_allowance_and_new_intents() {
     // value is older than the limit when consumed.
     venue.delays(0, 300);
     hedge.last_poll = None;
-    hedge.poll().await.unwrap();
+    poll_to_completion(&mut hedge).await;
     assert!(hedge.allowance().is_none(), "slow Hyperliquid reply");
     // observe itself yields nothing, also when closing: finish() must not
     // read a stale zero as a flat Lighter leg.
@@ -748,12 +770,12 @@ async fn stale_primary_observation_blocks_allowance_and_new_intents() {
     // Lighter's own request is slow: request start, not receipt, counts.
     venue.delays(300, 0);
     hedge.last_poll = None;
-    hedge.poll().await.unwrap();
+    poll_to_completion(&mut hedge).await;
     assert!(hedge.allowance().is_none(), "slow Lighter request");
     // Just inside the limit still works.
     venue.delays(50, 50);
     hedge.last_poll = None;
-    hedge.poll().await.unwrap();
+    poll_to_completion(&mut hedge).await;
     assert!(hedge.allowance().is_some(), "within the limit");
     // An allowance never outlives its primary evidence.
     tokio::time::sleep(Duration::from_millis(220)).await;

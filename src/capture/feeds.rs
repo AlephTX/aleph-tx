@@ -1,4 +1,4 @@
-use super::{HyperliquidBookMode, LegConfig, LighterClockAudit};
+use super::{LegConfig, LighterClockAudit};
 use crate::strategy::relative_value::{Book, Level, MarketTerms, Oracle, OracleMode};
 use anyhow::{Context, Result, ensure};
 use rust_decimal::Decimal;
@@ -32,7 +32,7 @@ pub(super) struct LegFeed<'a> {
     depth: LighterDepth,
     book: Option<Book>,
     book_from_snapshot: bool,
-    latest_snapshot_book_ms: u64,
+    latest_full_book_ms: u64,
     context: Option<ContextTick>,
     lighter_clock: LighterClockAudit,
 }
@@ -46,7 +46,7 @@ impl<'a> LegFeed<'a> {
             depth: LighterDepth::default(),
             book: None,
             book_from_snapshot: false,
-            latest_snapshot_book_ms: 0,
+            latest_full_book_ms: 0,
             context: None,
             lighter_clock: LighterClockAudit::default(),
         }
@@ -55,12 +55,18 @@ impl<'a> LegFeed<'a> {
     pub fn accepts(&self, source: &str) -> bool {
         match self.venue.as_str() {
             "lighter" => source == "lighter",
-            "arcus" => source == "arcus_snapshot",
-            "bulk" => source == "bulk_snapshot",
+            "arcus" | "bulk" => {
+                let rest_venue = source.strip_suffix("_snapshot");
+                rest_venue.unwrap_or(source) == self.venue
+                    && self
+                        .config
+                        .book_mode(&self.venue)
+                        .includes(rest_venue.is_some())
+            }
             _ => {
                 source == "hyperliquid"
                     || (source == "hyperliquid_snapshot"
-                        && self.config.book_mode() != HyperliquidBookMode::Websocket)
+                        && self.config.book_mode(&self.venue).includes(true))
             }
         }
     }
@@ -76,16 +82,18 @@ impl<'a> LegFeed<'a> {
                 self.context = None;
                 self.lighter_clock = LighterClockAudit::default();
             }
-            "hyperliquid_snapshot" => self.invalidate_hyperliquid_book(true),
-            "arcus_snapshot" | "bulk_snapshot" => self.book = None,
+            "hyperliquid_snapshot" | "arcus_snapshot" | "bulk_snapshot" => {
+                self.invalidate_full_book(true)
+            }
+            "arcus" | "bulk" => self.invalidate_full_book(false),
             _ => {
                 self.context = None;
-                self.invalidate_hyperliquid_book(false);
+                self.invalidate_full_book(false);
             }
         }
     }
 
-    fn invalidate_hyperliquid_book(&mut self, snapshot: bool) {
+    fn invalidate_full_book(&mut self, snapshot: bool) {
         if self.book_from_snapshot == snapshot {
             self.book = None;
         }
@@ -118,8 +126,8 @@ impl<'a> LegFeed<'a> {
                     .context("missing Lighter ID")?;
                 self.apply_lighter(payload, received, request_sent, id)
             }
-            "arcus_snapshot" | "bulk_snapshot" => {
-                self.apply_rest_snapshot(payload, received, source)
+            "arcus" | "arcus_snapshot" | "bulk" | "bulk_snapshot" => {
+                self.apply_external_book(payload, received, source)
             }
             _ => self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot"),
         }
@@ -241,21 +249,17 @@ impl<'a> LegFeed<'a> {
         if data["coin"].as_str() != Some(self.market.as_str()) {
             return Ok(Change::Other);
         }
-        let use_book = match self.config.book_mode() {
-            HyperliquidBookMode::Websocket => !snapshot,
-            HyperliquidBookMode::Snapshot => snapshot,
-            HyperliquidBookMode::Freshest => true,
-        };
+        let use_book = self.config.book_mode(&self.venue).includes(snapshot);
         match payload["channel"].as_str().unwrap_or_default() {
             "l2Book" if use_book => {
                 let book = crate::exchanges::hyperliquid::L2Book::deserialize(data)?;
                 let Some(time) = self.source_time(book.time, received) else {
-                    self.invalidate_hyperliquid_book(snapshot);
+                    self.invalidate_full_book(snapshot);
                     return Ok(Change::Clock(book.time.saturating_sub(received)));
                 };
                 // Both transports use the exchange clock. Retain the last
                 // accepted publication time across transport failures.
-                if time <= self.latest_snapshot_book_ms {
+                if time <= self.latest_full_book_ms {
                     return Ok(Change::Other);
                 }
                 let [bids, asks] = book.levels.map(|levels| {
@@ -266,7 +270,7 @@ impl<'a> LegFeed<'a> {
                         .collect::<Result<Vec<_>>>()
                 });
                 self.set_book(time, bids?, asks?);
-                self.latest_snapshot_book_ms = time;
+                self.latest_full_book_ms = time;
                 self.book_from_snapshot = snapshot;
                 Ok(Change::Book)
             }
@@ -290,20 +294,42 @@ impl<'a> LegFeed<'a> {
         }
     }
 
-    fn apply_rest_snapshot(
+    fn apply_external_book(
         &mut self,
         payload: &Value,
         received: u64,
         source: &str,
     ) -> Result<Change> {
-        let requested = payload["market"]
-            .as_str()
-            .context("missing requested market")?;
-        if requested != self.market {
-            return Ok(Change::Other);
-        }
-        let data = &payload["data"];
-        let (raw_ms, bids, asks) = if source == "arcus_snapshot" {
+        let snapshot = source.ends_with("_snapshot");
+        let data = match source {
+            "arcus"
+                if payload["channel"] == "l2Orderbook"
+                    && matches!(
+                        payload["type"].as_str(),
+                        Some("subscribed" | "channel_data")
+                    )
+                    && payload["id"].as_str() == Some(self.market.as_str()) =>
+            {
+                &payload["contents"]
+            }
+            "bulk"
+                if payload["type"] == "l2Snapshot"
+                    && payload["data"]["book"]["symbol"].as_str() == Some(self.market.as_str()) =>
+            {
+                &payload["data"]["book"]
+            }
+            _ if snapshot => {
+                let requested = payload["market"]
+                    .as_str()
+                    .context("missing requested market")?;
+                if requested != self.market {
+                    return Ok(Change::Other);
+                }
+                &payload["data"]
+            }
+            _ => return Ok(Change::Other),
+        };
+        let (raw_ms, bids, asks) = if self.venue == "arcus" {
             #[derive(Deserialize)]
             struct ArcusSnapshot {
                 timestamp: u64,
@@ -340,17 +366,18 @@ impl<'a> LegFeed<'a> {
                 && bids.iter().chain(&asks).all(|level| {
                     level.price > Decimal::ZERO && level.contracts > Decimal::ZERO
                 }),
-            "invalid REST snapshot depth"
+            "invalid full book depth"
         );
         let Some(time) = self.source_time(raw_ms, received) else {
-            self.book = None;
+            self.invalidate_full_book(snapshot);
             return Ok(Change::Clock(raw_ms.saturating_sub(received)));
         };
-        if time <= self.latest_snapshot_book_ms {
+        if time <= self.latest_full_book_ms {
             return Ok(Change::Other);
         }
         self.set_book(time, bids, asks);
-        self.latest_snapshot_book_ms = time;
+        self.latest_full_book_ms = time;
+        self.book_from_snapshot = snapshot;
         Ok(Change::Book)
     }
 

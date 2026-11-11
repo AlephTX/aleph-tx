@@ -7,8 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"nhooyr.io/websocket"
 )
 
 func TestPublicRESTSnapshotsKeepRequestIdentityAndWireTime(t *testing.T) {
@@ -51,6 +55,77 @@ func TestPublicRESTSnapshotsKeepRequestIdentityAndWireTime(t *testing.T) {
 			})
 			if !errors.Is(err, stop) {
 				t.Fatalf("snapshot was not delivered: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublicWebSocketSnapshotsArchiveOnlyRequestedFullBooks(t *testing.T) {
+	sources, err := subscriptions("", "", "", "", "", "ETH-USD", "ETH-USD", 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("expected two WebSocket sources, got %d", len(sources))
+	}
+	fixtures := map[string]struct{ request, control, publication string }{
+		"arcus": {
+			`{"type":"subscribe","channel":"l2Orderbook","id":"ETH-USD","nLevels":20}`,
+			`{"type":"connected"}`,
+			`{"type":"subscribed","channel":"l2Orderbook","id":"ETH-USD","contents":{"timestamp":1794325133390000,"bids":[["1999","1"]],"asks":[["2001","1"]]}}`,
+		},
+		"bulk": {
+			`{"method":"subscribe","subscription":[{"type":"l2Snapshot","symbol":"ETH-USD","nlevels":20}]}`,
+			`{"type":"subscriptionResponse","topics":["l2snapshot.ETH-USD.20"]}`,
+			`{"type":"l2Snapshot","topic":"l2snapshot.ETH-USD.20","data":{"book":{"symbol":"ETH-USD","updateType":"snapshot","timestamp":1794325133390,"levels":[[{"px":1999,"sz":1}],[{"px":2001,"sz":1}]]}}}`,
+		},
+	}
+	stop := errors.New("received fixture")
+	for _, source := range sources {
+		t.Run(source.source, func(t *testing.T) {
+			fixture := fixtures[source.source]
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.CloseNow()
+				ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+				defer cancel()
+				_, request, err := conn.Read(ctx)
+				var got, want any
+				if err != nil || json.Unmarshal(request, &got) != nil ||
+					json.Unmarshal([]byte(fixture.request), &want) != nil || !reflect.DeepEqual(got, want) {
+					t.Errorf("unexpected %s subscription", source.source)
+					return
+				}
+				marketField := `"id"`
+				if source.source == "bulk" {
+					marketField = `"symbol"`
+				}
+				otherMarket := strings.ReplaceAll(fixture.publication,
+					marketField+`:"ETH-USD"`, marketField+`:"BTC-USD"`)
+				for _, message := range []string{fixture.control, otherMarket, fixture.publication} {
+					if err := conn.Write(ctx, websocket.MessageText, []byte(message)); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}))
+			defer server.Close()
+			source.url = "ws" + strings.TrimPrefix(server.URL, "http")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			err := connect(ctx, source, func(row record) error {
+				if row.Source != source.source || row.Event != "message" || row.ReceivedAt <= 0 ||
+					row.RequestSentAt != 0 || string(row.Payload) != fixture.publication {
+					t.Error("capture did not preserve the requested publication and receipt time")
+				}
+				return stop
+			})
+			if !errors.Is(err, stop) {
+				t.Fatalf("requested publication not delivered: %v", err)
 			}
 		})
 	}

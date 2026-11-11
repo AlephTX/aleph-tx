@@ -1,4 +1,4 @@
-//! REST-only shutdown after the private feed becomes unavailable.
+//! REST recovery with terminal-order and account position evidence.
 
 use super::*;
 use anyhow::{Context, ensure};
@@ -96,10 +96,12 @@ impl LighterTrading {
             .as_ref()
             .context("Shutdown recovery requires the order tracker")?;
         tracker.require_reconciliation();
-        let mut orders = tracker.active_cois().into_iter().collect::<BTreeSet<_>>();
+        let mut orders = BTreeSet::new();
         let mut canceled = BTreeSet::new();
         let mut closes = 0;
         for _ in 0..10 {
+            let epoch = tracker.reconciliation_epoch();
+            orders.extend(tracker.recovery_cois());
             let open = self.get_active_orders().await?;
             if !open.is_empty() {
                 orders.extend(open.iter().map(|order| order.client_order_index));
@@ -114,19 +116,22 @@ impl LighterTrading {
             } else if let Some(fill_time) = self.terminal_fill_time(&orders).await? {
                 let account = self.position_evidence().await?;
                 let position = account.position;
-                if account.covers(fill_time) {
+                if account.covers(fill_time) && tracker.reconciliation_epoch() == epoch {
                     if position.is_zero() {
-                        tracing::info!(
-                            "Lighter REST recovery confirmed zero position and terminal orders"
-                        );
-                        return Ok(());
+                        if tracker.confirm_recovered_flat(epoch, &orders) {
+                            tracing::info!(
+                                "Lighter REST recovery confirmed zero position and terminal orders"
+                            );
+                            return Ok(());
+                        }
+                    } else {
+                        ensure!(closes < 3, "Lighter REST recovery left residual inventory");
+                        let position: f64 = position.try_into()?;
+                        let touch = self.recovery_touch(position > 0.0).await?;
+                        let close = self.place_order(self.close_order(position, touch)?).await?;
+                        orders.insert(close.client_order_index);
+                        closes += 1;
                     }
-                    ensure!(closes < 3, "Lighter REST recovery left residual inventory");
-                    let position: f64 = position.try_into()?;
-                    let touch = self.recovery_touch(position > 0.0).await?;
-                    let close = self.place_order(self.close_order(position, touch)?).await?;
-                    orders.insert(close.client_order_index);
-                    closes += 1;
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -404,6 +409,13 @@ mod tests {
         trading.test_auth_token = Some("fixture-read-auth");
         let tracker = Arc::new(OrderTracker::new());
         assert!(tracker.start_tracking(123, TrackerSide::Buy, 2000.0, 0.02));
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.0));
+        tracker
+            .apply_event(&crate::types::ShmPrivateEventV2::order_filled(
+                0, 2, 1002, 1, 123, 1, 2000.0, 0.02, 0.0, 0.0, false, 0, 1,
+            ))
+            .unwrap();
+        assert!(tracker.has_late_fills());
         trading.set_order_tracker(Arc::clone(&tracker));
         let result = trading.recover_flat().await;
         server.abort();
@@ -420,7 +432,7 @@ mod tests {
     /// HTTP client timeout must not fire on a paused one (~6 s total).
     #[tokio::test]
     async fn recovery_waits_for_an_account_watermark_covering_the_fill() {
-        let (result, requests, _) = recover(vec![
+        let (result, requests, unreconciled) = recover(vec![
             account(Some(20), "0"),
             account(None, "0"),
             account(Some(29), "0"),
@@ -429,6 +441,7 @@ mod tests {
         .await;
         result.unwrap();
         assert_eq!(requests, 4, "succeeded before the covering snapshot");
+        assert!(!unreconciled);
         // Never covered: recovery gives up after its 10 rounds and the
         // tracker still requires reconciliation.
         let (result, requests, unreconciled) =

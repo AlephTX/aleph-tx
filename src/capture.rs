@@ -59,13 +59,14 @@ pub struct LegConfig {
     #[serde(default)]
     pub use_hyperliquid_snapshots: bool,
     pub hyperliquid_book_mode: Option<HyperliquidBookMode>,
+    pub book_mode: Option<BookMode>,
     /// An independently established upper bound on how far the source clock
     /// leads the recorder. Subtract it from every source publication time.
     #[serde(default)]
     pub source_clock_ahead_bound_ms: u64,
     pub lighter_clock: Option<LighterClockPolicy>,
     pub funding: Option<FundingRule>,
-    /// Causally archived context for Arcus or BULK REST book recordings.
+    /// Causally archived context for Arcus or BULK book recordings.
     #[serde(default)]
     pub archived_contexts: Vec<ArchivedMarketContext>,
 }
@@ -81,19 +82,34 @@ pub struct ArchivedMarketContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HyperliquidBookMode {
+pub enum BookMode {
     Websocket,
     Snapshot,
     Freshest,
 }
 
+pub type HyperliquidBookMode = BookMode;
+
+impl BookMode {
+    fn includes(self, snapshot: bool) -> bool {
+        match self {
+            Self::Websocket => !snapshot,
+            Self::Snapshot => snapshot,
+            Self::Freshest => true,
+        }
+    }
+}
+
 impl LegConfig {
-    fn book_mode(&self) -> HyperliquidBookMode {
-        self.hyperliquid_book_mode
+    fn book_mode(&self, venue: &str) -> BookMode {
+        self.book_mode
+            .or(self.hyperliquid_book_mode)
             .unwrap_or(if self.use_hyperliquid_snapshots {
-                HyperliquidBookMode::Snapshot
+                BookMode::Snapshot
+            } else if matches!(venue, "arcus" | "bulk") {
+                BookMode::Freshest
             } else {
-                HyperliquidBookMode::Websocket
+                BookMode::Websocket
             })
     }
 }
@@ -237,19 +253,19 @@ impl CaptureConfig {
         );
         for (i, leg) in self.legs.iter().enumerate() {
             let venue = registry.get(&self.pair.legs[i].venue)?;
-            let rest_only = matches!(venue.id.as_str(), "arcus" | "bulk");
+            let external_context = matches!(venue.id.as_str(), "arcus" | "bulk");
             ensure!(
                 (venue.id == "lighter" && leg.lighter_market_id.is_some())
-                    || ((venue.hyperliquid_dex.is_some() || rest_only)
+                    || ((venue.hyperliquid_dex.is_some() || external_context)
                         && leg.lighter_market_id.is_none()),
                 "capture requires Lighter, Hyperliquid/HIP-3, Arcus or BULK market terms"
             );
-            if rest_only {
+            if external_context {
                 ensure!(
                     !leg.external_oracle
                         && !leg.accept_receipt_time_for_oracle
                         && leg.funding.is_none(),
-                    "Arcus and BULK REST books use archived_contexts for oracle and funding input"
+                    "Arcus and BULK books use archived_contexts for oracle and funding input"
                 );
                 ensure!(
                     !self.paper_entries || !leg.archived_contexts.is_empty(),
@@ -257,7 +273,7 @@ impl CaptureConfig {
                 );
             }
             ensure!(
-                (rest_only || leg.archived_contexts.is_empty())
+                (external_context || leg.archived_contexts.is_empty())
                     && leg.archived_contexts.windows(2).all(|w| {
                         w[0].available_at_ms < w[1].available_at_ms
                             && w[0].oracle.timestamp_ms <= w[1].oracle.timestamp_ms
@@ -283,7 +299,12 @@ impl CaptureConfig {
                     })
                     && (!(leg.use_hyperliquid_snapshots || leg.hyperliquid_book_mode.is_some())
                         || venue.hyperliquid_dex.is_some())
-                    && !(leg.use_hyperliquid_snapshots && leg.hyperliquid_book_mode.is_some()),
+                    && (leg.book_mode.is_none()
+                        || (venue.hyperliquid_dex.is_some() || external_context))
+                    && usize::from(leg.use_hyperliquid_snapshots)
+                        + usize::from(leg.hyperliquid_book_mode.is_some())
+                        + usize::from(leg.book_mode.is_some())
+                        <= 1,
                 "invalid capture clock or snapshot policy"
             );
             ensure!(
@@ -415,7 +436,9 @@ impl<'a> Compiler<'a> {
                 "lighter"
                     | "hyperliquid"
                     | "hyperliquid_snapshot"
+                    | "arcus"
                     | "arcus_snapshot"
+                    | "bulk"
                     | "bulk_snapshot"
                     | "coinbase"
             ),

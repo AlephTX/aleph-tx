@@ -784,14 +784,31 @@ impl InventoryNeutralMM {
         let Some(hedge) = &mut self.hedge else {
             return Ok(true);
         };
-        hedge.poll().await?;
+        let refreshing = match hedge.poll().await {
+            Ok(refreshing) => refreshing,
+            Err(error) => {
+                self.cancel_all_orders().await;
+                return Err(error);
+            }
+        };
         let (confirmed, short, long) = self.order_tracker.exposure_bounds();
         let blocked = self.quote_allowance(confirmed, short, long).is_none();
-        if blocked
-            && self.cancel_all_and_sync("inventory hedge").await
-            && let Some(hedge) = &mut self.hedge
-        {
-            hedge.rebalance().await?;
+        if blocked {
+            if refreshing
+                && self
+                    .active_orders
+                    .iter()
+                    .all(|order| order.order_index.is_some())
+            {
+                // Known cancels can go directly to the venue while REST
+                // position and book reads are outstanding.
+                self.cancel_all_orders().await;
+            } else if self.cancel_all_and_sync("inventory hedge").await
+                && !refreshing
+                && let Some(hedge) = &mut self.hedge
+            {
+                hedge.rebalance().await?;
+            }
         }
         if let Some(hedge) = &mut self.hedge {
             hedge.check_blocked(blocked)?;
@@ -1184,6 +1201,13 @@ impl InventoryNeutralMM {
     }
 
     async fn clean_exchange_state(&mut self, phase: &str) -> anyhow::Result<()> {
+        if self.order_tracker.has_late_fills() {
+            self.position_confirmation_after_ns = Some(wall_time_ns());
+            self.trading
+                .recover_flat_without_feed()
+                .await
+                .with_context(|| format!("{phase}: could not reconcile late Lighter fills"))?;
+        }
         let reconciliation_epoch = self.order_tracker.reconciliation_epoch();
         for attempt in 0..3 {
             let canceled = self.cancel_all_and_sync(phase).await;

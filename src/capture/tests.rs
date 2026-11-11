@@ -321,8 +321,7 @@ fn forecast_expires_at_the_payment_and_never_reads_settlement_as_prediction() {
     assert_eq!(coverage.settlement_records_written, [1, 0]);
 }
 
-#[test]
-fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
+fn arcus_bulk_config() -> CaptureConfig {
     let mut config = config();
     for (terms, venue) in config.pair.legs.iter_mut().zip(["arcus", "bulk"]) {
         terms.venue = venue.into();
@@ -334,6 +333,12 @@ fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
         leg.accept_receipt_time_for_oracle = false;
         leg.funding = None;
     }
+    config
+}
+
+#[test]
+fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
+    let mut config = arcus_bulk_config();
     config.legs[0].archived_contexts = vec![ArchivedMarketContext {
         market: "ETH-USD".into(),
         available_at_ms: T + 200,
@@ -382,6 +387,74 @@ fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
     assert_eq!(frames[2]["legs"][1]["book"]["timestamp_ms"], 0);
     assert_eq!(frames[3]["legs"][1]["book"]["timestamp_ms"], T + 299);
     assert_eq!(frames[4]["legs"][0]["book"]["timestamp_ms"], 0);
+}
+
+#[test]
+fn arcus_and_bulk_websocket_books_preserve_identity_clock_and_transport() {
+    let mut config = arcus_bulk_config();
+    config.legs[1].book_mode = Some(BookMode::Websocket);
+    let arcus_book = |time: u64| json!({"timestamp":time*1000+123,"bids":[["1999.9","4.5"]],"asks":[["2000.1","5.25"]]});
+    let arcus = |at, time, kind: &str| {
+        row(
+            "arcus",
+            at,
+            json!({"type":kind,"channel":"l2Orderbook","id":"ETH-USD","contents":arcus_book(time)}),
+        )
+    };
+    let bulk_book = |time: u64, symbol: &str| {
+        json!({"symbol":symbol,"updateType":"snapshot","timestamp":time,
+            "levels":[[{"px":1999.8,"sz":4.25}],[{"px":2000.2,"sz":5.5}]]})
+    };
+    let bulk = |at, time, symbol: &str| {
+        row(
+            "bulk",
+            at,
+            json!({"type":"l2Snapshot","topic":"l2snapshot.ETH-USD.20","data":{"book":bulk_book(time, symbol)}}),
+        )
+    };
+    let disconnect = |source: &str, at| json!({"source":source,"event":"disconnect","received_at_ms":at,"available_at_ms":at});
+    let mut invalid_snapshot = bulk(T + 300, T + 299, "ETH-USD");
+    invalid_snapshot["payload"]["data"]["book"]["updateType"] = "delta".into();
+    let rows = [
+        arcus(T, T - 3, "subscribed"),
+        bulk(T, T - 2, "ETH-USD"),
+        row(
+            "arcus_snapshot",
+            T + 100,
+            json!({"market":"ETH-USD","data":arcus_book(T+99)}),
+        ),
+        disconnect("arcus", T + 200),
+        bulk(T + 200, T + 198, "BTC-USD"),
+        row(
+            "bulk_snapshot",
+            T + 200,
+            json!({"market":"ETH-USD","data":bulk_book(T+199,"ETH-USD")}),
+        ),
+        arcus(T + 300, T + 98, "channel_data"),
+        invalid_snapshot,
+        disconnect("arcus_snapshot", T + 400),
+        arcus(T + 500, T + 499, "channel_data"),
+        bulk(T + 500, T + 498, "ETH-USD"),
+        bulk(T + 600, T + 620, "ETH-USD"),
+        footer(T + 700),
+    ];
+    let (coverage, frames) = replay(&config, &rows);
+    let time =
+        |frame: usize, leg: usize| frames[frame]["legs"][leg]["book"]["timestamp_ms"].as_u64();
+    assert_eq!(coverage.leg_book_updates, [3, 2]);
+    assert_eq!(coverage.leg_snapshot_updates, [1, 0]);
+    assert_eq!(coverage.rejected_publications, [0, 1]);
+    assert_eq!(coverage.clock_rejections, [0, 1]);
+    assert_eq!(time(0, 0), Some(T - 3));
+    assert_eq!(time(0, 1), Some(T - 2));
+    assert_eq!(time(2, 0), Some(T + 99)); // WS disconnect kept the REST book.
+    assert_eq!(time(2, 1), Some(T - 2)); // Ignored REST and another market.
+    assert_eq!(time(3, 0), Some(T + 99)); // Late WS book could not roll back.
+    assert_eq!(time(3, 1), Some(0)); // A delta in a snapshot envelope is invalid.
+    assert_eq!(time(4, 0), Some(0));
+    assert_eq!(time(5, 0), Some(T + 499));
+    assert_eq!(time(5, 1), Some(T + 498));
+    assert_eq!(time(6, 1), Some(0)); // Future source time.
 }
 
 #[test]

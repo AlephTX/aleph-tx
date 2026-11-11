@@ -22,7 +22,7 @@
 use crate::exchange::Exchange;
 use crossbeam::utils::CachePadded;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -129,6 +129,7 @@ pub struct TrackedOrder {
     pub fills: Vec<(u64, f64, f64)>,
     /// Submission outcome is unknown; absence from open orders cannot release risk.
     pub submission_uncertain: bool,
+    position_generation: u64,
 }
 
 impl TrackedOrder {
@@ -163,6 +164,9 @@ pub struct TrackerState {
     pub exchange_to_client: HashMap<u64, i64>,
     /// Completed orders TTL cache (for late events)
     pub completed_orders: HashMap<i64, TrackedOrder>,
+    /// Only orders reserved locally in this generation may move a rebased position.
+    position_generation: u64,
+    late_fill_orders: BTreeSet<i64>,
     total_fill_count: u64,
     total_fees: f64,
     /// Ring of the most recent fills, indexed by `total_fill_count % len`.
@@ -190,6 +194,8 @@ impl TrackerState {
             active_orders: HashMap::with_capacity(64),
             exchange_to_client: HashMap::with_capacity(64),
             completed_orders: HashMap::with_capacity(128),
+            position_generation: 0,
+            late_fill_orders: BTreeSet::new(),
             total_fill_count: 0,
             total_fees: 0.0,
             recent_fills: [FillPrint {
@@ -208,7 +214,7 @@ impl TrackerState {
 pub struct OrderTracker {
     /// All mutable order state behind a single RwLock for atomic traversal
     pub state: RwLock<TrackerState>,
-    /// Confirmed position (only driven by fill events, ground truth)
+    /// Position from the last cleanup and incremental fills for orders since then.
     pub confirmed_position: CachePadded<AtomicI64>,
     /// Legacy field name: signed trade cash flow less fees, scaled by POS_SCALE.
     /// This does not include inventory cost basis or mark-to-market PnL.
@@ -265,8 +271,9 @@ impl OrderTracker {
     /// A new gap during the cleanup always remains visible, even if it races
     /// between the comparison and the acknowledgment store.
     pub fn clear_reconciliation_if_epoch(&self, epoch: u64) -> bool {
+        let state = self.state.read();
         let _gate = self.reconciliation_gate.lock();
-        if self.reconciliation_epoch() != epoch {
+        if self.reconciliation_epoch() != epoch || !state.late_fill_orders.is_empty() {
             return false;
         }
         self.reconciled_epoch.store(epoch, Ordering::Release);
@@ -277,6 +284,35 @@ impl OrderTracker {
     /// no exchange open orders and obtained a fresh independent position snapshot.
     /// State mutations and gap detection cannot interleave with this commit.
     pub fn confirm_cleanup(&self, epoch: u64, authoritative_position: f64) -> bool {
+        self.commit_cleanup(epoch, authoritative_position, None)
+    }
+
+    /// REST recovery has checked the terminal history of the quarantined
+    /// orders and the account transaction watermark that covers their fills.
+    pub(crate) fn confirm_recovered_flat(&self, epoch: u64, orders: &BTreeSet<i64>) -> bool {
+        self.commit_cleanup(epoch, 0.0, Some(orders))
+    }
+
+    pub(crate) fn has_late_fills(&self) -> bool {
+        !self.state.read().late_fill_orders.is_empty()
+    }
+
+    pub(crate) fn recovery_cois(&self) -> BTreeSet<i64> {
+        let state = self.state.read();
+        state
+            .active_orders
+            .keys()
+            .chain(state.late_fill_orders.iter())
+            .copied()
+            .collect()
+    }
+
+    fn commit_cleanup(
+        &self,
+        epoch: u64,
+        authoritative_position: f64,
+        recovered_orders: Option<&BTreeSet<i64>>,
+    ) -> bool {
         if !authoritative_position.is_finite()
             || authoritative_position.abs() * POS_SCALE >= i64::MAX as f64
         {
@@ -285,9 +321,19 @@ impl OrderTracker {
         let _events = self.event_processing.lock();
         let mut state = self.state.write();
         let _gate = self.reconciliation_gate.lock();
-        if self.reconciliation_epoch() != epoch {
+        let covered = match recovered_orders {
+            Some(orders) => state
+                .active_orders
+                .keys()
+                .chain(state.late_fill_orders.iter())
+                .all(|id| orders.contains(id)),
+            None => state.late_fill_orders.is_empty(),
+        };
+        if self.reconciliation_epoch() != epoch || !covered {
             return false;
         }
+        state.position_generation += 1;
+        state.late_fill_orders.clear();
         let active: Vec<_> = state.active_orders.drain().collect();
         for (cid, mut order) in active {
             order.lifecycle = OrderLifecycle::Canceled;
@@ -519,6 +565,7 @@ impl OrderTracker {
             tracing::error!("Invalid order registration: coi={}", client_order_id);
             return false;
         }
+        let mut state = self.state.write();
         let order = TrackedOrder {
             client_order_id,
             exchange_order_id: None,
@@ -533,9 +580,9 @@ impl OrderTracker {
             total_fee: 0.0,
             fills: Vec::new(),
             submission_uncertain: false,
+            position_generation: state.position_generation,
         };
 
-        let mut state = self.state.write();
         if state.active_orders.contains_key(&client_order_id)
             || state.completed_orders.contains_key(&client_order_id)
         {
@@ -973,6 +1020,7 @@ impl OrderTracker {
                 total_fee: 0.0,
                 fills: Vec::new(),
                 submission_uncertain: false,
+                position_generation: 0,
             };
             state
                 .exchange_to_client
@@ -1031,6 +1079,19 @@ impl OrderTracker {
             {
                 return Ok(());
             }
+        }
+        // Receipt time can be newer than a snapshot even when the trade was
+        // already included. Keep the original event in telemetry and require
+        // terminal order history before a fill of uncertain provenance can
+        // affect the position. An auto-registered WS order is also unproven.
+        if state.position_generation != 0
+            && existing.is_none_or(|order| order.position_generation != state.position_generation)
+        {
+            state.late_fill_orders.insert(cid);
+            self.require_reconciliation();
+            return Ok(());
+        }
+        if let Some(order) = existing {
             anyhow::ensure!(
                 order.filled_size + event.fill_size <= order.original_size + FILL_COMPLETION_EPS,
                 "fill exceeds original order size for {}",
@@ -1129,6 +1190,7 @@ impl OrderTracker {
                 total_fee: event.fee_paid,
                 fills: vec![(event.trade_id, event.fill_size, event.fill_price)],
                 submission_uncertain: false,
+                position_generation: 0,
             };
             if event.remaining_size > FILL_COMPLETION_EPS {
                 order.lifecycle = OrderLifecycle::PartiallyFilled;

@@ -11,7 +11,7 @@ use super::pricing::{
     fallback_bbo_prices, local_reference_mid, stabilize_crossed_quotes,
 };
 use super::*;
-use crate::exchange::{OrderType, Side};
+use crate::exchange::{OrderParams, OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
 
 fn test_config() -> InventoryNeutralMMConfig {
@@ -1827,6 +1827,61 @@ fn wake_test_strategy(
         account,
     );
     (strategy, tracker, directory)
+}
+
+#[tokio::test]
+async fn resting_quotes_withdraw_while_hedge_rest_is_stalled() {
+    let venue = crate::live_hedge::DelayedVenue::start().await;
+    venue.delays(0, 10_000);
+    let (mut hedge, journal_path) = venue.hedge(Duration::from_secs(5));
+    assert!(hedge.poll().await.unwrap());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !venue.primary_read_started() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("background snapshot started");
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(100, 20);
+    let primary = Arc::new(replay::SimVenue::new(tracker.clone(), 0.0));
+    primary
+        .execute_batch(vec![BatchAction::Place(OrderParams {
+            size: 0.01,
+            price: 2000.0,
+            side: Side::Buy,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        })])
+        .await
+        .unwrap();
+    strategy.trading = primary.clone();
+    let mut strategy = strategy.with_inventory_hedge(hedge);
+    strategy.refresh_active_orders_from_tracker();
+    let started = Instant::now();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(1), strategy.prepare_inventory_hedge())
+            .await
+            .expect("withdrawal must not wait for Hyperliquid")
+            .unwrap()
+    );
+    println!(
+        "simulated hedge REST delay 10000 ms, withdrawal took {:.1} us",
+        started.elapsed().as_secs_f64() * 1e6
+    );
+    assert!(primary.book.lock().is_empty());
+    assert_eq!(tracker.worst_case_long(), 0.0);
+    assert!(
+        primary
+            .actions
+            .lock()
+            .iter()
+            .any(|action| matches!(action, replay::Action::Cancel { .. }))
+    );
+
+    drop(strategy);
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 /// Apply one owned fill to the tracker (client order `coid`).

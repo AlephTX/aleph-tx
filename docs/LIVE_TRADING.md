@@ -94,6 +94,11 @@ separate entry points.
   bids or asks that could fill, are capped by `max_unhedged_base`. The hedge
   waits for confirmed Lighter cancellations and reads actual venue positions
   before sending a bounded IOC. Position reductions use reduce-only orders.
+- Quote allowances are refreshed by a single background REST observation.
+  The strategy uses an allowance only while its Lighter position, Hyperliquid
+  account and book evidence remain fresh. It can withdraw known Lighter
+  orders by order index while an observation is still in flight. A hedge
+  still waits for Lighter cancellation confirmation and a fresh position read.
 - `deadband_base` is a running tolerance. It should account for both venues'
   lot sizes and the hedge venue's order minimum. Shutdown requires both legs
   to be flat.
@@ -116,6 +121,12 @@ separate entry points.
 - When the authenticated Lighter equity stream is quiet, the feeder
   refreshes balances through REST. Position freshness remains independent,
   and an older REST request cannot overwrite a newer WebSocket update.
+- Cleanup rebases Lighter inventory. Only orders registered after that rebase
+  can advance the new inventory from private fills. An unseen fill for an
+  older or untracked order suspends new risk and is retained when event
+  telemetry is enabled. REST recovery checks the exact order's terminal
+  history and the account transaction watermark before resuming or
+  completing cleanup.
 - If the feeder fails during shutdown, recovery queries Lighter open
   orders and confirms known orders by client ID. It checks the account
   transaction watermark after fills before issuing or confirming a

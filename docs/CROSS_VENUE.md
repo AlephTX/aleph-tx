@@ -12,8 +12,8 @@ or equity perpetuals, use the depth-aware [paper replay](PERP_RELATIVE_VALUE.md)
 | Hyperliquid | Go BBO plus public WebSocket and REST L2 capture | Native REST limit orders, cancellation and order status | Native BTC or ETH inventory hedge |
 | Entropy | HIP-3 metadata and `io:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
 | TradeXYZ | HIP-3 metadata and `xyz:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
-| Arcus | Public REST metadata, BBO and L2 capture | Standalone signed Ed25519 REST, order status and fills | Offline pair replay |
-| BULK | Public REST metadata, BBO and L2 capture | Read-only integration | Offline pair replay |
+| Arcus | Public REST metadata and BBO, REST and WebSocket L2 capture | Standalone signed Ed25519 REST, order status and fills | Offline pair replay |
+| BULK | Public REST metadata and BBO, REST and WebSocket L2 capture | Read-only integration | Offline pair replay |
 | Variational | Public v2 perpetual and swap statistics with source timestamps | Read-only indicative data | Market research |
 
 A liquidity domain identifies a matching book. Two frontends using the same

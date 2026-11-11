@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
+	"github.com/tidwall/gjson"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -68,7 +70,23 @@ func symbols(raw string) ([]string, error) {
 	return items, nil
 }
 
-func subscriptions(lighter, hl, coinbase, arcus, bulk string, snapshotInterval, clockRefresh time.Duration, hlFastBook bool) ([]subscription, error) {
+func perpetualSymbols(raw string) ([]string, error) {
+	coins, err := symbols(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, coin := range coins {
+		if strings.IndexFunc(coin, func(r rune) bool {
+			return !('A' <= r && r <= 'Z' || 'a' <= r && r <= 'z' ||
+				'0' <= r && r <= '9' || r == '-' || r == '_')
+		}) >= 0 {
+			return nil, fmt.Errorf("invalid perpetual market %q", coin)
+		}
+	}
+	return coins, nil
+}
+
+func subscriptions(lighter, hl, coinbase, arcus, bulk, arcusWS, bulkWS string, snapshotInterval, clockRefresh time.Duration, hlFastBook bool) ([]subscription, error) {
 	sources := []subscription{
 		{source: "lighter", url: "wss://mainnet.zklighter.elliot.ai/stream", clockRefresh: clockRefresh},
 		{source: "hyperliquid", url: "wss://api.hyperliquid.xyz/ws"},
@@ -135,26 +153,47 @@ func subscriptions(lighter, hl, coinbase, arcus, bulk string, snapshotInterval, 
 		{arcus, "arcus_snapshot", "https://api.arcus.xyz/v1/l2OrderBook"},
 		{bulk, "bulk_snapshot", "https://mainnet-api1.bulk.trade/api/v1/l2book"},
 	} {
-		coins, err := symbols(rest.markets)
+		coins, err := perpetualSymbols(rest.markets)
 		if err != nil {
 			return nil, err
 		}
 		if len(coins) > 4 {
 			return nil, fmt.Errorf("%s supports at most four markets", rest.source)
 		}
-		for _, coin := range coins {
-			if strings.IndexFunc(coin, func(r rune) bool {
-				return !('A' <= r && r <= 'Z' || 'a' <= r && r <= 'z' ||
-					'0' <= r && r <= '9' || r == '-' || r == '_')
-			}) >= 0 {
-				return nil, fmt.Errorf("invalid %s market %q", rest.source, coin)
-			}
-		}
 		if len(coins) > 0 {
 			enabled = append(enabled, subscription{
 				source: rest.source, url: rest.url, coins: coins, interval: time.Second,
 			})
 		}
+	}
+	for _, ws := range []struct{ markets, name, url string }{
+		{arcusWS, "arcus", "wss://api.arcus.xyz/v1/ws"},
+		{bulkWS, "bulk", "wss://mainnet-ws1.bulk.trade"},
+	} {
+		coins, err := perpetualSymbols(ws.markets)
+		if err != nil {
+			return nil, err
+		}
+		if len(coins) == 0 {
+			continue
+		}
+		source := subscription{source: ws.name, url: ws.url, coins: coins}
+		if ws.name == "arcus" {
+			for _, coin := range coins {
+				source.requests = append(source.requests, map[string]any{
+					"type": "subscribe", "channel": "l2Orderbook", "id": coin, "nLevels": 20,
+				})
+			}
+		} else {
+			books := make([]map[string]any, 0, len(coins))
+			for _, coin := range coins {
+				books = append(books, map[string]any{
+					"type": "l2Snapshot", "symbol": coin, "nlevels": 20,
+				})
+			}
+			source.requests = []any{map[string]any{"method": "subscribe", "subscription": books}}
+		}
+		enabled = append(enabled, source)
 	}
 	if len(enabled) == 0 {
 		return nil, errors.New("configure at least one public market")
@@ -306,11 +345,26 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 		if header.Type == "error" || header.Channel == "error" {
 			return fmt.Errorf("subscription rejected: %.240s", raw)
 		}
-		switch header.Type {
-		case "subscribed/order_book", "update/order_book", "subscribed/market_stats", "update/market_stats", "ticker":
-		default:
-			if header.Channel != "l2Book" && header.Channel != "activeAssetCtx" {
+		switch source.source {
+		case "arcus":
+			if header.Channel != "l2Orderbook" || !slices.Contains(source.coins, gjson.GetBytes(raw, "id").String()) ||
+				(header.Type != "subscribed" && header.Type != "channel_data") {
 				continue
+			}
+		case "bulk":
+			// The server can append depth parameters to the topic. The
+			// snapshot carries the native market identity independently.
+			if header.Type != "l2Snapshot" ||
+				!slices.Contains(source.coins, gjson.GetBytes(raw, "data.book.symbol").String()) {
+				continue
+			}
+		default:
+			switch header.Type {
+			case "subscribed/order_book", "update/order_book", "subscribed/market_stats", "update/market_stats", "ticker":
+			default:
+				if header.Channel != "l2Book" && header.Channel != "activeAssetCtx" {
+					continue
+				}
 			}
 		}
 		row := record{Source: source.source, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
@@ -467,6 +521,8 @@ func run() error {
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
 	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
 	bulk := flag.String("bulk", "", "comma-separated BULK perpetuals for 1s REST snapshots")
+	arcusWS := flag.String("arcus-ws", "", "comma-separated Arcus perpetuals for WebSocket L2 books")
+	bulkWS := flag.String("bulk-ws", "", "comma-separated BULK perpetuals for WebSocket L2 snapshots")
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")
 	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
 	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
@@ -482,7 +538,7 @@ func run() error {
 	if *hlFastBook && *hl == "" {
 		return errors.New("fast books need Hyperliquid markets")
 	}
-	sources, err := subscriptions(*lighter, *hl, *coinbase, *arcus, *bulk, *snapshotInterval, *clockRefresh, *hlFastBook)
+	sources, err := subscriptions(*lighter, *hl, *coinbase, *arcus, *bulk, *arcusWS, *bulkWS, *snapshotInterval, *clockRefresh, *hlFastBook)
 	if err != nil {
 		return err
 	}
