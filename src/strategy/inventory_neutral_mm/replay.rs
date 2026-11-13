@@ -952,6 +952,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cross_market_reserve_widens_the_inventory_adding_side_only() {
+        let shm = ShmFiles::create();
+        let reader = ShmReader::open(shm.path("matrix").to_str().unwrap(), NUM_SYMBOLS).unwrap();
+        let account = AccountStatsReader::open(shm.path("account").to_str().unwrap()).unwrap();
+        let tracker = Arc::new(OrderTracker::new());
+        let venue = Arc::new(SimVenue::new(Arc::clone(&tracker), 0.0));
+        let strategy = InventoryNeutralMM::with_data_sources(
+            config(),
+            venue as Arc<dyn Exchange>,
+            tracker,
+            reader,
+            account,
+            None,
+        );
+        let mut inputs = super::super::PricingInputs {
+            mid: 2_000.0,
+            pricing_mid: 2_000.0,
+            bid_touch: 1_999.9,
+            ask_touch: 2_000.1,
+            vol_bps: 1.0,
+            sigma_per_sqrt_sec: 0.0001,
+            as_score: 0.0,
+            using_external_fair_value: true,
+            order_flow_bps: 0.0,
+            cross_market_bps: 0.0,
+            volatility_pressure: 0.0,
+        };
+        let (bid, ask, baseline) = strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+        inputs.cross_market_bps = -3.0;
+        let (safer_bid, unchanged_ask, bounds) =
+            strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+        assert!(safer_bid < bid);
+        assert_eq!(unchanged_ask, ask);
+        assert_eq!(bounds.max_bid, baseline.max_bid);
+        assert_eq!(bounds.min_ask, baseline.min_ask);
+        inputs.cross_market_bps = 3.0;
+        let (unchanged_bid, unchanged_ask, _) =
+            strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+        assert_eq!((unchanged_bid, unchanged_ask), (bid, ask));
+    }
+
     /// Live frame one second after the previous one.
     fn frame(mid: f64, fill_fraction: f64) -> Frame {
         Frame {

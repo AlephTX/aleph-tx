@@ -360,6 +360,71 @@ fn optimized_carry_compares_verified_holds_and_reserves_unwind_payments() {
 }
 
 #[test]
+fn carry_policy_discounts_only_favorable_cash_from_observation_time() {
+    let mut scenario = crypto();
+    let frame = &scenario.frames[3];
+    let payment = frame.legs[0].forecast.as_ref().unwrap().payments[0].at_ms;
+    let now = frame.now_ms;
+    scenario.pair.funding_carry_policy = Some(FundingCarryPolicy {
+        credit_half_life_ms: Some(payment - now),
+        min_net_return_bps_per_day: None,
+    });
+    let planner = RelativeValue::new(scenario.pair, &VenueRegistry::default()).unwrap();
+    let hold = [now, payment + 1, payment + 801];
+    // A long pays 0.22, while the short's conservative 2.98 credit halves.
+    assert_eq!(planner.funding_bound(frame, 0, hold), Ok(d("1.27")));
+    // The other direction keeps the full 3.02 debit and halves its 0.18 credit.
+    assert_eq!(planner.funding_bound(frame, 1, hold), Ok(d("-2.93")));
+    // A payment before both fills or in the unwind contributes only potential debits.
+    for boundary in [
+        [payment, payment + 1, payment + 801],
+        [now, payment, payment + 800],
+    ] {
+        assert_eq!(planner.funding_bound(frame, 0, boundary), Ok(d("-0.22")));
+        assert_eq!(planner.funding_bound(frame, 1, boundary), Ok(d("-3.02")));
+    }
+}
+
+#[test]
+fn carry_policy_ranks_horizons_by_gross_notional_time_and_enforces_floor() {
+    let mut scenario = crypto();
+    scenario.pair.planner.funding_horizon_ms = 7_200_000;
+    scenario.pair.optimize_funding_horizon = true;
+    let frame = &mut scenario.frames[3];
+    let payment = frame.legs[0].forecast.as_ref().unwrap().payments[0].at_ms;
+    for leg in &mut frame.legs {
+        let payments = &mut leg.forecast.as_mut().unwrap().payments;
+        let mut next = payments[0];
+        next.at_ms += 3_600_000;
+        payments.push(next);
+    }
+    let old = first_plan(&scenario).unwrap();
+    assert_eq!(old.hold_until_ms, payment + 3_600_001);
+    assert_eq!(old.funding_return_bps_per_day, None);
+    scenario.pair.funding_carry_policy = Some(FundingCarryPolicy {
+        credit_half_life_ms: None,
+        min_net_return_bps_per_day: Some(d("500")),
+    });
+    let plan = first_plan(&scenario).unwrap();
+    assert_eq!(plan.hold_until_ms, payment + 1);
+    let days =
+        Decimal::from(plan.unwind_until_ms - scenario.frames[3].now_ms) / Decimal::from(DAY_MS);
+    let gross = d("4000.2") * plan.hedge.target_base;
+    let expected = plan.net_edge * BPS / (gross * days);
+    let actual = plan.funding_return_bps_per_day.unwrap();
+    assert!((actual - expected).abs() < d("0.000000000000000001"));
+
+    scenario.pair.optimize_funding_horizon = false;
+    assert!(matches!(
+        first_plan(&scenario),
+        Err(Rejection::FundingReturnBelowFloor)
+    ));
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert!(report.entry_diagnostics.blocked_by_gate[&EntryGate::FundingReturnBelowFloor] > 0);
+    assert_eq!(report.entries_submitted, 0);
+}
+
+#[test]
 fn equity_uses_prior_basis_and_picks_the_net_profitable_depth_band() {
     let scenario = equity();
     let plan = first_plan(&scenario).unwrap();

@@ -1,0 +1,38 @@
+{
+  "as_of_ms": 1800000000000,
+  "requested_base": "0.125",
+  "capital_quote": "3000",
+  "other_cost_quote": "3.00",
+  "buy": {
+    "settlement": {
+      "underlying": "EXAMPLE",
+      "index": "EXAMPLE-USD",
+      "fixing_rule": "SYNTHETIC-30MIN-TWAP-V1",
+      "currency": "USD",
+      "at_ms": 1800086400000
+    },
+    "linear_cash_settled": true,
+    "interim_payments": false,
+    "base_per_contract": "0.01",
+    "contract_step": "3",
+    "entry_limit": "10000",
+    "max_contracts": "15",
+    "fees_quote": "2.00"
+  },
+  "sell": {
+    "settlement": {
+      "underlying": "EXAMPLE",
+      "index": "EXAMPLE-USD",
+      "fixing_rule": "SYNTHETIC-30MIN-TWAP-V1",
+      "currency": "USD",
+      "at_ms": 1800086400000
+    },
+    "linear_cash_settled": true,
+    "interim_payments": false,
+    "base_per_contract": "0.02",
+    "contract_step": "1",
+    "entry_limit": "10100",
+    "max_contracts": "10",
+    "fees_quote": "2.20"
+  }
+}

@@ -31,13 +31,15 @@ def witnesses(path):
     return slots
 
 
-def make_tape(path, output, rates, begin, end, delay, premium):
+def make_tape(path, output, rates, begin, end, delay, premium, funding_policy=None):
     with unseal(path) as stream, output.open("x") as file:
         header = json.loads(stream.readline())
         pair = header["pair"]
         legs = pair["legs"]
         terms = [identifier(leg["venue"], leg["market"]) for leg in legs]
         pair.update(strategy="funding_carry", optimize_funding_horizon=True, recover_single_leg=True)
+        if funding_policy is not None:
+            pair["funding_carry_policy"] = funding_policy
         pair["planner"].update(max_funding_age_ms=HOUR, funding_horizon_ms=4*HOUR,
                                exit_basis_reserve_bps=2.0, min_net_edge_bps=0.5,
                                max_leg_notional_usd=100, max_unhedged_notional_usd=100)
@@ -102,6 +104,8 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--start-ms", type=int, required=True)
     parser.add_argument("--end-ms", type=int, required=True)
+    parser.add_argument("--credit-half-life-ms", type=int)
+    parser.add_argument("--min-net-return-bps-per-day")
     args = parser.parse_args()
     if not 0<args.start_ms<args.end_ms or args.start_ms%HOUR or args.end_ms%HOUR:
         parser.error("funding window must use ordered UTC hours")
@@ -110,6 +114,10 @@ def main():
     out.mkdir()
     rates = rate_archive(args.capture)
     output = {"start_ms":args.start_ms,"end_ms":args.end_ms,"engine_sha256":digest(args.engine),"markets":{}}
+    policy = {k: v for k, v in (("credit_half_life_ms", args.credit_half_life_ms),
+              ("min_net_return_bps_per_day", args.min_net_return_bps_per_day)) if v is not None}
+    if policy:
+        output["funding_carry_policy"] = policy
     for symbol in ("BTC","ETH"):
         tape = args.compiled / f"{symbol}-lighter-hyperliquid.ndjson.zst"
         slots = witnesses(tape)
@@ -117,7 +125,7 @@ def main():
         for tier, delay in (("standard",550),("standard",800),("premium",390),("premium",640)):
             tag = f"{symbol}-{tier}-{delay}ms"
             dest = out / f"{tag}.ndjson"
-            ready = make_tape(tape,dest,rates,args.start_ms,args.end_ms,delay,tier=="premium")
+            ready = make_tape(tape,dest,rates,args.start_ms,args.end_ms,delay,tier=="premium",policy or None)
             results[tag] = {"frames_with_forecast":ready} | summarize_run(native_run(args.engine.resolve(),dest,out,delay))
             dest.unlink()
         output["markets"][symbol] = {"source_sha256":digest(tape),

@@ -41,8 +41,8 @@ use execution::{
 };
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    BasisTracker, MarketState, OrderFlow, StaleBboAction, build_market_state, classify_stale_bbo,
-    data_age_ms, external_fair_value_mid, select_exchange_bbo,
+    BasisTracker, CrossMarketPressure, MarketState, OrderFlow, StaleBboAction, build_market_state,
+    classify_stale_bbo, data_age_ms, external_fair_value_mid, select_exchange_bbo,
 };
 use pricing::{
     AnchorParams, MakerPriceBounds, anchor_quotes_to_touch, cleanup_reference_mid,
@@ -423,6 +423,7 @@ struct PricingInputs {
     as_score: f64,
     using_external_fair_value: bool,
     order_flow_bps: f64,
+    cross_market_bps: f64,
     volatility_pressure: f64,
 }
 
@@ -452,6 +453,7 @@ pub struct InventoryNeutralMM {
     sigma: TimeScaledVolatility,
     basis: BasisTracker,
     order_flow: OrderFlow,
+    cross_market_pressure: CrossMarketPressure,
     volatility_regime: volatility_regime::VolatilityRegime,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
@@ -548,6 +550,7 @@ impl InventoryNeutralMM {
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             order_flow: OrderFlow::default(),
+            cross_market_pressure: CrossMarketPressure::default(),
             volatility_regime: volatility_regime::VolatilityRegime::default(),
             last_micro_sample: None,
             price_evidence: None,
@@ -1780,6 +1783,21 @@ impl InventoryNeutralMM {
                 reserve.half_life_ms,
             ) * reserve.max_widen_bps
         });
+        let cross_market_bps = self.config.cross_market_reserve.map_or(0.0, |reserve| {
+            let external = using_external
+                .then(|| select_exchange_bbo(exchanges, EXCH_HYPERLIQUID))
+                .flatten();
+            self.cross_market_pressure.observe(
+                bbo,
+                external,
+                now_ns,
+                [
+                    self.config.local_staleness_ms,
+                    self.config.external_staleness_ms,
+                ],
+                reserve,
+            )
+        });
         let volatility_pressure = self.config.volatility_regime.map_or(0.0, |regime| {
             self.volatility_regime.observe(
                 select_exchange_bbo(exchanges, EXCH_HYPERLIQUID).as_ref(),
@@ -1804,6 +1822,7 @@ impl InventoryNeutralMM {
             as_score,
             using_external_fair_value: using_external,
             order_flow_bps,
+            cross_market_bps,
             volatility_pressure,
         }
     }
@@ -1897,7 +1916,9 @@ impl InventoryNeutralMM {
         });
         if regime_reserve > 0.0
             || (inputs.using_external_fair_value
-                && (self.config.markout_reserve.is_some() || inputs.order_flow_bps != 0.0))
+                && (self.config.markout_reserve.is_some()
+                    || inputs.order_flow_bps != 0.0
+                    || inputs.cross_market_bps != 0.0))
         {
             let [bid_markout, ask_markout] = if inputs.using_external_fair_value {
                 self.config.markout_reserve.map_or([0.0; 2], |policy| {
@@ -1913,8 +1934,14 @@ impl InventoryNeutralMM {
                 [0.0; 2]
             };
             // The reserves overlap. Use the largest estimate on each side.
-            let bid_reserve = bid_markout.max(-inputs.order_flow_bps).max(regime_reserve);
-            let ask_reserve = ask_markout.max(inputs.order_flow_bps).max(regime_reserve);
+            let bid_reserve = bid_markout
+                .max(-inputs.order_flow_bps)
+                .max(-inputs.cross_market_bps)
+                .max(regime_reserve);
+            let ask_reserve = ask_markout
+                .max(inputs.order_flow_bps)
+                .max(inputs.cross_market_bps)
+                .max(regime_reserve);
             // Keep the side pointing toward flat at its original price.
             let bid_reserve = if q >= 0.0 { bid_reserve } else { 0.0 };
             let ask_reserve = if q <= 0.0 { ask_reserve } else { 0.0 };

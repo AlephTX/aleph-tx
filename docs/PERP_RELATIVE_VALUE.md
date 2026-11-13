@@ -133,6 +133,18 @@ lower bound for a reachable hold. `net_edge` means the priced candidate
 failed the net threshold. `best_net_edge_bps` records the best priced edge
 before turnover caps, so it can be positive in a run with zero entries.
 
+`pair.funding_carry_policy` enables an optional forecast credit haircut and
+capital-time hurdle. `credit_half_life_ms` discounts positive lower-bound
+cash flows from forecast observation to settlement. Potential debits retain
+their full modeled cost. `min_net_return_bps_per_day` is a decimal-string
+entry floor. Optimized horizons rank by modeled net return per day on the
+sum of both legs' risk notionals, including the unwind time. This denominator
+is a gross notional proxy. Portfolio selection still needs separately
+verified collateral, venue margin and switching costs. The settlement ledger
+books actual witnessed cash flows independently of forecast haircuts.
+[Perpetual funding and transaction costs](https://arxiv.org/abs/2212.06888) ·
+[Matched terminal settlement](CROSS_VENUE.md#dated-settlement-and-combination-orders)
+
 The [public recording workflow](PERP_RECORDING.md) creates this input format
 from venue data and reports timestamp and reference coverage.
 
@@ -253,6 +265,21 @@ actual simulated costs breach the budget, entry stops and the existing
 exit and recovery rules manage any remaining exposure. The projected
 budgets can be exceeded by later price moves. The report keeps cost
 unavailable for unresolved windows and assigns zero value to rewards.
+
+An optional `turnover_feedback` object enables cost-based quote selection
+when the maker venue is the incentive target. The replay searches up to eight
+displayed prices per side within `max_quote_distance_bps` and starts with the
+closest price that passes the budget. A resting entry rechecks executable
+hedge depth and its cost allowance. `min_reserve_bps` sets a positive safety
+margin and `max_reserve_bps` caps it. `alpha` in [0, 1] sets the weight of the
+latest completed cycle. Use zero for a fixed-reserve control.
+`overhead_bps` charges modeled operating costs on both venues' gross
+turnover. Fee-inclusive cash after overhead updates the reserve only from
+evidence-complete, flat cycles. Exits use the existing exposure controls.
+The report distinguishes target-venue turnover, modeled eligible turnover and
+unverified venue credit. Points and prospective rebates have zero value.
+[Cross-Exchange Mining feedback](https://hummingbot.org/strategies/v1-strategies/cross-exchange-mining/) ·
+[Queue position valuation](https://moallemi.com/ciamac/papers/queue-value-2016.pdf)
 
 The report counts maker and IOC fills separately, records signed IOC
 slippage against the submit touch, separates depth impact and fees, and
@@ -867,6 +894,121 @@ The archived aggregate report checksums are SHA-256.
 | Witnessed funding | `0aa133bfee6b72b5c9ab397cd10bcfd812e57e296a8cc39830f9d4b8f22634b4` |
 | NVDA recovery regression | `888adb4e271fa1d093c6fe7f22fa14aee60918f4ead3ee3aed2cbfa991ca535a` |
 | Input and binary evidence | `84239d0b136539cdbd555be4ed22b74d1c1eaac63ac8ea6dcb2848908fe2ae79` |
+
+## Execution policy comparison, 2026-11-13
+
+Oasis study `execution-policies-0d7f570b8753` reused the sealed 12:00–13:50
+Beijing evaluation inputs. This is a matched comparison on an already
+studied session. It has two independent execution windows per arm, 250
+and 500 ms one-way transport scenarios, and the recorded fee schedules.
+Public L2 and trade replay models queue position and partial fills with
+displayed liquidity. It has no counterfactual market impact or actual
+exchange priority evidence.
+[Queue position valuation](https://moallemi.com/ciamac/papers/queue-value-2016.pdf) ·
+[Replay fill assumptions](https://hftbacktest.readthedocs.io/en/latest/order_fill.html)
+
+### Quant market making
+
+The production quote loop adds an optional directional reserve from
+Hyperliquid microprice and short-lived Hyperliquid–Lighter basis. The
+signal decays over book age plus modeled placement delay. The comparison
+uses a 500 ms half-life, a 750 ms book skew limit and a 3 bps reserve cap.
+Both arms keep the same minute-range policy, $50 target, $1,000 equity,
+fees and inventory bounds. All 64 windows finished flat. The new reserve
+improved net PnL in 10 of 16 matched profiles, often by less than one
+cent per hour. The Standard ETH 12 bps floor stayed positive at both
+delays. The larger favorable and adverse changes occurred in Premium
+2 bps profiles that still lost money.
+[Configuration](CONFIGURATION.md) ·
+[Cross-market Bitcoin price discovery](https://arxiv.org/abs/2108.09750) ·
+[Latency and inventory research](https://arxiv.org/abs/2505.12465)
+
+| Market and profile | Transport | Control PnL/h | Cross-market reserve PnL/h |
+| --- | ---: | ---: | ---: |
+| ETH Standard 12 bps | 250 ms | +$0.160 | +$0.147 |
+| ETH Standard 12 bps | 500 ms | +$0.014 | +$0.017 |
+| ETH Premium 2 bps | 250 ms | −$1.527 | −$1.380 |
+| BTC Premium 2 bps | 250 ms | −$1.316 | −$1.444 |
+
+The reserve stays opt-in. A profitability decision needs fresh sessions
+and post-fill calibration at the actual placement and cancellation delays.
+
+### Arcus turnover and cost
+
+The touch control uses the existing entry gate. The fixed arm searches
+for the nearest passing displayed price with a 0.25 bps reserve. The
+feedback arm uses the same search with a 0.25 EWMA weight and a 4 bps
+reserve cap. Both search arms limit price distance to 12 bps and add
+0.25 bps of modeled overhead on gross turnover across both venues in
+the entry gate. Reported results charge that overhead once in every arm.
+The simulation gives zero value to points and prospective rebates.
+[Cross-Exchange Mining](https://hummingbot.org/strategies/v1-strategies/cross-exchange-mining/) ·
+[Arcus Points](https://arcus.xyz/blog/introducing-arcus-points)
+
+All 72 windows finished flat. At 0 and 4 bps caps every arm recorded
+zero fills. Each cell below shows the modeled Arcus turnover in completed
+cycles and the full modeled cost in bps of that turnover at the 8 bps
+entry cap. The cost includes fees, realized execution prices and overhead.
+
+| Market | Transport | Touch volume / cost | Fixed volume / cost | Feedback volume / cost |
+| --- | ---: | ---: | ---: | ---: |
+| BTC | 250 ms | $1,897 / 4.00 | $1,862 / 4.20 | $891 / 3.85 |
+| BTC | 500 ms | $1,824 / 4.72 | $1,671 / 4.49 | $1,196 / 4.32 |
+| ETH | 250 ms | $892 / 4.77 | $300 / 13.12 | $278 / 13.69 |
+| ETH | 500 ms | $1,220 / 7.16 | $926 / 7.32 | $617 / 7.85 |
+
+Feedback reduced absolute loss and turnover in all four comparisons
+against touch. Its unit cost improved on BTC and rose on ETH. The
+250 ms ETH realized cost exceeded the 8 bps projected entry cap after
+execution. Feedback's maximum observed net exposure lasted 9.55 seconds
+across the four profiles. All evaluated arms had zero turnover at
+nonpositive complete modeled cost. Actual venue credit is unavailable.
+
+### Conditional settlement and variable carry
+
+`matched-settlement` verified the synthetic example with a common 0.12
+base lot, 12.00 quote units of terminal spread and 7.20 of bounded costs.
+The conditional net is 4.80, or 16 bps on 3,000 of specified capital.
+This exercises matching fixing rules and contract multipliers. Real dated
+opportunities need independently verified instruments, tradeable size
+and clearing terms. [Combination execution](CROSS_VENUE.md#dated-settlement-and-combination-orders)
+
+The six-hour Lighter–Hyperliquid carry comparison used six witnessed
+settlements for each asset. Both the original policy and the one-hour
+credit half-life with a 0.5 bps/day gross-notional hurdle placed zero
+entries across their eight cases. The original Standard cases reached
+−15.23 bps for BTC and −16.60 bps for ETH after modeled costs. Under the
+haircut, no reachable candidate had both complete forecast inputs and
+positive conservative funding credit. The planner therefore reported
+no priced entry edge, and the daily return floor did not bind.
+
+### Reproduce
+
+Build `cross_venue` and `maker_replay` with `--features research-replay`.
+On Oasis, use the prior study's sealed inputs and the current binary.
+
+```sh
+quality="$HOME/aleph-tx-research/2026-11-12-quality-15gb"
+parent="$HOME/aleph-tx-research/2026-11-12-20h-full/results/production-study-2effb88e8816"
+result=$(mktemp -d "$parent/replay-XXXXXXXX")
+python3 scripts/replay_execution_policies.py "$parent/adaptive-strategy-07480bdf7830/study" \
+  "$quality" config.example.toml target/release/cross_venue target/release/maker_replay "$result/policies"
+python3 scripts/replay_witnessed_carry.py target/release/cross_venue "$quality" \
+  "$parent/maker-first-62e4ba4eadda/compiled" "$result/carry" \
+  --start-ms 1794510000000 --end-ms 1794531600000 \
+  --credit-half-life-ms 3600000 --min-net-return-bps-per-day 0.5
+```
+
+The Oasis aggregate reports are identified by SHA-256.
+
+| Report | SHA-256 |
+| --- | --- |
+| Quant | `50b220294b9dd79cadf6c5d4b7dec1d2c503f87f90eb34d6d8b011de08831f71` |
+| Turnover | `616377e04d44b78ef63d50827499693f6f77b04b1dcc3e9683f0e428d851225f` |
+| Carry control | `9b7409535571fea16a778b24720ec00efdf36fa87b2c96d270314fa872a09a74` |
+| Carry with haircut | `510ececcfb2fcf1aa4671bcc283e9e9a3d078e242fe8f47afa79c675ce41426a` |
+| Matched settlement example | `2cc15305d2cceca3c10cca7e44a1c1adab036743099106e29fc656b5f84d3898` |
+| Input and binary evidence | `4345d0104e2204d49525744116b43d4d6acd57987532df1a831e209fff662bec` |
 
 ## Research acceptance
 

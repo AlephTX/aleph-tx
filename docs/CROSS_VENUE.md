@@ -122,6 +122,68 @@ reserved exposure.
   checks coarser price tiers separately. Its order commands are explicit REST
   operations. The supervised inventory strategy uses Lighter and Hyperliquid.
 
+### Dated settlement and combination orders
+
+The offline `matched-settlement` command screens two linear cash-settled
+contracts with a common underlying, fixing index, fixing rule, expiry and
+settlement currency. The fixing rule includes the index source, averaging
+window and fallback methodology. Both legs must have terminal-only cash
+flows. The screen converts native quantities to a common base lot and
+subtracts supplied fee and holding-cost bounds from the terminal spread.
+Entry limits are expressed per base unit and apply at the supplied capacity.
+The return denominator is supplied capital across both accounts and any
+external reserve. The cash bound depends on matched fills, collateral through
+expiry and fulfillment of both contracts. Record venue minimums and verify
+capacity and settlement specifications before supplying an input.
+
+```sh
+target/release/cross_venue matched-settlement examples/matched_settlement.json
+```
+
+OKX Nitro Spreads and Deribit Combo Books execute their supported legs as a
+combination. Paradigm reports clearing status for all legs at the underlying
+settlement venue. Keep order matching and final clearing evidence distinct.
+The current AlephTX cross-venue simulator submits independent IOC legs and
+models partial execution and recovery.
+[OKX Nitro Spreads](https://www.okx.com/en-gb/help/nitro-spreads-introduction) ·
+[Deribit Combo Books](https://support.deribit.com/hc/en-us/articles/31424954956061-Combo-Books) ·
+[Paradigm clearing](https://docs.paradigm.co/unified-markets/summary)
+
+Deribit linear futures deliver in USDC using a 30-minute Deribit index
+average. OKX's USDT expiry product specifies USDT and a final-hour index
+average. Both venues also describe daily PnL settlement. A matching BTC
+ticker and delivery timestamp leave these contracts outside the current
+terminal-only screen.
+[Deribit linear futures](https://support.deribit.com/hc/en-us/articles/31424954805405-Linear-Futures) ·
+[Deribit daily settlement](https://support.deribit.com/hc/en-us/articles/29734325712413-Settlement) ·
+[OKX expiry futures](https://www.okx.com/en-us/help/expiry-futures)
+
+### Extended execution research
+
+Extended BTC-USD and ETH-USD returned active perpetual CLOB markets in the
+public API probe on 2026-11-13. Oasis received 40 consecutive public depth
+messages per market and an initial trade batch on each subscription.
+The short probe established feed access. A sealed, synchronized capture is
+required for a fill and cost comparison against Lighter.
+Market classification is per instrument.
+Before using CLOB queue simulation, check `isRfq` and verify the public depth
+sequence, trade IDs, timestamps, fee tier and settlement currency. RFQ market
+depth on the standard stream is indicative. The dedicated RFQ stream carries
+resting orders that an opposing IOC may pick up at the maker fee. The RFQ
+order endpoint has a one-request-per-second limit. Venue credits require
+separate account evidence.
+[Extended API and RFQ documentation](https://api.docs.extended.exchange/#rfq-markets)
+
+Extended's published ordinary crypto rates are 0 bps maker and 2.5 bps
+taker. Its RWA taker rate is 1 bp. Ordinary crypto maker rebates of 0.2,
+0.4, 0.6 and 1.0 bps depend on trailing 30-day maker market share and a
+$10 minimum daily payout. Lighter Standard regular orders are 0 bps on
+both sides, with 300 ms added to taker and cancel/modify actions. Plus
+uses 0.5 bps on both sides with the same delays. Treat these as venue
+schedule inputs and confirm the actual account tier for execution research.
+[Extended fee schedule](https://docs.extended.exchange/extended-resources/trading/trading-fees-and-rebates.md) ·
+[Lighter fee and latency schedule](https://docs.lighter.xyz/trading/trading-fees)
+
 Design references: [Hummingbot fill-driven hedge architecture](https://hummingbot.org/strategies/v1-strategies/cross-exchange-market-making/),
 [Hyperliquid perpetual metadata](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals),
 [Hyperliquid funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding),

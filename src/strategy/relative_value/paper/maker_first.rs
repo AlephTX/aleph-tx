@@ -5,6 +5,8 @@ use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
 use crate::strategy::relative_value::*;
 use std::collections::{BTreeMap, VecDeque};
 
+const MAX_FEEDBACK_LEVELS: usize = 8;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MakerFirstConfig {
@@ -31,6 +33,9 @@ pub struct MakerFirstConfig {
     /// Allow small confirmed inventory to close passively before routing it out.
     #[serde(default)]
     pub passive_offset: Option<PassiveOffset>,
+    /// Adjust the target-venue entry reserve using completed round trips.
+    #[serde(default)]
+    pub turnover_feedback: Option<TurnoverFeedback>,
     #[serde(with = "rust_decimal::serde::str")]
     pub maker_fee_bps: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -50,6 +55,41 @@ pub struct PassiveOffset {
     /// None retains the displayed round-trip control.
     #[serde(default)]
     pub close_probability: Option<[Decimal; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnoverFeedback {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub min_reserve_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_reserve_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub alpha: Decimal,
+    /// Additional modeled costs per unit of both venues' gross turnover.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub overhead_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_quote_distance_bps: Decimal,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TurnoverFeedbackReport {
+    pub min_reserve_bps: Decimal,
+    pub max_reserve_bps: Decimal,
+    pub final_reserve_bps: Decimal,
+    pub max_observed_reserve_bps: Decimal,
+    pub cycles_used: usize,
+    pub overhead_bps: Decimal,
+    pub overhead_quote: Decimal,
+    pub modeled_target_turnover_quote: Decimal,
+    pub modeled_eligible_turnover_quote: Decimal,
+    /// A public replay has no venue statement confirming program credit.
+    pub venue_credited_turnover_quote: Option<Decimal>,
+    pub net_after_overhead: Option<Decimal>,
+    pub liquidation_pnl_after_overhead: Option<Decimal>,
+    pub realized_cost_bps: Option<Decimal>,
+    pub outward_quotes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +191,8 @@ pub struct MakerFirstReport {
     pub entry_blocked: BTreeMap<&'static str, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incentive_turnover: Option<IncentiveTurnoverReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turnover_feedback: Option<TurnoverFeedbackReport>,
     pub below_minimum_hedge: usize,
     pub below_minimum_unwind: usize,
     pub incomplete: Option<&'static str>,
@@ -207,6 +249,7 @@ struct Ioc {
 struct Cycle {
     started_ms: u64,
     initial_cash: Decimal,
+    initial_turnover: Decimal,
     draining: bool,
     externalizing: bool,
     maker_turnover: Decimal,
@@ -230,7 +273,48 @@ struct Replay<'a> {
     next_ioc_ms: u64,
     notices: VecDeque<(u64, Decimal)>,
     unhedged_since: Option<u64>,
+    cost_feedback: CostFeedback,
     report: MakerFirstReport,
+}
+
+#[derive(Default)]
+struct CostFeedback {
+    excess_reserve_bps: Decimal,
+    max_excess_reserve_bps: Decimal,
+    cycles_used: usize,
+    outward_quotes: usize,
+    target_turnover: Decimal,
+}
+
+impl TurnoverFeedback {
+    fn overhead(self, gross: Decimal) -> Decimal {
+        gross * self.overhead_bps / BPS
+    }
+}
+
+impl CostFeedback {
+    fn observe(&mut self, policy: TurnoverFeedback, net: Decimal, eligible: Decimal) {
+        if policy.alpha.is_zero() {
+            return;
+        }
+        let headroom = policy.max_reserve_bps - policy.min_reserve_bps;
+        if eligible > Decimal::ZERO {
+            let cap = headroom * eligible;
+            let cost = (-net * BPS).clamp(-cap, cap) / eligible;
+            self.excess_reserve_bps = (self.excess_reserve_bps * (Decimal::ONE - policy.alpha)
+                + policy.alpha * cost)
+                .clamp(Decimal::ZERO, headroom);
+            self.cycles_used += 1;
+        } else if net < Decimal::ZERO {
+            // The loss belongs to the strategy even without target turnover.
+            self.excess_reserve_bps = headroom;
+        }
+        self.max_excess_reserve_bps = self.max_excess_reserve_bps.max(self.excess_reserve_bps);
+    }
+
+    fn reserve(&self, policy: TurnoverFeedback) -> Decimal {
+        policy.min_reserve_bps + self.excess_reserve_bps
+    }
 }
 
 fn opposite(side: HedgeSide) -> HedgeSide {
@@ -322,6 +406,21 @@ impl MakerFirstConfig {
                 "invalid passive offset size or time budget"
             );
         }
+        if let Some(policy) = self.turnover_feedback {
+            let max_bps = Decimal::from(100);
+            ensure!(
+                self.pair
+                    .mode
+                    .incentive()
+                    .is_some_and(|p| p.eligible_leg == self.maker_leg)
+                    && policy.min_reserve_bps > Decimal::ZERO
+                    && (policy.min_reserve_bps..=max_bps).contains(&policy.max_reserve_bps)
+                    && (Decimal::ZERO..=Decimal::ONE).contains(&policy.alpha)
+                    && (Decimal::ZERO..=max_bps).contains(&policy.overhead_bps)
+                    && (Decimal::ZERO..=max_bps).contains(&policy.max_quote_distance_bps),
+                "invalid maker-first turnover feedback"
+            );
+        }
         ensure!(
             self.pair.legs.iter().all(|leg| leg
                 .funding
@@ -409,7 +508,7 @@ impl Replay<'_> {
         }
     }
 
-    fn advance_quote(&mut self, now: u64) {
+    fn advance_quote(&mut self, now: u64, book_frame: bool) {
         let Some(mut quote) = self.quote.take() else {
             return;
         };
@@ -443,14 +542,16 @@ impl Replay<'_> {
                 }
                 let same_side = book.side(opposite(quote.side));
                 let worst = same_side.last().expect("valid book").price;
-                if signed_cost(quote.side, quote.price, worst) < Decimal::ZERO {
+                let level = same_side.iter().find(|level| level.price == quote.price);
+                if signed_cost(quote.side, quote.price, worst) < Decimal::ZERO
+                    || (self.config.turnover_feedback.is_some()
+                        && self.cycle.is_none()
+                        && level.is_none())
+                {
                     self.report.post_only_rejected += 1;
                     return;
                 }
-                quote.ahead = same_side
-                    .iter()
-                    .find(|level| level.price == quote.price)
-                    .map_or(Decimal::ZERO, |level| level.contracts)
+                quote.ahead = level.map_or(Decimal::ZERO, |level| level.contracts)
                     * self.config.pair.legs[self.maker()].base_per_contract;
                 quote.activated_ms = Some(now);
                 self.report.quotes_accepted += 1;
@@ -473,8 +574,12 @@ impl Replay<'_> {
             }),
             None => self.passive_cancel_by(now).is_some(),
         };
+        let feedback_cancel = book_frame
+            && self.config.turnover_feedback.is_some()
+            && self.cycle.is_none()
+            && !self.resting_turnover_within_budget(&quote, now);
         self.quote = Some(quote);
-        if expired || !hedgeable {
+        if expired || !hedgeable || feedback_cancel {
             self.cancel(now);
         }
     }
@@ -545,6 +650,7 @@ impl Replay<'_> {
             Cycle {
                 started_ms: now,
                 initial_cash: self.ledger.cash,
+                initial_turnover: self.ledger.turnover,
                 draining: false,
                 externalizing: false,
                 maker_turnover: Decimal::ZERO,
@@ -629,6 +735,9 @@ impl Replay<'_> {
     }
 
     fn record_eligible_fill(&mut self, leg: usize, time: u64, notional: Decimal) {
+        if self.config.turnover_feedback.is_some() && leg == self.maker() {
+            self.cost_feedback.target_turnover += notional;
+        }
         if self
             .config
             .pair
@@ -710,12 +819,13 @@ impl Replay<'_> {
         books: [&Book; 2],
         side: HedgeSide,
         closing: bool,
+        level: &Level,
     ) -> Result<Option<Candidate>> {
         let i = self.maker();
         let j = 1 - i;
         let maker = &self.config.pair.legs[i];
         let hedge = &self.config.pair.legs[j];
-        let passive = books[i].side(opposite(side))[0].price;
+        let passive = level.price;
         let mark = books[0].asks[0].price.max(books[1].asks[0].price);
         let quantity = if closing {
             self.ledger.positions[i].abs()
@@ -730,16 +840,21 @@ impl Replay<'_> {
         {
             return Ok(None);
         }
+        if !closing
+            && self.config.turnover_feedback.is_some()
+            && quantity * passive > books[i].available_notional.min(self.rules.max_single_leg)
+        {
+            return Ok(None);
+        }
         let Some(hedge_price) = self.limit(books[j], j, opposite(side), quantity) else {
             return Ok(None);
         };
         let maker_cash = cash(side, passive * quantity, self.config.maker_fee_bps);
         let hedge_cash = cash(opposite(side), hedge_price * quantity, hedge.taker_fee_bps);
-        let queue_ahead = books[i].side(opposite(side))[0].contracts;
         let mut candidate = Candidate {
             edge_bps: Decimal::ZERO,
             passive_entry: false,
-            queue_ahead,
+            queue_ahead: level.contracts,
             price: passive,
             quantity,
             side,
@@ -844,6 +959,105 @@ impl Replay<'_> {
         Some(edge)
     }
 
+    fn turnover_rank(
+        &self,
+        candidate: &Candidate,
+        budget: Option<TurnoverBudget>,
+        best_cost: &mut Option<Decimal>,
+    ) -> std::result::Result<Decimal, &'static str> {
+        let Some(projection) = &candidate.turnover else {
+            return Ok(candidate.edge_bps);
+        };
+        let budget = budget.expect("turnover mode has a budget");
+        let feedback = self.config.turnover_feedback;
+        let overhead = feedback.map_or(Decimal::ZERO, |p| p.overhead(projection.gross));
+        let loss = -projection.fallback_cash
+            + self.config.latency_reserve_bps / BPS * projection.gross
+            + overhead;
+        let reserve = feedback.map_or(Decimal::ZERO, |p| self.cost_feedback.reserve(p));
+        let reserved_loss = loss + reserve * projection.eligible / BPS;
+        if projection.gross > budget.turnover
+            || projection.fees > budget.fees
+            || budget
+                .loss
+                .is_some_and(|remaining| reserved_loss > remaining)
+        {
+            return Err("turnover_budget");
+        }
+        let Some(policy) = self.config.pair.mode.incentive() else {
+            return Ok(candidate.edge_bps);
+        };
+        if projection.eligible <= Decimal::ZERO {
+            return Err("turnover_cost");
+        }
+        let cost_bps = loss * BPS / projection.eligible;
+        let value = best_cost.get_or_insert(cost_bps);
+        *value = (*value).min(cost_bps);
+        let cash =
+            self.ledger.cash - feedback.map_or(Decimal::ZERO, |p| p.overhead(self.ledger.turnover));
+        if !policy.within_cost(cash, self.ledger.eligible_turnover)
+            || !policy.within_cost(-loss, projection.eligible)
+        {
+            return Err("turnover_cost");
+        }
+        if !policy.within_cost(-reserved_loss, projection.eligible) {
+            return Err("turnover_feedback");
+        }
+        Ok(-cost_bps)
+    }
+
+    fn resting_turnover_within_budget(&self, quote: &Quote, now: u64) -> bool {
+        let Some(books) = self.pair_books(now) else {
+            return false;
+        };
+        let i = self.maker();
+        let j = 1 - i;
+        let side = quote.side;
+        let quantity = quote.left;
+        let Some(hedge) = self.limit(books[j], j, opposite(side), quantity) else {
+            return false;
+        };
+        if quantity * quote.price > books[i].available_notional.min(self.rules.max_single_leg)
+            || !books[i].in_bounds(quote.price)
+        {
+            return false;
+        }
+        let maker_cash = cash(side, quote.price * quantity, self.config.maker_fee_bps);
+        let hedge_cash = cash(
+            opposite(side),
+            hedge * quantity,
+            self.config.pair.legs[j].taker_fee_bps,
+        );
+        let mut candidate = Candidate {
+            edge_bps: Decimal::ZERO,
+            passive_entry: false,
+            queue_ahead: quote.ahead,
+            price: quote.price,
+            quantity,
+            side,
+            hedge_limit: Some(hedge),
+            turnover: None,
+        };
+        if self
+            .opening_edge(books, &mut candidate, maker_cash, hedge_cash)
+            .is_none()
+            || candidate.passive_entry != quote.passive_entry
+        {
+            return false;
+        }
+        let mode = self.config.pair.mode;
+        let overhead = self
+            .config
+            .turnover_feedback
+            .map_or(Decimal::ZERO, |p| p.overhead(self.ledger.turnover));
+        let budget = mode.remaining_budget(
+            self.ledger.turnover,
+            self.ledger.fees,
+            self.ledger.cash - overhead,
+        );
+        self.turnover_rank(&candidate, budget, &mut None).is_ok()
+    }
+
     fn quote(&mut self, now: u64) -> Result<()> {
         if self.quote.is_some()
             || self.ioc.is_some()
@@ -868,19 +1082,21 @@ impl Replay<'_> {
         };
         let mode = self.config.pair.mode;
         let incentive = mode.incentive();
+        let feedback = self.config.turnover_feedback.filter(|_| !closing);
         if !closing
             && incentive.is_some_and(|p| !p.active_at(now) || now + horizon >= p.eligible_until_ms)
         {
             self.report.blocked("turnover_eligibility");
             return Ok(());
         }
-        if !closing && mode.realized_loss_exhausted(self.ledger.cash) {
+        let cash =
+            self.ledger.cash - feedback.map_or(Decimal::ZERO, |p| p.overhead(self.ledger.turnover));
+        if !closing && mode.realized_loss_exhausted(cash) {
             self.report.blocked("turnover_loss_limit");
             return Ok(());
         }
-        let budget =
-            mode.remaining_budget(self.ledger.turnover, self.ledger.fees, self.ledger.cash);
-        let mut best: Option<(Decimal, Candidate)> = None;
+        let budget = mode.remaining_budget(self.ledger.turnover, self.ledger.fees, cash);
+        let mut best: Option<(Decimal, Decimal, Candidate)> = None;
         let mut blocked = None;
         let mut best_edge = self.report.best_modeled_edge_bps;
         let mut best_cost = self.report.best_projected_turnover_cost_bps;
@@ -894,52 +1110,45 @@ impl Replay<'_> {
             {
                 continue;
             }
-            let Some(candidate) = self.candidate(books, side, closing)? else {
-                continue;
-            };
-            if !closing {
-                let value = best_edge.get_or_insert(candidate.edge_bps);
-                *value = (*value).max(candidate.edge_bps);
-            }
-            let mut rank = candidate.edge_bps;
-            if let Some(projection) = &candidate.turnover {
-                let budget = budget.expect("turnover mode has a budget");
-                let loss = -projection.fallback_cash
-                    + self.config.latency_reserve_bps / BPS * projection.gross;
-                if projection.gross > budget.turnover
-                    || projection.fees > budget.fees
-                    || budget.loss.is_some_and(|remaining| loss > remaining)
-                {
-                    blocked = Some("turnover_budget");
+            let levels = books[self.maker()].side(opposite(side));
+            let touch = levels[0].price;
+            let max_levels = feedback.map_or(1, |_| MAX_FEEDBACK_LEVELS);
+            for level in levels.iter().take(max_levels) {
+                let distance = (level.price - touch).abs() * BPS / touch;
+                if feedback.is_some_and(|p| distance > p.max_quote_distance_bps) {
+                    break;
+                }
+                let Some(candidate) = self.candidate(books, side, closing, level)? else {
                     continue;
+                };
+                if !closing {
+                    let value = best_edge.get_or_insert(candidate.edge_bps);
+                    *value = (*value).max(candidate.edge_bps);
                 }
-                if let Some(policy) = incentive {
-                    if projection.eligible <= Decimal::ZERO {
-                        blocked = Some("turnover_cost");
+                let rank = match self.turnover_rank(&candidate, budget, &mut best_cost) {
+                    Ok(rank) => rank,
+                    Err(reason) => {
+                        blocked = Some(reason);
                         continue;
                     }
-                    let cost_bps = loss * BPS / projection.eligible;
-                    let value = best_cost.get_or_insert(cost_bps);
-                    *value = (*value).min(cost_bps);
-                    if !policy.within_cost(self.ledger.cash, self.ledger.eligible_turnover)
-                        || !policy.within_cost(-loss, projection.eligible)
-                    {
-                        blocked = Some("turnover_cost");
-                        continue;
-                    }
-                    rank = -cost_bps;
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(prior_distance, prior_rank, prior)| {
+                        (distance, -rank, candidate.queue_ahead)
+                            < (*prior_distance, -*prior_rank, prior.queue_ahead)
+                    })
+                {
+                    best = Some((distance, rank, candidate));
                 }
-            }
-            if best.as_ref().is_none_or(|(prior_rank, prior)| {
-                (rank, prior.queue_ahead) > (*prior_rank, candidate.queue_ahead)
-            }) {
-                best = Some((rank, candidate));
+                // The nearest passing level preserves price priority.
+                break;
             }
         }
         self.report.best_modeled_edge_bps = best_edge;
         self.report.best_projected_turnover_cost_bps = best_cost;
         self.next_quote_ms = now + self.config.reprice_ms;
-        let Some((_, best)) = best else {
+        let Some((distance, _, best)) = best else {
             self.report
                 .blocked(blocked.unwrap_or("size_or_hedge_depth"));
             return Ok(());
@@ -954,6 +1163,9 @@ impl Replay<'_> {
                 "entry_net_edge"
             });
             return Ok(());
+        }
+        if feedback.is_some() && distance > Decimal::ZERO {
+            self.cost_feedback.outward_quotes += 1;
         }
         self.post(now, best, u64::MAX);
         Ok(())
@@ -1105,7 +1317,15 @@ impl Replay<'_> {
         {
             let pnl = self.ledger.cash - cycle.initial_cash;
             let eligible = std::mem::take(&mut self.ledger.cycle_eligible_turnover);
-            self.ledger.eligible_turnover += eligible;
+            if let Some(policy) = self.config.turnover_feedback {
+                if self.report.incomplete.is_none() && self.notices.is_empty() {
+                    self.ledger.eligible_turnover += eligible;
+                    let cost = policy.overhead(self.ledger.turnover - cycle.initial_turnover);
+                    self.cost_feedback.observe(policy, pnl - cost, eligible);
+                }
+            } else {
+                self.ledger.eligible_turnover += eligible;
+            }
             self.report.closed_cycles += 1;
             if cycle.draining {
                 self.report.forced_closes += 1;
@@ -1171,8 +1391,9 @@ impl Replay<'_> {
         }
     }
 
-    fn final_mark(&self) -> Result<Option<Decimal>> {
+    fn final_mark(&self) -> Result<Option<(Decimal, Decimal)>> {
         let mut value = self.ledger.cash;
+        let mut turnover = self.ledger.turnover;
         for (i, position) in self.ledger.positions.into_iter().enumerate() {
             if position.is_zero() {
                 continue;
@@ -1201,8 +1422,9 @@ impl Replay<'_> {
                 return Ok(None);
             }
             value += cash(side, fill.notional, terms.taker_fee_bps);
+            turnover += fill.notional;
         }
-        Ok(Some(value))
+        Ok(Some((value, turnover)))
     }
 
     fn run(
@@ -1277,7 +1499,7 @@ impl Replay<'_> {
                     .as_ref()
                     .is_some_and(|q| q.activated_ms.is_some())
             {
-                self.advance_quote(now);
+                self.advance_quote(now, book_frame);
             }
             self.advance(now)?;
             self.risk(now);
@@ -1293,7 +1515,8 @@ impl Replay<'_> {
         }
         self.report.open_positions_base = self.ledger.positions;
         self.report.fees = self.ledger.fees;
-        self.report.final_liquidation_pnl = self.final_mark()?;
+        let final_mark = self.final_mark()?;
+        self.report.final_liquidation_pnl = final_mark.map(|(cash, _)| cash);
         if !self.ledger.is_flat()
             || self.quote.is_some()
             || self.ioc.is_some()
@@ -1316,6 +1539,31 @@ impl Replay<'_> {
         if self.report.incomplete.is_none() {
             self.report.net_pnl = Some(self.ledger.cash);
             self.report.pnl_before_fees = Some(self.ledger.cash + self.ledger.fees);
+        }
+        if let Some(policy) = self.config.turnover_feedback {
+            let overhead_quote = policy.overhead(self.ledger.turnover);
+            let net_after_overhead = self.report.net_pnl.map(|cash| cash - overhead_quote);
+            let turnover = self.ledger.eligible_turnover;
+            self.report.turnover_feedback = Some(TurnoverFeedbackReport {
+                min_reserve_bps: policy.min_reserve_bps,
+                max_reserve_bps: policy.max_reserve_bps,
+                final_reserve_bps: self.cost_feedback.reserve(policy),
+                max_observed_reserve_bps: policy.min_reserve_bps
+                    + self.cost_feedback.max_excess_reserve_bps,
+                cycles_used: self.cost_feedback.cycles_used,
+                overhead_bps: policy.overhead_bps,
+                overhead_quote,
+                modeled_target_turnover_quote: self.cost_feedback.target_turnover,
+                modeled_eligible_turnover_quote: turnover,
+                venue_credited_turnover_quote: None,
+                net_after_overhead,
+                liquidation_pnl_after_overhead: final_mark
+                    .map(|(cash, gross)| cash - policy.overhead(gross)),
+                realized_cost_bps: net_after_overhead
+                    .filter(|_| turnover > Decimal::ZERO)
+                    .map(|cash| -cash * BPS / turnover),
+                outward_quotes: self.cost_feedback.outward_quotes,
+            });
         }
         Ok(self.report)
     }
@@ -1345,6 +1593,7 @@ pub fn run_maker_first(
         next_ioc_ms: 0,
         notices: VecDeque::new(),
         unhedged_since: None,
+        cost_feedback: CostFeedback::default(),
         report: MakerFirstReport {
             start_ms: config.start_ms,
             end_ms: config.end_ms,
@@ -1383,6 +1632,7 @@ mod tests {
             require_net_edge: false,
             entry_side: None,
             passive_offset: None,
+            turnover_feedback: None,
             maker_fee_bps: Decimal::ONE,
             quote_notional: Decimal::from(100),
             latency_reserve_bps: Decimal::ZERO,
@@ -1391,6 +1641,16 @@ mod tests {
 
     fn d(value: &str) -> Decimal {
         value.parse().unwrap()
+    }
+
+    fn feedback() -> TurnoverFeedback {
+        TurnoverFeedback {
+            min_reserve_bps: d("0.25"),
+            max_reserve_bps: d("4"),
+            alpha: d("0.25"),
+            overhead_bps: d("0.5"),
+            max_quote_distance_bps: d("12"),
+        }
     }
 
     fn books(config: &MakerFirstConfig, at: u64, maker_bid: &str) -> MakerFirstEvent {
@@ -1695,6 +1955,112 @@ mod tests {
         let measured = flat.incentive_turnover.unwrap();
         assert_eq!(measured.filled_turnover_quote, d("80"));
         assert_eq!(measured.realized_cost_bps, Some(d("-2")));
+    }
+
+    #[test]
+    fn turnover_feedback_widens_after_loss_and_returns_to_the_floor() {
+        let mut state = CostFeedback::default();
+        let policy = feedback();
+        assert_eq!(policy.overhead(d("400")), d("0.02"));
+        assert_eq!(state.reserve(policy), d("0.25"));
+        state.observe(policy, d("-0.06"), d("200"));
+        assert_eq!(state.reserve(policy), d("1"));
+        state.observe(policy, d("0.06"), d("200"));
+        assert_eq!(state.reserve(policy), d("0.25"));
+        state.observe(policy, d("-0.06"), Decimal::ZERO);
+        assert_eq!(state.reserve(policy), d("4"));
+        assert_eq!(state.cycles_used, 2);
+        let fixed = TurnoverFeedback {
+            alpha: Decimal::ZERO,
+            ..policy
+        };
+        state = CostFeedback::default();
+        state.observe(fixed, d("-0.06"), Decimal::ZERO);
+        assert_eq!(state.reserve(fixed), d("0.25"));
+    }
+
+    #[test]
+    fn zero_cost_quote_uses_observed_outward_depth_and_counts_only_flat_cycles() {
+        let mut cfg = passive_config(HedgeSide::Buy);
+        cfg.pair.strategy = Strategy::BasisReversion;
+        cfg.pair.legs[0].venue = "arcus".into();
+        cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.limit_buffer_bps = 0.0;
+        cfg.passive_offset.as_mut().unwrap().close_probability = Some([Decimal::ONE; 2]);
+        cfg.pair.mode = PaperMode::Turnover {
+            max_turnover_quote: d("500"),
+            max_fees_quote: d("1"),
+            max_realized_loss_quote: Some(d("0.50")),
+            incentive: Some(IncentiveTurnover {
+                eligible_leg: 0,
+                eligible_from_ms: cfg.start_ms,
+                eligible_until_ms: cfg.end_ms,
+                max_cost_bps: Decimal::ZERO,
+            }),
+        };
+        let run = |cfg: &MakerFirstConfig, observed_at_arrival, close| {
+            let t = cfg.start_ms;
+            let two_levels = |at, deeper| {
+                let mut event = books(cfg, at, "999.8");
+                if let MakerFirstEvent::Book { books, .. } = &mut event
+                    && deeper
+                {
+                    books[0].bids.push(Level {
+                        price: d("999.0"),
+                        contracts: d("0.10"),
+                    });
+                }
+                event
+            };
+            let mut events = vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t,
+                    leg: 0,
+                    online: true,
+                },
+                two_levels(t, true),
+                two_levels(t + 100, observed_at_arrival),
+                print_against(t + 110, HedgeSide::Buy, "999.0", "0.04"),
+                print_against(t + 120, HedgeSide::Buy, "998.9", "0.04"),
+                two_levels(t + 220, true),
+                two_levels(t + 320, true),
+            ];
+            if close {
+                events.extend([
+                    print_against(t + 330, HedgeSide::Sell, "1000.3", "0.04"),
+                    two_levels(t + 430, true),
+                    MakerFirstEvent::TradeFeed {
+                        at_ms: t + 431,
+                        leg: 0,
+                        online: false,
+                    },
+                    two_levels(t + 1_500, true),
+                    two_levels(t + 2_000, true),
+                ]);
+            }
+            events.push(MakerFirstEvent::End { at_ms: cfg.end_ms });
+            run_maker_first(cfg, events.into_iter().map(Ok), &VenueRegistry::default()).unwrap()
+        };
+        assert_eq!(run(&cfg, true, true).quotes_submitted, 0);
+        cfg.turnover_feedback = Some(feedback());
+        let missing = run(&cfg, false, false);
+        assert_eq!(missing.maker_fills, 0);
+        assert!(missing.post_only_rejected > 0);
+        let open = run(&cfg, true, false).turnover_feedback.unwrap();
+        assert_eq!(open.cycles_used, 0);
+        assert_eq!(open.modeled_target_turnover_quote, d("39.96"));
+        assert_eq!(open.modeled_eligible_turnover_quote, Decimal::ZERO);
+        assert!(open.net_after_overhead.is_none());
+        let flat = run(&cfg, true, true);
+        assert_eq!(flat.maker_fills, 2, "{flat:?}");
+        let measured = flat.turnover_feedback.unwrap();
+        assert!(measured.outward_quotes > 0);
+        assert_eq!(measured.cycles_used, 1);
+        assert_eq!(measured.modeled_eligible_turnover_quote, d("79.968"));
+        assert_eq!(measured.net_after_overhead, Some(d("0.0440016")));
+        assert!(measured.realized_cost_bps.unwrap() < Decimal::ZERO);
+        assert!(measured.venue_credited_turnover_quote.is_none());
     }
 
     #[test]

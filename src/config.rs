@@ -395,6 +395,9 @@ pub struct InventoryNeutralMMConfig {
     /// Reserve for short-horizon pressure in the external Hyperliquid book.
     #[serde(default)]
     pub order_flow_reserve: Option<OrderFlowReserveConfig>,
+    /// Directional reserve for transient cross-market price and depth pressure.
+    #[serde(default)]
+    pub cross_market_reserve: Option<CrossMarketReserveConfig>,
     /// Adjust inventory-adding quotes using completed external price ranges.
     #[serde(default)]
     pub volatility_regime: Option<VolatilityRegimeConfig>,
@@ -413,6 +416,17 @@ pub struct MarkoutReserveConfig {
 pub struct OrderFlowReserveConfig {
     pub half_life_ms: u64,
     pub max_widen_bps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossMarketReserveConfig {
+    pub half_life_ms: u64,
+    pub max_quote_skew_ms: u64,
+    pub max_widen_bps: f64,
+    /// One-way placement delay used to discount the signal through arrival.
+    #[serde(default)]
+    pub execution_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -563,6 +577,16 @@ impl InventoryNeutralMMConfig {
                 "{name}: invalid order flow reserve"
             );
         }
+        if let Some(reserve) = self.cross_market_reserve {
+            anyhow::ensure!(
+                (1..=60_000).contains(&reserve.half_life_ms)
+                    && reserve.max_quote_skew_ms <= 60_000
+                    && reserve.execution_delay_ms <= 10_000
+                    && reserve.max_widen_bps > 0.0
+                    && reserve.max_widen_bps <= self.max_spread_bps,
+                "{name}: invalid cross-market reserve"
+            );
+        }
         if let Some(regime) = self.volatility_regime {
             anyhow::ensure!(
                 (0.01..=1_000.0).contains(&regime.range_trigger_bps)
@@ -697,6 +721,7 @@ impl Default for InventoryNeutralMMConfig {
             markout_threshold_bps: default_markout_threshold_bps(),
             markout_reserve: None,
             order_flow_reserve: None,
+            cross_market_reserve: None,
             volatility_regime: None,
         }
     }

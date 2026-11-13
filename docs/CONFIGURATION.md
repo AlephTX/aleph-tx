@@ -58,6 +58,21 @@ inventory at the modeled venue delays.
 [Cross-venue crypto price discovery](https://arxiv.org/abs/2108.09750) ·
 [Oasis cadence comparison](PERP_RELATIVE_VALUE.md#quote-cadence-and-hedge-recovery-2026-11-13)
 
+The optional `[inventory_neutral_mm.cross_market_reserve]` table measures
+the transient Hyperliquid–Lighter midpoint basis relative to an EWMA and
+adds the Hyperliquid microprice offset derived from displayed bid and ask
+sizes. A positive reading widens inventory-adding asks, and a negative
+reading widens inventory-adding bids. The estimate uses fresh, two-sided
+books within `max_quote_skew_ms` and updates once per timestamp pair.
+`half_life_ms` controls the basis EWMA and discounts the signal through
+the age of the older book plus `execution_delay_ms`. Set the latter to the
+modeled one-way placement delay. `max_widen_bps` bounds the reserve.
+This quote adjustment shares the existing spread cap, profit floors
+and inventory controls. The default profile disables it.
+[Cross-venue price discovery](https://arxiv.org/abs/2108.09750) ·
+[Book pressure and related-market signals](https://blog.headlandstech.com/2017/08/03/quantitative-trading-summary/) ·
+[Limit order placement and latency](https://arxiv.org/abs/1610.00261)
+
 The optional `[inventory_neutral_mm.volatility_regime]` table uses the
 last five completed one-minute ranges from native Hyperliquid midpoints.
 The strategy samples at most once per receipt-time second and requires

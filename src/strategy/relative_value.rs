@@ -189,10 +189,39 @@ pub struct PairConfig {
     /// For funding carry, consider exiting after each reachable settlement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optimize_funding_horizon: bool,
+    /// Optional conservative policy for variable funding carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_carry_policy: Option<FundingCarryPolicy>,
     /// Simulate a protected close of a confirmed single-leg residual after
     /// all orders in the failed pair execution have become terminal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recover_single_leg: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingCarryPolicy {
+    /// Haircut favorable cash flows as the forecast-to-settlement time grows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit_half_life_ms: Option<u64>,
+    /// Entry floor on modeled net return per day of gross two-leg notional.
+    #[serde(
+        default,
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_net_return_bps_per_day: Option<Decimal>,
+}
+
+impl FundingCarryPolicy {
+    fn credit_factor(self, observed_at_ms: u64, payment_at_ms: u64) -> Decimal {
+        self.credit_half_life_ms.map_or(Decimal::ONE, |half_life| {
+            let horizon = (payment_at_ms - observed_at_ms) as f64;
+            // Round down at one part per billion. Tiny forecasts may contribute zero.
+            let ppb = ((-horizon / half_life as f64).exp2() * 1e9).floor() as i64;
+            Decimal::new(ppb, 9)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +545,8 @@ pub enum Rejection {
     Capacity,
     #[error("conservative net edge is below threshold")]
     Edge,
+    #[error("modeled funding return is below the daily gross notional floor")]
+    FundingReturnBelowFloor,
     #[error("no common lot fits the remaining turnover, fee and loss budget")]
     TurnoverBudget,
     #[error("completed turnover cycles exhausted the realized loss budget")]
@@ -550,6 +581,7 @@ pub enum EntryGate {
     FundingForecast,
     Capacity,
     NetEdge,
+    FundingReturnBelowFloor,
     LatencyWindow,
     FundingGuard,
     TurnoverBudget,
@@ -583,6 +615,7 @@ impl EntryGate {
             Self::TurnoverLossLimit => Rejection::TurnoverLossLimit,
             Self::TurnoverCost => Rejection::TurnoverCost,
             Self::TurnoverEligibility => Rejection::TurnoverEligibility,
+            Self::FundingReturnBelowFloor => Rejection::FundingReturnBelowFloor,
             Self::FundingNoCredit | Self::NetEdge => Rejection::Edge,
         }
     }
@@ -640,6 +673,12 @@ pub struct Plan {
     pub net_edge: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub net_edge_bps: Decimal,
+    /// Modeled return on gross two-leg notional per planned day, including unwind.
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub funding_return_bps_per_day: Option<Decimal>,
     /// Turnover and fees at the four modeled IOC limits.
     #[serde(with = "rust_decimal::serde::str")]
     pub modeled_turnover_quote: Decimal,
@@ -653,6 +692,15 @@ pub struct Plan {
     pub hold_until_ms: u64,
     pub unwind_until_ms: u64,
     pub hedge: HedgePlan,
+}
+
+impl Plan {
+    fn funding_rank(&self) -> (Decimal, Decimal) {
+        (
+            self.funding_return_bps_per_day.unwrap_or(self.net_edge),
+            self.net_edge,
+        )
+    }
 }
 
 type Decision<T> = std::result::Result<T, Rejection>;
@@ -738,6 +786,20 @@ impl PairConfig {
 
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
         self.planner.validate()?;
+        if let Some(policy) = self.funding_carry_policy {
+            ensure!(
+                self.strategy == Strategy::FundingCarry
+                    && (policy.credit_half_life_ms.is_some()
+                        || policy.min_net_return_bps_per_day.is_some())
+                    && policy
+                        .credit_half_life_ms
+                        .is_none_or(|value| (1..=30 * DAY_MS).contains(&value))
+                    && policy
+                        .min_net_return_bps_per_day
+                        .is_none_or(|value| (Decimal::ZERO..=BPS).contains(&value)),
+                "invalid funding carry policy"
+            );
+        }
         if let PaperMode::Turnover {
             max_turnover_quote,
             max_fees_quote,
@@ -1356,7 +1418,7 @@ impl RelativeValue {
                 Ok(plan)
                     if best
                         .as_ref()
-                        .is_none_or(|previous| plan.net_edge > previous.net_edge) =>
+                        .is_none_or(|previous| plan.funding_rank() > previous.funding_rank()) =>
                 {
                     best = Some(plan);
                 }
@@ -1477,7 +1539,7 @@ impl RelativeValue {
         };
         let rank = |plan: &Plan| match plan.modeled_eligible_turnover_quote {
             Some(turnover) => (plan.net_edge / turnover, turnover),
-            None => (plan.net_edge, Decimal::ZERO),
+            None => plan.funding_rank(),
         };
         for buy_leg in 0..2 {
             if self.config.strategy == Strategy::BasisReversion
@@ -1513,6 +1575,7 @@ impl RelativeValue {
                 Err(reason) => {
                     let gate = match reason {
                         Rejection::Edge => EntryGate::NetEdge,
+                        Rejection::FundingReturnBelowFloor => EntryGate::FundingReturnBelowFloor,
                         Rejection::TurnoverBudget => EntryGate::TurnoverBudget,
                         Rejection::TurnoverCost => EntryGate::TurnoverCost,
                         _ => EntryGate::Capacity,
@@ -1573,8 +1636,14 @@ impl RelativeValue {
                 let credit = self.config.strategy == Strategy::FundingCarry
                     && time > entry_until
                     && time < hold_until;
-                bound += if credit {
+                bound += if credit && lower > Decimal::ZERO {
                     lower
+                        * self
+                            .config
+                            .funding_carry_policy
+                            .map_or(Decimal::ONE, |policy| {
+                                policy.credit_factor(forecast.observed_at_ms, time)
+                            })
                 } else {
                     lower.min(Decimal::ZERO)
                 };
@@ -1612,6 +1681,7 @@ impl RelativeValue {
         let mut best: Option<((Decimal, Decimal), Decimal, Economics)> = None;
         let mut sized = false;
         let mut budget_blocked = false;
+        let mut funding_return_blocked = false;
         let mids = frame.legs.each_ref().map(|leg| leg.book.mid());
         let days = Decimal::from(score.window[2] - frame.now_ms) / Decimal::from(DAY_MS);
         let budget = frame
@@ -1636,6 +1706,23 @@ impl RelativeValue {
         let acceptable = |net, economics: &Economics| match incentive {
             Some(policy) => policy.within_cost(net, economics.leg_turnover(policy.eligible_leg)),
             None => net > Decimal::ZERO && net_bps(net) >= self.rules.min_edge,
+        };
+        let daily_return = |net: Decimal, econ: &Economics| {
+            self.config.funding_carry_policy.map(|_| {
+                // Reserve both legs at their risk prices. This gross proxy
+                // avoids treating venue margin or net delta as free capital.
+                let gross_per_base = risk_price(0, econ) + risk_price(1, econ);
+                net * BPS / (gross_per_base * days)
+            })
+        };
+        let daily_floor = self
+            .config
+            .funding_carry_policy
+            .and_then(|p| p.min_net_return_bps_per_day);
+        let below_daily_floor = |net, econ: &Economics| {
+            daily_floor
+                .zip(daily_return(net, econ))
+                .is_some_and(|(min, actual)| actual < min)
         };
         for candidate in candidates {
             let mut qty = floor_step(candidate, self.step).map_err(|_| Rejection::Capacity)?;
@@ -1665,6 +1752,10 @@ impl RelativeValue {
             if !acceptable(net, &econ) {
                 continue;
             }
+            if below_daily_floor(net, &econ) {
+                funding_return_blocked = true;
+                continue;
+            }
             if let Some(limit) = options.turnover_budget {
                 let affordable = limit.cap(qty, &econ, net);
                 if affordable < qty {
@@ -1684,6 +1775,10 @@ impl RelativeValue {
                     if !acceptable(net, &econ) {
                         continue;
                     }
+                    if below_daily_floor(net, &econ) {
+                        funding_return_blocked = true;
+                        continue;
+                    }
                 }
             }
             let rank = match incentive {
@@ -1699,6 +1794,8 @@ impl RelativeValue {
         }
         let (_, qty, econ) = best.ok_or(if budget_blocked {
             Rejection::TurnoverBudget
+        } else if funding_return_blocked {
+            Rejection::FundingReturnBelowFloor
         } else if sized && incentive.is_some() {
             Rejection::TurnoverCost
         } else if sized {
@@ -1730,6 +1827,7 @@ impl RelativeValue {
             capital_charge: econ.capital * qty,
             net_edge: net * qty,
             net_edge_bps: net / frame.reference.price * BPS,
+            funding_return_bps_per_day: daily_return(net, &econ),
             modeled_turnover_quote: econ.turnover_per_base() * qty,
             modeled_fees_quote: econ.fees * qty,
             modeled_eligible_turnover_quote: incentive

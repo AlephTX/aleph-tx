@@ -1,3 +1,4 @@
+use crate::config::CrossMarketReserveConfig;
 use crate::shm_reader::{NUM_EXCHANGES, ShmBboMessage};
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +102,78 @@ impl OrderFlow {
 
     fn decay(&self, age_ns: u64, half_life_ms: u64) -> f64 {
         self.value * 2.0_f64.powf(-(age_ns as f64) / (1_000_000.0 * half_life_ms as f64))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CrossMarketPressure {
+    times_ns: [u64; 2],
+    basis_bps: f64,
+    pressure_bps: f64,
+}
+
+impl CrossMarketPressure {
+    pub(super) fn observe(
+        &mut self,
+        local: &ShmBboMessage,
+        external: Option<ShmBboMessage>,
+        now_ns: u64,
+        max_age_ms: [u64; 2],
+        config: CrossMarketReserveConfig,
+    ) -> f64 {
+        let valid = |book: &ShmBboMessage, age| {
+            valid_quoteable_book(book)
+                && book.bid_price > 0.0
+                && book.ask_price > book.bid_price
+                && book.bid_size > 0.0
+                && book.ask_size > 0.0
+                && !is_stale_bbo(book.timestamp_ns, now_ns, age)
+        };
+        let Some(external) = external.filter(|b| {
+            valid(local, max_age_ms[0])
+                && valid(b, max_age_ms[1])
+                && local.timestamp_ns.abs_diff(b.timestamp_ns)
+                    <= config.max_quote_skew_ms * 1_000_000
+        }) else {
+            *self = Self::default();
+            return 0.0;
+        };
+        let times = [local.timestamp_ns, external.timestamp_ns];
+        let [local_prior, external_prior] = self.times_ns;
+        if times[0] < local_prior || times[1] < external_prior {
+            *self = Self::default();
+            return 0.0;
+        }
+        let half_life_ns = config.half_life_ms as f64 * 1_000_000.0;
+        if times != self.times_ns {
+            let local_mid = 0.5 * local.bid_price + 0.5 * local.ask_price;
+            let external_mid = 0.5 * external.bid_price + 0.5 * external.ask_price;
+            let basis = (external_mid.ln() - local_mid.ln()) * 10_000.0;
+            let size_scale = external.bid_size.max(external.ask_size);
+            let bid = external.bid_size / size_scale;
+            let ask = external.ask_size / size_scale;
+            let microprice_offset = (bid - ask) / (bid + ask)
+                * ((external.ask_price - external.bid_price) / external_mid)
+                * 5_000.0;
+            if local_prior == 0
+                || is_stale_bbo(local_prior, times[0], max_age_ms[0])
+                || is_stale_bbo(external_prior, times[1], max_age_ms[1])
+            {
+                self.basis_bps = basis;
+            } else {
+                let elapsed_ns = times[0].max(times[1]) - local_prior.max(external_prior);
+                let alpha = 1.0 - 2.0_f64.powf(-(elapsed_ns as f64) / half_life_ns);
+                self.basis_bps += alpha * (basis - self.basis_bps);
+            }
+            self.times_ns = times;
+            self.pressure_bps = basis - self.basis_bps + microprice_offset;
+        }
+        // Both legs contribute to the estimate. Discount through the age of
+        // the older book plus the time until the new quote can be executed.
+        let age_ns = now_ns - times[0].min(times[1]);
+        let horizon_ns = age_ns as f64 + config.execution_delay_ms as f64 * 1_000_000.0;
+        (self.pressure_bps * 2.0_f64.powf(-horizon_ns / half_life_ns))
+            .clamp(-config.max_widen_bps, config.max_widen_bps)
     }
 }
 
@@ -303,6 +376,99 @@ mod tests {
         book.timestamp_ns += 500_000_000;
         book.ask_size = 5.0;
         assert!(flow.observe(Some(book), book.timestamp_ns, age, half_life) < 0.0);
+    }
+
+    #[test]
+    fn cross_market_reserve_discounts_basis_and_book_pressure_through_execution() {
+        let mut pressure = CrossMarketPressure::default();
+        let config = CrossMarketReserveConfig {
+            half_life_ms: 500,
+            max_quote_skew_ms: 200,
+            max_widen_bps: 3.0,
+            execution_delay_ms: 500,
+        };
+        let ages = [1_000, 1_000];
+        let start = 1_000_000_000;
+        let mut local = msg(99.98, 100.02, start);
+        let mut external = msg(100.98, 101.02, start);
+        // A persistent venue premium contributes no initial basis signal.
+        assert_eq!(
+            pressure.observe(&local, Some(external), start, ages, config),
+            0.0
+        );
+
+        let next = start + 500_000_000;
+        local.timestamp_ns = next;
+        external.timestamp_ns = next;
+        external.bid_price += 0.04;
+        external.ask_price += 0.04;
+        external.bid_size = 3.0;
+        let value = pressure.observe(&local, Some(external), next, ages, config);
+        let basis_move = (101.04_f64 / 101.0).ln() * 10_000.0;
+        let obi_offset = 0.5 * (0.04 / 101.04) * 5_000.0;
+        assert!((value - (0.5 * basis_move + obi_offset) * 0.5).abs() < 1e-8);
+
+        // A repeated publication can only age the existing signal.
+        external.ask_size = 10.0;
+        let repeated = pressure.observe(&local, Some(external), next + 500_000_000, ages, config);
+        assert!((repeated - 0.5 * value).abs() < 1e-8);
+        assert_eq!(
+            pressure.observe(&local, Some(external), next + 1_001_000_000, ages, config),
+            0.0
+        );
+    }
+
+    #[test]
+    fn cross_market_reserve_reanchors_after_skew_and_rejects_clock_regression() {
+        let mut pressure = CrossMarketPressure::default();
+        let config = CrossMarketReserveConfig {
+            half_life_ms: 500,
+            max_quote_skew_ms: 200,
+            max_widen_bps: 0.25,
+            execution_delay_ms: 0,
+        };
+        let ages = [1_000, 1_000];
+        let start = 1_000_000_000;
+        let mut local = msg(99.98, 100.02, start);
+        let mut external = msg(99.98, 100.02, start);
+        assert_eq!(
+            pressure.observe(&local, Some(external), start, ages, config),
+            0.0
+        );
+
+        let next = start + 500_000_000;
+        local.timestamp_ns = next;
+        external.timestamp_ns = next;
+        external.bid_price -= 0.04;
+        external.ask_price -= 0.04;
+        assert_eq!(
+            pressure.observe(&local, Some(external), next, ages, config),
+            -0.25
+        );
+
+        let later = next + 250_000_000;
+        local.timestamp_ns = later;
+        assert_eq!(
+            pressure.observe(&local, Some(external), later, ages, config),
+            0.0
+        );
+        external.timestamp_ns = later;
+        assert_eq!(
+            pressure.observe(&local, Some(external), later, ages, config),
+            0.0
+        );
+
+        local.timestamp_ns -= 1;
+        external.ask_size = 5.0;
+        assert_eq!(
+            pressure.observe(&local, Some(external), later, ages, config),
+            0.0
+        );
+        local.timestamp_ns = later + 1;
+        assert_eq!(
+            pressure.observe(&local, Some(external), later, ages, config),
+            0.0
+        );
     }
 
     #[test]
