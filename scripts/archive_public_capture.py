@@ -19,6 +19,7 @@ SOURCES = {
     'lighter': ('lighter', 'core'), 'lighter_trades': ('lighter', 'core'),
     'lighter_robinhood': ('lighter', 'robinhood'), 'lighter_robinhood_trades': ('lighter', 'robinhood'),
     'extended': ('extended', 'mainnet'), 'extended_trades': ('extended', 'mainnet'),
+    'extended_index': ('extended', 'mainnet'),
     'arcus': ('arcus', 'mainnet'), 'arcus_snapshot': ('arcus', 'mainnet'),
     'bulk': ('bulk', 'mainnet'), 'bulk_snapshot': ('bulk', 'mainnet'),
     'coinbase': ('coinbase', 'spot'), 'collector': ('collector', 'session'),

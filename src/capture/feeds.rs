@@ -34,6 +34,7 @@ pub(super) struct LegFeed<'a> {
     book_from_snapshot: bool,
     latest_full_book_ms: u64,
     context: Option<ContextTick>,
+    extended_index_sequence: u64,
     lighter_clock: LighterClockAudit,
 }
 
@@ -48,6 +49,7 @@ impl<'a> LegFeed<'a> {
             book_from_snapshot: false,
             latest_full_book_ms: 0,
             context: None,
+            extended_index_sequence: 0,
             lighter_clock: LighterClockAudit::default(),
         }
     }
@@ -55,7 +57,9 @@ impl<'a> LegFeed<'a> {
     pub fn accepts(&self, source: &str) -> bool {
         match self.venue.as_str() {
             "lighter" | "lighter_robinhood" => source == self.venue,
-            "extended" => source == "extended",
+            "extended" => {
+                source == "extended" || (source == "extended_index" && self.config.external_oracle)
+            }
             "arcus" | "bulk" => {
                 let rest_venue = source.strip_suffix("_snapshot");
                 rest_venue.unwrap_or(source) == self.venue
@@ -91,6 +95,10 @@ impl<'a> LegFeed<'a> {
                 self.depth = LighterDepth::default();
                 self.book = None;
             }
+            "extended_index" => {
+                self.context = None;
+                self.extended_index_sequence = 0;
+            }
             _ => {
                 self.context = None;
                 self.invalidate_full_book(false);
@@ -110,6 +118,11 @@ impl<'a> LegFeed<'a> {
 
     pub fn context(&self) -> Option<ContextTick> {
         self.context
+    }
+
+    pub fn invalidate_extended_index(&mut self) {
+        self.context = None;
+        self.extended_index_sequence = u64::MAX;
     }
 
     pub fn clock_audit(&self) -> Option<LighterClockAudit> {
@@ -135,8 +148,52 @@ impl<'a> LegFeed<'a> {
                 self.apply_external_book(payload, received, source)
             }
             "extended" => self.apply_extended(payload, received),
+            "extended_index" => self.apply_extended_index(payload, received),
             _ => self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot"),
         }
+    }
+
+    fn apply_extended_index(&mut self, payload: &Value, received: u64) -> Result<Change> {
+        let data = &payload["data"];
+        if data["m"].as_str() != Some(self.market.as_str()) {
+            return Ok(Change::Other);
+        }
+        let sequence = payload["seq"]
+            .as_u64()
+            .context("missing Extended index sequence")?;
+        let calculated = data["ts"].as_u64().context("missing Extended index time")?;
+        let published = payload["ts"]
+            .as_u64()
+            .context("missing Extended publication time")?;
+        ensure!(
+            payload["type"] == "IP" && calculated <= published,
+            "invalid Extended index publication"
+        );
+        let prior = self.extended_index_sequence;
+        if sequence == 0 || (prior != 0 && prior.checked_add(1) != Some(sequence)) {
+            // Block all publications until a disconnect resets the sequence.
+            self.invalidate_extended_index();
+            return Ok(Change::Gap);
+        }
+        self.extended_index_sequence = sequence;
+        let Some(timestamp) = self
+            .source_time(calculated, received)
+            .filter(|_| self.source_time(published, received).is_some())
+        else {
+            self.context = None;
+            return Ok(Change::Clock(published.saturating_sub(received)));
+        };
+        if self
+            .context
+            .is_some_and(|previous| timestamp < previous.oracle.timestamp_ms)
+        {
+            self.invalidate_extended_index();
+            return Ok(Change::Clock(0));
+        }
+        let price =
+            Decimal::from_str_exact(data["p"].as_str().context("missing Extended index price")?)?;
+        self.set_context(timestamp, price, None, None, None)?;
+        Ok(Change::Other)
     }
 
     fn apply_extended(&mut self, payload: &Value, received: u64) -> Result<Change> {

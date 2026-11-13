@@ -64,6 +64,37 @@ class PublicArchiveTests(unittest.TestCase):
         self.assertEqual([e.get('online') for e in events if e['kind'] == 'trade_feed'], [True, False, True])
         self.assertEqual([e['source_ms'] for e in events if e['kind'] == 'trade'], [self.t + 1, self.t + 6])
 
+    def test_venue_trade_updates_preserve_source_time_after_reconnect(self):
+        cases = [('lighter_trades', 'lighter', '1'),
+                 ('lighter_robinhood_trades', 'lighter_robinhood', '1'),
+                 ('extended_trades', 'extended', 'BTC-USD')]
+        for source, venue, market in cases:
+            with self.subTest(venue=venue):
+                def publication(at, stamp, trade_id, *, subscribed):
+                    if source != 'extended_trades':
+                        payload = {'type': 'subscribed/trade' if subscribed else 'update/trade',
+                                   'channel': 'trade:1', 'trades': [{'trade_id': trade_id, 'market_id': 1,
+                                   'timestamp': self.t + stamp, 'price': '100', 'size': '0.1', 'is_maker_ask': True}]}
+                    else:
+                        payload = {'seq': 1 if subscribed else 2, 'data': [{'m': market, 'i': trade_id,
+                                   'T': self.t + stamp, 'p': '100', 'q': '0.1', 'S': 'BUY', 'tT': 'TRADE'}]}
+                    return self.row(source, 'message', at, market if venue == 'extended' else None, payload)
+
+                # The venue clock trails the receiver by tens of milliseconds.
+                # The update follows a new subscription but has an earlier venue time.
+                events = [publication(20, 1, 1, subscribed=True), publication(24, 10, 2, subscribed=False),
+                          self.row(source, 'disconnect', 30), publication(40, 20, 3, subscribed=True),
+                          publication(45, 22, 4, subscribed=False),
+                          self.row('collector', 'end', 50)]
+                source_file = self.root / f'{venue}.ndjson'
+                source_file.write_text(''.join(json.dumps(row) + '\n' for row in events))
+                archive = self.root / f'{venue}-archive'
+                ingest(source_file, archive)
+                replay = list(trade_events(archive, venue, market, 0))
+                self.assertEqual([row.get('online') for row in replay if row['kind'] == 'trade_feed'], [True, False, True])
+                self.assertEqual([(row['at_ms'], row['source_ms']) for row in replay if row['kind'] == 'trade'],
+                                 [(self.t + 25, self.t + 10), (self.t + 46, self.t + 22)])
+
     def test_funding_availability_comes_from_receive_time(self):
         _, archive = self.capture([self.row('hyperliquid_funding', 'message', 8000, 'ETH', {'data': [
             {'coin': 'ETH', 'fundingRate': '-0.0001', 'time': self.t + 76}]}), self.row('collector', 'end', 9000)])

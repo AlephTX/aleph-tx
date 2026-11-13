@@ -381,7 +381,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				}
 			}
 			continue
-		case "extended", "extended_trades":
+		case "extended", "extended_trades", "extended_index":
 			next, err := extendedPublication(raw, source, extendedSequence)
 			if err != nil {
 				return err
@@ -579,6 +579,7 @@ func run() error {
 	rhTrades := flag.Bool("lighter-robinhood-trades", false, "record Robinhood Chain Lighter public trades")
 	lighterTrades := flag.Bool("lighter-trades", false, "record Lighter public trades on a separate connection")
 	extended := flag.String("extended", "", "comma-separated active Extended CLOB perpetuals for public depth and trades")
+	extendedIndex := flag.Bool("extended-index", false, "record Extended public index prices for the selected markets")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
 	hlTrades := flag.Bool("hl-trades", false, "record Hyperliquid public trades and subscription acknowledgments")
 	hlFunding := flag.Duration("hl-funding-interval", 0, "poll public Hyperliquid funding history (minimum 1m)")
@@ -602,6 +603,9 @@ func run() error {
 	}
 	if *hlFastBook && *hl == "" {
 		return errors.New("fast books need Hyperliquid markets")
+	}
+	if *extendedIndex && *extended == "" {
+		return errors.New("-extended-index requires -extended markets")
 	}
 	sources, err := subscriptions(*lighter, *hl, *coinbase, *arcus, *bulk, *arcusWS, *bulkWS, *snapshotInterval, *clockRefresh, *hlFastBook)
 	if err != nil {
@@ -633,7 +637,7 @@ func run() error {
 	}
 	if *extended != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		extra, err := extendedSubscriptions(ctx, *extended)
+		extra, err := extendedSubscriptions(ctx, *extended, *extendedIndex)
 		cancel()
 		if err != nil {
 			return err

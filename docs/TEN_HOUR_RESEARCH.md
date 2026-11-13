@@ -153,6 +153,81 @@ execution/production qualification remains false until separate source
 quality and account-cost evidence are reviewed. Successful simulation does
 not establish actual venue fills or incentive credit.
 
+### Paired experiments
+
+For ETH quant, use the same 12 bps Core Standard baseline and tape in both
+arms. The experimental arm withdraws an inventory-increasing quote when
+the native Hyperliquid best-level size imbalance reaches 0.60 against
+that side and the source timestamp is no older than 250 ms. It preserves
+quotes that may close inventory and uses the existing cancel/fill lifecycle.
+The runner reports each ledger's net dollars per hour after modeled
+overhead, quote withdrawals, late cancels, turnover and one-second Maker
+markout. Compare complete ledgers on the same market interval.
+
+```sh
+python3 scripts/replay_quant_participation.py target/release/maker_replay \
+  /path/to/ten-hour-scenario-output /path/to/new-eth-quant-study --capital 500
+```
+
+For Extended × Lighter basis, compile a tape with both venue indices, an
+independent Coinbase reference and a declared paper notional allowance.
+Use `--route lighter-extended` with the archived compiled tape. The route
+uses 0/2.5 bps reference taker fees, a 550 ms one-way stress scenario and
+the same terminal drain as the native Hyperliquid baseline. A fee override
+is recorded as a sensitivity case. Public fees are account assumptions.
+
+```sh
+python3 scripts/replay_ten_hour_arbitrage.py target/release/cross_venue \
+  /path/to/ETH-lighter-extended.ndjson.zst /path/to/new-eth-basis-study \
+  --route lighter-extended --public-archive /path/to/venue-archive --start-ms UTC_MS
+```
+
+Extended × Lighter turnover uses the same archived market data with the
+`--turnover-venue extended --turnover-fees-bps 0 2.5` controls. Each opening
+posture and cost allowance gets an independent ledger. Compare net cost
+after both legs exit alongside target-venue volume and unhedged duration.
+Points and unconfirmed rebates carry zero value. Keep Robinhood Chain data
+under its own market domain and fee assumptions.
+[Extended fee schedule](https://docs.extended.exchange/extended-resources/trading/trading-fees-and-rebates)
+
+### Historical fee attribution
+
+Oasis job `basis-fee-attribution-20261113T173628Z` replayed the original
+ten-hour BTC/ETH interval with unchanged depth, signal and 550 ms delay.
+Each arm consumed its tape and completed a 60-second terminal drain.
+
+| Asset | Best modeled edge, reference fees | Best modeled edge, zero explicit fees | Entries in either arm |
+| --- | ---: | ---: | ---: |
+| BTC | −14.71 bps | −5.71 bps | 0 |
+| ETH | −15.32 bps | −6.30 bps | 0 |
+
+Reducing explicit fees recovers about 9 bps of modeled edge. The current
+signal still falls short of its full execution and exit hurdle on this
+historical window. Both arms have zero traded volume. The result isolates
+the fee effect for this policy and window. The new ETH participation and
+Extended route still require a complete real-market evaluation.
+
+### Fresh Oasis runs
+
+The 75-second Extended index smoke archived 51 BTC and 50 ETH index
+messages. The compiler found 677 BTC and 671 ETH frames with fresh books,
+venue indices and the independent reference. The smoke establishes source
+compatibility and supplies no strategy PnL.
+
+| Public source or run | Oasis research directory |
+| --- | --- |
+| Shared Core/Robinhood/Hyperliquid/Extended/Coinbase capture | `2026-11-13-continuous10h-153508` |
+| Hyperliquid trades, books and hourly funding history | `hyperliquid-public-10h-20261113T173441Z` |
+| Extended and Core Lighter with same-clock index evidence | `extended-lighter-index-10h-20261113T174747Z` |
+| Frozen independent replay job | `independent-profit-validation-20261113T174809Z` |
+
+The one-shot replay job waits for each sealed source. Quant and turnover
+use a common ten-hour window on the shared capture. Extended basis uses a
+later ten-hour window on the indexed capture. The job records the separate
+decision boundaries and retains individual reports. Do not compare these
+different windows as a paired experiment. The jobs were pending at this
+writing. No profit or turnover qualification is inferred from capture status.
+
 ## Oasis evidence — 2026-11-13
 
 An allowlisted content inventory found 340 unique public market archives

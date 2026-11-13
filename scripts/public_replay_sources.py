@@ -55,8 +55,9 @@ def trade_events(archive, venue, market, leg):
                     raise ValueError('conflicting duplicate public trade')
                 continue
             seen[key] = value
-            # Cached prints from before the acknowledgment cannot fill a new quote.
-            if not subscribed and stamp >= online_since:
+            # Lighter and Extended mark subscription snapshots on the wire.
+            # Keep the conservative cutoff for unmarked Hyperliquid trade batches.
+            if not subscribed and (source != 'hyperliquid_trades' or stamp >= online_since):
                 yield {'kind': 'trade', 'at_ms': at, 'leg': leg, 'source_ms': stamp,
                        'aggressor': side, 'price': str(price), 'contracts': str(size)}
 

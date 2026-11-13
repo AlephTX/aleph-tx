@@ -988,6 +988,8 @@ mod tests {
             order_flow_bps: 0.0,
             cross_market_bps: 0.0,
             volatility_pressure: 0.0,
+            #[cfg(feature = "research-replay")]
+            participation_bbo: None,
         };
         let (bid, ask, baseline) = strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
         inputs.cross_market_bps = -3.0;

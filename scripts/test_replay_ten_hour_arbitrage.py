@@ -48,7 +48,7 @@ class TenHourRunnerTests(unittest.TestCase):
             "tradable": True,
         }} for allowance in ("0", "150")]}
 
-    def replay(self, rows=None, decompressor_exit=0, timeout=5, suffix=""):
+    def replay(self, rows=None, decompressor_exit=0, timeout=5, suffix="", **options):
         source = self.root / ("synthetic-public-tape" + suffix)
         source.write_text("\n".join(json.dumps(row) for row in [self.header] +
                                    (self.rows if rows is None else rows)) + "\n")
@@ -57,7 +57,8 @@ class TenHourRunnerTests(unittest.TestCase):
                    "sys.stdout.buffer.flush(); sys.exit(int(sys.argv[2]))",
                    str(source), str(decompressor_exit)]
         out = self.root / ("output" + suffix)
-        report = run_replay(self.engine, source, out, timeout=timeout, decompressor=decoder, drain_ms=2000)
+        report = run_replay(self.engine, source, out, timeout=timeout, decompressor=decoder,
+                            drain_ms=2000, **options)
         self.assertEqual(report, json.loads((out / "manifest.json").read_text()))
         self.assertFalse((out / "input.ndjson").is_symlink())
         self.assertFalse(report["execution_qualified"])
@@ -90,6 +91,22 @@ class TenHourRunnerTests(unittest.TestCase):
                     self.assertEqual(book[field], expected["legs"][i]["book"][field])
         for key in ("source_sha256", "engine_sha256", "runner_sha256", "config_sha256"):
             self.assertEqual(len(report[key]), 64)
+
+    def test_route_and_fee_assumptions_match_engine_inputs(self):
+        self.header["pair"]["legs"][1]["venue"] = "extended"
+        for suffix, overrides, expected, scenario in (
+            ("-reference", {}, ["0", "2.5"], "public_reference"),
+            ("-zero-fee", {"taker_fees_bps": ("0", "0")}, ["0", "0"], "explicit_sensitivity"),
+        ):
+            report = self.replay(suffix=suffix, route="lighter-extended", **overrides)
+            self.assertTrue(report["diagnostic_run_succeeded"])
+            self.assertEqual(report["assumptions"]["taker_fees_bps"], expected)
+            self.assertEqual(report["assumptions"]["fee_scenario"], scenario)
+            legs = report["result"]["entry_diagnostics"]["header"]["pair"]["legs"]
+            self.assertEqual([leg["taker_fee_bps"] for leg in legs], expected)
+        report = self.replay(suffix="-mismatched-route")
+        self.assertFalse(report["diagnostic_run_succeeded"])
+        self.assertIsNone(report["engine_exit_code"])
 
     def test_terminal_source_gap_is_included_in_max_gap(self):
         rows = [self.frame(self.start), self.frame(self.start + 60_000),

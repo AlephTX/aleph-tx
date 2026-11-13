@@ -15,7 +15,7 @@ from replay_maker_campaign import HOUR, load, save, unseal
 from replay_maker_first_campaign import book_rows, digest, run_case, summarize
 
 
-def profile(symbol, terms, template):
+def profile(symbol, terms, template, *, basis_entries=False):
     lighter = next(r for r in terms["lighter"]["order_book_details"] if r["symbol"] == symbol)
     extended = next(r for r in terms["extended"]["data"] if r["name"] == f"{symbol}-USD")
     if extended.get("isRfq") is not False or extended["type"] != "PERPETUAL" or not extended["active"]:
@@ -37,8 +37,14 @@ def profile(symbol, terms, template):
         {"available_notional": "150", "book_mode": "websocket"},
     ]
     config["pair"]["planner"].update(max_quote_skew_ms=750, max_leg_notional_usd=150,
-                                      max_unhedged_notional_usd=150, min_net_edge_bps=0.5)
-    config.update(sample_ms=100, paper_entries=False, reference={"kind": "coinbase", "product": f"{symbol}-USD"})
+                                      max_unhedged_notional_usd=150)
+    config.update(sample_ms=100, paper_entries=basis_entries,
+                  reference={"kind": "coinbase", "product": f"{symbol}-USD"})
+    if basis_entries:
+        for leg in config["legs"]:
+            leg["external_oracle"] = True
+    else:
+        config["pair"]["planner"]["min_net_edge_bps"] = 0.5
     return config
 
 

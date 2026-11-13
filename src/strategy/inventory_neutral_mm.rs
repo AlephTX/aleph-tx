@@ -425,6 +425,8 @@ struct PricingInputs {
     order_flow_bps: f64,
     cross_market_bps: f64,
     volatility_pressure: f64,
+    #[cfg(feature = "research-replay")]
+    participation_bbo: Option<ShmBboMessage>,
 }
 
 /// Result of one quoting-loop iteration.
@@ -455,6 +457,8 @@ pub struct InventoryNeutralMM {
     order_flow: OrderFlow,
     cross_market_pressure: CrossMarketPressure,
     volatility_regime: volatility_regime::VolatilityRegime,
+    #[cfg(feature = "research-replay")]
+    quote_participation: Option<replay::recorded::QuoteParticipation>,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -552,6 +556,8 @@ impl InventoryNeutralMM {
             order_flow: OrderFlow::default(),
             cross_market_pressure: CrossMarketPressure::default(),
             volatility_regime: volatility_regime::VolatilityRegime::default(),
+            #[cfg(feature = "research-replay")]
+            quote_participation: None,
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -1836,6 +1842,11 @@ impl InventoryNeutralMM {
             order_flow_bps,
             cross_market_bps,
             volatility_pressure,
+            #[cfg(feature = "research-replay")]
+            participation_bbo: self
+                .quote_participation
+                .as_ref()
+                .and_then(|_| select_exchange_bbo(exchanges, EXCH_HYPERLIQUID)),
         }
     }
 
@@ -2095,6 +2106,22 @@ impl InventoryNeutralMM {
                 return;
             }
             QuoteCycleDecision::Execute(plan) => plan,
+        };
+        #[cfg(feature = "research-replay")]
+        let plan = if let Some(policy) = &mut self.quote_participation {
+            let mut plan = plan;
+            policy.apply(
+                &mut plan.target,
+                inputs.participation_bbo,
+                [
+                    self.account_stats.position,
+                    self.order_tracker.confirmed_position(),
+                ],
+                &runtime_config,
+            );
+            plan
+        } else {
+            plan
         };
 
         let max_side_replacements = max_side_requote_replacements_per_cycle(&inv_ctx);

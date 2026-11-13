@@ -7,7 +7,7 @@ boundary evidence or remaining exposure fails the diagnostic. Fee and stream
 quality verification remain external prerequisites for execution qualification.
 """
 import argparse
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import file_digest
 from itertools import chain
 import json
@@ -21,6 +21,7 @@ from archive_public_capture import verify_compiled
 from replay_maker_campaign import save, load
 
 TEN_HOURS = 36_000_000
+ROUTE_FEES = {"lighter-hyperliquid": ("0", "4.5"), "lighter-extended": ("0", "2.5")}
 
 
 def digest(path):
@@ -59,13 +60,26 @@ def terminal_report(report):
     return value if isinstance(value, dict) else {}
 
 
+def fee_pair(values):
+    try:
+        fees = tuple(Decimal(value) for value in values)
+    except InvalidOperation as error:
+        raise ValueError("invalid decimal taker fee") from error
+    if len(fees) != 2 or any(not fee.is_finite() or not 0 <= fee < 10_000 for fee in fees):
+        raise ValueError("two finite taker fees in [0, 10000) bps are required")
+    return tuple(map(str, fees))
+
+
 def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_000,
-               start_ms=None, archive_sha256=None):
+               start_ms=None, archive_sha256=None, route="lighter-hyperliquid", taker_fees_bps=None):
     """Retain a manifest even on failure; no source record body is exported."""
     if not 0 < timeout <= 3600:
         raise ValueError("timeout must be positive and no more than one hour")
     if not isinstance(drain_ms, int) or not 0 < drain_ms <= 3_600_000:
         raise ValueError("drain must be a positive integer and no more than one hour")
+    if route not in ROUTE_FEES:
+        raise ValueError("unsupported research route")
+    fees = fee_pair(ROUTE_FEES[route] if taker_fees_bps is None else taker_fees_bps)
     os.umask(0o077)
     engine, source, out = Path(engine).resolve(), Path(source).resolve(), Path(out).resolve()
     out.mkdir()
@@ -125,14 +139,14 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
                 end = begin + TEN_HOURS
                 drain_end = end + drain_ms
                 pair = header["pair"]
-                if [leg["venue"] for leg in pair["legs"]] != ["lighter", "hyperliquid"]:
-                    raise ValueError("unexpected baseline venue domains")
+                if [leg["venue"] for leg in pair["legs"]] != route.split("-"):
+                    raise ValueError("tape legs do not match the requested route")
                 pair["mode"] = {"kind": "pair_hedge"}
                 pair["strategy"] = "basis_reversion"
                 pair["basis"].update(entry_z=1.75, max_sample_gap_ms=15_000)
                 for key in ("max_leg_notional_usd", "max_unhedged_notional_usd"):
                     pair["planner"][key] = min(pair["planner"][key], 100)
-                for leg, fee in zip(pair["legs"], ("0", "4.5"), strict=True):
+                for leg, fee in zip(pair["legs"], fees, strict=True):
                     leg["taker_fee_bps"] = fee
                 header.update(one_way_latency_ms=550, trade_from_ms=begin, funding_guard_ms=1000,
                               trade_until_ms=end, drain_until_ms=drain_end)
@@ -270,7 +284,8 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
             ([] if terminal_complete else ["terminal_drain_incomplete"]),
         "production_qualified": False, "diagnostic_run_succeeded": not failures,
         "failures": sorted(set(failures)),
-        "assumptions": {"one_way_latency_ms": 550, "taker_fees_bps": ["0", "4.5"],
+        "assumptions": {"route": route, "one_way_latency_ms": 550, "taker_fees_bps": list(fees),
+            "fee_scenario": "public_reference" if taker_fees_bps is None else "explicit_sensitivity",
             "strategy": "basis_reversion", "mode": "pair_hedge", "entry_z": 1.75,
             "warmup_ms": begin - first if begin is not None and first is not None else None,
             "max_sample_gap_ms": 15_000, "funding_guard_ms": 1000,
@@ -278,7 +293,8 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
             "book_depth": "unchanged", "end_policy": "real post-cutoff IOC drain", "drain_ms": drain_ms,
             "zero_allowance_frames": zero_budget_frames, "allowance_reduced_frames": reduced_budget_frames},
         "result": {k: report.get(k) for k in ("frames", "entry_signals", "entries_submitted", "paired_entries",
-            "gross_turnover", "fees", "funding", "open_positions_base", "final_liquidation_pnl",
+            "gross_turnover", "fees", "funding", "open_positions_base", "realized_pnl",
+            "final_liquidation_pnl", "max_unhedged_ms", "opening_execution", "closing_execution",
             "halted", "open_phase", "entry_diagnostics", "terminal_drain")},
     }
     save(out / "manifest.json", manifest)
@@ -293,7 +309,15 @@ def main():
     parser.add_argument("--drain-seconds", type=int, default=60)
     parser.add_argument("--start-ms", type=int, help="UTC decision start shared with the other research scenarios")
     parser.add_argument("--public-archive", type=Path, help="verify shared archive provenance before replay")
+    parser.add_argument("--route", choices=ROUTE_FEES, default="lighter-hyperliquid")
+    parser.add_argument("--taker-fees-bps", nargs=2, metavar=("LIGHTER", "OTHER"),
+                        help="fee sensitivity scenario in tape leg order")
     args = parser.parse_args()
+    if args.taker_fees_bps is not None:
+        try:
+            args.taker_fees_bps = fee_pair(args.taker_fees_bps)
+        except ValueError as error:
+            parser.error(str(error))
     archive_sha256 = None
     if args.public_archive:
         try:
@@ -302,7 +326,7 @@ def main():
             parser.error(str(error))
     manifest = run_replay(args.engine, args.source, args.output, args.timeout_seconds,
                           drain_ms=args.drain_seconds * 1000, start_ms=args.start_ms,
-                          archive_sha256=archive_sha256)
+                          archive_sha256=archive_sha256, route=args.route, taker_fees_bps=args.taker_fees_bps)
     return 0 if manifest["diagnostic_run_succeeded"] else 1
 
 

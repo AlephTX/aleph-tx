@@ -410,6 +410,50 @@ fn extended_uses_absolute_level_sizes_and_invalidates_a_sequence_gap() {
 }
 
 #[test]
+fn extended_index_uses_source_time_and_requires_reconnect_after_gap() {
+    let mut cfg = config();
+    cfg.pair.legs[1].venue = "extended".into();
+    cfg.pair.legs[1].market = "ETH-USD".into();
+    cfg.legs[1].accept_receipt_time_for_oracle = false;
+    let index = |at, calculated, seq| {
+        let mut record = row(
+            "extended_index",
+            at,
+            json!({
+                "type":"IP", "data":{"m":"ETH-USD","p":"1999.8123","ts":calculated},
+                "ts":at-1, "seq":seq
+            }),
+        );
+        record["market"] = json!("ETH-USD");
+        record
+    };
+    let disconnect = json!({"source":"extended_index","event":"disconnect","market":"ETH-USD",
+                            "received_at_ms":T+400,"available_at_ms":T+400});
+    let (coverage, frames) = replay(
+        &cfg,
+        &[
+            index(T, T - 25, 7),
+            index(T + 100, T + 75, 8),
+            index(T + 200, T + 175, 10),
+            index(T + 300, T + 275, 11),
+            disconnect,
+            index(T + 500, T + 475, 1),
+            footer(T + 501),
+        ],
+    );
+    assert_eq!(coverage.extended_index_sequence_gaps, [0, 2]);
+    assert_eq!(coverage.disconnects["extended_index"], 1);
+    let oracle = |i: usize| &frames[i]["legs"][1]["oracle"];
+    assert_eq!(oracle(0)["mode"], "live_external");
+    assert_eq!(oracle(0)["price"], "1999.8123");
+    assert_eq!(oracle(1)["timestamp_ms"], T + 75);
+    for i in 2..=4 {
+        assert_eq!(oracle(i)["timestamp_ms"], 0);
+    }
+    assert_eq!(oracle(5)["timestamp_ms"], T + 475);
+}
+
+#[test]
 fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
     let mut config = arcus_bulk_config();
     config.legs[0].archived_contexts = vec![ArchivedMarketContext {

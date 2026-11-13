@@ -132,6 +132,81 @@ fn now_ms() -> u64 {
     wall_time_ns().expect("recorded replay clock") / NS_PER_MS
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HyperliquidObiFilter {
+    threshold: f64,
+    max_age_ms: u64,
+}
+
+impl HyperliquidObiFilter {
+    fn blocked_sides(
+        self,
+        book: Option<ShmBboMessage>,
+        at_ns: u64,
+        positions: [f64; 2],
+    ) -> Option<[bool; 2]> {
+        let book = book.filter(|book| {
+            book.bid_price > 0.0
+                && book.ask_price > book.bid_price
+                && book.bid_size.is_finite()
+                && book.ask_size.is_finite()
+                && book.bid_size > 0.0
+                && book.ask_size > 0.0
+                && !market_state::is_stale_bbo(book.timestamp_ns, at_ns, self.max_age_ms)
+        })?;
+        let scale = book.bid_size.max(book.ask_size);
+        let bid = book.bid_size / scale;
+        let ask = book.ask_size / scale;
+        let imbalance = (bid - ask) / (bid + ask);
+        // Both account and fill evidence must agree the blocked side cannot
+        // close inventory. An older position view must not suppress an exit.
+        Some([
+            imbalance <= -self.threshold && positions.iter().all(|&p| p >= 0.0),
+            imbalance >= self.threshold && positions.iter().all(|&p| p <= 0.0),
+        ])
+    }
+}
+
+#[derive(Serialize)]
+pub(in crate::strategy::inventory_neutral_mm) struct QuoteParticipation {
+    hyperliquid_obi_filter: HyperliquidObiFilter,
+    decisions: u64,
+    fresh_reference_decisions: u64,
+    withdrawn_bid_targets: u64,
+    withdrawn_ask_targets: u64,
+}
+
+impl QuoteParticipation {
+    pub(in crate::strategy::inventory_neutral_mm) fn apply(
+        &mut self,
+        target: &mut QuoteTarget,
+        book: Option<ShmBboMessage>,
+        positions: [f64; 2],
+        config: &InventoryNeutralMMConfig,
+    ) {
+        self.decisions += 1;
+        let at_ns = wall_time_ns().expect("recorded quote participation requires replay clock");
+        let Some([bid, ask]) = self
+            .hyperliquid_obi_filter
+            .blocked_sides(book, at_ns, positions)
+        else {
+            return;
+        };
+        self.fresh_reference_decisions += 1;
+        // A zero target goes through the production side planner. Resting
+        // orders remain exposed until the simulated cancel takes effect.
+        if bid && target.bid_size >= components::min_quotable_size(config, target.bid_price) {
+            self.withdrawn_bid_targets += 1;
+            target.bid_size = 0.0;
+        }
+        if ask && target.ask_size >= components::min_quotable_size(config, target.ask_price) {
+            self.withdrawn_ask_targets += 1;
+            target.ask_size = 0.0;
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedMakerConfig {
@@ -153,6 +228,8 @@ pub struct RecordedMakerConfig {
     taker_transport_ms: Option<u64>,
     #[serde(default)]
     diagnose_cross_market: bool,
+    #[serde(default)]
+    hyperliquid_obi_filter: Option<HyperliquidObiFilter>,
     order_response_ms: u64,
     trade_clock_guard_ms: u64,
     /// Maximum source-to-receipt delay of the public trade tape. Evidence
@@ -280,6 +357,14 @@ impl RecordedMakerConfig {
         ensure!(
             self.strategy.use_post_only && !self.strategy.use_depth_pricing,
             "recorded maker requires post-only quoting and BBO pricing"
+        );
+        ensure!(
+            self.hyperliquid_obi_filter.is_none_or(|filter| {
+                filter.threshold > 0.0
+                    && filter.threshold < 1.0
+                    && (1..=self.strategy.external_staleness_ms).contains(&filter.max_age_ms)
+            }),
+            "invalid Hyperliquid OBI filter threshold or reference age"
         );
         Ok(())
     }
@@ -1105,6 +1190,8 @@ pub struct RecordedMakerReport {
     halted: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cross_market_attribution: Option<CrossMarketAttribution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_participation: Option<QuoteParticipation>,
 }
 
 #[derive(Serialize)]
@@ -1212,6 +1299,16 @@ async fn drive(
         reader_account,
         None,
     );
+    strategy.quote_participation =
+        config
+            .hyperliquid_obi_filter
+            .map(|hyperliquid_obi_filter| QuoteParticipation {
+                hyperliquid_obi_filter,
+                decisions: 0,
+                fresh_reference_decisions: 0,
+                withdrawn_bid_targets: 0,
+                withdrawn_ask_targets: 0,
+            });
     let (stop, stop_rx) = watch::channel(false);
     let (done, mut account_done) = watch::channel(false);
     let mut frames = 0;
@@ -1455,6 +1552,7 @@ async fn drive(
         needs_reconciliation,
         halted,
         cross_market_attribution,
+        quote_participation: strategy.quote_participation,
     })
 }
 
@@ -1496,6 +1594,7 @@ mod tests {
             cancel_transport_ms: None,
             taker_transport_ms: None,
             diagnose_cross_market: false,
+            hyperliquid_obi_filter: None,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
             trade_delivery_grace_ms: 2_000,
@@ -1524,6 +1623,112 @@ mod tests {
             order_type: OrderType::PostOnly,
             reduce_only: false,
         })
+    }
+
+    #[test]
+    fn obi_filter_uses_only_fresh_two_sided_depth_and_preserves_the_exit_side() {
+        let filter = HyperliquidObiFilter {
+            threshold: 0.6,
+            max_age_ms: 250,
+        };
+        let at = START * NS_PER_MS;
+        let mut book = ShmBboMessage {
+            timestamp_ns: at,
+            bid_price: 1999.0,
+            ask_price: 2000.0,
+            bid_size: 1.0,
+            ask_size: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [0.0, 0.0]),
+            Some([true, false])
+        );
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [1.0, 0.0]),
+            Some([true, false])
+        );
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [1.0, -1.0]),
+            Some([false, false])
+        );
+        std::mem::swap(&mut book.bid_size, &mut book.ask_size);
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [0.0, 0.0]),
+            Some([false, true])
+        );
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [0.0, -1.0]),
+            Some([false, true])
+        );
+        assert_eq!(
+            filter.blocked_sides(Some(book), at, [1.0, -1.0]),
+            Some([false, false])
+        );
+        assert_eq!(filter.blocked_sides(Some(book), at - 1, [0.0, 0.0]), None);
+        assert_eq!(
+            filter.blocked_sides(Some(book), at + 251 * NS_PER_MS, [0.0, 0.0]),
+            None
+        );
+        book.ask_size = 0.0;
+        assert_eq!(filter.blocked_sides(Some(book), at, [0.0, 0.0]), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn obi_filter_zero_target_withdraws_resting_order_without_suppressing_exit() {
+        let _clock = ReplayClock::open(START, false);
+        let mut filter = QuoteParticipation {
+            hyperliquid_obi_filter: HyperliquidObiFilter {
+                threshold: 0.6,
+                max_age_ms: 250,
+            },
+            decisions: 0,
+            fresh_reference_decisions: 0,
+            withdrawn_bid_targets: 0,
+            withdrawn_ask_targets: 0,
+        };
+        let mut target = QuoteTarget {
+            bid_price: 1999.0,
+            ask_price: 2001.0,
+            bid_size: 0.05,
+            ask_size: 0.04,
+        };
+        let book = ShmBboMessage {
+            timestamp_ns: START * NS_PER_MS,
+            bid_price: 1999.0,
+            ask_price: 2000.0,
+            bid_size: 1.0,
+            ask_size: 5.0,
+            ..Default::default()
+        };
+        let config = config().strategy;
+        filter.apply(&mut target, Some(book), [0.04, 0.04], &config);
+        assert_eq!((target.bid_size, target.ask_size), (0.0, 0.04));
+        assert_eq!(
+            (filter.withdrawn_bid_targets, filter.withdrawn_ask_targets),
+            (1, 0)
+        );
+        let bid_plan = build_side_execution_plan(
+            &config,
+            &[ActiveOrder {
+                client_order_id: 1,
+                order_index: Some(42),
+                lifecycle: OrderLifecycle::Open,
+                side: OrderSide::Buy,
+                price: 1999.0,
+                size: 0.05,
+                placed_at: Instant::now(),
+            }],
+            OrderType::PostOnly,
+            Side::Buy,
+            target.bid_price,
+            target.bid_size,
+            0.0,
+            0.0,
+            1,
+        );
+        assert_eq!(bid_plan.to_cancel, [42]);
+        assert!(bid_plan.to_place.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

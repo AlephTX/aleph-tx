@@ -349,9 +349,18 @@ only the public trade fields needed to model fills.
 
 ```sh
 feeder/perp-capture -lighter 1,0 -lighter-trades -lighter-clock-refresh 4m \
-  -extended BTC-USD,ETH-USD -coinbase BTC-USD,ETH-USD -duration 15m \
+  -extended BTC-USD,ETH-USD -extended-index -coinbase BTC-USD,ETH-USD -duration 15m \
   -output recordings/extended-lighter.ndjson
 ```
+
+`-extended-index` subscribes to the official index on its own connection per
+market. The archive retains the index calculation, publication and receipt
+times. A sequence gap or disconnect invalidates the oracle independently
+of the order book. Set `external_oracle: true` on the Extended compiler leg
+to use that feed in basis replay. The index is an input to price validation.
+Funding amounts and the associated settlement evidence remain separate.
+[Extended index stream](https://api.docs.extended.exchange/#index-price-stream) ·
+[Oracle methodology](https://docs.extended.exchange/extended-resources/trading/oracle-prices)
 
 On Oasis, the initial 48-hour campaign started on 2026-11-13 at
 11:13:37 UTC. It seals approximately 15-minute shards after a 90-second

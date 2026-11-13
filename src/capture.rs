@@ -201,6 +201,7 @@ pub struct Coverage {
     pub max_rejected_clock_lead_ms: [u64; 2],
     pub lighter_nonce_gaps: [usize; 2],
     pub extended_sequence_gaps: [usize; 2],
+    pub extended_index_sequence_gaps: [usize; 2],
     pub fresh_book_pair_frames: usize,
     pub synchronized_book_pair_frames: usize,
     pub fresh_reference_frames: usize,
@@ -277,15 +278,19 @@ impl CaptureConfig {
                 "capture requires supported venue market terms"
             );
             if external_context {
+                let native_extended_index = venue.id == "extended" && leg.external_oracle;
                 ensure!(
-                    !leg.external_oracle
+                    (!leg.external_oracle || native_extended_index)
                         && !leg.accept_receipt_time_for_oracle
-                        && leg.funding.is_none(),
-                    "external depth uses archived_contexts for oracle and funding input"
+                        && leg.funding.is_none()
+                        && (!native_extended_index || leg.archived_contexts.is_empty()),
+                    "external venue context requires archived observations or an explicit Extended index"
                 );
                 ensure!(
-                    !self.paper_entries || !leg.archived_contexts.is_empty(),
-                    "external paper entries require archived venue context"
+                    !self.paper_entries
+                        || native_extended_index
+                        || !leg.archived_contexts.is_empty(),
+                    "external paper entries require venue context"
                 );
             }
             ensure!(
@@ -482,6 +487,7 @@ impl<'a> Compiler<'a> {
                     | "bulk"
                     | "bulk_snapshot"
                     | "extended"
+                    | "extended_index"
                     | "extended_trades"
                     | "lighter_trades"
                     | "coinbase"
@@ -515,6 +521,14 @@ impl<'a> Compiler<'a> {
                 }
             }
             ("message", Some(payload)) => {
+                if row.source == "extended_index" {
+                    ensure!(
+                        row.market.as_deref().is_some_and(|market| {
+                            payload["data"]["m"].as_str() == Some(market)
+                        }),
+                        "Extended index market does not match capture envelope"
+                    );
+                }
                 *self
                     .coverage
                     .source_messages
@@ -550,13 +564,13 @@ impl<'a> Compiler<'a> {
                                         .observe(row.available_at_ms - book.timestamp_ms);
                                 }
                             }
-                            Ok(feeds::Change::Gap) => {
-                                if row.source == "extended" {
-                                    self.coverage.extended_sequence_gaps[i] += 1;
-                                } else {
-                                    self.coverage.lighter_nonce_gaps[i] += 1;
+                            Ok(feeds::Change::Gap) => match row.source.as_str() {
+                                "extended" => self.coverage.extended_sequence_gaps[i] += 1,
+                                "extended_index" => {
+                                    self.coverage.extended_index_sequence_gaps[i] += 1
                                 }
-                            }
+                                _ => self.coverage.lighter_nonce_gaps[i] += 1,
+                            },
                             Ok(feeds::Change::Clock(ahead)) => {
                                 self.coverage.clock_rejections[i] += 1;
                                 self.coverage.max_rejected_clock_lead_ms[i] =
@@ -568,7 +582,11 @@ impl<'a> Compiler<'a> {
                             Ok(feeds::Change::Other) => {}
                             Err(_) => {
                                 self.coverage.rejected_publications[i] += 1;
-                                leg.disconnect(&row.source, row.market.as_deref());
+                                if row.source == "extended_index" {
+                                    leg.invalidate_extended_index();
+                                } else {
+                                    leg.disconnect(&row.source, row.market.as_deref());
+                                }
                             }
                         }
                     }

@@ -8,11 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 const extendedHost = "api.starknet.extended.exchange"
 
-func extendedSubscriptions(ctx context.Context, raw string) ([]subscription, error) {
+func extendedSubscriptions(ctx context.Context, raw string, withIndex bool) ([]subscription, error) {
 	markets, err := perpetualSymbols(raw)
 	if err != nil {
 		return nil, err
@@ -34,10 +35,10 @@ func extendedSubscriptions(ctx context.Context, raw string) ([]subscription, err
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Extended market metadata HTTP %d", response.StatusCode)
 	}
-	return extendedMarkets(io.LimitReader(response.Body, 1<<20), markets)
+	return extendedMarkets(io.LimitReader(response.Body, 1<<20), markets, withIndex)
 }
 
-func extendedMarkets(body io.Reader, markets []string) ([]subscription, error) {
+func extendedMarkets(body io.Reader, markets []string, withIndex bool) ([]subscription, error) {
 	var result struct {
 		Status string
 		Data   []struct {
@@ -63,6 +64,9 @@ func extendedMarkets(body io.Reader, markets []string) ([]subscription, error) {
 			subscription{source: "extended", market: market, url: stream + "orderbooks/" + market},
 			subscription{source: "extended_trades", market: market, url: stream + "publicTrades/" + market},
 		)
+		if withIndex {
+			feeds = append(feeds, subscription{source: "extended_index", market: market, url: stream + "prices/index/" + market})
+		}
 	}
 	return feeds, nil
 }
@@ -82,7 +86,8 @@ func extendedPublication(raw []byte, source subscription, previous uint64) (uint
 	if (previous > 0 && msg.Seq != previous+1) || (previous == 0 && source.source == "extended" && (msg.Type != "SNAPSHOT" || msg.Seq != 1)) {
 		return 0, errors.New("Extended sequence discontinuity")
 	}
-	if source.source == "extended" {
+	switch source.source {
+	case "extended":
 		var book struct {
 			Market string `json:"m"`
 		}
@@ -90,7 +95,22 @@ func extendedPublication(raw []byte, source subscription, previous uint64) (uint
 			(msg.Type != "SNAPSHOT" && msg.Type != "DELTA") {
 			return 0, errors.New("invalid Extended book identity or type")
 		}
-	} else {
+	case "extended_index":
+		var index struct {
+			Market string `json:"m"`
+			Price  string `json:"p"`
+			Time   uint64 `json:"ts"`
+		}
+		if err := json.Unmarshal(msg.Data, &index); err != nil || msg.Type != "IP" ||
+			index.Market != source.market || index.Time == 0 || index.Time > msg.Ts {
+			return 0, errors.New("invalid Extended index identity, type, or timestamp")
+		}
+		// Validate the price without rewriting the exact decimal on the wire.
+		price, err := strconv.ParseFloat(index.Price, 64)
+		if err != nil || price <= 0 || !json.Valid([]byte(index.Price)) {
+			return 0, errors.New("invalid Extended index price")
+		}
+	case "extended_trades":
 		var trades []struct {
 			Market string `json:"m"`
 		}
@@ -102,6 +122,8 @@ func extendedPublication(raw []byte, source subscription, previous uint64) (uint
 				return 0, errors.New("invalid Extended trade identity")
 			}
 		}
+	default:
+		return 0, errors.New("unsupported Extended public source")
 	}
 	return msg.Seq, nil
 }
