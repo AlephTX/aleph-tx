@@ -4,6 +4,10 @@ The three objectives share data and execution primitives but have separate
 profiles, ledgers, risk budgets and acceptance criteria. A profitable run
 in one objective cannot subsidize a loss in another.
 
+New validation uses [continuous ten-hour units](TEN_HOUR_RESEARCH.md).
+The short-window experiments below retain their original diagnostic scope;
+their total duration does not establish uninterrupted execution.
+
 | Objective | Decision | Primary measurements |
 | --- | --- | --- |
 | Quant profit | Select economically valuable trading events | Full net profit/hour, net bps, drawdown, inventory, capacity |

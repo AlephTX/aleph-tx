@@ -4,7 +4,7 @@
 
 .PHONY: help build build-rust build-feeder test test-rust test-go check fmt-check benchmark clean status clean-shm
 .PHONY: trade
-.PHONY: dashboard-install dashboard-build dashboard-check dashboard-dev test-python
+.PHONY: dashboard-install dashboard-build dashboard-check dashboard-dev test-python test-research
 .PHONY: lighter-up lighter-down lighter-logs
 .PHONY: backpack-up backpack-down backpack-logs
 .PHONY: edgex-up edgex-down edgex-logs
@@ -63,7 +63,7 @@ benchmark:
 	cargo test --locked --release --lib benchmark_ -- --ignored --nocapture
 	cd feeder && go test -run '^$$' -bench . -benchmem ./shm ./exchanges
 
-test: test-rust test-go
+test: test-rust test-go test-research
 
 test-rust:
 	cargo test --locked --lib --bins
@@ -73,6 +73,9 @@ test-go:
 
 test-python:
 	cd deploy/oasis && python3 -m unittest -v test_telemetry_store test_alerts
+
+test-research:
+	python3 -m unittest discover -s scripts -p 'test_*.py'
 
 # Dashboard SPA (Vite + React). Built locally; install.sh ships dashboard/dist.
 dashboard-install:

@@ -5,7 +5,9 @@ use crate::hedging::{HedgeAction, HedgeMachine, Leg, OrderIntent, OrderStatus, O
 use std::{borrow::Borrow, collections::BTreeMap};
 
 mod maker_first;
-pub use maker_first::{MakerFirstConfig, MakerFirstEvent, MakerFirstReport, run_maker_first};
+pub use maker_first::{
+    MakerFirstConfig, MakerFirstEvent, MakerFirstPreflight, MakerFirstReport, run_maker_first,
+};
 
 const MAX_FRAMES: usize = 1_000_000;
 
@@ -18,7 +20,52 @@ pub struct PaperScenario {
     pub funding_guard_ms: u64,
     /// Earlier frames update the estimator without placing simulated orders.
     pub trade_from_ms: Option<u64>,
+    /// Optional exclusive cutoff for opening new cycles; both bounds are required.
+    pub trade_until_ms: Option<u64>,
+    pub drain_until_ms: Option<u64>,
     pub frames: Vec<Frame>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PaperWindow {
+    pub trade_until_ms: u64,
+    pub drain_until_ms: u64,
+}
+
+impl PaperWindow {
+    pub fn from_bounds(
+        trade_until_ms: Option<u64>,
+        drain_until_ms: Option<u64>,
+    ) -> Result<Option<Self>> {
+        match (trade_until_ms, drain_until_ms) {
+            (None, None) => Ok(None),
+            (Some(trade_until_ms), Some(drain_until_ms)) => {
+                ensure!(
+                    trade_until_ms > 0 && trade_until_ms < drain_until_ms,
+                    "invalid paper drain window"
+                );
+                Ok(Some(Self {
+                    trade_until_ms,
+                    drain_until_ms,
+                }))
+            }
+            _ => anyhow::bail!("paper trade and drain cutoffs must both be provided"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TerminalDrainReport {
+    pub trade_until_ms: u64,
+    pub drain_until_ms: u64,
+    pub first_drain_frame_ms: Option<u64>,
+    pub first_frame_at_or_after_drain_until_ms: Option<u64>,
+    pub last_execution_frame_ms: Option<u64>,
+    pub decision_frames: usize,
+    pub drain_frames: usize,
+    /// Requires a real boundary publication, no residual position or pending
+    /// cycle, and no execution halt. A liquidation mark is not an exit fill.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -32,6 +79,7 @@ pub enum ExitReason {
     SessionChanged,
     FundingDeteriorated,
     FundingUnavailable,
+    WindowEnd,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +240,8 @@ pub struct PaperReport {
     pub halted: Option<String>,
     pub active_plan: Option<Plan>,
     pub open_phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_drain: Option<TerminalDrainReport>,
 }
 
 impl PaperReport {
@@ -479,6 +529,7 @@ struct Runner {
     latency: u64,
     funding_guard_ms: u64,
     trade_from_ms: Option<u64>,
+    window: Option<PaperWindow>,
     active: Option<Active>,
     ledger: Ledger,
     report: PaperReport,
@@ -494,6 +545,11 @@ enum Advance {
 }
 
 impl Runner {
+    fn draining(&self, now: u64) -> bool {
+        self.window
+            .is_some_and(|window| now >= window.trade_until_ms)
+    }
+
     fn poll_ioc(
         &mut self,
         pending: &mut Pending,
@@ -645,6 +701,14 @@ impl Runner {
             self.record_ioc(&pending, fill, gate, frame, opening);
         }
         if opening
+            && self.draining(now)
+            && self.ledger.positions[0] + self.ledger.positions[1] == Decimal::ZERO
+        {
+            // Pending intents submitted before the cutoff retain their real
+            // outcome. Once balanced, do not retry to increase paired size.
+            return Ok(Advance::Halt("decision window ended".into()));
+        }
+        if opening
             && now < execution.deadline
             && self.ledger.positions[0] + self.ledger.positions[1] == Decimal::ZERO
             && self.ledger.positions[0].abs() < execution.machine.target_base()
@@ -659,6 +723,17 @@ impl Runner {
         match execution.machine.next_action(now)? {
             HedgeAction::Submit { order } => {
                 let i = usize::from(order.venue == self.planner.config.legs[1].venue);
+                if opening && self.draining(now) {
+                    let net = self.ledger.positions[0] + self.ledger.positions[1];
+                    let change = if order.side == HedgeSide::Buy {
+                        order.base_quantity
+                    } else {
+                        -order.base_quantity
+                    };
+                    if (net + change).abs() >= net.abs() {
+                        return Ok(Advance::Halt("drain would increase net exposure".into()));
+                    }
+                }
                 self.report.execution(opening, i).ioc_submitted += 1;
                 let submit_touch = self
                     .planner
@@ -682,6 +757,9 @@ impl Runner {
 
     fn exit_reason(&self, active: &Active, frame: &Frame) -> Option<ExitReason> {
         let now = frame.now_ms;
+        if self.draining(now) {
+            return Some(ExitReason::WindowEnd);
+        }
         if self.planner.cutoff(frame).is_err()
             || frame.equity_session.map(|s| s.opens_at_ms) != active.session_open
             || self.planner.cutoff(frame).is_ok_and(|cutoff| {
@@ -742,7 +820,8 @@ impl Runner {
         let deadline = now
             .saturating_add(self.planner.config.execution_window_ms)
             .min(active.plan.unwind_until_ms)
-            .min(cutoff);
+            .min(cutoff)
+            .min(self.window.map_or(u64::MAX, |window| window.drain_until_ms));
         if deadline <= now.saturating_add(self.latency.saturating_mul(2)) {
             return Ok(None);
         }
@@ -837,7 +916,9 @@ impl Runner {
         plan: &Plan,
         frame: &Frame,
     ) -> Result<Advance> {
-        let deadline = plan.unwind_until_ms;
+        let deadline = plan
+            .unwind_until_ms
+            .min(self.window.map_or(u64::MAX, |window| window.drain_until_ms));
         if let Some(mut pending) = recovery.pending.take() {
             let Some((fill, gate)) = self.poll_ioc(&mut pending, frame, deadline)? else {
                 recovery.pending = Some(pending);
@@ -1158,8 +1239,29 @@ impl Runner {
         for frame in frames {
             let frame = frame?;
             let frame = frame.borrow();
+            ensure!(
+                frame.now_ms > previous,
+                "paper frame timestamps must increase"
+            );
             self.report.frames += 1;
             ensure!(self.report.frames <= MAX_FRAMES, "too many paper frames");
+            if let Some(drain) = &mut self.report.terminal_drain {
+                if frame.now_ms >= drain.trade_until_ms {
+                    drain.first_drain_frame_ms.get_or_insert(frame.now_ms);
+                }
+                if frame.now_ms >= drain.drain_until_ms {
+                    drain.first_frame_at_or_after_drain_until_ms = Some(frame.now_ms);
+                    // The boundary publication attests to elapsed time. Never
+                    // execute an IOC after the configured drain deadline.
+                    break;
+                }
+                drain.last_execution_frame_ms = Some(frame.now_ms);
+                if frame.now_ms >= drain.trade_until_ms {
+                    drain.drain_frames += 1;
+                } else if self.trade_from_ms.is_none_or(|start| frame.now_ms >= start) {
+                    drain.decision_frames += 1;
+                }
+            }
             let sample = self.planner.sample(frame)?;
             if sample.is_ok() || sample.is_err_and(|blocked| blocked.gate == EntryGate::Warmup) {
                 self.report.basis_samples += 1;
@@ -1184,7 +1286,7 @@ impl Runner {
                 if !self.advance_active(&mut active, frame)? {
                     self.active = Some(active);
                 }
-            } else if self.report.halted.is_none() {
+            } else if self.report.halted.is_none() && !self.draining(frame.now_ms) {
                 let diagnostics = &mut self.report.entry_diagnostics;
                 diagnostics.idle_frames += 1;
                 let plan = sample.and_then(|(signal, cutoff)| {
@@ -1231,6 +1333,26 @@ impl Runner {
             self.report.frames > self.report.training_frames,
             "no paper evaluation frames"
         );
+        if let Some(drain) = &mut self.report.terminal_drain {
+            ensure!(
+                drain.decision_frames > 0,
+                "no paper decision frames before cutoff"
+            );
+            drain.complete = drain.first_frame_at_or_after_drain_until_ms.is_some()
+                && self.ledger.is_flat()
+                && self.active.is_none()
+                && self.report.halted.is_none();
+            if !drain.complete && self.report.halted.is_none() {
+                self.report.halted = Some(
+                    if drain.first_frame_at_or_after_drain_until_ms.is_none() {
+                        "terminal drain missing boundary publication"
+                    } else {
+                        "terminal drain left exposure or pending execution"
+                    }
+                    .into(),
+                );
+            }
+        }
         self.report.open_positions_base = self.ledger.positions;
         self.report.gross_turnover = self.ledger.turnover;
         self.report.fees = self.ledger.fees;
@@ -1286,11 +1408,12 @@ impl Runner {
 }
 
 pub fn run_paper(scenario: &PaperScenario, registry: &VenueRegistry) -> Result<PaperReport> {
-    run_paper_frames(
+    run_paper_frames_with_window(
         &scenario.pair,
         scenario.one_way_latency_ms,
         scenario.trade_from_ms,
         scenario.funding_guard_ms,
+        PaperWindow::from_bounds(scenario.trade_until_ms, scenario.drain_until_ms)?,
         scenario.frames.iter().map(Ok),
         registry,
     )
@@ -1306,21 +1429,56 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
     frames: impl IntoIterator<Item = Result<T>>,
     registry: &VenueRegistry,
 ) -> Result<PaperReport> {
+    run_paper_frames_with_window(
+        pair,
+        one_way_latency_ms,
+        trade_from_ms,
+        funding_guard_ms,
+        None,
+        frames,
+        registry,
+    )
+}
+
+/// Optional terminal execution uses real post-cutoff frames; the legacy entry
+/// point above deliberately preserves the original EOF-mark behavior.
+pub fn run_paper_frames_with_window<T: Borrow<Frame>>(
+    pair: &PairConfig,
+    one_way_latency_ms: u64,
+    trade_from_ms: Option<u64>,
+    funding_guard_ms: u64,
+    window: Option<PaperWindow>,
+    frames: impl IntoIterator<Item = Result<T>>,
+    registry: &VenueRegistry,
+) -> Result<PaperReport> {
     ensure!(
         one_way_latency_ms > 0 && one_way_latency_ms.saturating_mul(2) < pair.execution_window_ms,
         "execution window must exceed the sequential two-leg latency"
     );
     validate_funding_guard(funding_guard_ms, &pair.legs)?;
+    if let Some(window) = window {
+        PaperWindow::from_bounds(Some(window.trade_until_ms), Some(window.drain_until_ms))?;
+        ensure!(
+            trade_from_ms.is_none_or(|start| start < window.trade_until_ms),
+            "paper decision window must follow warm-up"
+        );
+    }
     Runner {
         planner: RelativeValue::new(pair.clone(), registry)?,
         latency: one_way_latency_ms,
         funding_guard_ms,
         trade_from_ms,
+        window,
         active: None,
         ledger: Ledger::default(),
         report: PaperReport {
             mode: pair.mode,
             funding_guard_ms,
+            terminal_drain: window.map(|window| TerminalDrainReport {
+                trade_until_ms: window.trade_until_ms,
+                drain_until_ms: window.drain_until_ms,
+                ..Default::default()
+            }),
             entry_diagnostics: PaperEntryDiagnostics {
                 entry_z: pair.basis.entry_z,
                 stop_z: pair.basis.stop_z,
@@ -1334,4 +1492,142 @@ pub fn run_paper_frames<T: Borrow<Frame>>(
         consumed: [None; 2],
     }
     .run(frames)
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn equity_window(offset: u64, drain_offset: u64) -> PaperScenario {
+        let mut scenario: PaperScenario =
+            serde_json::from_str(include_str!("../../../examples/equity_basis_paper.json"))
+                .unwrap();
+        let start = scenario.frames[0].now_ms;
+        scenario.trade_until_ms = Some(start + offset);
+        scenario.drain_until_ms = Some(start + drain_offset);
+        let mut boundary = scenario.frames.last().unwrap().clone();
+        boundary.now_ms = start + drain_offset;
+        boundary.reference.timestamp_ms = boundary.now_ms;
+        for leg in &mut boundary.legs {
+            leg.book.timestamp_ms = boundary.now_ms;
+            leg.oracle.timestamp_ms = boundary.now_ms;
+        }
+        scenario
+            .frames
+            .retain(|frame| frame.now_ms < boundary.now_ms);
+        scenario.frames.push(boundary);
+        scenario
+    }
+
+    #[test]
+    fn terminal_window_closes_with_real_later_iocs_and_retains_fees() {
+        let scenario = equity_window(600, 1500);
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert_eq!(report.entries_submitted, 1);
+        assert_eq!(report.ioc_filled, 4);
+        assert_eq!(report.trades[0].exit_reason, ExitReason::WindowEnd);
+        assert!(report.trades[0].closed_at_ms >= scenario.trade_until_ms.unwrap());
+        assert!(report.trades[0].closed_at_ms < scenario.drain_until_ms.unwrap());
+        assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+        assert!(report.fees > Decimal::ZERO);
+        assert_eq!(report.final_liquidation_pnl, Some(report.realized_pnl));
+        let drain = report.terminal_drain.unwrap();
+        assert!(drain.complete);
+        assert_eq!(drain.first_drain_frame_ms, Some(scenario.frames[6].now_ms));
+        assert!(drain.last_execution_frame_ms.unwrap() < drain.drain_until_ms);
+    }
+
+    #[test]
+    fn terminal_cutoff_keeps_late_primary_fill_and_hedges_only_actual_exposure() {
+        let scenario = equity_window(350, 1500);
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert_eq!(report.entries_submitted, 1);
+        assert_eq!(report.paired_entries, 1);
+        assert_eq!(report.ioc_filled, 4);
+        assert_eq!(report.trades[0].exit_reason, ExitReason::WindowEnd);
+        assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+        assert!(report.terminal_drain.unwrap().complete);
+    }
+
+    #[test]
+    fn terminal_cutoff_prevents_new_cycles_even_when_later_signals_are_profitable() {
+        let scenario = equity_window(250, 1500);
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert_eq!(report.entries_submitted, 0);
+        assert_eq!(report.ioc_submitted, 0);
+        assert!(report.terminal_drain.unwrap().complete);
+    }
+
+    #[test]
+    fn terminal_missing_boundary_or_insufficient_drain_time_fails_closed() {
+        let mut scenario = equity_window(600, 1500);
+        scenario.frames.pop();
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert!(!report.terminal_drain.unwrap().complete);
+        assert_eq!(
+            report.halted.as_deref(),
+            Some("terminal drain missing boundary publication")
+        );
+
+        let scenario = equity_window(600, 900);
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert!(!report.terminal_drain.unwrap().complete);
+        assert!(
+            report
+                .open_positions_base
+                .iter()
+                .any(|position| !position.is_zero())
+        );
+        assert_eq!(report.ioc_filled, 2);
+        assert!(report.halted.is_some());
+    }
+
+    #[test]
+    fn terminal_bounds_are_paired_and_must_follow_warmup() {
+        assert!(PaperWindow::from_bounds(Some(100), None).is_err());
+        assert!(PaperWindow::from_bounds(Some(100), Some(100)).is_err());
+        let mut scenario = equity_window(600, 1500);
+        scenario.trade_from_ms = scenario.trade_until_ms;
+        assert!(run_paper(&scenario, &VenueRegistry::default()).is_err());
+    }
+
+    #[test]
+    fn terminal_drain_does_not_waive_realized_funding_evidence() {
+        let mut scenario: PaperScenario =
+            serde_json::from_str(include_str!("../../../examples/crypto_funding_paper.json"))
+                .unwrap();
+        scenario.trade_until_ms = Some(1_799_999_999_900);
+        scenario.drain_until_ms = Some(1_800_000_002_000);
+        let payment = scenario
+            .frames
+            .iter()
+            .find(|frame| frame.now_ms == 1_800_000_000_000)
+            .unwrap()
+            .clone();
+        for now in [1_800_000_000_100, 1_800_000_000_200] {
+            let mut frame = payment.clone();
+            frame.now_ms = now;
+            frame.reference.timestamp_ms = now;
+            for leg in &mut frame.legs {
+                leg.book.timestamp_ms = now;
+                leg.oracle.timestamp_ms = now;
+                leg.settled.clear();
+            }
+            scenario.frames.push(frame);
+        }
+        scenario.frames.sort_unstable_by_key(|frame| frame.now_ms);
+        let mut boundary = scenario.frames.last().unwrap().clone();
+        boundary.now_ms = scenario.drain_until_ms.unwrap();
+        scenario.frames.push(boundary);
+        let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+        assert!(report.funding > Decimal::ZERO);
+        assert!(report.terminal_drain.unwrap().complete);
+        for frame in &mut scenario.frames {
+            for leg in &mut frame.legs {
+                leg.settled.clear();
+            }
+        }
+        let error = run_paper(&scenario, &VenueRegistry::default()).unwrap_err();
+        assert!(error.to_string().contains("missing realized funding"));
+    }
 }

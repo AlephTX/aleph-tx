@@ -8,6 +8,8 @@ use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use tokio::sync::watch;
 
+mod continuous;
+
 const HOUR_MS: u64 = 3_600_000;
 const NS_PER_MS: u64 = 1_000_000;
 const SIGNAL_THRESHOLD_BPS: f64 = 0.01;
@@ -153,10 +155,72 @@ pub struct RecordedMakerConfig {
     diagnose_cross_market: bool,
     order_response_ms: u64,
     trade_clock_guard_ms: u64,
+    /// Maximum source-to-receipt delay of the public trade tape. Evidence
+    /// outside this bound invalidates the replay, even when no order is open.
+    #[serde(default = "default_trade_delivery_grace_ms")]
+    trade_delivery_grace_ms: u64,
+    #[serde(default)]
+    flat_at_funding: Option<FlatAtFunding>,
+    #[serde(default)]
+    trade_from_ms: Option<u64>,
     taker_fee_bps: f64,
     min_contracts: f64,
     min_notional: f64,
     depth_participation: f64,
+}
+
+fn default_trade_delivery_grace_ms() -> u64 {
+    2_000
+}
+
+/// Research-only schedule. No funding cash flow is assumed: the strategy
+/// must be demonstrably flat throughout every settlement guard interval.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FlatAtFunding {
+    interval_ms: u64,
+    offset_ms: u64,
+    drain_before_ms: u64,
+    guard_ms: u64,
+    max_event_gap_ms: u64,
+}
+
+impl FlatAtFunding {
+    fn next_slot(&self, at: u64) -> u64 {
+        if at < self.offset_ms {
+            self.offset_ms
+        } else {
+            (at - self.offset_ms) / self.interval_ms * self.interval_ms
+                + self.offset_ms
+                + self.interval_ms
+        }
+    }
+
+    fn phase(&self, at: u64) -> FundingPhase {
+        let next = self.next_slot(at);
+        let previous = next.saturating_sub(self.interval_ms);
+        if at < previous.saturating_add(self.guard_ms) {
+            FundingPhase::Guard(previous)
+        } else if at >= next.saturating_sub(self.guard_ms) {
+            FundingPhase::Guard(next)
+        } else if at >= next.saturating_sub(self.guard_ms + self.drain_before_ms) {
+            FundingPhase::Drain(next)
+        } else {
+            FundingPhase::Trading
+        }
+    }
+
+    fn allows_arrival(&self, at: u64, reducing: bool) -> bool {
+        matches!(self.phase(at), FundingPhase::Trading)
+            || (reducing && matches!(self.phase(at), FundingPhase::Drain(_)))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FundingPhase {
+    Trading,
+    Drain(u64),
+    Guard(u64),
 }
 
 impl RecordedMakerConfig {
@@ -166,10 +230,32 @@ impl RecordedMakerConfig {
             (1_600_000_000_000..2_300_000_000_000).contains(&self.start_ms)
                 && self.end_ms > self.start_ms
                 && self.drain_until_ms > self.end_ms
-                && self.drain_until_ms - self.end_ms <= 20_000
-                && self.start_ms / HOUR_MS == self.drain_until_ms / HOUR_MS,
-            "maker replay must fit in one UTC funding hour"
+                && self.drain_until_ms < 2_300_000_000_000
+                && self.drain_until_ms - self.end_ms <= 120_000
+                && self
+                    .trade_from_ms
+                    .is_none_or(|at| at >= self.start_ms && at < self.end_ms),
+            "invalid maker replay time range"
         );
+        if let Some(schedule) = &self.flat_at_funding {
+            ensure!(
+                (60_000..=86_400_000).contains(&schedule.interval_ms)
+                    && schedule.offset_ms < schedule.interval_ms
+                    && schedule.guard_ms >= self.trade_clock_guard_ms.max(1)
+                    && schedule.guard_ms <= 60_000
+                    && (1_000..=120_000).contains(&schedule.drain_before_ms)
+                    && schedule.drain_before_ms > self.trade_delivery_grace_ms
+                    && schedule.guard_ms * 2 + schedule.drain_before_ms < schedule.interval_ms
+                    && (1..=60_000).contains(&schedule.max_event_gap_ms),
+                "invalid flat-at-funding schedule"
+            );
+        } else {
+            ensure!(
+                self.drain_until_ms - self.end_ms <= 20_000
+                    && self.start_ms / HOUR_MS == self.drain_until_ms / HOUR_MS,
+                "maker replay must fit in one UTC funding hour without flat_at_funding"
+            );
+        }
         ensure!(
             (0.0..=100_000_000.0).contains(&self.initial_equity)
                 && self.initial_equity > 0.0
@@ -181,6 +267,7 @@ impl RecordedMakerConfig {
                 && self.taker_transport_ms.is_none_or(|value| value <= 2_000)
                 && self.order_response_ms <= 2_000
                 && self.trade_clock_guard_ms <= 1_000
+                && (1..=60_000).contains(&self.trade_delivery_grace_ms)
                 && (0.0..=1_000.0).contains(&self.taker_fee_bps)
                 && self.min_contracts.is_finite()
                 && self.min_contracts >= self.strategy.step_size
@@ -275,6 +362,10 @@ enum Aggressor {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Event {
+    TradeFeed {
+        at_ms: u64,
+        online: bool,
+    },
     Book {
         at_ms: u64,
         lighter: Book,
@@ -292,7 +383,9 @@ enum Event {
 impl Event {
     fn at_ms(&self) -> u64 {
         match *self {
-            Self::Book { at_ms, .. } | Self::Trade { at_ms, .. } => at_ms,
+            Self::Book { at_ms, .. }
+            | Self::Trade { at_ms, .. }
+            | Self::TradeFeed { at_ms, .. } => at_ms,
         }
     }
 }
@@ -302,6 +395,12 @@ struct Queue {
     ahead: f64,
     changed_side: bool,
     cancel_requested: bool,
+}
+
+struct CancelledOrder {
+    order: Resting,
+    cancelled_ms: u64,
+    expires_ms: u64,
 }
 
 #[derive(Default, Serialize)]
@@ -364,6 +463,17 @@ struct ExecutionAttribution {
 struct Market {
     book: Book,
     queue: BTreeMap<i64, Queue>,
+    cancelled: BTreeMap<i64, CancelledOrder>,
+    late_cancel_fills: u64,
+    historical_trades: u64,
+    pre_order_trades: u64,
+    first_maker_ms: Option<u64>,
+    funding_rejections: u64,
+    warmup_rejections: u64,
+    trade_feed_online: Option<bool>,
+    trade_feed_gaps: u64,
+    last_event_ms: u64,
+    last_account_publication_ms: Option<u64>,
     last_mid: Option<f64>,
     post_only_rejections: u64,
     precision_rejections: u64,
@@ -381,6 +491,10 @@ pub(super) struct Matching {
     taker_delay: Duration,
     response: Duration,
     clock_guard_ms: u64,
+    start_ms: u64,
+    trade_delivery_grace_ms: u64,
+    flat_at_funding: Option<FlatAtFunding>,
+    trade_from_ms: u64,
     max_age_ms: u64,
     step: f64,
     tick: f64,
@@ -393,6 +507,7 @@ impl Matching {
     fn new(config: &RecordedMakerConfig) -> Self {
         Self {
             market: PlMutex::new(Market {
+                last_event_ms: config.start_ms,
                 attribution: config
                     .diagnose_cross_market
                     .then(ExecutionAttribution::default),
@@ -409,6 +524,10 @@ impl Matching {
             taker_delay: Duration::from_millis(config.venue_taker_delay_ms),
             response: Duration::from_millis(config.order_response_ms),
             clock_guard_ms: config.trade_clock_guard_ms,
+            start_ms: config.start_ms,
+            trade_delivery_grace_ms: config.trade_delivery_grace_ms,
+            flat_at_funding: config.flat_at_funding.clone(),
+            trade_from_ms: config.trade_from_ms.unwrap_or(config.start_ms),
             max_age_ms: config.strategy.local_staleness_ms,
             step: config.strategy.step_size,
             tick: config.strategy.tick_size,
@@ -483,7 +602,83 @@ impl Matching {
     }
 
     pub(super) fn forget(&self, order_index: i64) {
-        self.market.lock().queue.remove(&order_index);
+        let mut state = self.market.lock();
+        state.queue.remove(&order_index);
+        state.cancelled.remove(&order_index);
+    }
+
+    pub(super) fn cancelled(&self, order: Resting) {
+        let mut state = self.market.lock();
+        let id = order.exchange_order_id as i64;
+        // IOC remainders have no maker queue and cannot match public prints.
+        if !state.queue.contains_key(&id) {
+            return;
+        }
+        let cancelled_ms = now_ms();
+        state.cancelled.insert(
+            id,
+            CancelledOrder {
+                order,
+                cancelled_ms,
+                expires_ms: cancelled_ms + self.trade_delivery_grace_ms + self.clock_guard_ms,
+            },
+        );
+    }
+
+    fn prune_cancelled(&self, at: u64) {
+        let mut state = self.market.lock();
+        let expired: Vec<_> = state
+            .cancelled
+            .iter()
+            .filter_map(|(&id, order)| (at > order.expires_ms).then_some(id))
+            .collect();
+        for id in expired {
+            state.cancelled.remove(&id);
+            state.queue.remove(&id);
+        }
+    }
+
+    pub(super) async fn wait_cancelled_prints(&self) -> Result<()> {
+        loop {
+            self.prune_cancelled(now_ms());
+            let deadline = self
+                .market
+                .lock()
+                .cancelled
+                .values()
+                .map(|order| order.expires_ms)
+                .max();
+            let Some(deadline) = deadline else {
+                break;
+            };
+            // One millisecond beyond the bound lets a print exactly at the
+            // deadline run before cleanup advances the tracker generation.
+            tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now_ms()) + 1)).await;
+        }
+        // A snapshot can be fresh and newer than the cancel request, yet
+        // predate the last allowed print. The account publisher enables this
+        // barrier before drive starts; matching-only tests have no publisher.
+        if self.market.lock().last_account_publication_ms.is_some() {
+            let fence_ms = now_ms();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if self
+                        .market
+                        .lock()
+                        .last_account_publication_ms
+                        .is_some_and(|at| at > fence_ms)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .context(
+                "recorded cleanup lacks an account publication after the delivery watermark",
+            )?;
+        }
+        Ok(())
     }
 
     fn admit(&self, order: Resting, ioc: bool, changed_side: bool) -> bool {
@@ -540,6 +735,7 @@ impl Matching {
                     cancel_requested: false,
                 },
             );
+            state.first_maker_ms.get_or_insert(now);
             if let Some(stats) = &mut state.attribution {
                 stats.maker_accepted += 1;
                 stats.changed_side_maker_accepted += u64::from(changed_side);
@@ -557,25 +753,55 @@ impl Matching {
         price: f64,
         size: f64,
         taker_buy: bool,
-    ) {
-        if source > at.saturating_add(self.clock_guard_ms) {
-            return;
+    ) -> Result<()> {
+        // Reconnect subscriptions may include recent history. Prints proved
+        // older than this simulator cannot involve any simulated order.
+        if source.saturating_add(self.clock_guard_ms) < self.start_ms {
+            self.market.lock().historical_trades += 1;
+            return Ok(());
         }
+        if at > source.saturating_add(self.trade_delivery_grace_ms) {
+            let mut state = self.market.lock();
+            if state
+                .first_maker_ms
+                .is_none_or(|first| source.saturating_add(self.clock_guard_ms) < first)
+            {
+                // A reconnect print during initial warmup cannot fill an
+                // order that did not yet exist. Keep this exclusion visible.
+                state.pre_order_trades += 1;
+                return Ok(());
+            }
+        }
+        ensure!(
+            at <= source.saturating_add(self.trade_delivery_grace_ms),
+            "trade delivery grace exceeded: source-to-receipt evidence incomplete"
+        );
+        if source > at.saturating_add(self.clock_guard_ms) {
+            anyhow::bail!("trade source time exceeds clock guard");
+        }
+        self.prune_cancelled(at);
         let eligible_ms = at.min(source.saturating_sub(self.clock_guard_ms));
-        let mut orders: Vec<_> = venue
-            .book
-            .lock()
-            .values()
-            .filter(|order| {
-                order.is_ask == taker_buy
-                    && (if taker_buy {
-                        price >= order.price - self.tick * 0.1
-                    } else {
-                        price <= order.price + self.tick * 0.1
-                    })
-            })
-            .copied()
-            .collect();
+        let mut orders: Vec<_> = venue.book.lock().values().copied().collect();
+        orders.extend(
+            self.market
+                .lock()
+                .cancelled
+                .values()
+                // Include the clock-uncertain overlap conservatively. A print
+                // unambiguously after cancellation cannot fill the tombstone.
+                .filter(|cancelled| {
+                    source.saturating_sub(self.clock_guard_ms) <= cancelled.cancelled_ms
+                })
+                .map(|cancelled| cancelled.order),
+        );
+        orders.retain(|order| {
+            order.is_ask == taker_buy
+                && (if taker_buy {
+                    price >= order.price - self.tick * 0.1
+                } else {
+                    price <= order.price + self.tick * 0.1
+                })
+        });
         orders.sort_unstable_by(|a, b| {
             let order = a.price.total_cmp(&b.price);
             (if taker_buy { order } else { order.reverse() })
@@ -635,6 +861,13 @@ impl Matching {
                     });
                 }
                 venue.fill(order, order.price, qty, false);
+                {
+                    let mut state = self.market.lock();
+                    if let Some(cancelled) = state.cancelled.get_mut(&id) {
+                        cancelled.order.remaining = (order.remaining - qty).max(0.0);
+                        state.late_cancel_fills += 1;
+                    }
+                }
                 remaining = (remaining - qty).max(0.0);
                 if qty >= order.remaining - self.step * 1e-6 {
                     self.forget(id);
@@ -644,6 +877,7 @@ impl Matching {
                 break;
             }
         }
+        Ok(())
     }
 
     fn ioc(&self, venue: &SimVenue, order: Resting, reduce_only: bool, submit_mid: Option<f64>) {
@@ -757,7 +991,24 @@ impl Matching {
                 BatchAction::Place(params) => {
                     let order = reservation.expect("place reservation");
                     let ioc = params.order_type == OrderType::Ioc;
-                    if self.admit(order, ioc, changed_sides[usize::from(order.is_ask)]) {
+                    let allowed = self.flat_at_funding.as_ref().is_none_or(|schedule| {
+                        schedule.allows_arrival(now_ms(), ioc && params.reduce_only)
+                    });
+                    if !allowed {
+                        self.market.lock().funding_rejections += 1;
+                    }
+                    let warmed = now_ms() >= self.trade_from_ms || (ioc && params.reduce_only);
+                    if !warmed {
+                        self.market.lock().warmup_rejections += 1;
+                    }
+                    let online = self.flat_at_funding.is_none()
+                        || self.market.lock().trade_feed_online == Some(true)
+                        || (ioc && params.reduce_only);
+                    if allowed
+                        && warmed
+                        && online
+                        && self.admit(order, ioc, changed_sides[usize::from(order.is_ask)])
+                    {
                         venue.activate(order);
                         if ioc {
                             self.ioc(venue, order, params.reduce_only, submit_mid);
@@ -820,6 +1071,18 @@ pub struct RecordedMakerReport {
     end_ms: u64,
     active_until_ms: u64,
     initial_equity: f64,
+    strategy_startups: u64,
+    daily_loss_start_equity: Option<f64>,
+    funding_mode: &'static str,
+    funding_boundaries_verified: u64,
+    trade_delivery_grace_ms: u64,
+    late_cancel_fills: u64,
+    historical_trades: u64,
+    pre_order_trades: u64,
+    funding_rejections: u64,
+    warmup_rejections: u64,
+    trade_feed_gaps: u64,
+    trade_feed_continuity_verified: bool,
     book_frames: u64,
     tape_trades: u64,
     accepted_orders: u64,
@@ -895,6 +1158,13 @@ fn account(config: &RecordedMakerConfig, venue: &SimVenue, shm: &mut ShmFiles, r
     let (_, low, high) = venue.tracker.exposure_bounds();
     let margin = low.abs().max(high.abs()) * mid.unwrap_or(0.0) / config.strategy.max_leverage;
     shm.publish_account_with_margin(equity, position, margin, now_ns);
+    venue
+        .recorded
+        .as_ref()
+        .expect("recorded matching")
+        .market
+        .lock()
+        .last_account_publication_ms = Some(now_ns / NS_PER_MS);
 }
 
 async fn drive(
@@ -943,8 +1213,7 @@ async fn drive(
         None,
     );
     let (stop, stop_rx) = watch::channel(false);
-    let (done, mut feed_done) = watch::channel(false);
-    let mut account_done = feed_done.clone();
+    let (done, mut account_done) = watch::channel(false);
     let mut frames = 0;
     let mut trades = 0;
     let mut last = config.start_ms;
@@ -963,25 +1232,48 @@ async fn drive(
                 if input.read_line(&mut line)? == 0 {
                     break;
                 }
-                ensure!(line.len() <= 64*1024,"maker event exceeds line limit");
-                let event: Event = serde_json::from_str(&line).context("invalid recorded maker event")?;
+                ensure!(line.len() <= 64 * 1024, "maker event exceeds line limit");
+                let event: Event =
+                    serde_json::from_str(&line).context("invalid recorded maker event")?;
                 let at = event.at_ms();
-                ensure!(at >= last && at < config.drain_until_ms,"maker events outside ordered replay window");
+                ensure!(
+                    at >= last && at < config.drain_until_ms,
+                    "maker events outside ordered replay window"
+                );
+                if let Some(schedule) = &config.flat_at_funding {
+                    ensure!(
+                        at - last <= schedule.max_event_gap_ms,
+                        "continuous replay event gap exceeds bound"
+                    );
+                }
                 last = at;
-                while delayed_books.front().is_some_and(|(at_publish, _, _)| *at_publish <= at) {
-                    let (at_publish, lighter, hyperliquid) = delayed_books.pop_front().expect("checked delayed book");
-                    tokio::select! {
-                        _ = feed_done.changed() => return Ok(()),
-                        _ = tokio::time::sleep_until(start+Duration::from_millis(at_publish-config.start_ms)) => {}
-                    }
+                while delayed_books
+                    .front()
+                    .is_some_and(|(at_publish, _, _)| *at_publish <= at)
+                {
+                    let (at_publish, lighter, hyperliquid) =
+                        delayed_books.pop_front().expect("checked delayed book");
+                    tokio::time::sleep_until(
+                        start + Duration::from_millis(at_publish - config.start_ms),
+                    )
+                    .await;
                     publish(&lighter, &hyperliquid);
                 }
-                tokio::select! {
-                    _ = feed_done.changed() => return Ok(()),
-                    _ = tokio::time::sleep_until(start+Duration::from_millis(at-config.start_ms)) => {}
-                }
+                tokio::time::sleep_until(start + Duration::from_millis(at - config.start_ms)).await;
+                matching.market.lock().last_event_ms = at;
                 match event {
-                    Event::Book { lighter, hyperliquid, .. } => {
+                    Event::TradeFeed { online, .. } => {
+                        let mut state = matching.market.lock();
+                        if !online && state.trade_feed_online != Some(false) {
+                            state.trade_feed_gaps += 1;
+                        }
+                        state.trade_feed_online = Some(online);
+                    }
+                    Event::Book {
+                        lighter,
+                        hyperliquid,
+                        ..
+                    } => {
                         lighter.validate(at)?;
                         hyperliquid.validate(at)?;
                         let at_publish = at + config.market_data_delay_ms;
@@ -993,26 +1285,49 @@ async fn drive(
                         matching.on_book(lighter);
                         frames += 1;
                     }
-                    Event::Trade { source_ms, price, size, aggressor, .. } => {
-                        ensure!(source_ms>0 && valid_price(price) && size.is_finite() && size>0.0,"invalid recorded trade");
-                        matching.on_trade(&sim,at,source_ms,price,size,matches!(aggressor,Aggressor::Buy));
+                    Event::Trade {
+                        source_ms,
+                        price,
+                        size,
+                        aggressor,
+                        ..
+                    } => {
+                        ensure!(
+                            source_ms > 0 && valid_price(price) && size.is_finite() && size > 0.0,
+                            "invalid recorded trade"
+                        );
+                        matching.on_trade(
+                            &sim,
+                            at,
+                            source_ms,
+                            price,
+                            size,
+                            matches!(aggressor, Aggressor::Buy),
+                        )?;
                         trades += 1;
                     }
                 }
             }
             for (at_publish, lighter, hyperliquid) in delayed_books {
-                tokio::select! {
-                    _ = feed_done.changed() => return Ok(()),
-                    _ = tokio::time::sleep_until(start+Duration::from_millis(at_publish-config.start_ms)) => {}
-                }
+                tokio::time::sleep_until(
+                    start + Duration::from_millis(at_publish - config.start_ms),
+                )
+                .await;
                 publish(&lighter, &hyperliquid);
             }
-            tokio::select! {
-                _ = feed_done.changed() => {},
-                _ = tokio::time::sleep_until(start+Duration::from_millis(config.drain_until_ms-config.start_ms)) => {},
+            if let Some(schedule) = &config.flat_at_funding {
+                ensure!(
+                    config.drain_until_ms - last <= schedule.max_event_gap_ms,
+                    "continuous replay ends without event coverage"
+                );
             }
+            tokio::time::sleep_until(
+                start + Duration::from_millis(config.drain_until_ms - config.start_ms),
+            )
+            .await;
             Ok(())
-        }.await;
+        }
+        .await;
         stop.send_replace(true);
         result
     };
@@ -1027,7 +1342,11 @@ async fn drive(
         }
     };
     let run = async {
-        let result = strategy.run(Some(stop_rx)).await;
+        let result = if config.flat_at_funding.is_some() {
+            continuous::run(&mut strategy, &config, &sim, stop_rx).await
+        } else {
+            (strategy.run(Some(stop_rx)).await, 0)
+        };
         done.send_replace(true);
         result
     };
@@ -1040,7 +1359,8 @@ async fn drive(
             }
         }
     };
-    let (data, (), result, ()) = tokio::join!(feed, accounts, run, end_quotes);
+    let (data, (), (result, funding_boundaries_verified), ()) =
+        tokio::join!(feed, accounts, run, end_quotes);
     data?;
     account(
         &config,
@@ -1060,7 +1380,13 @@ async fn drive(
     let risk = risk.into_inner();
     let halted = result.err().map(|err| format!("{err:#}"));
     let active_until_ms = now_ms();
-    let funding_safe = active_until_ms / HOUR_MS == config.start_ms / HOUR_MS;
+    let trade_feed_continuity_verified =
+        market.trade_feed_online == Some(true) && market.trade_feed_gaps == 0;
+    let funding_safe = if config.flat_at_funding.is_some() {
+        halted.is_none() && trade_feed_continuity_verified
+    } else {
+        active_until_ms / HOUR_MS == config.start_ms / HOUR_MS
+    };
     let cross_market_attribution =
         market
             .attribution
@@ -1084,6 +1410,25 @@ async fn drive(
         end_ms: config.end_ms,
         active_until_ms,
         initial_equity: config.initial_equity,
+        strategy_startups: 1,
+        daily_loss_start_equity: strategy
+            .daily_loss
+            .as_ref()
+            .map(|guard| guard.start_equity()),
+        funding_mode: if config.flat_at_funding.is_some() {
+            "flat_at_funding"
+        } else {
+            "single_funding_hour"
+        },
+        funding_boundaries_verified,
+        trade_delivery_grace_ms: config.trade_delivery_grace_ms,
+        late_cancel_fills: market.late_cancel_fills,
+        historical_trades: market.historical_trades,
+        pre_order_trades: market.pre_order_trades,
+        funding_rejections: market.funding_rejections,
+        warmup_rejections: market.warmup_rejections,
+        trade_feed_gaps: market.trade_feed_gaps,
+        trade_feed_continuity_verified,
         book_frames: frames,
         tape_trades: trades,
         accepted_orders: market.accepted_orders,
@@ -1153,11 +1498,484 @@ mod tests {
             diagnose_cross_market: false,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
+            trade_delivery_grace_ms: 2_000,
+            flat_at_funding: None,
+            trade_from_ms: None,
             taker_fee_bps: 4.0,
             min_contracts: 0.001,
             min_notional: 1.0,
             depth_participation: 0.25,
         }
+    }
+
+    fn book() -> Book {
+        Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        }
+    }
+
+    fn maker() -> BatchAction {
+        BatchAction::Place(OrderParams {
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.05,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_order_matches_late_pre_cancel_prints_without_reviving_reservations() {
+        let _clock = ReplayClock::open(START, false);
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 1.0);
+        venue.recorded = Some(Matching::new(&config()));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(book());
+        venue.execute_batch(vec![maker(), maker()]).await.unwrap();
+        let cancelled_id = *venue.book.lock().keys().next().unwrap();
+        venue.cancel_order(cancelled_id).await.unwrap();
+        let source = now_ms() - 150;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        matching
+            .on_trade(&venue, now_ms(), source, 100.0, 0.075, false)
+            .unwrap();
+        assert_eq!(venue.net_position(), 0.075);
+        assert_eq!(tracker.confirmed_position(), 0.075);
+        assert!(!venue.book.lock().contains_key(&cancelled_id));
+        assert_eq!(venue.book.lock().values().next().unwrap().remaining, 0.025);
+        assert_eq!(matching.market.lock().late_cancel_fills, 1);
+        assert_eq!(venue.ledger.lock().maker_fills, 2);
+        assert!((tracker.exposure_bounds().2 - 0.1).abs() < 1e-8);
+        assert!(!tracker.needs_reconciliation());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_partial_fills_keep_remaining_volume_and_cleanup_waits_for_delivery() {
+        let _clock = ReplayClock::open(START, false);
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
+        venue.recorded = Some(Matching::new(&config()));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(book());
+        venue.execute_batch(vec![maker()]).await.unwrap();
+        venue.cancel_all().await.unwrap();
+        let cancelled_at = now_ms();
+        let fill = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            matching
+                .on_trade(&venue, now_ms(), cancelled_at - 150, 100.0, 0.02, false)
+                .unwrap();
+            matching
+                .on_trade(&venue, now_ms(), cancelled_at - 140, 100.0, 0.03, false)
+                .unwrap();
+        };
+        let (orders, ()) = tokio::join!(venue.get_active_orders(), fill);
+        assert!(orders.unwrap().is_empty());
+        assert_eq!(venue.net_position(), 0.05);
+        assert_eq!(tracker.confirmed_position(), 0.05);
+        assert!(matching.market.lock().cancelled.is_empty());
+        assert_eq!(matching.market.lock().late_cancel_fills, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_cancel_prints_do_not_fill_and_expired_delivery_invalidates_replay() {
+        let _clock = ReplayClock::open(START, false);
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(tracker, 0.0);
+        venue.recorded = Some(Matching::new(&config()));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(book());
+        venue.execute_batch(vec![maker()]).await.unwrap();
+        venue.cancel_all().await.unwrap();
+        let cancelled_at = now_ms();
+        tokio::time::advance(Duration::from_millis(101)).await;
+        matching
+            .on_trade(&venue, now_ms(), now_ms(), 100.0, 0.05, false)
+            .unwrap();
+        assert_eq!(venue.net_position(), 0.0);
+        matching.wait_cancelled_prints().await.unwrap();
+        assert!(matching.market.lock().cancelled.is_empty());
+        assert!(
+            matching
+                .on_trade(&venue, now_ms(), cancelled_at - 150, 100.0, 0.05, false)
+                .unwrap_err()
+                .to_string()
+                .contains("delivery grace exceeded")
+        );
+        // Reconnect history that predates every possible simulated order is
+        // counted explicitly; it must neither fill nor invalidate a run.
+        matching
+            .on_trade(&venue, now_ms(), START - 60_000, 100.0, 0.05, false)
+            .unwrap();
+        assert_eq!(matching.market.lock().historical_trades, 1);
+        assert!(
+            matching
+                .on_trade(&venue, now_ms(), now_ms() + 101, 100.0, 0.05, false)
+                .is_err()
+        );
+    }
+
+    fn continuous_config(seconds: u64) -> RecordedMakerConfig {
+        let mut value = config();
+        value.end_ms = START + seconds * 1_000;
+        value.drain_until_ms = value.end_ms + 15_000;
+        value.strategy.use_post_only = true;
+        value.strategy.use_depth_pricing = false;
+        value.strategy.poll_interval_ms = 1_000;
+        value.flat_at_funding = Some(FlatAtFunding {
+            interval_ms: 60_000,
+            offset_ms: 0,
+            drain_before_ms: 10_000,
+            guard_ms: 1_000,
+            max_event_gap_ms: 2_000,
+        });
+        value
+    }
+
+    fn tape(config: &RecordedMakerConfig, feed: bool) -> String {
+        let mut data = String::new();
+        if feed {
+            data.push_str(&format!(
+                "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+                config.start_ms
+            ));
+        }
+        for at in (config.start_ms..config.drain_until_ms).step_by(1_000) {
+            let book =
+                serde_json::json!({"timestamp_ms":at,"bids":[[99.0,1.0]],"asks":[[101.0,1.0]]});
+            let event =
+                serde_json::json!({"kind":"book","at_ms":at,"lighter":book,"hyperliquid":book});
+            data.push_str(&event.to_string());
+            data.push('\n');
+        }
+        data
+    }
+
+    #[test]
+    fn continuous_driver_keeps_one_strategy_and_proves_each_flat_settlement() {
+        let config = continuous_config(125);
+        let data = tape(&config, true);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(report.halted.is_none(), "{:?}", report.halted);
+        assert_eq!(report.funding_boundaries_verified, 2);
+        assert_eq!(report.strategy_startups, 1);
+        assert_eq!(report.daily_loss_start_equity, Some(1_000.0));
+        assert_eq!(report.net_liquidation_pnl, Some(0.0));
+        assert_eq!(report.final_position, 0.0);
+        assert_eq!(report.active_until_ms, START + 140_000);
+    }
+
+    #[test]
+    fn continuous_driver_cannot_certify_missing_trade_feed_or_book_gaps() {
+        let config = continuous_config(125);
+        let data = tape(&config, false);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(
+            report
+                .halted
+                .as_ref()
+                .unwrap()
+                .contains("trade-feed evidence")
+        );
+        assert_eq!(report.net_liquidation_pnl, None);
+        assert!(!report.trade_feed_continuity_verified);
+        let config = continuous_config(125);
+        let data = tape(&config, true);
+        let data = data
+            .lines()
+            .filter(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                let at = event["at_ms"].as_u64().unwrap();
+                !(START + 10_000..START + 14_000).contains(&at)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            run_recorded_maker(config, data.as_bytes())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("event gap")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actual_arrival_rejects_new_risk_after_drain_boundary_and_during_warmup() {
+        let _clock = ReplayClock::open(START + 48_800, false);
+        let mut config = continuous_config(125);
+        config.trade_from_ms = Some(START + 48_900);
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(tracker, 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.market.lock().trade_feed_online = Some(true);
+        matching.on_book(book());
+        // Submission precedes the 49s drain boundary; arrival is after it.
+        venue.execute_batch(vec![maker()]).await.unwrap();
+        assert!(venue.book.lock().is_empty());
+        assert_eq!(matching.market.lock().funding_rejections, 1);
+        assert!(venue.tracker.active_orders_snapshot().is_empty());
+        config.flat_at_funding = None;
+        config.trade_from_ms = Some(now_ms() + 1_000);
+        venue.recorded = Some(Matching::new(&config));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(book());
+        venue.execute_batch(vec![maker()]).await.unwrap();
+        assert!(venue.book.lock().is_empty());
+        assert_eq!(matching.market.lock().warmup_rejections, 1);
+    }
+
+    #[test]
+    fn long_replay_requires_explicit_bounded_funding_mode() {
+        let mut config = continuous_config(36_000);
+        config.flat_at_funding.as_mut().unwrap().interval_ms = HOUR_MS;
+        config.validate().unwrap();
+        config.flat_at_funding.as_mut().unwrap().guard_ms = u64::MAX;
+        assert!(config.validate().is_err());
+        config.flat_at_funding = None;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("funding hour")
+        );
+    }
+
+    #[test]
+    fn slow_batch_cannot_skip_a_narrow_funding_guard_and_report_valid_profit() {
+        let mut config = continuous_config(125);
+        config.order_entry_ms = 2_000;
+        config.order_response_ms = 2_000;
+        config.venue_cancel_delay_ms = 2_000;
+        config.strategy.order_ttl_secs = 1;
+        config.trade_delivery_grace_ms = 100;
+        config.trade_clock_guard_ms = 0;
+        let schedule = config.flat_at_funding.as_mut().unwrap();
+        schedule.guard_ms = 1;
+        schedule.drain_before_ms = 1_000;
+        let data = tape(&config, true);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(
+            report
+                .halted
+                .as_ref()
+                .is_some_and(|error| error.contains("funding")),
+            "{:?}",
+            report.halted
+        );
+        assert_eq!(report.net_liquidation_pnl, None);
+    }
+
+    #[test]
+    fn narrow_guards_wake_at_the_exact_settlement_timestamp() {
+        let mut config = continuous_config(125);
+        config.trade_clock_guard_ms = 0;
+        config.flat_at_funding.as_mut().unwrap().guard_ms = 1;
+        let data = tape(&config, true);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(report.halted.is_none(), "{:?}", report.halted);
+        assert_eq!(report.funding_boundaries_verified, 2);
+    }
+
+    #[test]
+    fn ten_hours_are_one_ledger_with_ten_verified_hourly_slots() {
+        let mut config = continuous_config(36_000);
+        config.flat_at_funding.as_mut().unwrap().interval_ms = HOUR_MS;
+        config.trade_from_ms = Some(START + 60_000);
+        let data = tape(&config, true);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(report.halted.is_none(), "{:?}", report.halted);
+        assert_eq!(report.strategy_startups, 1);
+        assert_eq!(report.funding_boundaries_verified, 10);
+        assert_eq!(report.daily_loss_start_equity, Some(1_000.0));
+        assert_eq!(report.net_liquidation_pnl, Some(0.0));
+        assert_eq!(report.active_until_ms, START + 36_015_000);
+        assert!(report.warmup_rejections > 0);
+    }
+
+    fn with_feed_gap(data: String, off: u64, on: u64) -> String {
+        let mut events: Vec<serde_json::Value> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        events.push(serde_json::json!({"kind":"trade_feed","at_ms":off,"online":false}));
+        events.push(serde_json::json!({"kind":"trade_feed","at_ms":on,"online":true}));
+        events.sort_by_key(|event| event["at_ms"].as_u64().unwrap());
+        events
+            .into_iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn reconnect_preserves_gap_evidence_and_guard_disconnect_cannot_be_certified() {
+        let config = continuous_config(125);
+        let data = with_feed_gap(tape(&config, true), START + 20_000, START + 21_000);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(report.halted.is_none(), "{:?}", report.halted);
+        assert_eq!(report.trade_feed_gaps, 1);
+        assert!(!report.trade_feed_continuity_verified);
+        assert_eq!(report.net_liquidation_pnl, None);
+        let config = continuous_config(125);
+        let data = with_feed_gap(tape(&config, true), START + 60_200, START + 62_000);
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(
+            report
+                .halted
+                .as_ref()
+                .unwrap()
+                .contains("trade-feed evidence")
+        );
+        assert_eq!(report.net_liquidation_pnl, None);
+    }
+
+    #[test]
+    fn receipt_activity_does_not_make_stale_guard_books_fresh() {
+        let config = continuous_config(125);
+        let data = tape(&config, true)
+            .lines()
+            .map(|line| {
+                let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["kind"] == "book" && event["at_ms"].as_u64().unwrap() >= START + 55_000 {
+                    event["lighter"]["timestamp_ms"] = (START + 55_000).into();
+                }
+                event.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = run_recorded_maker(config, data.as_bytes()).unwrap();
+        assert!(report.halted.as_ref().unwrap().contains("fresh book"));
+        assert_eq!(report.net_liquidation_pnl, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn funding_cleanup_cannot_reset_the_daily_loss_budget() {
+        let mut config = continuous_config(125);
+        config.strategy.max_daily_loss_pct = 0.03;
+        let _clock = ReplayClock::open(START, false);
+        let mut files = ShmFiles::for_symbol(config.strategy.symbol_id).unwrap();
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let venue = Arc::new(venue);
+        let matching = venue.recorded.as_ref().unwrap();
+        let reader = ShmReader::open(files.path("matrix").to_str().unwrap(), NUM_SYMBOLS).unwrap();
+        let account_reader =
+            AccountStatsReader::open(files.path("account").to_str().unwrap()).unwrap();
+        let mut risk = Risk {
+            high: config.initial_equity,
+            ..Default::default()
+        };
+        account(&config, &venue, &mut files, &mut risk);
+        let mut strategy = InventoryNeutralMM::with_data_sources(
+            config.strategy.clone(),
+            Arc::clone(&venue) as Arc<dyn Exchange>,
+            tracker,
+            reader,
+            account_reader,
+            None,
+        );
+        let (_stop, stop_rx) = watch::channel(false);
+        let publish = async {
+            for millis in (0..140_000).step_by(100) {
+                if millis == 10_000 || millis == 70_000 {
+                    // Synthetic cash losses on either side of settlement.
+                    // Each is below the cap; together they breach it.
+                    venue.ledger.lock().cash -= if millis == 10_000 { 20.0 } else { 15.0 };
+                }
+                let book = book();
+                book.write_bbo(&files, LIGHTER);
+                book.write_bbo(&files, EXCH_HYPERLIQUID);
+                files.publish_version();
+                matching.on_book(book);
+                {
+                    let mut state = matching.market.lock();
+                    state.trade_feed_online = Some(true);
+                    state.last_event_ms = now_ms();
+                }
+                account(&config, &venue, &mut files, &mut risk);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let ((result, verified), ()) = tokio::join!(
+            continuous::run(&mut strategy, &config, &venue, stop_rx),
+            publish
+        );
+        assert_eq!(verified, 1);
+        assert!(format!("{:#}", result.unwrap_err()).contains("daily loss limit breached"));
+        assert_eq!(
+            strategy.daily_loss.as_ref().unwrap().start_equity(),
+            1_000.0
+        );
+        assert_eq!(venue.cash_flow(), -35.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_waits_for_account_published_after_the_last_allowed_cancel_fill() {
+        let mut config = config();
+        config.trade_clock_guard_ms = 0;
+        let _clock = ReplayClock::open(START, false);
+        let mut files = ShmFiles::for_symbol(config.strategy.symbol_id).unwrap();
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let venue = Arc::new(venue);
+        let matching = venue.recorded.as_ref().unwrap();
+        let reader = ShmReader::open(files.path("matrix").to_str().unwrap(), NUM_SYMBOLS).unwrap();
+        let account_reader =
+            AccountStatsReader::open(files.path("account").to_str().unwrap()).unwrap();
+        let mut risk = Risk {
+            high: config.initial_equity,
+            ..Default::default()
+        };
+        account(&config, &venue, &mut files, &mut risk);
+        let mut strategy = InventoryNeutralMM::with_data_sources(
+            config.strategy.clone(),
+            Arc::clone(&venue) as Arc<dyn Exchange>,
+            Arc::clone(&tracker),
+            reader,
+            account_reader,
+            None,
+        );
+        matching.on_book(book());
+        venue.execute_batch(vec![maker()]).await.unwrap();
+        venue.cancel_all().await.unwrap();
+        let cancelled_at = now_ms();
+        let expires_at = cancelled_at + config.trade_delivery_grace_ms;
+        let publish = async {
+            tokio::time::sleep(Duration::from_millis(expires_at - now_ms() - 1)).await;
+            account(&config, &venue, &mut files, &mut risk); // zero, but one ms before fill
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            matching
+                .on_trade(&venue, now_ms(), cancelled_at, 100.0, 0.05, false)
+                .unwrap();
+            assert_eq!(venue.net_position(), 0.05);
+            assert_eq!(tracker.confirmed_position(), 0.05);
+            for _ in 0..70 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let book = book();
+                book.write_bbo(&files, LIGHTER);
+                book.write_bbo(&files, EXCH_HYPERLIQUID);
+                files.publish_version();
+                matching.on_book(book);
+                account(&config, &venue, &mut files, &mut risk);
+            }
+        };
+        let (cleaned, ()) = tokio::join!(
+            strategy.clean_exchange_state("late delivery regression"),
+            publish
+        );
+        cleaned.unwrap();
+        assert_eq!(venue.net_position(), 0.0);
+        assert_eq!(tracker.confirmed_position(), 0.0);
+        assert_eq!(venue.ledger.lock().maker_fills, 1);
+        assert_eq!(venue.ledger.lock().taker_fills, 1);
+        assert!(!tracker.needs_reconciliation());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1188,10 +2006,14 @@ mod tests {
             Duration::from_millis(550)
         );
         venue.execute_batch(vec![maker(), maker()]).await.unwrap();
-        matching.on_trade(&venue, now_ms(), START + 200, 100.0, 1.0, false);
+        matching
+            .on_trade(&venue, now_ms(), START + 200, 100.0, 1.0, false)
+            .unwrap();
         assert_eq!(venue.net_position(), 0.0);
         tokio::time::advance(Duration::from_millis(200)).await;
-        matching.on_trade(&venue, now_ms(), now_ms(), 100.0, 0.075, false);
+        matching
+            .on_trade(&venue, now_ms(), now_ms(), 100.0, 0.075, false)
+            .unwrap();
         assert_eq!(venue.net_position(), 0.075);
         assert_eq!(tracker.confirmed_position(), 0.075);
 
@@ -1272,7 +2094,9 @@ mod tests {
         let cancel = venue.cancel_all();
         let fill = async {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            matching.on_trade(&venue, now_ms(), now_ms(), 100.0, 0.05, false);
+            matching
+                .on_trade(&venue, now_ms(), now_ms(), 100.0, 0.05, false)
+                .unwrap();
         };
         let (result, ()) = tokio::join!(cancel, fill);
         assert_eq!(result.unwrap(), 0);

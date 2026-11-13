@@ -439,7 +439,7 @@ func runSource(ctx context.Context, source subscription, emit func(record) error
 	return err
 }
 
-func capture(ctx context.Context, sources []subscription, out *os.File) error {
+func capture(ctx context.Context, sources []subscription, out syncWriter) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	queue := make(chan record, 4096)
@@ -553,6 +553,7 @@ func run() error {
 	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
 	duration := flag.Duration("duration", time.Minute, "recording duration")
 	path := flag.String("output", "", "new output NDJSON file")
+	compressed := flag.Bool("gzip", false, "stream gzip-compressed NDJSON to the output file")
 	flag.Parse()
 	if *path == "" || *duration < time.Second || *duration > 24*time.Hour {
 		return errors.New("provide -output and a duration from 1s to 24h")
@@ -598,7 +599,7 @@ func run() error {
 	if len(sources) == 0 {
 		return errors.New("configure at least one public market")
 	}
-	out, err := os.OpenFile(*path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	out, err := openCaptureOutput(*path, *compressed)
 	if err != nil {
 		return err
 	}

@@ -5,11 +5,30 @@ use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
 use crate::strategy::relative_value::*;
 use std::collections::{BTreeMap, VecDeque};
 
+mod funding;
 mod posture;
+pub use funding::{FlatAtFunding, FundingFlatReport};
+use funding::{FundingState, TimerKind};
 use posture::PostureState;
 pub use posture::{TurnoverControl, TurnoverPosture, TurnoverPosturePolicy, TurnoverPostureReport};
 
 const MAX_FEEDBACK_LEVELS: usize = 8;
+
+/// Configuration capability check, not validation of a tape or a profitability
+/// claim. Funding avoidance still requires runtime proof at every boundary.
+#[derive(Debug, Serialize)]
+pub struct MakerFirstPreflight {
+    pub scope: &'static str,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub duration_ms: u64,
+    pub execution_supported: bool,
+    pub funding_slots_by_leg: [u64; 2],
+    pub first_funding_slot_ms: [Option<u64>; 2],
+    pub blockers: Vec<&'static str>,
+    pub required_engine_work: Vec<&'static str>,
+    pub required_evidence: Vec<&'static str>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +48,9 @@ pub struct MakerFirstConfig {
     pub hold_ms: u64,
     pub unhedged_timeout_ms: u64,
     pub drain_ms: u64,
+    /// Research-only: prove flat through every funding guard; never impute a payment.
+    #[serde(default)]
+    pub flat_at_funding: Option<FlatAtFunding>,
     /// Touch control submits without a net edge gate.
     pub require_net_edge: bool,
     /// If omitted, compare both opening directions on every decision.
@@ -227,6 +249,8 @@ pub struct MakerFirstReport {
     pub below_minimum_hedge: usize,
     pub below_minimum_unwind: usize,
     pub incomplete: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_flat: Option<FundingFlatReport>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -375,6 +399,7 @@ struct Replay<'a> {
     unhedged_since: Option<u64>,
     cost_feedback: CostFeedback,
     posture: PostureState,
+    funding: Option<FundingState>,
     report: MakerFirstReport,
 }
 
@@ -472,6 +497,15 @@ impl MakerFirstConfig {
     }
 
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
+        let capability = self.preflight(registry)?;
+        ensure!(
+            capability.execution_supported,
+            "maker-first execution window crosses a funding slot"
+        );
+        Ok(())
+    }
+
+    pub fn preflight(&self, registry: &VenueRegistry) -> Result<MakerFirstPreflight> {
         self.pair.validate(registry)?;
         ensure!(
             self.pair.asset_class == AssetClass::Crypto
@@ -554,18 +588,128 @@ impl MakerFirstConfig {
                 "invalid hedged exit policy"
             );
         }
-        ensure!(
-            self.pair.legs.iter().all(|leg| leg
+        if let Some(policy) = self.flat_at_funding {
+            policy.validate(self)?;
+        }
+        let mut slots = [0; 2];
+        let mut first = [None; 2];
+        for (i, leg) in self.pair.legs.iter().enumerate() {
+            let (at, count) = leg
                 .funding
                 .window(self.start_ms, self.end_ms)
-                .is_some_and(|(_, count)| count == 0)),
-            "maker-first execution window crosses a funding slot"
-        );
-        Ok(())
+                .ok_or_else(|| anyhow::anyhow!("funding schedule overflow"))?;
+            slots[i] = count;
+            first[i] = (count > 0).then_some(at);
+        }
+        let supported = slots == [0; 2] || self.flat_at_funding.is_some();
+        Ok(MakerFirstPreflight {
+            scope: "configuration_only_no_tape_validated",
+            start_ms: self.start_ms,
+            end_ms: self.end_ms,
+            duration_ms: self.end_ms - self.start_ms,
+            execution_supported: supported,
+            funding_slots_by_leg: slots,
+            first_funding_slot_ms: first,
+            blockers: if supported {
+                vec![]
+            } else {
+                vec!["maker_first_funding_lifecycle_not_supported"]
+            },
+            // Maker prints arrive after their source timestamps. Booking funding
+            // against receipt-time inventory would misprice a late pre-slot fill.
+            // These are implementation requirements, not merely missing data.
+            required_engine_work: if supported {
+                vec![]
+            } else {
+                vec![
+                    "source_time_position_watermark_and_late_fill_resolution",
+                    "settlement_booking_in_continuous_cash_and_loss_ledger",
+                    "funding_boundary_fill_and_order_guard",
+                ]
+            },
+            required_evidence: if self.flat_at_funding.is_some() {
+                vec![
+                    "verified_funding_schedule_and_settlement_guard",
+                    "bounded_source_to_receipt_trade_delivery",
+                    "public_trade_and_book_continuity_across_payment_boundaries",
+                    "flat_positions_and_resolved_orders_at_every_funding_guard",
+                ]
+            } else if supported {
+                vec![]
+            } else {
+                vec![
+                    "verified_realized_or_witnessed_payment_for_each_held_slot",
+                    "venue_market_currency_and_funding_schedule_provenance",
+                    "public_trade_and_book_continuity_across_payment_boundaries",
+                ]
+            },
+        })
     }
 }
 
 impl Replay<'_> {
+    fn funding_paused(&self, now: u64) -> bool {
+        self.funding.as_ref().is_some_and(|state| state.paused(now))
+    }
+
+    fn funding_failure(&mut self, reason: &'static str) {
+        self.report.incomplete.get_or_insert(reason);
+        if let Some(state) = &mut self.funding {
+            state.report.failure.get_or_insert(reason);
+        }
+    }
+
+    fn funding_flat(&self) -> bool {
+        self.ledger.is_flat()
+            && self.quote.is_none()
+            && self.ioc.is_none()
+            && self.notices.is_empty()
+            && self.cycle.is_none()
+    }
+
+    fn funding_timers(&mut self, until: u64) -> Result<()> {
+        loop {
+            let timer = self.funding.as_mut().and_then(|state| {
+                state.timers.front().filter(|(at, _)| *at <= until)?;
+                state.timers.pop_front()
+            });
+            let Some((now, kind)) = timer else {
+                return Ok(());
+            };
+            if self.posture.expire(now) {
+                self.report.turnover_posture.controls_expired += 1;
+                self.posture_changed(now);
+            }
+            if matches!(kind, TimerKind::Resume) {
+                // A book received before the guard cannot authorize resumption.
+                self.usable = [false; 2];
+                self.funding
+                    .as_mut()
+                    .expect("funding timer owns state")
+                    .resume_after_ms = now;
+            }
+            self.risk(now);
+            self.advance_quote(now, false);
+            self.advance(now)?;
+            self.risk(now);
+            if matches!(kind, TimerKind::Check | TimerKind::Slot(_)) {
+                if !self.funding_flat() {
+                    self.funding_failure("funding_boundary_not_flat_and_resolved");
+                }
+                let state = self.funding.as_mut().expect("funding timer owns state");
+                state.report.boundary_checks += 1;
+                if let TimerKind::Slot(legs) = kind
+                    && state.report.failure.is_none()
+                    && self.report.incomplete.is_none()
+                {
+                    for (i, paid) in legs.into_iter().enumerate() {
+                        state.report.verified_slots_by_leg[i] += u64::from(paid);
+                    }
+                }
+            }
+        }
+    }
+
     fn maker(&self) -> usize {
         self.config.maker_leg
     }
@@ -628,6 +772,10 @@ impl Replay<'_> {
             );
             self.usable[i] = book.timestamp_ms > 0
                 && book.timestamp_ms >= self.last_source_ms[i]
+                && self
+                    .funding
+                    .as_ref()
+                    .is_none_or(|s| book.timestamp_ms >= s.resume_after_ms)
                 && book.valid_depth(&self.config.pair.legs[i]);
             if self.usable[i] {
                 self.last_source_ms[i] = book.timestamp_ms;
@@ -1389,11 +1537,22 @@ impl Replay<'_> {
             || self.ioc.is_some()
             || now < self.next_quote_ms
             || self.report.incomplete.is_some()
+            || self.funding_paused(now)
         {
             return Ok(());
         }
         let closing = self.cycle.is_some();
         let horizon = self.config.entry_horizon_ms();
+        if !closing
+            && self
+                .funding
+                .as_ref()
+                .and_then(|s| s.next_pause(now))
+                .is_some_and(|at| now + horizon >= at)
+        {
+            self.report.blocked("funding_entry_horizon");
+            return Ok(());
+        }
         if !closing && now + horizon >= self.config.end_ms {
             return Ok(());
         }
@@ -1738,6 +1897,10 @@ impl Replay<'_> {
     }
 
     fn advance(&mut self, now: u64) -> Result<()> {
+        let funding_pause = self.funding_paused(now);
+        if funding_pause {
+            self.cancel(now, "funding_guard");
+        }
         self.poll_ioc(now)?;
         let mut confirmed = false;
         while self.notices.front().is_some_and(|(at, _)| *at <= now) {
@@ -1768,6 +1931,7 @@ impl Replay<'_> {
                 || cycle.paired_at_ms.is_none())
                 && now >= cycle.started_ms + self.config.hold_ms;
             cycle.draining |= opening_timeout
+                || funding_pause
                 || paired_time
                 || paired_basis
                 || paired_book
@@ -1983,6 +2147,7 @@ impl Replay<'_> {
                 "unordered maker-first tape"
             );
             previous = now;
+            self.funding_timers(now)?;
             if self.posture.expire(now) {
                 self.report.turnover_posture.controls_expired += 1;
                 self.posture_changed(now);
@@ -2009,6 +2174,32 @@ impl Replay<'_> {
                             && source_ms > 0,
                         "invalid maker-first print"
                     );
+                    if leg == self.maker()
+                        && let Some(state) = &mut self.funding
+                    {
+                        if source_ms < self.config.start_ms {
+                            // The replay starts with no orders or inventory. A
+                            // reconnect history print cannot fill our later order.
+                            state.report.ignored_prestart_prints += 1;
+                            self.report.trade_prints += 1;
+                            continue;
+                        }
+                        state.report.max_trade_delivery_ms = state
+                            .report
+                            .max_trade_delivery_ms
+                            .max(now.saturating_sub(source_ms));
+                    }
+                    if self.funding.is_some()
+                        && leg == self.maker()
+                        && (source_ms > now
+                            || now - source_ms > self.config.trade_delivery_grace_ms)
+                    {
+                        self.report.late_trade_prints += 1;
+                        self.report.trade_prints += 1;
+                        self.funding_failure("funding_trade_delivery_bound_violated");
+                        self.cancel(now, "unbounded_trade_delivery");
+                        continue;
+                    }
                     if leg == self.maker() && self.feed_online {
                         self.trade(now, source_ms, aggressor, px, contracts)?;
                     }
@@ -2022,6 +2213,7 @@ impl Replay<'_> {
                                 .quote
                                 .as_ref()
                                 .is_some_and(|quote| quote.activated_ms.is_some())
+                                || (self.funding.is_some() && !self.funding_flat())
                             {
                                 self.report.incomplete = Some("resting_order_during_trade_gap");
                             }
@@ -2085,8 +2277,11 @@ impl Replay<'_> {
                     .is_some_and(|c| c.paired_at_ms.is_some()),
         );
         self.report.fees = self.ledger.fees;
-        let final_mark = self.final_mark()?;
-        self.report.final_liquidation_pnl = final_mark.map(|(cash, _)| cash);
+        if let Some(state) = &self.funding
+            && state.report.verified_slots_by_leg != state.report.planned_slots_by_leg
+        {
+            self.funding_failure("funding_slots_not_verified");
+        }
         if !self.ledger.is_flat()
             || self.quote.is_some()
             || self.ioc.is_some()
@@ -2094,6 +2289,13 @@ impl Replay<'_> {
         {
             self.report.incomplete.get_or_insert("residual_at_cutoff");
         }
+        // A marked residual cannot repair an unproven historical funding cashflow.
+        let final_mark = if self.funding.is_some() && self.report.incomplete.is_some() {
+            None
+        } else {
+            self.final_mark()?
+        };
+        self.report.final_liquidation_pnl = final_mark.map(|(cash, _)| cash);
         if let Some(policy) = self.config.pair.mode.incentive() {
             let turnover = self.ledger.eligible_turnover;
             self.report.incentive_turnover = Some(IncentiveTurnoverReport {
@@ -2135,6 +2337,7 @@ impl Replay<'_> {
                 outward_quotes: self.cost_feedback.outward_quotes,
             });
         }
+        self.report.funding_flat = self.funding.map(|state| state.report);
         Ok(self.report)
     }
 }
@@ -2145,8 +2348,12 @@ pub fn run_maker_first(
     registry: &VenueRegistry,
 ) -> Result<MakerFirstReport> {
     config.validate(registry)?;
+    new_replay(config)?.run(events)
+}
+
+fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
     let [a, b] = &config.pair.legs;
-    Replay {
+    Ok(Replay {
         config,
         rules: Rules::new(&config.pair)?,
         common_step: common_quantity_step(a.base_step(), b.base_step())?,
@@ -2165,18 +2372,22 @@ pub fn run_maker_first(
         unhedged_since: None,
         cost_feedback: CostFeedback::default(),
         posture: PostureState::new(config.turnover_posture),
+        funding: FundingState::new(config)?,
         report: MakerFirstReport {
             start_ms: config.start_ms,
             end_ms: config.end_ms,
             ..Default::default()
         },
-    }
-    .run(events)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod funding_tests {
+        include!("maker_first/funding_tests.rs");
+    }
 
     fn config() -> MakerFirstConfig {
         let pair = serde_json::from_str::<super::super::PaperScenario>(include_str!(
@@ -2200,6 +2411,7 @@ mod tests {
             hold_ms: 2_000,
             unhedged_timeout_ms: 1_000,
             drain_ms: 4_000,
+            flat_at_funding: None,
             require_net_edge: false,
             entry_side: None,
             turnover_posture: None,
@@ -2312,6 +2524,48 @@ mod tests {
         cfg.start_ms = 3_590_000;
         cfg.end_ms = 3_615_000;
         assert!(cfg.validate(&VenueRegistry::default()).is_err());
+    }
+
+    #[test]
+    fn ten_hour_preflight_reports_each_funding_schedule_without_authorizing_execution() {
+        let mut cfg = config();
+        cfg.end_ms = cfg.start_ms + 10 * 3_600_000;
+        cfg.pair.legs[1].funding.interval_ms = 8 * 3_600_000;
+        let preflight = cfg.preflight(&VenueRegistry::default()).unwrap();
+        assert_eq!(preflight.duration_ms, 36_000_000);
+        assert_eq!(preflight.funding_slots_by_leg, [10, 1]);
+        assert_eq!(
+            preflight.first_funding_slot_ms,
+            [Some(3_600_000), Some(28_800_000)]
+        );
+        assert!(!preflight.execution_supported);
+        assert!(
+            preflight
+                .required_engine_work
+                .contains(&"source_time_position_watermark_and_late_fill_resolution")
+        );
+        assert!(cfg.validate(&VenueRegistry::default()).is_err());
+        assert!(
+            run_maker_first(
+                &cfg,
+                Vec::<Result<MakerFirstEvent>>::new(),
+                &VenueRegistry::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preflight_preserves_short_window_admission_and_rejects_invalid_risk_parameters() {
+        let mut cfg = config();
+        let short = cfg.preflight(&VenueRegistry::default()).unwrap();
+        assert!(short.execution_supported);
+        assert_eq!(short.funding_slots_by_leg, [0, 0]);
+        assert!(short.required_engine_work.is_empty());
+        assert_eq!(short.scope, "configuration_only_no_tape_validated");
+        cfg.end_ms = cfg.start_ms + 36_000_000;
+        cfg.quote_notional = Decimal::ZERO;
+        assert!(cfg.preflight(&VenueRegistry::default()).is_err());
     }
 
     #[test]

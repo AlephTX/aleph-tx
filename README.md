@@ -71,6 +71,12 @@ Lighter Core and Robinhood Chain are separate data domains. Robinhood
 support currently covers public capture and offline compilation.
 [Independent research and controls](docs/INDEPENDENT_STRATEGY_RESEARCH.md)
 
+Validation uses continuous **10-hour units**, with warm-up and final exits
+accounted separately. Quant, arbitrage and turnover retain independent
+state and cash ledgers; shared tape is counted once as market evidence.
+[Ten-hour validation and current limits](docs/TEN_HOUR_RESEARCH.md) ·
+[Data-source registry](docs/RESEARCH_DATA_SOURCES.md)
+
 ## Architecture
 
 ```mermaid

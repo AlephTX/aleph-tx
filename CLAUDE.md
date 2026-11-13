@@ -21,6 +21,15 @@ Follow the repository-wide rule in [AGENTS.md](AGENTS.md#sensitive-data-and-git)
 
 ## Working in this repository
 
+Strategy research follows the user's persistent contract in
+[AGENTS.md](AGENTS.md#strategy-research-contract): quant profit, hedge
+arbitrage and incentive turnover have independent ledgers and continuous
+10-hour validation units. Start from the
+[data-source registry](docs/RESEARCH_DATA_SOURCES.md) and the campaign
+inventory; do not forget or silently replace prior data sources. Preserve
+short diagnostics and missing evidence without promoting them to a complete
+10-hour validation or a profitability claim.
+
 - Use directory-level `CLAUDE.md` files for module orientation. Verify any
   older launch command, layout detail, or version claim against the Makefile,
   source, and current runbook before relying on it.

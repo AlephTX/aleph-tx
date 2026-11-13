@@ -54,6 +54,26 @@ Enable Lighter calibration on the copied profile with `legs[0].lighter_clock`
 as described below. Review Entropy's contract economics and session-specific
 oracle before using the capture for paper entries.
 
+## Continuous ten-hour studies
+
+Use `-duration 10h15m -gzip -output /path/to/new.ndjson.gz.partial` for a
+single-process compressed capture with time reserved for warm-up and drain.
+`-gzip` controls compression; the filename alone does not. Existing output
+files are never overwritten. Flush, gzip footer, fsync and close failures
+remain capture failures. A requested duration is not proof of completed
+coverage, and cancellation also writes a terminal marker.
+
+After natural completion, validate the complete compressed stream, actual
+duration, process exit and each source's continuity before sealing and
+hashing. The compiler requires decompressed NDJSON; consume the decompressor
+to EOF and verify its status/CRC. Preserve partials and source gaps instead
+of concatenating them into apparent continuous coverage.
+
+Quant, arbitrage and turnover require separate continuous ledgers. Existing
+hourly flat-start replays are diagnostics, not ten-hour validation units.
+See [the current execution limits and Oasis study](TEN_HOUR_RESEARCH.md)
+and the durable [source registry](RESEARCH_DATA_SOURCES.md).
+
 ## Lighter Core and Robinhood Chain
 
 Capture the two deployments with explicit source identities:

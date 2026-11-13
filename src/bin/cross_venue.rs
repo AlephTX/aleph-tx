@@ -12,7 +12,7 @@ use aleph_tx::{
     strategy::matched_settlement::MatchedSettlement,
     strategy::relative_value::{
         Frame as PerpFrame, MakerFirstConfig, MakerFirstEvent, PairConfig, PaperReport,
-        PaperScenario, run_maker_first, run_paper, run_paper_frames,
+        PaperScenario, PaperWindow, run_maker_first, run_paper, run_paper_frames_with_window,
     },
     venues::VenueRegistry,
 };
@@ -175,6 +175,8 @@ fn stream_paper(mut reader: impl BufRead, registry: &VenueRegistry) -> Result<Pa
         pair: PairConfig,
         one_way_latency_ms: u64,
         trade_from_ms: Option<u64>,
+        trade_until_ms: Option<u64>,
+        drain_until_ms: Option<u64>,
         #[serde(default)]
         funding_guard_ms: u64,
     }
@@ -188,11 +190,12 @@ fn stream_paper(mut reader: impl BufRead, registry: &VenueRegistry) -> Result<Pa
             .with_context(|| format!("Invalid replay frame on line {line}"))
             .transpose()
     });
-    run_paper_frames(
+    run_paper_frames_with_window(
         &header.pair,
         header.one_way_latency_ms,
         header.trade_from_ms,
         header.funding_guard_ms,
+        PaperWindow::from_bounds(header.trade_until_ms, header.drain_until_ms)?,
         frames,
         registry,
     )
@@ -410,6 +413,10 @@ async fn main() -> Result<()> {
             };
             print(&report)
         }
+        [command, file] if command == "maker-first-preflight" => {
+            let config: MakerFirstConfig = read_replay(file)?;
+            print(&config.preflight(&registry)?)
+        }
         [command, config, input, output] if command == "perp-compile" => {
             capture_to_replay(&read_replay(config)?, input, output, &registry)
         }
@@ -521,7 +528,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -544,6 +551,37 @@ mod tests {
         let registry = VenueRegistry::default();
         let streamed = stream_paper(std::io::Cursor::new(ndjson), &registry).unwrap();
         let batch = run_paper(&serde_json::from_str(fixture).unwrap(), &registry).unwrap();
+        assert_eq!(
+            serde_json::to_value(streamed).unwrap(),
+            serde_json::to_value(batch).unwrap()
+        );
+    }
+
+    #[test]
+    fn streamed_terminal_drain_preserves_batch_accounting() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/equity_basis_paper.json")).unwrap();
+        let start = fixture["frames"][0]["now_ms"].as_u64().unwrap();
+        fixture["trade_until_ms"] = json!(start + 600);
+        fixture["drain_until_ms"] = json!(start + 1100);
+        let mut boundary = fixture["frames"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        boundary["now_ms"] = json!(start + 1100);
+        fixture["frames"].as_array_mut().unwrap().push(boundary);
+        let registry = VenueRegistry::default();
+        let batch =
+            run_paper(&serde_json::from_value(fixture.clone()).unwrap(), &registry).unwrap();
+        assert!(batch.terminal_drain.as_ref().unwrap().complete);
+        let frames = fixture.as_object_mut().unwrap().remove("frames").unwrap();
+        let mut ndjson = format!("{fixture}\n");
+        for frame in frames.as_array().unwrap() {
+            ndjson.push_str(&format!("{frame}\n"));
+        }
+        let streamed = stream_paper(std::io::Cursor::new(ndjson), &registry).unwrap();
         assert_eq!(
             serde_json::to_value(streamed).unwrap(),
             serde_json::to_value(batch).unwrap()

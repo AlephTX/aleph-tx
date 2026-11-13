@@ -3,9 +3,10 @@
 
 mod paper;
 pub use paper::{
-    ExitReason, IncentiveTurnoverReport, MakerFirstConfig, MakerFirstEvent, MakerFirstReport,
-    PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperMarketCosts, PaperReport,
-    PaperScenario, PaperTrade, run_maker_first, run_paper, run_paper_frames,
+    ExitReason, IncentiveTurnoverReport, MakerFirstConfig, MakerFirstEvent, MakerFirstPreflight,
+    MakerFirstReport, PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperMarketCosts,
+    PaperReport, PaperScenario, PaperTrade, PaperWindow, TerminalDrainReport, run_maker_first,
+    run_paper, run_paper_frames, run_paper_frames_with_window,
 };
 
 use crate::{

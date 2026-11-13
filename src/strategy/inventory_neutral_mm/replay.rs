@@ -291,13 +291,13 @@ impl SimVenue {
                 self.fill(order, order.price, order.remaining, false);
             }
         }
-        #[cfg(feature = "research-replay")]
-        if let Some(matching) = &self.recorded {
-            matching.forget(order_index);
-        }
         let removed = self.book.lock().remove(&order_index);
         match removed {
             Some(order) => {
+                #[cfg(feature = "research-replay")]
+                if let Some(matching) = &self.recorded {
+                    matching.cancelled(order);
+                }
                 #[cfg(test)]
                 self.record(Action::Cancel {
                     at_ms: self.now_ms(),
@@ -538,6 +538,13 @@ impl Exchange for SimVenue {
         Ok(ids.len() as u32)
     }
     async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            // A public print can arrive after the simulated cancel ACK. Do
+            // not let cleanup certify a fresh position before that bounded
+            // delivery window has elapsed and the print has been applied.
+            matching.wait_cancelled_prints().await?;
+        }
         Ok(self
             .book
             .lock()

@@ -48,6 +48,25 @@ testnet work, and every branch, tag, and commit in a proposed push.
 | Telemetry and console | [Rust writer](src/telemetry_sink.rs), [Python monitor and store](deploy/oasis/), [React dashboard](dashboard/) |
 | Capture and research | [cross-venue CLI](src/bin/cross_venue.rs), [recording guide](docs/PERP_RECORDING.md), [paper replay guide](docs/PERP_RELATIVE_VALUE.md) |
 
+## Strategy research contract
+
+- Research quant profit, hedge arbitrage and incentive turnover independently:
+  separate configurations, execution state, capital and loss budgets, ledgers
+  and reports. Shared data or execution primitives do not permit cross-subsidy.
+- Use continuous **10-hour validation units**. Record any pre-window warm-up
+  and terminal drain separately. Do not present summed short replays with
+  inventory, equity or budget resets as a continuous 10-hour result. Preserve
+  shorter runs as diagnostics and report missing coverage explicitly.
+- Maintain the durable [data-source registry](docs/RESEARCH_DATA_SOURCES.md)
+  and an append-only campaign inventory outside Git. Record every consumed
+  source, domain, market, time range, hash, availability rule, data gap and
+  transformation, including funding and fees. Preserve previous versions and
+  failures; check the inventory before claiming data is unavailable or unused.
+- Freeze strategy parameters and split boundaries before validation; distinguish
+  historical regression, selection and untouched holdout periods. Report all
+  tested variants and incomplete results. A promising mechanism is a research
+  hypothesis, not evidence or a promise of profitable execution.
+
 ## Verification
 
 Use the [Makefile](Makefile) entry points and CI toolchain. Test the affected
