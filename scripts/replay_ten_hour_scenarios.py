@@ -15,8 +15,10 @@ from pathlib import Path
 import subprocess
 import tomllib
 
+from archive_public_capture import verify_compiled
 from replay_maker_campaign import books, load, save, strategy_config, unseal
 from replay_maker_first_campaign import digest
+from public_replay_sources import trade_events
 
 TEN_HOURS = 36_000_000
 CAPITAL_SIZES = ((500, 50), (1000, 100))
@@ -61,15 +63,18 @@ def strict_trade_rows(files, market, leg, end):
                            "aggressor": side, "price": str(row["price"]), "contracts": str(row["size"])}
 
 
-def time_window(campaign, symbol):
-    with unseal(campaign / "results/final" / f"{symbol}-freshest.ndjson.zst") as stream:
+def time_window(campaign, symbol, compiled=None, start_ms=None):
+    source = compiled or campaign / "results/final" / f"{symbol}-freshest.ndjson.zst"
+    with unseal(source) as stream:
         next(stream)
         first = json.loads(next(stream))["now_ms"]
         # Read to EOF to verify the compressed archive, even during discovery.
         last = first
         for line in stream:
             last = json.loads(line)["now_ms"]
-    begin = first + 600_000
+    begin = start_ms if start_ms is not None else first + 600_000
+    if begin - first < 60_000:
+        raise ValueError("requested window lacks sixty seconds of warm-up")
     end = begin + TEN_HOURS
     if last < end + 15_000:
         raise ValueError("source lacks ten decision hours and terminal drain")
@@ -77,12 +82,14 @@ def time_window(campaign, symbol):
             "end_ms": end, "drain_until_ms": end + 15_000}
 
 
-def quant_input(campaign, symbol, window, output):
+def quant_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None):
     files = sorted((campaign / "raw").glob("lighter-trades-*.jsonl.gz"))
-    if not files:
+    if public_archive is None and not files:
         raise ValueError("missing Lighter public trade files")
     first, stop = window["warmup_start_ms"], window["drain_until_ms"]
-    timeline = merge(books(campaign, symbol), strict_trade_rows(files, symbol, 0, stop),
+    prints = (strict_trade_rows(files, symbol, 0, stop) if public_archive is None else
+              trade_events(public_archive, "lighter", str(lighter_id), 0))
+    timeline = merge(books(campaign, symbol, compiled), prints,
                      key=lambda row: (row["at_ms"], row["kind"] == "book"))
     online = False
     states = 0
@@ -117,23 +124,24 @@ def quant_input(campaign, symbol, window, output):
             else:
                 emit(row)
     return {"events": counts, "explicit_feed_states": states,
-            "compiled_sha256": digest(campaign / "results/final" / f"{symbol}-freshest.ndjson.zst"),
-            "public_trade_files_sha256": {path.name: digest(path) for path in files},
+            "compiled_sha256": digest(compiled or campaign / "results/final" / f"{symbol}-freshest.ndjson.zst"),
+            "public_trade_files_sha256": ({path.name: digest(path) for path in files} if public_archive is None else
+                                          {"manifest.json": digest(public_archive / "manifest.json")}),
             "input_sha256": digest(output)}
 
 
 
-def turnover_input(campaign, symbol, window, output):
+def turnover_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None, target="arcus"):
     start, stop = window["start_ms"], window["drain_until_ms"]
-    route = f"{symbol}-lighter-arcus"
-    source = campaign / "results/final" / f"{route}.ndjson.zst"
+    route = f"{symbol}-lighter-{target}"
+    source = compiled or campaign / "results/final" / f"{route}.ndjson.zst"
     spans = [[None, None], [None, None]]
     book_span = [None, None]
     info, counts = {}, {"book": 0, "trade": 0, "trade_feed": 0}
     explicit_feed_states = [0, 0]
     with unseal(source) as stream:
         pair = json.loads(next(stream))["pair"]
-        if [leg["venue"] for leg in pair["legs"]] != ["lighter", "arcus"]:
+        if [leg["venue"] for leg in pair["legs"]] != ["lighter", target]:
             raise ValueError("unexpected turnover source domains")
         def book_events():
             previous = None
@@ -152,11 +160,18 @@ def turnover_input(campaign, symbol, window, output):
                 yield {"kind": "book", "at_ms": at, "books": books}
         def prints(leg):
             terms = pair["legs"][leg]
-            paths = sorted((campaign / "raw").glob(f'{terms["venue"]}-trades-*.jsonl.gz'))
-            if not paths:
-                raise ValueError("missing turnover public trade source")
-            info[terms["venue"]] = {p.name: digest(p) for p in paths}
-            for event in strict_trade_rows(paths, terms["market"], leg, 2**63):
+            venue = terms["venue"]
+            if public_archive is None:
+                paths = sorted((campaign / "raw").glob(f"{venue}-trades-*.jsonl.gz"))
+                if not paths:
+                    raise ValueError("missing turnover public trade source")
+                info[venue] = {p.name: digest(p) for p in paths}
+                events = strict_trade_rows(paths, terms["market"], leg, 2**63)
+            else:
+                info[venue] = {"manifest.json": digest(public_archive / "manifest.json")}
+                market = str(lighter_id) if leg == 0 else terms["market"]
+                events = trade_events(public_archive, venue, market, leg)
+            for event in events:
                 if event["kind"] == "trade_feed":
                     explicit_feed_states[leg] += 1
                 if spans[leg][0] is None:
@@ -217,8 +232,8 @@ def quant_policy(base, market, symbol, window, capital, size):
 
 def turnover_policies(pair, window, fees):
     start, end, stop = (window[k] for k in ("start_ms", "end_ms", "drain_until_ms"))
-    if [leg["venue"] for leg in pair["legs"]] != ["lighter", "arcus"]:
-        raise ValueError("expected Core Lighter hedge and Arcus target domains")
+    if pair["legs"][0]["venue"] != "lighter" or pair["legs"][1]["venue"] not in ("arcus", "extended", "hyperliquid"):
+        raise ValueError("expected Core Lighter hedge and a supported target domain")
     for capital, size in CAPITAL_SIZES:
         for posture in POSTURES:
             for cost in (0, 4):
@@ -287,7 +302,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("campaign", "quant_engine", "pair_engine", "base_config", "market_terms", "output"):
         parser.add_argument(name, type=Path)
+    parser.add_argument("--public-archive", type=Path)
+    parser.add_argument("--compiled-dir", type=Path)
+    parser.add_argument("--start-ms", type=int, help="UTC decision start shared with arbitrage research")
+    parser.add_argument("--turnover-venue", choices=("arcus", "extended", "hyperliquid"), default="arcus")
+    parser.add_argument("--turnover-fees-bps", nargs=2, metavar=("MAKER", "TAKER"))
     args = parser.parse_args()
+    if args.public_archive and not args.compiled_dir:
+        parser.error("--public-archive requires --compiled-dir")
+    if args.turnover_venue != "arcus" and not args.turnover_fees_bps:
+        parser.error("provide explicit fees for the target trading domain")
     os.umask(0o077)
     out, campaign = args.output.resolve(), args.campaign.resolve()
     out.mkdir()
@@ -295,7 +319,8 @@ def main():
         (out / name).mkdir()
     with args.base_config.open("rb") as stream:
         base = tomllib.load(stream)["inventory_neutral_mm"]
-    campaign_info, terms = load(campaign / "campaign.json"), load(args.market_terms)
+    campaign_info = None if args.public_archive else load(campaign / "campaign.json")
+    terms = load(args.market_terms)
     engines = {"quant": args.quant_engine.resolve(), "turnover": args.pair_engine.resolve()}
     report = {"schema_version": 1, "sample": "historical_reuse", "ledger_restarts": 0,
               "runner_sha256": digest(Path(__file__)), "engine_sha256": {k: digest(v) for k, v in engines.items()},
@@ -305,14 +330,33 @@ def main():
               "points_value_quote": "0", "unconfirmed_rebates_quote": "0", "venue_credited_turnover_quote": None}
     save(out / "policy.json", report | {"frozen_grid": "two assets; two capital/size cases; three turnover postures; 0/4bps loss allowances"})
     for symbol in ("BTC", "ETH"):
-        window = time_window(campaign, symbol)
+        compiled = args.compiled_dir / f"{symbol}-freshest.ndjson.zst" if args.compiled_dir else None
+        window = time_window(campaign, symbol, compiled, args.start_ms)
+        if args.public_archive:
+            # Read the market mapping and terms from this tape's archived
+            # compilation profile, rather than an unrelated old campaign.
+            capture_config = args.compiled_dir / f"{symbol}-capture.json"
+            provenance = verify_compiled(args.public_archive, compiled)
+            if provenance["config_sha256"] != digest(capture_config):
+                raise ValueError("compiled market terms do not match the archive compilation profile")
+            profile = load(capture_config)
+            spec = profile["pair"]["legs"][0]
+            market = {"id": profile["legs"][0]["lighter_market_id"],
+                      "price_decimals": -Decimal(spec["tick"]).normalize().as_tuple().exponent,
+                      "size_decimals": -Decimal(spec["lot"]).normalize().as_tuple().exponent,
+                      "min_base_amount": spec["min_contracts"], "min_quote_amount": spec["min_notional"]}
+            if spec["venue"] != "lighter" or spec["market"] != symbol or any(
+                    Decimal(spec[key]).normalize().as_tuple().digits != (1,) for key in ("tick", "lot")):
+                raise ValueError("unsupported Lighter market terms")
+        else:
+            market = campaign_info["selected"]["lighter"][symbol]
         report["source_evidence"][symbol] = {"window": window}
         try:
             tape = out / "inputs" / f"quant-{symbol}.ndjson"
-            report["source_evidence"][symbol]["quant"] = quant_input(campaign, symbol, window, tape)
+            report["source_evidence"][symbol]["quant"] = quant_input(campaign, symbol, window, tape,
+                compiled=compiled, public_archive=args.public_archive, lighter_id=market["id"])
             if not report["source_evidence"][symbol]["quant"]["explicit_feed_states"]:
                 raise ValueError("missing_public_trade_feed_lifecycle")
-            market = campaign_info["selected"]["lighter"][symbol]
             report["quant"][symbol] = {}
             for capital, size in CAPITAL_SIZES:
                 label = f"quant-{symbol}-{capital}capital-{size}size"
@@ -327,14 +371,22 @@ def main():
                 "source_blocker": "missing_public_trade_feed_lifecycle" if str(error) == "missing_public_trade_feed_lifecycle" else "other_preparation_failure"}
             save(out / "report.json", report)
         try:
-            route = f"{symbol}-lighter-arcus"
+            route = f"{symbol}-lighter-{args.turnover_venue}"
             period = (window["start_ms"], window["drain_until_ms"], "historical_reuse")
-            pair, provenance = turnover_input(campaign, symbol, window, out / "inputs" / f"{route}-{period[0]}.ndjson")
+            turnover_book = compiled if args.turnover_venue == "hyperliquid" else (
+                args.compiled_dir / f"{route}.ndjson.zst" if args.compiled_dir else None)
+            if args.public_archive and turnover_book != compiled:
+                verify_compiled(args.public_archive, turnover_book)
+            pair, provenance = turnover_input(campaign, symbol, window, out / "inputs" / f"{route}-{period[0]}.ndjson",
+                compiled=turnover_book, public_archive=args.public_archive, lighter_id=market["id"], target=args.turnover_venue)
             report["source_evidence"][symbol]["turnover"] = provenance
             if not provenance["explicit_feed_states_by_leg"][1]:
                 raise ValueError("missing_public_trade_feed_lifecycle")
-            target = next(t for t in terms["arcus"] if t["baseAsset"] == symbol)
-            fees = tuple(str(Decimal(target[key]) / 100) for key in ("effectiveMakerFeePpm", "effectiveTakerFeePpm"))
+            if args.turnover_fees_bps:
+                fees = tuple(str(Decimal(value)) for value in args.turnover_fees_bps)
+            else:
+                target = next(t for t in terms["arcus"] if t["baseAsset"] == symbol)
+                fees = tuple(str(Decimal(target[key]) / 100) for key in ("effectiveMakerFeePpm", "effectiveTakerFeePpm"))
             report["turnover"][symbol] = {}
             for label, policy in turnover_policies(pair, window, fees):
                 label = f"turnover-{symbol}-{label}"

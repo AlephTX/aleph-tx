@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 
+from archive_public_capture import verify_compiled
 from replay_maker_campaign import save, load
 
 TEN_HOURS = 36_000_000
@@ -58,7 +59,8 @@ def terminal_report(report):
     return value if isinstance(value, dict) else {}
 
 
-def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_000):
+def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_000,
+               start_ms=None, archive_sha256=None):
     """Retain a manifest even on failure; no source record body is exported."""
     if not 0 < timeout <= 3600:
         raise ValueError("timeout must be positive and no more than one hour")
@@ -117,7 +119,10 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
                 header = json.loads(stream.readline())
                 initial_line = stream.readline()
                 first = json.loads(initial_line)["now_ms"]
-                begin, end = first + 60_000, first + 60_000 + TEN_HOURS
+                begin = start_ms if start_ms is not None else first + 60_000
+                if begin - first < 60_000:
+                    raise ValueError("requested window lacks sixty seconds of warm-up")
+                end = begin + TEN_HOURS
                 drain_end = end + drain_ms
                 pair = header["pair"]
                 if [leg["venue"] for leg in pair["legs"]] != ["lighter", "hyperliquid"]:
@@ -256,6 +261,7 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
         "frames": frames, "max_observed_frame_gap_ms": maximum_gap,
         "funding_evidence_events": witnessed, "engine_exit_code": engine_code,
         "archive_exit_code": archive_code, "source_sha256": source_hash, "engine_sha256": engine_hash,
+        "archive_manifest_sha256": archive_sha256,
         "compressed_archive_verified": archive_eof and archive_code == 0,
         "runner_sha256": digest(Path(__file__)), "config_sha256": config_hash,
         "fees_account_verified": False, "coverage_quality_verified": False,
@@ -266,7 +272,8 @@ def run_replay(engine, source, out, timeout=180, decompressor=None, drain_ms=60_
         "failures": sorted(set(failures)),
         "assumptions": {"one_way_latency_ms": 550, "taker_fees_bps": ["0", "4.5"],
             "strategy": "basis_reversion", "mode": "pair_hedge", "entry_z": 1.75,
-            "warmup_ms": 60_000, "max_sample_gap_ms": 15_000, "funding_guard_ms": 1000,
+            "warmup_ms": begin - first if begin is not None and first is not None else None,
+            "max_sample_gap_ms": 15_000, "funding_guard_ms": 1000,
             "available_notional_rule": "min(original,100)", "planner_limits_rule": "min(original,100)",
             "book_depth": "unchanged", "end_policy": "real post-cutoff IOC drain", "drain_ms": drain_ms,
             "zero_allowance_frames": zero_budget_frames, "allowance_reduced_frames": reduced_budget_frames},
@@ -284,9 +291,18 @@ def main():
         parser.add_argument(name, type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=180)
     parser.add_argument("--drain-seconds", type=int, default=60)
+    parser.add_argument("--start-ms", type=int, help="UTC decision start shared with the other research scenarios")
+    parser.add_argument("--public-archive", type=Path, help="verify shared archive provenance before replay")
     args = parser.parse_args()
+    archive_sha256 = None
+    if args.public_archive:
+        try:
+            archive_sha256 = verify_compiled(args.public_archive, args.source)["archive_manifest_sha256"]
+        except (OSError, ValueError, KeyError) as error:
+            parser.error(str(error))
     manifest = run_replay(args.engine, args.source, args.output, args.timeout_seconds,
-                          drain_ms=args.drain_seconds * 1000)
+                          drain_ms=args.drain_seconds * 1000, start_ms=args.start_ms,
+                          archive_sha256=archive_sha256)
     return 0 if manifest["diagnostic_run_succeeded"] else 1
 
 

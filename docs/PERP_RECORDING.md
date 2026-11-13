@@ -54,6 +54,9 @@ Enable Lighter calibration on the copied profile with `legs[0].lighter_clock`
 as described below. Review Entropy's contract economics and session-specific
 oracle before using the capture for paper entries.
 
+See the [shared public archive](PUBLIC_MARKET_ARCHIVE.md) for Hyperliquid
+trade and funding capture, domain partitions and reusable replay inputs.
+
 ## Continuous ten-hour studies
 
 Use `-duration 10h15m -gzip -output /path/to/new.ndjson.gz.partial` for a

@@ -475,6 +475,8 @@ impl<'a> Compiler<'a> {
                     | "lighter_robinhood_trades"
                     | "hyperliquid"
                     | "hyperliquid_snapshot"
+                    | "hyperliquid_trades"
+                    | "hyperliquid_funding"
                     | "arcus"
                     | "arcus_snapshot"
                     | "bulk"
@@ -487,6 +489,10 @@ impl<'a> Compiler<'a> {
             "unsupported capture source"
         );
         match (row.event.as_str(), row.payload) {
+            ("connected", None)
+                if matches!(row.source.as_str(), "hyperliquid" | "hyperliquid_trades") => {}
+            ("subscribed", Some(_))
+                if matches!(row.source.as_str(), "hyperliquid" | "hyperliquid_trades") => {}
             ("disconnect" | "clock_refresh", None) => {
                 if row.event == "clock_refresh" {
                     ensure!(
@@ -804,8 +810,10 @@ pub fn compile(
                 && now >= row.received_at_ms
                 && now >= group
                 && row.request_sent_at_ms.is_none_or(|sent| {
-                    matches!(row.source.as_str(), "lighter" | "lighter_robinhood")
-                        && row.event == "message"
+                    matches!(
+                        row.source.as_str(),
+                        "lighter" | "lighter_robinhood" | "hyperliquid_funding"
+                    ) && row.event == "message"
                         && sent > 0
                         && sent <= row.received_at_ms
                 }),

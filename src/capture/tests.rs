@@ -663,3 +663,33 @@ fn lighter_domains_do_not_share_market_ids_or_disconnects() {
         crate::venues::OrderSupport::ReadOnly
     ));
 }
+
+#[test]
+fn hyperliquid_public_evidence_compiles_without_becoming_a_funding_payment() {
+    let rows = [
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        json!({"source":"hyperliquid_trades","event":"connected","market":"ETH","received_at_ms":T,"available_at_ms":T}),
+        json!({"source":"hyperliquid_trades","event":"subscribed","market":"ETH","received_at_ms":T,"available_at_ms":T,
+            "payload":{"type":"trades","coin":"ETH"}}),
+        row(
+            "hyperliquid_trades",
+            T + 100,
+            json!({"channel":"trades","data":[{"coin":"ETH","time":T,"tid":1}]}),
+        ),
+        json!({"source":"hyperliquid_funding","event":"message","market":"ETH","received_at_ms":T+200,
+            "available_at_ms":T+200,"request_sent_at_ms":T+180,"payload":{"data":[{"coin":"ETH","time":T,"fundingRate":"0.0001"}]}}),
+        json!({"source":"hyperliquid_trades","event":"disconnect","market":"ETH","received_at_ms":T+300,"available_at_ms":T+300}),
+        footer(T + 400),
+    ];
+    let (coverage, frames) = replay(&config(), &rows);
+    assert_eq!(coverage.source_messages["hyperliquid_funding"], 1);
+    assert_eq!(coverage.source_messages["hyperliquid_trades"], 1);
+    assert_eq!(coverage.disconnects["hyperliquid_trades"], 1);
+    assert_eq!(coverage.settlement_records_written, [0, 0]);
+    assert!(
+        frames.last().unwrap()["legs"][1]["book"]["tradable"]
+            .as_bool()
+            .unwrap()
+    );
+}

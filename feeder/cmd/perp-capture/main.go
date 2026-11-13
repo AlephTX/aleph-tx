@@ -103,6 +103,7 @@ func subscriptions(lighter, hl, coinbase, arcus, bulk, arcusWS, bulkWS string, s
 			continue
 		}
 		source := &sources[i]
+		source.coins = items
 		for _, item := range items {
 			switch source.source {
 			case "lighter":
@@ -218,8 +219,10 @@ func pollSnapshots(ctx context.Context, source subscription, emit func(record) e
 	return context.Cause(ctx)
 }
 
-func snapshotRequest(ctx context.Context, source subscription, coin string) (*http.Request, error) {
+func snapshotRequest(ctx context.Context, source subscription, coin string, sent int64) (*http.Request, error) {
 	switch source.source {
+	case "hyperliquid_funding":
+		return hyperliquidFundingRequest(ctx, source.url, coin, sent)
 	case "hyperliquid_snapshot":
 		query, err := json.Marshal(map[string]string{"type": "l2Book", "coin": coin})
 		if err != nil {
@@ -251,7 +254,8 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 	ticker := time.NewTicker(source.interval)
 	defer ticker.Stop()
 	for {
-		request, err := snapshotRequest(ctx, source, coin)
+		sent := time.Now().UnixMilli()
+		request, err := snapshotRequest(ctx, source, coin, sent)
 		if err != nil {
 			return err
 		}
@@ -268,19 +272,25 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 		if response.StatusCode != http.StatusOK || len(body) > 1<<20 {
 			return fmt.Errorf("invalid %s for %s: HTTP %d", source.source, coin, response.StatusCode)
 		}
-		snapshot := snapshotPayload{Data: body}
-		if source.source == "hyperliquid_snapshot" {
-			snapshot.Channel = "l2Book"
+		if source.source == "hyperliquid_funding" {
+			if err := emitHyperliquidFunding(source, coin, sent, received, body, emit); err != nil {
+				return err
+			}
 		} else {
-			// Arcus snapshots do not echo the symbol. Archive the requested market.
-			snapshot.Market = coin
-		}
-		payload, err := json.Marshal(snapshot)
-		if err != nil {
-			return err
-		}
-		if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: payload}); err != nil {
-			return err
+			snapshot := snapshotPayload{Data: body}
+			if source.source == "hyperliquid_snapshot" {
+				snapshot.Channel = "l2Book"
+			} else {
+				// Arcus snapshots do not echo the symbol. Archive the requested market.
+				snapshot.Market = coin
+			}
+			payload, err := json.Marshal(snapshot)
+			if err != nil {
+				return err
+			}
+			if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: payload}); err != nil {
+				return err
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -301,6 +311,11 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
+	if source.isHyperliquidWS() {
+		if err := emit(record{Source: source.source, Market: source.market, Event: "connected", ReceivedAt: time.Now().UnixMilli()}); err != nil {
+			return err
+		}
+	}
 	subscriptionSends := make(map[string]time.Time)
 	for _, request := range source.requests {
 		if sub, ok := request.(lighterSubscription); ok {
@@ -311,7 +326,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 		}
 	}
 	var heartbeat []byte
-	if source.source == "hyperliquid" {
+	if source.isHyperliquidWS() {
 		heartbeat = []byte(`{"method":"ping"}`)
 	}
 	stopKeepalive := wsutil.StartKeepalive(ctx, source.source, conn, 15*time.Second, heartbeat)
@@ -319,9 +334,10 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 
 	nonces := make(map[string]uint64)
 	var extendedSequence uint64
+	acknowledged := make(map[string]bool)
 	for {
 		readCtx, cancelRead := ctx, func() {}
-		if source.source != "extended_trades" {
+		if source.source != "extended_trades" && source.source != "hyperliquid_trades" {
 			readCtx, cancelRead = context.WithTimeout(ctx, 30*time.Second)
 		}
 		// An inactive market can have no trades while the transport is healthy.
@@ -353,6 +369,18 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			return errors.New("public subscription rejected")
 		}
 		switch source.source {
+		case "hyperliquid", "hyperliquid_trades":
+			publication, err := hyperliquidPublication(source, header.Channel, raw, acknowledged)
+			if err != nil {
+				return err
+			}
+			if publication.Event != "" {
+				publication.ReceivedAt = received.UnixMilli()
+				if err := emit(publication); err != nil {
+					return err
+				}
+			}
+			continue
 		case "extended", "extended_trades":
 			next, err := extendedPublication(raw, source, extendedSequence)
 			if err != nil {
@@ -510,7 +538,7 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 			cancel(err)
 			return err
 		}
-		if row.Event == "message" {
+		if row.Event == "message" || row.Source == "hyperliquid_trades" && row.Event == "subscribed" {
 			counts[row.Source+"\x00"+row.Market]++
 		}
 	}
@@ -519,7 +547,16 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 		return err
 	}
 	for _, source := range sources {
-		if counts[source.source+"\x00"+source.market] == 0 {
+		market := source.market
+		if source.source == "hyperliquid" || source.source == "hyperliquid_funding" {
+			for _, coin := range source.coins {
+				if counts[source.source+"\x00"+coin] == 0 {
+					return fmt.Errorf("no publications from %s %s", source.source, coin)
+				}
+			}
+			continue
+		}
+		if counts[source.source+"\x00"+market] == 0 {
 			return fmt.Errorf("no publications from %s %s", source.source, source.market)
 		}
 	}
@@ -543,6 +580,8 @@ func run() error {
 	lighterTrades := flag.Bool("lighter-trades", false, "record Lighter public trades on a separate connection")
 	extended := flag.String("extended", "", "comma-separated active Extended CLOB perpetuals for public depth and trades")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
+	hlTrades := flag.Bool("hl-trades", false, "record Hyperliquid public trades and subscription acknowledgments")
+	hlFunding := flag.Duration("hl-funding-interval", 0, "poll public Hyperliquid funding history (minimum 1m)")
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
 	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
 	bulk := flag.String("bulk", "", "comma-separated BULK perpetuals for 1s REST snapshots")
@@ -568,6 +607,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	hlSources, err := hyperliquidExtraSources(*hl, *hlTrades, *hlFunding)
+	if err != nil {
+		return err
+	}
+	sources = append(sources, hlSources...)
 	rhSources, err := robinhoodSubscriptions(*rh, *rhTrades, *clockRefresh)
 	if err != nil {
 		return err

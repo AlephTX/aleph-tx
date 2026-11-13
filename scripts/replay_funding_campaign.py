@@ -21,12 +21,19 @@ RESERVE_BPS = 5.0
 FORECAST_BARS = 3
 
 
-def rate_archive(root):
-    first = {}
-    conflicts = {}
+def historical_rate_samples(root):
     for path in sorted((root / "history" / "funding").glob("*.json.gz")):
         with gzip.open(path, "rt") as file:
-            sample = json.load(file)
+            yield json.load(file)
+
+
+def rate_archive(root, public_archive=None):
+    from itertools import chain
+    from public_replay_sources import funding_samples
+
+    first, conflicts = {}, {}
+    current = funding_samples(public_archive) if public_archive is not None else ()
+    for sample in chain(historical_rate_samples(root), current):
         at = sample["available_at_ms"]
         for item in sample["rates"]:
             slot = item["slot_ms"]
@@ -317,6 +324,7 @@ def main():
     parser.add_argument("campaign", type=Path)
     parser.add_argument("metadata", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--public-archive", type=Path, help="include archived Hyperliquid funding history")
     parser.add_argument("--engine", type=Path)
     parser.add_argument("--equity-results", type=Path)
     parser.add_argument("--revision")
@@ -333,7 +341,7 @@ def main():
     sources = [final / f"{s}-freshest.ndjson.zst" for s in ("BTC", "ETH")]
     sources += [final / f"{r}.ndjson.zst" for r in sorted(previous["routes"])
                 if set(r.split("-")[1:]) <= {"lighter", "entropy", "trade_xyz"}]
-    rates = rate_archive(root)
+    rates = rate_archive(root, args.public_archive)
     if args.engine:
         native_carry(sources, args.engine.resolve(), args.equity_results.resolve(),
                      args.output.resolve(), metadata, previous, rates, args.revision)

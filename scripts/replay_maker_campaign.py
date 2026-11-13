@@ -93,8 +93,8 @@ def compile_book(book):
     return {"timestamp_ms": book["timestamp_ms"], **depth}
 
 
-def books(campaign, symbol):
-    file = campaign / "results" / "final" / f"{symbol}-freshest.ndjson.zst"
+def books(campaign, symbol, compiled=None):
+    file = compiled or campaign / "results" / "final" / f"{symbol}-freshest.ndjson.zst"
     with unseal(file) as stream:
         header = json.loads(stream.readline())
         assert [leg["venue"] for leg in header["pair"]["legs"]] == ["lighter", "hyperliquid"]

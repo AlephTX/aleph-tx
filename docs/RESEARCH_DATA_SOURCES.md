@@ -9,7 +9,7 @@ Public research archives and their detailed manifests stay on Oasis under
 `~/aleph-tx-research`, outside Git. Private account material stays in protected
 storage and out of public inventories and tool output. Commit only reviewed
 source specifications, aggregate findings and synthetic fixtures.
-[Recording contract](PERP_RECORDING.md) ·
+[Recording contract](PERP_RECORDING.md) · [Shared public archive](PUBLIC_MARKET_ARCHIVE.md) ·
 [Independent objectives](INDEPENDENT_STRATEGY_RESEARCH.md)
 
 ## Independent objectives and ten-hour units
@@ -45,7 +45,7 @@ inventory; an adapter is not proof of a complete dataset.
 | --- | --- | --- | --- |
 | `lighter.core` | `lighter`; Core public L2, statistics, separate public trades and subscription clock evidence | Historical crypto/RWA inputs and Extended paired capture | Market terms, account fee/delay assumptions, book/trade coverage and held-position funding |
 | `lighter.robinhood` | `lighter_robinhood`; independent Robinhood Chain L2, statistics, public trades and clocks | Five-minute ingestion check documented on 2026-11-13; separate longer collection started | Domain-specific history, collateral/settlement, fees, delays, funding and API incentive eligibility; Core history cannot substitute |
-| `hyperliquid.core` | `hyperliquid`; native WebSocket/REST books, contexts and archived public trades | Historical BTC/ETH and RWA campaigns; both transports supported | Native instrument, account fees, oracle methodology, transport gaps and settled funding |
+| `hyperliquid.core` | `hyperliquid`; native WebSocket/REST books, contexts, public trades and polled funding history | Historical BTC/ETH and RWA campaigns; both transports supported | Native instrument, account fees, oracle methodology, transport gaps and settled funding |
 | `hyperliquid.entropy` | `entropy`, native `io:SYMBOL`; HIP-3 books and contexts through Hyperliquid | Public RWA pair studies; ongoing coverage is campaign-specific | Deployer-specific terms, fees, oracle, funding, actual trade coverage and incentive rules |
 | `hyperliquid.tradexyz` | `trade_xyz`, native `xyz:SYMBOL`; HIP-3 books and contexts | Public RWA pair studies | Product-specific economics, independent stock/session evidence, fees and funding; native Hyperliquid terms do not automatically apply |
 | `arcus` | Public REST metadata/BBO, REST and WebSocket L2; archived trades where present | Historical BTC/ETH maker-first inputs and RWA coverage studies | Trade coverage, price/time units, oracle contexts, fees, funding and full-cycle exits |
