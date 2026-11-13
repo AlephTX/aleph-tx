@@ -54,7 +54,7 @@ impl<'a> LegFeed<'a> {
 
     pub fn accepts(&self, source: &str) -> bool {
         match self.venue.as_str() {
-            "lighter" => source == "lighter",
+            "lighter" | "lighter_robinhood" => source == self.venue,
             "extended" => source == "extended",
             "arcus" | "bulk" => {
                 let rest_venue = source.strip_suffix("_snapshot");
@@ -77,7 +77,7 @@ impl<'a> LegFeed<'a> {
             return;
         }
         match source {
-            "lighter" => {
+            "lighter" | "lighter_robinhood" => {
                 self.depth = LighterDepth::default();
                 self.book = None;
                 self.context = None;
@@ -124,7 +124,7 @@ impl<'a> LegFeed<'a> {
         source: &str,
     ) -> Result<Change> {
         match source {
-            "lighter" => {
+            "lighter" | "lighter_robinhood" => {
                 let id = self
                     .config
                     .lighter_market_id

@@ -8,7 +8,8 @@ or equity perpetuals, use the depth-aware [paper replay](PERP_RELATIVE_VALUE.md)
 
 | Venue | Data in AlephTX | Order transport | Operating scope |
 | --- | --- | --- | --- |
-| Lighter | Go BBO, depth and private events plus public L2 capture | Native signer on Linux x86-64 | Primary BTC or ETH maker |
+| Lighter Core | Go BBO, depth and private events plus public L2 capture | Native signer on Linux x86-64 | Primary BTC or ETH maker |
+| Lighter Robinhood Chain | Separate public L2, market statistics and trade capture | Read-only integration | Domain-specific offline research |
 | Hyperliquid | Go BBO plus public WebSocket and REST L2 capture | Native REST limit orders, cancellation and order status | Native BTC or ETH inventory hedge |
 | Entropy | HIP-3 metadata and `io:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
 | TradeXYZ | HIP-3 metadata and `xyz:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
@@ -23,6 +24,18 @@ identifies shared infrastructure. Native Hyperliquid, Entropy and TradeXYZ
 have distinct books and share that risk domain. Entropy × TradeXYZ
 requires `allow_shared_risk_domain: true` on the pair.
 [Hyperliquid HIP-3](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals).
+
+`lighter` remains the Core identifier. `lighter_robinhood` identifies the
+Robinhood Chain instance: independent contracts, sequencer and liquidity,
+with public API base `https://api.rh.lighter.xyz/`. Equal market IDs on the
+two instances do not identify the same book. The registry conservatively
+assigns both to the `lighter` risk domain, so a Core/Robinhood research pair
+requires the shared-risk opt-in **and** verified matching economics.
+Robinhood's USDG deposit documentation must not be treated as a USDC
+settlement guarantee. Core signing chain IDs and account settings are not
+reused for Robinhood; live order support is not enabled.
+[Official domain specifications](https://docs.robinhood.com/chain/lighter-domains/) ·
+[Public domain capture](PERP_RECORDING.md#lighter-core-and-robinhood-chain)
 
 A single recording can support all six pairings among Entropy, Arcus,
 TradeXYZ and BULK. Each replay has its own limits and evaluates one pair

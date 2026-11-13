@@ -54,6 +54,35 @@ Enable Lighter calibration on the copied profile with `legs[0].lighter_clock`
 as described below. Review Entropy's contract economics and session-specific
 oracle before using the capture for paper entries.
 
+## Lighter Core and Robinhood Chain
+
+Capture the two deployments with explicit source identities:
+
+```sh
+feeder/perp-capture -lighter 1,0 -lighter-trades \
+  -lighter-robinhood 1,0 -lighter-robinhood-trades \
+  -lighter-clock-refresh 4m -coinbase BTC-USD,ETH-USD \
+  -duration 5m -output recordings/lighter-domains.ndjson
+```
+
+Recheck IDs against each domain's public `orderBookDetails` before a new
+campaign. On 2026-11-13 both exposed BTC as 1 and ETH as 0; this coincidence
+is not a mapping contract. Robinhood capture uses
+`wss://api.rh.lighter.xyz/stream` and writes `lighter_robinhood` and
+`lighter_robinhood_trades`. Public trade payloads use the same allowlist
+sanitizer as Core. Clock refresh and snapshot evidence remain per connection.
+
+A compiler leg selects `pair.legs[i].venue = "lighter_robinhood"` with its
+own `legs[i].lighter_market_id` and `lighter_clock`. A Core message,
+disconnect or clock observation cannot update that leg. The common
+`lighter-clock-refresh` flag applies to both enabled deployments.
+
+Verify settlement currency, funding, fees, account tier, action delay and
+incentive eligibility separately. Historical Core data cannot stand in for
+Robinhood data. No Robinhood signer or private account path is enabled.
+[Domain specifications](https://docs.robinhood.com/chain/lighter-domains/) ·
+[Independent research](INDEPENDENT_STRATEGY_RESEARCH.md)
+
 ## Four-venue pair recordings
 
 Record all four WebSocket books to the same file so every

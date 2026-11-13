@@ -5,6 +5,10 @@ use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
 use crate::strategy::relative_value::*;
 use std::collections::{BTreeMap, VecDeque};
 
+mod posture;
+use posture::PostureState;
+pub use posture::{TurnoverControl, TurnoverPosture, TurnoverPosturePolicy, TurnoverPostureReport};
+
 const MAX_FEEDBACK_LEVELS: usize = 8;
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +34,9 @@ pub struct MakerFirstConfig {
     /// If omitted, compare both opening directions on every decision.
     #[serde(default)]
     pub entry_side: Option<HedgeSide>,
+    /// Turnover-only entry direction; every posture still hedges confirmed fills fully.
+    #[serde(default)]
+    pub turnover_posture: Option<TurnoverPosturePolicy>,
     /// Allow small confirmed inventory to close passively before routing it out.
     #[serde(default)]
     pub passive_offset: Option<PassiveOffset>,
@@ -132,6 +139,10 @@ pub enum MakerFirstEvent {
         leg: usize,
         online: bool,
     },
+    TurnoverControl {
+        at_ms: u64,
+        control: TurnoverControl,
+    },
     End {
         at_ms: u64,
     },
@@ -143,6 +154,7 @@ impl MakerFirstEvent {
             Self::Book { at_ms, .. }
             | Self::Trade { at_ms, .. }
             | Self::TradeFeed { at_ms, .. }
+            | Self::TurnoverControl { at_ms, .. }
             | Self::End { at_ms } => at_ms,
         }
     }
@@ -197,6 +209,7 @@ pub struct MakerFirstReport {
     pub maker_spread_capture: Decimal,
     pub forced_close_pnl: Decimal,
     pub cycle_attribution: CycleAttribution,
+    pub turnover_posture: TurnoverPostureReport,
     pub realized_pnl: Decimal,
     pub pnl_before_fees: Option<Decimal>,
     pub net_pnl: Option<Decimal>,
@@ -229,6 +242,7 @@ pub struct CycleAttribution {
     pub closing_hedge_fees: [Decimal; 2],
     #[serde(serialize_with = "super::serialize_positions")]
     pub forced_ioc_fees: [Decimal; 2],
+    pub closing_quotes: ClosingQuoteAttribution,
     pub closing_maker_fills: usize,
     #[serde(with = "rust_decimal::serde::str")]
     pub closing_maker_turnover: Decimal,
@@ -260,6 +274,19 @@ pub struct CycleAttribution {
     pub paired_drain_blocked: usize,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct ClosingQuoteAttribution {
+    /// Each stage counts a quote once, including quotes in unfinished cycles.
+    pub submitted: usize,
+    pub accepted: usize,
+    pub touched: usize,
+    pub filled: usize,
+    pub expired_before_activation: usize,
+    pub post_only_rejected: usize,
+    /// Counts the first cancellation request for each quote.
+    pub cancel_requested: BTreeMap<&'static str, usize>,
+}
+
 impl MakerFirstReport {
     fn blocked(&mut self, reason: &'static str) {
         *self.entry_blocked.entry(reason).or_default() += 1;
@@ -267,6 +294,7 @@ impl MakerFirstReport {
 }
 
 struct Quote {
+    posture: TurnoverPosture,
     side: HedgeSide,
     price: Decimal,
     left: Decimal,
@@ -278,6 +306,8 @@ struct Quote {
     hedge_limit: Option<Decimal>,
     passive_entry: bool,
     closing: bool,
+    closing_touched: bool,
+    closing_filled: bool,
 }
 
 struct Candidate {
@@ -311,6 +341,7 @@ struct Ioc {
 }
 
 struct Cycle {
+    posture: TurnoverPosture,
     started_ms: u64,
     initial_cash: Decimal,
     initial_turnover: Decimal,
@@ -343,6 +374,7 @@ struct Replay<'a> {
     notices: VecDeque<(u64, Decimal)>,
     unhedged_since: Option<u64>,
     cost_feedback: CostFeedback,
+    posture: PostureState,
     report: MakerFirstReport,
 }
 
@@ -467,6 +499,16 @@ impl MakerFirstConfig {
                 && (Decimal::ZERO..=Decimal::from(100)).contains(&self.latency_reserve_bps),
             "invalid maker-first execution policy"
         );
+        if let Some(policy) = self.turnover_posture {
+            ensure!(
+                !self.pair.mode.is_pair_hedge()
+                    && self.entry_side.is_none()
+                    && self.passive_offset.is_none()
+                    && self.hedged_exit.is_some()
+                    && (1..=3_600_000).contains(&policy.max_control_ttl_ms),
+                "invalid isolated turnover posture policy"
+            );
+        }
         if let Some(offset) = &self.passive_offset {
             let cancel_window = self.transport_ms
                 + self.maker_cancel_delay_ms
@@ -532,6 +574,14 @@ impl Replay<'_> {
         self.ledger.positions.iter().sum()
     }
 
+    fn posture_changed(&mut self, now: u64) {
+        self.report.turnover_posture.posture_changes += 1;
+        self.cancel(now, "posture_change");
+        if let Some(c) = &mut self.cycle {
+            c.draining = true;
+        }
+    }
+
     fn fresh(&self, i: usize, now: u64) -> Option<&Book> {
         let book = self.books.as_ref()?.get(i)?;
         (self.usable[i] && now - book.timestamp_ms <= self.config.pair.planner.max_quote_age_ms)
@@ -589,13 +639,22 @@ impl Replay<'_> {
         Ok(())
     }
 
-    fn cancel(&mut self, now: u64) {
+    fn cancel(&mut self, now: u64, reason: &'static str) {
         if let Some(quote) = self.quote.as_mut()
             && quote.cancelled_ms.is_none()
         {
             quote.cancelled_ms =
                 Some(now + self.config.transport_ms + self.config.maker_cancel_delay_ms);
             self.report.quote_cancels += 1;
+            if quote.closing {
+                *self
+                    .report
+                    .cycle_attribution
+                    .closing_quotes
+                    .cancel_requested
+                    .entry(reason)
+                    .or_default() += 1;
+            }
         }
     }
 
@@ -619,6 +678,10 @@ impl Replay<'_> {
         if quote.activated_ms.is_none() && now >= quote.arrival_ms {
             if now >= quote.expires_ms {
                 self.report.quote_expired_before_activation += 1;
+                self.report
+                    .cycle_attribution
+                    .closing_quotes
+                    .expired_before_activation += usize::from(quote.closing);
                 return;
             }
             if let Some(book) = self.fresh(self.maker(), now)
@@ -629,6 +692,10 @@ impl Replay<'_> {
                     || signed_cost(quote.side, quote.price, touch) >= Decimal::ZERO
                 {
                     self.report.post_only_rejected += 1;
+                    self.report
+                        .cycle_attribution
+                        .closing_quotes
+                        .post_only_rejected += usize::from(quote.closing);
                     return;
                 }
                 let same_side = book.side(opposite(quote.side));
@@ -640,12 +707,17 @@ impl Replay<'_> {
                         && level.is_none())
                 {
                     self.report.post_only_rejected += 1;
+                    self.report
+                        .cycle_attribution
+                        .closing_quotes
+                        .post_only_rejected += usize::from(quote.closing);
                     return;
                 }
                 quote.ahead = level.map_or(Decimal::ZERO, |level| level.contracts)
                     * self.config.pair.legs[self.maker()].base_per_contract;
                 quote.activated_ms = Some(now);
                 self.report.quotes_accepted += 1;
+                self.report.cycle_attribution.closing_quotes.accepted += usize::from(quote.closing);
             }
         }
         let expired = now >= quote.expires_ms;
@@ -675,9 +747,24 @@ impl Replay<'_> {
             && self.config.turnover_feedback.is_some()
             && self.cycle.is_none()
             && !self.resting_turnover_within_budget(&quote, now);
+        let cancel_reason = if expired {
+            Some(
+                if quote.expires_ms < quote.arrival_ms + self.config.quote_lifetime_ms {
+                    "close_deadline"
+                } else {
+                    "quote_ttl"
+                },
+            )
+        } else if !hedgeable {
+            Some("hedge_protection")
+        } else if feedback_cancel {
+            Some("turnover_budget")
+        } else {
+            None
+        };
         self.quote = Some(quote);
-        if expired || !hedgeable || feedback_cancel {
-            self.cancel(now);
+        if let Some(reason) = cancel_reason {
+            self.cancel(now, reason);
         }
     }
 
@@ -710,6 +797,10 @@ impl Replay<'_> {
             return Ok(());
         }
         self.report.maker_prints_touching_quote += 1;
+        if quote.closing && !quote.closing_touched {
+            quote.closing_touched = true;
+            self.report.cycle_attribution.closing_quotes.touched += 1;
+        }
         let terms = &self.config.pair.legs[i];
         let mut volume = contracts * terms.base_per_contract;
         if price == quote.price {
@@ -727,6 +818,7 @@ impl Replay<'_> {
         let side = quote.side;
         let closing = quote.closing;
         let passive_side = quote.passive_entry.then_some(side_index(side));
+        let posture = quote.posture;
         let offsets_inventory = quote.hedge_limit.is_none();
         if offsets_inventory || (closing && self.config.hedged_exit.is_some()) {
             let position = self.ledger.positions[i];
@@ -738,6 +830,10 @@ impl Replay<'_> {
         if offsets_inventory {
             self.report.passive_offset_fills += 1;
         }
+        if closing && !quote.closing_filled {
+            quote.closing_filled = true;
+            self.report.cycle_attribution.closing_quotes.filled += 1;
+        }
         let notional = base * quote.price;
         quote.left -= base;
         if quote.left.is_zero() {
@@ -747,11 +843,13 @@ impl Replay<'_> {
             if let Some(i) = passive_side {
                 self.report.passive_cycles_started[i] += 1;
             }
+            self.report.turnover_posture.cycles_started[posture.index()] += 1;
             Cycle {
+                posture,
                 started_ms: now,
                 initial_cash: self.ledger.cash,
                 initial_turnover: self.ledger.turnover,
-                draining: false,
+                draining: posture != self.posture.posture,
                 externalizing: false,
                 maker_turnover: Decimal::ZERO,
                 passive_side,
@@ -1329,13 +1427,13 @@ impl Replay<'_> {
         let mut best_edge = self.report.best_modeled_edge_bps;
         let mut best_cost = self.report.best_projected_turnover_cost_bps;
         for side in [HedgeSide::Buy, HedgeSide::Sell] {
-            if (closing && side != direction(self.ledger.positions[self.maker()]))
-                || (!closing
-                    && self
-                        .config
-                        .entry_side
-                        .is_some_and(|opening| side != opening))
-            {
+            let permitted = if closing {
+                side == direction(self.ledger.positions[self.maker()])
+            } else {
+                self.posture.posture.permits(side)
+                    && self.config.entry_side.is_none_or(|opening| side == opening)
+            };
+            if !permitted {
                 continue;
             }
             let levels = books[self.maker()].side(opposite(side));
@@ -1428,7 +1526,9 @@ impl Replay<'_> {
 
     fn post(&mut self, now: u64, candidate: Candidate, cancel_by: u64) {
         let arrival_ms = now + self.config.transport_ms;
+        let closing = self.cycle.is_some();
         self.quote = Some(Quote {
+            posture: self.posture.posture,
             side: candidate.side,
             price: candidate.price,
             left: candidate.quantity,
@@ -1439,9 +1539,12 @@ impl Replay<'_> {
             cancelled_ms: None,
             hedge_limit: candidate.hedge_limit,
             passive_entry: candidate.passive_entry,
-            closing: self.cycle.is_some(),
+            closing,
+            closing_touched: false,
+            closing_filled: false,
         });
         self.report.quotes_submitted += 1;
+        self.report.cycle_attribution.closing_quotes.submitted += usize::from(closing);
     }
 
     fn quote_passive_offset(&mut self, now: u64, cancel_by: u64) {
@@ -1647,7 +1750,7 @@ impl Replay<'_> {
                 .as_ref()
                 .is_some_and(|quote| quote.hedge_limit.is_some())
         {
-            self.cancel(now);
+            self.cancel(now, "fill_confirmed");
         }
         self.update_paired_state(now);
         let (paired_time, paired_basis, paired_book) = self.paired_stop(now);
@@ -1673,7 +1776,7 @@ impl Replay<'_> {
                 || exposure_stop;
         }
         if self.cycle.as_ref().is_some_and(|cycle| cycle.draining) {
-            self.cancel(now);
+            self.cancel(now, "drain");
             if self.quote.is_none() && self.notices.is_empty() {
                 let [a, b] = self.ledger.positions;
                 let net = a + b;
@@ -1758,6 +1861,8 @@ impl Replay<'_> {
                     self.report.passive_cycles_completed[side] += 1;
                 }
             }
+            self.report.turnover_posture.cycles_completed[cycle.posture.index()] += 1;
+            self.report.turnover_posture.realized_pnl[cycle.posture.index()] += pnl;
             self.report.realized_pnl += pnl;
         }
         let closing_ready = self.config.hedged_exit.is_none()
@@ -1787,7 +1892,7 @@ impl Replay<'_> {
         {
             // The reduce quote can still fill until cancellation and its
             // delivery window are complete. Keep the hedge waiting.
-            self.cancel(now);
+            self.cancel(now, "externalize");
         } else {
             let pending: Decimal = self.notices.iter().map(|(_, quantity)| quantity).sum();
             let confirmed = self.net() - pending;
@@ -1878,6 +1983,10 @@ impl Replay<'_> {
                 "unordered maker-first tape"
             );
             previous = now;
+            if self.posture.expire(now) {
+                self.report.turnover_posture.controls_expired += 1;
+                self.posture_changed(now);
+            }
             let mut book_frame = false;
             match event {
                 MakerFirstEvent::Book { books, .. } => {
@@ -1916,8 +2025,23 @@ impl Replay<'_> {
                             {
                                 self.report.incomplete = Some("resting_order_during_trade_gap");
                             }
-                            self.cancel(now);
+                            self.cancel(now, "trade_feed_gap");
                         }
+                    }
+                }
+                MakerFirstEvent::TurnoverControl { control, .. } => {
+                    let previous = self.posture.posture;
+                    if self
+                        .config
+                        .turnover_posture
+                        .is_some_and(|p| self.posture.control(p, now, control))
+                    {
+                        self.report.turnover_posture.controls_accepted += 1;
+                        if previous != self.posture.posture {
+                            self.posture_changed(now);
+                        }
+                    } else {
+                        self.report.turnover_posture.controls_rejected += 1;
                     }
                 }
                 MakerFirstEvent::End { .. } => {
@@ -1925,6 +2049,7 @@ impl Replay<'_> {
                         now == self.config.end_ms,
                         "incorrect maker-first tape cutoff"
                     );
+                    self.risk(now);
                     ended = true;
                     continue;
                 }
@@ -1950,6 +2075,7 @@ impl Replay<'_> {
             self.report.total_unhedged_ms += elapsed;
             self.report.max_unhedged_ms = self.report.max_unhedged_ms.max(elapsed);
         }
+        self.report.turnover_posture.final_posture = self.posture.posture;
         self.report.open_positions_base = self.ledger.positions;
         self.report.cycle_attribution.paired_cycles_open_at_cutoff = usize::from(
             !self.ledger.is_flat()
@@ -2038,6 +2164,7 @@ pub fn run_maker_first(
         notices: VecDeque::new(),
         unhedged_since: None,
         cost_feedback: CostFeedback::default(),
+        posture: PostureState::new(config.turnover_posture),
         report: MakerFirstReport {
             start_ms: config.start_ms,
             end_ms: config.end_ms,
@@ -2075,6 +2202,7 @@ mod tests {
             drain_ms: 4_000,
             require_net_edge: false,
             entry_side: None,
+            turnover_posture: None,
             passive_offset: None,
             turnover_feedback: None,
             hedged_exit: None,
@@ -2243,6 +2371,10 @@ mod tests {
         assert_eq!(stats.forced_ioc_cycles, 0);
         assert_eq!(stats.total_time_to_hedge_ms, 200);
         assert_eq!(stats.total_hedge_to_close_ms, 2300);
+        assert!(stats.closing_quotes.submitted >= stats.closing_quotes.accepted);
+        assert!(stats.closing_quotes.accepted >= stats.closing_quotes.touched);
+        assert_eq!(stats.closing_quotes.touched, 1);
+        assert_eq!(stats.closing_quotes.filled, 1);
         assert_eq!(stats.closing_maker_fills, 1);
         assert_eq!(stats.opening_maker_fees[0], d("0.0059988"));
         assert_eq!(stats.closing_maker_fees[0], d("0.0060012"));
@@ -2253,6 +2385,7 @@ mod tests {
         let unhedged = run(&cfg, "0.02", false);
         assert_eq!(unhedged.exposure_stops, 1, "{unhedged:?}");
         assert_eq!(unhedged.cycle_attribution.paired_maker_closes, 0);
+        assert_eq!(unhedged.cycle_attribution.closing_quotes.submitted, 0);
         assert_eq!(unhedged.cycle_attribution.hedged_time_stops, 0);
         assert!(unhedged.cycle_attribution.forced_ioc_fees[0] > Decimal::ZERO);
     }
@@ -2713,5 +2846,216 @@ mod tests {
         assert_eq!(result.max_unhedged_ms, 1_300);
         assert_eq!(result.passive_cycles_started, [0, 1]);
         assert_eq!(result.passive_cycles_completed, [0, 0]);
+    }
+    fn posture_config(posture: TurnoverPosture) -> MakerFirstConfig {
+        let mut c = config();
+        c.pair.strategy = Strategy::BasisReversion;
+        c.pair.mode = PaperMode::Turnover {
+            max_turnover_quote: d("100000"),
+            max_fees_quote: d("100"),
+            max_realized_loss_quote: Some(d("100")),
+            incentive: None,
+        };
+        c.pair.legs[0].venue = "arcus".into();
+        for leg in &mut c.pair.legs {
+            leg.taker_fee_bps = Decimal::ZERO;
+        }
+        c.pair.planner.depth_fraction = 1.0;
+        c.pair.planner.min_net_edge_bps = 0.0;
+        c.maker_fee_bps = Decimal::ZERO;
+        c.require_net_edge = true;
+        c.hedged_exit = Some(HedgedExit {
+            max_hold_ms: 6000,
+            min_saving_bps: Decimal::ZERO,
+            max_adverse_basis_bps: d("10"),
+            use_cycle_deadline: false,
+        });
+        c.turnover_posture = Some(TurnoverPosturePolicy {
+            initial: posture,
+            max_control_ttl_ms: 10000,
+        });
+        c
+    }
+
+    fn posture_tape(
+        c: &MakerFirstConfig,
+        posture: TurnoverPosture,
+        control: Option<(u64, TurnoverControl)>,
+    ) -> Vec<Result<MakerFirstEvent>> {
+        let t = c.start_ms;
+        let mut events = vec![MakerFirstEvent::TradeFeed {
+            at_ms: t,
+            leg: 0,
+            online: true,
+        }];
+        for offset in (0..=21000).step_by(100) {
+            let mut b = books(c, t + offset, "999.8");
+            if let MakerFirstEvent::Book { books, .. } = &mut b {
+                for book in books {
+                    for level in book.bids.iter_mut().chain(book.asks.iter_mut()) {
+                        level.contracts = d("5");
+                    }
+                }
+            }
+            events.push(b);
+        }
+        let buy = posture != TurnoverPosture::ShortFirst;
+        events.push(print_against(
+            t + 110,
+            if buy { HedgeSide::Buy } else { HedgeSide::Sell },
+            if buy { "999.7" } else { "1000.3" },
+            "0.08",
+        ));
+        events.push(print_against(
+            t + 2410,
+            if buy { HedgeSide::Sell } else { HedgeSide::Buy },
+            if buy { "1000.3" } else { "999.7" },
+            "0.08",
+        ));
+        if let Some((at_ms, control)) = control {
+            events.push(MakerFirstEvent::TurnoverControl { at_ms, control });
+        }
+        events.push(MakerFirstEvent::End { at_ms: c.end_ms });
+        events.sort_by_key(MakerFirstEvent::time);
+        events.into_iter().map(Ok).collect()
+    }
+
+    #[test]
+    fn turnover_postures_fully_hedge_and_close_both_legs() {
+        for posture in [
+            TurnoverPosture::Neutral,
+            TurnoverPosture::LongFirst,
+            TurnoverPosture::ShortFirst,
+        ] {
+            let cfg = posture_config(posture);
+            let r = run_maker_first(
+                &cfg,
+                posture_tape(&cfg, posture, None),
+                &VenueRegistry::default(),
+            )
+            .unwrap();
+            assert_eq!(r.incomplete, None, "{posture:?}: {r:?}");
+            assert!(r.closed_cycles > 0, "{r:?}");
+            assert_eq!(r.open_positions_base, [Decimal::ZERO; 2]);
+            assert_eq!(r.exposure_stops, 0, "{r:?}");
+            assert!(r.cycle_attribution.paired_closed_cycles > 0, "{r:?}");
+            assert!(r.turnover_posture.cycles_started[posture.index()] > 0);
+            assert_eq!(
+                r.turnover_posture.cycles_completed[posture.index()],
+                r.closed_cycles
+            );
+            assert_eq!(
+                r.turnover_posture.realized_pnl[posture.index()],
+                r.realized_pnl
+            );
+        }
+    }
+
+    #[test]
+    fn turnover_control_drains_old_fills_and_expires_to_neutral() {
+        let cfg = posture_config(TurnoverPosture::LongFirst);
+        let t = cfg.start_ms;
+        let control = TurnoverControl {
+            revision: 1,
+            issued_at_ms: t + 160,
+            expires_at_ms: t + 1600,
+            posture: TurnoverPosture::ShortFirst,
+        };
+        let r = run_maker_first(
+            &cfg,
+            posture_tape(&cfg, TurnoverPosture::LongFirst, Some((t + 160, control))),
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(r.incomplete, None, "{r:?}");
+        assert_eq!(r.turnover_posture.controls_accepted, 1);
+        assert_eq!(r.turnover_posture.controls_expired, 1);
+        assert_eq!(r.turnover_posture.final_posture, TurnoverPosture::Neutral);
+        assert!(r.forced_closes > 0);
+        assert_eq!(r.open_positions_base, [Decimal::ZERO; 2]);
+    }
+
+    #[test]
+    fn turnover_control_keeps_late_fill_in_original_posture_cohort() {
+        let cfg = posture_config(TurnoverPosture::LongFirst);
+        let t = cfg.start_ms;
+        // Change before the first fill; the old order can still execute while
+        // cancellation travels. Its first late fill starts an old, draining cycle.
+        let control = TurnoverControl {
+            revision: 1,
+            issued_at_ms: t + 60,
+            expires_at_ms: t + 1600,
+            posture: TurnoverPosture::ShortFirst,
+        };
+        let r = run_maker_first(
+            &cfg,
+            posture_tape(&cfg, TurnoverPosture::LongFirst, Some((t + 60, control))),
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(r.incomplete, None, "{r:?}");
+        assert_eq!(r.turnover_posture.cycles_started, [0, 1, 0]);
+        assert_eq!(r.turnover_posture.cycles_completed, [0, 1, 0]);
+        assert_eq!(r.open_positions_base, [Decimal::ZERO; 2]);
+    }
+
+    #[test]
+    fn fixed_turnover_posture_preserves_legacy_entry_execution() {
+        for (posture, side) in [
+            (TurnoverPosture::Neutral, None),
+            (TurnoverPosture::LongFirst, Some(HedgeSide::Buy)),
+            (TurnoverPosture::ShortFirst, Some(HedgeSide::Sell)),
+        ] {
+            let cfg = posture_config(posture);
+            let mut legacy = posture_config(posture);
+            legacy.turnover_posture = None;
+            legacy.entry_side = side;
+            let execute = |c: &MakerFirstConfig| {
+                run_maker_first(c, posture_tape(c, posture, None), &VenueRegistry::default())
+                    .unwrap()
+            };
+            let (new, old) = (execute(&cfg), execute(&legacy));
+            assert_eq!(new.net_pnl, old.net_pnl);
+            assert_eq!(new.maker_turnover, old.maker_turnover);
+            assert_eq!(new.taker_turnover, old.taker_turnover);
+            assert_eq!(new.max_unhedged_ms, old.max_unhedged_ms);
+            assert_eq!(new.open_positions_base, old.open_positions_base);
+        }
+    }
+
+    #[test]
+    fn turnover_control_rejects_replay_future_and_risk_mutation() {
+        let policy = posture_config(TurnoverPosture::Neutral)
+            .turnover_posture
+            .unwrap();
+        let mut state = PostureState::new(Some(policy));
+        let c = TurnoverControl {
+            revision: 1,
+            issued_at_ms: 100,
+            expires_at_ms: 500,
+            posture: TurnoverPosture::LongFirst,
+        };
+        assert!(!state.control(policy, 99, c));
+        assert!(state.control(policy, 100, c));
+        assert!(!state.control(policy, 101, c));
+        assert!(!state.control(policy, 500, TurnoverControl { revision: 2, ..c }));
+        assert!(!state.control(
+            policy,
+            200,
+            TurnoverControl {
+                revision: 2,
+                expires_at_ms: 20000,
+                ..c
+            }
+        ));
+        assert!(serde_json::from_str::<TurnoverControl>(r#"{"revision":2,"issued_at_ms":100,"expires_at_ms":500,"posture":"long_first","max_directional_notional":"999999"}"#).is_err());
+        assert!(state.expire(500));
+        assert_eq!(state.posture, TurnoverPosture::Neutral);
+        let mut cfg = posture_config(TurnoverPosture::LongFirst);
+        cfg.turnover_posture.as_mut().unwrap().max_control_ttl_ms = 0;
+        assert!(cfg.validate(&VenueRegistry::default()).is_err());
+        cfg.turnover_posture.as_mut().unwrap().max_control_ttl_ms = 10000;
+        cfg.pair.mode = PaperMode::PairHedge;
+        assert!(cfg.validate(&VenueRegistry::default()).is_err());
     }
 }

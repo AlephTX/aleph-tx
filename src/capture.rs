@@ -270,7 +270,8 @@ impl CaptureConfig {
             let venue = registry.get(&self.pair.legs[i].venue)?;
             let external_context = matches!(venue.id.as_str(), "arcus" | "bulk" | "extended");
             ensure!(
-                (venue.id == "lighter" && leg.lighter_market_id.is_some())
+                (matches!(venue.id.as_str(), "lighter" | "lighter_robinhood")
+                    && leg.lighter_market_id.is_some())
                     || ((venue.hyperliquid_dex.is_some() || external_context)
                         && leg.lighter_market_id.is_none()),
                 "capture requires supported venue market terms"
@@ -470,6 +471,8 @@ impl<'a> Compiler<'a> {
             matches!(
                 row.source.as_str(),
                 "lighter"
+                    | "lighter_robinhood"
+                    | "lighter_robinhood_trades"
                     | "hyperliquid"
                     | "hyperliquid_snapshot"
                     | "arcus"
@@ -486,7 +489,10 @@ impl<'a> Compiler<'a> {
         match (row.event.as_str(), row.payload) {
             ("disconnect" | "clock_refresh", None) => {
                 if row.event == "clock_refresh" {
-                    ensure!(row.source == "lighter", "unexpected clock refresh source");
+                    ensure!(
+                        matches!(row.source.as_str(), "lighter" | "lighter_robinhood"),
+                        "unexpected clock refresh source"
+                    );
                     self.coverage.lighter_clock_refreshes += 1;
                 } else {
                     *self
@@ -798,7 +804,7 @@ pub fn compile(
                 && now >= row.received_at_ms
                 && now >= group
                 && row.request_sent_at_ms.is_none_or(|sent| {
-                    row.source == "lighter"
+                    matches!(row.source.as_str(), "lighter" | "lighter_robinhood")
                         && row.event == "message"
                         && sent > 0
                         && sent <= row.received_at_ms

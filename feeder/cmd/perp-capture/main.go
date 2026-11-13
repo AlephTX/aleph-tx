@@ -359,7 +359,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				return err
 			}
 			extendedSequence = next
-		case "lighter_trades":
+		case "lighter_trades", "lighter_robinhood_trades":
 			if header.Type != "subscribed/trade" && header.Type != "update/trade" {
 				continue
 			}
@@ -389,7 +389,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			}
 		}
 		row := record{Source: source.source, Market: source.market, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
-		if source.source == "lighter" && strings.HasPrefix(header.Type, "subscribed/") {
+		if isLighterBookSource(source.source) && strings.HasPrefix(header.Type, "subscribed/") {
 			channel := strings.Replace(header.Channel, ":", "/", 1)
 			if sent, ok := subscriptionSends[channel]; ok {
 				delete(subscriptionSends, channel)
@@ -406,7 +406,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 		}
 		// Record the gap before reconnecting so the compiler invalidates the
 		// previous book. A new connection starts with a fresh snapshot.
-		if source.source == "lighter" && (header.Type == "subscribed/order_book" || header.Type == "update/order_book") {
+		if isLighterBookSource(source.source) && (header.Type == "subscribed/order_book" || header.Type == "update/order_book") {
 			if header.Book == nil || header.Book.Nonce == 0 {
 				return errors.New("missing Lighter book nonce")
 			}
@@ -538,6 +538,8 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 
 func run() error {
 	lighter := flag.String("lighter", "", "comma-separated Lighter market IDs")
+	rh := flag.String("lighter-robinhood", "", "comma-separated Robinhood Chain Lighter market IDs (independent domain)")
+	rhTrades := flag.Bool("lighter-robinhood-trades", false, "record Robinhood Chain Lighter public trades")
 	lighterTrades := flag.Bool("lighter-trades", false, "record Lighter public trades on a separate connection")
 	extended := flag.String("extended", "", "comma-separated active Extended CLOB perpetuals for public depth and trades")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
@@ -555,7 +557,7 @@ func run() error {
 	if *path == "" || *duration < time.Second || *duration > 24*time.Hour {
 		return errors.New("provide -output and a duration from 1s to 24h")
 	}
-	if *clockRefresh != 0 && (*lighter == "" || *clockRefresh < 30*time.Second || *clockRefresh > 9*time.Minute) {
+	if *clockRefresh != 0 && ((*lighter == "" && *rh == "") || *clockRefresh < 30*time.Second || *clockRefresh > 9*time.Minute) {
 		return errors.New("clock refresh needs Lighter markets and an interval from 30s to 9m")
 	}
 	if *hlFastBook && *hl == "" {
@@ -565,6 +567,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	rhSources, err := robinhoodSubscriptions(*rh, *rhTrades, *clockRefresh)
+	if err != nil {
+		return err
+	}
+	if *rhTrades && *rh == "" {
+		return errors.New("Robinhood trades require Robinhood market IDs")
+	}
+	sources = append(sources, rhSources...)
 	if *lighterTrades {
 		source := subscription{source: "lighter_trades", url: "wss://mainnet.zklighter.elliot.ai/stream"}
 		for _, raw := range strings.Split(*lighter, ",") {

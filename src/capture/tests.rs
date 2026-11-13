@@ -631,3 +631,35 @@ fn rejects_truncated_input_and_equity_entries_without_the_underlying_feed() {
     .unwrap_err();
     assert!(err.to_string().contains("external reference and session"));
 }
+
+#[test]
+fn lighter_domains_do_not_share_market_ids_or_disconnects() {
+    let mut cfg = config();
+    cfg.pair.legs[0].venue = "lighter_robinhood".into();
+    let mut rh = lighter(T + 100, T + 99, 10, 0, true);
+    rh["source"] = json!("lighter_robinhood");
+    let rows = [
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        rh,
+        json!({"source":"lighter","event":"disconnect","received_at_ms":T+200,"available_at_ms":T+200}),
+        footer(T + 300),
+    ];
+    let (coverage, frames) = replay(&cfg, &rows);
+    assert_eq!(coverage.leg_book_updates, [1, 1]);
+    assert!(!frames[0]["legs"][0]["book"]["tradable"].as_bool().unwrap());
+    assert!(
+        frames.last().unwrap()["legs"][0]["book"]["tradable"]
+            .as_bool()
+            .unwrap()
+    );
+    let registry = VenueRegistry::default();
+    assert_ne!(
+        registry.get("lighter").unwrap().liquidity_domain,
+        registry.get("lighter_robinhood").unwrap().liquidity_domain
+    );
+    assert!(matches!(
+        registry.get("lighter_robinhood").unwrap().order_support,
+        crate::venues::OrderSupport::ReadOnly
+    ));
+}

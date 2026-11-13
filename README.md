@@ -55,7 +55,7 @@ line or Node 24 via `make dashboard-build`.
 | Supervised | `inventory_hedge` | Lighter market making with native Hyperliquid IOC hedges sized from confirmed inventory. Set `strategy_mode = "inventory_hedge"` and `[inventory_hedge]`. |
 | Paper | `pair_hedge` | Funding carry or basis reversion on one matched pair per run. This is the default `pair.mode` for `perp-replay`. |
 | Paper | Maker-first | Public prints advance a passive order's queue. Confirmed partials drive protected IOC hedges. See [maker-first replay](docs/PERP_RELATIVE_VALUE.md#maker-first-replay). |
-| Paper | `turnover` | Round-trip turnover, fee and loss budgets. An optional incentive policy compares unit costs on a reviewed unissued-token venue. Set `pair.mode.kind = "turnover"`. |
+| Paper | `turnover` | Separate turnover, fee and loss budgets. `neutral`, `long_first` and `short_first` select opening direction while retaining full hedging. Incentive eligibility is reviewed per venue and program. |
 
 The supervised launcher supports mainnet and testnet. Both network modes
 can submit and cancel orders. The paper matrix covers the six pairings
@@ -63,6 +63,13 @@ among Entropy, Arcus, TradeXYZ and BULK. Entropy and TradeXYZ have distinct
 books on shared Hyperliquid infrastructure, so that pair requires an
 explicit shared-risk opt-in. [Trading runbook](docs/LIVE_TRADING.md) ·
 [Venue capabilities](docs/CROSS_VENUE.md)
+
+Quant profit, arbitrage and incentive turnover use independent experiments
+and ledgers. User or external decisions can select a turnover posture through
+a versioned, expiring replay control; they cannot change risk limits.
+Lighter Core and Robinhood Chain are separate data domains. Robinhood
+support currently covers public capture and offline compilation.
+[Independent research and controls](docs/INDEPENDENT_STRATEGY_RESEARCH.md)
 
 ## Architecture
 

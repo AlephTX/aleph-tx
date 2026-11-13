@@ -54,6 +54,14 @@ impl Default for VenueRegistry {
                     LimitOrderBook,
                 ),
                 (
+                    "lighter_robinhood",
+                    "lighter:robinhood",
+                    "lighter",
+                    None,
+                    ReadOnly,
+                    LimitOrderBook,
+                ),
+                (
                     "hyperliquid",
                     "hyperliquid:core",
                     "hyperliquid",

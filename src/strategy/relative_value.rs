@@ -825,7 +825,7 @@ impl PairConfig {
                         && self.legs.get(policy.eligible_leg).is_some_and(|leg| {
                             !matches!(leg.venue.as_str(), "lighter" | "hyperliquid")
                         }),
-                    "incentive turnover requires a reviewed unissued-token venue, eligibility period and loss budget"
+                    "incentive turnover requires a reviewed incentive venue, eligibility period and loss budget"
                 );
             }
         }
