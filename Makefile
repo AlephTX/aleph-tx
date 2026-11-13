@@ -66,7 +66,7 @@ benchmark:
 test: test-rust test-go test-research
 
 test-rust:
-	cargo test --locked --lib --bins
+	cargo test --locked --features research-replay --lib --bins
 
 test-go:
 	cd feeder && go test -race ./...
@@ -92,7 +92,7 @@ dashboard-dev:
 	cd dashboard && npm run dev
 
 check:
-	cargo clippy --locked --lib --bins -- -D warnings
+	cargo clippy --locked --features research-replay --lib --bins -- -D warnings
 	cd feeder && go vet ./...
 
 fmt-check:
