@@ -1,8 +1,11 @@
 //! Sequential IOC replay against later L2 publications, with realized funding.
 
 use super::*;
-use crate::hedging::{HedgeAction, HedgeMachine, OrderIntent, OrderStatus, OrderUpdate};
+use crate::hedging::{HedgeAction, HedgeMachine, Leg, OrderIntent, OrderStatus, OrderUpdate};
 use std::{borrow::Borrow, collections::BTreeMap};
+
+mod maker_first;
+pub use maker_first::{MakerFirstConfig, MakerFirstEvent, MakerFirstReport, run_maker_first};
 
 const MAX_FRAMES: usize = 1_000_000;
 
@@ -22,6 +25,7 @@ pub struct PaperScenario {
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
     Reverted,
+    TurnoverComplete,
     BasisStop,
     HoldingTime,
     ReferenceLost,
@@ -102,6 +106,16 @@ pub struct PaperMarketCosts {
     pub execution_cost_bps: Option<Decimal>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct IncentiveTurnoverReport {
+    pub venue: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub filled_turnover_quote: Decimal,
+    /// Whole-strategy cash cost divided by fills in the reviewed venue window.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub realized_cost_bps: Option<Decimal>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct PaperEntryDiagnostics {
     pub idle_frames: usize,
@@ -139,6 +153,13 @@ pub struct PaperReport {
     pub opening_execution: [PaperLegExecution; 2],
     pub closing_execution: [PaperLegExecution; 2],
     pub market_costs: [PaperMarketCosts; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incentive_turnover: Option<IncentiveTurnoverReport>,
+    pub reversion_exits_below_floor: usize,
+    pub single_leg_recovery_started: usize,
+    pub single_leg_recovery_flat: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub single_leg_recovery_pnl: Decimal,
     pub funding_guard_ms: u64,
     pub funding_guard_blocked_fills: usize,
     pub funding_guard_skipped_entries: usize,
@@ -218,6 +239,8 @@ struct Ledger {
     funding_upper: Decimal,
     witnessed_funding_payments: usize,
     turnover: Decimal,
+    eligible_turnover: Decimal,
+    cycle_eligible_turnover: Decimal,
 }
 
 impl Default for Ledger {
@@ -230,6 +253,8 @@ impl Default for Ledger {
             funding_upper: Decimal::ZERO,
             witnessed_funding_payments: 0,
             turnover: Decimal::ZERO,
+            eligible_turnover: Decimal::ZERO,
+            cycle_eligible_turnover: Decimal::ZERO,
         }
     }
 }
@@ -345,6 +370,7 @@ impl FundingEvent<'_> {
 }
 
 struct Pending {
+    leg_index: usize,
     order: OrderIntent,
     submitted_at_ms: u64,
     submit_touch: Option<Decimal>,
@@ -367,10 +393,17 @@ impl Execution {
     }
 }
 
+#[derive(Default)]
+struct Recovery {
+    pending: Option<Pending>,
+    attempts: u32,
+}
+
 enum Phase {
     Opening(Execution),
     Holding,
     Closing(Execution),
+    Recovering(Recovery),
     Halted,
 }
 
@@ -380,6 +413,7 @@ impl Phase {
             Self::Opening(_) => "opening",
             Self::Holding => "holding",
             Self::Closing(_) => "closing",
+            Self::Recovering(_) => "recovering",
             Self::Halted => "halted",
         }
     }
@@ -460,6 +494,130 @@ enum Advance {
 }
 
 impl Runner {
+    fn poll_ioc(
+        &mut self,
+        pending: &mut Pending,
+        frame: &Frame,
+        deadline: u64,
+    ) -> Result<Option<(Fill, Option<PaperIocGate>)>> {
+        let now = frame.now_ms;
+        if now >= deadline {
+            // A simulated intent expires before it reaches an eligible book.
+            self.report.ioc_expired_without_book += 1;
+            return Ok(Some((Fill::default(), Some(pending.expiry_gate))));
+        }
+        let i = pending.leg_index;
+        let book = &frame.legs[i].book;
+        let waiting = if self.planner.session_end(frame).is_err() {
+            Some(PaperIocGate::DeadlineSession)
+        } else if !self.planner.usable_book(frame, i) {
+            Some(PaperIocGate::DeadlineBookUnavailable)
+        } else if book.timestamp_ms < pending.submitted_at_ms.saturating_add(self.latency) {
+            Some(PaperIocGate::DeadlineBookBeforeArrival)
+        } else if self
+            .planner
+            .config
+            .legs
+            .iter()
+            .any(|leg| leg.funding.near_payment(now, self.funding_guard_ms))
+        {
+            self.report.funding_guard_blocked_fills += 1;
+            Some(PaperIocGate::DeadlineFundingGuard)
+        } else {
+            None
+        };
+        if let Some(gate) = waiting {
+            pending.expiry_gate = gate;
+            return Ok(None);
+        }
+        let order = &pending.order;
+        let touch = book.side(order.side)[0].price;
+        if !book.in_bounds(order.limit_price) || !book.in_bounds(touch) {
+            return Ok(Some((Fill::default(), Some(PaperIocGate::PriceBand))));
+        }
+        let marketable = match order.side {
+            HedgeSide::Buy => touch <= order.limit_price,
+            HedgeSide::Sell => touch >= order.limit_price,
+        };
+        if !marketable {
+            return Ok(Some((
+                Fill::default(),
+                Some(PaperIocGate::LimitNotMarketable),
+            )));
+        }
+        let fill = sweep(
+            book,
+            &self.planner.config.legs[i],
+            order.side,
+            order.limit_price,
+            order.base_quantity,
+            self.planner.rules.participation,
+        )?;
+        let gate = fill.base.is_zero().then_some(PaperIocGate::DepthBelowLot);
+        Ok(Some((fill, gate)))
+    }
+
+    fn record_ioc(
+        &mut self,
+        pending: &Pending,
+        fill: Fill,
+        unfilled_gate: Option<PaperIocGate>,
+        frame: &Frame,
+        opening: bool,
+    ) {
+        let i = pending.leg_index;
+        let book = &frame.legs[i].book;
+        let order = &pending.order;
+        let stats = self.report.execution(opening, i);
+        if fill.base == order.base_quantity {
+            stats.ioc_filled += 1;
+        } else if !fill.base.is_zero() {
+            stats.ioc_partial += 1;
+        } else {
+            stats.ioc_unfilled += 1;
+            if let Some(gate) = unfilled_gate {
+                *stats.unfilled_by_gate.entry(gate).or_default() += 1;
+            }
+        }
+        if fill.base > Decimal::ZERO {
+            if self
+                .planner
+                .config
+                .mode
+                .incentive()
+                .is_some_and(|policy| policy.eligible_leg == i && policy.active_at(frame.now_ms))
+            {
+                self.ledger.cycle_eligible_turnover += fill.notional;
+            }
+            self.consumed[i] = Some((book.timestamp_ms, order.side));
+            let side_sign = if order.side == HedgeSide::Buy {
+                Decimal::ONE
+            } else {
+                -Decimal::ONE
+            };
+            stats.filled_base += fill.base;
+            stats.filled_notional_quote += fill.notional;
+            stats.max_fill_elapsed_ms = stats
+                .max_fill_elapsed_ms
+                .max(frame.now_ms - pending.submitted_at_ms);
+            let arrival_touch = book.side(order.side)[0].price;
+            stats.depth_impact_quote += side_sign * (fill.notional - fill.base * arrival_touch);
+            if let Some(touch) = pending.submit_touch {
+                let submit_notional = fill.base * touch;
+                stats.submit_touch_notional_quote += submit_notional;
+                stats.slippage_quote += side_sign * (fill.notional - submit_notional);
+            } else {
+                stats.fills_without_submit_touch += 1;
+            }
+        }
+        stats.fees_quote += self.ledger.trade(
+            i,
+            order.side,
+            fill,
+            self.planner.config.legs[i].taker_fee_bps,
+        );
+    }
+
     fn advance(
         &mut self,
         execution: &mut Execution,
@@ -468,110 +626,23 @@ impl Runner {
     ) -> Result<Advance> {
         let now = frame.now_ms;
         if let Some(mut pending) = execution.pending.take() {
-            let i = usize::from(pending.order.venue == self.planner.config.legs[1].venue);
-            let book = &frame.legs[i].book;
+            let Some((fill, gate)) = self.poll_ioc(&mut pending, frame, execution.deadline)? else {
+                execution.pending = Some(pending);
+                return Ok(Advance::Working);
+            };
             let order = &pending.order;
-            let (fill, unfilled_gate) = if now >= execution.deadline {
-                // The simulator expires intents without a usable publication
-                // before their deadline. It has no exchange-side order in flight.
-                self.report.ioc_expired_without_book += 1;
-                (Fill::default(), Some(pending.expiry_gate))
-            } else {
-                let waiting = if self.planner.session_end(frame).is_err() {
-                    Some(PaperIocGate::DeadlineSession)
-                } else if !self.planner.usable_book(frame, i) {
-                    Some(PaperIocGate::DeadlineBookUnavailable)
-                } else if book.timestamp_ms < pending.submitted_at_ms.saturating_add(self.latency) {
-                    Some(PaperIocGate::DeadlineBookBeforeArrival)
-                } else if self
-                    .planner
-                    .config
-                    .legs
-                    .iter()
-                    .any(|leg| leg.funding.near_payment(now, self.funding_guard_ms))
-                {
-                    self.report.funding_guard_blocked_fills += 1;
-                    Some(PaperIocGate::DeadlineFundingGuard)
-                } else {
-                    None
-                };
-                if let Some(gate) = waiting {
-                    pending.expiry_gate = gate;
-                    execution.pending = Some(pending);
-                    return Ok(Advance::Working);
-                }
-                let touch = book.side(order.side)[0].price;
-                let marketable = match order.side {
-                    HedgeSide::Buy => touch <= order.limit_price,
-                    HedgeSide::Sell => touch >= order.limit_price,
-                };
-                if !book.in_bounds(order.limit_price) || !book.in_bounds(touch) {
-                    (Fill::default(), Some(PaperIocGate::PriceBand))
-                } else if !marketable {
-                    (Fill::default(), Some(PaperIocGate::LimitNotMarketable))
-                } else {
-                    let fill = sweep(
-                        book,
-                        &self.planner.config.legs[i],
-                        order.side,
-                        order.limit_price,
-                        order.base_quantity,
-                        self.planner.rules.participation,
-                    )?;
-                    let gate = fill.base.is_zero().then_some(PaperIocGate::DepthBelowLot);
-                    (fill, gate)
-                }
-            };
-            let order = pending.order;
-            let stats = self.report.execution(opening, i);
-            let status = if fill.base == order.base_quantity {
-                stats.ioc_filled += 1;
-                OrderStatus::Filled
-            } else {
-                if fill.base > Decimal::ZERO {
-                    stats.ioc_partial += 1;
-                } else {
-                    stats.ioc_unfilled += 1;
-                    if let Some(gate) = unfilled_gate {
-                        *stats.unfilled_by_gate.entry(gate).or_default() += 1;
-                    }
-                }
-                OrderStatus::Canceled
-            };
             execution.machine.apply_update(OrderUpdate {
-                client_order_id: order.client_order_id,
-                venue: order.venue,
+                client_order_id: order.client_order_id.clone(),
+                venue: order.venue.clone(),
                 exchange_order_id: None,
                 cumulative_filled_base: fill.base,
-                status,
+                status: if fill.base == order.base_quantity {
+                    OrderStatus::Filled
+                } else {
+                    OrderStatus::Canceled
+                },
             })?;
-            if fill.base > Decimal::ZERO {
-                self.consumed[i] = Some((book.timestamp_ms, order.side));
-                let side_sign = if order.side == HedgeSide::Buy {
-                    Decimal::ONE
-                } else {
-                    -Decimal::ONE
-                };
-                stats.filled_base += fill.base;
-                stats.filled_notional_quote += fill.notional;
-                stats.max_fill_elapsed_ms =
-                    stats.max_fill_elapsed_ms.max(now - pending.submitted_at_ms);
-                let arrival_touch = book.side(order.side)[0].price;
-                stats.depth_impact_quote += side_sign * (fill.notional - fill.base * arrival_touch);
-                if let Some(touch) = pending.submit_touch {
-                    let submit_notional = fill.base * touch;
-                    stats.submit_touch_notional_quote += submit_notional;
-                    stats.slippage_quote += side_sign * (fill.notional - submit_notional);
-                } else {
-                    stats.fills_without_submit_touch += 1;
-                }
-            }
-            stats.fees_quote += self.ledger.trade(
-                i,
-                order.side,
-                fill,
-                self.planner.config.legs[i].taker_fee_bps,
-            );
+            self.record_ioc(&pending, fill, gate, frame, opening);
         }
         if opening
             && now < execution.deadline
@@ -594,6 +665,7 @@ impl Runner {
                     .usable_book(frame, i)
                     .then(|| frame.legs[i].book.side(order.side)[0].price);
                 execution.pending = Some(Pending {
+                    leg_index: i,
                     order,
                     submitted_at_ms: now,
                     submit_touch,
@@ -633,6 +705,9 @@ impl Runner {
         if z >= self.planner.config.basis.stop_z {
             return Some(ExitReason::BasisStop);
         }
+        if self.planner.config.mode.incentive().is_some() {
+            return Some(ExitReason::TurnoverComplete);
+        }
         if active.plan.strategy == Strategy::BasisReversion && z <= self.planner.config.basis.exit_z
         {
             return Some(ExitReason::Reverted);
@@ -651,7 +726,12 @@ impl Runner {
         None
     }
 
-    fn exit_execution(&self, active: &Active, frame: &Frame) -> Result<Option<Execution>> {
+    fn exit_execution(
+        &mut self,
+        active: &Active,
+        frame: &Frame,
+        reason: ExitReason,
+    ) -> Result<Option<Execution>> {
         let Ok(cutoff) = self.planner.session_end(frame) else {
             return Ok(None);
         };
@@ -678,15 +758,42 @@ impl Runner {
             })
         });
         let base = self.ledger.positions[0].abs();
+        let profit_floor = (reason == ExitReason::Reverted)
+            .then_some(self.planner.config.basis.min_exit_profit_bps)
+            .flatten();
         let limit = |i: usize| {
             let curve = &curves[i][usize::from(sides[i] == HedgeSide::Sell)];
-            curve.limit(base).or_else(|_| curve.last().map(|b| b.limit))
+            let limit = curve.limit(base);
+            if profit_floor.is_some() {
+                limit
+            } else {
+                limit.or_else(|_| curve.last().map(|b| b.limit))
+            }
         };
         let (Ok(a), Ok(b)) = (limit(0), limit(1)) else {
             return Ok(None);
         };
         if (0..2).any(|i| base < self.planner.config.legs[i].min_base([a, b][i])) {
             return Ok(None);
+        }
+        if let Some(floor) = profit_floor {
+            let close_cash = [a, b]
+                .into_iter()
+                .enumerate()
+                .map(|(i, limit)| {
+                    let sign = if sides[i] == HedgeSide::Sell {
+                        Decimal::ONE
+                    } else {
+                        -Decimal::ONE
+                    };
+                    limit * base * (sign - self.planner.config.legs[i].taker_fee_bps / BPS)
+                })
+                .sum::<Decimal>();
+            let profit = self.ledger.cash + close_cash - active.baseline_cash;
+            if profit < floor / BPS * base * frame.reference.price {
+                self.report.reversion_exits_below_floor += 1;
+                return Ok(None);
+            }
         }
         let plan = self.planner.hedge_plan(
             sides,
@@ -697,6 +804,110 @@ impl Runner {
             &curves,
         )?;
         Ok(Some(Execution::new(&plan)?))
+    }
+
+    fn failed_execution(&mut self, execution: &Execution, reason: String) -> Phase {
+        self.report.halted = Some(reason);
+        if self.planner.config.recover_single_leg
+            && self
+                .ledger
+                .positions
+                .iter()
+                .filter(|p| !p.is_zero())
+                .count()
+                == 1
+            && execution.pending.is_none()
+            && execution
+                .machine
+                .snapshot()
+                .orders
+                .iter()
+                .all(|order| order.terminal && !order.uncertain)
+        {
+            self.report.single_leg_recovery_started += 1;
+            Phase::Recovering(Recovery::default())
+        } else {
+            Phase::Halted
+        }
+    }
+
+    fn advance_recovery(
+        &mut self,
+        recovery: &mut Recovery,
+        plan: &Plan,
+        frame: &Frame,
+    ) -> Result<Advance> {
+        let deadline = plan.unwind_until_ms;
+        if let Some(mut pending) = recovery.pending.take() {
+            let Some((fill, gate)) = self.poll_ioc(&mut pending, frame, deadline)? else {
+                recovery.pending = Some(pending);
+                return Ok(Advance::Working);
+            };
+            let position = self.ledger.positions[pending.leg_index];
+            ensure!(
+                !position.is_zero()
+                    && (position > Decimal::ZERO) == (pending.order.side == HedgeSide::Sell)
+                    && fill.base <= position.abs(),
+                "paper recovery fill would increase exposure"
+            );
+            self.record_ioc(&pending, fill, gate, frame, false);
+        }
+        if self.ledger.is_flat() {
+            return Ok(Advance::Complete);
+        }
+        let now = frame.now_ms;
+        if now.saturating_add(self.latency) >= deadline
+            || recovery.attempts >= plan.hedge.max_order_attempts
+        {
+            return Ok(Advance::Halt("single-leg recovery exhausted".into()));
+        }
+        let i = usize::from(self.ledger.positions[0].is_zero());
+        if self.planner.session_end(frame).is_err() || !self.planner.usable_book(frame, i) {
+            return Ok(Advance::Working);
+        }
+        let position = self.ledger.positions[i];
+        let side = if position > Decimal::ZERO {
+            HedgeSide::Sell
+        } else {
+            HedgeSide::Buy
+        };
+        let terms = &self.planner.config.legs[i];
+        let book = &frame.legs[i].book;
+        let depth = Depth::build(book, terms, side, self.planner.rules);
+        let Ok(last) = depth.last() else {
+            return Ok(Advance::Working);
+        };
+        let base = floor_step(position.abs().min(last.base), terms.base_step())?;
+        let Ok(limit) = depth.limit(base) else {
+            return Ok(Advance::Working);
+        };
+        if base < terms.min_base(limit).max(terms.base_step()) {
+            return Ok(Advance::Working);
+        }
+        let order = OrderIntent {
+            client_order_id: format!("{}-reduce-{}", plan.hedge.execution_id, recovery.attempts),
+            venue: terms.venue.clone(),
+            instrument: terms.underlying_id.clone(),
+            leg: if terms.venue == plan.hedge.primary.venue {
+                Leg::Primary
+            } else {
+                Leg::Hedge
+            },
+            side,
+            base_quantity: base,
+            limit_price: limit,
+            immediate_or_cancel: true,
+        };
+        recovery.attempts += 1;
+        self.report.execution(false, i).ioc_submitted += 1;
+        recovery.pending = Some(Pending {
+            leg_index: i,
+            order,
+            submitted_at_ms: now,
+            submit_touch: Some(book.side(side)[0].price),
+            expiry_gate: PaperIocGate::DeadlineNoFrame,
+        });
+        Ok(Advance::Working)
     }
 
     /// Returns true once the active cycle can be dropped.
@@ -727,8 +938,7 @@ impl Runner {
                         active.opened_at = frame.now_ms;
                         active.phase = Phase::Holding;
                     } else {
-                        self.report.halted = Some(format!("entry {reason}"));
-                        active.phase = Phase::Halted;
+                        active.phase = self.failed_execution(exec, format!("entry {reason}"));
                     }
                 }
             },
@@ -737,11 +947,16 @@ impl Runner {
                     .exit_reason
                     .or_else(|| self.exit_reason(active, frame));
                 if let Some(reason) = reason {
-                    active.exit_reason = Some(reason);
+                    if reason != ExitReason::Reverted
+                        || self.planner.config.basis.min_exit_profit_bps.is_none()
+                    {
+                        active.exit_reason = Some(reason);
+                    }
                     if frame.now_ms >= active.plan.unwind_until_ms {
                         self.report.halted = Some("exit window expired".into());
                         active.phase = Phase::Halted;
-                    } else if let Some(mut exec) = self.exit_execution(active, frame)? {
+                    } else if let Some(mut exec) = self.exit_execution(active, frame, reason)? {
+                        active.exit_reason = Some(reason);
                         self.advance(&mut exec, frame, false)?;
                         active.phase = Phase::Closing(exec);
                     }
@@ -755,6 +970,8 @@ impl Runner {
                     let funding = self.ledger.funding - active.baseline_funding;
                     let funding_upper = self.ledger.funding_upper - active.baseline_funding_upper;
                     let pnl_upper = pnl + (funding_upper - funding);
+                    self.ledger.eligible_turnover +=
+                        std::mem::take(&mut self.ledger.cycle_eligible_turnover);
                     self.report.realized_pnl += pnl;
                     self.report.realized_pnl_upper_bound += pnl_upper;
                     self.report.trades.push(PaperTrade {
@@ -772,11 +989,28 @@ impl Runner {
                     return Ok(true);
                 }
                 Advance::Halt(reason) => {
-                    self.report.halted = Some(format!("exit {reason}"));
-                    active.phase = Phase::Halted;
+                    active.phase = self.failed_execution(exec, format!("exit {reason}"));
                 }
             },
-            Phase::Halted => {}
+            Phase::Recovering(_) | Phase::Halted => {}
+        }
+        if let Phase::Recovering(recovery) = &mut active.phase {
+            match self.advance_recovery(recovery, &active.plan, frame)? {
+                Advance::Working => {}
+                Advance::Complete => {
+                    let pnl = self.ledger.cash - active.baseline_cash;
+                    let pnl_upper = pnl
+                        + (self.ledger.funding_upper - active.baseline_funding_upper)
+                        - (self.ledger.funding - active.baseline_funding);
+                    self.report.single_leg_recovery_flat += 1;
+                    self.report.single_leg_recovery_pnl += pnl;
+                    self.report.realized_pnl += pnl;
+                    self.report.realized_pnl_upper_bound += pnl_upper;
+                    self.ledger.cycle_eligible_turnover = Decimal::ZERO;
+                    return Ok(true);
+                }
+                Advance::Halt(_) => active.phase = Phase::Halted,
+            }
         }
         Ok(false)
     }
@@ -803,17 +1037,22 @@ impl Runner {
             self.report.reject(EntryGate::FundingGuard.into());
             return Ok(());
         }
-        if let PaperMode::Turnover {
-            max_turnover_quote,
-            max_fees_quote,
-        } = self.planner.config.mode
-            && (self.ledger.turnover + plan.modeled_turnover_quote > max_turnover_quote
-                || self.ledger.fees + plan.modeled_fees_quote > max_fees_quote)
+        if self
+            .planner
+            .config
+            .mode
+            .remaining_budget(self.ledger.turnover, self.ledger.fees, self.ledger.cash)
+            .is_some_and(|budget| {
+                plan.modeled_turnover_quote > budget.turnover
+                    || plan.modeled_fees_quote > budget.fees
+                    || budget.loss.is_some_and(|loss| -plan.net_edge > loss)
+            })
         {
             self.report.reject(EntryGate::TurnoverBudget.into());
             return Ok(());
         }
         let mut exec = Execution::new(&plan.hedge)?;
+        self.ledger.cycle_eligible_turnover = Decimal::ZERO;
         self.advance(&mut exec, frame, true)?;
         self.report.entries_submitted += 1;
         self.active = Some(Active {
@@ -945,10 +1184,21 @@ impl Runner {
                 if !self.advance_active(&mut active, frame)? {
                     self.active = Some(active);
                 }
-            } else {
+            } else if self.report.halted.is_none() {
                 let diagnostics = &mut self.report.entry_diagnostics;
                 diagnostics.idle_frames += 1;
                 let plan = sample.and_then(|(signal, cutoff)| {
+                    let mode = self.planner.config.mode;
+                    if self.ledger.is_flat() {
+                        if mode.realized_loss_exhausted(self.ledger.cash) {
+                            return Err(EntryGate::TurnoverLossLimit.into());
+                        }
+                        if mode.incentive().is_some_and(|policy| {
+                            !policy.within_cost(self.ledger.cash, self.ledger.eligible_turnover)
+                        }) {
+                            return Err(EntryGate::TurnoverCost.into());
+                        }
+                    }
                     let abs_z = signal.z.abs();
                     diagnostics.max_abs_z =
                         Some(diagnostics.max_abs_z.map_or(abs_z, |max| max.max(abs_z)));
@@ -958,11 +1208,11 @@ impl Runner {
                         cutoff,
                         self.funding_guard_ms,
                         EntryOptions {
-                            turnover_budget: self
-                                .planner
-                                .config
-                                .mode
-                                .remaining_budget(self.ledger.turnover, self.ledger.fees),
+                            turnover_budget: mode.remaining_budget(
+                                self.ledger.turnover,
+                                self.ledger.fees,
+                                self.ledger.cash,
+                            ),
                             best_edge_bps: Some(&mut diagnostics.best_net_edge_bps),
                         },
                     )
@@ -987,6 +1237,17 @@ impl Runner {
         self.report.funding = self.ledger.funding;
         self.report.funding_upper_bound = self.ledger.funding_upper;
         self.report.witnessed_funding_payments = self.ledger.witnessed_funding_payments;
+        if let Some(policy) = self.planner.config.mode.incentive() {
+            let turnover = self.ledger.eligible_turnover;
+            self.report.incentive_turnover = Some(IncentiveTurnoverReport {
+                venue: self.planner.config.legs[policy.eligible_leg].venue.clone(),
+                filled_turnover_quote: turnover,
+                realized_cost_bps: (turnover > Decimal::ZERO
+                    && self.ledger.is_flat()
+                    && self.active.is_none())
+                .then(|| -self.ledger.cash / turnover * BPS),
+            });
+        }
         self.report.market_costs = std::array::from_fn(|i| {
             let terms = &self.planner.config.legs[i];
             let entry = &self.report.opening_execution[i];

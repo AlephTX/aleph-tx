@@ -1,4 +1,4 @@
-//! Offline replay of the production `InventoryNeutralMM` quoting loop.
+//! Offline venue and shared-memory adapter for the production quoting loop.
 //!
 //! Each step publishes a BBO frame, settles resting orders the new frame
 //! trades through (the market moves before the strategy reacts), publishes
@@ -24,8 +24,11 @@
 //!   timestamps share that domain and advance only via `Frame::advance_ms`
 //!   and the strategy's own sleeps.
 //!
-//! Scope: correctness of the production decision path and accounting. It
-//! does not estimate live fill rates or PnL; no recorded dataset is used.
+//! These assumptions apply to the synthetic tests. The recorded-data
+//! runner uses a public trade tape, depth, and a separate latency model.
+
+#[cfg(feature = "research-replay")]
+pub mod recorded;
 
 use super::*;
 use crate::exchange::{
@@ -35,11 +38,14 @@ use crate::shm_reader::NUM_SYMBOLS;
 use crate::types::ShmPrivateEventV2;
 use parking_lot::Mutex as PlMutex;
 use std::collections::BTreeMap;
-use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 
-const LIGHTER: u8 = 2;
+const LIGHTER: u8 = crate::config::EXCH_LIGHTER;
+#[cfg(test)]
 const BINANCE: u8 = 6;
+#[cfg(test)]
 const SYMBOL: u16 = crate::config::SYM_ETH;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,11 +58,13 @@ pub(super) struct Resting {
 }
 
 /// Taker fee for offline IOC fills (timeout flatten). Assumption, not a quote.
+#[cfg(test)]
 const SIM_TAKER_FEE_BPS: f64 = 2.0;
 
 /// Venue action as observed by the simulated exchange, in scaled integers so
 /// traces compare exactly. `at_ms` is replay time since the run started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(super) enum Action {
     Place {
         at_ms: u64,
@@ -83,12 +91,25 @@ pub(super) enum Action {
     },
 }
 
+#[cfg(test)]
 fn e4(v: f64) -> i64 {
     (v * 1e4).round() as i64
 }
 
 fn e8(v: f64) -> i64 {
     (v * 1e8).round() as i64
+}
+
+#[derive(Clone, Copy, Default)]
+struct Ledger {
+    position_e8: i64,
+    cash: f64,
+    maker_notional: f64,
+    taker_notional: f64,
+    maker_fees: f64,
+    taker_fees: f64,
+    maker_fills: u64,
+    taker_fills: u64,
 }
 
 /// Simulated Lighter venue. Holds resting orders and emits tracker events.
@@ -99,24 +120,45 @@ pub(super) struct SimVenue {
     next_exchange_id: std::sync::atomic::AtomicU64,
     sequence: std::sync::atomic::AtomicU64,
     pub fee_bps: f64,
+    taker_fee_bps: f64,
+    symbol: u16,
+    ledger: PlMutex<Ledger>,
+    #[cfg(feature = "research-replay")]
+    recorded: Option<recorded::Matching>,
     /// Fill events applied, for conservation checks: (is_ask, price, size, fee).
+    #[cfg(test)]
     pub fills: PlMutex<Vec<(bool, f64, f64, f64)>>,
     /// Count of cancel requests that found no live order (cancel/fill races).
+    #[cfg(test)]
     pub cancel_misses: std::sync::atomic::AtomicU64,
     /// When set, a cancel request loses the race: the order fills first and
     /// the cancel finds nothing, as with Lighter's "order not found".
+    #[cfg(test)]
     pub fill_before_cancel: std::sync::atomic::AtomicBool,
     /// Fill events exactly as published, for identity-preserving redelivery.
+    #[cfg(test)]
     pub fill_events: PlMutex<Vec<ShmPrivateEventV2>>,
     /// Every venue action with its replay time.
+    #[cfg(test)]
     pub actions: PlMutex<Vec<Action>>,
     /// Current visible touch, used to match IOC orders.
     touch: PlMutex<(f64, f64)>,
+    #[cfg(test)]
     started: Instant,
 }
 
 impl SimVenue {
+    #[cfg(test)]
     pub fn new(tracker: Arc<OrderTracker>, fee_bps: f64) -> Self {
+        Self::for_symbol(tracker, SYMBOL, fee_bps, SIM_TAKER_FEE_BPS)
+    }
+
+    fn for_symbol(
+        tracker: Arc<OrderTracker>,
+        symbol: u16,
+        fee_bps: f64,
+        taker_fee_bps: f64,
+    ) -> Self {
         Self {
             tracker,
             book: PlMutex::new(BTreeMap::new()),
@@ -124,20 +166,33 @@ impl SimVenue {
             next_exchange_id: std::sync::atomic::AtomicU64::new(1_000),
             sequence: std::sync::atomic::AtomicU64::new(0),
             fee_bps,
+            taker_fee_bps,
+            symbol,
+            ledger: PlMutex::new(Ledger::default()),
+            #[cfg(feature = "research-replay")]
+            recorded: None,
+            #[cfg(test)]
             fills: PlMutex::new(Vec::new()),
+            #[cfg(test)]
             cancel_misses: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             fill_before_cancel: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             fill_events: PlMutex::new(Vec::new()),
+            #[cfg(test)]
             actions: PlMutex::new(Vec::new()),
             touch: PlMutex::new((0.0, 0.0)),
+            #[cfg(test)]
             started: Instant::now(),
         }
     }
 
+    #[cfg(test)]
     fn now_ms(&self) -> u64 {
         Instant::now().duration_since(self.started).as_millis() as u64
     }
 
+    #[cfg(test)]
     fn record(&self, action: Action) {
         self.actions.lock().push(action);
     }
@@ -159,6 +214,17 @@ impl SimVenue {
     /// Register an order the strategy placed, as LighterTrading would before
     /// submission, then acknowledge it as the private stream would.
     fn place(&self, side: Side, price: f64, size: f64, ioc: bool) -> PlaceResult {
+        let order = self.reserve(side, price, size, ioc);
+        self.activate(order);
+        PlaceResult {
+            client_order_index: order.client_order_id,
+            side,
+            price,
+            size,
+        }
+    }
+
+    fn reserve(&self, side: Side, price: f64, size: f64, _ioc: bool) -> Resting {
         let coid = self
             .next_coid
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -171,44 +237,51 @@ impl SimVenue {
         };
         assert!(self.tracker.start_tracking(coid, tracker_side, price, size));
         let is_ask = side == Side::Sell;
+        #[cfg(test)]
         self.record(Action::Place {
             at_ms: self.now_ms(),
             is_ask,
             price: e4(price),
             size: e8(size),
-            ioc,
+            ioc: _ioc,
         });
-        self.apply(ShmPrivateEventV2::order_created(
-            self.next_sequence(),
-            LIGHTER,
-            SYMBOL,
+        Resting {
+            client_order_id: coid,
             exchange_order_id,
-            coid,
-            exchange_order_id as i64,
-            price,
-            size,
             is_ask,
-            0,
-        ));
-        self.book.lock().insert(
-            exchange_order_id as i64,
-            Resting {
-                client_order_id: coid,
-                exchange_order_id,
-                is_ask,
-                price,
-                remaining: size,
-            },
-        );
-        PlaceResult {
-            client_order_index: coid,
-            side,
             price,
-            size,
+            remaining: size,
         }
     }
 
+    fn event_time(&self) -> u64 {
+        #[cfg(feature = "research-replay")]
+        if self.recorded.is_some() {
+            return wall_time_ns();
+        }
+        0
+    }
+
+    fn activate(&self, order: Resting) {
+        self.apply(ShmPrivateEventV2::order_created(
+            self.next_sequence(),
+            LIGHTER,
+            self.symbol,
+            order.exchange_order_id,
+            order.client_order_id,
+            order.exchange_order_id as i64,
+            order.price,
+            order.remaining,
+            order.is_ask,
+            self.event_time(),
+        ));
+        self.book
+            .lock()
+            .insert(order.exchange_order_id as i64, order);
+    }
+
     fn cancel(&self, order_index: i64) {
+        #[cfg(test)]
         if self
             .fill_before_cancel
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -218,9 +291,14 @@ impl SimVenue {
                 self.fill(order, order.price, order.remaining, false);
             }
         }
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            matching.forget(order_index);
+        }
         let removed = self.book.lock().remove(&order_index);
         match removed {
             Some(order) => {
+                #[cfg(test)]
                 self.record(Action::Cancel {
                     at_ms: self.now_ms(),
                     exchange_order_id: order.exchange_order_id,
@@ -228,14 +306,15 @@ impl SimVenue {
                 self.apply(ShmPrivateEventV2::order_canceled(
                     self.next_sequence(),
                     LIGHTER,
-                    SYMBOL,
+                    self.symbol,
                     order.exchange_order_id,
                     order.client_order_id,
                     order_index,
                     order.remaining,
-                    0,
+                    self.event_time(),
                 ))
             }
+            #[cfg(test)]
             None => {
                 self.record(Action::CancelMiss {
                     at_ms: self.now_ms(),
@@ -244,11 +323,14 @@ impl SimVenue {
                 self.cancel_misses
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            #[cfg(not(test))]
+            None => {}
         }
     }
 
     /// Fill resting orders the frame trades through. `fraction` < 1 leaves a
     /// partial remainder resting.
+    #[cfg(test)]
     pub fn settle(&self, bid: f64, ask: f64, fraction: f64) {
         *self.touch.lock() = (bid, ask);
         let crossing: Vec<Resting> = self
@@ -283,7 +365,7 @@ impl SimVenue {
     fn fill(&self, order: Resting, price: f64, size: f64, taker: bool) {
         let remaining = ((order.remaining - size) * 1e8).round() / 1e8;
         let fee_bps = if taker {
-            SIM_TAKER_FEE_BPS
+            self.taker_fee_bps
         } else {
             self.fee_bps
         };
@@ -292,7 +374,7 @@ impl SimVenue {
         let event = ShmPrivateEventV2::order_filled(
             sequence,
             LIGHTER,
-            SYMBOL,
+            self.symbol,
             order.exchange_order_id,
             order.client_order_id,
             order.exchange_order_id as i64,
@@ -301,11 +383,29 @@ impl SimVenue {
             remaining,
             fee,
             order.is_ask,
-            0,
+            self.event_time(),
             sequence + 1_000_000, // unique trade id per fill
         );
         self.apply(event);
+        {
+            let mut ledger = self.ledger.lock();
+            let notional = price * size;
+            let sign = if order.is_ask { -1 } else { 1 };
+            ledger.position_e8 += sign * e8(size);
+            ledger.cash -= sign as f64 * notional + fee;
+            if taker {
+                ledger.taker_notional += notional;
+                ledger.taker_fees += fee;
+                ledger.taker_fills += 1;
+            } else {
+                ledger.maker_notional += notional;
+                ledger.maker_fees += fee;
+                ledger.maker_fills += 1;
+            }
+        }
+        #[cfg(test)]
         self.fill_events.lock().push(event);
+        #[cfg(test)]
         self.record(Action::Fill {
             at_ms: self.now_ms(),
             is_ask: order.is_ask,
@@ -314,6 +414,7 @@ impl SimVenue {
             fee: e8(fee),
             taker,
         });
+        #[cfg(test)]
         self.fills.lock().push((order.is_ask, price, size, fee));
         let mut book = self.book.lock();
         if remaining > 0.0 {
@@ -369,6 +470,7 @@ impl SimVenue {
     }
 
     /// Burn one sequence number so the next event arrives after a gap.
+    #[cfg(test)]
     pub fn skip_sequence(&self) {
         self.next_sequence();
     }
@@ -376,6 +478,7 @@ impl SimVenue {
     /// Re-apply a previously published event verbatim: same order, client,
     /// exchange and trade identity and its original (now stale) sequence, as
     /// when a ring reader re-reads a slot.
+    #[cfg(test)]
     pub fn redeliver(&self, event: &ShmPrivateEventV2) -> anyhow::Result<()> {
         self.tracker.apply_event(event)
     }
@@ -385,6 +488,7 @@ impl SimVenue {
     /// (feeder/exchanges/trade_dedupe.go), so after a feeder restart or window
     /// eviction a websocket replay reaches the ring as a new sequence with an
     /// already-applied trade id.
+    #[cfg(test)]
     pub fn republish(&self, event: &ShmPrivateEventV2) -> anyhow::Result<()> {
         let mut event = *event;
         event.sequence = self.next_sequence();
@@ -392,23 +496,12 @@ impl SimVenue {
     }
 
     pub fn net_position(&self) -> f64 {
-        self.fills
-            .lock()
-            .iter()
-            .map(|(is_ask, _, size, _)| if *is_ask { -size } else { *size })
-            .sum()
+        self.ledger.lock().position_e8 as f64 / 1e8
     }
 
     /// Signed trade cash flow less fees, as OrderTracker accounts it.
     pub fn cash_flow(&self) -> f64 {
-        self.fills
-            .lock()
-            .iter()
-            .map(|(is_ask, price, size, fee)| {
-                let notional = price * size;
-                (if *is_ask { notional } else { -notional }) - fee
-            })
-            .sum()
+        self.ledger.lock().cash
     }
 }
 
@@ -424,10 +517,18 @@ impl Exchange for SimVenue {
         anyhow::bail!("replay: legacy batch API is not used by the strategy")
     }
     async fn cancel_order(&self, order_index: i64) -> anyhow::Result<()> {
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            matching.wait_cancel().await;
+        }
         self.cancel(order_index);
         Ok(())
     }
     async fn cancel_all(&self) -> anyhow::Result<u32> {
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            matching.wait_cancel().await;
+        }
         let ids: Vec<i64> = self.book.lock().keys().copied().collect();
         for id in &ids {
             self.cancel(*id);
@@ -449,10 +550,18 @@ impl Exchange for SimVenue {
             })
             .collect())
     }
-    async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+    async fn close_all_positions(&self, _mid: f64) -> anyhow::Result<()> {
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            return matching.flatten(self, _mid).await;
+        }
         anyhow::bail!("replay: taker flatten is not simulated")
     }
     async fn execute_batch(&self, actions: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+        #[cfg(feature = "research-replay")]
+        if let Some(matching) = &self.recorded {
+            return matching.execute(self, actions).await;
+        }
         let mut place_results = Vec::new();
         for action in actions {
             match action {
@@ -485,6 +594,7 @@ impl Exchange for SimVenue {
 
 /// One replay frame: local and external books plus optional partial fills.
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub(super) struct Frame {
     pub lighter_bid: f64,
     pub lighter_ask: f64,
@@ -506,72 +616,112 @@ pub(super) struct Frame {
 /// Temp SHM segments the strategy reads like production.
 pub(super) struct ShmFiles {
     pub directory: PathBuf,
+    matrix: File,
+    account: File,
+    symbol: u16,
     version: u64,
     account_version: u64,
 }
 
 impl ShmFiles {
+    #[cfg(test)]
     pub fn create() -> Self {
+        Self::for_symbol(SYMBOL).unwrap()
+    }
+
+    fn for_symbol(symbol: u16) -> anyhow::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
         let directory = std::env::temp_dir().join(format!("aleph-replay-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        // Full production layout: 2048 versions + 2048 x 7 BBO slots.
-        std::fs::write(
-            directory.join("matrix"),
-            vec![0u8; NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 64],
-        )
-        .unwrap();
-        std::fs::write(directory.join("account"), [0u8; 128]).unwrap();
-        Self {
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let matrix = File::create_new(directory.join("matrix"))?;
+        matrix.set_len((NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 64) as u64)?;
+        let account = File::create_new(directory.join("account"))?;
+        account.set_len(128)?;
+        Ok(Self {
             directory,
+            matrix,
+            account,
+            symbol,
             version: 0,
             account_version: 0,
-        }
+        })
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.directory.join(name)
     }
 
-    fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
-        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(bytes).unwrap();
+    #[cfg(test)]
+    fn write_at(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(bytes, offset).unwrap();
     }
 
-    fn write_bbo(&self, exchange: u8, bid: f64, ask: f64, ts_ns: u64) {
+    fn write_bbo(&self, exchange: u8, bid: (f64, f64), ask: (f64, f64), ts_ns: u64) {
         let mut slot = [0u8; 64];
         slot[0..4].copy_from_slice(&2u32.to_le_bytes()); // even seqlock
         slot[4] = 1;
         slot[5] = exchange;
-        slot[6..8].copy_from_slice(&SYMBOL.to_le_bytes());
+        slot[6..8].copy_from_slice(&self.symbol.to_le_bytes());
         slot[8..16].copy_from_slice(&ts_ns.to_le_bytes());
-        slot[16..24].copy_from_slice(&bid.to_le_bytes());
-        slot[24..32].copy_from_slice(&5.0f64.to_le_bytes());
-        slot[32..40].copy_from_slice(&ask.to_le_bytes());
-        slot[40..48].copy_from_slice(&5.0f64.to_le_bytes());
+        slot[16..24].copy_from_slice(&bid.0.to_le_bytes());
+        slot[24..32].copy_from_slice(&bid.1.to_le_bytes());
+        slot[32..40].copy_from_slice(&ask.0.to_le_bytes());
+        slot[40..48].copy_from_slice(&ask.1.to_le_bytes());
         let offset = (NUM_SYMBOLS * 8) as u64
-            + (SYMBOL as u64 * NUM_EXCHANGES as u64 + exchange as u64) * 64;
-        Self::write_at(&self.path("matrix"), offset, &slot);
+            + (self.symbol as u64 * NUM_EXCHANGES as u64 + exchange as u64) * 64;
+        self.matrix.write_all_at(&slot, offset).unwrap();
     }
 
+    #[cfg(test)]
     pub fn publish(&mut self, frame: &Frame, ts_ns: u64) {
-        self.write_bbo(LIGHTER, frame.lighter_bid, frame.lighter_ask, ts_ns);
+        self.write_bbo(
+            LIGHTER,
+            (frame.lighter_bid, 5.0),
+            (frame.lighter_ask, 5.0),
+            ts_ns,
+        );
         let half = frame.external_mid * 0.5e-4;
         self.write_bbo(
             BINANCE,
-            frame.external_mid - half,
-            frame.external_mid + half,
+            (frame.external_mid - half, 5.0),
+            (frame.external_mid + half, 5.0),
             ts_ns,
         );
-        self.version += 1;
-        Self::write_at(
-            &self.path("matrix"),
-            SYMBOL as u64 * 8,
-            &self.version.to_le_bytes(),
-        );
+        self.publish_version();
     }
 
+    fn publish_version(&mut self) {
+        self.version += 1;
+        self.matrix
+            .write_all_at(&self.version.to_le_bytes(), u64::from(self.symbol) * 8)
+            .unwrap();
+    }
+
+    #[cfg(test)]
     pub fn publish_account(&mut self, equity: f64, position: f64, ts_ns: u64) {
+        self.write_account(equity, equity, position, 0.05, ts_ns);
+    }
+
+    #[cfg(feature = "research-replay")]
+    fn publish_account_with_margin(&mut self, equity: f64, position: f64, margin: f64, ts_ns: u64) {
+        let available = (equity - margin).max(0.0);
+        let usage = if equity > 0.0 {
+            (margin / equity).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.write_account(equity, available, position, usage, ts_ns);
+    }
+
+    fn write_account(
+        &mut self,
+        equity: f64,
+        available: f64,
+        position: f64,
+        margin_usage: f64,
+        ts_ns: u64,
+    ) {
         self.account_version += 2; // even = stable
         let mut stats = [0u8; 128];
         let f = |v: f64| v.to_le_bytes();
@@ -579,13 +729,13 @@ impl ShmFiles {
         stats[8..16].copy_from_slice(&f(equity)); // collateral
         stats[16..24].copy_from_slice(&f(equity)); // portfolio value
         stats[24..32].copy_from_slice(&f(1.0)); // leverage
-        stats[32..40].copy_from_slice(&f(equity)); // available balance
-        stats[40..48].copy_from_slice(&f(0.05)); // margin usage
-        stats[48..56].copy_from_slice(&f(equity * 10.0)); // buying power
+        stats[32..40].copy_from_slice(&f(available));
+        stats[40..48].copy_from_slice(&f(margin_usage));
+        stats[48..56].copy_from_slice(&f(available * 10.0)); // buying power
         stats[56..64].copy_from_slice(&ts_ns.to_le_bytes());
         stats[64..72].copy_from_slice(&f(position));
         stats[72..80].copy_from_slice(&ts_ns.to_le_bytes());
-        Self::write_at(&self.path("account"), 0, &stats);
+        self.account.write_all_at(&stats, 0).unwrap();
     }
 }
 
@@ -597,6 +747,7 @@ impl Drop for ShmFiles {
 
 /// Result of a replay, compared for determinism.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(test)]
 pub(super) struct Outcome {
     pub fills: Vec<(bool, i64, i64)>, // (is_ask, price in 1e-4, size in 1e-8)
     pub position: i64,
@@ -616,6 +767,7 @@ pub(super) struct Outcome {
     pub frames: usize,
 }
 
+#[cfg(test)]
 impl Outcome {
     /// A successful replay consumed every frame: no error, one cycle outcome
     /// and one state per input frame. Use for every success scenario; the
@@ -640,6 +792,7 @@ impl Outcome {
     }
 }
 
+#[cfg(test)]
 pub(super) fn wall_ns() -> u64 {
     wall_time_ns()
 }
@@ -650,6 +803,7 @@ pub(super) fn wall_ns() -> u64 {
 /// the strategy, `OrderTracker` and SHM timestamps then share one replay
 /// time domain that advances only via `Frame::advance_ms` and the strategy's
 /// own sleeps, so time-gated branches replay identically.
+#[cfg(test)]
 pub(super) async fn run(
     config: InventoryNeutralMMConfig,
     frames: &[Frame],
@@ -661,6 +815,7 @@ pub(super) async fn run(
 
 /// `run` with an optional telemetry sink on the strategy and a hook that
 /// sees the strategy itself after each cycle (e.g. to export snapshots).
+#[cfg(test)]
 pub(super) async fn run_with(
     config: InventoryNeutralMMConfig,
     frames: &[Frame],

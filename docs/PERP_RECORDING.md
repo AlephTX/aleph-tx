@@ -228,8 +228,14 @@ settings. Each minute price becomes an `equity_minute_close` only after the
 minute ends and the modeled publication delay elapses. The default delay is
 60 seconds. The separate reference age allows one minute between updates.
 Venue book and oracle limits still apply. Archived charts carry trade-minute
-labels, so the delay is a research assumption. Point-in-time quote archives
-can use the `external` reference path with their observed arrival times.
+labels, so the delay is a research assumption. When the recorder observed
+each bar as it appeared, set `reference.kind` to
+`observed_equity_minute_bars` and supply `underlying_id` and a `bars` array.
+Each bar carries a UTC minute-end `ends_at_ms`, its first receipt
+`available_at_ms`, and a decimal string `close`. The compiler exposes a bar
+from its recorded receipt and measures reference age from the minute end.
+Minute ends must increase and receipt times must be nondecreasing.
+Point-in-time quote archives can use the `external` reference path.
 [Nasdaq market data](https://www.nasdaq.com/market-activity)
 
 ## Research orders and funding
@@ -255,6 +261,27 @@ additional data. [Lighter SDK](https://github.com/elliottech/lighter-python),
 
 A capture folder is excluded from Git. Preserve the raw recording, coverage
 report, exact configuration and replay report together to reproduce a run.
+
+## Oasis research archive
+
+For a multi-venue campaign, keep public L2 updates and snapshots alongside
+the public trade tape. Preserve depth on both sides, sequence and transport
+events, and source and receipt timestamps. Count validated L2 bytes after
+sealing each shard. Coinbase spot prices provide a crypto reference and
+are excluded from execution and the execution-venue byte target.
+
+Archive venue oracle or mark context and the funding estimate with its
+next payment time. Keep a separate payment history with per-payment rate,
+exchange timestamp and first response receipt. For an endpoint without a
+publication timestamp, retain the request and receipt times and leave the
+publication time unknown. The compiler and funding study consume these
+observations only after they were available. Keep any reviewed payment
+valuation or witnessed settlement evidence separate from the rate history.
+
+Preserve first-seen independent equity minute prices, session and halt
+evidence, corporate actions, and the market terms used to size and price
+the simulated orders. The [Oasis replay results](PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12)
+document the research policies and the archived artifacts they consume.
 
 ## First recordings
 

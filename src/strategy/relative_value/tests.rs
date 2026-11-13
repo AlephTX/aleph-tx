@@ -24,6 +24,101 @@ fn first_plan(scenario: &PaperScenario) -> Decision<Plan> {
 }
 
 #[test]
+fn incentive_turnover_reserves_cycle_loss_and_counts_only_the_reviewed_leg() {
+    let mut scenario = equity();
+    let start = scenario.frames[0].now_ms;
+    let books = scenario.frames[0]
+        .legs
+        .each_ref()
+        .map(|leg| leg.book.clone());
+    for frame in &mut scenario.frames {
+        for (leg, book) in frame.legs.iter_mut().zip(&books) {
+            leg.book = book.clone();
+            leg.book.timestamp_ms = frame.now_ms;
+        }
+    }
+    let incentive = IncentiveTurnover {
+        eligible_leg: 1,
+        eligible_from_ms: start,
+        eligible_until_ms: start + 2_800,
+        max_cost_bps: d("6"),
+    };
+    let mode = |policy| PaperMode::Turnover {
+        max_turnover_quote: d("400"),
+        max_fees_quote: d("1"),
+        max_realized_loss_quote: Some(d("0.05")),
+        incentive: Some(policy),
+    };
+    scenario.pair.mode = mode(incentive);
+    let plan = first_plan(&scenario).unwrap();
+    assert!(plan.net_edge < Decimal::ZERO && plan.net_edge >= d("-0.05"));
+    assert!(plan.hedge.target_base < Decimal::ONE);
+    assert_eq!(plan.modeled_convergence, Decimal::ZERO);
+    let registry = VenueRegistry::default();
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(report.entries_submitted, 1);
+    assert_eq!(report.ioc_filled, 4);
+    assert_eq!(report.trades[0].exit_reason, ExitReason::TurnoverComplete);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    let activity = report.incentive_turnover.unwrap();
+    assert_eq!(activity.venue, "entropy");
+    assert_eq!(
+        activity.filled_turnover_quote,
+        report.market_costs[1].turnover_quote
+    );
+    assert!(activity.filled_turnover_quote < report.gross_turnover);
+    assert_eq!(
+        activity.realized_cost_bps,
+        Some(-report.realized_pnl / activity.filled_turnover_quote * BPS)
+    );
+
+    scenario.pair.mode = mode(IncentiveTurnover {
+        max_cost_bps: Decimal::ZERO,
+        ..incentive
+    });
+    assert!(matches!(
+        first_plan(&scenario),
+        Err(Rejection::TurnoverCost)
+    ));
+    scenario.pair.mode = mode(IncentiveTurnover {
+        eligible_until_ms: start + 2_000,
+        ..incentive
+    });
+    assert!(matches!(
+        first_plan(&scenario),
+        Err(Rejection::TurnoverEligibility)
+    ));
+    scenario.pair.mode = mode(IncentiveTurnover {
+        eligible_leg: 0,
+        ..incentive
+    });
+    assert!(run_paper(&scenario, &registry).is_err());
+}
+
+#[test]
+fn reversion_exit_profit_floor_still_allows_the_holding_time_exit() {
+    let mut scenario = equity();
+    scenario.pair.basis.min_exit_profit_bps = Some(d("50"));
+    let hold = first_plan(&scenario).unwrap().hold_until_ms;
+    let last = scenario.frames.last().unwrap().clone();
+    for now in [hold, hold + 100, hold + 200, hold + 300] {
+        let mut frame = last.clone();
+        frame.now_ms = now;
+        frame.reference.timestamp_ms = now;
+        for leg in &mut frame.legs {
+            leg.book.timestamp_ms = now;
+            leg.oracle.timestamp_ms = now;
+        }
+        scenario.frames.push(frame);
+    }
+    let report = run_paper(&scenario, &VenueRegistry::default()).unwrap();
+    assert!(report.reversion_exits_below_floor > 0);
+    assert_eq!(report.paired_entries, 1);
+    assert_eq!(report.trades[0].exit_reason, ExitReason::HoldingTime);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+}
+
+#[test]
 fn crypto_carry_uses_explicit_funding_and_settles_four_fills() {
     let scenario = crypto();
     let plan = first_plan(&scenario).unwrap();
@@ -98,6 +193,8 @@ fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
         scenario.pair.mode = PaperMode::Turnover {
             max_turnover_quote,
             max_fees_quote,
+            max_realized_loss_quote: None,
+            incentive: None,
         };
         let report = run_paper(&scenario, &registry).unwrap();
         assert_eq!(first_plan(&scenario).unwrap().hedge.target_base, d("0.038"));
@@ -111,6 +208,8 @@ fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
         scenario.pair.mode = PaperMode::Turnover {
             max_turnover_quote,
             max_fees_quote,
+            max_realized_loss_quote: None,
+            incentive: None,
         };
         assert!(matches!(
             first_plan(&scenario),
@@ -126,6 +225,8 @@ fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
     scenario.pair.mode = PaperMode::Turnover {
         max_turnover_quote: planned.0,
         max_fees_quote: planned.1,
+        max_realized_loss_quote: None,
+        incentive: None,
     };
     // Repeat the opportunity in the following funding interval. The first
     // cycle spends the whole budget and the second must not reuse it.
@@ -148,6 +249,7 @@ fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
             }
         }
     }
+    let first_len = scenario.frames.len();
     scenario.frames.extend(second);
     let report = run_paper(&scenario, &registry).unwrap();
     assert_eq!(report.entries_submitted, 1);
@@ -155,6 +257,24 @@ fn turnover_budget_sizes_to_common_lots_and_reserves_a_complete_cycle() {
     assert_eq!(report.ioc_filled, 4);
     assert_eq!(report.realized_pnl, d("0.0232"));
     assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    scenario.pair.mode = PaperMode::Turnover {
+        max_turnover_quote: d("1000"),
+        max_fees_quote: d("10"),
+        max_realized_loss_quote: Some(d("0.01")),
+        incentive: None,
+    };
+    // Forecast remains favorable, but the first cycle's actual funding
+    // reverses. Its exits must complete before the new entry is blocked.
+    for frame in &mut scenario.frames[..first_len] {
+        for payment in frame.legs.iter_mut().flat_map(|leg| &mut leg.settled) {
+            payment.rate = -payment.rate;
+        }
+    }
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(report.entries_submitted, 1);
+    assert_eq!(report.ioc_filled, 4);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    assert!(report.entry_diagnostics.blocked_by_gate[&EntryGate::TurnoverLossLimit] > 0);
 }
 
 #[test]
@@ -561,6 +681,41 @@ fn primary_can_fill_when_hedge_book_is_unavailable_and_exposure_is_reported() {
     assert_eq!(report.max_unhedged_base, d("0.04"));
     assert_eq!(report.max_unhedged_ms, 800);
     assert_eq!(report.realized_pnl, Decimal::ZERO);
+}
+
+#[test]
+fn single_leg_recovery_uses_a_later_book_and_stops_new_entries() {
+    let mut scenario = crypto();
+    scenario.pair.recover_single_leg = true;
+    scenario.frames.truncate(7);
+    for frame in &mut scenario.frames[4..] {
+        frame.legs[1].book.tradable = false;
+    }
+    let deadline_frame = scenario.frames.last().unwrap().clone();
+    let mut stale = deadline_frame.clone();
+    stale.now_ms += 100;
+    scenario.frames.push(stale);
+    let registry = VenueRegistry::default();
+    let pending = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(pending.single_leg_recovery_started, 1);
+    assert_eq!(pending.single_leg_recovery_flat, 0);
+    assert_eq!(pending.open_positions_base, [d("0.04"), Decimal::ZERO]);
+
+    for offset in [200, 300] {
+        let mut next = deadline_frame.clone();
+        next.now_ms += offset;
+        next.legs[0].book.timestamp_ms = next.now_ms;
+        scenario.frames.push(next);
+    }
+    let report = run_paper(&scenario, &registry).unwrap();
+    assert_eq!(report.entries_submitted, 1);
+    assert_eq!(report.paired_entries, 0);
+    assert_eq!(report.single_leg_recovery_flat, 1);
+    assert_eq!(report.open_positions_base, [Decimal::ZERO; 2]);
+    assert_eq!(report.closing_execution[0].ioc_filled, 1);
+    assert_eq!(report.max_unhedged_ms, 1000);
+    assert_eq!(report.realized_pnl, report.single_leg_recovery_pnl);
+    assert!(report.realized_pnl < Decimal::ZERO);
 }
 
 #[test]

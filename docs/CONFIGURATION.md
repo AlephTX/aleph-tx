@@ -33,6 +33,32 @@ Configure `max_spread_bps` to cover the maker round trip, configured hedge
 cost and profit floor. The launcher validates this relationship when
 hedging is enabled. [Trading runbook](LIVE_TRADING.md#configure-and-validate).
 
+The optional `[inventory_neutral_mm.markout_reserve]` table widens the
+inventory-adding side using its own recent fill markouts against fresh
+external fair value. `max_widen_bps` caps the reserve on each side and
+`max_spread_bps` caps the model's combined spread. Set `close_cost_bps` to
+the modeled exit fee and impact. The gross markout target includes this
+cost, the maker fee and half the round-trip profit floor. The estimate
+requires eight marked fills per side and expires after
+`max_sample_age_ms`. Validate the policy at the account tier's actual
+placement, cancellation and IOC latencies in the public-data replay.
+[Limit order placement and latency](https://arxiv.org/abs/1610.00261) ·
+[Oasis execution sensitivity](PERP_RELATIVE_VALUE.md#market-selection-and-execution-sensitivity-2026-11-13)
+
+The optional `[inventory_neutral_mm.order_flow_reserve]` table uses
+changes in the native Hyperliquid best prices and displayed sizes.
+`half_life_ms` sets the decay and `max_widen_bps` bounds the price
+reserve on the side exposed to the pressure. The estimate advances
+once per fresh publication and resets on stale books or a clock
+regression. The quote loop takes the larger of the order-flow and
+fill-markout reserves on each side and preserves the spread cap and
+the quote toward flat.
+Tune `min_cycle_interval_ms` against eligible fills, net PnL and
+inventory at the modeled venue delays.
+[Order flow imbalance](https://doi.org/10.1093/jjfinec/nbt003) ·
+[Cross-venue crypto price discovery](https://arxiv.org/abs/2108.09750) ·
+[Oasis cadence comparison](PERP_RELATIVE_VALUE.md#quote-cadence-and-hedge-recovery-2026-11-13)
+
 ## Credentials and network
 
 Keep funded credentials in the local environment file or process
@@ -59,7 +85,9 @@ markets with a reviewed common underlying, payoff and settlement, plus
 per-leg precision, minimums, fees and funding terms. Use `pair_hedge` for
 unbudgeted strategy replay within the configured risk limits or `turnover`
 with quote-denominated activity and fee caps. Both use the same signal
-and exposure checks. [Pair sizing and replay](PERP_RELATIVE_VALUE.md#replay).
+and exposure checks by default. An explicit incentive policy can study
+the cost of activity on a reviewed unissued-token venue within a dated
+eligibility window. [Pair sizing and replay](PERP_RELATIVE_VALUE.md#replay).
 
 The capture compiler adds transport and timing settings, archived venue
 context, independent reference prices and session evidence. Enable paper

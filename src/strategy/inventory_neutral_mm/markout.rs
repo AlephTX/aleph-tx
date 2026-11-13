@@ -49,6 +49,31 @@ struct Pending {
     print: FillPrint,
 }
 
+#[derive(Clone, Copy, Default)]
+struct FillMean {
+    weighted_bps: f64,
+    weight: f64,
+    samples: u32,
+}
+
+impl FillMean {
+    fn record(&mut self, bps: f64, alpha: f64) {
+        self.weighted_bps += alpha * (bps - self.weighted_bps);
+        self.weight += alpha * (1.0 - self.weight);
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn average(self) -> Option<f64> {
+        (self.samples >= MIN_SAMPLES && self.weight > 0.0).then(|| self.weighted_bps / self.weight)
+    }
+}
+
+struct SideSamples {
+    means: [FillMean; 2],
+    updated_at: [Option<Instant>; 2],
+    max_age: Duration,
+}
+
 pub(super) struct MarkoutTracker {
     horizon: Duration,
     tolerance: Duration,
@@ -56,10 +81,8 @@ pub(super) struct MarkoutTracker {
     threshold_bps: f64,
     pending: [Option<Pending>; PENDING],
     last_sequence: u64,
-    /// Raw EWMA accumulator; divided by `weight` to remove the zero-start bias.
-    ewma_bps: f64,
-    weight: f64,
-    samples: u32,
+    mean: FillMean,
+    sides: Option<SideSamples>,
     stats: MarkoutStats,
 }
 
@@ -77,11 +100,19 @@ impl MarkoutTracker {
             threshold_bps,
             pending: [None; PENDING],
             last_sequence: 0,
-            ewma_bps: 0.0,
-            weight: 0.0,
-            samples: 0,
+            mean: FillMean::default(),
+            sides: None,
             stats: MarkoutStats::default(),
         }
+    }
+
+    pub(super) fn with_side_samples(mut self, max_age: Option<Duration>) -> Self {
+        self.sides = max_age.map(|max_age| SideSamples {
+            means: [FillMean::default(); 2],
+            updated_at: [None; 2],
+            max_age,
+        });
+        self
     }
 
     /// Pull new fills from the tracker and mark those whose horizon has come.
@@ -124,6 +155,16 @@ impl MarkoutTracker {
             match markout_bps(entry.print, fair) {
                 Some(bps) => {
                     self.record(bps);
+                    if let Some(sides) = &mut self.sides {
+                        let i = usize::from(entry.print.side == OrderSide::Sell);
+                        if sides.updated_at[i]
+                            .is_some_and(|at| now.saturating_duration_since(at) > sides.max_age)
+                        {
+                            sides.means[i] = FillMean::default();
+                        }
+                        sides.means[i].record(bps, self.alpha);
+                        sides.updated_at[i] = Some(now);
+                    }
                     self.stats.marked += 1;
                     self.stats.last_delay_ms = late.as_secs_f64() * 1000.0;
                 }
@@ -164,14 +205,31 @@ impl MarkoutTracker {
     }
 
     fn record(&mut self, bps: f64) {
-        self.ewma_bps += self.alpha * (bps - self.ewma_bps);
-        self.weight += self.alpha * (1.0 - self.weight);
-        self.samples = self.samples.saturating_add(1);
+        self.mean.record(bps, self.alpha);
     }
 
     /// Bias-corrected average markout once enough fills have been marked.
     pub(super) fn ewma_bps(&self) -> Option<f64> {
-        (self.samples >= MIN_SAMPLES && self.weight > 0.0).then(|| self.ewma_bps / self.weight)
+        self.mean.average()
+    }
+
+    pub(super) fn side_reserve_bps(
+        &self,
+        now: Instant,
+        gross_target_bps: f64,
+        max_widen_bps: f64,
+    ) -> [f64; 2] {
+        let Some(sides) = &self.sides else {
+            return [0.0; 2];
+        };
+        [0, 1].map(|i| {
+            sides.updated_at[i]
+                .filter(|at| now.saturating_duration_since(*at) <= sides.max_age)
+                .and_then(|_| sides.means[i].average())
+                .map_or(0.0, |bps| {
+                    (gross_target_bps - bps).clamp(0.0, max_widen_bps)
+                })
+        })
     }
 
     /// Spread multiplier in [1, MAX_MARKOUT_SPREAD_MULT]: +10% per bp of
@@ -259,6 +317,27 @@ mod tests {
             toxic.record(-100.0);
         }
         assert_eq!(toxic.spread_multiplier(), MAX_MARKOUT_SPREAD_MULT);
+    }
+
+    #[test]
+    fn directional_reserve_requires_fresh_samples_for_each_side() {
+        let start = Instant::now();
+        let mut marks =
+            MarkoutTracker::new(5.0, 20.0, -1.0).with_side_samples(Some(Duration::from_secs(20)));
+        for sequence in 1..=u64::from(MIN_SAMPLES) {
+            marks.enqueue(print(sequence, OrderSide::Buy, 100.0, start));
+            marks.enqueue(print(sequence + 20, OrderSide::Sell, 100.0, start));
+        }
+        let orders = OrderTracker::new();
+        let due = start + Duration::from_secs(5);
+        marks.update(&orders, 100.02, due);
+        assert_eq!(marks.side_reserve_bps(due, 1.0, 2.0), [0.0, 2.0]);
+        let expired = due + Duration::from_secs(21);
+        assert_eq!(marks.side_reserve_bps(expired, 1.0, 2.0), [0.0; 2]);
+        marks.enqueue(print(60, OrderSide::Sell, 100.0, expired));
+        let next = expired + Duration::from_secs(5);
+        marks.update(&orders, 100.02, next);
+        assert_eq!(marks.side_reserve_bps(next, 1.0, 2.0), [0.0; 2]);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 
 mod paper;
 pub use paper::{
-    ExitReason, PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperMarketCosts,
-    PaperReport, PaperScenario, PaperTrade, run_paper, run_paper_frames,
+    ExitReason, IncentiveTurnoverReport, MakerFirstConfig, MakerFirstEvent, MakerFirstReport,
+    PaperEntryDiagnostics, PaperIocGate, PaperLegExecution, PaperMarketCosts, PaperReport,
+    PaperScenario, PaperTrade, run_maker_first, run_paper, run_paper_frames,
 };
 
 use crate::{
@@ -44,13 +45,44 @@ pub enum Strategy {
 pub enum PaperMode {
     #[default]
     PairHedge,
-    /// Apply session budgets to the same profitable entry signals.
+    /// Bound round-trip costs for profit-seeking or incentive turnover.
     Turnover {
         #[serde(with = "rust_decimal::serde::str")]
         max_turnover_quote: Decimal,
         #[serde(with = "rust_decimal::serde::str")]
         max_fees_quote: Decimal,
+        /// Stop adding risk after a flat, completed cycle breaches this loss.
+        #[serde(
+            default,
+            with = "rust_decimal::serde::str_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        max_realized_loss_quote: Option<Decimal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incentive: Option<IncentiveTurnover>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncentiveTurnover {
+    /// Index in `legs` of the reviewed, unissued-token venue.
+    pub eligible_leg: usize,
+    pub eligible_from_ms: u64,
+    pub eligible_until_ms: u64,
+    /// Maximum cash cost per eligible venue turnover, including the hedge.
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_cost_bps: Decimal,
+}
+
+impl IncentiveTurnover {
+    fn active_at(self, now_ms: u64) -> bool {
+        (self.eligible_from_ms..self.eligible_until_ms).contains(&now_ms)
+    }
+
+    fn within_cost(self, net: Decimal, eligible_turnover: Decimal) -> bool {
+        net * BPS >= -self.max_cost_bps * eligible_turnover
+    }
 }
 
 impl PaperMode {
@@ -62,10 +94,13 @@ impl PaperMode {
         self,
         used_turnover: Decimal,
         used_fees: Decimal,
+        cash: Decimal,
     ) -> Option<TurnoverBudget> {
         let Self::Turnover {
             max_turnover_quote,
             max_fees_quote,
+            max_realized_loss_quote,
+            incentive,
         } = self
         else {
             return None;
@@ -73,7 +108,21 @@ impl PaperMode {
         Some(TurnoverBudget {
             turnover: (max_turnover_quote - used_turnover).max(Decimal::ZERO),
             fees: (max_fees_quote - used_fees).max(Decimal::ZERO),
+            loss: incentive
+                .and(max_realized_loss_quote)
+                .map(|limit| (limit + cash).max(Decimal::ZERO)),
         })
+    }
+
+    fn realized_loss_exhausted(self, net_cash: Decimal) -> bool {
+        matches!(self, Self::Turnover { max_realized_loss_quote: Some(limit), .. } if net_cash <= -limit)
+    }
+
+    fn incentive(self) -> Option<IncentiveTurnover> {
+        match self {
+            Self::Turnover { incentive, .. } => incentive,
+            Self::PairHedge => None,
+        }
     }
 }
 
@@ -81,10 +130,11 @@ impl PaperMode {
 struct TurnoverBudget {
     turnover: Decimal,
     fees: Decimal,
+    loss: Option<Decimal>,
 }
 
 impl TurnoverBudget {
-    fn cap(self, size: Decimal, economics: &Economics) -> Decimal {
+    fn cap(self, size: Decimal, economics: &Economics, net: Decimal) -> Decimal {
         let turnover = economics.turnover_per_base();
         let mut cap = size;
         if turnover * size > self.turnover {
@@ -92,6 +142,11 @@ impl TurnoverBudget {
         }
         if economics.fees * size > self.fees {
             cap = cap.min(self.fees / economics.fees);
+        }
+        if let Some(loss) = self.loss
+            && -net * size > loss
+        {
+            cap = cap.min(loss / -net);
         }
         cap
     }
@@ -134,6 +189,10 @@ pub struct PairConfig {
     /// For funding carry, consider exiting after each reachable settlement.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optimize_funding_horizon: bool,
+    /// Simulate a protected close of a confirmed single-leg residual after
+    /// all orders in the failed pair execution have become terminal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recover_single_leg: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +288,12 @@ pub struct BasisConfig {
     pub stop_z: f64,
     /// Fraction of the distance to the trailing mean credited on entry.
     pub reversion_fraction: f64,
+    /// Minimum cycle profit at protective close limits for a voluntary exit.
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub min_exit_profit_bps: Option<Decimal>,
 }
 
 impl Default for BasisConfig {
@@ -244,6 +309,7 @@ impl Default for BasisConfig {
             exit_z: 0.5,
             stop_z: 5.0,
             reversion_fraction: 0.5,
+            min_exit_profit_bps: None,
         }
     }
 }
@@ -450,8 +516,14 @@ pub enum Rejection {
     Capacity,
     #[error("conservative net edge is below threshold")]
     Edge,
-    #[error("no profitable common lot fits the remaining turnover and fee budget")]
+    #[error("no common lot fits the remaining turnover, fee and loss budget")]
     TurnoverBudget,
+    #[error("completed turnover cycles exhausted the realized loss budget")]
+    TurnoverLossLimit,
+    #[error("modeled or realized cost exceeds the eligible-turnover limit")]
+    TurnoverCost,
+    #[error("cycle falls outside the reviewed incentive eligibility period")]
+    TurnoverEligibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -481,6 +553,9 @@ pub enum EntryGate {
     LatencyWindow,
     FundingGuard,
     TurnoverBudget,
+    TurnoverLossLimit,
+    TurnoverCost,
+    TurnoverEligibility,
 }
 
 impl EntryGate {
@@ -505,6 +580,9 @@ impl EntryGate {
             Self::FundingForecast | Self::FundingGuard => Rejection::Funding,
             Self::Capacity => Rejection::Capacity,
             Self::TurnoverBudget => Rejection::TurnoverBudget,
+            Self::TurnoverLossLimit => Rejection::TurnoverLossLimit,
+            Self::TurnoverCost => Rejection::TurnoverCost,
+            Self::TurnoverEligibility => Rejection::TurnoverEligibility,
             Self::FundingNoCredit | Self::NetEdge => Rejection::Edge,
         }
     }
@@ -567,6 +645,11 @@ pub struct Plan {
     pub modeled_turnover_quote: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub modeled_fees_quote: Decimal,
+    #[serde(
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub modeled_eligible_turnover_quote: Option<Decimal>,
     pub hold_until_ms: u64,
     pub unwind_until_ms: u64,
     pub hedge: HedgePlan,
@@ -658,14 +741,31 @@ impl PairConfig {
         if let PaperMode::Turnover {
             max_turnover_quote,
             max_fees_quote,
+            max_realized_loss_quote,
+            incentive,
         } = self.mode
         {
             ensure!(
                 max_turnover_quote > Decimal::ZERO
                     && bounded(max_turnover_quote)
-                    && bounded(max_fees_quote),
-                "invalid turnover or fee budget"
+                    && bounded(max_fees_quote)
+                    && max_realized_loss_quote
+                        .is_none_or(|loss| loss > Decimal::ZERO && bounded(loss)),
+                "invalid turnover, fee, or realized loss budget"
             );
+            if let Some(policy) = incentive {
+                ensure!(
+                    self.strategy == Strategy::BasisReversion
+                        && max_realized_loss_quote.is_some()
+                        && policy.eligible_from_ms > 0
+                        && policy.eligible_until_ms > policy.eligible_from_ms
+                        && (Decimal::ZERO..=BPS).contains(&policy.max_cost_bps)
+                        && self.legs.get(policy.eligible_leg).is_some_and(|leg| {
+                            !matches!(leg.venue.as_str(), "lighter" | "hyperliquid")
+                        }),
+                    "incentive turnover requires a reviewed unissued-token venue, eligibility period and loss budget"
+                );
+            }
         }
         ensure!(
             self.planner.max_base_quantity <= 1e9
@@ -705,7 +805,10 @@ impl PairConfig {
                 && finite_between(basis.stop_z, 0.01, 20.0)
                 && basis.exit_z < basis.entry_z
                 && basis.entry_z < basis.stop_z
-                && finite_between(basis.reversion_fraction, 0.01, 1.0),
+                && finite_between(basis.reversion_fraction, 0.01, 1.0)
+                && basis
+                    .min_exit_profit_bps
+                    .is_none_or(|floor| (Decimal::ZERO..=BPS).contains(&floor)),
             "invalid basis estimator policy"
         );
         for leg in &self.legs {
@@ -1116,10 +1219,11 @@ impl RelativeValue {
     /// so the next trade's baseline is fit on observations available then.
     pub fn observe(&mut self, frame: &Frame) -> Result<Decision<Plan>> {
         let options = EntryOptions {
-            turnover_budget: self
-                .config
-                .mode
-                .remaining_budget(Decimal::ZERO, Decimal::ZERO),
+            turnover_budget: self.config.mode.remaining_budget(
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            ),
             ..Default::default()
         };
         Ok(self
@@ -1199,9 +1303,20 @@ impl RelativeValue {
         mut options: EntryOptions<'_>,
     ) -> EntryDecision<Plan> {
         let now = frame.now_ms;
-        let max_hold = now
-            .checked_add(self.config.planner.funding_horizon_ms)
-            .ok_or(EntryGate::Session)?;
+        let mut horizon = self.config.planner.funding_horizon_ms;
+        if self.config.mode.incentive().is_some() {
+            // An incentive cycle unwinds as soon as it is paired. Reserve
+            // one more execution window before the hard close trigger.
+            horizon = horizon.min(self.config.execution_window_ms.saturating_mul(2));
+        }
+        let max_hold = now.checked_add(horizon).ok_or(EntryGate::Session)?;
+        if let Some(policy) = self.config.mode.incentive()
+            && (!policy.active_at(now)
+                || max_hold.saturating_add(self.config.execution_window_ms)
+                    > policy.eligible_until_ms)
+        {
+            return Err(EntryGate::TurnoverEligibility.into());
+        }
         let mut depth = None;
         if self.config.strategy != Strategy::FundingCarry || !self.config.optimize_funding_horizon {
             return self.plan_for_hold(frame, signal, max_hold, cutoff, &mut depth, &mut options);
@@ -1327,8 +1442,10 @@ impl RelativeValue {
         if signal.z.abs() >= bps.stop_z {
             return Err(EntryGate::BasisBeyondStop.into());
         }
+        let incentive = self.config.mode.incentive();
         let mean_reversion = match self.config.strategy {
             Strategy::FundingCarry => Decimal::ZERO,
+            Strategy::BasisReversion if incentive.is_some() => Decimal::ZERO,
             Strategy::BasisReversion if signal.z.abs() >= bps.entry_z => {
                 dec((signal.observed_bps - signal.mean_bps).abs() * bps.reversion_fraction)
                     .map_err(|_| EntryGate::NetEdge)?
@@ -1358,8 +1475,13 @@ impl RelativeValue {
         } else {
             EntryGate::Capacity
         };
+        let rank = |plan: &Plan| match plan.modeled_eligible_turnover_quote {
+            Some(turnover) => (plan.net_edge / turnover, turnover),
+            None => (plan.net_edge, Decimal::ZERO),
+        };
         for buy_leg in 0..2 {
             if self.config.strategy == Strategy::BasisReversion
+                && incentive.is_none()
                 && (buy_leg == 0) != (signal.z > 0.0)
             {
                 continue;
@@ -1383,7 +1505,7 @@ impl RelativeValue {
                 Ok(plan)
                     if best
                         .as_ref()
-                        .is_none_or(|current| plan.net_edge > current.net_edge) =>
+                        .is_none_or(|current| rank(&plan) > rank(current)) =>
                 {
                     best = Some(plan);
                 }
@@ -1392,6 +1514,7 @@ impl RelativeValue {
                     let gate = match reason {
                         Rejection::Edge => EntryGate::NetEdge,
                         Rejection::TurnoverBudget => EntryGate::TurnoverBudget,
+                        Rejection::TurnoverCost => EntryGate::TurnoverCost,
                         _ => EntryGate::Capacity,
                     };
                     rejected = rejected.max(gate);
@@ -1486,7 +1609,7 @@ impl RelativeValue {
                 .flat_map(|curve| curve.bands().iter().map(|b| b.base))
                 .filter(|size| *size < cap),
         );
-        let mut best: Option<(Decimal, Economics)> = None;
+        let mut best: Option<((Decimal, Decimal), Decimal, Economics)> = None;
         let mut sized = false;
         let mut budget_blocked = false;
         let mids = frame.legs.each_ref().map(|leg| leg.book.mid());
@@ -1509,6 +1632,11 @@ impl RelativeValue {
             })
         };
         let net_bps = |net| net / frame.reference.price * BPS;
+        let incentive = self.config.mode.incentive();
+        let acceptable = |net, economics: &Economics| match incentive {
+            Some(policy) => policy.within_cost(net, economics.leg_turnover(policy.eligible_leg)),
+            None => net > Decimal::ZERO && net_bps(net) >= self.rules.min_edge,
+        };
         for candidate in candidates {
             let mut qty = floor_step(candidate, self.step).map_err(|_| Rejection::Capacity)?;
             if qty <= Decimal::ZERO {
@@ -1534,11 +1662,11 @@ impl RelativeValue {
                 let edge = net_bps(net);
                 *best = Some(best.map_or(edge, |previous| previous.max(edge)));
             }
-            if net <= Decimal::ZERO || net_bps(net) < self.rules.min_edge {
+            if !acceptable(net, &econ) {
                 continue;
             }
             if let Some(limit) = options.turnover_budget {
-                let affordable = limit.cap(qty, &econ);
+                let affordable = limit.cap(qty, &econ, net);
                 if affordable < qty {
                     qty = floor_step(affordable, self.step).map_err(|_| Rejection::Capacity)?;
                     if qty <= Decimal::ZERO {
@@ -1546,27 +1674,33 @@ impl RelativeValue {
                         continue;
                     }
                     econ = self.economics(depth, score, qty, mids, days)?;
+                    net = econ.net(score);
                     // Repricing can cross a depth band. Check its exact costs
                     // again; the smaller band's boundary is also enumerated.
-                    if !fits(qty, &econ) || limit.cap(qty, &econ) < qty {
+                    if !fits(qty, &econ) || limit.cap(qty, &econ, net) < qty {
                         budget_blocked = true;
                         continue;
                     }
-                    net = econ.net(score);
-                    if net <= Decimal::ZERO || net_bps(net) < self.rules.min_edge {
+                    if !acceptable(net, &econ) {
                         continue;
                     }
                 }
             }
-            if best
-                .as_ref()
-                .is_none_or(|(previous, old)| net * qty > old.net(score) * previous)
-            {
-                best = Some((qty, econ));
+            let rank = match incentive {
+                Some(policy) => {
+                    let eligible = econ.leg_turnover(policy.eligible_leg);
+                    (net / eligible, eligible * qty)
+                }
+                None => (net * qty, Decimal::ZERO),
+            };
+            if best.as_ref().is_none_or(|(previous, ..)| rank > *previous) {
+                best = Some((rank, qty, econ));
             }
         }
-        let (qty, econ) = best.ok_or(if budget_blocked {
+        let (_, qty, econ) = best.ok_or(if budget_blocked {
             Rejection::TurnoverBudget
+        } else if sized && incentive.is_some() {
+            Rejection::TurnoverCost
         } else if sized {
             Rejection::Edge
         } else {
@@ -1598,6 +1732,8 @@ impl RelativeValue {
             net_edge_bps: net / frame.reference.price * BPS,
             modeled_turnover_quote: econ.turnover_per_base() * qty,
             modeled_fees_quote: econ.fees * qty,
+            modeled_eligible_turnover_quote: incentive
+                .map(|policy| econ.leg_turnover(policy.eligible_leg) * qty),
             hold_until_ms: score.window[1],
             unwind_until_ms: score.window[2],
             hedge,
@@ -1700,6 +1836,10 @@ struct Economics {
 impl Economics {
     fn turnover_per_base(&self) -> Decimal {
         self.entry_limits.iter().chain(&self.exit_limits).sum()
+    }
+
+    fn leg_turnover(&self, leg: usize) -> Decimal {
+        self.entry_limits[leg] + self.exit_limits[leg]
     }
 
     fn net(&self, score: Score) -> Decimal {

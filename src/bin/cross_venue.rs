@@ -10,7 +10,8 @@ use aleph_tx::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
     strategy::relative_value::{
-        Frame as PerpFrame, PairConfig, PaperReport, PaperScenario, run_paper, run_paper_frames,
+        Frame as PerpFrame, MakerFirstConfig, MakerFirstEvent, PairConfig, PaperReport,
+        PaperScenario, run_maker_first, run_paper, run_paper_frames,
     },
     venues::VenueRegistry,
 };
@@ -360,6 +361,19 @@ async fn main() -> Result<()> {
             print(&report)?;
             std::process::exit(report.status.exit_code());
         }
+        [command, config, file] if command == "maker-first-replay" => {
+            let config: MakerFirstConfig = read_replay(config)?;
+            let mut reader = BufReader::new(File::open(file)?);
+            let mut bytes = Vec::new();
+            let mut line = 0;
+            let events = std::iter::from_fn(|| {
+                line += 1;
+                read_record::<MakerFirstEvent>(&mut reader, &mut bytes)
+                    .with_context(|| format!("Invalid maker-first event on line {line}"))
+                    .transpose()
+            });
+            print(&run_maker_first(&config, events, &registry)?)
+        }
         [command, file] if command == "replay" => {
             let replay: Replay = read_replay(file)?;
             replay.config.validate()?;
@@ -503,7 +517,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }

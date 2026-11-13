@@ -137,6 +137,10 @@ pub enum ReferenceFeed {
         publication_delay_ms: u64,
         bars: Vec<EquityMinuteBar>,
     },
+    ObservedEquityMinuteBars {
+        underlying_id: String,
+        bars: Vec<ObservedEquityMinuteBar>,
+    },
     Missing,
 }
 
@@ -144,6 +148,15 @@ pub enum ReferenceFeed {
 #[serde(deny_unknown_fields)]
 pub struct EquityMinuteBar {
     pub ends_at_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub close: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedEquityMinuteBar {
+    pub ends_at_ms: u64,
+    pub available_at_ms: u64,
     #[serde(with = "rust_decimal::serde::str")]
     pub close: Decimal,
 }
@@ -386,12 +399,33 @@ impl CaptureConfig {
                         && bar.close > Decimal::ZERO),
                 "invalid equity minute reference, underlying or publication policy"
             ),
+            ReferenceFeed::ObservedEquityMinuteBars {
+                underlying_id,
+                bars,
+            } => ensure!(
+                self.pair.asset_class == AssetClass::Equity
+                    && *underlying_id == self.pair.legs[0].underlying_id
+                    && self.pair.equity_minute_reference_max_age_ms.is_some()
+                    && !bars.is_empty()
+                    && bars.windows(2).all(|w| {
+                        w[0].ends_at_ms < w[1].ends_at_ms
+                            && w[0].available_at_ms <= w[1].available_at_ms
+                    })
+                    && bars.iter().all(|bar| {
+                        bar.ends_at_ms >= EQUITY_MINUTE_MS
+                            && bar.ends_at_ms.is_multiple_of(EQUITY_MINUTE_MS)
+                            && bar.ends_at_ms <= bar.available_at_ms
+                            && bar.close > Decimal::ZERO
+                    }),
+                "invalid observed equity minute reference or availability order"
+            ),
             ReferenceFeed::Missing => {}
         }
         if self.paper_entries && self.pair.asset_class == AssetClass::Equity {
             let has_reference = match &self.reference {
                 ReferenceFeed::External { observations } => !observations.is_empty(),
-                ReferenceFeed::EquityMinuteBars { .. } => true,
+                ReferenceFeed::EquityMinuteBars { .. }
+                | ReferenceFeed::ObservedEquityMinuteBars { .. } => true,
                 _ => false,
             };
             ensure!(
@@ -553,6 +587,14 @@ impl<'a> Compiler<'a> {
                         mode: OracleMode::EquityMinuteClose,
                     })
             }
+            ReferenceFeed::ObservedEquityMinuteBars { bars, .. } => bars
+                .get(..bars.partition_point(|bar| bar.available_at_ms <= now))
+                .and_then(|slice| slice.last())
+                .map(|bar| Oracle {
+                    price: bar.close,
+                    timestamp_ms: bar.ends_at_ms,
+                    mode: OracleMode::EquityMinuteClose,
+                }),
             ReferenceFeed::Missing => None,
         }
         .unwrap_or_else(missing_oracle);

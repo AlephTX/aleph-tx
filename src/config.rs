@@ -389,6 +389,27 @@ pub struct InventoryNeutralMMConfig {
     /// Average markout (bps) tolerated before widening; negative = adverse.
     #[serde(default = "default_markout_threshold_bps")]
     pub markout_threshold_bps: f64, // default: -1
+    /// Directional markout reserve on inventory-adding quotes.
+    #[serde(default)]
+    pub markout_reserve: Option<MarkoutReserveConfig>,
+    /// Reserve for short-horizon pressure in the external Hyperliquid book.
+    #[serde(default)]
+    pub order_flow_reserve: Option<OrderFlowReserveConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkoutReserveConfig {
+    pub max_widen_bps: f64,
+    pub close_cost_bps: f64,
+    pub max_sample_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderFlowReserveConfig {
+    pub half_life_ms: u64,
+    pub max_widen_bps: f64,
 }
 
 fn positive(name: &str, values: &[f64]) -> anyhow::Result<()> {
@@ -514,6 +535,23 @@ impl InventoryNeutralMMConfig {
             self.markout_threshold_bps.is_finite(),
             "{name}: markout_threshold_bps must be finite"
         );
+        if let Some(reserve) = self.markout_reserve {
+            anyhow::ensure!(
+                reserve.max_widen_bps > 0.0
+                    && reserve.max_widen_bps <= self.max_spread_bps
+                    && (0.0..=10_000.0).contains(&reserve.close_cost_bps)
+                    && reserve.max_sample_age_ms > 0,
+                "{name}: invalid directional markout reserve"
+            );
+        }
+        if let Some(reserve) = self.order_flow_reserve {
+            anyhow::ensure!(
+                reserve.half_life_ms > 0
+                    && reserve.max_widen_bps > 0.0
+                    && reserve.max_widen_bps <= self.max_spread_bps,
+                "{name}: invalid order flow reserve"
+            );
+        }
         anyhow::ensure!(
             self.min_portfolio_scale <= self.max_portfolio_scale,
             "{name}: portfolio scale bounds reversed"
@@ -638,6 +676,8 @@ impl Default for InventoryNeutralMMConfig {
             markout_horizon_secs: default_markout_horizon_secs(),
             markout_halflife_fills: default_markout_halflife_fills(),
             markout_threshold_bps: default_markout_threshold_bps(),
+            markout_reserve: None,
+            order_flow_reserve: None,
         }
     }
 }

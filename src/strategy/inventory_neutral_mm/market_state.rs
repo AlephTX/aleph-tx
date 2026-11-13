@@ -25,6 +25,85 @@ pub(super) fn is_stale_bbo(timestamp_ns: u64, now_ns: u64, threshold_ms: u64) ->
     timestamp_ns == 0 || timestamp_ns > now_ns || data_age_ms(timestamp_ns, now_ns) > threshold_ms
 }
 
+/// Depth-normalized imbalance of successive external best quotes.
+#[derive(Default)]
+pub(super) struct OrderFlow {
+    previous: Option<ShmBboMessage>,
+    value: f64,
+}
+
+impl OrderFlow {
+    pub(super) fn observe(
+        &mut self,
+        book: Option<ShmBboMessage>,
+        now_ns: u64,
+        stale_ms: u64,
+        half_life_ms: u64,
+    ) -> f64 {
+        let Some(book) = book.filter(|book| {
+            valid_quoteable_book(book)
+                && book.bid_price > 0.0
+                && book.ask_price > book.bid_price
+                && book.bid_size > 0.0
+                && book.ask_size > 0.0
+                && !is_stale_bbo(book.timestamp_ns, now_ns, stale_ms)
+        }) else {
+            *self = Self::default();
+            return 0.0;
+        };
+        if let Some(last) = self.previous {
+            if book.timestamp_ns == last.timestamp_ns {
+                return self.decay(now_ns - book.timestamp_ns, half_life_ms);
+            }
+            if book.timestamp_ns < last.timestamp_ns
+                || data_age_ms(last.timestamp_ns, book.timestamp_ns) > stale_ms
+            {
+                self.value = 0.0;
+            } else {
+                let current_bid = if book.bid_price >= last.bid_price {
+                    book.bid_size
+                } else {
+                    0.0
+                };
+                let prior_bid = if book.bid_price <= last.bid_price {
+                    last.bid_size
+                } else {
+                    0.0
+                };
+                let current_ask = if book.ask_price <= last.ask_price {
+                    book.ask_size
+                } else {
+                    0.0
+                };
+                let prior_ask = if book.ask_price >= last.ask_price {
+                    last.ask_size
+                } else {
+                    0.0
+                };
+                let depth = 0.25 * book.bid_size
+                    + 0.25 * book.ask_size
+                    + 0.25 * last.bid_size
+                    + 0.25 * last.ask_size;
+                let imbalance = if depth > 0.0 {
+                    ((current_bid - prior_bid) / depth - (current_ask - prior_ask) / depth)
+                        .clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dt_ms = (book.timestamp_ns - last.timestamp_ns) as f64 / 1_000_000.0;
+                let alpha = 1.0 - 2.0_f64.powf(-dt_ms / half_life_ms as f64);
+                self.value += alpha * (imbalance - self.value);
+            }
+        }
+        self.previous = Some(book);
+        self.decay(now_ns - book.timestamp_ns, half_life_ms)
+    }
+
+    fn decay(&self, age_ns: u64, half_life_ms: u64) -> f64 {
+        self.value * 2.0_f64.powf(-(age_ns as f64) / (1_000_000.0 * half_life_ms as f64))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StaleBboAction {
     Fresh,
@@ -188,6 +267,43 @@ pub(super) fn external_fair_value_mid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_flow_uses_only_new_external_publications_and_expires() {
+        let start = 1_000_000_000;
+        let half_life = 500;
+        let age = 1_000;
+        let mut flow = OrderFlow::default();
+        let mut book = ShmBboMessage {
+            timestamp_ns: start,
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(flow.observe(Some(book), start, age, half_life), 0.0);
+        book.timestamp_ns += 500_000_000;
+        book.bid_size = 4.0;
+        let time = book.timestamp_ns;
+        assert_eq!(flow.observe(Some(book), time, age, half_life), 0.5);
+        assert_eq!(
+            flow.observe(Some(book), time + 500_000_000, age, half_life),
+            0.25
+        );
+        assert_eq!(
+            flow.observe(Some(book), time + 1_001_000_000, age, half_life),
+            0.0
+        );
+        book.timestamp_ns += 1_100_000_000;
+        assert_eq!(
+            flow.observe(Some(book), book.timestamp_ns, age, half_life),
+            0.0
+        );
+        book.timestamp_ns += 500_000_000;
+        book.ask_size = 5.0;
+        assert!(flow.observe(Some(book), book.timestamp_ns, age, half_life) < 0.0);
+    }
 
     #[test]
     fn basis_tracker_converges_to_persistent_premium() {

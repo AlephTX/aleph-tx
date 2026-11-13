@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Institutional-grade quantitative trading system"
 
+[features]
+research-replay = ["tokio/test-util"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
@@ -69,6 +72,11 @@ path = "src/bin/backpack_mm.rs"
 [[bin]]
 name = "edgex_mm"
 path = "src/bin/edgex_mm.rs"
+
+[[bin]]
+name = "maker_replay"
+path = "src/bin/maker_replay.rs"
+required-features = ["research-replay"]
 
 [profile.release]
 lto = true

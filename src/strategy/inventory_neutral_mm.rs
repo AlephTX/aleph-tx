@@ -1,19 +1,8 @@
-//! Inventory-Neutral Market Maker (Tier-1 HFT Strategy)
-//!
-//! Based on Citadel/Jump Trading principles:
-//! 1. Asymmetric order sizing to maintain near-zero inventory
-//! 2. Dynamic spread based on realized volatility + adverse selection
-//! 3. Aggressive position flattening when inventory deviates
-//! 4. Passive normal quoting with reduce-only emergency flattening
-//!
-//! Key Innovation: **Inventory-Weighted Order Sizing**
-//! - Short 0.1 ETH → Bid 0.13 ETH, Ask 0.03 ETH (net +0.1 if bid fills)
-//! - Long 0.1 ETH → Bid 0.03 ETH, Ask 0.13 ETH (net -0.1 if ask fills)
-//!
-//! Returns depend on execution costs and market conditions; no return target is guaranteed.
+//! Inventory-aware market making with external fair value, protected
+//! post-only quotes and bounded inventory recovery.
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
-use crate::config::InventoryNeutralMMConfig;
+use crate::config::{EXCH_HYPERLIQUID, InventoryNeutralMMConfig};
 use crate::exchange::{BatchAction, Exchange, OrderType, Side};
 use crate::live_hedge::{LiveInventoryHedge, QuoteAllowance};
 use crate::order_tracker::{OrderLifecycle, OrderSide, OrderTracker};
@@ -33,7 +22,7 @@ mod housekeeping;
 mod market_state;
 mod markout;
 mod pricing;
-#[cfg(test)]
+#[cfg(any(test, feature = "research-replay"))]
 mod replay;
 use components::{
     QuoteCycleDecision, QuoteTarget, RiskSnapshot, apply_risk_limits, decide_quote_cycle,
@@ -51,14 +40,16 @@ use execution::{
 };
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
-    BasisTracker, MarketState, StaleBboAction, build_market_state, classify_stale_bbo, data_age_ms,
-    external_fair_value_mid,
+    BasisTracker, MarketState, OrderFlow, StaleBboAction, build_market_state, classify_stale_bbo,
+    data_age_ms, external_fair_value_mid, select_exchange_bbo,
 };
 use pricing::{
     AnchorParams, MakerPriceBounds, anchor_quotes_to_touch, cleanup_reference_mid,
     effective_penny_ticks, fallback_bbo_prices, fee_aware_half_spread, local_reference_mid,
     momentum_half_spreads, stabilize_crossed_quotes,
 };
+#[cfg(feature = "research-replay")]
+pub use replay::recorded::run_recorded_maker;
 
 // ─── Account Stats ───────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
@@ -111,6 +102,10 @@ impl AccountStats {
 /// always reads the system wall clock.
 #[cfg(not(test))]
 fn wall_time_ns() -> u64 {
+    #[cfg(feature = "research-replay")]
+    if let Some(time) = replay::recorded::wall_time_ns() {
+        return time;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -119,6 +114,10 @@ fn wall_time_ns() -> u64 {
 
 #[cfg(test)]
 fn wall_time_ns() -> u64 {
+    #[cfg(feature = "research-replay")]
+    if let Some(time) = replay::recorded::wall_time_ns() {
+        return time;
+    }
     static ANCHOR: std::sync::OnceLock<(std::time::Instant, u64)> = std::sync::OnceLock::new();
     let (anchor, anchor_ns) = *ANCHOR.get_or_init(|| {
         let wall = std::time::SystemTime::now()
@@ -132,6 +131,14 @@ fn wall_time_ns() -> u64 {
         Some(ahead) => anchor_ns + ahead.as_nanos() as u64,
         None => anchor_ns - anchor.duration_since(now).as_nanos() as u64,
     }
+}
+
+fn strategy_utc_day() -> i32 {
+    #[cfg(feature = "research-replay")]
+    if let Some(day) = replay::recorded::utc_day() {
+        return day;
+    }
+    crate::daily_loss::utc_day_now()
 }
 
 fn account_source_age(snapshot: &AccountStatsSnapshot, now_ns: u64) -> Duration {
@@ -414,6 +421,7 @@ struct PricingInputs {
     sigma_per_sqrt_sec: f64,
     as_score: f64,
     using_external_fair_value: bool,
+    order_flow_bps: f64,
 }
 
 /// Result of one quoting-loop iteration.
@@ -441,6 +449,7 @@ pub struct InventoryNeutralMM {
     micro: MicrostructureTracker,
     sigma: TimeScaledVolatility,
     basis: BasisTracker,
+    order_flow: OrderFlow,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -535,6 +544,7 @@ impl InventoryNeutralMM {
             ),
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
+            order_flow: OrderFlow::default(),
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -542,6 +552,11 @@ impl InventoryNeutralMM {
                 config.markout_horizon_secs,
                 config.markout_halflife_fills,
                 config.markout_threshold_bps,
+            )
+            .with_side_samples(
+                config
+                    .markout_reserve
+                    .map(|policy| Duration::from_millis(policy.max_sample_age_ms)),
             ),
             config,
             trading,
@@ -760,10 +775,7 @@ impl InventoryNeutralMM {
     fn check_daily_loss(&mut self) -> anyhow::Result<()> {
         if let Some(guard) = &mut self.daily_loss {
             guard
-                .check(
-                    self.account_stats.portfolio_value,
-                    crate::daily_loss::utc_day_now(),
-                )
+                .check(self.account_stats.portfolio_value, strategy_utc_day())
                 .context("Lighter daily loss check failed")?;
         }
         Ok(())
@@ -825,7 +837,7 @@ impl InventoryNeutralMM {
             self.daily_loss_state.clone(),
             self.config.max_daily_loss_pct,
             self.account_stats.portfolio_value,
-            crate::daily_loss::utc_day_now(),
+            strategy_utc_day(),
         )?);
         // A restart can already be near the daily limit. Publish immediately,
         // including while the quote loop is waiting for hedge reconciliation.
@@ -1740,6 +1752,19 @@ impl InventoryNeutralMM {
             f64::NAN
         };
         self.markout.update(&self.order_tracker, markout_fair, now);
+        let order_flow_bps = self.config.order_flow_reserve.map_or(0.0, |reserve| {
+            let book = if using_external {
+                select_exchange_bbo(exchanges, EXCH_HYPERLIQUID)
+            } else {
+                None
+            };
+            self.order_flow.observe(
+                book,
+                now_ns,
+                self.config.external_staleness_ms,
+                reserve.half_life_ms,
+            ) * reserve.max_widen_bps
+        });
         // Until the time-scaled estimate warms up, fall back to the per-sample
         // figure; both are ~1e-4 for liquid perps at sub-second sampling.
         let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);
@@ -1754,6 +1779,7 @@ impl InventoryNeutralMM {
             sigma_per_sqrt_sec,
             as_score,
             using_external_fair_value: using_external,
+            order_flow_bps,
         }
     }
 
@@ -1836,11 +1862,41 @@ impl InventoryNeutralMM {
             fee_floor_bps,
             vol_cap_bps,
         )?;
-        let (bid_half_spread, ask_half_spread) = momentum_half_spreads(
+        let (mut bid_half_spread, mut ask_half_spread) = momentum_half_spreads(
             half_spread,
             self.micro.momentum_bps(),
             self.config.momentum_skew_scale,
         );
+        if inputs.using_external_fair_value
+            && (self.config.markout_reserve.is_some() || inputs.order_flow_bps != 0.0)
+        {
+            let [bid_markout, ask_markout] =
+                self.config.markout_reserve.map_or([0.0; 2], |policy| {
+                    self.markout.side_reserve_bps(
+                        Instant::now(),
+                        self.config.maker_fee_bps
+                            + policy.close_cost_bps
+                            + self.config.min_profit_bps / 2.0,
+                        policy.max_widen_bps,
+                    )
+                });
+            // Both estimates cover adverse selection. Use the larger reserve.
+            let bid_reserve = bid_markout.max(-inputs.order_flow_bps);
+            let ask_reserve = ask_markout.max(inputs.order_flow_bps);
+            // Keep the side pointing toward flat at its original price.
+            let bid_reserve = if q >= 0.0 { bid_reserve } else { 0.0 };
+            let ask_reserve = if q <= 0.0 { ask_reserve } else { 0.0 };
+            let requested = bid_reserve + ask_reserve;
+            if requested > 0.0 {
+                let bps_price = inputs.pricing_mid / 10_000.0;
+                let room = (self.config.max_spread_bps
+                    - (bid_half_spread + ask_half_spread) / bps_price)
+                    .max(0.0);
+                let scale = bps_price * (room / requested).min(1.0);
+                bid_half_spread += bid_reserve * scale;
+                ask_half_spread += ask_reserve * scale;
+            }
+        }
 
         let raw_bid = ((reservation_price - bid_half_spread) / self.config.tick_size).floor()
             * self.config.tick_size;

@@ -54,7 +54,8 @@ line or Node 24 via `make dashboard-build`.
 | Supervised | `quant` | Lighter market making with fair-value, inventory and loss controls. Set `strategy_mode = "quant"`. |
 | Supervised | `inventory_hedge` | Lighter market making with native Hyperliquid IOC hedges sized from confirmed inventory. Set `strategy_mode = "inventory_hedge"` and `[inventory_hedge]`. |
 | Paper | `pair_hedge` | Funding carry or basis reversion on one matched pair per run. This is the default `pair.mode` for `perp-replay`. |
-| Paper | `turnover` | The same signals with turnover and fee caps on new entries, budgeted for both legs’ round trip. Set `pair.mode.kind = "turnover"`. |
+| Paper | Maker-first | Public prints advance a passive order's queue. Confirmed partials drive protected IOC hedges. See [maker-first replay](docs/PERP_RELATIVE_VALUE.md#maker-first-replay). |
+| Paper | `turnover` | Round-trip turnover, fee and loss budgets. An optional incentive policy compares unit costs on a reviewed unissued-token venue. Set `pair.mode.kind = "turnover"`. |
 
 The supervised launcher supports mainnet and testnet. Both network modes
 can submit and cancel orders. The paper matrix covers the six pairings
@@ -103,11 +104,11 @@ configuration values. [Shared-memory ABI](docs/DUAL_TRACK_IPC.md) ·
 | Audit and observability | Bind fee evidence to exact order identity. Track venue-reported fees, modeled costs, trade PnL and account equity separately. | [Fee evidence](docs/LIVE_TRADING.md#bind-and-measure-fee-evidence) · [Oasis runbook](deploy/oasis/README.md) |
 | Research acceptance | Preserve source and availability times, freeze parameters before the holdout, and report entry rejections, costs, residual exposure and final inventory. | [Recording](docs/PERP_RECORDING.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) |
 
-The four-venue NVDA capture synchronized 51 to 123 of 153 frames across
-six pairs under one set of clock and freshness limits. It ran at zero
-order capacity to measure data coverage. Funding forecasts and settled
-payments are reported separately. Prospective venue rewards have zero
-value in the model. [Coverage report](docs/PERP_RECORDING.md#nvda-coverage-check)
+The 20-hour Oasis campaign measures cross-venue basis and funding alongside
+a production-quote replay on public books and trades. Its holdout reports
+include fee scenarios, entry rejections, fill costs and residual inventory.
+Prospective venue rewards have zero value in the model.
+[Oasis holdout results](docs/PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12)
 
 ## Release gates for new execution routes
 

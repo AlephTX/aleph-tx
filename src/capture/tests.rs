@@ -230,6 +230,31 @@ fn equity_minutes_use_completed_regular_session_bars_after_publication_delay() {
 }
 
 #[test]
+fn observed_equity_bars_wait_for_the_recorded_receipt() {
+    let mut config: CaptureConfig =
+        serde_json::from_str(include_str!("../../examples/nvda_capture.json")).unwrap();
+    config.pair.equity_minute_reference_max_age_ms = Some(180_000);
+    config.reference = ReferenceFeed::ObservedEquityMinuteBars {
+        underlying_id: "NASDAQ:NVDA".into(),
+        bars: vec![ObservedEquityMinuteBar {
+            ends_at_ms: T + 60_000,
+            available_at_ms: T + 67_000,
+            close: Decimal::from(200),
+        }],
+    };
+    let rows = [
+        row("coinbase", T + 66_900, json!({})),
+        row("coinbase", T + 67_000, json!({})),
+        footer(T + 67_100),
+    ];
+    config.sample_ms = 100;
+    let (_, frames) = replay(&config, &rows);
+    assert_eq!(frames[0]["reference"]["timestamp_ms"], 0);
+    assert_eq!(frames[1]["reference"]["timestamp_ms"], T + 60_000);
+    assert_eq!(frames[1]["reference"]["mode"], "equity_minute_close");
+}
+
+#[test]
 fn receipt_order_and_context_policy_prevent_reference_lookahead() {
     let mut config = config();
     config.reference = ReferenceFeed::External {
