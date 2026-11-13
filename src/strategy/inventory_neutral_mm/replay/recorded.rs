@@ -10,20 +10,96 @@ use tokio::sync::watch;
 
 const HOUR_MS: u64 = 3_600_000;
 const NS_PER_MS: u64 = 1_000_000;
+const SIGNAL_THRESHOLD_BPS: f64 = 0.01;
+const MARKOUT_MS: u64 = 1_000;
 
 thread_local! {
     static CLOCK: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
+    static ATTRIBUTION: RefCell<Option<QuoteAttribution>> = const { RefCell::new(None) };
+    static CHANGED_QUOTES: Cell<[bool; 2]> = const { Cell::new([false; 2]) };
+}
+
+#[derive(Default, Serialize)]
+struct QuoteAttribution {
+    evaluated: u64,
+    signal_nonzero: u64,
+    signal_at_least_0_01_bps: u64,
+    reserve_dominates: u64,
+    snapped_quote_changed: u64,
+    snapped_side_changes: [u64; 2],
+}
+
+pub(in crate::strategy::inventory_neutral_mm) fn attribute_quote(
+    strategy: &InventoryNeutralMM,
+    inputs: &PricingInputs,
+    position: f64,
+    quoted: Option<(f64, f64, MakerPriceBounds)>,
+) -> [bool; 2] {
+    ATTRIBUTION.with_borrow_mut(|stats| {
+        let Some(stats) = stats else {
+            return [false; 2];
+        };
+        stats.evaluated += 1;
+        let signal = inputs.cross_market_bps;
+        stats.signal_nonzero += u64::from(signal != 0.0);
+        stats.signal_at_least_0_01_bps += u64::from(signal.abs() >= SIGNAL_THRESHOLD_BPS);
+        if signal == 0.0 || !inputs.using_external_fair_value {
+            return [false; 2];
+        }
+        let [bid_other, ask_other] = strategy.competing_directional_reserves(inputs);
+        if !((position >= 0.0 && -signal > bid_other) || (position <= 0.0 && signal > ask_other)) {
+            return [false; 2];
+        }
+        stats.reserve_dominates += 1;
+        let mut control = inputs.clone();
+        control.cross_market_bps = 0.0;
+        let control = strategy.calculate_optimal_quotes(&control, position);
+        let changed = match (quoted, control) {
+            (Some((bid, ask, _)), Some((control_bid, control_ask, _))) => {
+                [bid != control_bid, ask != control_ask]
+            }
+            (Some(_), None) | (None, Some(_)) => [true; 2],
+            (None, None) => [false; 2],
+        };
+        stats.snapped_quote_changed += u64::from(changed.into_iter().any(|value| value));
+        for (count, changed) in stats.snapped_side_changes.iter_mut().zip(changed) {
+            *count += u64::from(changed);
+        }
+        changed
+    })
+}
+
+pub(in crate::strategy::inventory_neutral_mm) struct ChangedQuotes(Option<[bool; 2]>);
+
+impl ChangedQuotes {
+    pub(in crate::strategy::inventory_neutral_mm) fn open(sides: [bool; 2]) -> Self {
+        Self(
+            sides
+                .into_iter()
+                .any(|changed| changed)
+                .then(|| CHANGED_QUOTES.replace(sides)),
+        )
+    }
+}
+
+impl Drop for ChangedQuotes {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0 {
+            CHANGED_QUOTES.set(prior);
+        }
+    }
 }
 
 struct ReplayClock;
 
 impl ReplayClock {
-    fn open(start_ms: u64) -> Self {
+    fn open(start_ms: u64, diagnose: bool) -> Self {
         assert!(
             CLOCK
                 .replace(Some((start_ms * NS_PER_MS, Instant::now())))
                 .is_none()
         );
+        ATTRIBUTION.replace(diagnose.then(QuoteAttribution::default));
         Self
     }
 }
@@ -31,6 +107,7 @@ impl ReplayClock {
 impl Drop for ReplayClock {
     fn drop(&mut self) {
         CLOCK.set(None);
+        ATTRIBUTION.replace(None);
     }
 }
 
@@ -66,6 +143,14 @@ pub struct RecordedMakerConfig {
     venue_cancel_delay_ms: u64,
     #[serde(default)]
     venue_taker_delay_ms: u64,
+    #[serde(default)]
+    market_data_delay_ms: u64,
+    #[serde(default)]
+    cancel_transport_ms: Option<u64>,
+    #[serde(default)]
+    taker_transport_ms: Option<u64>,
+    #[serde(default)]
+    diagnose_cross_market: bool,
     order_response_ms: u64,
     trade_clock_guard_ms: u64,
     taker_fee_bps: f64,
@@ -91,6 +176,9 @@ impl RecordedMakerConfig {
                 && (1..=2_000).contains(&self.order_entry_ms)
                 && self.venue_cancel_delay_ms <= 2_000
                 && self.venue_taker_delay_ms <= 2_000
+                && self.market_data_delay_ms <= 2_000
+                && self.cancel_transport_ms.is_none_or(|value| value <= 2_000)
+                && self.taker_transport_ms.is_none_or(|value| value <= 2_000)
                 && self.order_response_ms <= 2_000
                 && self.trade_clock_guard_ms <= 1_000
                 && (0.0..=1_000.0).contains(&self.taker_fee_bps)
@@ -110,7 +198,7 @@ impl RecordedMakerConfig {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Book {
     timestamp_ms: u64,
@@ -212,6 +300,64 @@ impl Event {
 struct Queue {
     activated_ms: u64,
     ahead: f64,
+    changed_side: bool,
+    cancel_requested: bool,
+}
+
+#[derive(Default, Serialize)]
+struct MakerFillQuality {
+    fills: u64,
+    turnover: f64,
+    fees: f64,
+    cancel_pending_fills: u64,
+    total_queue_age_ms: u64,
+    marked_fills_1s: u64,
+    marked_turnover_1s: f64,
+    markout_quote_1s: f64,
+}
+
+impl MakerFillQuality {
+    fn fill(
+        &mut self,
+        quantity: f64,
+        price: f64,
+        fee_bps: f64,
+        queue_age: u64,
+        cancel_pending: bool,
+    ) {
+        self.fills += 1;
+        self.turnover += quantity * price;
+        self.fees += quantity * price * fee_bps / 10_000.0;
+        self.cancel_pending_fills += u64::from(cancel_pending);
+        self.total_queue_age_ms += queue_age;
+    }
+
+    fn mark(&mut self, fill: &PendingMarkout, mid: f64) {
+        self.marked_fills_1s += 1;
+        self.marked_turnover_1s += fill.signed_quantity.abs() * fill.price;
+        self.markout_quote_1s += fill.signed_quantity * (mid - fill.price);
+    }
+}
+
+struct PendingMarkout {
+    due_ms: u64,
+    signed_quantity: f64,
+    price: f64,
+    changed_side: bool,
+}
+
+#[derive(Default)]
+struct ExecutionAttribution {
+    maker_submitted: u64,
+    maker_accepted: u64,
+    maker_cancel_requests: u64,
+    changed_side_maker_submitted: u64,
+    changed_side_maker_accepted: u64,
+    all_maker_fills: MakerFillQuality,
+    changed_side_maker_fills: MakerFillQuality,
+    pending_marks: VecDeque<PendingMarkout>,
+    ioc_cost_quote_vs_submit_mid: f64,
+    ioc_turnover_with_submit_mid: f64,
 }
 
 #[derive(Default)]
@@ -223,11 +369,14 @@ struct Market {
     precision_rejections: u64,
     stale_rejections: u64,
     accepted_orders: u64,
+    attribution: Option<ExecutionAttribution>,
 }
 
 pub(super) struct Matching {
     market: PlMutex<Market>,
     entry: Duration,
+    cancel_transport: Duration,
+    taker_transport: Duration,
     cancel_delay: Duration,
     taker_delay: Duration,
     response: Duration,
@@ -243,8 +392,19 @@ pub(super) struct Matching {
 impl Matching {
     fn new(config: &RecordedMakerConfig) -> Self {
         Self {
-            market: PlMutex::new(Market::default()),
+            market: PlMutex::new(Market {
+                attribution: config
+                    .diagnose_cross_market
+                    .then(ExecutionAttribution::default),
+                ..Default::default()
+            }),
             entry: Duration::from_millis(config.order_entry_ms),
+            cancel_transport: Duration::from_millis(
+                config.cancel_transport_ms.unwrap_or(config.order_entry_ms),
+            ),
+            taker_transport: Duration::from_millis(
+                config.taker_transport_ms.unwrap_or(config.order_entry_ms),
+            ),
             cancel_delay: Duration::from_millis(config.venue_cancel_delay_ms),
             taker_delay: Duration::from_millis(config.venue_taker_delay_ms),
             response: Duration::from_millis(config.order_response_ms),
@@ -261,7 +421,25 @@ impl Matching {
     fn on_book(&self, book: Book) {
         let mut state = self.market.lock();
         if let Some((bid, ask)) = book.touch() {
-            state.last_mid = Some(bid[0] * 0.5 + ask[0] * 0.5);
+            let mid = bid[0] * 0.5 + ask[0] * 0.5;
+            state.last_mid = Some(mid);
+            if let Some(stats) = &mut state.attribution {
+                let now = now_ms();
+                while let Some(fill) = stats.pending_marks.front() {
+                    let expired = now > fill.due_ms + MARKOUT_MS;
+                    let eligible = book.timestamp_ms >= fill.due_ms && book.timestamp_ms <= now;
+                    if !expired && !eligible {
+                        break;
+                    }
+                    let fill = stats.pending_marks.pop_front().expect("checked markout");
+                    if eligible && !expired {
+                        stats.all_maker_fills.mark(&fill, mid);
+                        if fill.changed_side {
+                            stats.changed_side_maker_fills.mark(&fill, mid);
+                        }
+                    }
+                }
+            }
         }
         // Never replenish IOC depth from a repeated publication.
         if book.timestamp_ms != state.book.timestamp_ms {
@@ -270,31 +448,45 @@ impl Matching {
     }
 
     pub(super) async fn wait_cancel(&self) {
-        tokio::time::sleep(self.entry + self.cancel_delay).await;
+        tokio::time::sleep(self.cancel_transport + self.cancel_delay).await;
+    }
+
+    pub(super) fn record_cancel_request(&self, order_index: Option<i64>) {
+        let mut state = self.market.lock();
+        let Market {
+            queue, attribution, ..
+        } = &mut *state;
+        if let Some(stats) = attribution {
+            for (&id, order) in queue.iter_mut() {
+                if order_index.is_none_or(|index| id == index) && !order.cancel_requested {
+                    order.cancel_requested = true;
+                    stats.maker_cancel_requests += 1;
+                }
+            }
+        }
     }
 
     fn batch_delay(&self, actions: &[BatchAction]) -> Duration {
         // Keep the recorded model's batch ordering and hold a mixed batch
         // until its slowest action is eligible to match.
-        let venue_delay = actions
+        actions
             .iter()
             .map(|action| match action {
-                BatchAction::Cancel(_) => self.cancel_delay,
+                BatchAction::Cancel(_) => self.cancel_transport + self.cancel_delay,
                 BatchAction::Place(params) if params.order_type == OrderType::Ioc => {
-                    self.taker_delay
+                    self.taker_transport + self.taker_delay
                 }
-                BatchAction::Place(_) => Duration::ZERO,
+                BatchAction::Place(_) => self.entry,
             })
             .max()
-            .unwrap_or_default();
-        self.entry + venue_delay
+            .unwrap_or(self.entry)
     }
 
     pub(super) fn forget(&self, order_index: i64) {
         self.market.lock().queue.remove(&order_index);
     }
 
-    fn admit(&self, order: Resting, ioc: bool) -> bool {
+    fn admit(&self, order: Resting, ioc: bool, changed_side: bool) -> bool {
         let now = now_ms();
         let mut state = self.market.lock();
         let size = order.remaining;
@@ -344,8 +536,14 @@ impl Matching {
                 Queue {
                     activated_ms: now,
                     ahead,
+                    changed_side,
+                    cancel_requested: false,
                 },
             );
+            if let Some(stats) = &mut state.attribution {
+                stats.maker_accepted += 1;
+                stats.changed_side_maker_accepted += u64::from(changed_side);
+            }
         }
         state.accepted_orders += 1;
         true
@@ -386,7 +584,7 @@ impl Matching {
         let mut remaining = size;
         for order in orders {
             let id = order.exchange_order_id as i64;
-            {
+            let (activated_ms, changed_side, cancel_requested) = {
                 let mut state = self.market.lock();
                 let Some(queue) = state.queue.get_mut(&id) else {
                     continue;
@@ -403,9 +601,39 @@ impl Matching {
                 } else {
                     queue.ahead = 0.0;
                 }
-            }
+                (
+                    queue.activated_ms,
+                    queue.changed_side,
+                    queue.cancel_requested,
+                )
+            };
             let qty = components::round_down_to_step(order.remaining.min(remaining), self.step);
             if qty > 0.0 {
+                if let Some(stats) = &mut self.market.lock().attribution {
+                    let age = at - activated_ms;
+                    stats.all_maker_fills.fill(
+                        qty,
+                        order.price,
+                        venue.fee_bps,
+                        age,
+                        cancel_requested,
+                    );
+                    if changed_side {
+                        stats.changed_side_maker_fills.fill(
+                            qty,
+                            order.price,
+                            venue.fee_bps,
+                            age,
+                            cancel_requested,
+                        );
+                    }
+                    stats.pending_marks.push_back(PendingMarkout {
+                        due_ms: at + MARKOUT_MS,
+                        signed_quantity: if order.is_ask { -qty } else { qty },
+                        price: order.price,
+                        changed_side,
+                    });
+                }
                 venue.fill(order, order.price, qty, false);
                 remaining = (remaining - qty).max(0.0);
                 if qty >= order.remaining - self.step * 1e-6 {
@@ -418,7 +646,7 @@ impl Matching {
         }
     }
 
-    fn ioc(&self, venue: &SimVenue, order: Resting, reduce_only: bool) {
+    fn ioc(&self, venue: &SimVenue, order: Resting, reduce_only: bool, submit_mid: Option<f64>) {
         let mut remaining = order.remaining;
         if reduce_only {
             let position = venue.net_position();
@@ -430,10 +658,13 @@ impl Matching {
         }
         let id = order.exchange_order_id as i64;
         let mut state = self.market.lock();
+        let Market {
+            book, attribution, ..
+        } = &mut *state;
         let levels = if order.is_ask {
-            &mut state.book.bids
+            &mut book.bids
         } else {
-            &mut state.book.asks
+            &mut book.asks
         };
         // The book stores remaining executable size after prior IOC fills.
         // Subtract consumed depth in original-display units.
@@ -454,6 +685,17 @@ impl Matching {
                 let resting = venue.book.lock().get(&id).copied();
                 if let Some(resting) = resting {
                     venue.fill(resting, level[0], qty, true);
+                    if let Some(stats) = attribution
+                        && let Some(mid) = submit_mid
+                    {
+                        let cost = if order.is_ask {
+                            mid - level[0]
+                        } else {
+                            level[0] - mid
+                        };
+                        stats.ioc_cost_quote_vs_submit_mid += qty * cost;
+                        stats.ioc_turnover_with_submit_mid += qty * level[0];
+                    }
                     level[1] = (level[1] - qty / self.participation).max(0.0);
                     remaining = (remaining - qty).max(0.0);
                 }
@@ -473,6 +715,28 @@ impl Matching {
         venue: &SimVenue,
         actions: Vec<BatchAction>,
     ) -> Result<BatchResult> {
+        let changed_sides = CHANGED_QUOTES.get();
+        let submit_mid = {
+            let state = self.market.lock();
+            state
+                .book
+                .fresh(now_ms(), self.max_age_ms)
+                .then_some(state.last_mid)
+                .flatten()
+        };
+        for action in &actions {
+            match action {
+                BatchAction::Cancel(id) => self.record_cancel_request(Some(*id)),
+                BatchAction::Place(params) if params.order_type != OrderType::Ioc => {
+                    if let Some(stats) = &mut self.market.lock().attribution {
+                        stats.maker_submitted += 1;
+                        stats.changed_side_maker_submitted +=
+                            u64::from(changed_sides[usize::from(params.side == Side::Sell)]);
+                    }
+                }
+                BatchAction::Place(_) => {}
+            }
+        }
         let reservations: Vec<_> = actions
             .iter()
             .map(|action| match action {
@@ -493,10 +757,10 @@ impl Matching {
                 BatchAction::Place(params) => {
                     let order = reservation.expect("place reservation");
                     let ioc = params.order_type == OrderType::Ioc;
-                    if self.admit(order, ioc) {
+                    if self.admit(order, ioc, changed_sides[usize::from(order.is_ask)]) {
                         venue.activate(order);
                         if ioc {
-                            self.ioc(venue, order, params.reduce_only);
+                            self.ioc(venue, order, params.reduce_only, submit_mid);
                         }
                     } else {
                         venue.apply(ShmPrivateEventV2::order_rejected(
@@ -576,6 +840,23 @@ pub struct RecordedMakerReport {
     resting_orders: usize,
     needs_reconciliation: bool,
     halted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cross_market_attribution: Option<CrossMarketAttribution>,
+}
+
+#[derive(Serialize)]
+struct CrossMarketAttribution {
+    #[serde(flatten)]
+    quote: QuoteAttribution,
+    maker_submitted: u64,
+    maker_accepted: u64,
+    maker_cancel_requests: u64,
+    changed_side_maker_submitted: u64,
+    changed_side_maker_accepted: u64,
+    all_maker_fills: MakerFillQuality,
+    changed_side_maker_fills: MakerFillQuality,
+    ioc_cost_quote_vs_submit_mid: f64,
+    ioc_turnover_with_submit_mid: f64,
 }
 
 #[derive(Default)]
@@ -620,7 +901,7 @@ async fn drive(
     config: RecordedMakerConfig,
     mut input: impl BufRead,
 ) -> Result<RecordedMakerReport> {
-    let _clock = ReplayClock::open(config.start_ms);
+    let _clock = ReplayClock::open(config.start_ms, config.diagnose_cross_market);
     let start = Instant::now();
     let mut files = ShmFiles::for_symbol(config.strategy.symbol_id)?;
     let tracker = Arc::new(OrderTracker::new());
@@ -670,6 +951,13 @@ async fn drive(
     let feed = async {
         let result: Result<()> = async {
             let mut line = String::new();
+            let mut delayed_books = VecDeque::<(u64, Book, Book)>::new();
+            let publish = |lighter: &Book, hyperliquid: &Book| {
+                let mut shm = files.borrow_mut();
+                lighter.write_bbo(&shm, LIGHTER);
+                hyperliquid.write_bbo(&shm, EXCH_HYPERLIQUID);
+                shm.publish_version();
+            };
             loop {
                 line.clear();
                 if input.read_line(&mut line)? == 0 {
@@ -680,6 +968,14 @@ async fn drive(
                 let at = event.at_ms();
                 ensure!(at >= last && at < config.drain_until_ms,"maker events outside ordered replay window");
                 last = at;
+                while delayed_books.front().is_some_and(|(at_publish, _, _)| *at_publish <= at) {
+                    let (at_publish, lighter, hyperliquid) = delayed_books.pop_front().expect("checked delayed book");
+                    tokio::select! {
+                        _ = feed_done.changed() => return Ok(()),
+                        _ = tokio::time::sleep_until(start+Duration::from_millis(at_publish-config.start_ms)) => {}
+                    }
+                    publish(&lighter, &hyperliquid);
+                }
                 tokio::select! {
                     _ = feed_done.changed() => return Ok(()),
                     _ = tokio::time::sleep_until(start+Duration::from_millis(at-config.start_ms)) => {}
@@ -688,10 +984,12 @@ async fn drive(
                     Event::Book { lighter, hyperliquid, .. } => {
                         lighter.validate(at)?;
                         hyperliquid.validate(at)?;
-                        let mut shm = files.borrow_mut();
-                        lighter.write_bbo(&shm,LIGHTER);
-                        hyperliquid.write_bbo(&shm,EXCH_HYPERLIQUID);
-                        shm.publish_version();
+                        let at_publish = at + config.market_data_delay_ms;
+                        if config.market_data_delay_ms == 0 {
+                            publish(&lighter, &hyperliquid);
+                        } else if at_publish < config.drain_until_ms {
+                            delayed_books.push_back((at_publish, lighter.clone(), hyperliquid));
+                        }
                         matching.on_book(lighter);
                         frames += 1;
                     }
@@ -701,6 +999,13 @@ async fn drive(
                         trades += 1;
                     }
                 }
+            }
+            for (at_publish, lighter, hyperliquid) in delayed_books {
+                tokio::select! {
+                    _ = feed_done.changed() => return Ok(()),
+                    _ = tokio::time::sleep_until(start+Duration::from_millis(at_publish-config.start_ms)) => {}
+                }
+                publish(&lighter, &hyperliquid);
             }
             tokio::select! {
                 _ = feed_done.changed() => {},
@@ -744,7 +1049,7 @@ async fn drive(
         &mut risk.borrow_mut(),
     );
     let ledger = *sim.ledger.lock();
-    let market = matching.market.lock();
+    let mut market = matching.market.lock();
     let resting_orders = sim.book.lock().len();
     let final_position = sim.net_position();
     ensure!(
@@ -756,6 +1061,24 @@ async fn drive(
     let halted = result.err().map(|err| format!("{err:#}"));
     let active_until_ms = now_ms();
     let funding_safe = active_until_ms / HOUR_MS == config.start_ms / HOUR_MS;
+    let cross_market_attribution =
+        market
+            .attribution
+            .take()
+            .map(|execution| CrossMarketAttribution {
+                quote: ATTRIBUTION
+                    .replace(None)
+                    .expect("enabled quote attribution"),
+                maker_submitted: execution.maker_submitted,
+                maker_accepted: execution.maker_accepted,
+                maker_cancel_requests: execution.maker_cancel_requests,
+                changed_side_maker_submitted: execution.changed_side_maker_submitted,
+                changed_side_maker_accepted: execution.changed_side_maker_accepted,
+                all_maker_fills: execution.all_maker_fills,
+                changed_side_maker_fills: execution.changed_side_maker_fills,
+                ioc_cost_quote_vs_submit_mid: execution.ioc_cost_quote_vs_submit_mid,
+                ioc_turnover_with_submit_mid: execution.ioc_turnover_with_submit_mid,
+            });
     Ok(RecordedMakerReport {
         start_ms: config.start_ms,
         end_ms: config.end_ms,
@@ -786,6 +1109,7 @@ async fn drive(
         resting_orders,
         needs_reconciliation,
         halted,
+        cross_market_attribution,
     })
 }
 
@@ -808,11 +1132,10 @@ mod tests {
     use super::*;
     use crate::exchange::OrderParams;
 
-    #[tokio::test(start_paused = true)]
-    async fn tape_and_iocs_spend_observed_volume_once() {
-        const START: u64 = 1_800_000_000_000;
-        let _clock = ReplayClock::open(START);
-        let config = RecordedMakerConfig {
+    const START: u64 = 1_800_000_000_000;
+
+    fn config() -> RecordedMakerConfig {
+        RecordedMakerConfig {
             strategy: InventoryNeutralMMConfig {
                 step_size: 0.001,
                 ..Default::default()
@@ -824,13 +1147,23 @@ mod tests {
             order_entry_ms: 250,
             venue_cancel_delay_ms: 300,
             venue_taker_delay_ms: 140,
+            market_data_delay_ms: 0,
+            cancel_transport_ms: None,
+            taker_transport_ms: None,
+            diagnose_cross_market: false,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
             taker_fee_bps: 4.0,
             min_contracts: 0.001,
             min_notional: 1.0,
             depth_participation: 0.25,
-        };
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tape_and_iocs_spend_observed_volume_once() {
+        let _clock = ReplayClock::open(START, false);
+        let config = config();
         let tracker = Arc::new(OrderTracker::new());
         let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
         venue.recorded = Some(Matching::new(&config));
@@ -884,5 +1217,83 @@ mod tests {
         let sent_at = now_ms();
         assert_eq!(venue.cancel_all().await.unwrap(), 1);
         assert!(now_ms() - sent_at >= 550);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attributed_quote_retains_tag_and_counts_fill_during_cancel_delay() {
+        let _clock = ReplayClock::open(START, true);
+        let mut config = config();
+        config.diagnose_cross_market = true;
+        config.cancel_transport_ms = Some(400);
+        config.taker_transport_ms = Some(50);
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(tracker, 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(Book {
+            timestamp_ms: START,
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        let maker = BatchAction::Place(OrderParams {
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.05,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        });
+        let ioc = BatchAction::Place(OrderParams {
+            side: Side::Sell,
+            price: 99.0,
+            size: 0.05,
+            order_type: OrderType::Ioc,
+            reduce_only: true,
+        });
+        assert_eq!(
+            matching
+                .batch_delay(std::slice::from_ref(&maker))
+                .as_millis(),
+            250
+        );
+        assert_eq!(
+            matching.batch_delay(std::slice::from_ref(&ioc)).as_millis(),
+            190
+        );
+        assert_eq!(
+            matching
+                .batch_delay(&[BatchAction::Cancel(1), maker.clone()])
+                .as_millis(),
+            700
+        );
+        {
+            let _changed = ChangedQuotes::open([true, false]);
+            venue.execute_batch(vec![maker]).await.unwrap();
+        }
+        let cancel = venue.cancel_all();
+        let fill = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            matching.on_trade(&venue, now_ms(), now_ms(), 100.0, 0.05, false);
+        };
+        let (result, ()) = tokio::join!(cancel, fill);
+        assert_eq!(result.unwrap(), 0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[100.0, 1.0]],
+        });
+        venue.execute_batch(vec![ioc]).await.unwrap();
+        assert_eq!(venue.net_position(), 0.0);
+        let market = matching.market.lock();
+        let stats = market.attribution.as_ref().unwrap();
+        assert_eq!(stats.changed_side_maker_submitted, 1);
+        assert_eq!(stats.changed_side_maker_accepted, 1);
+        assert_eq!(stats.maker_cancel_requests, 1);
+        let marked = &stats.changed_side_maker_fills;
+        assert_eq!(marked.fills, 1);
+        assert_eq!(marked.cancel_pending_fills, 1);
+        assert_eq!(marked.marked_fills_1s, 1);
+        assert_eq!(marked.markout_quote_1s, -0.025);
+        assert_eq!(stats.ioc_cost_quote_vs_submit_mid, 0.025);
     }
 }

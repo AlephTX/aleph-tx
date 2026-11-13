@@ -1010,6 +1010,157 @@ The Oasis aggregate reports are identified by SHA-256.
 | Matched settlement example | `2cc15305d2cceca3c10cca7e44a1c1adab036743099106e29fc656b5f84d3898` |
 | Input and binary evidence | `4345d0104e2204d49525744116b43d4d6acd57987532df1a831e209fff662bec` |
 
+## Execution attribution and hedged exits, 2026-11-13
+
+### ETH Standard execution attribution
+
+The study reused the same two execution windows from the 12:00–13:50
+Beijing archive and held the 12 bps floor, $50 target and $1,000 equity
+fixed. Its 250 ms transport baseline retains the Standard account's
+additional 300 ms taker and cancellation delays. The reserve's assumed
+placement latency stays at 250 ms across arms. Eighteen paired replays
+completed and liquidated their inventory.
+
+The baseline recorded 46,751 quote evaluations. The directional
+reserve reached 0.01 bps on 40,811 (87.3%), strictly exceeded the competing
+reserves on 2,430 (5.2%), and changed at least one post-grid price in
+2,039 evaluations (4.4%).
+Fifty-eight submissions on changed sides were accepted, out of 2,159
+accepted maker orders. None of those 58 filled. The 42 baseline maker fills
+had a gross one-second markout of −0.86 bps, measured from receipt. The
+signal-off arm made 39 maker fills and $0.160/h, compared with $0.147/h for
+the baseline. The order attribution is a same-state quote comparison.
+The net results include feedback from all subsequent orders and inventory.
+
+| Replay arm | Maker fills | Fills during pending cancel | Gross turnover/h | Net bps on gross | Net PnL/h |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 250 ms baseline | 42 | 28 | $1,147 | 1.28 | +$0.147 |
+| Signal off | 39 | 27 | $1,114 | 1.44 | +$0.160 |
+| Placement +250 ms | 50 | 38 | $1,367 | 0.96 | +$0.132 |
+| Cancellation +250 ms | 55 | 42 | $1,590 | 0.15 | +$0.024 |
+| IOC +250 ms | 43 | 30 | $1,135 | 1.34 | +$0.152 |
+| Batch response +250 ms | 57 | 40 | $1,572 | 1.33 | +$0.209 |
+| Market data +250 ms | 51 | 34 | $1,392 | −0.51 | −$0.071 |
+| All three transport paths +250 ms | 53 | 41 | $1,378 | 0.12 | +$0.017 |
+| Double requote threshold and order TTL | 38 | 21 | $1,080 | 1.30 | +$0.140 |
+
+Cancellation delay accounts for the largest loss among the three
+isolated outbound actions. Market data delay models stale strategy
+visibility while matching on the original event clock. Response delay
+applies to the batch acknowledgment; fill notice timing stays fixed.
+The combined effect includes different inventory paths and batches that
+wait for their slowest operation. The queue retention arm raised mean
+fill queue age from 4.02 s to 5.13 s. The archive supports attribution
+within these windows. A participation model and size ladder require
+additional untouched sessions and queue calibration.
+[Live execution latency study](https://doi.org/10.1080/14697688.2025.2515933) ·
+[Queue replay assumptions](https://hftbacktest.readthedocs.io/en/latest/order_fill.html)
+
+### Paired inventory exits
+
+`hedged_exit` in `maker-first-replay` adds a post-hedge holding limit,
+an adverse-basis stop and a minimum incremental saving against closing
+both legs immediately. It starts its clock when the two legs are
+confirmed and paired, with no pending maker remainder, IOC or fill
+notice. The separate unhedged timer still starts on net exposure.
+`use_cycle_deadline` keeps the old first-fill cutoff for an exit-policy
+comparison. Longer holding limits also reserve a larger end-of-window
+drain buffer. Each report separates opening maker, opening hedge,
+closing maker, closing hedge and forced IOC fees by leg. Fee totals
+include partial cycles; paired close timing uses fully closed cycles.
+The reduce-only order planner reserves executable remainder size against
+both venue minimums. When a full close would increase net exposure,
+it also checks whether the companion leg can be closed at current
+protected prices. Arrival-time partial fills can still leave untradeable
+remainders. The report records those residuals and withholds complete
+net PnL when positions remain open at cutoff.
+
+The Arcus touch replay kept the original 8 bps cap. All 46 legacy cycles
+used forced IOC exits. In BTC at 250 ms, Arcus fees were $0.142 opening
+maker and $0.427 forced IOC, or about 3.00 bps of $1,897 target turnover.
+The 180-second arm closed two of seven paired cycles with an Arcus
+maker fill and Lighter IOC hedge, with $0.030 Arcus closing maker fees
+and $0.342 Arcus forced IOC fees across the arm.
+Total modeled cost still reached 3.76 bps. The minimum-size guard
+cleared the ETH 500 ms 60-second residual seen in development. Each
+BTC 500 ms extended-hold arm retained one window with an Arcus residual
+below its reduce-only base minimum after an arrival-time partial.
+Both windows remain incomplete and carry no realized cost estimate.
+
+| Arcus maker route | Transport | Legacy cost | Same deadline | Paired 60 s | Paired 180 s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BTC | 250 ms | 4.00 | 4.00 | 4.21 | 3.76 |
+| BTC | 500 ms | 4.72 | 4.85 | Residual | Residual |
+| ETH | 250 ms | 4.77 | 4.22 | 4.88 | 4.22 |
+| ETH | 500 ms | 7.16 | 7.17 | 6.41 | 6.87 |
+
+Costs are bps of modeled Arcus target turnover after fees, execution
+and an overhead charge of 0.25 bps on both venues' gross turnover.
+
+### Extended × Lighter research profile
+
+The public paired replay uses Extended as the maker leg and sends
+Lighter IOC hedges sized to confirmed fills. It uses 250 ms transport,
+an additional 300 ms Lighter Standard IOC delay, $100 target orders and
+a 2.5 s unhedged timeout. It compares the legacy exit, the incremental
+exit with the legacy cutoff, and independent 15, 60 and 180 s paired
+holding limits when the shard has enough time to drain. Entry cost
+caps of 0, 4 and 8 bps are separate sensitivity arms. The report records
+the target venue denominator, both venues' fees, execution prices,
+residual positions and overhead of 0.25 bps on gross turnover. Points
+and unconfirmed rebates carry zero value.
+
+The profile models matched linear USD exposure at USD/USDC parity.
+Windows end before the hourly funding boundary; a residual invalidates
+the completed-cycle cost. Account funding, margin and rebate evidence
+are separate inputs for longer holds. The script hashes the recorded
+terms and applies the published ordinary fee schedule. Use the metadata
+version that corresponds to the shard.
+[Extended funding payments](https://docs.extended.exchange/extended-resources/trading/funding-payments) ·
+[Extended fee schedule](https://docs.extended.exchange/extended-resources/trading/trading-fees-and-rebates) ·
+[Lighter fee and delay schedule](https://docs.lighter.xyz/trading/trading-fees)
+
+In the first 15-minute shard, BTC and ETH had 8,105 and 8,108
+synchronized frames out of 8,127. The compiler rejected zero
+publications and observed three Lighter clock refreshes. The replay
+consumed 451 Extended BTC prints and 128 Extended ETH prints. The
+0 bps cap accepted zero orders across both assets. BTC accepted 156
+quotes in the legacy 4 bps arm with zero fills. The 8 bps BTC arm
+produced the following completed cycles.
+
+| BTC 8 bps arm | Extended turnover | Closed / forced | Net after overhead | Cost on Extended turnover |
+| --- | ---: | ---: | ---: | ---: |
+| Legacy | $298.09 | 3 / 3 | −$0.084 | 2.82 bps |
+| Same deadline | $298.09 | 3 / 3 | −$0.090 | 3.03 bps |
+| Paired 15 s | $298.09 | 3 / 3 | −$0.084 | 2.82 bps |
+| Paired 60 s | $298.12 | 3 / 3 | −$0.075 | 2.52 bps |
+| Paired 180 s | $214.86 | 2 / 2 | −$0.049 | 2.28 bps |
+
+The BTC legacy arm recorded seven IOC fills, 2.95 s maximum net
+exposure duration, and −0.32 bps IOC slippage versus touch at
+submission, where negative is favorable. The smaller 180-second
+arm also excluded more late-window entries. ETH completed one forced
+cycle in the 4 bps arms at 4.59–6.63 bps. Its 8 bps arms were
+incomplete because the Extended trade feed disconnected while a
+maker quote could still fill. The pilot verifies the data and
+execution path. The 48-hour campaign and fresh-session economic
+validation are in progress.
+
+```sh
+cargo build --locked --release --features research-replay --bin maker_replay --bin cross_venue
+python3 scripts/replay_maker_attribution.py target/release/maker_replay \
+  "$maker_inputs" "$output/eth-attribution" "$eth_profile_1" "$eth_profile_2"
+python3 scripts/replay_extended_lighter.py target/release/cross_venue \
+  "$sealed_shard" "$metadata_directory" "$output/extended-btc" --symbol BTC
+```
+
+| Oasis aggregate report | SHA-256 |
+| --- | --- |
+| ETH Standard attribution | `fe3e84fe809867770fd5124ea8361fe00b4488fadeae91562a1449c7d5cb27de` |
+| Arcus paired exits | `e678105bc3bcc738bf38f521cc73471c6dc731a6ee06cb19f7bc4534580bb4bf` |
+| Extended × Lighter BTC 15-minute replay | `aef41a6b4b22b2e8129874afdd40dc360123349ce8fe91190221f3c00a9b628d` |
+| Extended × Lighter ETH 15-minute replay | `49a187f1b581341c02bba2a31933ef9779fa74fff81495d9e95724ad02a1be77` |
+
 ## Research acceptance
 
 Archive the raw file, compile profile and report, simulation input and

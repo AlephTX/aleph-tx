@@ -519,6 +519,7 @@ impl Exchange for SimVenue {
     async fn cancel_order(&self, order_index: i64) -> anyhow::Result<()> {
         #[cfg(feature = "research-replay")]
         if let Some(matching) = &self.recorded {
+            matching.record_cancel_request(Some(order_index));
             matching.wait_cancel().await;
         }
         self.cancel(order_index);
@@ -527,6 +528,7 @@ impl Exchange for SimVenue {
     async fn cancel_all(&self) -> anyhow::Result<u32> {
         #[cfg(feature = "research-replay")]
         if let Some(matching) = &self.recorded {
+            matching.record_cancel_request(None);
             matching.wait_cancel().await;
         }
         let ids: Vec<i64> = self.book.lock().keys().copied().collect();

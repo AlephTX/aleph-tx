@@ -55,6 +55,7 @@ impl<'a> LegFeed<'a> {
     pub fn accepts(&self, source: &str) -> bool {
         match self.venue.as_str() {
             "lighter" => source == "lighter",
+            "extended" => source == "extended",
             "arcus" | "bulk" => {
                 let rest_venue = source.strip_suffix("_snapshot");
                 rest_venue.unwrap_or(source) == self.venue
@@ -71,8 +72,8 @@ impl<'a> LegFeed<'a> {
         }
     }
 
-    pub fn disconnect(&mut self, source: &str) {
-        if !self.accepts(source) {
+    pub fn disconnect(&mut self, source: &str, market: Option<&str>) {
+        if !self.accepts(source) || market.is_some_and(|value| value != self.market) {
             return;
         }
         match source {
@@ -86,6 +87,10 @@ impl<'a> LegFeed<'a> {
                 self.invalidate_full_book(true)
             }
             "arcus" | "bulk" => self.invalidate_full_book(false),
+            "extended" => {
+                self.depth = LighterDepth::default();
+                self.book = None;
+            }
             _ => {
                 self.context = None;
                 self.invalidate_full_book(false);
@@ -129,8 +134,81 @@ impl<'a> LegFeed<'a> {
             "arcus" | "arcus_snapshot" | "bulk" | "bulk_snapshot" => {
                 self.apply_external_book(payload, received, source)
             }
+            "extended" => self.apply_extended(payload, received),
             _ => self.apply_hyperliquid(payload, received, source == "hyperliquid_snapshot"),
         }
+    }
+
+    fn apply_extended(&mut self, payload: &Value, received: u64) -> Result<Change> {
+        let data = &payload["data"];
+        if data["m"].as_str() != Some(self.market.as_str()) {
+            return Ok(Change::Other);
+        }
+        let sequence = payload["seq"]
+            .as_u64()
+            .filter(|v| *v > 0)
+            .context("invalid Extended sequence")?;
+        let snapshot = match payload["type"].as_str() {
+            Some("SNAPSHOT") => true,
+            Some("DELTA") => false,
+            _ => anyhow::bail!("invalid Extended book type"),
+        };
+        let raw = payload["ts"]
+            .as_u64()
+            .context("missing Extended book time")?;
+        let Some(time) = self.source_time(raw, received) else {
+            self.book = None;
+            self.depth = LighterDepth::default();
+            return Ok(Change::Clock(raw.saturating_sub(received)));
+        };
+        let levels = |side: &Value| -> Result<Vec<LighterLevel>> {
+            #[derive(Deserialize)]
+            struct ExtendedLevel {
+                p: String,
+                q: Option<String>,
+                c: Option<String>,
+            }
+            Vec::<ExtendedLevel>::deserialize(side)?
+                .into_iter()
+                .map(|level| {
+                    // Full snapshots can omit c. A delta's q is a signed change.
+                    let size = if snapshot { level.q } else { level.c }
+                        .context("missing Extended absolute quantity")?;
+                    Ok(LighterLevel {
+                        price: level.p,
+                        size,
+                    })
+                })
+                .collect()
+        };
+        let prior = self.depth.nonce;
+        if prior.is_some_and(|p| p.checked_add(1) != Some(sequence)) {
+            self.book = None;
+            self.depth = LighterDepth::default();
+            return Ok(Change::Gap);
+        }
+        if prior.is_some_and(|_| time < self.depth.time) {
+            self.book = None;
+            self.depth = LighterDepth::default();
+            return Ok(Change::Clock(0));
+        }
+        let update = LighterUpdate {
+            nonce: sequence,
+            begin_nonce: sequence - 1,
+            last_updated_at: 0,
+            bids: levels(&data["b"])?,
+            asks: levels(&data["a"])?,
+        };
+        let change = self.depth.apply(update, time, snapshot)?;
+        match change {
+            Change::Book => {
+                let [bids, asks] = self.depth.levels();
+                self.set_book(time, bids, asks);
+            }
+            Change::Gap => self.book = None,
+            _ => {}
+        }
+        Ok(change)
     }
 
     fn apply_lighter(

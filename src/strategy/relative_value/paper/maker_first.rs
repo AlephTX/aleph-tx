@@ -36,6 +36,9 @@ pub struct MakerFirstConfig {
     /// Adjust the target-venue entry reserve using completed round trips.
     #[serde(default)]
     pub turnover_feedback: Option<TurnoverFeedback>,
+    /// Separate waiting budget and economics for an already hedged position.
+    #[serde(default)]
+    pub hedged_exit: Option<HedgedExit>,
     #[serde(with = "rust_decimal::serde::str")]
     pub maker_fee_bps: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -43,6 +46,20 @@ pub struct MakerFirstConfig {
     /// A reserve for changes in basis and hedge prices before matching.
     #[serde(with = "rust_decimal::serde::str")]
     pub latency_reserve_bps: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HedgedExit {
+    pub max_hold_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub min_saving_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_adverse_basis_bps: Decimal,
+    /// Retain the original time limit from the first maker fill. Useful for
+    /// comparing exit economics at the same opening horizon.
+    #[serde(default)]
+    pub use_cycle_deadline: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +196,7 @@ pub struct MakerFirstReport {
     pub ioc_submit_touch_turnover: Decimal,
     pub maker_spread_capture: Decimal,
     pub forced_close_pnl: Decimal,
+    pub cycle_attribution: CycleAttribution,
     pub realized_pnl: Decimal,
     pub pnl_before_fees: Option<Decimal>,
     pub net_pnl: Option<Decimal>,
@@ -198,6 +216,50 @@ pub struct MakerFirstReport {
     pub incomplete: Option<&'static str>,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct CycleAttribution {
+    /// In pair leg order. Includes every simulated fill, even in unfinished cycles.
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub opening_maker_fees: [Decimal; 2],
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub opening_hedge_fees: [Decimal; 2],
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub closing_maker_fees: [Decimal; 2],
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub closing_hedge_fees: [Decimal; 2],
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub forced_ioc_fees: [Decimal; 2],
+    pub closing_maker_fills: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub closing_maker_turnover: Decimal,
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub forced_ioc_turnover: [Decimal; 2],
+    #[serde(serialize_with = "super::serialize_positions")]
+    pub forced_ioc_slippage: [Decimal; 2],
+    /// Lifecycle cohorts require flat positions and complete evidence at close.
+    pub paired_closed_cycles: usize,
+    pub paired_maker_closes: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub paired_maker_close_pnl: Decimal,
+    pub forced_ioc_cycles: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub forced_ioc_cycle_pnl: Decimal,
+    pub total_time_to_hedge_ms: u64,
+    pub max_time_to_hedge_ms: u64,
+    pub timed_paired_closed_cycles: usize,
+    pub total_hedge_to_close_ms: u64,
+    pub max_hedge_to_close_ms: u64,
+    pub paired_cycles_open_at_cutoff: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_paired_gross_notional: Decimal,
+    pub hedged_time_stops: usize,
+    pub hedged_basis_stops: usize,
+    pub hedged_book_stops: usize,
+    pub reduce_ioc_dust_avoided: usize,
+    pub reduce_ioc_dust_fills: usize,
+    pub paired_drain_blocked: usize,
+}
+
 impl MakerFirstReport {
     fn blocked(&mut self, reason: &'static str) {
         *self.entry_blocked.entry(reason).or_default() += 1;
@@ -215,6 +277,7 @@ struct Quote {
     cancelled_ms: Option<u64>,
     hedge_limit: Option<Decimal>,
     passive_entry: bool,
+    closing: bool,
 }
 
 struct Candidate {
@@ -244,6 +307,7 @@ struct Ioc {
     arrival_ms: u64,
     expires_ms: u64,
     unwind: bool,
+    closing_hedge: bool,
 }
 
 struct Cycle {
@@ -254,6 +318,11 @@ struct Cycle {
     externalizing: bool,
     maker_turnover: Decimal,
     passive_side: Option<usize>,
+    paired_at_ms: Option<u64>,
+    hedge_fill_at_ms: Option<u64>,
+    paired_basis_bps: Option<Decimal>,
+    closing_maker_filled: bool,
+    forced_ioc_filled: bool,
 }
 
 struct Replay<'a> {
@@ -357,6 +426,19 @@ fn min_order_base(terms: &MarketTerms, limit: Decimal, reduces_leg: bool) -> Dec
 }
 
 impl MakerFirstConfig {
+    fn entry_horizon_ms(&self) -> u64 {
+        let hold_ms = self.hedged_exit.map_or(self.hold_ms, |p| {
+            if p.use_cycle_deadline {
+                p.max_hold_ms.max(self.hold_ms)
+            } else {
+                p.max_hold_ms.saturating_add(self.hold_ms)
+            }
+        });
+        self.drain_ms
+            .saturating_add(hold_ms)
+            .saturating_add(self.quote_lifetime_ms)
+    }
+
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
         self.pair.validate(registry)?;
         ensure!(
@@ -378,8 +460,7 @@ impl MakerFirstConfig {
                 && (1..=60_000).contains(&self.hold_ms)
                 && (100..=15_000).contains(&self.unhedged_timeout_ms)
                 && (1_000..=60_000).contains(&self.drain_ms)
-                && self.drain_ms + self.hold_ms + self.quote_lifetime_ms
-                    < self.end_ms - self.start_ms
+                && self.entry_horizon_ms() < self.end_ms - self.start_ms
                 && (-Decimal::from(100)..=Decimal::from(1_000)).contains(&self.maker_fee_bps)
                 && self.quote_notional > Decimal::ZERO
                 && bounded(self.quote_notional)
@@ -419,6 +500,16 @@ impl MakerFirstConfig {
                     && (Decimal::ZERO..=max_bps).contains(&policy.overhead_bps)
                     && (Decimal::ZERO..=max_bps).contains(&policy.max_quote_distance_bps),
                 "invalid maker-first turnover feedback"
+            );
+        }
+        if let Some(policy) = self.hedged_exit {
+            let max_bps = Decimal::from(1_000);
+            ensure!(
+                (1..=180_000).contains(&policy.max_hold_ms)
+                    && (Decimal::ZERO..=max_bps).contains(&policy.min_saving_bps)
+                    && policy.max_adverse_basis_bps > Decimal::ZERO
+                    && policy.max_adverse_basis_bps <= max_bps,
+                "invalid hedged exit policy"
             );
         }
         ensure!(
@@ -562,15 +653,21 @@ impl Replay<'_> {
         let hedge_leg = 1 - self.maker();
         let hedgeable = match quote.hedge_limit {
             Some(previous) => self.pair_books(now).is_some_and(|books| {
-                if !self.config.require_net_edge {
+                let paired_close = quote.closing && self.config.hedged_exit.is_some();
+                if !self.config.require_net_edge && !paired_close {
                     return true;
                 }
-                self.limit(books[hedge_leg], hedge_leg, hedge_side, quote.left)
-                    .is_some_and(|limit| {
-                        let reference = previous * quote.left;
-                        signed_cost(hedge_side, limit * quote.left, reference)
+                let limit = if paired_close {
+                    self.reduce_limit(books[hedge_leg], hedge_leg, hedge_side, quote.left)
+                } else {
+                    self.limit(books[hedge_leg], hedge_leg, hedge_side, quote.left)
+                };
+                limit.is_some_and(|limit| {
+                    let reference = previous * quote.left;
+                    !self.config.require_net_edge
+                        || signed_cost(hedge_side, limit * quote.left, reference)
                             <= reference * self.config.latency_reserve_bps / BPS
-                    })
+                })
             }),
             None => self.passive_cancel_by(now).is_some(),
         };
@@ -628,14 +725,17 @@ impl Replay<'_> {
             return Ok(());
         }
         let side = quote.side;
+        let closing = quote.closing;
         let passive_side = quote.passive_entry.then_some(side_index(side));
         let offsets_inventory = quote.hedge_limit.is_none();
-        if offsets_inventory {
+        if offsets_inventory || (closing && self.config.hedged_exit.is_some()) {
             let position = self.ledger.positions[i];
             ensure!(
                 !position.is_zero() && side == direction(position) && base <= position.abs(),
-                "passive offset would increase confirmed inventory"
+                "maker close would increase confirmed inventory"
             );
+        }
+        if offsets_inventory {
             self.report.passive_offset_fills += 1;
         }
         let notional = base * quote.price;
@@ -655,9 +755,18 @@ impl Replay<'_> {
                 externalizing: false,
                 maker_turnover: Decimal::ZERO,
                 passive_side,
+                paired_at_ms: None,
+                hedge_fill_at_ms: None,
+                paired_basis_bps: None,
+                closing_maker_filled: false,
+                forced_ioc_filled: false,
             }
         });
         cycle.maker_turnover += notional;
+        cycle.closing_maker_filled |= closing && !offsets_inventory;
+        if !closing {
+            cycle.hedge_fill_at_ms = None;
+        }
         self.report.maker_fills += 1;
         self.report.maker_buy_fills += usize::from(side == HedgeSide::Buy);
         self.report.maker_sell_fills += usize::from(side == HedgeSide::Sell);
@@ -666,9 +775,18 @@ impl Replay<'_> {
         if let Some(mid) = midpoint {
             self.report.maker_spread_capture -= signed_cost(side, notional, base * mid);
         }
-        self.report.maker_fees +=
-            self.ledger
-                .trade(i, side, Fill { base, notional }, self.config.maker_fee_bps);
+        let fee = self
+            .ledger
+            .trade(i, side, Fill { base, notional }, self.config.maker_fee_bps);
+        self.report.maker_fees += fee;
+        let attribution = &mut self.report.cycle_attribution;
+        if closing {
+            attribution.closing_maker_fees[i] += fee;
+            attribution.closing_maker_turnover += notional;
+            attribution.closing_maker_fills += 1;
+        } else {
+            attribution.opening_maker_fees[i] += fee;
+        }
         let signed_base = if side == HedgeSide::Buy { base } else { -base };
         self.notices
             .push_back((now + self.config.fill_notice_ms, signed_base));
@@ -708,6 +826,13 @@ impl Replay<'_> {
                 && order.quantity <= exposure.abs(),
             "maker-first IOC would increase confirmed exposure"
         );
+        if order.closing_hedge && self.config.hedged_exit.is_some() {
+            let leg = self.ledger.positions[order.leg];
+            ensure!(
+                !leg.is_zero() && order.side == direction(leg) && order.quantity <= leg.abs(),
+                "maker-first closing hedge would increase leg exposure"
+            );
+        }
         let fill = sweep(
             book,
             terms,
@@ -729,8 +854,39 @@ impl Replay<'_> {
         self.report.ioc_depth_impact += signed_cost(order.side, fill.notional, fill.base * touch);
         self.report.taker_turnover += fill.notional;
         self.record_eligible_fill(order.leg, fill_time, fill.notional);
-        self.ledger
+        let notional = fill.notional;
+        let fill_base = fill.base;
+        let leg_before = self.ledger.positions[order.leg];
+        let remainder = leg_before.abs() - fill_base;
+        let dust = self.config.hedged_exit.is_some()
+            && (order.unwind || order.closing_hedge)
+            && remainder > Decimal::ZERO
+            && remainder < min_order_base(terms, touch.min(order.limit), true);
+        let fee = self
+            .ledger
             .trade(order.leg, order.side, fill, terms.taker_fee_bps);
+        let attribution = &mut self.report.cycle_attribution;
+        attribution.reduce_ioc_dust_fills += usize::from(dust);
+        if order.unwind {
+            self.cycle
+                .as_mut()
+                .expect("unwind has an active cycle")
+                .forced_ioc_filled = true;
+            attribution.forced_ioc_fees[order.leg] += fee;
+            attribution.forced_ioc_turnover[order.leg] += notional;
+            attribution.forced_ioc_slippage[order.leg] +=
+                signed_cost(order.side, notional, fill_base * order.touch);
+        } else if order.closing_hedge {
+            attribution.closing_hedge_fees[order.leg] += fee;
+        } else {
+            attribution.opening_hedge_fees[order.leg] += fee;
+        }
+        if !order.unwind && !order.closing_hedge && self.net().is_zero() && !self.ledger.is_flat() {
+            self.cycle
+                .as_mut()
+                .expect("opening hedge has an active cycle")
+                .hedge_fill_at_ms = Some(now);
+        }
         Ok(())
     }
 
@@ -763,19 +919,36 @@ impl Replay<'_> {
         let Ok(last) = curve.last() else {
             return Ok(());
         };
-        let quantity = floor_step(position.abs().min(last.base), terms.base_step())?;
+        let closing_hedge = !unwind && self.cycle.as_ref().is_some_and(|c| c.closing_maker_filled);
+        let mut target = position.abs();
+        if closing_hedge && self.config.hedged_exit.is_some() {
+            let leg = self.ledger.positions[i];
+            if leg.is_zero() || direction(leg) != side {
+                return Ok(());
+            }
+            target = target.min(leg.abs());
+        }
+        let mut quantity = floor_step(target.min(last.base), terms.base_step())?;
+        let leg = self.ledger.positions[i];
+        let reduces_leg = !leg.is_zero() && direction(leg) == side && quantity <= leg.abs();
+        let touch = book.side(side)[0].price;
+        let mut dust_avoided = false;
+        if reduces_leg && self.config.hedged_exit.is_some() && (unwind || closing_hedge) {
+            let adjusted =
+                Self::retain_tradable_remainder(terms, &curve, touch, leg.abs(), quantity)?;
+            dust_avoided = adjusted < quantity;
+            quantity = adjusted;
+        }
         let Ok(limit) = curve.limit(quantity) else {
             return Ok(());
         };
-        let reduces_leg = !self.ledger.positions[i].is_zero()
-            && direction(self.ledger.positions[i]) == side
-            && quantity <= self.ledger.positions[i].abs();
         if quantity.is_zero() || quantity < min_order_base(terms, limit, reduces_leg) {
             if unwind {
                 self.report.below_minimum_unwind += 1;
             } else {
                 self.report.below_minimum_hedge += 1;
             }
+            self.report.cycle_attribution.reduce_ioc_dust_avoided += usize::from(dust_avoided);
             return Ok(());
         }
         let arrival_ms = now + self.config.transport_ms + self.config.taker_delay_ms[i];
@@ -789,13 +962,33 @@ impl Replay<'_> {
             side,
             quantity,
             limit,
-            touch: book.side(side)[0].price,
+            touch,
             arrival_ms,
             expires_ms,
             unwind,
+            closing_hedge,
         });
+        self.report.cycle_attribution.reduce_ioc_dust_avoided += usize::from(dust_avoided);
         self.report.ioc_submitted += 1;
         Ok(())
+    }
+
+    fn retain_tradable_remainder(
+        terms: &MarketTerms,
+        curve: &Depth,
+        touch: Decimal,
+        position: Decimal,
+        quantity: Decimal,
+    ) -> Result<Decimal> {
+        if quantity >= position || quantity.is_zero() {
+            return Ok(quantity);
+        }
+        // Use the protected depth for the remaining order. The touch is a
+        // conservative price for the notional floor of a buy to close.
+        let price = curve.last().map_or(touch, |last| last.limit.min(touch));
+        let minimum = min_order_base(terms, price, true);
+        let ceiling = (position - minimum).max(Decimal::ZERO);
+        floor_step(quantity.min(ceiling), terms.base_step())
     }
 
     fn limit(
@@ -812,6 +1005,28 @@ impl Replay<'_> {
         (quantity >= terms.min_base(limit)
             && quantity * limit <= book.available_notional.min(self.rules.max_single_leg))
         .then_some(limit)
+    }
+
+    fn reduce_limit(
+        &self,
+        book: &Book,
+        leg: usize,
+        side: HedgeSide,
+        quantity: Decimal,
+    ) -> Option<Decimal> {
+        let terms = &self.config.pair.legs[leg];
+        let position = self.ledger.positions[leg];
+        if position.is_zero()
+            || side != direction(position)
+            || quantity > position.abs()
+            || quantity % terms.base_step() != Decimal::ZERO
+        {
+            return None;
+        }
+        let limit = Depth::build(book, terms, side, self.rules)
+            .limit(quantity)
+            .ok()?;
+        (quantity >= min_order_base(terms, limit, true)).then_some(limit)
     }
 
     fn candidate(
@@ -836,8 +1051,9 @@ impl Replay<'_> {
                 self.common_step,
             )?
         };
-        if quantity.is_zero() || quantity < maker.min_base(passive) || !books[i].in_bounds(passive)
-        {
+        let hedged_exit = self.config.hedged_exit.filter(|_| closing);
+        let min_size = min_order_base(maker, passive, hedged_exit.is_some());
+        if quantity.is_zero() || quantity < min_size || !books[i].in_bounds(passive) {
             return Ok(None);
         }
         if !closing
@@ -846,7 +1062,12 @@ impl Replay<'_> {
         {
             return Ok(None);
         }
-        let Some(hedge_price) = self.limit(books[j], j, opposite(side), quantity) else {
+        let hedge_price = if hedged_exit.is_some() {
+            self.reduce_limit(books[j], j, opposite(side), quantity)
+        } else {
+            self.limit(books[j], j, opposite(side), quantity)
+        };
+        let Some(hedge_price) = hedge_price else {
             return Ok(None);
         };
         let maker_cash = cash(side, passive * quantity, self.config.maker_fee_bps);
@@ -861,7 +1082,14 @@ impl Replay<'_> {
             hedge_limit: Some(hedge_price),
             turnover: None,
         };
-        let cash_edge = if let Some(cycle) = &self.cycle {
+        let cash_edge = if hedged_exit.is_some() {
+            // The paired hedge IOC is identical for both exits. Sunk cash
+            // and that shared hedge cost cancel out of the comparison.
+            let Some(ioc) = self.reduce_limit(books[i], i, side, quantity) else {
+                return Ok(None);
+            };
+            maker_cash - cash(side, ioc * quantity, maker.taker_fee_bps)
+        } else if let Some(cycle) = &self.cycle {
             (maker_cash + hedge_cash) + (self.ledger.cash - cycle.initial_cash)
         } else {
             let Some(edge) = self.opening_edge(books, &mut candidate, maker_cash, hedge_cash)
@@ -1067,7 +1295,7 @@ impl Replay<'_> {
             return Ok(());
         }
         let closing = self.cycle.is_some();
-        let horizon = self.config.drain_ms + self.config.hold_ms + self.config.quote_lifetime_ms;
+        let horizon = self.config.entry_horizon_ms();
         if !closing && now + horizon >= self.config.end_ms {
             return Ok(());
         }
@@ -1153,8 +1381,14 @@ impl Replay<'_> {
                 .blocked(blocked.unwrap_or("size_or_hedge_depth"));
             return Ok(());
         };
+        let hedged_exit = self.config.hedged_exit.filter(|_| closing);
+        if hedged_exit.is_some_and(|p| best.edge_bps < p.min_saving_bps) {
+            self.report.blocked("paired_maker_saving");
+            return Ok(());
+        }
         if self.config.require_net_edge
             && incentive.is_none()
+            && hedged_exit.is_none()
             && best.edge_bps < self.rules.min_edge
         {
             self.report.blocked(if closing {
@@ -1167,7 +1401,24 @@ impl Replay<'_> {
         if feedback.is_some() && distance > Decimal::ZERO {
             self.cost_feedback.outward_quotes += 1;
         }
-        self.post(now, best, u64::MAX);
+        let cancel_by = hedged_exit.map_or(u64::MAX, |policy| {
+            let cycle = self
+                .cycle
+                .as_ref()
+                .expect("paired close has an active cycle");
+            let stop = self
+                .paired_deadline(cycle, policy)
+                .expect("paired close has a stable opening hedge");
+            stop.saturating_sub(
+                self.config.transport_ms
+                    + self.config.maker_cancel_delay_ms
+                    + self.config.trade_delivery_grace_ms
+                    + self.config.trade_clock_guard_ms,
+            )
+        });
+        if now + self.config.transport_ms < cancel_by {
+            self.post(now, best, cancel_by);
+        }
         Ok(())
     }
 
@@ -1188,6 +1439,7 @@ impl Replay<'_> {
             cancelled_ms: None,
             hedge_limit: candidate.hedge_limit,
             passive_entry: candidate.passive_entry,
+            closing: self.cycle.is_some(),
         });
         self.report.quotes_submitted += 1;
     }
@@ -1240,6 +1492,148 @@ impl Replay<'_> {
         );
     }
 
+    fn paired_basis_bps(&self, now: u64) -> Option<Decimal> {
+        let books = self.pair_books(now)?;
+        let maker_mid = books[self.maker()].mid();
+        let hedge_mid = books[1 - self.maker()].mid();
+        let basis = (maker_mid - hedge_mid) / hedge_mid * BPS;
+        Some(if self.ledger.positions[self.maker()] > Decimal::ZERO {
+            basis
+        } else {
+            -basis
+        })
+    }
+
+    fn paired_deadline(&self, cycle: &Cycle, policy: HedgedExit) -> Option<u64> {
+        let start = cycle.paired_at_ms?;
+        let anchor = if policy.use_cycle_deadline {
+            cycle.started_ms
+        } else {
+            start
+        };
+        Some((anchor + policy.max_hold_ms).min(self.config.end_ms - self.config.drain_ms))
+    }
+
+    fn update_paired_state(&mut self, now: u64) {
+        let stable = !self.ledger.is_flat()
+            && self.net().is_zero()
+            && self.quote.is_none()
+            && self.ioc.is_none()
+            && self.notices.is_empty();
+        if !stable {
+            return;
+        }
+        let basis = self
+            .config
+            .hedged_exit
+            .and_then(|_| self.paired_basis_bps(now));
+        let cycle = self
+            .cycle
+            .as_mut()
+            .expect("paired inventory has an active cycle");
+        if self.config.hedged_exit.is_some()
+            && cycle.paired_at_ms.is_none()
+            && now >= cycle.started_ms + self.config.hold_ms
+        {
+            return;
+        }
+        if !cycle.draining {
+            cycle.paired_at_ms.get_or_insert(now);
+            if cycle.paired_basis_bps.is_none() {
+                cycle.paired_basis_bps = basis;
+            }
+        }
+    }
+
+    fn paired_stop(&self, now: u64) -> (bool, bool, bool) {
+        let Some(policy) = self.config.hedged_exit else {
+            return (false, false, false);
+        };
+        let Some(cycle) = self.cycle.as_ref() else {
+            return (false, false, false);
+        };
+        let Some(deadline) = self.paired_deadline(cycle, policy) else {
+            return (false, false, false);
+        };
+        let time = now >= deadline;
+        let basis = self
+            .paired_basis_bps(now)
+            .zip(cycle.paired_basis_bps)
+            .is_some_and(|(current, initial)| initial - current > policy.max_adverse_basis_bps);
+        // Stale books withdraw the maker. Temporary inter-venue skew alone
+        // cannot generate new quotes or a basis observation.
+        let book = self.fresh(0, now).is_none() || self.fresh(1, now).is_none();
+        (time, basis, book)
+    }
+
+    fn record_completed_cycle(&mut self, cycle: &Cycle, now: u64, pnl: Decimal) {
+        if self.report.incomplete.is_some() || !self.notices.is_empty() {
+            return;
+        }
+        let stats = &mut self.report.cycle_attribution;
+        if cycle.forced_ioc_filled {
+            stats.forced_ioc_cycles += 1;
+            stats.forced_ioc_cycle_pnl += pnl;
+        }
+        if cycle.paired_at_ms.is_some() {
+            stats.paired_closed_cycles += 1;
+            if cycle.closing_maker_filled && !cycle.forced_ioc_filled {
+                stats.paired_maker_closes += 1;
+                stats.paired_maker_close_pnl += pnl;
+            }
+        }
+        if let Some(hedge_at) = cycle.hedge_fill_at_ms {
+            stats.timed_paired_closed_cycles += 1;
+            let hedge_ms = hedge_at - cycle.started_ms;
+            let close_ms = now - hedge_at;
+            stats.total_time_to_hedge_ms += hedge_ms;
+            stats.max_time_to_hedge_ms = stats.max_time_to_hedge_ms.max(hedge_ms);
+            stats.total_hedge_to_close_ms += close_ms;
+            stats.max_hedge_to_close_ms = stats.max_hedge_to_close_ms.max(close_ms);
+        }
+    }
+
+    fn paired_drain_quantity(&self, now: u64, leg: usize, requested: Decimal) -> Result<Decimal> {
+        let full = self.ledger.positions[leg];
+        let companion = self.ledger.positions[1 - leg];
+        if full.is_zero() || companion.is_zero() {
+            return Ok(requested);
+        }
+        let Some(book) = self.fresh(leg, now) else {
+            return Ok(Decimal::ZERO);
+        };
+        let side = direction(full);
+        let terms = &self.config.pair.legs[leg];
+        if requested.abs() < full.abs() {
+            let curve = Depth::build(book, terms, side, self.rules);
+            if let Ok(last) = curve.last() {
+                let quantity = floor_step(requested.abs().min(last.base), terms.base_step())?;
+                let touch = book.side(side)[0].price;
+                let safe =
+                    Self::retain_tradable_remainder(terms, &curve, touch, full.abs(), quantity)?;
+                if curve.limit(safe).is_ok_and(|limit| {
+                    safe > Decimal::ZERO && safe >= min_order_base(terms, limit, true)
+                }) {
+                    return Ok(requested);
+                }
+            }
+        }
+        // Require executable full reductions before intentionally increasing
+        // net exposure. A full close that reduces net can still be used to
+        // contain an existing mismatch, with the remaining leg kept on book.
+        let full_closeable = self.reduce_limit(book, leg, side, full.abs()).is_some();
+        let companion_closeable = companion.abs() <= (full + companion).abs()
+            || self.fresh(1 - leg, now).is_some_and(|book| {
+                self.reduce_limit(book, 1 - leg, direction(companion), companion.abs())
+                    .is_some()
+            });
+        Ok(if full_closeable && companion_closeable {
+            full
+        } else {
+            Decimal::ZERO
+        })
+    }
+
     fn advance(&mut self, now: u64) -> Result<()> {
         self.poll_ioc(now)?;
         let mut confirmed = false;
@@ -1255,14 +1649,25 @@ impl Replay<'_> {
         {
             self.cancel(now);
         }
+        self.update_paired_state(now);
+        let (paired_time, paired_basis, paired_book) = self.paired_stop(now);
         if let Some(cycle) = &mut self.cycle {
             let exposure_stop = self
                 .unhedged_since
                 .is_some_and(|at| now >= at + self.config.unhedged_timeout_ms);
-            if exposure_stop && !cycle.draining {
-                self.report.exposure_stops += 1;
+            if !cycle.draining {
+                self.report.exposure_stops += usize::from(exposure_stop);
+                self.report.cycle_attribution.hedged_time_stops += usize::from(paired_time);
+                self.report.cycle_attribution.hedged_basis_stops += usize::from(paired_basis);
+                self.report.cycle_attribution.hedged_book_stops += usize::from(paired_book);
             }
-            cycle.draining |= now >= cycle.started_ms + self.config.hold_ms
+            let opening_timeout = (self.config.hedged_exit.is_none()
+                || cycle.paired_at_ms.is_none())
+                && now >= cycle.started_ms + self.config.hold_ms;
+            cycle.draining |= opening_timeout
+                || paired_time
+                || paired_basis
+                || paired_book
                 || now >= self.config.end_ms - self.config.drain_ms
                 || self.report.incomplete.is_some()
                 || exposure_stop;
@@ -1280,27 +1685,40 @@ impl Replay<'_> {
                 } else {
                     (1, net)
                 };
-                let full = self.ledger.positions[i];
-                let below_minimum = self.fresh(i, now).is_some_and(|book| {
-                    let terms = &self.config.pair.legs[i];
-                    let touch = book.side(direction(quantity))[0].price;
-                    floor_step(quantity.abs(), terms.base_step())
-                        .is_ok_and(|base| base < min_order_base(terms, touch, true))
-                });
-                // If the residual cannot be traded, a protected full close
-                // can still clear the leg when its companion remains tradable.
-                let companion = self.ledger.positions[1 - i];
-                let companion_closeable = self.fresh(1 - i, now).is_some_and(|book| {
-                    let terms = &self.config.pair.legs[1 - i];
-                    let touch = book.side(direction(companion))[0].price;
-                    companion.abs() >= min_order_base(terms, touch, true)
-                });
-                let close = if below_minimum && full.abs() > quantity.abs() && companion_closeable {
-                    full
+                if self.config.hedged_exit.is_some() {
+                    if now >= self.next_ioc_ms && self.ioc.is_none() && !quantity.is_zero() {
+                        let close = self.paired_drain_quantity(now, i, quantity)?;
+                        if close.is_zero() {
+                            self.report.cycle_attribution.paired_drain_blocked += 1;
+                            self.next_ioc_ms = now + self.config.reprice_ms;
+                        } else {
+                            self.submit_ioc(now, i, close, true)?;
+                        }
+                    }
                 } else {
-                    quantity
-                };
-                self.submit_ioc(now, i, close, true)?;
+                    let full = self.ledger.positions[i];
+                    let below_minimum = self.fresh(i, now).is_some_and(|book| {
+                        let terms = &self.config.pair.legs[i];
+                        let touch = book.side(direction(quantity))[0].price;
+                        floor_step(quantity.abs(), terms.base_step())
+                            .is_ok_and(|base| base < min_order_base(terms, touch, true))
+                    });
+                    // If the residual cannot be traded, a protected full close
+                    // can still clear the leg when its companion remains tradable.
+                    let companion = self.ledger.positions[1 - i];
+                    let companion_closeable = self.fresh(1 - i, now).is_some_and(|book| {
+                        let terms = &self.config.pair.legs[1 - i];
+                        let touch = book.side(direction(companion))[0].price;
+                        companion.abs() >= min_order_base(terms, touch, true)
+                    });
+                    let close =
+                        if below_minimum && full.abs() > quantity.abs() && companion_closeable {
+                            full
+                        } else {
+                            quantity
+                        };
+                    self.submit_ioc(now, i, close, true)?;
+                }
             }
         } else if !self.net().is_zero() {
             if let Some(cancel_by) = self.passive_cancel_by(now) {
@@ -1312,10 +1730,12 @@ impl Replay<'_> {
         if self.ledger.is_flat()
             && self.quote.is_none()
             && self.ioc.is_none()
-            && (self.notices.is_empty() || self.config.passive_offset.is_none())
+            && (self.notices.is_empty()
+                || (self.config.passive_offset.is_none() && self.config.hedged_exit.is_none()))
             && let Some(cycle) = self.cycle.take()
         {
             let pnl = self.ledger.cash - cycle.initial_cash;
+            self.record_completed_cycle(&cycle, now, pnl);
             let eligible = std::mem::take(&mut self.ledger.cycle_eligible_turnover);
             if let Some(policy) = self.config.turnover_feedback {
                 if self.report.incomplete.is_none() && self.notices.is_empty() {
@@ -1340,8 +1760,15 @@ impl Replay<'_> {
             }
             self.report.realized_pnl += pnl;
         }
+        let closing_ready = self.config.hedged_exit.is_none()
+            || self
+                .cycle
+                .as_ref()
+                .is_none_or(|cycle| cycle.paired_at_ms.is_some());
         if self.net().is_zero()
-            && (self.notices.is_empty() || self.config.passive_offset.is_none())
+            && closing_ready
+            && (self.notices.is_empty()
+                || (self.config.passive_offset.is_none() && self.config.hedged_exit.is_none()))
             && self.cycle.as_ref().is_none_or(|cycle| !cycle.draining)
         {
             self.quote(now)?;
@@ -1370,6 +1797,16 @@ impl Replay<'_> {
     }
 
     fn risk(&mut self, now: u64) {
+        let [a, b] = self.ledger.positions;
+        if !a.is_zero()
+            && !b.is_zero()
+            && a.is_sign_negative() != b.is_sign_negative()
+            && let [Some(a_book), Some(b_book)] = [self.fresh(0, now), self.fresh(1, now)]
+        {
+            let gross = a.abs().min(b.abs()) * (a_book.mid() + b_book.mid());
+            let stats = &mut self.report.cycle_attribution;
+            stats.max_paired_gross_notional = stats.max_paired_gross_notional.max(gross);
+        }
         let net = self.net().abs();
         if net.is_zero() {
             if let Some(start) = self.unhedged_since.take() {
@@ -1514,6 +1951,13 @@ impl Replay<'_> {
             self.report.max_unhedged_ms = self.report.max_unhedged_ms.max(elapsed);
         }
         self.report.open_positions_base = self.ledger.positions;
+        self.report.cycle_attribution.paired_cycles_open_at_cutoff = usize::from(
+            !self.ledger.is_flat()
+                && self
+                    .cycle
+                    .as_ref()
+                    .is_some_and(|c| c.paired_at_ms.is_some()),
+        );
         self.report.fees = self.ledger.fees;
         let final_mark = self.final_mark()?;
         self.report.final_liquidation_pnl = final_mark.map(|(cash, _)| cash);
@@ -1633,6 +2077,7 @@ mod tests {
             entry_side: None,
             passive_offset: None,
             turnover_feedback: None,
+            hedged_exit: None,
             maker_fee_bps: Decimal::ONE,
             quote_notional: Decimal::from(100),
             latency_reserve_bps: Decimal::ZERO,
@@ -1739,6 +2184,180 @@ mod tests {
         cfg.start_ms = 3_590_000;
         cfg.end_ms = 3_615_000;
         assert!(cfg.validate(&VenueRegistry::default()).is_err());
+    }
+
+    #[test]
+    fn paired_wait_preserves_opening_deadline_and_closes_by_maker_when_hedged() {
+        let mut cfg = passive_config(HedgeSide::Buy);
+        cfg.passive_offset = None;
+        cfg.pair.limit_buffer_bps = 0.0;
+        cfg.pair.strategy = Strategy::BasisReversion;
+        cfg.pair.legs[0].venue = "arcus".into();
+        cfg.pair.legs[0].taker_fee_bps = d("4.5");
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.planner.min_net_edge_bps = 0.0;
+        cfg.require_net_edge = false;
+        cfg.maker_fee_bps = d("1.5");
+        cfg.hedged_exit = Some(HedgedExit {
+            max_hold_ms: 6_000,
+            min_saving_bps: Decimal::ZERO,
+            max_adverse_basis_bps: d("10"),
+            use_cycle_deadline: false,
+        });
+        let start = cfg.start_ms;
+        let run = |cfg: &MakerFirstConfig, opening_fill, hedge_fill| {
+            let mut rows = vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start,
+                    leg: 0,
+                    online: true,
+                },
+                books(cfg, start, "999.8"),
+                books(cfg, start + 100, "999.8"),
+                print_against(start + 110, HedgeSide::Buy, "999.7", opening_fill),
+                books(cfg, start + 210, "999.8"),
+            ];
+            if hedge_fill {
+                rows.push(books(cfg, start + 310, "999.8"));
+            }
+            rows.extend([
+                books(cfg, start + 1_800, "999.8"),
+                books(cfg, start + 2_300, "999.8"),
+                books(cfg, start + 2_400, "999.8"),
+                print_against(start + 2_410, HedgeSide::Sell, "1000.3", opening_fill),
+                books(cfg, start + 2_510, "999.8"),
+                books(cfg, start + 2_610, "999.8"),
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start + 2_611,
+                    leg: 0,
+                    online: false,
+                },
+                books(cfg, start + 3_050, "999.8"),
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ]);
+            run_maker_first(cfg, rows.into_iter().map(Ok), &VenueRegistry::default()).unwrap()
+        };
+        let paired = run(&cfg, "0.04", true);
+        let stats = &paired.cycle_attribution;
+        assert_eq!(stats.paired_maker_closes, 1, "{paired:?}");
+        assert_eq!(stats.forced_ioc_cycles, 0);
+        assert_eq!(stats.total_time_to_hedge_ms, 200);
+        assert_eq!(stats.total_hedge_to_close_ms, 2300);
+        assert_eq!(stats.closing_maker_fills, 1);
+        assert_eq!(stats.opening_maker_fees[0], d("0.0059988"));
+        assert_eq!(stats.closing_maker_fees[0], d("0.0060012"));
+        assert_eq!(paired.fees, d("0.012"));
+        assert_eq!(paired.net_pnl, Some(d("-0.004")));
+        assert_eq!(stats.max_paired_gross_notional, d("80.012"));
+
+        let unhedged = run(&cfg, "0.02", false);
+        assert_eq!(unhedged.exposure_stops, 1, "{unhedged:?}");
+        assert_eq!(unhedged.cycle_attribution.paired_maker_closes, 0);
+        assert_eq!(unhedged.cycle_attribution.hedged_time_stops, 0);
+        assert!(unhedged.cycle_attribution.forced_ioc_fees[0] > Decimal::ZERO);
+    }
+
+    #[test]
+    fn paired_exit_recovers_a_partial_maker_close_without_stranding_a_leg() {
+        let mut cfg = passive_config(HedgeSide::Buy);
+        cfg.passive_offset = None;
+        cfg.pair.limit_buffer_bps = 0.0;
+        cfg.pair.strategy = Strategy::BasisReversion;
+        cfg.pair.legs[0].venue = "arcus".into();
+        cfg.pair.legs[0].taker_fee_bps = d("4.5");
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].min_notional = d("30");
+        cfg.require_net_edge = false;
+        cfg.maker_fee_bps = d("1.5");
+        cfg.hedged_exit = Some(HedgedExit {
+            max_hold_ms: 6_000,
+            min_saving_bps: Decimal::ZERO,
+            max_adverse_basis_bps: d("10"),
+            use_cycle_deadline: false,
+        });
+        let t = cfg.start_ms;
+        let registry = VenueRegistry::default();
+        let opening = |cfg: &MakerFirstConfig| {
+            vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t,
+                    leg: 0,
+                    online: true,
+                },
+                books(cfg, t, "999.8"),
+                books(cfg, t + 100, "999.8"),
+                print_against(t + 110, HedgeSide::Buy, "999.7", "0.04"),
+                books(cfg, t + 210, "999.8"),
+                books(cfg, t + 310, "999.8"),
+            ]
+        };
+        let mut rows = opening(&cfg);
+        rows.extend([
+            books(&cfg, t + 1_800, "999.8"),
+            books(&cfg, t + 2_300, "999.8"),
+            books(&cfg, t + 2_400, "999.8"),
+            print_against(t + 2_410, HedgeSide::Sell, "1000.3", "0.02"),
+            books(&cfg, t + 2_510, "999.8"),
+            books(&cfg, t + 2_610, "999.8"),
+            books(&cfg, t + 4_120, "999.8"),
+            books(&cfg, t + 4_220, "999.8"),
+            MakerFirstEvent::TradeFeed {
+                at_ms: t + 4_221,
+                leg: 0,
+                online: false,
+            },
+            books(&cfg, t + 4_320, "999.8"),
+            MakerFirstEvent::End { at_ms: cfg.end_ms },
+        ]);
+        let recovered = run_maker_first(&cfg, rows.into_iter().map(Ok), &registry).unwrap();
+        assert_eq!(
+            recovered.cycle_attribution.closing_maker_fills, 1,
+            "{recovered:?}"
+        );
+        assert!(recovered.cycle_attribution.reduce_ioc_dust_avoided > 0);
+        assert_eq!(recovered.cycle_attribution.reduce_ioc_dust_fills, 0);
+        assert_eq!(recovered.cycle_attribution.forced_ioc_cycles, 1);
+        assert_eq!(recovered.open_positions_base, [Decimal::ZERO; 2]);
+        assert!(recovered.net_pnl.is_some(), "{recovered:?}");
+
+        let mut rows = opening(&cfg);
+        for offset in [1_800, 2_300, 2_400, 6_310, 6_410] {
+            let mut event = books(&cfg, t + offset, "999.8");
+            if let MakerFirstEvent::Book { books, .. } = &mut event {
+                books[1].bids[0].price = d("699.8");
+                books[1].asks[0].price = d("700.0");
+            }
+            rows.push(event);
+        }
+        rows.push(MakerFirstEvent::End { at_ms: cfg.end_ms });
+        let blocked = run_maker_first(&cfg, rows.into_iter().map(Ok), &registry).unwrap();
+        assert!(
+            blocked.cycle_attribution.paired_drain_blocked > 0,
+            "{blocked:?}"
+        );
+        assert_eq!(blocked.open_positions_base, [d("0.04"), d("-0.04")]);
+        assert_eq!(blocked.max_unhedged_ms, 200);
+        assert!(blocked.net_pnl.is_none());
+
+        cfg.pair.legs[0].min_contracts = d("0.02");
+        let mut rows = opening(&cfg);
+        rows.push(books(&cfg, t + 6_310, "999.8"));
+        let mut arrival = books(&cfg, t + 6_410, "999.8");
+        if let MakerFirstEvent::Book { books, .. } = &mut arrival {
+            books[0].bids[0].contracts = d("0.03");
+        }
+        rows.extend([
+            arrival,
+            books(&cfg, t + 6_510, "999.8"),
+            MakerFirstEvent::End { at_ms: cfg.end_ms },
+        ]);
+        let partial = run_maker_first(&cfg, rows.into_iter().map(Ok), &registry).unwrap();
+        assert_eq!(
+            partial.cycle_attribution.reduce_ioc_dust_fills, 1,
+            "{partial:?}"
+        );
+        assert_eq!(partial.open_positions_base, [d("0.01"), Decimal::ZERO]);
+        assert!(partial.net_pnl.is_none());
     }
 
     #[test]

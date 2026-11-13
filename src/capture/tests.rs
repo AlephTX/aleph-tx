@@ -362,6 +362,54 @@ fn arcus_bulk_config() -> CaptureConfig {
 }
 
 #[test]
+fn extended_uses_absolute_level_sizes_and_invalidates_a_sequence_gap() {
+    let mut cfg = config();
+    cfg.pair.legs[1].venue = "extended".into();
+    cfg.pair.legs[1].market = "ETH-USD".into();
+    cfg.legs[1].external_oracle = false;
+    cfg.legs[1].accept_receipt_time_for_oracle = false;
+    cfg.legs[1].funding = None;
+    let extended = |at, seq, kind, size| {
+        let levels = if kind == "SNAPSHOT" {
+            json!({
+                "m":"ETH-USD","b":[{"p":"1999.9","q":size},{"p":"1999.8","q":"2"}],
+                "a":[{"p":"2000.1","q":"3"}]
+            })
+        } else {
+            json!({
+                "m":"ETH-USD","b":[{"p":"1999.9","q":"-9","c":size},{"p":"1999.8","q":"9","c":"2"}],
+                "a":[{"p":"2000.1","q":"9","c":"3"}]
+            })
+        };
+        row(
+            "extended",
+            at,
+            json!({
+                "ts":at,"type":kind,"seq":seq,
+                "data": levels
+            }),
+        )
+    };
+    let (coverage, frames) = replay(
+        &cfg,
+        &[
+            extended(T, 1, "SNAPSHOT", "4"),
+            extended(T + 100, 2, "DELTA", "0"),
+            extended(T + 200, 4, "DELTA", "7"),
+            extended(T + 300, 5, "DELTA", "7"),
+            extended(T + 400, 1, "SNAPSHOT", "6"),
+            footer(T + 401),
+        ],
+    );
+    assert_eq!(coverage.extended_sequence_gaps, [0, 1]);
+    assert_eq!(coverage.leg_book_updates, [0, 3]);
+    assert_eq!(frames[0]["legs"][1]["book"]["bids"][0]["contracts"], "4");
+    assert_eq!(frames[1]["legs"][1]["book"]["bids"][0]["price"], "1999.8");
+    assert_eq!(frames[2]["legs"][1]["book"]["timestamp_ms"], 0);
+    assert_eq!(frames[4]["legs"][1]["book"]["bids"][0]["contracts"], "6");
+}
+
+#[test]
 fn arcus_and_bulk_snapshots_bind_market_and_use_source_and_context_times() {
     let mut config = arcus_bulk_config();
     config.legs[0].archived_contexts = vec![ArchivedMarketContext {

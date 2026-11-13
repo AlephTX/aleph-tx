@@ -762,18 +762,30 @@ impl InventoryNeutralMM {
                 self.inventory_age.last_attempt = Some(now);
                 self.execute_timeout_flatten(inputs.mid).await;
             }
-        } else if let Some((our_bid, our_ask, bounds)) =
-            self.calculate_optimal_quotes(&inputs, quoting_position)
-        {
-            self.execute_quoting_cycle(our_bid, our_ask, bounds, &inputs, shutdown)
-                .await;
-            if self.hedged_low_margin {
-                // perform_graceful_shutdown cleans Lighter, then
-                // hedge.finish() closes Hyperliquid against it.
-                anyhow::bail!("Low margin while hedged; unwinding both legs");
-            }
         } else {
-            self.cancel_all_orders().await;
+            let quote = self.calculate_optimal_quotes(&inputs, quoting_position);
+            #[cfg(feature = "research-replay")]
+            let changed_sides =
+                replay::recorded::attribute_quote(self, &inputs, quoting_position, quote);
+            if let Some((our_bid, our_ask, bounds)) = quote {
+                self.execute_quoting_cycle(
+                    our_bid,
+                    our_ask,
+                    bounds,
+                    &inputs,
+                    shutdown,
+                    #[cfg(feature = "research-replay")]
+                    changed_sides,
+                )
+                .await;
+                if self.hedged_low_margin {
+                    // perform_graceful_shutdown cleans Lighter, then
+                    // hedge.finish() closes Hyperliquid against it.
+                    anyhow::bail!("Low margin while hedged; unwinding both legs");
+                }
+            } else {
+                self.cancel_all_orders().await;
+            }
         }
 
         Ok(CycleOutcome::Quoted)
@@ -1827,6 +1839,28 @@ impl InventoryNeutralMM {
         }
     }
 
+    fn competing_directional_reserves(&self, inputs: &PricingInputs) -> [f64; 2] {
+        let regime = self.config.volatility_regime.map_or(0.0, |regime| {
+            regime.max_widen_bps * inputs.volatility_pressure
+        });
+        if !inputs.using_external_fair_value {
+            return [regime; 2];
+        }
+        let [bid_markout, ask_markout] = self.config.markout_reserve.map_or([0.0; 2], |policy| {
+            self.markout.side_reserve_bps(
+                Instant::now(),
+                self.config.maker_fee_bps
+                    + policy.close_cost_bps
+                    + self.config.min_profit_bps / 2.0,
+                policy.max_widen_bps,
+            )
+        });
+        [
+            bid_markout.max(-inputs.order_flow_bps).max(regime),
+            ask_markout.max(inputs.order_flow_bps).max(regime),
+        ]
+    }
+
     /// Avellaneda-Stoikov pricing logic (v6.0.0)
     ///
     /// Uses external fair value as pricing_mid. Kappa is used directly from config
@@ -1920,28 +1954,10 @@ impl InventoryNeutralMM {
                     || inputs.order_flow_bps != 0.0
                     || inputs.cross_market_bps != 0.0))
         {
-            let [bid_markout, ask_markout] = if inputs.using_external_fair_value {
-                self.config.markout_reserve.map_or([0.0; 2], |policy| {
-                    self.markout.side_reserve_bps(
-                        Instant::now(),
-                        self.config.maker_fee_bps
-                            + policy.close_cost_bps
-                            + self.config.min_profit_bps / 2.0,
-                        policy.max_widen_bps,
-                    )
-                })
-            } else {
-                [0.0; 2]
-            };
+            let [bid_competing, ask_competing] = self.competing_directional_reserves(inputs);
             // The reserves overlap. Use the largest estimate on each side.
-            let bid_reserve = bid_markout
-                .max(-inputs.order_flow_bps)
-                .max(-inputs.cross_market_bps)
-                .max(regime_reserve);
-            let ask_reserve = ask_markout
-                .max(inputs.order_flow_bps)
-                .max(inputs.cross_market_bps)
-                .max(regime_reserve);
+            let bid_reserve = bid_competing.max(-inputs.cross_market_bps);
+            let ask_reserve = ask_competing.max(inputs.cross_market_bps);
             // Keep the side pointing toward flat at its original price.
             let bid_reserve = if q >= 0.0 { bid_reserve } else { 0.0 };
             let ask_reserve = if q <= 0.0 { ask_reserve } else { 0.0 };
@@ -2008,6 +2024,7 @@ impl InventoryNeutralMM {
         bounds: MakerPriceBounds,
         inputs: &PricingInputs,
         shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
+        #[cfg(feature = "research-replay")] changed_sides: [bool; 2],
     ) {
         let mid = inputs.mid;
         self.reconcile_after_new_fill_if_needed().await;
@@ -2188,6 +2205,8 @@ impl InventoryNeutralMM {
         }
 
         if !actions.is_empty() {
+            #[cfg(feature = "research-replay")]
+            let _diagnostic_dispatch = replay::recorded::ChangedQuotes::open(changed_sides);
             match self.trading.execute_batch(actions).await {
                 Ok(result) => {
                     self.last_execution_batch_at = Some(Instant::now());

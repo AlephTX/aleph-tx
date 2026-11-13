@@ -14,6 +14,7 @@ or equity perpetuals, use the depth-aware [paper replay](PERP_RELATIVE_VALUE.md)
 | TradeXYZ | HIP-3 metadata and `xyz:SYMBOL` books via both Hyperliquid transports | Hyperliquid REST with resolved HIP-3 asset IDs | Offline pair replay |
 | Arcus | Public REST metadata and BBO, REST and WebSocket L2 capture | Standalone signed Ed25519 REST, order status and fills | Offline pair replay |
 | BULK | Public REST metadata and BBO, REST and WebSocket L2 capture | Read-only integration | Offline pair replay |
+| Extended | Public CLOB metadata, sequenced WebSocket L2 and public trades | Read-only capture | Offline maker-first replay |
 | Variational | Public v2 perpetual and swap statistics with source timestamps | Read-only indicative data | Market research |
 
 A liquidity domain identifies a matching book. Two frontends using the same
@@ -158,14 +159,37 @@ terminal-only screen.
 [Deribit daily settlement](https://support.deribit.com/hc/en-us/articles/29734325712413-Settlement) ·
 [OKX expiry futures](https://www.okx.com/en-us/help/expiry-futures)
 
+The public Deribit Box probe checks the signed legs of each open four-leg
+combination for common USDC settlement, fixing, expiry and multiplier.
+A long Box has a fixed gross expiry value equal to quantity times strike
+width. The probe calculates a depth-weighted debit and uses the native
+fill-or-kill limit to bound cash outflow. A positive net cash-flow bound
+also requires bounded delivery, financing and trading costs. Account
+margin remains unknown from public endpoints.
+
+```sh
+python3 scripts/probe_deribit_box.py
+```
+
+At 11:18:02 UTC on 2026-11-13, the probe checked 36 active USDC combinations,
+including four with four legs and complete leg metadata, against 3,162
+open USDC linear options. It found zero native Box candidates. The
+documented combo creation types omit Box. Block RFQ has a separate minimum
+size, quote and margin workflow. No account quote or margin evidence was
+collected.
+[Deribit combo types](https://support.deribit.com/hc/en-us/articles/31424954956061-Combo-Books) ·
+[Combo order types](https://support.deribit.com/hc/en-us/articles/25944794271261-Option-Combo-Order) ·
+[Linear USDC options](https://support.deribit.com/hc/en-us/articles/31424932728093-Linear-USDC-Options) ·
+[Fees](https://support.deribit.com/hc/en-us/articles/25944746248989-Fees) ·
+[Block RFQ](https://support.deribit.com/hc/en-us/articles/25951371614621-Deribit-Block-RFQ)
+
 ### Extended execution research
 
-Extended BTC-USD and ETH-USD returned active perpetual CLOB markets in the
-public API probe on 2026-11-13. Oasis received 40 consecutive public depth
-messages per market and an initial trade batch on each subscription.
-The short probe established feed access. A sealed, synchronized capture is
-required for a fill and cost comparison against Lighter.
-Market classification is per instrument.
+Oasis records Extended BTC-USD and ETH-USD active CLOB perpetuals with
+Lighter on one receipt clock. The initial sealed sample included
+sequenced depth and public trades for both markets.
+[Capture and replay](PERP_RECORDING.md#extended--lighter-synchronized-capture)
+
 Before using CLOB queue simulation, check `isRfq` and verify the public depth
 sequence, trade IDs, timestamps, fee tier and settlement currency. RFQ market
 depth on the standard stream is indicative. The dedicated RFQ stream carries

@@ -175,6 +175,7 @@ pub struct Record {
     event: String,
     received_at_ms: u64,
     available_at_ms: u64,
+    market: Option<String>,
     request_sent_at_ms: Option<u64>,
     payload: Option<serde_json::Value>,
 }
@@ -199,6 +200,7 @@ pub struct Coverage {
     pub lighter_clock_refreshes: usize,
     pub max_rejected_clock_lead_ms: [u64; 2],
     pub lighter_nonce_gaps: [usize; 2],
+    pub extended_sequence_gaps: [usize; 2],
     pub fresh_book_pair_frames: usize,
     pub synchronized_book_pair_frames: usize,
     pub fresh_reference_frames: usize,
@@ -266,23 +268,23 @@ impl CaptureConfig {
         );
         for (i, leg) in self.legs.iter().enumerate() {
             let venue = registry.get(&self.pair.legs[i].venue)?;
-            let external_context = matches!(venue.id.as_str(), "arcus" | "bulk");
+            let external_context = matches!(venue.id.as_str(), "arcus" | "bulk" | "extended");
             ensure!(
                 (venue.id == "lighter" && leg.lighter_market_id.is_some())
                     || ((venue.hyperliquid_dex.is_some() || external_context)
                         && leg.lighter_market_id.is_none()),
-                "capture requires Lighter, Hyperliquid/HIP-3, Arcus or BULK market terms"
+                "capture requires supported venue market terms"
             );
             if external_context {
                 ensure!(
                     !leg.external_oracle
                         && !leg.accept_receipt_time_for_oracle
                         && leg.funding.is_none(),
-                    "Arcus and BULK books use archived_contexts for oracle and funding input"
+                    "external depth uses archived_contexts for oracle and funding input"
                 );
                 ensure!(
                     !self.paper_entries || !leg.archived_contexts.is_empty(),
-                    "Arcus and BULK paper entries require archived venue context"
+                    "external paper entries require archived venue context"
                 );
             }
             ensure!(
@@ -474,6 +476,9 @@ impl<'a> Compiler<'a> {
                     | "arcus_snapshot"
                     | "bulk"
                     | "bulk_snapshot"
+                    | "extended"
+                    | "extended_trades"
+                    | "lighter_trades"
                     | "coinbase"
             ),
             "unsupported capture source"
@@ -491,7 +496,7 @@ impl<'a> Compiler<'a> {
                         .or_default() += 1;
                 }
                 for leg in &mut self.legs {
-                    leg.disconnect(&row.source);
+                    leg.disconnect(&row.source, row.market.as_deref());
                 }
                 if row.source == "coinbase" {
                     self.coinbase = None;
@@ -533,7 +538,13 @@ impl<'a> Compiler<'a> {
                                         .observe(row.available_at_ms - book.timestamp_ms);
                                 }
                             }
-                            Ok(feeds::Change::Gap) => self.coverage.lighter_nonce_gaps[i] += 1,
+                            Ok(feeds::Change::Gap) => {
+                                if row.source == "extended" {
+                                    self.coverage.extended_sequence_gaps[i] += 1;
+                                } else {
+                                    self.coverage.lighter_nonce_gaps[i] += 1;
+                                }
+                            }
                             Ok(feeds::Change::Clock(ahead)) => {
                                 self.coverage.clock_rejections[i] += 1;
                                 self.coverage.max_rejected_clock_lead_ms[i] =
@@ -545,7 +556,7 @@ impl<'a> Compiler<'a> {
                             Ok(feeds::Change::Other) => {}
                             Err(_) => {
                                 self.coverage.rejected_publications[i] += 1;
-                                leg.disconnect(&row.source);
+                                leg.disconnect(&row.source, row.market.as_deref());
                             }
                         }
                     }

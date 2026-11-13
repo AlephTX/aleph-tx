@@ -283,6 +283,38 @@ evidence, corporate actions, and the market terms used to size and price
 the simulated orders. The [Oasis replay results](PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12)
 document the research policies and the archived artifacts they consume.
 
+### Extended × Lighter synchronized capture
+
+Record both BTC and ETH books and trades on one receipt clock. Extended
+metadata must identify each requested market as an active perpetual CLOB.
+Each Extended market and stream has its own WebSocket and sequence.
+The compiler applies absolute quantities from depth deltas, deletes
+zero-quantity levels and waits for a fresh snapshot after a gap.
+Lighter trades use a separate connection from the clock refresh and retain
+only the public trade fields needed to model fills.
+[Extended market data](https://api.docs.extended.exchange/) ·
+[Lighter clock calibration](#lighter-subscription-clock-evidence)
+
+```sh
+feeder/perp-capture -lighter 1,0 -lighter-trades -lighter-clock-refresh 4m \
+  -extended BTC-USD,ETH-USD -coinbase BTC-USD,ETH-USD -duration 15m \
+  -output recordings/extended-lighter.ndjson
+```
+
+On Oasis, the initial 48-hour campaign started on 2026-11-13 at
+11:13:37 UTC. It seals approximately 15-minute shards after a 90-second
+transport check and reserves 10 GiB of free disk. Each segment manifest
+records source counts, sizes, times and checksums. The campaign snapshots
+public market metadata and fee schedules at launch and every six hours.
+The first full shard logged one Extended ETH trade read timeout during
+a quiet interval. Starting with shard 003, the collector uses WebSocket
+ping/pong to detect a failed Extended trade connection and permits
+healthy idle streams. The archive records the collector hash transition
+in `collector-versions.json`.
+Select the metadata version for the shard being replayed. The replay
+command and fee assumptions are in
+[execution attribution and hedged exits](PERP_RELATIVE_VALUE.md#execution-attribution-and-hedged-exits-2026-11-13).
+
 ## First recordings
 
 The 2026-11-06 UTC recordings contain about five minutes of ETH/BTC and

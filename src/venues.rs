@@ -80,6 +80,14 @@ impl Default for VenueRegistry {
                 ("arcus", "arcus", "arcus", None, RestClient, LimitOrderBook),
                 ("bulk", "bulk", "bulk", None, ReadOnly, LimitOrderBook),
                 (
+                    "extended",
+                    "extended",
+                    "extended",
+                    None,
+                    ReadOnly,
+                    LimitOrderBook,
+                ),
+                (
                     "variational",
                     "variational",
                     "variational",

@@ -34,6 +34,7 @@ type record struct {
 	ReceivedAt    int64           `json:"received_at_ms"`
 	AvailableAt   int64           `json:"available_at_ms"`
 	RequestSentAt int64           `json:"request_sent_at_ms,omitempty"`
+	Market        string          `json:"market,omitempty"`
 	Payload       json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -44,6 +45,7 @@ type lighterSubscription struct {
 
 type subscription struct {
 	source, url  string
+	market       string
 	requests     []any
 	coins        []string
 	interval     time.Duration
@@ -195,9 +197,6 @@ func subscriptions(lighter, hl, coinbase, arcus, bulk, arcusWS, bulkWS string, s
 		}
 		enabled = append(enabled, source)
 	}
-	if len(enabled) == 0 {
-		return nil, errors.New("configure at least one public market")
-	}
 	return enabled, nil
 }
 
@@ -293,7 +292,9 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 
 func connect(ctx context.Context, source subscription, emit func(record) error) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	conn, _, err := websocket.Dial(dialCtx, source.url, nil)
+	conn, _, err := websocket.Dial(dialCtx, source.url, &websocket.DialOptions{
+		HTTPHeader: http.Header{"User-Agent": {"AlephTX-public-capture/1.0"}},
+	})
 	cancel()
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -317,11 +318,17 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	defer stopKeepalive()
 
 	nonces := make(map[string]uint64)
+	var extendedSequence uint64
 	for {
-		readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		readCtx, cancelRead := ctx, func() {}
+		if source.source != "extended_trades" {
+			readCtx, cancelRead = context.WithTimeout(ctx, 30*time.Second)
+		}
+		// An inactive market can have no trades while the transport is healthy.
+		// The keepalive closes an unresponsive connection and wakes this read.
 		_, raw, err := conn.Read(readCtx)
 		received := time.Now()
-		cancel()
+		cancelRead()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
@@ -343,9 +350,23 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			continue
 		}
 		if header.Type == "error" || header.Channel == "error" {
-			return fmt.Errorf("subscription rejected: %.240s", raw)
+			return errors.New("public subscription rejected")
 		}
 		switch source.source {
+		case "extended", "extended_trades":
+			next, err := extendedPublication(raw, source, extendedSequence)
+			if err != nil {
+				return err
+			}
+			extendedSequence = next
+		case "lighter_trades":
+			if header.Type != "subscribed/trade" && header.Type != "update/trade" {
+				continue
+			}
+			raw, err = publicLighterTrades(raw)
+			if err != nil {
+				return err
+			}
 		case "arcus":
 			if header.Channel != "l2Orderbook" || !slices.Contains(source.coins, gjson.GetBytes(raw, "id").String()) ||
 				(header.Type != "subscribed" && header.Type != "channel_data") {
@@ -367,7 +388,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				}
 			}
 		}
-		row := record{Source: source.source, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
+		row := record{Source: source.source, Market: source.market, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
 		if source.source == "lighter" && strings.HasPrefix(header.Type, "subscribed/") {
 			channel := strings.Replace(header.Channel, ":", "/", 1)
 			if sent, ok := subscriptionSends[channel]; ok {
@@ -449,7 +470,7 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 				if errors.Is(err, errClockRefresh) {
 					event = "clock_refresh"
 				}
-				if emit(record{Source: source.source, Event: event, ReceivedAt: time.Now().UnixMilli()}) != nil {
+				if emit(record{Source: source.source, Market: source.market, Event: event, ReceivedAt: time.Now().UnixMilli()}) != nil {
 					return
 				}
 				if event == "clock_refresh" {
@@ -490,7 +511,7 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 			return err
 		}
 		if row.Event == "message" {
-			counts[row.Source]++
+			counts[row.Source+"\x00"+row.Market]++
 		}
 	}
 	if err := context.Cause(ctx); err != nil &&
@@ -498,8 +519,8 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 		return err
 	}
 	for _, source := range sources {
-		if counts[source.source] == 0 {
-			return fmt.Errorf("no publications from %s", source.source)
+		if counts[source.source+"\x00"+source.market] == 0 {
+			return fmt.Errorf("no publications from %s %s", source.source, source.market)
 		}
 	}
 	if err := write(record{Source: "collector", Event: "end", ReceivedAt: time.Now().UnixMilli()}); err != nil {
@@ -517,6 +538,8 @@ func capture(ctx context.Context, sources []subscription, out *os.File) error {
 
 func run() error {
 	lighter := flag.String("lighter", "", "comma-separated Lighter market IDs")
+	lighterTrades := flag.Bool("lighter-trades", false, "record Lighter public trades on a separate connection")
+	extended := flag.String("extended", "", "comma-separated active Extended CLOB perpetuals for public depth and trades")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
 	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
@@ -541,6 +564,29 @@ func run() error {
 	sources, err := subscriptions(*lighter, *hl, *coinbase, *arcus, *bulk, *arcusWS, *bulkWS, *snapshotInterval, *clockRefresh, *hlFastBook)
 	if err != nil {
 		return err
+	}
+	if *lighterTrades {
+		source := subscription{source: "lighter_trades", url: "wss://mainnet.zklighter.elliot.ai/stream"}
+		for _, raw := range strings.Split(*lighter, ",") {
+			id, err := strconv.ParseUint(raw, 10, 16)
+			if err != nil {
+				return errors.New("Lighter trades require Lighter market IDs")
+			}
+			source.requests = append(source.requests, lighterSubscription{Type: "subscribe", Channel: fmt.Sprintf("trade/%d", id)})
+		}
+		sources = append(sources, source)
+	}
+	if *extended != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		extra, err := extendedSubscriptions(ctx, *extended)
+		cancel()
+		if err != nil {
+			return err
+		}
+		sources = append(sources, extra...)
+	}
+	if len(sources) == 0 {
+		return errors.New("configure at least one public market")
 	}
 	out, err := os.OpenFile(*path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
