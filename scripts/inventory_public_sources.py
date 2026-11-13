@@ -21,7 +21,8 @@ import re
 import stat
 
 
-CAMPAIGN_PREFIXES = ("2026-", "extended-lighter-", "robinhood-")
+CAMPAIGN_PREFIXES = ("2026-", "extended-lighter-", "extended-index-smoke-", "robinhood-",
+                     "hyperliquid-public-", "public-venues-")
 PRIVATE_NAME = re.compile(
     r"(?:^|[-_.])(?:private|account|accounts|orders|fills|balance|balances|telemetry|"
     r"recovery|debug|auth|authenticated|signed|credential|credentials|secret|secrets|"
@@ -29,11 +30,12 @@ PRIVATE_NAME = re.compile(
 PUBLIC_METADATA_LEAVES = {
     "lighter": ("lighter", "market_terms"), "extended": ("extended", "market_terms"),
     "lighter_fees": ("lighter", "fees"), "extended_fees": ("extended", "fees"),
+    "xyz-markets.json": ("trade_xyz", "market_terms"), "io-markets.json": ("entropy", "market_terms"),
 }
 
 
 def public_metadata_hint(path, location, campaign_name):
-    if re.fullmatch(r"metadata-\d{3}", location):
+    if location == "metadata" or re.fullmatch(r"metadata-\d{3}", location):
         return PUBLIC_METADATA_LEAVES.get(path.name)
     if location != "root":
         return None
@@ -139,7 +141,7 @@ def inventory_public_sources(root):
             if child.is_symlink():
                 skipped["symlink"] += 1
             elif child.is_dir():
-                if child.name not in {"raw", "segments"} and not re.fullmatch(r"metadata-\d{3}", child.name):
+                if child.name not in {"raw", "segments", "metadata"} and not re.fullmatch(r"metadata-\d{3}", child.name):
                     skip_directory(child, "excluded_campaign_directory")
                     continue
                 for path in sorted(child.iterdir()):

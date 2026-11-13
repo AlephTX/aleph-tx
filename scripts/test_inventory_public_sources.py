@@ -1,4 +1,5 @@
 import gzip
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,6 +8,35 @@ from inventory_public_sources import inventory_public_sources
 
 
 class PublicInventoryTests(unittest.TestCase):
+    def test_strategy_independent_campaigns_and_exact_metadata_are_discoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for prefix in ("hyperliquid-public-10h", "extended-lighter-index-10h", "public-venues-10h"):
+                campaign = root / (prefix + "-synthetic")
+                metadata = campaign / "metadata"
+                metadata.mkdir(parents=True)
+                (campaign / "public.ndjson.gz").write_bytes(prefix.encode())
+                (campaign / "public.ndjson.gz.partial").write_bytes(b"active")
+                (metadata / "lighter").write_bytes(b"synthetic public market terms")
+                (metadata / "account.json").write_bytes(b"excluded")
+            report = inventory_public_sources(root)
+            self.assertEqual(report["unique_archives"], 3)
+            self.assertEqual(report["unique_metadata"], 1)
+            self.assertEqual(report["skipped_counts"]["incomplete_archive"], 3)
+            self.assertEqual(report["skipped_counts"]["private_indicating_name"], 3)
+
+    def test_hip3_market_metadata_has_distinct_venue_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "public-venues-synthetic" / "metadata"
+            metadata.mkdir(parents=True)
+            for dex in ('xyz', 'io'):
+                (metadata / f'{dex}-markets.json').write_text(json.dumps({'dex': dex}))
+            report = inventory_public_sources(root)
+            self.assertEqual(report['unique_metadata'], 2)
+            self.assertEqual({item['source_family_hint'] for item in report['artifacts']},
+                             {'entropy', 'trade_xyz'})
+
     def test_known_archives_are_deduplicated_without_counting_unknown_quality(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

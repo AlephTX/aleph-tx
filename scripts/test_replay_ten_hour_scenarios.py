@@ -7,10 +7,55 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from replay_ten_hour_scenarios import quant_input, strict_trade_rows, turnover_input
+from replay_ten_hour_scenarios import quant_input, strict_trade_rows, turnover_input, turnover_policies, robinhood_market_id
 
 
 class ContinuousSourceTests(unittest.TestCase):
+    def test_robinhood_profile_binds_both_domain_ids_and_hash(self):
+        profile = {'pair': {'legs': [{'venue': 'lighter', 'market': 'BTC'},
+                                    {'venue': 'lighter_robinhood', 'market': 'BTC'}]},
+                   'legs': [{'lighter_market_id': 1}, {'lighter_market_id': 42}]}
+        with patch('replay_ten_hour_scenarios.load', return_value=profile), \
+                patch('replay_ten_hour_scenarios.digest', return_value='a' * 64):
+            lineage = {'config_sha256': 'a' * 64}
+            self.assertEqual(robinhood_market_id(Path('synthetic'), lineage, 'BTC', 1), 42)
+            for symbol, core in (('ETH', 1), ('BTC', 2)):
+                with self.assertRaisesRegex(ValueError, 'domain mapping'):
+                    robinhood_market_id(Path('synthetic'), lineage, symbol, core)
+            with self.assertRaisesRegex(ValueError, 'compilation profile'):
+                robinhood_market_id(Path('synthetic'), {'config_sha256': 'b' * 64}, 'BTC', 1)
+            for identifier in (True, '42', -1, 65536):
+                profile['legs'][1]['lighter_market_id'] = identifier
+                with self.assertRaisesRegex(ValueError, 'native market ID'):
+                    robinhood_market_id(Path('synthetic'), lineage, 'BTC', 1)
+
+    def test_robinhood_uses_its_native_id_and_separate_action_delays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pair = {'legs': [{'venue': 'lighter', 'market': 'BTC'},
+                             {'venue': 'lighter_robinhood', 'market': 'BTC'}]}
+            frames = [{'pair': pair}] + [{'now_ms': at, 'legs': [
+                {'book': {'available_notional': '0'}}, {'book': {'available_notional': '0'}}]}
+                for at in (90, 150, 300)]
+            def events(archive, venue, market, leg):
+                self.assertEqual((venue, market), (('lighter', '1'), ('lighter_robinhood', '42'))[leg])
+                return iter({'kind': 'trade_feed', 'at_ms': at, 'leg': leg, 'online': True}
+                            for at in (80, 300))
+            window = {'start_ms': 100, 'end_ms': 285, 'drain_until_ms': 300}
+            with patch('replay_ten_hour_scenarios.unseal', return_value=io.StringIO(
+                    '\n'.join(map(json.dumps, frames)))), \
+                    patch('replay_ten_hour_scenarios.trade_events', side_effect=events), \
+                    patch('replay_ten_hour_scenarios.digest', return_value='a' * 64):
+                _, report = turnover_input(root, 'BTC', window, root / 'input.ndjson',
+                    public_archive=root, compiled=root/'tape', lighter_id=1,
+                    target='lighter_robinhood', target_market_id=42)
+            self.assertEqual(report['explicit_feed_states_by_leg'], [2, 2])
+            for _, policy in turnover_policies(pair, window, ('0', '0')):
+                self.assertEqual(policy['maker_cancel_delay_ms'], 300)
+                self.assertEqual(policy['taker_delay_ms'], [300, 300])
+            with self.assertRaisesRegex(ValueError, 'native market ID'):
+                turnover_input(root, 'BTC', window, root/'invalid.ndjson', target='lighter_robinhood')
+
     @contextmanager
     def turnover_fixture(self, arcus_end=300):
         with tempfile.TemporaryDirectory() as directory:

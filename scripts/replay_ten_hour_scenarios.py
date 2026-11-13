@@ -131,7 +131,26 @@ def quant_input(campaign, symbol, window, output, *, compiled=None, public_archi
 
 
 
-def turnover_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None, target="arcus"):
+def robinhood_market_id(config, lineage, symbol, core_market_id):
+    """Bind both domains to the exact profile that produced the paired tape."""
+    if digest(config) != lineage["config_sha256"]:
+        raise ValueError("Robinhood market mapping differs from compilation profile")
+    profile = load(config)
+    if ([(leg["venue"], leg["market"]) for leg in profile["pair"]["legs"]]
+            != [("lighter", symbol), ("lighter_robinhood", symbol)]
+            or profile["legs"][0]["lighter_market_id"] != core_market_id):
+        raise ValueError("unexpected Robinhood or Core trading domain mapping")
+    identifier = profile["legs"][1]["lighter_market_id"]
+    if type(identifier) is not int or not 0 <= identifier <= 65535:
+        raise ValueError("invalid Robinhood native market ID")
+    return identifier
+
+
+def turnover_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None,
+                   target="arcus", target_market_id=None):
+    if target == "lighter_robinhood" and (public_archive is None or type(target_market_id) is not int
+                                          or not 0 <= target_market_id <= 65535):
+        raise ValueError("Robinhood requires its archived native market ID and public archive")
     start, stop = window["start_ms"], window["drain_until_ms"]
     route = f"{symbol}-lighter-{target}"
     source = compiled or campaign / "results/final" / f"{route}.ndjson.zst"
@@ -169,7 +188,8 @@ def turnover_input(campaign, symbol, window, output, *, compiled=None, public_ar
                 events = strict_trade_rows(paths, terms["market"], leg, 2**63)
             else:
                 info[venue] = {"manifest.json": digest(public_archive / "manifest.json")}
-                market = str(lighter_id) if leg == 0 else terms["market"]
+                market = str(lighter_id) if leg == 0 else (
+                    str(target_market_id) if venue == "lighter_robinhood" else terms["market"])
                 events = trade_events(public_archive, venue, market, leg)
             for event in events:
                 if event["kind"] == "trade_feed":
@@ -232,8 +252,9 @@ def quant_policy(base, market, symbol, window, capital, size):
 
 def turnover_policies(pair, window, fees):
     start, end, stop = (window[k] for k in ("start_ms", "end_ms", "drain_until_ms"))
-    if pair["legs"][0]["venue"] != "lighter" or pair["legs"][1]["venue"] not in ("arcus", "extended", "hyperliquid"):
+    if pair["legs"][0]["venue"] != "lighter" or pair["legs"][1]["venue"] not in ("arcus", "extended", "hyperliquid", "lighter_robinhood"):
         raise ValueError("expected Core Lighter hedge and a supported target domain")
+    target_delay = 300 if pair["legs"][1]["venue"] == "lighter_robinhood" else 0
     for capital, size in CAPITAL_SIZES:
         for posture in POSTURES:
             for cost in (0, 4):
@@ -247,8 +268,8 @@ def turnover_policies(pair, window, fees):
                                       "eligible_until_ms": end, "max_cost_bps": str(cost)}}
                 yield label, {"pair": pair | {"legs": legs, "mode": mode},
                     "maker_leg": 1, "start_ms": start, "end_ms": stop,
-                    "transport_ms": 250, "fill_notice_ms": 100, "maker_cancel_delay_ms": 0,
-                    "taker_delay_ms": [300, 0], "trade_clock_guard_ms": 100,
+                    "transport_ms": 250, "fill_notice_ms": 100, "maker_cancel_delay_ms": target_delay,
+                    "taker_delay_ms": [300, target_delay], "trade_clock_guard_ms": 100,
                     "trade_delivery_grace_ms": 750, "quote_lifetime_ms": 800,
                     "reprice_ms": 100, "hold_ms": 15_000, "unhedged_timeout_ms": 2500,
                     "drain_ms": 15_000, "require_net_edge": True,
@@ -305,13 +326,15 @@ def main():
     parser.add_argument("--public-archive", type=Path)
     parser.add_argument("--compiled-dir", type=Path)
     parser.add_argument("--start-ms", type=int, help="UTC decision start shared with arbitrage research")
-    parser.add_argument("--turnover-venue", choices=("arcus", "extended", "hyperliquid"), default="arcus")
+    parser.add_argument("--turnover-venue", choices=("arcus", "extended", "hyperliquid", "lighter_robinhood"), default="arcus")
     parser.add_argument("--turnover-fees-bps", nargs=2, metavar=("MAKER", "TAKER"))
     args = parser.parse_args()
     if args.public_archive and not args.compiled_dir:
         parser.error("--public-archive requires --compiled-dir")
     if args.turnover_venue != "arcus" and not args.turnover_fees_bps:
         parser.error("provide explicit fees for the target trading domain")
+    if args.turnover_venue == "lighter_robinhood" and not args.public_archive:
+        parser.error("Robinhood requires a public archive and its hashed compilation profile")
     os.umask(0o077)
     out, campaign = args.output.resolve(), args.campaign.resolve()
     out.mkdir()
@@ -375,10 +398,15 @@ def main():
             period = (window["start_ms"], window["drain_until_ms"], "historical_reuse")
             turnover_book = compiled if args.turnover_venue == "hyperliquid" else (
                 args.compiled_dir / f"{route}.ndjson.zst" if args.compiled_dir else None)
+            target_market_id = None
             if args.public_archive and turnover_book != compiled:
-                verify_compiled(args.public_archive, turnover_book)
+                lineage = verify_compiled(args.public_archive, turnover_book)
+                if args.turnover_venue == "lighter_robinhood":
+                    target_config = args.compiled_dir / f"{route}.config.json"
+                    target_market_id = robinhood_market_id(target_config, lineage, symbol, market["id"])
             pair, provenance = turnover_input(campaign, symbol, window, out / "inputs" / f"{route}-{period[0]}.ndjson",
-                compiled=turnover_book, public_archive=args.public_archive, lighter_id=market["id"], target=args.turnover_venue)
+                compiled=turnover_book, public_archive=args.public_archive, lighter_id=market["id"],
+                target=args.turnover_venue, target_market_id=target_market_id)
             report["source_evidence"][symbol]["turnover"] = provenance
             if not provenance["explicit_feed_states_by_leg"][1]:
                 raise ValueError("missing_public_trade_feed_lifecycle")

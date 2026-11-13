@@ -65,6 +65,18 @@ same decision window. `replay_funding_campaign.py --public-archive` includes the
 funding history using its original availability times. Existing campaign inputs
 remain supported.
 
+For Robinhood turnover, use `--turnover-venue lighter_robinhood` and explicit
+`--turnover-fees-bps MAKER TAKER`. Keep the paired `BTC-lighter-lighter_robinhood.config.json`
+or `ETH-lighter-lighter_robinhood.config.json` alongside its corresponding
+`.ndjson.zst` tape. Its hash must match the compiler provenance, and its
+Core native market ID must match the baseline profile. Robinhood public
+prints use the target profile's own native market ID, never the Core ID.
+The current runner assumes 300 ms target cancel/Taker delay plus transport;
+domain-specific fees, latency, collateral and reward eligibility remain
+qualification requirements. This offline addition does not change an
+already frozen replay job. See the
+[current research checkpoint](RESEARCH_PROGRESS_2026_11_14.md).
+
 ## Compact rebuilt inputs
 
 Use the pinned historical generator and source files to reproduce the

@@ -5,6 +5,11 @@ AlephTX. It records provenance and intended use. It does not certify that
 all sources are recording, contain a complete history, or support profitable
 execution. Consult the sealed campaign inventory before each new study.
 
+The [November 14 checkpoint](RESEARCH_PROGRESS_2026_11_14.md) records the
+expanded Entropy/TradeXYZ/Arcus/BULK collection, fast-book supplement,
+remaining channel gaps and updated immutable inventory. It distinguishes
+strategy-independent capture from consolidation of older campaign files.
+
 Public research archives and their detailed manifests stay on Oasis under
 `~/aleph-tx-research`, outside Git. Private account material stays in protected
 storage and out of public inventories and tool output. Commit only reviewed
