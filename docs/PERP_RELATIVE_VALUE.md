@@ -219,6 +219,41 @@ drains the pair on timeout and preserves any residual at the cutoff.
 [Cross-exchange market making](https://hummingbot.org/strategies/v1-strategies/cross-exchange-market-making/) ·
 [Quoting under adverse selection](https://arxiv.org/abs/2508.20225)
 
+Set `entry_side` to `"buy"` or `"sell"` to isolate an opening direction.
+Omit it to compare both directions at each decision. The optional
+`passive_offset` policy waits for a same-venue post-only reduction while
+confirmed inventory fits `max_net_notional` and `max_wait_ms`. The
+entry check still requires protective hedge depth for the opening side.
+An edge-gated reduction prices the remaining close against the cash
+already booked. The wait budget includes maker transport, cancel delay
+and the late-print window. At the boundary the runner cancels the
+reduction, lets its delivery window expire and sends a protected IOC
+for the confirmed residual. The hold and exposure stops still govern
+the emergency close. Any remaining position stays visible in the report.
+[Inventory internalization and external hedging](https://doi.org/10.1111/mafi.12367)
+
+An edge-gated offset may supply `close_probability` as `[buy, sell]`
+for the two opening directions. The expected cash after the first
+fill weights the two-maker close and the fallback using these inputs.
+The fallback prices a taker close on the maker leg and both protected
+hedge IOCs. The runner waits for a passive reduction when its expected
+cash beats immediate hedging and passes the entry floor. The counts
+of initiated and completed passive cycles include open attempts in
+the denominator. Estimate probabilities on earlier windows for the
+same route, side, wait budget and latency.
+[State-dependent limit-order fills](https://arxiv.org/abs/2403.02572)
+
+Maker-first replay also accepts `pair.mode.kind = "turnover"` with
+the edge policy enabled. Opening checks apply the remaining gross
+turnover, fee and cash-loss budgets to the modeled round trip and IOC
+fallback. The incentive variant ranks by the conservative cost per
+unit of turnover on the reviewed venue. It credits simulated fills
+within the eligibility interval after the cycle finishes flat. If
+actual simulated costs breach the budget, entry stops and the existing
+exit and recovery rules manage any remaining exposure. The projected
+budgets can be exceeded by later price moves. The report keeps cost
+unavailable for unresolved windows and assigns zero value to rewards.
+
 The report counts maker and IOC fills separately, records signed IOC
 slippage against the submit touch, separates depth impact and fees, and
 measures time with net exposure from the maker print's receipt. Public L2
@@ -325,6 +360,51 @@ The compiled tapes and per-window reports are archived on Oasis.
 | Maker-first execution | `f93dfc060fac81d13cad47b41840f0bbb7b04927b1108fa9d9ae4dd5b43e0c7e` |
 | Witnessed carry | `cb9d28c8390c5556b2816c92fed53ddaeaeac417209f46e1e4ffb444a5e314d6` |
 | Capture and contract evidence | `c4b118e90fde5cd186f489c4f3980db0c117489e8145e2860aec0e030d533604` |
+
+### Passive inventory offset, 2026-11-13
+
+Oasis run `passive-offset-aa493f40a3f7` evaluated 09:00–12:00 Beijing
+time, with 10:00–12:00 as holdout. It used fresh public prints and
+100 ms books for BTC and ETH on Lighter–Hyperliquid and Lighter–Arcus.
+The $100 quote target, $105 passive inventory limit, four-second wait,
+seven-second exposure stop and 250 ms modeled transport were fixed.
+The comparison kept the fees, risk limits and emergency timeouts
+identical between immediate and passive-offset touch policies. The research
+also replayed the two opening directions independently.
+
+The 60 holdout windows include 12 flat windows with usable coverage.
+Eight had fills and lost $11.01 in aggregate. The other four were
+the Arcus edge cases and had zero fills. Each Arcus direction below
+had one complete hour. Its other hour ended with residual inventory.
+
+| Arcus maker and Lighter hedge | Long-first cost (bps of Arcus maker turnover) | Short-first cost (bps of Arcus maker turnover) |
+| --- | ---: | ---: |
+| BTC | 8.57 | 7.91 |
+| ETH | 11.87 | 8.20 |
+
+On Lighter, the edge-gated passive policy booked 13 two-maker cycles
+across the four holdout routes. Those cycles earned $0.237 on $2,415
+of maker turnover. The same policies lost $7.17 across all closed
+cycles and left residuals in every full window. Forced exits accounted
+for 79 of 94 closed cycles. The BTC Lighter maker with Arcus hedge and
+the passive touch policy finished both holdout hours with matched base
+positions still open. It recorded 396 fills per hour and $10.59 of
+losses on closed cycles. The edge-gated Lighter policies finished with
+single-leg residuals worth up to $4.83 at the last displayed mid.
+The two-maker cycles were 13.8% of closed cycles. At the two groups'
+observed average gains and losses, break-even on closed cycles alone
+would require 83.4% two-maker cycles. Improving the entry estimate
+requires predicting the chance of a passive offset within the wait
+budget and pricing the fallback using executable depth and fees.
+
+For the preceding six witnessed funding slots, BTC's positive funding
+direction was long Lighter and short Hyperliquid in all six. ETH
+favored short Lighter and long Hyperliquid in four. A direction selected
+after settlement is a diagnostic. The causal funding replay retained
+the executable fee and depth gates and placed zero entries.
+
+The aggregate report SHA-256 is
+`78e55272464ab6c071de1b4317eeab38afc72b24af36cfac76a4d7fdabd5e8bc`.
 
 ## Entropy and venue rewards
 
@@ -642,6 +722,151 @@ The study archives configs, binary hashes and trial reports on Oasis.
 The SHA-256 values for `maker-report.json` and `signal.json` are
 `a0b3c940262cab1c121d982d5631efaba94558152ca3573ca19ff8e1bd275ceb` and
 `acc4e811b8596abf4252c8024478254bea46dbef8e621d2d2ac38ff7ef84d013`.
+
+## Adaptive quoting and turnover replay, 2026-11-13
+
+Oasis study `adaptive-strategy-07480bdf7830` used BTC and ETH public
+trades and 100 ms compiled depth. Comparison data spans 09:00–12:00
+Beijing time. The chronological holdout spans 12:00–13:50. The cutoff
+uses the common sealed depth and trade coverage. The script verifies
+trade receipts through the cutoff for Lighter, Hyperliquid and Arcus.
+Each execution window is bounded by the venues' hourly settlements.
+The study uses 250 and 500 ms one-way transport scenarios, plus the
+Lighter tier's venue action delays. All PnL is in modeled quote units,
+with Arcus USD treated at par with USDC for the crypto pair.
+[Lighter fees and action delays](https://docs.lighter.xyz/trading/trading-fees) ·
+[Hyperliquid fees](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees)
+
+### Inventory-neutral quant
+
+`maker_replay` runs the production quote loop with the public books,
+aggressor trades, a simulated order tracker and a $50 quote target on
+$1,000 starting equity. The minute-range candidate uses five completed
+external midpoint ranges, an 8 bps trigger, a 3 bps maximum widening and
+a 0.5 minimum size scale on the inventory-adding side. The comparison
+keeps the corresponding fee tier and 2 or 12 bps profit floor fixed.
+[Crypto volatility and liquidity cycles](https://arxiv.org/abs/2109.12142) ·
+[Configuration](CONFIGURATION.md)
+
+All 64 holdout windows finished flat. The minute-range policy reduced
+time-weighted absolute inventory by 3.2–55.7% across the 16 matched
+comparisons and improved PnL in eight. The figures below use the Standard
+tier and a 12 bps floor. Each row combines two windows totaling 1.831 hours.
+
+| Market | Transport | Control PnL/h | Minute range PnL/h | Minute range fills/h | Mean inventory control → minute range |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BTC | 250 ms | −$0.008 | −$0.035 | 22.4 | $18.29 → $11.95 |
+| BTC | 500 ms | −$0.065 | −$0.147 | 23.5 | $18.33 → $11.24 |
+| ETH | 250 ms | +$0.215 | +$0.160 | 29.5 | $21.63 → $12.32 |
+| ETH | 500 ms | −$0.011 | +$0.014 | 36.6 | $23.02 → $12.53 |
+
+The ETH candidate is positive at both modeled delays in this sample.
+Its matched control earns more at 250 ms. All Premium candidates and
+all 2 bps candidates lost money. The volatility policy remains opt-in.
+
+### Cross-venue arbitrage
+
+The $100 maker-first profiles compare an immediate hedge, a passive
+offset scored at displayed prices, and the same offset scored with
+estimated completion and protected fallback costs. The estimate uses
+only comparison-window starts and full passive closes by route, opening
+direction and latency. It uses a one-sided Wilson lower estimate with
+zero credit below 20 attempts. Serially dependent orders make this a
+conservative scoring heuristic. The Lighter maker estimates ranged
+from 1.3% to 11.1%. Arcus and Hyperliquid maker samples fell below the
+minimum for both directions. The maximum passive wait is five seconds.
+[Cross-venue price formation](https://arxiv.org/abs/2108.09750) ·
+[Queue state and limit-order fills](https://arxiv.org/abs/2403.02572)
+
+The calibrated variant and the immediate-hedge control each finished
+32 holdout windows flat with zero fills. Lighter maker estimates of the
+best net entry ranged from −6.51 to −2.13 bps across the four market
+routes. Some Hyperliquid maker quotes cleared the price gate and had no
+simulated executions. The displayed-price offset generated 490 maker
+and 782 IOC fills across its 32 windows. Fifteen ended with residuals.
+Its 303 closed cycles lost $22.45, including cycles in the incomplete
+windows. The 17 complete windows lost $4.06 in aggregate. Its largest
+residual exposure persisted for about 60 minutes, so the exit timer
+alone cannot bound realized exposure.
+
+The sequential IOC basis control also finished all 16 windows without
+entries. On Lighter–Hyperliquid the best priced edge was −14.11 bps for
+BTC and −14.44 bps for ETH. The Arcus routes failed the fresh venue
+oracle gate before pricing an entry. The same evidence gap blocked all
+24 Arcus sequential IOC turnover trials. The maker-first Arcus rows
+measure short-horizon depth and trade execution between settlements.
+
+A separate six-hour funding run verified six Lighter–Hyperliquid
+settlements for each asset. All eight configurations finished with
+zero entries. The best Standard net entry estimates were −15.23 bps
+for BTC and −16.60 bps for ETH with execution costs and the basis
+reserve. The archived funding report retains each settlement.
+[Perpetual funding and transaction-cost bounds](https://arxiv.org/abs/2212.06888)
+
+### Turnover with an Arcus maker
+
+The replay tests a $2,000 gross turnover budget, a $1 projected fee
+budget and a $0.50 cash-loss entry stop per window. The unit cost uses
+cash PnL across both legs and simulated Arcus turnover in flat cycles.
+At 0 and 4 bps caps all windows finished without fills. The best
+projected maker-first cost was 5.51 bps for BTC and 5.57 bps for ETH.
+At 8 bps both maker-first variants produced identical executions in
+this sample. All trading windows finished flat.
+
+| Market | Transport | Modeled Arcus turnover | Net PnL | Fees | Cost per Arcus turnover | Fills/h | Longest net exposure |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| BTC | 250 ms | $1,897 | −$0.665 | $0.569 | 3.50 bps | 30.0 | 9.56 s |
+| BTC | 500 ms | $1,824 | −$0.771 | $0.547 | 4.22 bps | 30.0 | 12.49 s |
+| ETH | 250 ms | $892 | −$0.382 | $0.268 | 4.28 bps | 15.8 | 9.44 s |
+| ETH | 500 ms | $1,220 | −$0.814 | $0.366 | 6.67 bps | 22.9 | 10.30 s |
+
+All 46 completed cycles in these four configurations used a timed or
+risk-driven close. The seven-second exposure stop starts draining.
+Cancel and IOC completion can extend the actual exposure past that time.
+The model assigns zero value to points. Live reward eligibility depends
+on Arcus program rules and venue-reported credit.
+[Arcus Points](https://arcus.xyz/blog/introducing-arcus-points) ·
+[Protocol Terms](https://arcus.xyz/legal/protocol-terms)
+
+The separate NVDA regression on archived Entropy–Lighter and
+Entropy–TradeXYZ books reproduced zero completed pairs at 500 and 800 ms.
+At an 8 bps turnover cap, four cases recovered the first fill after the
+second leg missed its deadline. Recovery took 1.59–2.52 seconds of net
+exposure and lost $0.014–$0.046 per case, with zero modeled eligible
+turnover. The current BTC/ETH study uses the four qualified Lighter
+routes. Entropy and TradeXYZ require a matching listed contract, and BULK
+needs qualified market terms and public prints for a maker comparison.
+
+### Reproduce
+
+The study directory on Oasis contains the compiled tapes, frozen per-run
+configs, reports and binary identities. Its comparison tape is under the
+earlier `passive-offset-56c7dc666408/compiled` directory. Run the study with
+Python 3.11 or newer and `zstd`.
+
+```sh
+cargo build --locked --release --features research-replay --bin cross_venue --bin maker_replay
+quality="$HOME/aleph-tx-research/2026-11-12-quality-15gb"
+parent="$HOME/aleph-tx-research/2026-11-12-20h-full/results/production-study-2effb88e8816"
+study="$parent/adaptive-strategy-07480bdf7830"
+result=$(mktemp -d "$parent/replay-XXXXXXXX")
+python3 scripts/replay_strategy_campaign.py "$quality" "$study/market-terms.json" \
+  "$parent/passive-offset-56c7dc666408/compiled" "$study/compiled" \
+  target/release/cross_venue target/release/maker_replay config.example.toml "$result/strategy" \
+  --begin-ms 1794531600000 --holdout-ms 1794542400000 --end-ms 1794549000000
+```
+
+The archived aggregate report checksums are SHA-256.
+
+| Report | SHA-256 |
+| --- | --- |
+| Production maker replay | `2f4b74370e416d2a688278815c0362d13151c1d80055f4f23299f073923110c0` |
+| Maker-first arbitrage and turnover | `a725178638f4720add4e6989af2b4f65eb993e27e906021cb0665b2f6f737242` |
+| Sequential IOC controls | `049ebf499869a273b22b1d008ed4d62434e23f2c6822a82e385bad3002e3c15b` |
+| Completion probability calibration | `c7e1be25d074f6136b728445837891e0cb48e2b1c89588ccd66766335713133f` |
+| Witnessed funding | `0aa133bfee6b72b5c9ab397cd10bcfd812e57e296a8cc39830f9d4b8f22634b4` |
+| NVDA recovery regression | `888adb4e271fa1d093c6fe7f22fa14aee60918f4ead3ee3aed2cbfa991ca535a` |
+| Input and binary evidence | `84239d0b136539cdbd555be4ed22b74d1c1eaac63ac8ea6dcb2848908fe2ae79` |
 
 ## Research acceptance
 

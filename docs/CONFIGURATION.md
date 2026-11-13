@@ -50,14 +50,26 @@ changes in the native Hyperliquid best prices and displayed sizes.
 `half_life_ms` sets the decay and `max_widen_bps` bounds the price
 reserve on the side exposed to the pressure. The estimate advances
 once per fresh publication and resets on stale books or a clock
-regression. The quote loop takes the larger of the order-flow and
-fill-markout reserves on each side and preserves the spread cap and
-the quote toward flat.
+regression. The quote loop takes the largest applicable reserve on
+each side and preserves the spread cap and the quote toward flat.
 Tune `min_cycle_interval_ms` against eligible fills, net PnL and
 inventory at the modeled venue delays.
 [Order flow imbalance](https://doi.org/10.1093/jjfinec/nbt003) ·
 [Cross-venue crypto price discovery](https://arxiv.org/abs/2108.09750) ·
 [Oasis cadence comparison](PERP_RELATIVE_VALUE.md#quote-cadence-and-hedge-recovery-2026-11-13)
+
+The optional `[inventory_neutral_mm.volatility_regime]` table uses the
+last five completed one-minute ranges from native Hyperliquid midpoints.
+The strategy samples at most once per receipt-time second and requires
+45 fresh observations per minute. An incomplete minute resets warmup.
+Pressure rises from zero at `range_trigger_bps` to full at twice that
+range. It widens inventory-adding quotes by up to `max_widen_bps` and
+scales their size down to `min_size_scale`. This adjustment uses the
+root mean square of the five ranges. Flat inventory allows it on both
+sides. Position and margin controls still apply to every quote.
+The example profile leaves this option disabled.
+[Crypto volatility and liquidity cycles](https://arxiv.org/abs/2109.12142) ·
+[Oasis strategy comparison](PERP_RELATIVE_VALUE.md#adaptive-quoting-and-turnover-replay-2026-11-13)
 
 ## Credentials and network
 

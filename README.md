@@ -108,7 +108,8 @@ The 20-hour Oasis campaign measures cross-venue basis and funding alongside
 a production-quote replay on public books and trades. Its holdout reports
 include fee scenarios, entry rejections, fill costs and residual inventory.
 Prospective venue rewards have zero value in the model.
-[Oasis holdout results](docs/PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12)
+[20-hour holdout](docs/PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12) ·
+[Adaptive quoting and turnover](docs/PERP_RELATIVE_VALUE.md#adaptive-quoting-and-turnover-replay-2026-11-13)
 
 ## Release gates for new execution routes
 

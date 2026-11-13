@@ -155,7 +155,7 @@ def strategy_config(base, market, symbol, capital, maker, overrides):
     } | overrides
 
 
-def run_case(engine, out, base, market, capital, item):
+def run_case(engine, out, base, market, capital, item, *, venue_cancel_delay=0, venue_taker_delay=0):
     symbol, period, name, delay = item
     maker, taker, change = SCENARIOS[name]
     label = f"{symbol}-{period['start_ms']}-{name}-{delay}ms"
@@ -165,6 +165,7 @@ def run_case(engine, out, base, market, capital, item):
         "strategy": strategy_config(base, market, symbol, capital, maker, change),
         **{k: period[k] for k in ("start_ms", "end_ms", "drain_until_ms")},
         "initial_equity": capital, "order_entry_ms": delay, "order_response_ms": RESPONSE_MS,
+        "venue_cancel_delay_ms": venue_cancel_delay, "venue_taker_delay_ms": venue_taker_delay,
         "trade_clock_guard_ms": 100, "taker_fee_bps": taker, "depth_participation": 0.25,
         "min_contracts": float(market["min_base_amount"]), "min_notional": float(market["min_quote_amount"]),
     }

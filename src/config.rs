@@ -395,6 +395,9 @@ pub struct InventoryNeutralMMConfig {
     /// Reserve for short-horizon pressure in the external Hyperliquid book.
     #[serde(default)]
     pub order_flow_reserve: Option<OrderFlowReserveConfig>,
+    /// Adjust inventory-adding quotes using completed external price ranges.
+    #[serde(default)]
+    pub volatility_regime: Option<VolatilityRegimeConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -410,6 +413,14 @@ pub struct MarkoutReserveConfig {
 pub struct OrderFlowReserveConfig {
     pub half_life_ms: u64,
     pub max_widen_bps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolatilityRegimeConfig {
+    pub range_trigger_bps: f64,
+    pub max_widen_bps: f64,
+    pub min_size_scale: f64,
 }
 
 fn positive(name: &str, values: &[f64]) -> anyhow::Result<()> {
@@ -552,6 +563,14 @@ impl InventoryNeutralMMConfig {
                 "{name}: invalid order flow reserve"
             );
         }
+        if let Some(regime) = self.volatility_regime {
+            anyhow::ensure!(
+                (0.01..=1_000.0).contains(&regime.range_trigger_bps)
+                    && (0.0..=self.max_spread_bps).contains(&regime.max_widen_bps)
+                    && (0.0..=1.0).contains(&regime.min_size_scale),
+                "{name}: invalid volatility regime"
+            );
+        }
         anyhow::ensure!(
             self.min_portfolio_scale <= self.max_portfolio_scale,
             "{name}: portfolio scale bounds reversed"
@@ -678,6 +697,7 @@ impl Default for InventoryNeutralMMConfig {
             markout_threshold_bps: default_markout_threshold_bps(),
             markout_reserve: None,
             order_flow_reserve: None,
+            volatility_regime: None,
         }
     }
 }

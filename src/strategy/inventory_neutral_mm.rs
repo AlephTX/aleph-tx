@@ -24,6 +24,7 @@ mod markout;
 mod pricing;
 #[cfg(any(test, feature = "research-replay"))]
 mod replay;
+mod volatility_regime;
 use components::{
     QuoteCycleDecision, QuoteTarget, RiskSnapshot, apply_risk_limits, decide_quote_cycle,
     inventory_deadband_size, inventory_skew_ratio, position_for_quoting, residual_exposure_abs,
@@ -422,6 +423,7 @@ struct PricingInputs {
     as_score: f64,
     using_external_fair_value: bool,
     order_flow_bps: f64,
+    volatility_pressure: f64,
 }
 
 /// Result of one quoting-loop iteration.
@@ -450,6 +452,7 @@ pub struct InventoryNeutralMM {
     sigma: TimeScaledVolatility,
     basis: BasisTracker,
     order_flow: OrderFlow,
+    volatility_regime: volatility_regime::VolatilityRegime,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -545,6 +548,7 @@ impl InventoryNeutralMM {
             sigma: TimeScaledVolatility::new(),
             basis: BasisTracker::new(config.basis_tau_secs, config.max_basis_bps),
             order_flow: OrderFlow::default(),
+            volatility_regime: volatility_regime::VolatilityRegime::default(),
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -758,7 +762,7 @@ impl InventoryNeutralMM {
         } else if let Some((our_bid, our_ask, bounds)) =
             self.calculate_optimal_quotes(&inputs, quoting_position)
         {
-            self.execute_quoting_cycle(our_bid, our_ask, bounds, inputs.mid, shutdown)
+            self.execute_quoting_cycle(our_bid, our_ask, bounds, &inputs, shutdown)
                 .await;
             if self.hedged_low_margin {
                 // perform_graceful_shutdown cleans Lighter, then
@@ -939,6 +943,7 @@ impl InventoryNeutralMM {
         our_ask: f64,
         mid: f64,
         risk: &RiskSnapshot,
+        volatility_pressure: f64,
     ) -> Option<QuoteTarget> {
         let spread_bps = ((our_ask - our_bid) / mid) * 10000.0;
         self.telemetry.update_spread_size(spread_bps);
@@ -959,10 +964,20 @@ impl InventoryNeutralMM {
             self.micro.adverse_selection_score(),
             self.config.adverse_selection_threshold,
         );
-        let bid_size =
-            components::round_down_to_step(bid_size * toxicity_scale, self.config.step_size);
-        let ask_size =
-            components::round_down_to_step(ask_size * toxicity_scale, self.config.step_size);
+        let regime_scale = self.config.volatility_regime.map_or(1.0, |regime| {
+            1.0 - volatility_pressure * (1.0 - regime.min_size_scale)
+        });
+        let position = risk.position_for_quoting;
+        let bid_scale = if position >= 0.0 { regime_scale } else { 1.0 };
+        let ask_scale = if position <= 0.0 { regime_scale } else { 1.0 };
+        let bid_size = components::round_down_to_step(
+            bid_size * toxicity_scale * bid_scale,
+            self.config.step_size,
+        );
+        let ask_size = components::round_down_to_step(
+            ask_size * toxicity_scale * ask_scale,
+            self.config.step_size,
+        );
 
         Some(QuoteTarget {
             bid_price: our_bid,
@@ -1765,6 +1780,15 @@ impl InventoryNeutralMM {
                 reserve.half_life_ms,
             ) * reserve.max_widen_bps
         });
+        let volatility_pressure = self.config.volatility_regime.map_or(0.0, |regime| {
+            self.volatility_regime.observe(
+                select_exchange_bbo(exchanges, EXCH_HYPERLIQUID).as_ref(),
+                now_ns,
+                self.config.external_staleness_ms,
+            );
+            self.volatility_regime
+                .pressure(now_ns, regime.range_trigger_bps)
+        });
         // Until the time-scaled estimate warms up, fall back to the per-sample
         // figure; both are ~1e-4 for liquid perps at sub-second sampling.
         let sigma_per_sqrt_sec = self.sigma.sigma().unwrap_or(vol_bps / 10000.0);
@@ -1780,6 +1804,7 @@ impl InventoryNeutralMM {
             as_score,
             using_external_fair_value: using_external,
             order_flow_bps,
+            volatility_pressure,
         }
     }
 
@@ -1867,10 +1892,14 @@ impl InventoryNeutralMM {
             self.micro.momentum_bps(),
             self.config.momentum_skew_scale,
         );
-        if inputs.using_external_fair_value
-            && (self.config.markout_reserve.is_some() || inputs.order_flow_bps != 0.0)
+        let regime_reserve = self.config.volatility_regime.map_or(0.0, |regime| {
+            regime.max_widen_bps * inputs.volatility_pressure
+        });
+        if regime_reserve > 0.0
+            || (inputs.using_external_fair_value
+                && (self.config.markout_reserve.is_some() || inputs.order_flow_bps != 0.0))
         {
-            let [bid_markout, ask_markout] =
+            let [bid_markout, ask_markout] = if inputs.using_external_fair_value {
                 self.config.markout_reserve.map_or([0.0; 2], |policy| {
                     self.markout.side_reserve_bps(
                         Instant::now(),
@@ -1879,10 +1908,13 @@ impl InventoryNeutralMM {
                             + self.config.min_profit_bps / 2.0,
                         policy.max_widen_bps,
                     )
-                });
-            // Both estimates cover adverse selection. Use the larger reserve.
-            let bid_reserve = bid_markout.max(-inputs.order_flow_bps);
-            let ask_reserve = ask_markout.max(inputs.order_flow_bps);
+                })
+            } else {
+                [0.0; 2]
+            };
+            // The reserves overlap. Use the largest estimate on each side.
+            let bid_reserve = bid_markout.max(-inputs.order_flow_bps).max(regime_reserve);
+            let ask_reserve = ask_markout.max(inputs.order_flow_bps).max(regime_reserve);
             // Keep the side pointing toward flat at its original price.
             let bid_reserve = if q >= 0.0 { bid_reserve } else { 0.0 };
             let ask_reserve = if q <= 0.0 { ask_reserve } else { 0.0 };
@@ -1947,9 +1979,10 @@ impl InventoryNeutralMM {
         our_bid: f64,
         our_ask: f64,
         bounds: MakerPriceBounds,
-        mid: f64,
+        inputs: &PricingInputs,
         shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) {
+        let mid = inputs.mid;
         self.reconcile_after_new_fill_if_needed().await;
         if shutdown_requested(shutdown) {
             return;
@@ -1967,7 +2000,9 @@ impl InventoryNeutralMM {
         }
 
         let risk = self.build_risk_snapshot(mid);
-        let Some(target) = self.build_quote_target(our_bid, our_ask, mid, &risk) else {
+        let Some(target) =
+            self.build_quote_target(our_bid, our_ask, mid, &risk, inputs.volatility_pressure)
+        else {
             self.cancel_all_orders().await;
             return;
         };

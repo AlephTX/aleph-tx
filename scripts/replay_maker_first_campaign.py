@@ -77,7 +77,7 @@ def windows(begin, holdout, end):
         yield (slot + 2_000, slot + HOUR - 2_000, "comparison" if slot < holdout else "holdout")
 
 
-def write_inputs(route, capture, compiled, out, periods, until):
+def write_inputs(route, capture, compiled, out, periods, until, *, trade_files=None):
     source_path = compiled / f"{route}.ndjson.zst"
     start = periods[0][0]
     info = {}
@@ -85,7 +85,8 @@ def write_inputs(route, capture, compiled, out, periods, until):
         pair = json.loads(stream.readline())["pair"]
         def tape(venue, market, leg):
             source = "hyperliquid" if venue in ("entropy", "trade_xyz") else venue
-            files = sorted((capture / "raw").glob(f"{source}-trades-*.jsonl.gz"))
+            files = (trade_files[source] if trade_files is not None
+                     else sorted((capture / "raw").glob(f"{source}-trades-*.jsonl.gz")))
             if not files:
                 raise ValueError(f"missing public trade archive for {source}")
             info[source] = {p.name: digest(p) for p in files}
@@ -154,7 +155,8 @@ def cases(pair, arcus_fees):
 
 
 def summarize(rows):
-    fields = ("maker_fills", "ioc_fills", "ioc_submitted", "ioc_partial", "ioc_expired", "ioc_price_misses",
+    fields = ("maker_fills", "maker_buy_fills", "maker_sell_fills", "passive_offset_fills", "passive_only_cycles",
+              "ioc_fills", "ioc_submitted", "ioc_partial", "ioc_expired", "ioc_price_misses",
               "ioc_depth_misses", "closed_cycles", "forced_closes", "exposure_stops", "post_only_rejected",
               "quotes_submitted", "quotes_accepted", "late_trade_prints", "below_minimum_hedge",
               "quote_expired_before_activation", "quote_cancelled_before_activation", "maker_prints_touching_quote",
@@ -165,7 +167,8 @@ def summarize(rows):
     hours = duration / HOUR
     totals = {name: sum(row.get(name, 0) for row in rows) for name in fields}
     numerics = ("fees", "maker_fees", "maker_turnover", "taker_turnover", "maker_spread_capture",
-                "ioc_slippage", "ioc_depth_impact", "ioc_submit_touch_turnover", "forced_close_pnl", "realized_pnl")
+                "ioc_slippage", "ioc_depth_impact", "ioc_submit_touch_turnover", "forced_close_pnl", "realized_pnl",
+                "passive_only_pnl", "passive_only_maker_turnover")
     totals |= {name: sum(float(row.get(name, 0)) for row in rows) for name in numerics}
     reasons = Counter()
     blocked = Counter()
@@ -176,11 +179,21 @@ def summarize(rows):
     net = sum(float(row["net_pnl"]) for row in valid) if len(valid)==len(rows) else None
     gross = sum(float(row["pnl_before_fees"]) for row in valid) if net is not None else None
     best = [Decimal(row["best_modeled_edge_bps"]) for row in rows if row.get("best_modeled_edge_bps") is not None]
+    costs = [Decimal(row["best_projected_turnover_cost_bps"]) for row in rows
+             if row.get("best_projected_turnover_cost_bps") is not None]
+    modeled_eligible = sum(float(row.get("incentive_turnover", {}).get("filled_turnover_quote", 0)) for row in rows)
     fills = totals["maker_fills"] + totals["ioc_fills"]
     return totals | {
         "windows": len(rows), "complete_windows": len(valid), "hours": hours,
         "incomplete_reasons": reasons, "entry_blocked": blocked,
         "best_modeled_edge_bps": str(max(best)) if best else None,
+        "best_projected_turnover_cost_bps": str(min(costs)) if costs else None,
+        "modeled_eligible_turnover": modeled_eligible,
+        "eligible_cost_bps": -net * 1e4 / modeled_eligible if net is not None and modeled_eligible else None,
+        "passive_cycles_started": [sum(row.get("passive_cycles_started", [0, 0])[i] for row in rows)
+                                   for i in (0, 1)],
+        "passive_cycles_completed": [sum(row.get("passive_cycles_completed", [0, 0])[i] for row in rows)
+                                     for i in (0, 1)],
         "max_unhedged_ms": max(row.get("max_unhedged_ms", 0) for row in rows),
         "max_net_notional": max(float(row.get("max_net_notional", 0)) for row in rows),
         "mean_unhedged_ms": totals["total_unhedged_ms"]/totals["unhedged_episodes"] if totals["unhedged_episodes"] else None,
