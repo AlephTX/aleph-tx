@@ -1,6 +1,7 @@
 import unittest
 from decimal import Decimal
-from replay_turnover_cost_curve import COST_CAPS, point, serialized_sum_matches, reward_eligibility
+from replay_turnover_cost_curve import (COST_CAPS, point, serialized_sum_matches,
+                                       reward_eligibility, basis_risk_variants)
 from replay_ten_hour_scenarios import summarize_quant, turnover_policies
 
 
@@ -8,12 +9,31 @@ class CostCurveTests(unittest.TestCase):
     def test_reward_denominators_are_unknown_with_explicit_fraction_scenarios(self):
         r = reward_eligibility(Decimal(1000), Decimal(800), Decimal("-0.4"))
         self.assertIsNone(r["confirmed_eligible_turnover"])
+        self.assertIsNone(r["confirmed_cost_bps_per_eligible_turnover"])
+        self.assertIsNone(r["standard_to_standard_rewarded"])
         self.assertFalse(r["premium_guarantees_rewards"])
         self.assertIsNone(r["fraction_scenarios"]["0"]["cost_bps_per_assumed_eligible_turnover"])
         self.assertEqual(Decimal(r["fraction_scenarios"]["0.2"]["cost_bps_per_assumed_eligible_turnover"]), Decimal(25))
         self.assertIsNone(reward_eligibility(Decimal(1000), None, None)["fraction_scenarios"]["1"]["assumed_eligible_turnover"])
         with self.assertRaises(ValueError):
             reward_eligibility(Decimal(100), Decimal(101), Decimal(0))
+
+    def test_basis_ablation_preserves_execution_budgets_and_exit_policy(self):
+        pair = {"legs": [{"venue": "lighter"}, {"venue": "lighter_robinhood"}]}
+        window = {"start_ms": 1000, "end_ms": 36_001_000, "drain_until_ms": 36_016_000}
+        configs = list(turnover_policies(pair, window, ("0", "0"), cost_caps=("2",)))
+        self.assertEqual(len(configs), 6)
+        for _, original in configs:
+            variants = dict(basis_risk_variants(original))
+            self.assertEqual(len(variants), 4)
+            self.assertEqual(variants["fixed_0.5"], original)
+            for config in variants.values():
+                self.assertEqual(config["pair"], original["pair"])
+                self.assertEqual(config["hedged_exit"], original["hedged_exit"])
+                self.assertEqual(config["flat_at_funding"], original["flat_at_funding"])
+                self.assertEqual(config["maker_cancel_delay_ms"], original["maker_cancel_delay_ms"])
+                self.assertEqual(config["latency_reserve_bps"], original["latency_reserve_bps"])
+            self.assertNotIn("basis_risk_reserve", original)
 
     def test_legacy_float_rounding_does_not_mask_cash_errors(self):
         self.assertTrue(serialized_sum_matches([0.1, 0.2], 0.30000000000000004))
@@ -103,6 +123,8 @@ class CostCurveTests(unittest.TestCase):
     def test_exact_breakdown_does_not_use_contradictory_legacy_headlines(self):
         row = self.exact_cash_row()
         row["net_pnl"], row["pnl_before_fees"], row["fees"] = "10", "10.1", "9"
+        row["turnover_feedback"]["net_after_overhead"] = "100"
+        row["turnover_feedback"]["overhead_quote"] = "9"
         p = point(row)
         self.assertTrue(p["cash_attribution_reconciled"])
         self.assertTrue(p["cash_components_reconciled"])
@@ -136,10 +158,11 @@ class CostCurveTests(unittest.TestCase):
         row = self.exact_cash_row()
         row["turnover_feedback"]["net_after_overhead"] = "0.4"
         p = point(row)
-        self.assertFalse(p["cash_attribution_reconciled"])
-        self.assertIsNone(p["net_after_overhead"])
-        self.assertIsNone(p["realized_cost_bps_per_target_turnover"])
-        self.assertIsNone(p["reward_eligibility"]["rule_window_candidate_turnover"])
+        self.assertTrue(p["cash_attribution_reconciled"])
+        self.assertFalse(p["legacy_headline_consistent"])
+        self.assertEqual(p["net_after_overhead"], "-0.4")
+        self.assertEqual(Decimal(p["realized_cost_bps_per_target_turnover"]), Decimal("4"))
+        self.assertIsNone(p["reward_eligibility"]["confirmed_eligible_turnover"])
 
     def test_partial_exact_proof_does_not_fall_back_to_legacy(self):
         for missing in ("whole_ledger_cash_reconciled", "whole_ledger_net_before_overhead",
@@ -158,7 +181,11 @@ class CostCurveTests(unittest.TestCase):
         self.assertFalse(point(row)["cash_attribution_reconciled"])
         row = self.exact_cash_row()
         row["turnover_feedback"]["overhead_quote"] = "0.2"
-        self.assertFalse(point(row)["cash_attribution_reconciled"])
+        self.assertTrue(point(row)["cash_attribution_reconciled"])
+        self.assertFalse(point(row)["legacy_headline_consistent"])
+        self.assertEqual(point(row)["modeled_overhead_quote"], "0.1")
+        row["execution_costs"]["cycles"][0]["overhead_quote"] = "0.2"
+        self.assertFalse(point(row)["cash_components_reconciled"])
 
     def test_legacy_after_overhead_keeps_existing_ulp_bound(self):
         row = self.exact_cash_row()

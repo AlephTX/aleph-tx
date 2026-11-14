@@ -5,9 +5,12 @@ use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
 use crate::strategy::relative_value::*;
 use std::collections::{BTreeMap, VecDeque};
 
+mod basis_risk;
 mod costs;
 mod funding;
 mod posture;
+use basis_risk::BasisRiskState;
+pub use basis_risk::{BasisRiskReport, BasisRiskReserve};
 pub use funding::{FlatAtFunding, FundingFlatReport};
 use funding::{FundingState, TimerKind};
 use posture::PostureState;
@@ -83,6 +86,9 @@ pub struct MakerFirstConfig {
     /// A reserve for changes in basis and hedge prices before matching.
     #[serde(with = "rust_decimal::serde::str")]
     pub latency_reserve_bps: Decimal,
+    /// Offline turnover entry reserve; never changes exits or hedge protection.
+    #[serde(default)]
+    pub basis_risk_reserve: Option<BasisRiskReserve>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -192,6 +198,8 @@ impl MakerFirstEvent {
 
 #[derive(Debug, Default, Serialize)]
 pub struct MakerFirstReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_risk_reserve: Option<BasisRiskReport>,
     pub conservative_cancel_guard: bool,
     pub cancel_guard_overlap_prints: usize,
     pub cancel_guard_overlap_fills: usize,
@@ -414,6 +422,7 @@ struct Replay<'a> {
     notices: VecDeque<(u64, Decimal)>,
     unhedged_since: Option<u64>,
     cost_feedback: CostFeedback,
+    basis_risk: BasisRiskState,
     posture: PostureState,
     funding: Option<FundingState>,
     report: MakerFirstReport,
@@ -523,6 +532,9 @@ impl MakerFirstConfig {
 
     pub fn preflight(&self, registry: &VenueRegistry) -> Result<MakerFirstPreflight> {
         self.pair.validate(registry)?;
+        if let Some(policy) = self.basis_risk_reserve {
+            policy.validate(self)?;
+        }
         ensure!(
             self.pair.asset_class == AssetClass::Crypto
                 && (self.pair.mode.is_pair_hedge() || self.require_net_edge)
@@ -798,6 +810,18 @@ impl Replay<'_> {
             }
         }
         self.books = Some(books);
+        if let Some(policy) = self.config.basis_risk_reserve {
+            let observation = self.pair_books(now).filter(|_| self.feed_online).map(|b| {
+                let maker = b[self.maker()].mid();
+                let hedge = b[1 - self.maker()].mid();
+                (
+                    (maker - hedge) / hedge * BPS,
+                    [b[0].timestamp_ms, b[1].timestamp_ms],
+                )
+            });
+            self.basis_risk
+                .observe(policy, self.config.latency_reserve_bps, now, observation);
+        }
         let mark = self
             .fresh(self.maker(), now)
             .map(|b| (b.timestamp_ms, b.mid()));
@@ -1530,16 +1554,22 @@ impl Replay<'_> {
         candidate: &Candidate,
         budget: Option<TurnoverBudget>,
         best_cost: &mut Option<Decimal>,
+        now: u64,
     ) -> std::result::Result<Decimal, &'static str> {
         let Some(projection) = &candidate.turnover else {
             return Ok(candidate.edge_bps);
         };
         let budget = budget.expect("turnover mode has a budget");
+        let latency_reserve = if let Some(policy) = self.config.basis_risk_reserve {
+            self.basis_risk
+                .value(policy, now)
+                .ok_or("basis_risk_warmup_or_gap")?
+        } else {
+            self.config.latency_reserve_bps
+        };
         let feedback = self.config.turnover_feedback;
         let overhead = feedback.map_or(Decimal::ZERO, |p| p.overhead(projection.gross));
-        let loss = -projection.fallback_cash
-            + self.config.latency_reserve_bps / BPS * projection.gross
-            + overhead;
+        let loss = -projection.fallback_cash + latency_reserve / BPS * projection.gross + overhead;
         let reserve = feedback.map_or(Decimal::ZERO, |p| self.cost_feedback.reserve(p));
         let reserved_loss = loss + reserve * projection.eligible / BPS;
         if projection.gross > budget.turnover
@@ -1621,7 +1651,8 @@ impl Replay<'_> {
             self.ledger.fees,
             self.ledger.cash - overhead,
         );
-        self.turnover_rank(&candidate, budget, &mut None).is_ok()
+        self.turnover_rank(&candidate, budget, &mut None, now)
+            .is_ok()
     }
 
     fn quote(&mut self, now: u64) -> Result<()> {
@@ -1702,7 +1733,7 @@ impl Replay<'_> {
                     let value = best_edge.get_or_insert(candidate.edge_bps);
                     *value = (*value).max(candidate.edge_bps);
                 }
-                let rank = match self.turnover_rank(&candidate, budget, &mut best_cost) {
+                let rank = match self.turnover_rank(&candidate, budget, &mut best_cost, now) {
                     Ok(rank) => rank,
                     Err(reason) => {
                         blocked = Some(reason);
@@ -2307,6 +2338,7 @@ impl Replay<'_> {
                     if leg == self.maker() {
                         self.feed_online = online;
                         if !online {
+                            self.basis_risk.feed_offline();
                             if self
                                 .quote
                                 .as_ref()
@@ -2447,6 +2479,10 @@ impl Replay<'_> {
             costs.reconcile_ledger(self.report.net_pnl, after);
         }
         self.report.funding_flat = self.funding.map(|state| state.report);
+        self.report.basis_risk_reserve = self.config.basis_risk_reserve.map(|policy| {
+            self.basis_risk
+                .report(policy, self.config.latency_reserve_bps)
+        });
         Ok(self.report)
     }
 }
@@ -2480,6 +2516,7 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         notices: VecDeque::new(),
         unhedged_since: None,
         cost_feedback: CostFeedback::default(),
+        basis_risk: BasisRiskState::default(),
         posture: PostureState::new(config.turnover_posture),
         funding: FundingState::new(config)?,
         report: MakerFirstReport {
@@ -2495,6 +2532,10 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod basis_risk_tests {
+        include!("maker_first/basis_risk_tests.rs");
+    }
 
     mod funding_tests {
         include!("maker_first/funding_tests.rs");
@@ -2534,6 +2575,7 @@ mod tests {
             maker_fee_bps: Decimal::ONE,
             quote_notional: Decimal::from(100),
             latency_reserve_bps: Decimal::ZERO,
+            basis_risk_reserve: None,
         }
     }
 

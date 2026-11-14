@@ -262,6 +262,25 @@ See [the independent ten-hour results](TEN_HOUR_RESEARCH.md#completed-independen
 
 ## Inventory fields and maintenance
 
+### November 14 basis-risk reuse
+
+`rh-turnover-cost-curve-20261114T043334Z/prepared` was found through the
+existing public campaign inventory and reused, without recapture, for
+`basis-risk-selection-20261114/ablation-v2`. BTC and ETH each retain the
+November 13 23:45:09.240–November 14 09:45:09.240 Beijing decision window
+and 15-second terminal drain. This is historical selection, not another
+independent sample. No new funding or fee observations were introduced.
+The source manifest preserves public trade feed gaps, receipt-time ordering,
+USDG/USDC parity uncertainty and historical latency assumptions.
+
+The four-arm entry-only comparison has 48 separate configurations and ledgers;
+policy SHA-256 is
+`1c82d8e644b20312c5d5fb989324675781fe15c1380c61acee09854ea9b742e5`.
+Source/config/executable hashes and outcomes are appended outside Git in
+`basis-risk-selection-20261114/inventory-start.json` and its completion record.
+The superseded first attempt is retained. See the
+[mechanism and comparison design](BASIS_RISK_SELECTION_2026_11_14.md).
+
 Before consumption, each imported or newly sealed archive must have:
 
 | Group | Required information |

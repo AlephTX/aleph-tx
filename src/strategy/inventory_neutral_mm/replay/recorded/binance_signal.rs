@@ -118,8 +118,17 @@ pub(in crate::strategy::inventory_neutral_mm) struct Participation {
     signal: Arc<PlMutex<Signal>>,
     decisions: u64,
     fresh_reference_decisions: u64,
+    fresh_reference_fraction: Option<f64>,
+    unavailable_reference_decisions: u64,
+    shock_reference_decisions: u64,
     withdrawn_bid_targets: u64,
     withdrawn_ask_targets: u64,
+    withdrawn_bid_targets_by_shock: u64,
+    withdrawn_ask_targets_by_shock: u64,
+    /// Missing, stale, invalidated or not-yet-warmed history. Target changes,
+    /// not exchange cancellations or independently identified PnL effects.
+    withdrawn_bid_targets_by_unavailable: u64,
+    withdrawn_ask_targets_by_unavailable: u64,
     rejected_updates: u64,
     resets: u64,
 }
@@ -131,8 +140,15 @@ impl Participation {
             signal,
             decisions: 0,
             fresh_reference_decisions: 0,
+            fresh_reference_fraction: None,
+            unavailable_reference_decisions: 0,
+            shock_reference_decisions: 0,
             withdrawn_bid_targets: 0,
             withdrawn_ask_targets: 0,
+            withdrawn_bid_targets_by_shock: 0,
+            withdrawn_ask_targets_by_shock: 0,
+            withdrawn_bid_targets_by_unavailable: 0,
+            withdrawn_ask_targets_by_unavailable: 0,
             rejected_updates: 0,
             resets: 0,
         }
@@ -148,6 +164,10 @@ impl Participation {
         let signal = self.signal.lock();
         let ready = signal.allowed(now_ms());
         self.fresh_reference_decisions += u64::from(ready.is_some());
+        self.unavailable_reference_decisions += u64::from(ready.is_none());
+        self.shock_reference_decisions += u64::from(ready.is_some_and(|p| !p[0] || !p[1]));
+        self.fresh_reference_fraction =
+            Some(self.fresh_reference_decisions as f64 / self.decisions as f64);
         self.rejected_updates = signal.rejected_updates;
         self.resets = signal.resets;
         if !self.policy.enabled {
@@ -162,6 +182,8 @@ impl Participation {
         {
             target.bid_size = 0.0;
             self.withdrawn_bid_targets += 1;
+            self.withdrawn_bid_targets_by_shock += u64::from(ready.is_some());
+            self.withdrawn_bid_targets_by_unavailable += u64::from(ready.is_none());
         }
         if !sell
             && positions.iter().all(|&p| p <= 0.0)
@@ -169,6 +191,8 @@ impl Participation {
         {
             target.ask_size = 0.0;
             self.withdrawn_ask_targets += 1;
+            self.withdrawn_ask_targets_by_shock += u64::from(ready.is_some());
+            self.withdrawn_ask_targets_by_unavailable += u64::from(ready.is_none());
         }
     }
 }
@@ -231,6 +255,79 @@ mod tests {
                 );
                 assert_eq!([target.bid_price, target.ask_price], [100.0, 101.0]);
             }
+            assert_eq!(gate.unavailable_reference_decisions, 4);
+            assert_eq!(gate.fresh_reference_fraction, Some(0.0));
+            assert_eq!(
+                gate.withdrawn_bid_targets_by_unavailable,
+                if enabled { 2 } else { 0 }
+            );
+            assert_eq!(
+                gate.withdrawn_ask_targets_by_unavailable,
+                if enabled { 2 } else { 0 }
+            );
+            assert_eq!(gate.withdrawn_bid_targets_by_shock, 0);
+            assert_eq!(gate.withdrawn_ask_targets_by_shock, 0);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shock_and_unavailable_withdrawals_partition_targets_without_changing_prices() {
+        let _clock = ReplayClock::open(2000, false);
+        let p = policy();
+        let signal = Arc::new(PlMutex::new(Signal::new(p)));
+        signal
+            .lock()
+            .update(1000, 1000, 1, Some(100.0), Some(1))
+            .unwrap();
+        signal
+            .lock()
+            .update(2000, 2000, 1, Some(99.98), Some(2))
+            .unwrap();
+        let mut gate = Participation::new(p, signal);
+        let config = InventoryNeutralMMConfig::default();
+        let target = || QuoteTarget {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+        };
+        let mut fresh = target();
+        gate.apply(&mut fresh, [0.0; 2], &config);
+        assert_eq!([fresh.bid_size, fresh.ask_size], [0.0, 1.0]);
+        tokio::time::advance(Duration::from_millis(501)).await;
+        let mut stale = target();
+        gate.apply(&mut stale, [0.0; 2], &config);
+        assert_eq!([stale.bid_size, stale.ask_size], [0.0, 0.0]);
+        assert_eq!([stale.bid_price, stale.ask_price], [100.0, 101.0]);
+        assert_eq!(gate.fresh_reference_fraction, Some(0.5));
+        assert_eq!(
+            (
+                gate.shock_reference_decisions,
+                gate.unavailable_reference_decisions
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                gate.withdrawn_bid_targets_by_shock,
+                gate.withdrawn_ask_targets_by_shock
+            ),
+            (1, 0)
+        );
+        assert_eq!(
+            (
+                gate.withdrawn_bid_targets_by_unavailable,
+                gate.withdrawn_ask_targets_by_unavailable
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            gate.withdrawn_bid_targets,
+            gate.withdrawn_bid_targets_by_shock + gate.withdrawn_bid_targets_by_unavailable
+        );
+        assert_eq!(
+            gate.withdrawn_ask_targets,
+            gate.withdrawn_ask_targets_by_shock + gate.withdrawn_ask_targets_by_unavailable
+        );
     }
 }

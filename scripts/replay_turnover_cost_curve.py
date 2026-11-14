@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Freeze RH/Core turnover budgets and measure complete-cycle cost versus volume."""
 import argparse
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 import math
@@ -13,6 +14,22 @@ from replay_ten_hour_scenarios import TEN_HOURS, execute, turnover_policies
 from replay_trade_preflight import audit
 
 COST_CAPS = ("0", "0.5", "1", "2", "4", "8")
+BASIS_RISK_POLICY = {"lookback_ms": 15_000, "sample_ms": 100, "max_gap_ms": 1000,
+                     "min_reserve_bps": "0.5", "range_multiplier": "0.5", "max_reserve_bps": "2"}
+
+
+def basis_risk_variants(config):
+    """One mechanism and a fixed-high control, frozen before any outcomes."""
+    for name in ("fixed_0.5", "warmup_fixed_0.5", "adaptive_0.5_to_2", "warmup_fixed_2"):
+        variant = deepcopy(config)
+        if variant["latency_reserve_bps"] != "0.5" or variant.get("basis_risk_reserve"):
+            raise ValueError("basis-risk comparison requires the unchanged 0.5 bps baseline")
+        if name != "fixed_0.5":
+            variant["basis_risk_reserve"] = dict(BASIS_RISK_POLICY)
+            if name.startswith("warmup_fixed_"):
+                variant["basis_risk_reserve"]["range_multiplier"] = "0"
+                variant["basis_risk_reserve"]["min_reserve_bps"] = name.removeprefix("warmup_fixed_")
+        yield name, variant
 
 
 def decimal(value):
@@ -50,9 +67,13 @@ def reward_eligibility(target, candidate, net):
         }
     return {"status": "unknown_counterparty_tier_and_program_qualification",
             "confirmed_eligible_turnover": None,
+            "confirmed_cost_bps_per_eligible_turnover": None,
+            "qualification_adjusted_cost_status": "undefined_without_confirmed_eligible_output",
             "rule_window_candidate_turnover": str(candidate) if candidate is not None else None,
             "cash_points_value": "0", "scope": "fixed_cash_ledger_denominator_only_no_order_replay",
-            "standard_to_standard_rewarded": False, "premium_guarantees_rewards": False,
+            "standard_to_standard_rewarded": None,
+            "standard_to_standard_rule_status": "unresolved_source_and_definition",
+            "premium_guarantees_rewards": False,
             "fraction_scenarios": scenarios}
 
 
@@ -95,17 +116,13 @@ def point(row):
                      and serialized_sum_matches((c["net_before_overhead"] for c in cycles), full_net))
     if cash_complete:
         if exact_proof:
-            # Diagnostic totals and cycle amounts are exact decimal strings.
-            # Legacy report fields may round, but may not contradict that proof.
+            # Only exact ledger/cycle amounts certify cash. Legacy float headers
+            # are checked separately below and cannot veto an exact cash proof.
             cash_complete = (
                 isinstance(full_net, str) and isinstance(full_after, str)
                 and all(isinstance(c.get("net_before_overhead"), str)
                         and isinstance(c.get("net_after_overhead"), str) for c in cycles)
-                and serialized_sum_matches((c["net_after_overhead"] for c in cycles), full_after)
-                and serialized_sum_matches([feedback["net_after_overhead"]], full_after)
-                and feedback.get("overhead_quote") is not None
-                and serialized_sum_matches([feedback["overhead_quote"]],
-                                           str(decimal(full_net) - decimal(full_after))))
+                and serialized_sum_matches((c["net_after_overhead"] for c in cycles), full_after))
         else:
             cash_complete = (feedback.get("overhead_quote") is not None
                              and serialized_sum_matches(
@@ -201,6 +218,8 @@ def main():
     parser.add_argument("prepared", type=Path, help="hash-bound RH/Core inputs and public provenance")
     parser.add_argument("output", type=Path)
     parser.add_argument("--workers", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--basis-risk-ablation", action="store_true",
+                        help="48 historical selection arms at the existing 2 bps cost budget")
     args = parser.parse_args()
     os.umask(0o077)
     engine, prepared, out = (p.resolve() for p in (args.engine, args.prepared, args.output))
@@ -215,6 +234,7 @@ def main():
     for name in ("configs", "runs"):
         (out / name).mkdir()
     frozen, inputs, admissions = {}, {}, {}
+    cost_caps = ("2",) if args.basis_risk_ablation else COST_CAPS
     for symbol in ("BTC", "ETH"):
         spec = source["markets"][symbol]
         window = spec["window"]
@@ -227,7 +247,10 @@ def main():
         if [p["venue"] for p in pair["legs"]] != ["lighter", "lighter_robinhood"]:
             raise ValueError("this curve prioritizes the RH/Core route")
         inputs[symbol] = tape
-        policies = list(turnover_policies(pair, window, ("0", "0"), cost_caps=COST_CAPS))
+        policies = list(turnover_policies(pair, window, ("0", "0"), cost_caps=cost_caps))
+        if args.basis_risk_ablation:
+            policies = [(label + "-" + arm, variant) for label, config in policies
+                        for arm, variant in basis_risk_variants(config)]
         for label, config in policies:
             label = symbol + "-" + label
             config["diagnose_cycles"] = True
@@ -240,13 +263,28 @@ def main():
     # Every asset, budget and posture is frozen before any engine is invoked.
     policy = {"sample": "historical_selection", "program": "turnover", "route": "RH_Core",
               "execution_qualified": False, "source_manifest_sha256": source_hash,
-              "source_evidence": source, "cost_caps_bps": COST_CAPS,
-              "cost_cap_quote_per_million": {v: str(decimal(v) * 100) for v in COST_CAPS},
+              "source_evidence": source, "cost_caps_bps": cost_caps,
+              "cost_cap_quote_per_million": {v: str(decimal(v) * 100) for v in cost_caps},
               "engine_sha256": digest(engine), "runner_sha256": digest(Path(__file__)),
               "config_sha256": {n: f["sha256"] for n, f in frozen.items()},
               "modeled_overhead_source": "uncalibrated_research_assumption_not_exchange_fee",
               "reward_eligibility": "unknown; admission budgets use target-volume assumptions, not confirmed points eligibility",
               "max_workers": args.workers, "observed_volume_is_not_a_capacity_guarantee": True}
+    if args.basis_risk_ablation:
+        policy["basis_risk_ablation"] = {
+            "adaptive_policy": BASIS_RISK_POLICY, "fixed_reserve_controls_bps": ["0.5", "2"],
+            "scope": "historical_selection_not_holdout_or_calibrated_latency",
+            "selection_reason": "prior_2bps_curve_has_fills_keep_both_assets_capitals_all_postures",
+            "execution_model": "unchanged_historical_transport250_cancel300_not_current_RH_tier_calibration",
+            "startup": "all_three_new_arms_require_full_15s_observation_within_decision_window",
+            "reserve_charge": "bps_of_projected_two_venue_gross_turnover_not_an_actual_fee",
+            "decision_duration_ms": TEN_HOURS,
+            "terminal_drain_recorded_separately": True,
+        }
+    dependencies = [Path(__file__).with_name(n) for n in (
+        "archive_public_capture.py", "replay_maker_campaign.py", "replay_ten_hour_scenarios.py",
+        "replay_trade_preflight.py")]
+    policy["runner_dependency_sha256"] = {p.name: digest(p) for p in dependencies}
     save(out / "policy.json", policy)
     results = {}
     def run(label, spec):
@@ -258,6 +296,9 @@ def main():
                     "blockers": admissions[spec["symbol"]]["blockers"]}
         row = execute(engine, path, inputs[spec["symbol"]], out / "runs" / (label + ".json"), True)
         result = point(row)
+        if args.basis_risk_ablation:
+            result.update({key: row.get(key) for key in (
+                "basis_risk_reserve", "entry_blocked", "quotes_submitted", "quote_cancels")})
         if digest(path) != spec["sha256"]:
             raise ValueError("frozen configuration changed during replay")
         result["cost_cap_bps"] = spec["cost_cap_bps"]
@@ -274,6 +315,8 @@ def main():
                                   "error_type": type(error).__name__}
             save(out / "report.json", policy | {"runs": results, "matrix_finished": False})
     if (digest(engine) != policy["engine_sha256"] or digest(source_path) != source_hash
+            or digest(Path(__file__)) != policy["runner_sha256"]
+            or any(digest(p) != policy["runner_dependency_sha256"][p.name] for p in dependencies)
             or any(digest(p) != source["markets"][s]["input_sha256"] for s, p in inputs.items())):
         raise ValueError("frozen engine or inputs changed during matrix")
     complete = sum(r.get("ledger_complete") is True and r.get("cash_attribution_reconciled") is True
