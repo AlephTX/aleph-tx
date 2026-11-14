@@ -51,15 +51,137 @@ class CostCurveTests(unittest.TestCase):
                    "whole_ledger_net_after_overhead": "-0.0427946",
                    "cycles": [{"completed": True, "cash_reconciled": True,
                        "price_decomposition_reconciled": True, "net_before_overhead": "-0.0327946",
+                       "net_after_overhead": "-0.0427946",
+                       "fees_quote": "0", "price_loss_quote": "0.0327946", "overhead_quote": "0.01",
                        "opening_hedge_slippage_vs_submit_touch": "0", "stages": [],
                        "price_drift_cost_quote": "0.0327946", "entry_markouts": []}]}}
         self.assertTrue(point(row)["cash_attribution_reconciled"])
         self.assertEqual(point(row)["net_after_overhead_exact"], "-0.0427946")
+        self.assertTrue(point(row)["cash_components_reconciled"])
+        self.assertFalse(point(row)["legacy_headline_consistent"])
+        self.assertEqual(point(row)["price_loss_quote"], "0.0327946")
         row["execution_costs"]["whole_ledger_cash_reconciled"] = False
         self.assertFalse(point(row)["cash_attribution_reconciled"])
         row["execution_costs"]["whole_ledger_cash_reconciled"] = True
         row["execution_costs"]["whole_ledger_net_before_overhead"] = "-0.0327945"
         self.assertFalse(point(row)["cash_attribution_reconciled"])
+
+    @staticmethod
+    def exact_cash_row():
+        return {"engine_exit_code": 0, "incomplete": None, "net_pnl": "-0.3",
+                "pnl_before_fees": "-0.2", "fees": "0.1", "closed_cycles": 1,
+                "open_positions_base": ["0", "0"], "turnover_feedback": {
+                    "modeled_target_turnover_quote": "1000", "modeled_eligible_turnover_quote": "800",
+                    "net_after_overhead": "-0.4", "overhead_quote": "0.1"},
+                "execution_costs": {"whole_ledger_cash_reconciled": True,
+                    "whole_ledger_net_before_overhead": "-0.3", "whole_ledger_net_after_overhead": "-0.4",
+                    "cycles": [{"completed": True, "cash_reconciled": True,
+                        "price_decomposition_reconciled": True, "net_before_overhead": "-0.3",
+                        "net_after_overhead": "-0.4", "opening_hedge_slippage_vs_submit_touch": "0",
+                        "fees_quote": "0.1", "price_loss_quote": "0.2", "overhead_quote": "0.1",
+                        "stages": [], "price_drift_cost_quote": "0.2", "entry_markouts": []}]}}
+
+    def test_exact_after_overhead_drives_costs_and_reward_denominators(self):
+        row = self.exact_cash_row()
+        exact = "-0.40000000000000001"
+        row["execution_costs"]["whole_ledger_net_after_overhead"] = exact
+        row["execution_costs"]["cycles"][0]["net_after_overhead"] = exact
+        row["execution_costs"]["cycles"][0]["overhead_quote"] = "0.10000000000000001"
+        row["turnover_feedback"]["net_after_overhead"] = -0.4
+        row["turnover_feedback"]["overhead_quote"] = 0.1
+        p = point(row)
+        self.assertTrue(p["cash_attribution_reconciled"])
+        self.assertEqual(p["net_after_overhead"], exact)
+        self.assertEqual(p["net_after_overhead_exact"], exact)
+        self.assertEqual(Decimal(p["realized_cost_bps_per_target_turnover"]), -Decimal(exact) * 10)
+        eligible = p["reward_eligibility"]["fraction_scenarios"]["1"]
+        self.assertEqual(Decimal(eligible["cost_bps_per_assumed_eligible_turnover"]),
+                         -Decimal(exact) / Decimal(800) * 10000)
+        self.assertTrue(p["cash_components_reconciled"])
+        self.assertEqual(p["modeled_overhead_quote"], "0.10000000000000001")
+
+    def test_exact_breakdown_does_not_use_contradictory_legacy_headlines(self):
+        row = self.exact_cash_row()
+        row["net_pnl"], row["pnl_before_fees"], row["fees"] = "10", "10.1", "9"
+        p = point(row)
+        self.assertTrue(p["cash_attribution_reconciled"])
+        self.assertTrue(p["cash_components_reconciled"])
+        self.assertTrue(p["price_decomposition_reconciled"])
+        self.assertFalse(p["legacy_headline_consistent"])
+        self.assertEqual(p["net_after_overhead"], "-0.4")
+        self.assertEqual(p["price_loss_quote"], "0.2")
+        self.assertEqual(p["explicit_fees_quote"], "0.1")
+        self.assertEqual(p["modeled_overhead_quote"], "0.1")
+
+    def test_missing_or_inconsistent_exact_components_are_unknown_not_legacy(self):
+        for field in ("fees_quote", "price_loss_quote", "overhead_quote"):
+            for missing in (True, False):
+                with self.subTest(field=field, missing=missing):
+                    row = self.exact_cash_row()
+                    cycle = row["execution_costs"]["cycles"][0]
+                    if missing:
+                        del cycle[field]
+                    else:
+                        cycle[field] = "99"
+                    p = point(row)
+                    self.assertTrue(p["cash_attribution_reconciled"])
+                    self.assertFalse(p["cash_components_reconciled"])
+                    self.assertFalse(p["price_decomposition_reconciled"])
+                    self.assertIsNone(p["price_loss_quote"])
+                    self.assertIsNone(p["explicit_fees_quote"])
+                    self.assertIsNone(p["modeled_overhead_quote"])
+                    self.assertIsNone(p["execution_cost_by_stage"])
+
+    def test_contradictory_legacy_sign_cannot_certify_profitable_cost_curve(self):
+        row = self.exact_cash_row()
+        row["turnover_feedback"]["net_after_overhead"] = "0.4"
+        p = point(row)
+        self.assertFalse(p["cash_attribution_reconciled"])
+        self.assertIsNone(p["net_after_overhead"])
+        self.assertIsNone(p["realized_cost_bps_per_target_turnover"])
+        self.assertIsNone(p["reward_eligibility"]["rule_window_candidate_turnover"])
+
+    def test_partial_exact_proof_does_not_fall_back_to_legacy(self):
+        for missing in ("whole_ledger_cash_reconciled", "whole_ledger_net_before_overhead",
+                        "whole_ledger_net_after_overhead"):
+            with self.subTest(missing=missing):
+                row = self.exact_cash_row()
+                del row["execution_costs"][missing]
+                self.assertFalse(point(row)["cash_attribution_reconciled"])
+        row = self.exact_cash_row()
+        del row["execution_costs"]["cycles"][0]["net_after_overhead"]
+        self.assertFalse(point(row)["cash_attribution_reconciled"])
+
+    def test_after_overhead_exact_sum_and_overhead_must_reconcile(self):
+        row = self.exact_cash_row()
+        row["execution_costs"]["cycles"][0]["net_after_overhead"] = "-0.40000000000000000001"
+        self.assertFalse(point(row)["cash_attribution_reconciled"])
+        row = self.exact_cash_row()
+        row["turnover_feedback"]["overhead_quote"] = "0.2"
+        self.assertFalse(point(row)["cash_attribution_reconciled"])
+
+    def test_legacy_after_overhead_keeps_existing_ulp_bound(self):
+        row = self.exact_cash_row()
+        row["execution_costs"] = {"cycles": row["execution_costs"]["cycles"]}
+        row["turnover_feedback"]["net_after_overhead"] = -0.4000000000000001
+        row["turnover_feedback"]["overhead_quote"] = 0.1
+        row["net_pnl"] = -0.3
+        self.assertTrue(point(row)["cash_attribution_reconciled"])
+        row["turnover_feedback"]["net_after_overhead"] = -0.400000001
+        self.assertFalse(point(row)["cash_attribution_reconciled"])
+        row["turnover_feedback"]["net_after_overhead"] = "-0.40000000000000000001"
+        row["turnover_feedback"]["overhead_quote"] = "0.1"
+        row["net_pnl"] = "-0.3"
+        self.assertFalse(point(row)["cash_attribution_reconciled"])
+
+    def test_exact_proof_does_not_repair_funding_invalidity(self):
+        row = self.exact_cash_row()
+        row["incomplete"] = "funding_boundary_not_flat_and_resolved"
+        p = point(row)
+        self.assertFalse(p["ledger_complete"])
+        self.assertFalse(p["cash_attribution_reconciled"])
+        self.assertIsNone(p["net_after_overhead_exact"])
+        self.assertIsNone(p["realized_cost_bps_per_target_turnover"])
 
     def test_fee_price_and_overhead_costs_reconcile_per_target_volume(self):
         row = {"engine_exit_code": 0, "incomplete": None, "net_pnl": "-0.3", "pnl_before_fees": "-0.2",

@@ -8,6 +8,9 @@ use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use tokio::sync::watch;
 
+mod cancel_timing;
+#[cfg(test)]
+mod cancel_timing_tests;
 mod continuous;
 pub(in crate::strategy::inventory_neutral_mm) mod local_signal;
 
@@ -505,6 +508,7 @@ struct Queue {
     ahead: f64,
     changed_side: bool,
     cancel_requested: bool,
+    cancel_window: Option<cancel_timing::CancelWindow>,
 }
 
 struct CancelledOrder {
@@ -555,6 +559,7 @@ struct PendingMarkout {
     price: f64,
     changed_side: bool,
     cancel_pending: bool,
+    cancel_source_timing: cancel_timing::SourceTiming,
 }
 
 #[derive(Default, Serialize)]
@@ -596,6 +601,7 @@ struct ExecutionAttribution {
     changed_side_maker_fills: MakerFillQuality,
     pending_marks: [VecDeque<PendingMarkout>; 3],
     maker_markouts: [HorizonMarkout; 3],
+    cancel_timing: cancel_timing::Diagnostics,
     ioc_cost_quote_vs_submit_mid: f64,
     ioc_turnover_with_submit_mid: f64,
 }
@@ -654,6 +660,7 @@ impl Matching {
                         horizon_ms,
                         ..Default::default()
                     }),
+                    cancel_timing: cancel_timing::Diagnostics::new(config.trade_clock_guard_ms),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -701,6 +708,7 @@ impl Matching {
                         let fill = pending.pop_front().expect("checked markout");
                         if eligible && !expired {
                             stats.maker_markouts[index].mark(&fill, mid);
+                            stats.cancel_timing.mark(index, &fill, mid);
                             if index == 0 {
                                 stats.all_maker_fills.mark(&fill, mid);
                                 if fill.changed_side {
@@ -709,6 +717,7 @@ impl Matching {
                             }
                         } else {
                             stats.maker_markouts[index].expired_fills += 1;
+                            stats.cancel_timing.expire(index, fill.cancel_source_timing);
                         }
                     }
                 }
@@ -725,15 +734,33 @@ impl Matching {
     }
 
     pub(super) fn record_cancel_request(&self, order_index: Option<i64>) {
+        self.record_cancel_with_delay(order_index, self.cancel_transport + self.cancel_delay);
+    }
+
+    fn record_cancel_with_delay(&self, order_index: Option<i64>, delay: Duration) {
+        let requested_ms = now_ms();
+        let effective_ms = requested_ms.saturating_add(delay.as_millis() as u64);
         let mut state = self.market.lock();
         let Market {
             queue, attribution, ..
         } = &mut *state;
         if let Some(stats) = attribution {
             for (&id, order) in queue.iter_mut() {
-                if order_index.is_none_or(|index| id == index) && !order.cancel_requested {
-                    order.cancel_requested = true;
-                    stats.maker_cancel_requests += 1;
+                if order_index.is_none_or(|index| id == index) {
+                    if !order.cancel_requested {
+                        order.cancel_requested = true;
+                        stats.maker_cancel_requests += 1;
+                    }
+                    // Diagnostics only. A repeated request preserves the first
+                    // request and the earliest modeled cancellation deadline.
+                    if let Some(prior) = &mut order.cancel_window {
+                        prior.effective_ms = prior.effective_ms.min(effective_ms);
+                    } else {
+                        order.cancel_window = Some(cancel_timing::CancelWindow {
+                            requested_ms,
+                            effective_ms,
+                        });
+                    }
                 }
             }
         }
@@ -887,6 +914,7 @@ impl Matching {
                     ahead,
                     changed_side,
                     cancel_requested: false,
+                    cancel_window: None,
                 },
             );
             state.first_maker_ms.get_or_insert(now);
@@ -964,8 +992,10 @@ impl Matching {
         let mut remaining = size;
         for order in orders {
             let id = order.exchange_order_id as i64;
-            let (activated_ms, changed_side, cancel_requested) = {
+            let (activated_ms, changed_side, cancel_requested, cancel_window) = {
                 let mut state = self.market.lock();
+                let observed_effective_ms =
+                    state.cancelled.get(&id).map(|order| order.cancelled_ms);
                 let Some(queue) = state.queue.get_mut(&id) else {
                     continue;
                 };
@@ -985,12 +1015,28 @@ impl Matching {
                     queue.activated_ms,
                     queue.changed_side,
                     queue.cancel_requested,
+                    queue.cancel_window.map(|mut window| {
+                        // Once a simulated cancellation has executed, use its
+                        // observed local effect time instead of the deadline.
+                        if let Some(at) = observed_effective_ms {
+                            window.effective_ms = at;
+                        }
+                        window
+                    }),
                 )
             };
             let qty = components::round_down_to_step(order.remaining.min(remaining), self.step);
             if qty > 0.0 {
                 if let Some(stats) = &mut self.market.lock().attribution {
                     let age = at - activated_ms;
+                    let cancel_source_timing = stats.cancel_timing.fill(
+                        source,
+                        at,
+                        activated_ms,
+                        cancel_window,
+                        qty * order.price,
+                        venue.fee_bps,
+                    );
                     stats.all_maker_fills.fill(
                         qty,
                         order.price,
@@ -1016,6 +1062,7 @@ impl Matching {
                             price: order.price,
                             changed_side,
                             cancel_pending: cancel_requested,
+                            cancel_source_timing,
                         });
                     }
                 }
@@ -1109,6 +1156,7 @@ impl Matching {
         actions: Vec<BatchAction>,
     ) -> Result<BatchResult> {
         let changed_sides = CHANGED_QUOTES.get();
+        let batch_delay = self.batch_delay(&actions);
         let submit_mid = {
             let state = self.market.lock();
             state
@@ -1119,7 +1167,7 @@ impl Matching {
         };
         for action in &actions {
             match action {
-                BatchAction::Cancel(id) => self.record_cancel_request(Some(*id)),
+                BatchAction::Cancel(id) => self.record_cancel_with_delay(Some(*id), batch_delay),
                 BatchAction::Place(params) if params.order_type != OrderType::Ioc => {
                     if let Some(stats) = &mut self.market.lock().attribution {
                         stats.maker_submitted += 1;
@@ -1142,7 +1190,7 @@ impl Matching {
                 BatchAction::Cancel(_) => None,
             })
             .collect();
-        tokio::time::sleep(self.batch_delay(&actions)).await;
+        tokio::time::sleep(batch_delay).await;
         let mut places = Vec::new();
         for (action, reservation) in actions.into_iter().zip(reservations) {
             match action {
@@ -1284,6 +1332,7 @@ struct CrossMarketAttribution {
     changed_side_maker_fills: MakerFillQuality,
     markout_anchor: &'static str,
     maker_markouts: [HorizonMarkout; 3],
+    cancel_timing: cancel_timing::Diagnostics,
     ioc_cost_quote_vs_submit_mid: f64,
     ioc_turnover_with_submit_mid: f64,
 }
@@ -1601,6 +1650,13 @@ async fn drive(
         {
             quality.pending_at_cutoff = pending.len();
         }
+        for (horizon, pending) in execution.pending_marks.iter().enumerate() {
+            for fill in pending {
+                execution
+                    .cancel_timing
+                    .pending_at_cutoff(horizon, fill.cancel_source_timing);
+            }
+        }
         CrossMarketAttribution {
             quote: ATTRIBUTION
                 .replace(None)
@@ -1614,6 +1670,7 @@ async fn drive(
             changed_side_maker_fills: execution.changed_side_maker_fills,
             markout_anchor: "simulated_fill_receipt",
             maker_markouts: execution.maker_markouts,
+            cancel_timing: execution.cancel_timing,
             ioc_cost_quote_vs_submit_mid: execution.ioc_cost_quote_vs_submit_mid,
             ioc_turnover_with_submit_mid: execution.ioc_turnover_with_submit_mid,
         }
@@ -1697,9 +1754,9 @@ mod tests {
     use super::*;
     use crate::exchange::OrderParams;
 
-    const START: u64 = 1_800_000_000_000;
+    pub(super) const START: u64 = 1_800_000_000_000;
 
-    fn config() -> RecordedMakerConfig {
+    pub(super) fn config() -> RecordedMakerConfig {
         RecordedMakerConfig {
             strategy: InventoryNeutralMMConfig {
                 step_size: 0.001,
@@ -1747,6 +1804,7 @@ mod tests {
                     price: 100.0,
                     changed_side: false,
                     cancel_pending: true,
+                    cancel_source_timing: cancel_timing::SourceTiming::DuringCancelWindow,
                 });
             }
         }
@@ -1777,7 +1835,7 @@ mod tests {
         assert_eq!(stats.maker_markouts[2].expired_fills, 1);
     }
 
-    fn book() -> Book {
+    pub(super) fn book() -> Book {
         Book {
             timestamp_ms: now_ms(),
             bids: vec![[99.0, 1.0]],
@@ -1785,7 +1843,7 @@ mod tests {
         }
     }
 
-    fn maker() -> BatchAction {
+    pub(super) fn maker() -> BatchAction {
         BatchAction::Place(OrderParams {
             side: Side::Buy,
             price: 100.0,

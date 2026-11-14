@@ -17,7 +17,7 @@ are selection evidence, not independent profit validation.
 
 | Program | Current mechanism | Continuous ten-hour evidence | Decision |
 | --- | --- | --- | --- |
-| Quant profit | Inventory-aware Lighter Core Maker quoting; compare external reference, Core-only fair value and a local reversal gate | ETH Core-only Standard: +0.127003 / +0.418129 net at $500/$1,000 capital labels, on 988.73 / 2,085.70 gross turnover. Premium: −0.000782 / −0.139330; TTL 15/30 s does not improve Standard; Core-only reversal gate has no fills | Core-only Standard remains a candidate. All 15 and 18 Maker fills occur with cancellation pending; the frozen 13:00–23:00 prospective window is still required |
+| Quant profit | Inventory-aware Lighter Core Maker quoting; compare external reference, Core-only fair value and a local reversal gate | ETH Core-only Standard: +0.127003 / +0.418129 net at $500/$1,000 capital labels, on 988.73 / 2,085.70 gross turnover. Premium: −0.000782 / −0.139330; TTL 15/30 s does not improve Standard; Core-only reversal gate has no fills | Core-only Standard remains a candidate. All 15 and 18 Maker fills have the cancel-pending label at receipt; source-time cohorts remain unaudited. The frozen 13:00–23:00 prospective window is still required |
 | Hedge arbitrage | Matched basis/funding positions; require executable edge after both legs' fees, depth, delay, exit costs and funding evidence | Indexed Extended/Core BTC and ETH: both flat, zero entries/volume; best evaluated net edges −5.421 / −6.144 bps versus +2 bps admission | No qualifying entry. RWA/funding candidates still need complete execution and settlement evidence |
 | Incentive turnover | RH Maker entry/close with Core IOC hedges; independent neutral/long-first/short-first ledgers and 0/0.5/1/2/4/8 bps admission budgets | Conservative cancellation sensitivity: 47 complete cash ledgers out of 72; 32 zero-volume, 15 nonzero and all negative. BTC 4/8 bps complete arms reach 4,946–9,968 target volume at 1.336–1.651 bps cost, with 52–54 cycles | A modeled cost-volume curve, not profit or confirmed eligible volume. Keep 21 feed-gap failures, four funding failures and one incomplete price attribution visible |
 
@@ -26,6 +26,28 @@ RH/Core monetary comparisons retain unverified USDG/USDC parity and
 domain execution assumptions; reward value remains zero. More collected
 hours do not establish counterparty tier, effective account fees or actual
 venue matching. The detailed tables below preserve every tested variant.
+
+## Imported execution-clock and cash-report audit
+
+The November 14 review patch is integrated locally. The original
+`cancel_pending_fills` label describes cancellation state when a trade is
+processed. It does not establish that execution occurred after the cancel
+request. New diagnostic cohorts retain unknown source-clock calibration;
+the historical 15/18 counts and cash ledgers have not been rerun or replaced.
+
+A synthetic conflict reproduced the cost-reporting bug: an exact net of
+−0.4 and a legacy feedback net of +0.4 produced a falsely negative cost.
+The imported fix rejects conflicting cash evidence and uses reconciled exact
+totals for accepted reports. Historical cost curves above remain archived
+selection results pending regeneration; this reproduction does not show that
+those archived results contain the same conflict.
+
+The current official account-types page specifies 200 ms additional
+Maker/Cancel latency for RH Standard. This newly checked rule does not
+rewrite the older 300 ms research assumption or the frozen prospective run.
+Binance A/B requires separate receipt/availability evidence and a new frozen
+window. See the [execution audit](EXECUTION_CLOCK_REVIEW_2026_11_14.md) and
+[priority venue design](PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md).
 
 ## Execution and incentive review
 
@@ -85,11 +107,11 @@ below is net quote PnL, including the unchanged 0.25 bps model allowance.
 The Premium counterfactual uses the public zero-stake 0.4/2.8 bps
 Maker/Taker fees, 0 ms additional cancellation delay and 140 ms additional
 Taker delay. It retains **250 ms transport**. All five Maker fills at $500
-and all seven at $1,000 occur with cancellation pending. The Standard
-controls have 15 and 18 Maker fills respectively, also all cancel-pending.
-Thus removing an additional venue delay does not remove the entire
-cancellation window. The new fill path and fees must be considered
-together; this is not a fixed-ledger fee subtraction.
+and all seven at $1,000 have the cancel-pending label at receipt. The Standard
+controls have 15 and 18 Maker fills respectively, with the same receipt-state
+label. These counts alone cannot locate execution inside the cancel window.
+The new fill path and fees must be considered together; this is not a
+fixed-ledger fee subtraction.
 
 The existing lifetime knob applies to ordinary quote replacement. The
 strategy's edge-floor withdrawal check runs before that replacement plan;

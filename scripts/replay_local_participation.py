@@ -17,6 +17,19 @@ POLICY = {"lookback_ms": 2000, "recovery_ms": 500, "max_age_ms": 500,
           "min_shock_notional": 1000.0}
 
 
+def summarize_cancel_timing(timing):
+    """Keep modeled source-clock cohorts separate from receipt-state labels."""
+    if timing is None:
+        return None
+    cohorts = []
+    for cohort in timing["cohorts"]:
+        marks = [mark | {"markout_bps": (mark["markout_quote"] / mark["marked_turnover"] * 10_000
+                                       if mark["marked_turnover"] else None)}
+                 for mark in cohort["markouts"]]
+        cohorts.append(cohort | {"markouts": marks})
+    return timing | {"cohorts": cohorts}
+
+
 def summarize_local(row):
     local = row.get("local_participation") or {}
     decisions, ready = local.get("decisions"), local.get("ready_decisions")
@@ -35,6 +48,8 @@ def summarize_local(row):
         "maker_markouts": marks,
         "markout_anchor": row.get("cross_market_attribution", {}).get("markout_anchor"),
         "fair_value_mode": row.get("fair_value_mode"),
+        "cancel_pending_label_basis": "cancel_request_observed_by_simulated_fill_receipt",
+        "cancel_timing": summarize_cancel_timing(row.get("cross_market_attribution", {}).get("cancel_timing")),
     }
 
 

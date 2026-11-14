@@ -91,6 +91,13 @@ ledgers. Target turnover is reported separately from unknown reward
 eligibility; points have no assumed cash value.
 [Current results and source gaps](docs/RESEARCH_PROGRESS_2026_11_14.md)
 
+The next research design prioritizes Arcus, Entropy, TradeXYZ, BULK and
+Lighter Robinhood, starting with local pricing versus Binance risk filtering.
+Execution-clock diagnostics distinguish delayed trade receipt from modeled
+cancellation timing; exact cash proofs govern turnover cost reporting.
+[Priority venue design](docs/PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md) ·
+[Execution and cash audit](docs/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
+
 ## Architecture
 
 ```mermaid

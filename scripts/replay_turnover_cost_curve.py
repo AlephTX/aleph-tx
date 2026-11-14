@@ -56,6 +56,23 @@ def reward_eligibility(target, candidate, net):
             "fraction_scenarios": scenarios}
 
 
+def exact_cash_components(cycles, before, after):
+    """Use only exact cycle amounts for a certified cash decomposition."""
+    fields = ("fees_quote", "price_loss_quote", "overhead_quote")
+    if not all(isinstance(c.get(key), str) for c in cycles for key in fields):
+        return None
+    totals = {key: sum((decimal(c[key]) for c in cycles), Decimal(0)) for key in fields}
+    if (totals["fees_quote"] + totals["price_loss_quote"] != -decimal(before)
+            or totals["overhead_quote"] != decimal(before) - decimal(after)
+            or any(decimal(c["fees_quote"]) + decimal(c["price_loss_quote"])
+                   != -decimal(c["net_before_overhead"])
+                   or decimal(c["overhead_quote"]) != (decimal(c["net_before_overhead"])
+                                                       - decimal(c["net_after_overhead"]))
+                   for c in cycles)):
+        return None
+    return totals
+
+
 def point(row):
     feedback = row.get("turnover_feedback") or {}
     target = decimal(feedback.get("modeled_target_turnover_quote", 0))
@@ -64,15 +81,59 @@ def point(row):
                 and all(decimal(p) == 0 for p in row.get("open_positions_base", [None])))
     diagnostics = row.get("execution_costs") or {}
     cycles = diagnostics.get("cycles", [])
-    exact_proof = "whole_ledger_cash_reconciled" in diagnostics
+    # A partial exact schema must not silently downgrade to the legacy path.
+    exact_proof = any(key in diagnostics for key in (
+        "whole_ledger_cash_reconciled", "whole_ledger_net_before_overhead",
+        "whole_ledger_net_after_overhead"))
     full_net = diagnostics.get("whole_ledger_net_before_overhead") if exact_proof else row.get("net_pnl")
+    full_after = (diagnostics.get("whole_ledger_net_after_overhead") if exact_proof
+                  else feedback.get("net_after_overhead"))
     cash_complete = (complete and len(cycles) == row.get("closed_cycles")
                      and all(c["completed"] and c["cash_reconciled"] for c in cycles)
-                     and (not exact_proof or diagnostics["whole_ledger_cash_reconciled"] is True)
-                     and full_net is not None
+                     and (not exact_proof or diagnostics.get("whole_ledger_cash_reconciled") is True)
+                     and full_net is not None and full_after is not None
                      and serialized_sum_matches((c["net_before_overhead"] for c in cycles), full_net))
-    price_complete = cash_complete and all(c["price_decomposition_reconciled"] for c in cycles)
-    net = decimal(feedback["net_after_overhead"]) if cash_complete else None
+    if cash_complete:
+        if exact_proof:
+            # Diagnostic totals and cycle amounts are exact decimal strings.
+            # Legacy report fields may round, but may not contradict that proof.
+            cash_complete = (
+                isinstance(full_net, str) and isinstance(full_after, str)
+                and all(isinstance(c.get("net_before_overhead"), str)
+                        and isinstance(c.get("net_after_overhead"), str) for c in cycles)
+                and serialized_sum_matches((c["net_after_overhead"] for c in cycles), full_after)
+                and serialized_sum_matches([feedback["net_after_overhead"]], full_after)
+                and feedback.get("overhead_quote") is not None
+                and serialized_sum_matches([feedback["overhead_quote"]],
+                                           str(decimal(full_net) - decimal(full_after))))
+        else:
+            cash_complete = (feedback.get("overhead_quote") is not None
+                             and serialized_sum_matches(
+                                 [full_after, feedback["overhead_quote"]], full_net))
+    components = None
+    if cash_complete:
+        if exact_proof:
+            components = exact_cash_components(cycles, full_net, full_after)
+        elif (row.get("fees") is not None and row.get("pnl_before_fees") is not None
+              and serialized_sum_matches([full_net, row["fees"]], row["pnl_before_fees"])):
+            components = {"fees_quote": decimal(row["fees"]),
+                          "price_loss_quote": -decimal(row["pnl_before_fees"]),
+                          "overhead_quote": decimal(feedback["overhead_quote"])}
+    components_complete = components is not None
+    # Legacy headers remain visible as a consistency signal, never as the source
+    # of a certified exact breakdown. A rounded legacy before-total must not
+    # invalidate the independent exact proof that was added to replace it.
+    legacy_consistent = None
+    if components_complete:
+        legacy_consistent = all(value is not None and serialized_sum_matches([value], str(expected))
+                                for value, expected in (
+                                    (row.get("net_pnl"), full_net),
+                                    (feedback.get("net_after_overhead"), full_after),
+                                    (row.get("pnl_before_fees"), -components["price_loss_quote"]),
+                                    (row.get("fees"), components["fees_quote"]),
+                                    (feedback.get("overhead_quote"), components["overhead_quote"])))
+    price_complete = components_complete and all(c["price_decomposition_reconciled"] for c in cycles)
+    net = decimal(full_after) if cash_complete else None
     costs = None if net is None or not target else -net / target * 10_000
     candidate = feedback.get("modeled_eligible_turnover_quote") if cash_complete else None
     eligibility = reward_eligibility(target, decimal(candidate) if candidate is not None else None, net)
@@ -100,6 +161,8 @@ def point(row):
         "cancel_guard_overlap_turnover": row.get("cancel_guard_overlap_turnover"),
         "maker_fills_after_cancel_request": row.get("maker_fills_after_cancel_request"),
         "ledger_complete": complete, "cash_attribution_reconciled": cash_complete,
+        "cash_components_reconciled": components_complete,
+        "legacy_headline_consistent": legacy_consistent,
         "cash_proof": "engine_exact_full_ledger" if exact_proof else "legacy_json_rounding",
         "net_after_overhead_exact": diagnostics.get("whole_ledger_net_after_overhead") if cash_complete else None,
         "price_decomposition_reconciled": price_complete,
@@ -107,9 +170,9 @@ def point(row):
         "net_after_overhead": str(net) if net is not None else None,
         "realized_cost_bps_per_target_turnover": str(costs) if costs is not None else None,
         "cost_quote_per_million_target_turnover": str(costs * 100) if costs is not None else None,
-        "price_loss_quote": (str(-decimal(row["pnl_before_fees"])) if cash_complete else None),
-        "explicit_fees_quote": str(row["fees"]) if cash_complete else None,
-        "modeled_overhead_quote": str(feedback["overhead_quote"]) if cash_complete else None,
+        "price_loss_quote": str(components["price_loss_quote"]) if components_complete else None,
+        "explicit_fees_quote": str(components["fees_quote"]) if components_complete else None,
+        "modeled_overhead_quote": str(components["overhead_quote"]) if components_complete else None,
         "execution_cost_by_stage": stages if price_complete else None,
         "reward_eligibility": eligibility,
         "forced_close_fills": sum(s["fills"] for s in forced_stages) if cash_complete else None,
