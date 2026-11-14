@@ -60,8 +60,11 @@ window; none is an untouched holdout or an account-tier recommendation.
 ### Reward eligibility changes the denominator
 
 The public RH points rule excludes **Standard-to-Standard** activity for
-both point types. Public trade prints do not identify the counterparty's
-account tier or prove program qualification. The reports now keep target
+both point types. **Correction after the public fee-field review:** prints
+can carry Maker/Taker fee integers that match published account schedules.
+They support fee-signature classification, but do not attest account tier
+or prove program qualification. Older captures stripped these fields and
+cannot recover them. The reports now keep target
 turnover, rule-window candidate turnover and confirmed eligible turnover
 separate; the last remains unknown. The 0%, 20%, 50%, 80% and 100%
 eligibility cases change only the denominator of the existing cash ledger.

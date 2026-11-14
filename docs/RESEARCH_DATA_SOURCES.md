@@ -93,6 +93,15 @@ research run; add a source record when their data actually enters research.
 
 ## Funding, fees and contract evidence
 
+The November 14 `public-fee-observability-20261114T134000Z` campaign adds
+collector-versioned public Lighter fee integers, separately for Core and RH.
+Its own metadata and 60 s smoke capture are sealed; the prospective ten-hour
+measurement is scheduled, not complete. Raw/public evidence, all hashes and
+append-only events stay outside Git. Its `arbitrage-funding-review` subdirectory
+reuses the existing 14-day sources below, keeps download availability, and
+reports all six NVDA/SNDK direction cases without changing funding multipliers.
+See [current independent decisions](INDEPENDENT_STRATEGY_RESEARCH.md#current-research-decisions).
+
 These need their own versioned entries even when they share a connection
 with a price feed:
 
@@ -179,8 +188,10 @@ fee/latency and LPP documents with actual request/receipt times and hashes.
 The RH points document excludes Standard-to-Standard activity from both
 point types and specifies the November 6–19 weekly hedge-boost directions.
 Other qualification exclusions and venue discretion still apply. Public
-book/print data does not prove counterparty tier; neither Standard nor
-Premium simulated volume is labeled confirmed eligible volume.
+prints can contain optional `maker_fee` / `taker_fee` integers. Their matches
+to a dated schedule are useful flow-class hypotheses, not account-tier or
+reward attestations. Older sanitized tapes stripped these fields. Neither
+Standard nor Premium simulated volume is labeled confirmed eligible volume.
 [RH program](https://docs.lighter.xyz/programs/lighter-on-robinhood-chain-points)
 
 The archived general fee schedule supplies the Core Premium counterfactual

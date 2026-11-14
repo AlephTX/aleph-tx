@@ -91,13 +91,13 @@ func TestExtendedIndexCapturePreservesExactPublicationAndRejectsSequenceGap(t *t
 	}
 }
 
-func TestLighterPublicTradeCaptureKeepsOnlyReplayFields(t *testing.T) {
+func TestLighterPublicTradeCaptureKeepsOnlyPublicResearchFields(t *testing.T) {
 	raw := []byte(`{"type":"update/trade","channel":"trade:0","trades":[{"trade_id":123,"market_id":0,"timestamp":1700000000000,"price":"67500.0","size":"0.01","is_maker_ask":false,"ask_account_id":42,"ask_id":11,"maker_fee":9}]}`)
 	filtered, err := publicLighterTrades(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"type":"update/trade","channel":"trade:0","trades":[{"trade_id":123,"market_id":0,"timestamp":1700000000000,"price":"67500.0","size":"0.01","is_maker_ask":false}]}`
+	want := `{"type":"update/trade","channel":"trade:0","fee_fields_version":1,"trades":[{"trade_id":123,"market_id":0,"timestamp":1700000000000,"price":"67500.0","size":"0.01","is_maker_ask":false,"maker_fee":9}]}`
 	if string(filtered) != want {
 		t.Fatal("unexpected public trade archive fields or values")
 	}

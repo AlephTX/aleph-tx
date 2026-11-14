@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestLighterPublicTradeExecutionMetadataExactAndRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"type":"update/trade","channel":"trade:0","trades":[{"trade_id":9007199254740997,"market_id":0,"timestamp":1700000000000,"price":"100.00","size":"0.01","is_maker_ask":false,"transaction_time":9007199254740993,"block_height":18446744073709551615,"sequence_index":9007199254740995}]}`
+	want := `{"type":"update/trade","channel":"trade:0","fee_fields_version":1,"trades":[{"trade_id":9007199254740997,"market_id":0,"timestamp":1700000000000,"price":"100.00","size":"0.01","is_maker_ask":false,"transaction_time":9007199254740993,"block_height":18446744073709551615,"sequence_index":9007199254740995,"maker_fee":9}]}`
 	if string(got) != want {
 		t.Fatal("public clock fields changed precision, block timestamp changed, or private fields escaped")
 	}
@@ -36,7 +37,8 @@ func TestLighterPublicTradeExecutionMetadataMissingNullAndZero(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(got) != string(envelope(base+tc.retained)) {
+			want := strings.Replace(string(envelope(base+tc.retained)), `"trades":`, `"fee_fields_version":1,"trades":`, 1)
+			if string(got) != want {
 				t.Fatal("missing metadata was inferred or an unavailable wire zero was changed")
 			}
 		})
@@ -52,6 +54,29 @@ func TestLighterPublicTradeExecutionMetadataRejectsInvalidIntegers(t *testing.T)
 					t.Fatal("invalid integer metadata was accepted or exported")
 				}
 			})
+		}
+	}
+}
+
+func TestLighterPublicFeesPreserveSignedIntegersAndOmission(t *testing.T) {
+	for _, fees := range []string{"", `,"maker_fee":0,"taker_fee":100`,
+		`,"maker_fee":-1,"taker_fee":350`, `,"maker_fee":9007199254740993`} {
+		raw := []byte(`{"type":"update/trade","channel":"trade:0","fee_fields_version":99,"trades":[{"trade_id":1,"market_id":0,"timestamp":1,"price":"1","size":"1","is_maker_ask":true` + fees + `,"ask_account_id":42,"integrator_maker_fee":123}]}`)
+		got, err := publicLighterTrades(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"type":"update/trade","channel":"trade:0","fee_fields_version":1,"trades":[{"trade_id":1,"market_id":0,"timestamp":1,"price":"1","size":"1","is_maker_ask":true` + fees + `}]}`
+		if string(got) != want {
+			t.Fatal("fee precision, omission, collector marker or redaction changed")
+		}
+	}
+	for _, field := range []string{"maker_fee", "taker_fee"} {
+		for _, value := range []string{"1.5", "1e3", `"100"`, "true", "{}", "9223372036854775808"} {
+			raw := []byte(fmt.Sprintf(`{"trades":[{%q:%s}]}`, field, value))
+			if got, err := publicLighterTrades(raw); err == nil || got != nil {
+				t.Fatal("invalid fee integer accepted")
+			}
 		}
 	}
 }

@@ -100,6 +100,52 @@ own `legs[i].lighter_market_id` and `lighter_clock`. A Core message,
 disconnect or clock observation cannot update that leg. The common
 `lighter-clock-refresh` flag applies to both enabled deployments.
 
+### Public fee signatures
+
+New Lighter trade envelopes carry collector-owned `fee_fields_version: 1`
+and retain optional signed integer `maker_fee` / `taker_fee` without float
+conversion. Explicit zero stays zero; missing/null is not filled. Account,
+order, position, PnL, transaction-hash and integrator fields remain excluded.
+The marker distinguishes a fee-retaining collector from historical captures
+that stripped fees. It does not certify reward qualification or change the
+existing replay clock or matching decisions.
+
+The official [trade schema](https://docs.lighter.xyz/api/websocket) describes
+optional fields as omitted when zero or empty. The audit keeps this category
+separate from explicit zero and legacy missing fields. Nonzero does not mean
+Premium: the published Standard special-order fee is 1 bp, compatible with
+wire value 100. Core and RH schedules are separate; the supplied dated policy
+labels exact **schedule matches**, with unmapped integers left unmapped.
+
+```sh
+python3 scripts/audit_lighter_public_fees.py /research/sealed-archive \
+  lighter_robinhood 0 examples/lighter_fee_signature_review.json \
+  /research/new-fee-audit.json
+```
+
+Optional `--books /research/eth-books.ndjson.zst --book-config
+/research/eth-books.json --symbol ETH` adds 1 s / 5 s markouts. The tape must
+be compiled from the **same archive** using `compile_archive(...,
+precise_times=True)`, with independent local-book semantics. The config hash,
+venue, symbol and native ID must match. Entry uses a strictly earlier available
+book; future marks use as-of books, reject stale/gapped books and censor the
+unobserved tail. Positive markout is adverse to the passive side. These are
+local-availability-relative public-print diagnostics, not strategy fills or PnL.
+
+For a simulated Maker, the relevant peer signature is the **Taker** field.
+Overall market flow fractions cannot replace the counterparty composition of
+its eventual fills. Reports leave strategy eligibility fraction and confirmed
+eligible turnover null, and never export account/order identities. Conflicts,
+unacknowledged records, disconnections and missing markouts remain visible.
+
+`capture_lighter_fee_window.py` accepts a separately frozen campaign plan and
+starts only its own public collector. The continuous observation window is ten
+hours, with warm-up/drain separate, a minimum 16 GiB disk reserve and maximum
+512 MiB output budget. Budget failures preserve the partial and stop only that
+driver's process group. It verifies protected experiment hashes before starting
+and sealing. Natural completion still requires continuity and fee audits;
+collecting ten hours is not strategy validation.
+
 Verify settlement currency, funding, fees, account tier, action delay and
 incentive eligibility separately. Historical Core data cannot stand in for
 Robinhood data. No Robinhood signer or private account path is enabled.

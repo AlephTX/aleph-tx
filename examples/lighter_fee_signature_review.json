@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-11-14",
+  "qualification_verified": false,
+  "wire_scale_interpretation": "fee-signature hypotheses matched to the public tables; 100 wire units correspond to 1 bps",
+  "sources": [
+    "https://docs.lighter.xyz/api/websocket",
+    "https://docs.lighter.xyz/trading/trading-fees",
+    "https://docs.lighter.xyz/developers/robinhood-chain/overview"
+  ],
+  "domains": {
+    "lighter": {
+      "maker": {"premium_schedule_match": [40, 39, 38, 36, 34, 32, 30, 28], "plus_schedule_match": [50], "standard_special_order_compatible": [100]},
+      "taker": {"premium_schedule_match": [280, 273, 266, 252, 238, 224, 210, 196], "plus_schedule_match": [50], "standard_special_order_compatible": [100]}
+    },
+    "lighter_robinhood": {
+      "maker": {"premium_schedule_match": [120, 117, 114, 108, 102, 96, 84], "plus_schedule_match": [150], "standard_special_order_compatible": [100]},
+      "taker": {"premium_schedule_match": [350, 341, 333, 315, 298, 280, 245], "plus_schedule_match": [150], "standard_special_order_compatible": [100]}
+    }
+  }
+}

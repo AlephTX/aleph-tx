@@ -26,6 +26,93 @@ Current perpetual basis reversion is statistical relative value, not a
 locked terminal cash flow. Funding carry remains a separate, uncertain
 cash-flow component. Neither is relabeled as risk-free arbitrage.
 
+## Current research decisions
+
+The priority venues remain **Arcus, Entropy, TradeXYZ, BULK and Lighter RH**.
+Core is a separate control/hedge domain. Historical Extended results below
+remain regression evidence, not the incentive venue priority.
+
+| Independent objective | Next measured mechanism | Evidence required before a new strategy holdout |
+| --- | --- | --- |
+| Quant | Local state-conditioned quotes; public fee-class flow as a lagged toxicity hypothesis; Binance stale-only control in a new experiment | Fee-conditioned 1/5 s markouts, opportunity loss, available-time causality and unchanged baseline replay; existing Binance eight arms stay frozen |
+| Arbitrage | NVDA/SNDK io/xyz/Arcus executable basis and realized funding differences | Contract/unit/session/settlement review, both-leg fees and exit depth, funding witnesses and separate capital; no points |
+| Incentive | RH immediate hedge vs inventory-threshold hedge vs single-venue inventory control; Arcus RWA quote quality and retained capital | Each structure gets its own capital/loss budget and complete ledger; peer fee signatures do not certify rewards or substitute for observed points |
+
+The public fee auditor and capture protocol are documented in
+[Public fee signatures](PERP_RECORDING.md#public-fee-signatures). These are
+alternative **offline** experiment identities, not instructions to create
+multiple accounts or manufacture activity. Fee observations become available
+only with the trade publication; the next order cannot know its future
+counterparty. Use prior available flow summaries for any predictive feature.
+
+For cost comparisons, keep both eligibility fractions unknown until verified:
+`cost per eligible million = 100 * target_cost_bps / eligible_fraction`.
+For positive costs, Standard is cheaper than Premium only when
+`p_standard / p_premium > cost_standard / cost_premium`. Setting
+`p_premium = 1` is an explicit sensitivity, not a consequence of paying fees.
+Published latency differences and fee factors require separate execution and
+reward measurements. No account tier is changed by the research.
+
+Arcus quote quality is a candidate supported by its public program, not a
+guaranteed allocation. Its off-hours price bands, anchor and margin affect
+exit capacity. Entropy rebates stay in Entropy's own cash ledger only when
+confirmed; TradeXYZ rewards remain unconfirmed. BULK competition eligibility
+and market-making economics remain separate, including participant-level
+exclusions that separate ledgers cannot override.
+
+### Public measurement scheduled for November 14–15
+
+`public-fee-observability-20261114T134000Z` is an independent Oasis capture
+of Core/RH BTC/ETH public books and fee-retaining prints. Its observation
+window is **November 14 23:20 through November 15 09:20 Beijing**, with
+capture from 23:10 to 09:22. It is a ten-hour **measurement**, not a new
+strategy-profit validation. Per-domain market metadata, collector, driver,
+fee policy and protected experiment identities are frozen outside Git.
+Plan SHA-256: `97fbc3705a206c33666c03bce96bfa884ee131ae4e93cce966c402e2bd1211a5`.
+The driver reserves 16 GiB, caps its own file at 512 MiB, and preserves failures.
+The previous prospective quant and Binance collectors were not replaced.
+
+A separate 60 s smoke capture passed same-process timing and compilation.
+After subscription snapshots were excluded, it had 46 RH ETH and 33 RH BTC
+live prints. ETH's Premium-matching **Taker** fraction was 8.83% by notional;
+91.17% had omitted Taker fee fields (zero/empty per the public schema).
+These very short observations are not a population estimate, an eligibility
+fraction or a strategy PnL. They demonstrate why the large Premium **Maker**
+share in a market snapshot cannot estimate a Standard Maker's reward yield.
+Same-source ETH 1/5 s markout joins also ran, retaining missing tail labels.
+
+Verification used Rust 1.95.0 and Go 1.25.0: formatting, Clippy, Go vet,
+the full Go race suite, 127 Python research tests and default release builds
+passed. The Mac Rust library run had 551 passing tests, six ignored and seven
+failures in existing local HTTP fixture tests: the environment returned 502
+for loopback requests, including after a process-local proxy bypass attempt.
+That is not a fully passing Rust test run; no Rust files changed in this patch.
+The initial sandbox/cache failures and subsequent checks remain outside Git.
+
+### Historical funding screen, independent of incentive research
+
+The existing October 31 10:00–November 14 10:00 Beijing archives contain
+336 matched hourly slots for NVDA and SNDK across io/xyz/Arcus. Published
+decimal funding is multiplied by 10,000 **once**; today's fundingMultiplier
+is not applied again or backdated. This screen has no trading decisions and
+does not certify settlement cash flows.
+
+| Fixed direction | NVDA mean bps/hour | SNDK mean bps/hour |
+| --- | ---: | ---: |
+| Long io / short xyz | −0.114725 | −0.072952 |
+| Long io / short Arcus | −0.069109 | −0.007987 |
+| Long xyz / short Arcus | +0.045616 | +0.064966 |
+
+These use equal leg notionals and a **single-leg** denominator, before fees,
+execution, collateral conversion and capital costs. The proposed positive
+long-io/short-xyz structural carry is not supported by these published rates.
+Reversing after inspecting the sample is selection, not a validated strategy.
+Thirty-three disjoint ten-hour funding sums and six remaining hours are kept
+separately; they are not continuous simulated strategy ledgers. Calendar-only
+weekend cuts are descriptive, with holidays and exceptional sessions unaudited.
+The ordinary Friday 20:00–Monday 04:00 New York interval is 56 hours; at an
+assumed 5% annual rate it is about 3.24 bps on one leg, not locked net profit.
+
 ## Turnover postures
 
 The user selects opening direction on the **target maker venue**. These are

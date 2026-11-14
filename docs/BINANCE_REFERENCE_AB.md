@@ -44,6 +44,8 @@ Binance 原生 `E`、`T`、`u`、符号与精确字符串 BBO 保留；缺失不
 
 当前官方账户表的 RH Premium 最低量档为 1.2/3.5 bps，Core Premium 零质押档为 0.4/2.8 bps，不能混用。本轮不变更账户等级。依据为 [11 月 14 日执行审计](EXECUTION_CLOCK_REVIEW_2026_11_14.md)及其[官方账户类型来源](https://docs.lighter.xyz/developers/reference/account-types.md)；当前重新拉取页面失败，不能声称又独立验证了新的生效日期。
 
+后续公开费率审计已成功归档 [RH overview](https://docs.lighter.xyz/developers/robinhood-chain/overview.md)，确认该页列出的 Standard Maker/Cancel/Taker 附加延迟为 200/200/300 ms，Premium 最低量档为 1.2/3.5 bps。这是新的公开来源快照，不是账户实测，也没有改写上述冻结配置；早先访问失败的记录继续保留。
+
 0.25 bps 额外开销继续单列为未校准模型假设，输出 0/0.1/0.25/0.5 bps 固定现金敏感性。每小时资金费边界平仓、末端 drain、日内损失 guard 均沿用现有连续驱动，不拆成短段重置资本。
 
 ## 编译和运行
@@ -73,7 +75,7 @@ python3 scripts/replay_binance_ab.py run /research/new-frozen-ab /research/new-a
 ## Claude 调研的取舍
 
 - 接纳平台优先级、激励成本预算、RH/Core 等级分别建模、Hedge Boost 自有账本、实收时间归档等方向。
-- Standard-to-Standard 的积分规则存在来源和定义争议，暂不作为确定准入规则；实际积分与资格未知仍为未知，不据此断言所有 Standard 交易无奖励。没有代替用户联系平台。
+- 官方明确排除 Standard-to-Standard 奖励；具体成交的资格映射仍未验证。新公开费率审计可以提供档位表匹配线索，但不据此确认奖励，也不能把缺失费率的旧磁带补成零费率。没有代替用户联系平台。
 - Binance 公开 `exchangeInfo` 本轮确认 NVDAUSDT、SNDKUSDT 为 `TRADIFI_PERPETUAL`、状态 TRADING；对应原始 BBO 已收到。但尚未证明其股数、时段、指数和 io/xyz/Arcus 一致，不能据此运行股票套利。Pre-IPO 配对继续待核实。
 - Arrakis 的其他时段/网络测得的领先关系不迁移为 Oasis 的 100/700 ms 优势，35–50 ms 建模延迟也不等于实测。历史 aggTrades 不能补造 Oasis 过去的接收时间。
 - BULK AURA、Arcus 第三方积分公式、未知空投、某钱包群体与未来反女巫规则不进入确定收益。无官方确认不等于已证明不存在。
