@@ -24,6 +24,8 @@ def validate_baseline(config, window):
             or window["drain_until_ms"] - window["end_ms"] != 15_000
             or not config.get("flat_at_funding")
             or config.get("hyperliquid_obi_filter") is not None
+            or config.get("local_reversal_filter") is not None
+            or config.get("core_only", False)
             or config.get("market_data_delay_ms", 0) != 0
             or config.get("cancel_transport_ms", 250) != 250
             or config.get("taker_transport_ms", 250) != 250
@@ -41,6 +43,9 @@ def summarize(row):
     attribution = row.get("cross_market_attribution", {})
     marks = attribution.get("all_maker_fills", {})
     marked_turnover = marks.get("marked_turnover_1s", 0)
+    participation = row.get("quote_participation") or {}
+    decisions = participation.get("decisions")
+    fresh = participation.get("fresh_reference_decisions")
     return summary | {
         "net_quote_per_hour": None if net is None else net / (TEN_HOURS / HOUR),
         "net_bps_of_gross_turnover": None if net is None or not turnover else net / turnover * 10_000,
@@ -52,6 +57,7 @@ def summarize(row):
         "maker_markout_bps_1s": (marks["markout_quote_1s"] / marked_turnover * 10_000
                                 if marked_turnover else None),
         "quote_participation": row.get("quote_participation"),
+        "fresh_reference_fraction": (fresh / decisions if decisions and fresh is not None else None),
     }
 
 
@@ -61,6 +67,8 @@ def main():
     parser.add_argument("ten_hour_output", type=Path, help="output of replay_ten_hour_scenarios.py")
     parser.add_argument("output", type=Path)
     parser.add_argument("--capital", choices=(500, 1000), type=int, default=500)
+    parser.add_argument("--max-reference-age-ms", choices=(250, 1000), type=int, default=250,
+                        help="250 ms frozen baseline or separately labeled 1 s historical sensitivity")
     args = parser.parse_args()
     os.umask(0o077)
     source = args.ten_hour_output.resolve()
@@ -88,11 +96,12 @@ def main():
     out.mkdir()
     arms = {"control": config | {"diagnose_cross_market": True},
             "hyperliquid_obi_filter": config | {"diagnose_cross_market": True,
-                                              "hyperliquid_obi_filter": FILTER}}
+                                              "hyperliquid_obi_filter": FILTER | {"max_age_ms": args.max_reference_age_ms}}}
     configs = {arm: out / f"{arm}.config.json" for arm in arms}
     for arm, frozen in arms.items():
         save(configs[arm], frozen)
     policy = {"strategy": "quant_profit", "sample": source_report["sample"],
+              "experiment": "frozen_250ms_filter" if args.max_reference_age_ms == 250 else "historical_1000ms_reference_age_sensitivity",
               "source_report_sha256": source_report_hash, "baseline_config_sha256": baseline_hash,
               "input_sha256": tape_hash, "engine_sha256": digest(engine),
               "runner_sha256": digest(Path(__file__)), "source_evidence": evidence,

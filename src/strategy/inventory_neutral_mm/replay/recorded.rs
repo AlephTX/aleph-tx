@@ -9,11 +9,13 @@ use std::io::BufRead;
 use tokio::sync::watch;
 
 mod continuous;
+pub(in crate::strategy::inventory_neutral_mm) mod local_signal;
 
 const HOUR_MS: u64 = 3_600_000;
 const NS_PER_MS: u64 = 1_000_000;
 const SIGNAL_THRESHOLD_BPS: f64 = 0.01;
 const MARKOUT_MS: u64 = 1_000;
+const MARKOUT_HORIZONS_MS: [u64; 3] = [1_000, 5_000, 30_000];
 
 thread_local! {
     static CLOCK: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
@@ -230,6 +232,11 @@ pub struct RecordedMakerConfig {
     diagnose_cross_market: bool,
     #[serde(default)]
     hyperliquid_obi_filter: Option<HyperliquidObiFilter>,
+    #[serde(default)]
+    local_reversal_filter: Option<local_signal::LocalReversalFilter>,
+    /// Research-only Core data ablation; external books are not published.
+    #[serde(default)]
+    core_only: bool,
     order_response_ms: u64,
     trade_clock_guard_ms: u64,
     /// Maximum source-to-receipt delay of the public trade tape. Evidence
@@ -366,6 +373,23 @@ impl RecordedMakerConfig {
             }),
             "invalid Hyperliquid OBI filter threshold or reference age"
         );
+        if let Some(policy) = self.local_reversal_filter {
+            policy.validate()?;
+            ensure!(
+                self.hyperliquid_obi_filter.is_none(),
+                "compare local and reference filters in separate experiments"
+            );
+        }
+        if self.core_only {
+            ensure!(
+                self.hyperliquid_obi_filter.is_none()
+                    && self.strategy.volatility_regime.is_none()
+                    && self.strategy.order_flow_reserve.is_none()
+                    && self.strategy.cross_market_reserve.is_none()
+                    && self.strategy.markout_reserve.is_none(),
+                "Core-only replay cannot enable external-reference policies"
+            );
+        }
         Ok(())
     }
 }
@@ -454,6 +478,7 @@ enum Event {
     Book {
         at_ms: u64,
         lighter: Book,
+        #[serde(default)]
         hyperliquid: Book,
     },
     Trade {
@@ -523,11 +548,41 @@ impl MakerFillQuality {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PendingMarkout {
     due_ms: u64,
     signed_quantity: f64,
     price: f64,
     changed_side: bool,
+    cancel_pending: bool,
+}
+
+#[derive(Default, Serialize)]
+struct HorizonMarkout {
+    horizon_ms: u64,
+    marked_fills: u64,
+    marked_turnover: f64,
+    markout_quote: f64,
+    cancel_pending_marked_fills: u64,
+    cancel_pending_marked_turnover: f64,
+    cancel_pending_markout_quote: f64,
+    expired_fills: u64,
+    pending_at_cutoff: usize,
+}
+
+impl HorizonMarkout {
+    fn mark(&mut self, fill: &PendingMarkout, mid: f64) {
+        let turnover = fill.signed_quantity.abs() * fill.price;
+        let value = fill.signed_quantity * (mid - fill.price);
+        self.marked_fills += 1;
+        self.marked_turnover += turnover;
+        self.markout_quote += value;
+        if fill.cancel_pending {
+            self.cancel_pending_marked_fills += 1;
+            self.cancel_pending_marked_turnover += turnover;
+            self.cancel_pending_markout_quote += value;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -539,7 +594,8 @@ struct ExecutionAttribution {
     changed_side_maker_accepted: u64,
     all_maker_fills: MakerFillQuality,
     changed_side_maker_fills: MakerFillQuality,
-    pending_marks: VecDeque<PendingMarkout>,
+    pending_marks: [VecDeque<PendingMarkout>; 3],
+    maker_markouts: [HorizonMarkout; 3],
     ioc_cost_quote_vs_submit_mid: f64,
     ioc_turnover_with_submit_mid: f64,
 }
@@ -593,9 +649,13 @@ impl Matching {
         Self {
             market: PlMutex::new(Market {
                 last_event_ms: config.start_ms,
-                attribution: config
-                    .diagnose_cross_market
-                    .then(ExecutionAttribution::default),
+                attribution: config.diagnose_cross_market.then(|| ExecutionAttribution {
+                    maker_markouts: MARKOUT_HORIZONS_MS.map(|horizon_ms| HorizonMarkout {
+                        horizon_ms,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             entry: Duration::from_millis(config.order_entry_ms),
@@ -629,17 +689,26 @@ impl Matching {
             state.last_mid = Some(mid);
             if let Some(stats) = &mut state.attribution {
                 let now = now_ms();
-                while let Some(fill) = stats.pending_marks.front() {
-                    let expired = now > fill.due_ms + MARKOUT_MS;
-                    let eligible = book.timestamp_ms >= fill.due_ms && book.timestamp_ms <= now;
-                    if !expired && !eligible {
-                        break;
-                    }
-                    let fill = stats.pending_marks.pop_front().expect("checked markout");
-                    if eligible && !expired {
-                        stats.all_maker_fills.mark(&fill, mid);
-                        if fill.changed_side {
-                            stats.changed_side_maker_fills.mark(&fill, mid);
+                for (index, pending) in stats.pending_marks.iter_mut().enumerate() {
+                    while let Some(fill) = pending.front() {
+                        // All horizons allow at most one second for a fresh
+                        // post-horizon publication. A late price is not a label.
+                        let expired = now > fill.due_ms + MARKOUT_MS;
+                        let eligible = book.timestamp_ms >= fill.due_ms && book.timestamp_ms <= now;
+                        if !expired && !eligible {
+                            break;
+                        }
+                        let fill = pending.pop_front().expect("checked markout");
+                        if eligible && !expired {
+                            stats.maker_markouts[index].mark(&fill, mid);
+                            if index == 0 {
+                                stats.all_maker_fills.mark(&fill, mid);
+                                if fill.changed_side {
+                                    stats.changed_side_maker_fills.mark(&fill, mid);
+                                }
+                            }
+                        } else {
+                            stats.maker_markouts[index].expired_fills += 1;
                         }
                     }
                 }
@@ -938,12 +1007,17 @@ impl Matching {
                             cancel_requested,
                         );
                     }
-                    stats.pending_marks.push_back(PendingMarkout {
-                        due_ms: at + MARKOUT_MS,
-                        signed_quantity: if order.is_ask { -qty } else { qty },
-                        price: order.price,
-                        changed_side,
-                    });
+                    for (pending, horizon) in
+                        stats.pending_marks.iter_mut().zip(MARKOUT_HORIZONS_MS)
+                    {
+                        pending.push_back(PendingMarkout {
+                            due_ms: at + horizon,
+                            signed_quantity: if order.is_ask { -qty } else { qty },
+                            price: order.price,
+                            changed_side,
+                            cancel_pending: cancel_requested,
+                        });
+                    }
                 }
                 venue.fill(order, order.price, qty, false);
                 {
@@ -1152,6 +1226,7 @@ impl Matching {
 
 #[derive(Serialize)]
 pub struct RecordedMakerReport {
+    fair_value_mode: &'static str,
     start_ms: u64,
     end_ms: u64,
     active_until_ms: u64,
@@ -1192,6 +1267,8 @@ pub struct RecordedMakerReport {
     cross_market_attribution: Option<CrossMarketAttribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_participation: Option<QuoteParticipation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_participation: Option<local_signal::LocalParticipation>,
 }
 
 #[derive(Serialize)]
@@ -1205,6 +1282,8 @@ struct CrossMarketAttribution {
     changed_side_maker_accepted: u64,
     all_maker_fills: MakerFillQuality,
     changed_side_maker_fills: MakerFillQuality,
+    markout_anchor: &'static str,
+    maker_markouts: [HorizonMarkout; 3],
     ioc_cost_quote_vs_submit_mid: f64,
     ioc_turnover_with_submit_mid: f64,
 }
@@ -1299,6 +1378,18 @@ async fn drive(
         reader_account,
         None,
     );
+    let local_signal = config
+        .local_reversal_filter
+        .map(|policy| Arc::new(PlMutex::new(local_signal::LocalSignal::new(policy))));
+    if config.core_only {
+        strategy.use_local_fair_value();
+    }
+    strategy.local_participation = config.local_reversal_filter.map(|policy| {
+        local_signal::LocalParticipation::new(
+            policy,
+            Arc::clone(local_signal.as_ref().expect("configured local signal")),
+        )
+    });
     strategy.quote_participation =
         config
             .hyperliquid_obi_filter
@@ -1319,9 +1410,14 @@ async fn drive(
             let mut line = String::new();
             let mut delayed_books = VecDeque::<(u64, Book, Book)>::new();
             let publish = |lighter: &Book, hyperliquid: &Book| {
+                if let Some(signal) = &local_signal {
+                    signal.lock().book(now_ms(), lighter);
+                }
                 let mut shm = files.borrow_mut();
                 lighter.write_bbo(&shm, LIGHTER);
-                hyperliquid.write_bbo(&shm, EXCH_HYPERLIQUID);
+                if !config.core_only {
+                    hyperliquid.write_bbo(&shm, EXCH_HYPERLIQUID);
+                }
                 shm.publish_version();
             };
             loop {
@@ -1360,6 +1456,9 @@ async fn drive(
                 matching.market.lock().last_event_ms = at;
                 match event {
                     Event::TradeFeed { online, .. } => {
+                        if let Some(signal) = &local_signal {
+                            signal.lock().feed(at, online);
+                        }
                         let mut state = matching.market.lock();
                         if !online && state.trade_feed_online != Some(false) {
                             state.trade_feed_gaps += 1;
@@ -1372,7 +1471,9 @@ async fn drive(
                         ..
                     } => {
                         lighter.validate(at)?;
-                        hyperliquid.validate(at)?;
+                        if !config.core_only {
+                            hyperliquid.validate(at)?;
+                        }
                         let at_publish = at + config.market_data_delay_ms;
                         if config.market_data_delay_ms == 0 {
                             publish(&lighter, &hyperliquid);
@@ -1401,6 +1502,14 @@ async fn drive(
                             size,
                             matches!(aggressor, Aggressor::Buy),
                         )?;
+                        if let Some(signal) = &local_signal {
+                            signal.lock().trade(
+                                at,
+                                source_ms,
+                                price * size,
+                                matches!(aggressor, Aggressor::Buy),
+                            );
+                        }
                         trades += 1;
                     }
                 }
@@ -1484,25 +1593,37 @@ async fn drive(
     } else {
         active_until_ms / HOUR_MS == config.start_ms / HOUR_MS
     };
-    let cross_market_attribution =
-        market
-            .attribution
-            .take()
-            .map(|execution| CrossMarketAttribution {
-                quote: ATTRIBUTION
-                    .replace(None)
-                    .expect("enabled quote attribution"),
-                maker_submitted: execution.maker_submitted,
-                maker_accepted: execution.maker_accepted,
-                maker_cancel_requests: execution.maker_cancel_requests,
-                changed_side_maker_submitted: execution.changed_side_maker_submitted,
-                changed_side_maker_accepted: execution.changed_side_maker_accepted,
-                all_maker_fills: execution.all_maker_fills,
-                changed_side_maker_fills: execution.changed_side_maker_fills,
-                ioc_cost_quote_vs_submit_mid: execution.ioc_cost_quote_vs_submit_mid,
-                ioc_turnover_with_submit_mid: execution.ioc_turnover_with_submit_mid,
-            });
+    let cross_market_attribution = market.attribution.take().map(|mut execution| {
+        for (quality, pending) in execution
+            .maker_markouts
+            .iter_mut()
+            .zip(&execution.pending_marks)
+        {
+            quality.pending_at_cutoff = pending.len();
+        }
+        CrossMarketAttribution {
+            quote: ATTRIBUTION
+                .replace(None)
+                .expect("enabled quote attribution"),
+            maker_submitted: execution.maker_submitted,
+            maker_accepted: execution.maker_accepted,
+            maker_cancel_requests: execution.maker_cancel_requests,
+            changed_side_maker_submitted: execution.changed_side_maker_submitted,
+            changed_side_maker_accepted: execution.changed_side_maker_accepted,
+            all_maker_fills: execution.all_maker_fills,
+            changed_side_maker_fills: execution.changed_side_maker_fills,
+            markout_anchor: "simulated_fill_receipt",
+            maker_markouts: execution.maker_markouts,
+            ioc_cost_quote_vs_submit_mid: execution.ioc_cost_quote_vs_submit_mid,
+            ioc_turnover_with_submit_mid: execution.ioc_turnover_with_submit_mid,
+        }
+    });
     Ok(RecordedMakerReport {
+        fair_value_mode: if config.core_only {
+            "core_only"
+        } else {
+            "external_with_local_fallback"
+        },
         start_ms: config.start_ms,
         end_ms: config.end_ms,
         active_until_ms,
@@ -1553,6 +1674,7 @@ async fn drive(
         halted,
         cross_market_attribution,
         quote_participation: strategy.quote_participation,
+        local_participation: strategy.local_participation,
     })
 }
 
@@ -1595,6 +1717,8 @@ mod tests {
             taker_transport_ms: None,
             diagnose_cross_market: false,
             hyperliquid_obi_filter: None,
+            local_reversal_filter: None,
+            core_only: false,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
             trade_delivery_grace_ms: 2_000,
@@ -1605,6 +1729,52 @@ mod tests {
             min_notional: 1.0,
             depth_participation: 0.25,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fill_markouts_keep_horizons_and_cancel_cohorts_separate() {
+        let _clock = ReplayClock::open(START, false);
+        let mut cfg = config();
+        cfg.diagnose_cross_market = true;
+        let matching = Matching::new(&cfg);
+        {
+            let mut market = matching.market.lock();
+            let stats = market.attribution.as_mut().unwrap();
+            for (queue, horizon) in stats.pending_marks.iter_mut().zip(MARKOUT_HORIZONS_MS) {
+                queue.push_back(PendingMarkout {
+                    due_ms: START + horizon,
+                    signed_quantity: 0.1,
+                    price: 100.0,
+                    changed_side: false,
+                    cancel_pending: true,
+                });
+            }
+        }
+        for (advance, publication, mid) in [
+            (1_000, START + 999, 101.0),
+            (100, START + 1_000, 101.0),
+            (3_900, START + 5_000, 99.0),
+            (26_001, START + 31_001, 200.0),
+        ] {
+            tokio::time::sleep(Duration::from_millis(advance)).await;
+            matching.on_book(Book {
+                timestamp_ms: publication,
+                bids: vec![[mid - 0.01, 1.0]],
+                asks: vec![[mid + 0.01, 1.0]],
+            });
+        }
+        let state = matching.market.lock();
+        let stats = state.attribution.as_ref().unwrap();
+        assert_eq!(stats.all_maker_fills.marked_fills_1s, 1);
+        for (index, expected) in [(0, 0.1), (1, -0.1)] {
+            let label = &stats.maker_markouts[index];
+            assert_eq!(label.marked_fills, 1);
+            assert_eq!(label.cancel_pending_marked_fills, 1);
+            assert!((label.markout_quote - expected).abs() < 1e-10);
+            assert_eq!(label.cancel_pending_marked_turnover, 10.0);
+        }
+        assert_eq!(stats.maker_markouts[2].marked_fills, 0);
+        assert_eq!(stats.maker_markouts[2].expired_fills, 1);
     }
 
     fn book() -> Book {
@@ -1857,6 +2027,51 @@ mod tests {
             data.push('\n');
         }
         data
+    }
+
+    #[test]
+    fn core_only_quotes_are_invariant_to_external_book_prices() {
+        let run = |external_mid: Option<f64>| {
+            let mut cfg = continuous_config(125);
+            cfg.core_only = true;
+            cfg.diagnose_cross_market = true;
+            let data = tape(&cfg, true)
+                .lines()
+                .map(|line| {
+                    let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                    if row["kind"] == "book" {
+                        if let Some(mid) = external_mid {
+                            row["hyperliquid"]["bids"] = serde_json::json!([[mid - 1.0, 1.0]]);
+                            row["hyperliquid"]["asks"] = serde_json::json!([[mid + 1.0, 1.0]]);
+                        } else {
+                            row.as_object_mut().unwrap().remove("hyperliquid");
+                        }
+                    }
+                    row.to_string() + "\n"
+                })
+                .collect::<String>();
+            run_recorded_maker(cfg, data.as_bytes()).unwrap()
+        };
+        let control = run(Some(100.0));
+        assert!(
+            control
+                .cross_market_attribution
+                .as_ref()
+                .unwrap()
+                .maker_submitted
+                > 0
+        );
+        assert_eq!(control.fair_value_mode, "core_only");
+        let control = serde_json::to_value(control).unwrap();
+        assert_eq!(control, serde_json::to_value(run(Some(500.0))).unwrap());
+        assert_eq!(control, serde_json::to_value(run(None)).unwrap());
+        let mut invalid = continuous_config(125);
+        invalid.core_only = true;
+        invalid.hyperliquid_obi_filter = Some(HyperliquidObiFilter {
+            threshold: 0.6,
+            max_age_ms: 250,
+        });
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

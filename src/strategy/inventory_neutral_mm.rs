@@ -459,6 +459,8 @@ pub struct InventoryNeutralMM {
     volatility_regime: volatility_regime::VolatilityRegime,
     #[cfg(feature = "research-replay")]
     quote_participation: Option<replay::recorded::QuoteParticipation>,
+    #[cfg(feature = "research-replay")]
+    local_participation: Option<replay::recorded::local_signal::LocalParticipation>,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -558,6 +560,8 @@ impl InventoryNeutralMM {
             volatility_regime: volatility_regime::VolatilityRegime::default(),
             #[cfg(feature = "research-replay")]
             quote_participation: None,
+            #[cfg(feature = "research-replay")]
+            local_participation: None,
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -2113,6 +2117,22 @@ impl InventoryNeutralMM {
             policy.apply(
                 &mut plan.target,
                 inputs.participation_bbo,
+                [
+                    self.account_stats.position,
+                    self.order_tracker.confirmed_position(),
+                ],
+                &runtime_config,
+            );
+            plan
+        } else {
+            plan
+        };
+
+        #[cfg(feature = "research-replay")]
+        let plan = if let Some(policy) = &mut self.local_participation {
+            let mut plan = plan;
+            policy.apply(
+                &mut plan.target,
                 [
                     self.account_stats.position,
                     self.order_tracker.confirmed_position(),

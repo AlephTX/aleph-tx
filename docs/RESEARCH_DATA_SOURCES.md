@@ -9,6 +9,10 @@ The [November 14 checkpoint](RESEARCH_PROGRESS_2026_11_14.md) records the
 expanded Entropy/TradeXYZ/Arcus/BULK collection, fast-book supplement,
 remaining channel gaps and updated immutable inventory. It distinguishes
 strategy-independent capture from consolidation of older campaign files.
+The main shared source has since sealed. Its new ten-hour execution results,
+tail-delivery admission failures and reference-age diagnostics are recorded
+in the same checkpoint. Source duration, timing admission and economic
+qualification remain separate statuses.
 
 Public research archives and their detailed manifests stay on Oasis under
 `~/aleph-tx-research`, outside Git. Private account material stays in protected
@@ -48,13 +52,13 @@ inventory; an adapter is not proof of a complete dataset.
 
 | Stable source family | Identity and data | Documented availability | Evidence still required for an economic validation |
 | --- | --- | --- | --- |
-| `lighter.core` | `lighter`; Core public L2, statistics, separate public trades and subscription clock evidence | Historical crypto/RWA inputs and Extended paired capture | Market terms, account fee/delay assumptions, book/trade coverage and held-position funding |
-| `lighter.robinhood` | `lighter_robinhood`; independent Robinhood Chain L2, statistics, public trades and clocks | Five-minute ingestion check documented on 2026-11-13; separate longer collection started | Domain-specific history, collateral/settlement, fees, delays, funding and API incentive eligibility; Core history cannot substitute |
-| `hyperliquid.core` | `hyperliquid`; native WebSocket/REST books, contexts, public trades and polled funding history | Historical BTC/ETH and RWA campaigns; both transports supported | Native instrument, account fees, oracle methodology, transport gaps and settled funding |
+| `lighter.core` | `lighter`; Core public L2, statistics, separate public trades and subscription clock evidence | Historical crypto/RWA inputs; new shared BTC/ETH source sealed November 14, with complete ten-hour quant diagnostic ledgers | Market terms, account fee/delay assumptions, book/trade coverage and held-position funding |
+| `lighter.robinhood` | `lighter_robinhood`; independent Robinhood Chain L2, statistics, public trades and clocks | Shared ten-hour BTC/ETH source compiled for the priority cost curve; 750 ms timing passes but retains three disconnects per market; separate 12 h capture sealed | Domain-specific history, collateral/settlement, fees, gap exposure, funding and API incentive eligibility; Core history cannot substitute |
+| `hyperliquid.core` | `hyperliquid`; native WebSocket/REST books, contexts, public trades and polled funding history | Historical BTC/ETH and RWA campaigns; shared reference-age audit and separate 90-second native fast-book timing probe on November 14 | Native instrument, account fees, oracle methodology, transport gaps and settled funding; fast-book timing is not ten-hour coverage |
 | `hyperliquid.entropy` | `entropy`, native `io:SYMBOL`; HIP-3 books and contexts through Hyperliquid | Public RWA pair studies; ongoing coverage is campaign-specific | Deployer-specific terms, fees, oracle, funding, actual trade coverage and incentive rules |
 | `hyperliquid.tradexyz` | `trade_xyz`, native `xyz:SYMBOL`; HIP-3 books and contexts | Public RWA pair studies | Product-specific economics, independent stock/session evidence, fees and funding; native Hyperliquid terms do not automatically apply |
-| `arcus` | Public REST metadata/BBO, REST and WebSocket L2; archived trades where present | Historical BTC/ETH maker-first inputs and RWA coverage studies | Trade coverage, price/time units, oracle contexts, fees, funding and full-cycle exits |
-| `extended` | Active-CLOB metadata, sequenced per-market WebSocket depth and public trades | BTC/ETH paired collection started 2026-11-13; collector transition recorded at shard 003 | Correct metadata version, book/trade gaps, account fees, settled funding and confirmed cash rebates |
+| `arcus` | Public REST metadata/BBO, REST and WebSocket L2; archived trades where present | Historical BTC/ETH maker-first inputs; November 14 supplement has 336/336 hourly funding records for each of six markets | New trade-stream coverage, oracle/payment marks, effective historical terms, fees and full-cycle exits; published rates alone do not certify held-position cash flows |
+| `extended` | Active-CLOB metadata, sequenced per-market WebSocket depth and public trades | Shared ten-hour source sealed; separate index capture still collecting at November 14 10:32 Beijing; 750 ms Maker timing rejected and 2 s historical sensitivity recorded independently | Correct metadata version, book/trade gaps, account fees, settled funding and confirmed cash rebates |
 | `bulk` | Public REST/WebSocket books and metadata | RWA coverage studies and read-only adapter | Tradable product, precision/time units, trades and queue evidence, fees and funding; snapshots alone cannot establish Maker fills |
 | `variational` | Public v2 perpetual/swap statistics and source times; indicative marks | Read-only research adapter; executable API work deferred by the user | Executable quotes/orders and correct contract cash flows; indicative marks cannot serve as fillable L2 |
 
@@ -79,6 +83,7 @@ and exclusions. RWA candidates also need corporate-action and session checks.
 | `nasdaq.corporate_actions` | Dividend, split and other payoff adjustments | Required over the proposed equity window. Missing evidence does not mean no action occurred. |
 | `pyth.equity_reference_attempt` | Earlier candidate independent equity source | Initial recordings documented unavailable independent equity/action coverage. Preserve the failure record; it is not a usable reference series. |
 | `deribit.public_product_probe` | Public USDC contracts, native combos/books and fees for fixed-cash-flow research | `scripts/probe_deribit_box.py` provides a limited probe. A snapshot does not establish continuous execution, account margin or a positive executable Box. |
+| `pendle.boros.candidate` | Fixed-versus-floating funding contracts and spread-market documentation | Considered November 14; documentation only, no API series or executable-price validation. Match underlying venue/index, settlement cadence, maturity, collateral, margin, liquidation and complete entry/exit costs before any replay. A fixed rate does not eliminate basis, execution or liquidation risk. |
 
 Reference availability and calendar semantics are specified in
 [equity replay preparation](PERP_RECORDING.md#archived-equity-reference-and-sessions).
@@ -114,6 +119,111 @@ The [funding proof/audit workflow](PERP_RECORDING.md#audited-funding-cashflows)
 separates forecasts, rates and witnessed unit cash flows. Private fee and
 account evidence stays protected; only irreversibly redacted provenance and
 aggregate findings belong in a public report.
+
+### November 14 funding supplement
+
+The immutable `public-funding-review-20261114T025117Z` campaign stores
+Hyperliquid `meta` for `io`/`xyz` and 14-day `fundingHistory` responses for
+NVDA, SNDK and AAPL. The reviewed interval is October 31 10:00 through
+November 14 10:00 Beijing, half-open. Five series have 336 hourly slots;
+`io:AAPL` has 271. Current Growth Mode and delisting metadata have their
+actual November 14 availability and are not backdated into earlier fees.
+Published decimal rates are converted once by multiplying by 10,000;
+deployer funding multipliers are not applied again to published history.
+
+`arcus-funding-supplement-20261114T025903Z` stores `/v1/markets` and
+`/v1/fundingRates?market=SYMBOL-USD&limit=1000` for BTC, SPY, QQQ, NVDA,
+MU and SNDK. Each response contains 1,000 unique hourly records, including
+336/336 slots in the same 14-day interval. Native market IDs and display
+names match metadata. The archived official
+[API specification](https://docs.arcus.xyz/api-reference/public/get-market-funding-rates)
+defines `time` in epoch microseconds and `fundingRate` as an hourly decimal
+rate. Conversion retains original source and download times. The
+[funding mechanics](https://docs.arcus.xyz/concepts/perpetuals/funding)
+also describe distinct off-hours RWA rules; current documentation alone
+does not certify unchanged historical contract terms.
+
+`public-funding-audit-20261114T030022Z` binds both captures and official
+documents by hash. Its initial schema/coverage report is retained; the
+separate `units-reviewed.json` records the subsequently verified units.
+Each source campaign has an append-only `inventory-entry.json`, actual
+request/response times and a saved capture driver. They supplement the old
+raw-tape inventory rather than changing its totals. These rates support
+historical screening, not account-confirmed payments or executable returns.
+See the [new review results](RESEARCH_PROGRESS_2026_11_14.md#external-review-follow-up).
+
+### November 14 RH/Core and prospective inputs
+
+`rh-turnover-cost-curve-20261114T043334Z/prepared` binds the shared sealed
+source to BTC/ETH RH/Core compiled tapes, native per-domain IDs and exact
+input hashes. The original three disconnects per market and 750 ms delivery
+test remain intact. Fees, funding cadence and RH action delays are explicit
+research assumptions. Core USDC and RH USDG use an **unverified 1:1 research
+numeraire**; conversion costs and account eligibility are not certified.
+The manifest and `inventory-entry.json` preserve these limitations outside
+Git. A complete paper ledger does not remove them.
+
+`core-rh-prospective-10h-20261114T044946Z` is a new public source for the
+fixed November 14 13:00–23:00 Beijing quant window. Six ETH policies were
+frozen before recording. Raw Core/RH BTC/ETH books and acknowledged trades,
+HL books and Coinbase references share original receipt ordering; native
+market mappings come from that campaign's metadata. On natural completion,
+the driver verifies the full gzip stream and writes a new archive and
+capture inventory before replay. Until then it is an active partial, not
+usable holdout evidence. [Frozen study](RESEARCH_PROGRESS_2026_11_14.md#prospective-window-already-frozen)
+
+### November 14 public incentive and execution rules
+
+`public-rules-review-20261114T052857Z` archives official RH points, Lighter
+fee/latency and LPP documents with actual request/receipt times and hashes.
+The RH points document excludes Standard-to-Standard activity from both
+point types and specifies the November 6–19 weekly hedge-boost directions.
+Other qualification exclusions and venue discretion still apply. Public
+book/print data does not prove counterparty tier; neither Standard nor
+Premium simulated volume is labeled confirmed eligible volume.
+[RH program](https://docs.lighter.xyz/programs/lighter-on-robinhood-chain-points)
+
+The archived general fee schedule supplies the Core Premium counterfactual
+at zero LIT stake: 0.4/2.8 bps Maker/Taker, no additional cancel latency and
+140 ms additional Taker latency. It is a current public assumption, not
+historical account evidence. The supplied review's RH 300 ms claim cites our
+own configured assumption; the RH API documentation probes returned identical
+generic pages without domain-specific delay text, and index follow-ups failed.
+RH-specific effective delays therefore remain unverified in this audit.
+[General schedule](https://docs.lighter.xyz/trading/trading-fees)
+
+LPP's official document requires Premium/Advanced status, eligible resting
+quotes and asset-specific parameters. Its roughly one-minute randomized
+snapshots score quoting liquidity; OI-hours alone are not that program's
+published scoring model. No LPP receipts or account participation were
+inferred. The archived documents do not replace receipt or settlement proof.
+[LPP specification](https://docs.lighter.xyz/programs/liquidity-partner-program)
+
+The execution follow-up reuses the already inventoried historical tapes;
+it adds no independent market sample. `execution-measurement-20261114T053515Z`
+freezes 84 cancellation arms and eight quant sensitivities, with the public
+fees treated as counterfactual assumptions. Its append-only aggregate
+inventory is `execution-review-20261114T060430Z`. The separate
+`exact-cash-proof-20261114T055810Z` preserves the original reports and binds
+two unchanged-parameter replays to their original configurations and raw
+reports. It verifies economic/cycle parity and replaces one serialization
+classification in a new review report; it does not repair feed gaps or
+create holdout evidence. See the [results and remaining limits](RESEARCH_PROGRESS_2026_11_14.md#execution-and-incentive-review).
+`execution-final-checkpoint-20261114T060808Z` binds the final curve,
+source verification, rules and unchanged prospective policy; inventory
+SHA-256 is `0a1284abc1acae274aedf3d35cb6ebd419a331e88b777f290af258f4485ab595`.
+
+### November 14 12:57 inventory refresh
+
+`public-inventory-20261114T045728Z/catalog.json` contains **448 unique
+public archives**, **26 metadata objects** and **4,267,910,691 compressed
+archive bytes**, with eight duplicate aliases. The inventory hash is
+`2d5a73267a92dab8c8d2c801c4d55a0152944003835d128092c7e30ade9cc65e`.
+It preserves the earlier catalogs and includes newly sealed capture files;
+it excludes active partials, derived reports and sources outside its explicit
+allowlist. Funding supplements and the new prospective campaign have the
+separate manifests described above. Counts do not certify per-stream
+continuity or represent total disk usage.
 
 ## Archive inventory snapshot
 

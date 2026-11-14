@@ -77,6 +77,20 @@ state and cash ledgers; shared tape is counted once as market evidence.
 [Ten-hour validation and current limits](docs/TEN_HOUR_RESEARCH.md) ·
 [Data-source registry](docs/RESEARCH_DATA_SOURCES.md)
 
+Research programs can run independently on the shared tapes. Maker trade
+timing is checked before a turnover matrix, and signal reports expose fresh
+reference availability alongside complete-ledger PnL.
+Offline probes separate Core-only fair value from the local entry filter
+and report fill-conditioned 1/5/30-second markouts, including fills during
+pending cancellation. Paired controls must reproduce the source campaign.
+RH/Core turnover research freezes cost-budget curves and reconciles each
+cycle's execution costs, price drift, fees and modeled overhead. Feed gaps,
+small samples and unverified collateral assumptions remain explicit.
+Cancellation-overlap and account-tier sensitivities use separate frozen
+ledgers. Target turnover is reported separately from unknown reward
+eligibility; points have no assumed cash value.
+[Current results and source gaps](docs/RESEARCH_PROGRESS_2026_11_14.md)
+
 ## Architecture
 
 ```mermaid

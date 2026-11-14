@@ -5,6 +5,7 @@ use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
 use crate::strategy::relative_value::*;
 use std::collections::{BTreeMap, VecDeque};
 
+mod costs;
 mod funding;
 mod posture;
 pub use funding::{FlatAtFunding, FundingFlatReport};
@@ -42,6 +43,10 @@ pub struct MakerFirstConfig {
     pub maker_cancel_delay_ms: u64,
     pub taker_delay_ms: [u64; 2],
     pub trade_clock_guard_ms: u64,
+    /// Offline sensitivity: include the clock-uncertain cancellation overlap.
+    /// False preserves the historical strict-before-cancel matching model.
+    #[serde(default)]
+    pub conservative_cancel_guard: bool,
     pub trade_delivery_grace_ms: u64,
     pub quote_lifetime_ms: u64,
     pub reprice_ms: u64,
@@ -68,6 +73,9 @@ pub struct MakerFirstConfig {
     /// Separate waiting budget and economics for an already hedged position.
     #[serde(default)]
     pub hedged_exit: Option<HedgedExit>,
+    /// Offline diagnostics only; never changes admission or execution.
+    #[serde(default)]
+    pub diagnose_cycles: bool,
     #[serde(with = "rust_decimal::serde::str")]
     pub maker_fee_bps: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -184,6 +192,12 @@ impl MakerFirstEvent {
 
 #[derive(Debug, Default, Serialize)]
 pub struct MakerFirstReport {
+    pub conservative_cancel_guard: bool,
+    pub cancel_guard_overlap_prints: usize,
+    pub cancel_guard_overlap_fills: usize,
+    pub maker_fills_after_cancel_request: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cancel_guard_overlap_turnover: Decimal,
     pub start_ms: u64,
     pub end_ms: u64,
     pub book_frames: usize,
@@ -231,6 +245,8 @@ pub struct MakerFirstReport {
     pub maker_spread_capture: Decimal,
     pub forced_close_pnl: Decimal,
     pub cycle_attribution: CycleAttribution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_costs: Option<costs::Costs>,
     pub turnover_posture: TurnoverPostureReport,
     pub realized_pnl: Decimal,
     pub pnl_before_fees: Option<Decimal>,
@@ -782,6 +798,12 @@ impl Replay<'_> {
             }
         }
         self.books = Some(books);
+        let mark = self
+            .fresh(self.maker(), now)
+            .map(|b| (b.timestamp_ms, b.mid()));
+        if let Some(costs) = &mut self.report.execution_costs {
+            costs.book(now, mark);
+        }
         self.report.book_frames += 1;
         self.report.synchronized_book_frames += usize::from(self.pair_books(now).is_some());
         Ok(())
@@ -811,7 +833,13 @@ impl Replay<'_> {
             return;
         };
         if quote.cancelled_ms.is_some_and(|at| {
-            now >= at + self.config.trade_delivery_grace_ms + self.config.trade_clock_guard_ms
+            let last_receipt =
+                at + self.config.trade_delivery_grace_ms + self.config.trade_clock_guard_ms;
+            if self.config.conservative_cancel_guard {
+                now > last_receipt
+            } else {
+                now >= last_receipt
+            }
         }) {
             return;
         }
@@ -930,18 +958,35 @@ impl Replay<'_> {
             self.report.late_trade_prints += 1;
         }
         let midpoint = self.fresh(i, now).map(Book::mid);
+        let reference_mids = [
+            self.fresh(0, now).map(Book::mid),
+            self.fresh(1, now).map(Book::mid),
+        ];
         let Some(quote) = self.quote.as_mut() else {
             return Ok(());
         };
         let guarded = source.saturating_sub(self.config.trade_clock_guard_ms);
         if quote.activated_ms.is_none_or(|at| at >= guarded)
-            || quote
-                .cancelled_ms
-                .is_some_and(|at| source.saturating_add(self.config.trade_clock_guard_ms) >= at)
             || source > now
             || quote.side == side
             || signed_cost(quote.side, price, quote.price) > Decimal::ZERO
         {
+            return Ok(());
+        }
+        let strict_excluded = quote
+            .cancelled_ms
+            .is_some_and(|at| source.saturating_add(self.config.trade_clock_guard_ms) >= at);
+        let conservative_excluded = quote.cancelled_ms.is_some_and(|at| {
+            guarded > at
+                || now > at + self.config.trade_delivery_grace_ms + self.config.trade_clock_guard_ms
+        });
+        let overlap = strict_excluded && !conservative_excluded;
+        self.report.cancel_guard_overlap_prints += usize::from(overlap);
+        if if self.config.conservative_cancel_guard {
+            conservative_excluded
+        } else {
+            strict_excluded
+        } {
             return Ok(());
         }
         self.report.maker_prints_touching_quote += 1;
@@ -983,11 +1028,19 @@ impl Replay<'_> {
             self.report.cycle_attribution.closing_quotes.filled += 1;
         }
         let notional = base * quote.price;
+        self.report.maker_fills_after_cancel_request += usize::from(quote.cancelled_ms.is_some());
+        if overlap {
+            self.report.cancel_guard_overlap_fills += 1;
+            self.report.cancel_guard_overlap_turnover += notional;
+        }
         quote.left -= base;
         if quote.left.is_zero() {
             self.quote = None;
         }
         let cycle = self.cycle.get_or_insert_with(|| {
+            if let Some(costs) = &mut self.report.execution_costs {
+                costs.begin(now, reference_mids);
+            }
             if let Some(i) = passive_side {
                 self.report.passive_cycles_started[i] += 1;
             }
@@ -1025,6 +1078,24 @@ impl Replay<'_> {
             .ledger
             .trade(i, side, Fill { base, notional }, self.config.maker_fee_bps);
         self.report.maker_fees += fee;
+        if let Some(costs) = &mut self.report.execution_costs {
+            costs.fill(costs::CostFill {
+                now,
+                leg: i,
+                maker_leg: i,
+                phase: if closing {
+                    costs::Phase::CloseMaker
+                } else {
+                    costs::Phase::EntryMaker
+                },
+                side,
+                base,
+                notional,
+                fee,
+                mid: midpoint,
+                submit_touch: None,
+            });
+        }
         let attribution = &mut self.report.cycle_attribution;
         if closing {
             attribution.closing_maker_fees[i] += fee;
@@ -1092,6 +1163,7 @@ impl Replay<'_> {
             return Ok(());
         }
         let fill_time = book.timestamp_ms;
+        let fill_mid = book.mid();
         self.consumed_ms[order.leg] = fill_time;
         self.report.ioc_fills += 1;
         self.report.ioc_partial += usize::from(fill.base < order.quantity);
@@ -1111,6 +1183,26 @@ impl Replay<'_> {
         let fee = self
             .ledger
             .trade(order.leg, order.side, fill, terms.taker_fee_bps);
+        if let Some(costs) = &mut self.report.execution_costs {
+            costs.fill(costs::CostFill {
+                now,
+                leg: order.leg,
+                maker_leg: self.config.maker_leg,
+                phase: if order.unwind {
+                    costs::Phase::ForcedClose
+                } else if order.closing_hedge {
+                    costs::Phase::CloseHedge
+                } else {
+                    costs::Phase::EntryHedge
+                },
+                side: order.side,
+                base: fill_base,
+                notional,
+                fee,
+                mid: Some(fill_mid),
+                submit_touch: Some(order.touch),
+            });
+        }
         let attribution = &mut self.report.cycle_attribution;
         attribution.reduce_ioc_dust_fills += usize::from(dust);
         if order.unwind {
@@ -1832,6 +1924,12 @@ impl Replay<'_> {
         if self.report.incomplete.is_some() || !self.notices.is_empty() {
             return;
         }
+        if let Some(costs) = &mut self.report.execution_costs {
+            let overhead = self.config.turnover_feedback.map_or(Decimal::ZERO, |p| {
+                p.overhead(self.ledger.turnover - cycle.initial_turnover)
+            });
+            costs.close(now, pnl, overhead);
+        }
         let stats = &mut self.report.cycle_attribution;
         if cycle.forced_ioc_filled {
             stats.forced_ioc_cycles += 1;
@@ -2262,6 +2360,9 @@ impl Replay<'_> {
             ended && self.report.book_frames > 0,
             "incomplete maker-first tape"
         );
+        if let Some(costs) = &mut self.report.execution_costs {
+            costs.finish(self.config.end_ms);
+        }
         if let Some(at) = self.unhedged_since {
             let elapsed = self.config.end_ms - at;
             self.report.total_unhedged_ms += elapsed;
@@ -2337,6 +2438,14 @@ impl Replay<'_> {
                 outward_quotes: self.cost_feedback.outward_quotes,
             });
         }
+        if let Some(costs) = &mut self.report.execution_costs {
+            let after = self
+                .report
+                .turnover_feedback
+                .as_ref()
+                .map_or(self.report.net_pnl, |r| r.net_after_overhead);
+            costs.reconcile_ledger(self.report.net_pnl, after);
+        }
         self.report.funding_flat = self.funding.map(|state| state.report);
         Ok(self.report)
     }
@@ -2374,8 +2483,10 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         posture: PostureState::new(config.turnover_posture),
         funding: FundingState::new(config)?,
         report: MakerFirstReport {
+            conservative_cancel_guard: config.conservative_cancel_guard,
             start_ms: config.start_ms,
             end_ms: config.end_ms,
+            execution_costs: config.diagnose_cycles.then(costs::Costs::new),
             ..Default::default()
         },
     })
@@ -2405,6 +2516,7 @@ mod tests {
             maker_cancel_delay_ms: 100,
             taker_delay_ms: [0; 2],
             trade_clock_guard_ms: 0,
+            conservative_cancel_guard: false,
             trade_delivery_grace_ms: 150,
             quote_lifetime_ms: 800,
             reprice_ms: 100,
@@ -2418,6 +2530,7 @@ mod tests {
             passive_offset: None,
             turnover_feedback: None,
             hedged_exit: None,
+            diagnose_cycles: false,
             maker_fee_bps: Decimal::ONE,
             quote_notional: Decimal::from(100),
             latency_reserve_bps: Decimal::ZERO,
@@ -2466,6 +2579,101 @@ mod tests {
             price: d("1000"),
             contracts: d(contracts),
         }
+    }
+
+    fn cancellation_quote(start: u64) -> Quote {
+        Quote {
+            posture: TurnoverPosture::Neutral,
+            side: HedgeSide::Buy,
+            price: d("1000"),
+            left: d("0.1"),
+            ahead: Decimal::ZERO,
+            arrival_ms: start,
+            activated_ms: Some(start),
+            expires_ms: start + 2_000,
+            cancelled_ms: Some(start + 1_000),
+            hedge_limit: Some(d("1000")),
+            passive_entry: false,
+            closing: false,
+            closing_touched: false,
+            closing_filled: false,
+        }
+    }
+
+    #[test]
+    fn cancel_guard_sensitivity_bounds_clock_overlap_and_preserves_cash() {
+        for (offset, strict_fill, conservative_fill) in [
+            (-101, true, true),
+            (-100, false, true),
+            (0, false, true),
+            (100, false, true),
+            (101, false, false),
+        ] {
+            for (conservative, expected) in [(false, strict_fill), (true, conservative_fill)] {
+                let mut cfg = config();
+                cfg.trade_clock_guard_ms = 100;
+                cfg.conservative_cancel_guard = conservative;
+                let mut replay = new_replay(&cfg).unwrap();
+                replay.quote = Some(cancellation_quote(cfg.start_ms));
+                let source = (cfg.start_ms as i64 + 1_000 + offset) as u64;
+                replay
+                    .trade(source + 50, source, HedgeSide::Sell, d("1000"), d("0.01"))
+                    .unwrap();
+                assert_eq!(replay.report.maker_fills, usize::from(expected));
+                assert_eq!(
+                    replay.report.cancel_guard_overlap_fills,
+                    usize::from(expected && conservative && offset >= -100)
+                );
+                assert_eq!(
+                    replay.ledger.positions[0],
+                    if expected { d("0.01") } else { Decimal::ZERO }
+                );
+                assert_eq!(
+                    replay.ledger.cash,
+                    if expected {
+                        d("-10.001")
+                    } else {
+                        Decimal::ZERO
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conservative_tombstone_keeps_last_receipt_then_releases() {
+        let mut cfg = config();
+        cfg.trade_clock_guard_ms = 100;
+        cfg.conservative_cancel_guard = true;
+        let mut replay = new_replay(&cfg).unwrap();
+        replay.quote = Some(cancellation_quote(cfg.start_ms));
+        let end = cfg.start_ms + 1_000 + 100 + cfg.trade_delivery_grace_ms;
+        replay.advance_quote(end, false);
+        assert!(replay.quote.is_some());
+        replay
+            .trade(
+                end,
+                end - cfg.trade_delivery_grace_ms,
+                HedgeSide::Sell,
+                d("1000"),
+                d("0.01"),
+            )
+            .unwrap();
+        assert_eq!(replay.report.cancel_guard_overlap_fills, 1);
+        replay
+            .trade(
+                end + 1,
+                end - cfg.trade_delivery_grace_ms,
+                HedgeSide::Sell,
+                d("1000"),
+                d("0.01"),
+            )
+            .unwrap();
+        assert_eq!(replay.report.maker_fills, 1);
+        replay.advance_quote(end + 1, false);
+        assert!(replay.quote.is_none());
+        assert_eq!(replay.ledger.positions[0], d("0.01"));
+        assert!(!replay.notices.is_empty());
     }
 
     #[test]
@@ -3172,6 +3380,53 @@ mod tests {
         events.push(MakerFirstEvent::End { at_ms: c.end_ms });
         events.sort_by_key(MakerFirstEvent::time);
         events.into_iter().map(Ok).collect()
+    }
+
+    #[test]
+    fn cycle_cost_diagnostics_preserve_all_three_posture_ledgers() {
+        for posture in [
+            TurnoverPosture::Neutral,
+            TurnoverPosture::LongFirst,
+            TurnoverPosture::ShortFirst,
+        ] {
+            let mut cfg = posture_config(posture);
+            let control = run_maker_first(
+                &cfg,
+                posture_tape(&cfg, posture, None),
+                &VenueRegistry::default(),
+            )
+            .unwrap();
+            cfg.diagnose_cycles = true;
+            let measured = run_maker_first(
+                &cfg,
+                posture_tape(&cfg, posture, None),
+                &VenueRegistry::default(),
+            )
+            .unwrap();
+            assert_eq!(control.net_pnl, measured.net_pnl);
+            assert_eq!(control.maker_turnover, measured.maker_turnover);
+            assert_eq!(control.taker_turnover, measured.taker_turnover);
+            assert_eq!(control.quotes_submitted, measured.quotes_submitted);
+            assert_eq!(control.quote_cancels, measured.quote_cancels);
+            let costs = measured.execution_costs.unwrap();
+            assert!(costs.whole_ledger_cash_reconciled);
+            assert_eq!(costs.whole_ledger_net_before_overhead, measured.net_pnl);
+            assert_eq!(costs.cycles.len(), measured.closed_cycles);
+            assert!(
+                costs
+                    .cycles
+                    .iter()
+                    .all(|c| c.completed && c.cash_reconciled && c.price_decomposition_reconciled)
+            );
+            assert_eq!(
+                costs
+                    .cycles
+                    .iter()
+                    .map(|c| c.net_before_overhead.unwrap())
+                    .sum::<Decimal>(),
+                measured.net_pnl.unwrap()
+            );
+        }
     }
 
     #[test]

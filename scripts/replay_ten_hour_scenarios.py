@@ -19,6 +19,7 @@ from archive_public_capture import verify_compiled
 from replay_maker_campaign import books, load, save, strategy_config, unseal
 from replay_maker_first_campaign import digest
 from public_replay_sources import trade_events
+from replay_trade_preflight import audit as audit_trade_timing, timing_policy
 
 TEN_HOURS = 36_000_000
 CAPITAL_SIZES = ((500, 50), (1000, 100))
@@ -250,14 +251,20 @@ def quant_policy(base, market, symbol, window, capital, size):
                 "drain_before_ms": 15_000, "guard_ms": 1000, "max_event_gap_ms": 5000}}
 
 
-def turnover_policies(pair, window, fees):
+def turnover_policies(pair, window, fees, trade_delivery_ms=750, cost_caps=(0, 4)):
+    if type(trade_delivery_ms) is not int or not 0 < trade_delivery_ms <= 5000:
+        raise ValueError("turnover trade delivery bound must be in [1, 5000] ms")
+    cost_caps = tuple(Decimal(str(value)).normalize() for value in cost_caps)
+    if (not cost_caps or len(set(cost_caps)) != len(cost_caps)
+            or any(not c.is_finite() or not 0 <= c <= 100 for c in cost_caps)):
+        raise ValueError("cost caps must be unique finite values in [0, 100] bps")
     start, end, stop = (window[k] for k in ("start_ms", "end_ms", "drain_until_ms"))
     if pair["legs"][0]["venue"] != "lighter" or pair["legs"][1]["venue"] not in ("arcus", "extended", "hyperliquid", "lighter_robinhood"):
         raise ValueError("expected Core Lighter hedge and a supported target domain")
     target_delay = 300 if pair["legs"][1]["venue"] == "lighter_robinhood" else 0
     for capital, size in CAPITAL_SIZES:
         for posture in POSTURES:
-            for cost in (0, 4):
+            for cost in cost_caps:
                 label = f"{posture}-{capital}capital-{size}size-{cost}bps"
                 legs = [dict(leg) for leg in pair["legs"]]
                 legs[0]["taker_fee_bps"], legs[1]["taker_fee_bps"] = "0", fees[1]
@@ -270,7 +277,7 @@ def turnover_policies(pair, window, fees):
                     "maker_leg": 1, "start_ms": start, "end_ms": stop,
                     "transport_ms": 250, "fill_notice_ms": 100, "maker_cancel_delay_ms": target_delay,
                     "taker_delay_ms": [300, target_delay], "trade_clock_guard_ms": 100,
-                    "trade_delivery_grace_ms": 750, "quote_lifetime_ms": 800,
+                    "trade_delivery_grace_ms": trade_delivery_ms, "quote_lifetime_ms": 800,
                     "reprice_ms": 100, "hold_ms": 15_000, "unhedged_timeout_ms": 2500,
                     "drain_ms": 15_000, "require_net_edge": True,
                     "maker_fee_bps": fees[0], "quote_notional": str(size), "latency_reserve_bps": "0.5",
@@ -309,6 +316,11 @@ def summarize_quant(row):
     volume = row.get("maker_turnover", 0) + row.get("taker_turnover", 0)
     result["net_after_overhead"] = None if net is None else net - volume * 0.25 / 10_000
     result["modeled_overhead_bps_of_gross_turnover"] = 0.25
+    result["modeled_overhead_source"] = "uncalibrated_research_assumption_not_exchange_fee"
+    result["net_before_modeled_overhead"] = net
+    result["net_bps_before_modeled_overhead"] = net / volume * 10_000 if net is not None and volume else None
+    result["fixed_ledger_overhead_sensitivity"] = {
+        str(cost): None if net is None else net - volume * cost / 10_000 for cost in (0, 0.1, 0.25, 0.5)}
     return result
 
 
@@ -319,6 +331,47 @@ def summarize_turnover(row):
     return {key: row.get(key) for key in keys}
 
 
+def execute_turnover_grid(engine, out, symbol, pair, window, fees, tape, input_sha256, trade_delivery_ms=750):
+    """Freeze every arm, then reject shared timing failures before any engine runs."""
+    configs = {}
+    policies = {}
+    for label, policy in turnover_policies(pair, window, fees, trade_delivery_ms):
+        label = f"turnover-{symbol}-{label}"
+        configs[label] = out / "configs" / f"{label}.json"
+        policies[label] = policy
+        save(configs[label], policy)
+    config_hashes = {label: digest(path) for label, path in configs.items()}
+    first = next(iter(policies.values()))
+    if any(timing_policy(policy) != timing_policy(first) for policy in policies.values()):
+        raise ValueError("turnover matrix must share one explicit timing policy")
+    admission = audit_trade_timing(tape, first)
+    if admission["input_sha256"] != input_sha256:
+        raise ValueError("turnover input changed after preparation")
+    audit_path = out / f"turnover-{symbol}.trade-preflight.json"
+    save(audit_path, admission)
+    audit_hash = digest(audit_path)
+    results = {}
+    for label, config in configs.items():
+        if digest(config) != config_hashes[label]:
+            raise ValueError("frozen turnover configuration changed before execution")
+        if admission["trade_timing_admitted"]:
+            row = summarize_turnover(execute(engine, config, tape, out / "runs" / f"{label}.json", True))
+            row["execution_started"] = True
+        else:
+            row = {"incomplete": "input_trade_timing_rejected", "engine_exit_code": None,
+                   "net_pnl": None, "source_blockers": admission["blockers"], "execution_started": False}
+        if digest(config) != config_hashes[label]:
+            raise ValueError("frozen turnover configuration changed during execution")
+        results[label] = row | {"config_sha256": config_hashes[label], "ledger_id": label,
+                               "trade_preflight_sha256": audit_hash}
+        # Retain completed arms even if a later independent execution fails.
+        save(out / f"turnover-{symbol}.progress.json", results)
+    if digest(tape) != input_sha256:
+        raise ValueError("turnover input changed during replay")
+    return results, {"sha256": audit_hash, "trade_timing_admitted": admission["trade_timing_admitted"],
+                     "blockers": admission["blockers"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("campaign", "quant_engine", "pair_engine", "base_config", "market_terms", "output"):
@@ -326,33 +379,45 @@ def main():
     parser.add_argument("--public-archive", type=Path)
     parser.add_argument("--compiled-dir", type=Path)
     parser.add_argument("--start-ms", type=int, help="UTC decision start shared with arbitrage research")
+    parser.add_argument("--program", nargs="+", choices=("quant", "turnover"), default=("quant", "turnover"),
+                        help="run independent programs without repeating unrelated ledgers")
+    parser.add_argument("--symbols", nargs="+", choices=("BTC", "ETH"), default=("BTC", "ETH"))
     parser.add_argument("--turnover-venue", choices=("arcus", "extended", "hyperliquid", "lighter_robinhood"), default="arcus")
     parser.add_argument("--turnover-fees-bps", nargs=2, metavar=("MAKER", "TAKER"))
+    parser.add_argument("--turnover-trade-delivery-ms", type=int, default=750,
+                        help="explicit historical timing sensitivity; default frozen bound remains 750 ms")
     args = parser.parse_args()
+    if not 0 < args.turnover_trade_delivery_ms <= 5000:
+        parser.error("--turnover-trade-delivery-ms must be in [1, 5000]")
     if args.public_archive and not args.compiled_dir:
         parser.error("--public-archive requires --compiled-dir")
-    if args.turnover_venue != "arcus" and not args.turnover_fees_bps:
+    if "turnover" in args.program and args.turnover_venue != "arcus" and not args.turnover_fees_bps:
         parser.error("provide explicit fees for the target trading domain")
-    if args.turnover_venue == "lighter_robinhood" and not args.public_archive:
+    if "turnover" in args.program and args.turnover_venue == "lighter_robinhood" and not args.public_archive:
         parser.error("Robinhood requires a public archive and its hashed compilation profile")
     os.umask(0o077)
     out, campaign = args.output.resolve(), args.campaign.resolve()
     out.mkdir()
     for name in ("inputs", "configs", "runs"):
         (out / name).mkdir()
-    with args.base_config.open("rb") as stream:
-        base = tomllib.load(stream)["inventory_neutral_mm"]
+    base = None
+    if "quant" in args.program:
+        with args.base_config.open("rb") as stream:
+            base = tomllib.load(stream)["inventory_neutral_mm"]
     campaign_info = None if args.public_archive else load(campaign / "campaign.json")
     terms = load(args.market_terms)
-    engines = {"quant": args.quant_engine.resolve(), "turnover": args.pair_engine.resolve()}
+    engines = {k: v.resolve() for k, v in (("quant", args.quant_engine), ("turnover", args.pair_engine))
+               if k in args.program}
     report = {"schema_version": 1, "sample": "historical_reuse", "ledger_restarts": 0,
               "runner_sha256": digest(Path(__file__)), "engine_sha256": {k: digest(v) for k, v in engines.items()},
               "market_terms_sha256": digest(args.market_terms), "capital_sizes": CAPITAL_SIZES,
+              "programs": sorted(set(args.program)), "symbols": sorted(set(args.symbols)),
+              "turnover_trade_delivery_ms": args.turnover_trade_delivery_ms,
               "source_evidence": {}, "quant": {}, "turnover": {}, "execution_qualified": False,
               "qualification_blockers": ["account_fees_unverified", "stream_quality_requires_separate_audit"],
               "points_value_quote": "0", "unconfirmed_rebates_quote": "0", "venue_credited_turnover_quote": None}
-    save(out / "policy.json", report | {"frozen_grid": "two assets; two capital/size cases; three turnover postures; 0/4bps loss allowances"})
-    for symbol in ("BTC", "ETH"):
+    save(out / "policy.json", report | {"frozen_grid": "selected programs/assets; two capital/size cases; three turnover postures; 0/4bps loss allowances"})
+    for symbol in dict.fromkeys(args.symbols):
         compiled = args.compiled_dir / f"{symbol}-freshest.ndjson.zst" if args.compiled_dir else None
         window = time_window(campaign, symbol, compiled, args.start_ms)
         if args.public_archive:
@@ -374,25 +439,28 @@ def main():
         else:
             market = campaign_info["selected"]["lighter"][symbol]
         report["source_evidence"][symbol] = {"window": window}
-        try:
-            tape = out / "inputs" / f"quant-{symbol}.ndjson"
-            report["source_evidence"][symbol]["quant"] = quant_input(campaign, symbol, window, tape,
-                compiled=compiled, public_archive=args.public_archive, lighter_id=market["id"])
-            if not report["source_evidence"][symbol]["quant"]["explicit_feed_states"]:
-                raise ValueError("missing_public_trade_feed_lifecycle")
-            report["quant"][symbol] = {}
-            for capital, size in CAPITAL_SIZES:
-                label = f"quant-{symbol}-{capital}capital-{size}size"
-                cfg = out / "configs" / f"{label}.json"
-                save(cfg, quant_policy(base, market, symbol, window, capital, size))
-                row = execute(engines["quant"], cfg, tape, out / "runs" / f"{label}.json")
-                report["quant"][symbol][label] = summarize_quant(row) | {"config_sha256": digest(cfg), "ledger_id": label}
+        if "quant" in args.program:
+            try:
+                tape = out / "inputs" / f"quant-{symbol}.ndjson"
+                report["source_evidence"][symbol]["quant"] = quant_input(campaign, symbol, window, tape,
+                    compiled=compiled, public_archive=args.public_archive, lighter_id=market["id"])
+                if not report["source_evidence"][symbol]["quant"]["explicit_feed_states"]:
+                    raise ValueError("missing_public_trade_feed_lifecycle")
+                report["quant"][symbol] = {}
+                for capital, size in CAPITAL_SIZES:
+                    label = f"quant-{symbol}-{capital}capital-{size}size"
+                    cfg = out / "configs" / f"{label}.json"
+                    save(cfg, quant_policy(base, market, symbol, window, capital, size))
+                    row = execute(engines["quant"], cfg, tape, out / "runs" / f"{label}.json")
+                    report["quant"][symbol][label] = summarize_quant(row) | {"config_sha256": digest(cfg), "ledger_id": label}
+                    save(out / "report.json", report)
+            except Exception as error:
+                (out / f"quant-{symbol}.prepare-error").write_text(str(error))
+                report["quant"].setdefault(symbol, {})["preparation"] = {"incomplete": "input_preparation_failed", "error_type": type(error).__name__,
+                    "source_blocker": "missing_public_trade_feed_lifecycle" if str(error) == "missing_public_trade_feed_lifecycle" else "other_preparation_failure"}
                 save(out / "report.json", report)
-        except Exception as error:
-            (out / f"quant-{symbol}.prepare-error").write_text(str(error))
-            report["quant"].setdefault(symbol, {})["preparation"] = {"incomplete": "input_preparation_failed", "error_type": type(error).__name__,
-                "source_blocker": "missing_public_trade_feed_lifecycle" if str(error) == "missing_public_trade_feed_lifecycle" else "other_preparation_failure"}
-            save(out / "report.json", report)
+        if "turnover" not in args.program:
+            continue
         try:
             route = f"{symbol}-lighter-{args.turnover_venue}"
             period = (window["start_ms"], window["drain_until_ms"], "historical_reuse")
@@ -415,22 +483,26 @@ def main():
             else:
                 target = next(t for t in terms["arcus"] if t["baseAsset"] == symbol)
                 fees = tuple(str(Decimal(target[key]) / 100) for key in ("effectiveMakerFeePpm", "effectiveTakerFeePpm"))
-            report["turnover"][symbol] = {}
-            for label, policy in turnover_policies(pair, window, fees):
-                label = f"turnover-{symbol}-{label}"
-                cfg = out / "configs" / f"{label}.json"
-                save(cfg, policy)
-                row = execute(engines["turnover"], cfg, out / "inputs" / f"{route}-{period[0]}.ndjson", out / "runs" / f"{label}.json", True)
-                report["turnover"][symbol][label] = summarize_turnover(row) | {"config_sha256": digest(cfg), "ledger_id": label}
-                save(out / "report.json", report)
+            report["turnover"][symbol], admission = execute_turnover_grid(
+                engines["turnover"], out, symbol, pair, window, fees,
+                out / "inputs" / f"{route}-{period[0]}.ndjson", provenance["input_sha256"],
+                args.turnover_trade_delivery_ms)
+            report["source_evidence"][symbol]["turnover"]["trade_preflight"] = admission
+            save(out / "report.json", report)
         except Exception as error:
             (out / f"turnover-{symbol}.prepare-error").write_text(str(error))
             report["turnover"].setdefault(symbol, {})["preparation"] = {"incomplete": "input_preparation_failed", "error_type": type(error).__name__,
                 "source_blocker": "missing_public_trade_feed_lifecycle" if str(error) == "missing_public_trade_feed_lifecycle" else "other_preparation_failure"}
             save(out / "report.json", report)
+    outcomes = [row for kind in report["programs"] for arms in report[kind].values() for row in arms.values()]
+    incomplete = sum(bool(row.get("incomplete") or row.get("halted") or row.get("engine_exit_code") != 0
+                          or row.get("terminal_flat_and_feed_verified") is False)
+                     for row in outcomes)
     print(json.dumps({"report_ready": True, "quant_runs": sum(map(len, report["quant"].values())),
-                      "turnover_runs": sum(map(len, report["turnover"].values()))}))
+                      "turnover_runs": sum(map(len, report["turnover"].values())),
+                      "incomplete_or_rejected": incomplete}))
+    return 1 if incomplete else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

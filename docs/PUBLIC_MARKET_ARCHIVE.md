@@ -54,6 +54,10 @@ and connection events. Validate time coverage and gaps separately before
 admitting a continuous ten-hour research window.
 
 The quant and turnover runner accepts `--public-archive` and `--compiled-dir`.
+Use `--program quant` or `--program turnover` to schedule each objective
+independently, and `--symbols ETH` to select one asset. The turnover matrix
+shares a hash-bound trade-timing admission audit before starting its independent
+ledgers. See [timing admission and its limits](TEN_HOUR_RESEARCH.md#independent-scheduling-and-input-admission).
 Keep each `BTC-capture.json` or `ETH-capture.json` with its compiled tape.
 The runner verifies the profile hash before using its market IDs and terms.
 For turnover on native Hyperliquid, use `--turnover-venue hyperliquid` with

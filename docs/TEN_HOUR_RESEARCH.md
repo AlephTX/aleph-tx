@@ -24,7 +24,7 @@ gaps caused by collector restart or subscription refresh.
 | --- | --- | --- |
 | Quant profit | Existing ETH/BTC baseline versus event participation filters; inspect fill-conditioned markout, actual quote changes and queue loss | Net dollars/hour, net bps and capacity after fees, funding and final exits; isolate directional inventory PnL |
 | Hedge arbitrage | Basis-reversion baseline; funding carry and fixed-settlement products remain separately labeled hypotheses | Executable full-cycle cash flows, leg completion, capital requirements and rejection reasons; forecasts cannot become settled income |
-| Incentive turnover | Extended/Core and separate Robinhood-domain research; compare `neutral`, `long_first`, `short_first` with the same risk limits | Target-venue volume, complete net cost, natural Maker exits, forced exits and exposure duration; points and unconfirmed rebates remain zero |
+| Incentive turnover | Prioritize Robinhood/Core; retain Extended/Core as a historical control. Compare `neutral`, `long_first`, `short_first` at frozen cost budgets | Target-venue volume, complete net cost, natural Maker exits, forced exits and exposure duration; points and unconfirmed rebates remain zero |
 
 The turnover postures select which side opens on the target venue. Confirmed
 fills remain fully hedged; `long_first` does not authorize residual net-long
@@ -84,6 +84,188 @@ An unsupported ten-hour window returns its funding-slot counts and missing
 engine/evidence requirements. It does not start a replay or submit orders.
 
 ## Continuous execution modes
+
+### Core local participation probe
+
+Build the offline engine with `cargo build --locked --release --features
+research-replay --bin maker_replay`, then run:
+
+```sh
+python3 scripts/replay_local_participation.py \
+  /path/to/maker_replay /path/to/ten-hour-scenarios /path/to/new-comparison
+
+# Separate fixed sensitivity: retain an entry permit for at most one second.
+python3 scripts/replay_local_participation.py \
+  /path/to/maker_replay /path/to/ten-hour-scenarios /path/to/new-hold-comparison \
+  --entry-hold-ms 1000
+
+# Six arms: original control, Core-only control, Core-only reversal gate.
+python3 scripts/replay_local_participation.py \
+  /path/to/maker_replay /path/to/ten-hour-scenarios /path/to/new-core-comparison \
+  --core-only
+```
+
+The runner freezes four independent ledgers before executing any arm:
+$500/$1,000 ETH controls and the same budgets with a local reversal entry
+gate. The inspected input window is explicitly historical selection, not
+a holdout. No fitted model or parameter search is claimed. Controls must
+reproduce the parent net PnL and both turnover totals before the comparison
+can complete. Source, engine and config hashes bind the experiment.
+
+By default, only the entry gate uses Core-local features; baseline fair
+value and risk still use their original reference. With `--core-only`,
+each size instead has three arms: the original external-reference control,
+a Core-only fair-value control, and that same Core-only control with the
+entry gate. The engine does not publish external books in Core-only mode,
+allows them to be absent, and rejects external OBI or reference-dependent
+reserve/regime overlays. Synthetic tests require identical reports with
+ordinary, displaced and absent external books. The report records
+`fair_value_mode`; the same-fair-value comparison isolates the entry gate.
+
+The gate uses a two-second lookback,
+500 ms recovery interval, 500 ms source-age ceiling, 0.5 bps initial price
+move, 0.1 bps recovery, 0.60 trade-flow imbalance and $1,000 initial flow.
+Buy entries require selling pressure followed by price and flow recovery;
+sell entries mirror those conditions. These thresholds are hypotheses.
+
+A bounded ring retains 100 ms receipt buckets; the current incomplete flow
+bucket is excluded. Future, pre-subscription and over-age trade timestamps
+cannot supply predictors. A disconnect clears history and requires fresh
+warm-up. Insufficient or non-reversing evidence withdraws entry targets.
+Both confirmed fills and account publications must agree a side cannot
+reduce inventory before the gate withdraws it. Existing cancellation,
+pending exposure, exit, funding and loss controls remain responsible for
+execution. The gate is available only under `research-replay`.
+
+The default `entry_hold_ms = 0` withdraws an entry when the reversal
+condition disappears. The separate 1,000 ms sensitivity retains each
+side's permit until its original expiry while evidence remains ready.
+Repeated positive samples before expiry do not extend that permit. Unknown
+or stale evidence clears it immediately. Holding participation does not
+impose a minimum order lifetime: the baseline may still reprice, cancel,
+reduce risk or exit. Reports count targets admitted only by a held permit
+separately. Both policies remain historical selection experiments.
+
+Reports expose signal-ready decisions and admitted/withdrawn entry targets.
+Optional execution diagnostics now measure Maker markout at 1, 5 and 30
+seconds after simulated fill receipt, with separate cancel-pending cohorts
+and turnover denominators. A label requires a book source time at or after
+its horizon and receipt within the following one second. Expired and
+unresolved end-of-tape labels remain explicit; they are not zero returns.
+These are fill-conditioned diagnostics, not training labels for every
+decision or realized round-trip PnL. Any subsequent fitted model needs an
+earlier training period and an additional continuous ten-hour validation
+window; splitting this ten-hour input into two five-hour runs would not
+satisfy the research contract.
+
+### Turnover cost versus observed volume
+
+```sh
+python3 scripts/replay_turnover_cost_curve.py \
+  /path/to/cross_venue /path/to/prepared-rh-core /path/to/new-curve
+```
+
+The prepared manifest binds BTC/ETH tapes and native pair metadata by hash,
+with explicit gaps, receipt ordering, window and source lineage. The runner
+requires the RH/Core route and an explicit **unverified USDG/USDC parity**
+research assumption. It does not qualify collateral conversion, account fees,
+funding terms, incentive eligibility or executable profit.
+
+Before starting an engine, freeze all 72 independent ledgers: two assets,
+two capital/order sizes, three opening postures, and 0/0.5/1/2/4/8 bps
+admission budgets. These correspond to $0/$50/$100/$200/$400/$800 per
+million dollars of target-venue volume. A budget is a modeled admission
+allowance, not a cap on realized loss or an observed cost estimate. Preserve
+the original independent turnover, fee and loss limits. Do not pool volume
+across arms or discard feed-gap failures. The 750 ms trade preflight runs
+once per input; passing timing does not certify feed continuity.
+
+`diagnose_cycles` adds optional offline attribution without changing orders:
+
+- Entry Maker, entry hedge, Maker close, hedge close and forced-close
+  execution costs use each leg's fresh fill-time midpoint. Their signed sum
+  plus both legs' price drift reconciles exactly to flat-cycle price loss.
+- Explicit fees and the 0.25 bps modeled overhead on gross turnover are
+  separate. Overhead is an uncalibrated research assumption, not an exchange
+  charge. Actual target-venue cost per million is `-net / target_volume * 1e6`.
+- Entry 1 s/5 s mid-price moves and hedge slippage against submission touch
+  are overlapping diagnostics, **not additional cash costs**. Missing,
+  expired and end-of-tape labels remain explicit.
+
+Each completed cycle must reconcile in Rust's exact decimal cash ledger.
+New diagnostic amounts serialize as decimal strings. Historical float JSON
+can pass aggregate comparison only within the sum of individual float ULPs,
+and only when every engine-level exact reconciliation already passed.
+Incomplete ledgers have unknown full-window net cost; zero volume has no
+cost-per-volume estimate. Report sparse samples and all tested variants.
+Raw per-cycle reports remain outside Git. An observed curve on the selected
+window is not an estimate of production capacity or a holdout result.
+
+Quant reports also expose pre-overhead net PnL and fixed-ledger sensitivities
+at 0/0.1/0.25/0.5 bps. This reprices the same executions; it does not simulate
+how different fees or latency could change order decisions.
+
+### Cancellation, account-tier and reward sensitivities
+
+```sh
+python3 scripts/replay_cancel_guard.py \
+  /path/to/cross_venue /path/to/rh-turnover-cost-curve-job /path/to/new-guard-study
+python3 scripts/replay_quant_execution_sensitivity.py \
+  /path/to/maker_replay /path/to/core-only-comparison \
+  /path/to/quant-ETH.ndjson /path/to/new-execution-study
+```
+
+The optional paper-only `conservative_cancel_guard` preserves the old
+strict-before-cancel model by default. With it enabled, a print can match a
+cancelled quote when `source_ms - guard <= cancel_effective_ms`, instead of
+requiring `source_ms + guard < cancel_effective_ms`. Activation, source-time
+validity, queue consumption and delivery bounds still apply. The tombstone
+remains reserved through the last admissible receipt, including equality;
+confirmed inventory and pending fill notices survive its eventual removal.
+Reports count overlap prints, actual overlap fills/turnover and fills after
+a cancellation request. Extra fills are not automatically worse PnL, so
+neither matching mode is claimed to bound realized profitability.
+
+The guard runner freezes all 72 conservative RH/Core arms and 12 strict
+2 bps controls before execution. Strict controls must reproduce the parent
+cycle counts, target turnover and full-ledger net cash. Original gaps and
+failed runs remain visible; no gap is repaired by a clock-policy change.
+
+The separate quant runner freezes eight Core-only ETH ledgers: Standard,
+Premium counterfactual, Standard TTL 15 s and Standard TTL 30 s, at each of
+two sizes. Premium uses current zero-stake public assumptions of 0.4/2.8 bps
+Maker/Taker fees and 0/140 ms additional cancel/Taker latency. Transport
+remains 250 ms. TTL changes the existing replacement-lifetime knob; risk
+withdrawals and exits retain their immediate authority. These are historical
+selection experiments and do not switch any account or modify an existing
+prospective window. [Published fee/latency schedule](https://docs.lighter.xyz/trading/trading-fees)
+
+RH **target turnover is not confirmed reward-eligible turnover**. Its
+official program excludes Standard-to-Standard activity; other exclusions
+and venue discretion still apply even if one side is Premium. The public
+execution tape does not certify counterparty tiers. Reports keep confirmed
+eligibility unknown and provide separate 0/20/50/80/100% denominator scenarios
+on the rule-window candidate volume. They hold orders and cash fixed, never
+value points, and do not retest admission with discounted eligible volume.
+Zero assumed eligible volume has undefined cost per eligible dollar, not
+zero cost. [RH points rules](https://docs.lighter.xyz/programs/lighter-on-robinhood-chain-points)
+
+Forced-close attribution reports cycle/fill counts and signed execution cost.
+Its fraction of total cost is defined only for positive full-ledger cost and
+can exceed 100% when other components offset it. Price drift, fees and overhead
+remain separate. This descriptive fraction is not a calibrated rule for
+relaxing unhedged timeouts, basis stops or funding guards.
+
+New cycle diagnostics also serialize whole-ledger net amounts as decimal
+strings and check the sum of completed cycles against the engine's exact
+cash, before and after overhead. Python requires that proof when present;
+it does not fall back to a float tolerance if the exact proof fails. Legacy
+reports retain their original representation and bounded rounding check.
+A representation failure is preserved and reviewed separately with an
+unchanged-parameter replay and economic/cycle parity, rather than loosening
+the tolerance after observing a failed result.
+
+### Execution lifecycle
 
 All three modes below are offline research paths. Existing live execution
 and account permissions are unchanged.
@@ -147,6 +329,46 @@ The turnover capital cases set order, loss, fee and volume budgets; they
 are not an account-level margin stress test. No return on collateral or
 annual return is inferred from those labels.
 
+### Independent scheduling and input admission
+
+`replay_ten_hour_scenarios.py --program quant` and `--program turnover`
+select independent programs; `--symbols ETH` restricts the asset. Defaults
+retain both programs and both assets. A turnover-only job does not load the
+quant engine or strategy configuration, although their positional arguments
+remain for CLI compatibility. It still uses the hash-bound baseline capture
+profile for the Core market mapping. A failed turnover input cannot force a
+repeat of completed quant ledgers.
+
+Before a turnover matrix runs, the runner freezes all configurations and
+audits the common input once. The audit binds the exact input bytes and
+timing policy, consumes the terminal marker, rejects changes during reading,
+and counts future or over-bound source times per leg. It follows the engine's
+Maker-leg funding check: a print strictly older than the flat-start ledger is
+excluded; a print at the start remains subject to the bound. It preserves
+disconnects and delayed prints. Hedge-leg delay statistics remain visible,
+but only Maker-leg timing failures reject this particular gate.
+
+```sh
+python3 scripts/replay_trade_preflight.py /path/to/maker-config.json \
+  /path/to/normalized-input.ndjson /path/to/new-timing-audit.json
+```
+
+Standalone exit code 2 means timing admission failed. The matrix runner
+records every rejected arm, its config hash, the shared audit hash and
+`execution_started: false`; PnL stays unknown. The runner exits 1 for rejected
+or incomplete runs, even if its report was successfully written. Existing
+reports and prior failed executions are never reclassified by a new audit.
+Passing this gate does not prove feed continuity, book quality, settlement,
+fees, completed execution or profitability. Exposure-dependent gap checks
+remain in the engine.
+
+The default delivery allowance remains **750 ms**. An explicit
+`--turnover-trade-delivery-ms 2000` is a separately archived historical
+sensitivity. The same late prints now remain eligible for a longer cancel
+and funding drain lifecycle; they are not deleted or retimestamped. The
+15-second drain and all notional/loss limits remain unchanged. A bound chosen
+after inspecting a sample cannot make that sample untouched holdout evidence.
+
 The runners preserve source hashes, configuration and executable identity,
 receipt-time controls, negative results and incomplete executions. Their
 execution/production qualification remains false until separate source
@@ -168,6 +390,16 @@ markout. Compare complete ledgers on the same market interval.
 python3 scripts/replay_quant_participation.py target/release/maker_replay \
   /path/to/ten-hour-scenario-output /path/to/new-eth-quant-study --capital 500
 ```
+
+The paired report includes `fresh_reference_fraction`: fresh filter decisions
+divided by all filter decisions. Missing coverage or a zero decision count
+remains unknown. A complete cash ledger does not mean its signal received
+sufficient fresh observations. The original filter keeps its **250 ms** age
+limit. `--max-reference-age-ms 1000` creates a separately labeled historical
+reference-age sensitivity with the same 0.60 imbalance threshold, fees,
+latency, execution lifecycle and capital. Report both outcomes and signal
+availability; do not select a profitable age retrospectively and call it a
+holdout result.
 
 For Extended × Lighter basis, compile a tape with both venue indices, an
 independent Coinbase reference and a declared paper notional allowance.
