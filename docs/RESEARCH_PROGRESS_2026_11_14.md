@@ -880,3 +880,32 @@ Raw data and prior backtest results were retained. No existing collector,
 node service or frozen experiment was restarted or rewritten in this update.
 The next economic conclusions must come from sealed, qualified ten-hour
 windows with final inventory and both legs' costs reconciled.
+
+## Binance 同机链路与下一窗口冻结（2026-11-14 16:04 BJT）
+
+审计修复先完成提交并推送 `2d5a5c7`。随后新增公开 Binance 单币 BBO、同进程精确时间归档、独立盘口编译和研究专用方向风险过滤；协议见 [Binance A/B](BINANCE_REFERENCE_AB.md)。原有两份其他工作文档未修改或暂存。
+
+**新连续验证尚未开始，没有新的十小时盈利结论。** 90 秒 Oasis 同机探测已封存，共 127,842 条消息，覆盖 RH/Core、Arcus、BULK、Entropy、TradeXYZ；Binance BTC/ETH/NVDA/SNDK 均有 BBO。ETH 原始 51,884 条 BBO 全部通过本轮字段、时钟差诊断和原始序号检查。全归档同进程序号验证通过，队列消费延迟最大约 4.31 ms。源时间与本机接收差值中位数约 18–21 ms，仅为未校时差值。
+
+派生 874 个独立盘口帧，Core/RH 新鲜帧分别 871/870。短样本四组链路回放均退出正常、终端平仓，均无成交；只验证输入与过滤路径，不能用作收益证据。完整原始数据保留，25 ms 完结桶只用于派生参考输入。
+
+Claude 新报告的 RH Standard 200/200/300 ms 延迟与前一审计表一致，下一窗口另加 250 ms transport 假设。RH 新单 450 ms、取消 450 ms；Core 新单 250 ms、取消 550 ms。RH/Core Premium 费率保持分别建模，没有升级账户。Standard-to-Standard 奖励限制的来源与定义有争议，设计文档已改为待核实；Hedge Boost 可在激励场景自己的两腿账本内研究，不借用其他场景资本。
+
+### 冻结与调度
+
+- 决策：**11 月 14 日 23:20 至 11 月 15 日 09:20 BJT**；warm-up 23:19，drain 到 09:20:15。采集 23:10 至 09:22，完整地位于旧冻结决策窗口之后。
+- RH ETH 是主域，Core ETH 为对照。两档资本 500/1000、A 本地报价、B 同报价加 Binance 方向过滤，共八个独立账本；RH 用 USDG、Core 用 USDC，不合并现金。
+- 冻结 policy SHA-256：`db9189a71069bde9194cbf9b0be8cbc5ae0e9e362b5efcc8c7748c036bb848b5`。
+- Oasis 新目录 `~/aleph-tx-research/binance-reference-ab-20261114T152000Z-v2`，等待进程 350587，capture-plan SHA-256 `abfe5edc81b408111ef9e14b507e894b103ec58afb485c5cf2e5cc66471d8deb`。
+- 本机隔离目录 `/private/tmp/aleph-binance-ab-20261114T152000Z-v2`，封存等待进程 97702。封存后校验 SHA、下载公开原始文件、分片归档、准入检查，再运行八臂；本机休眠会延后后处理，不影响 Oasis 采集。研究脚本和二进制已复制冻结，后续工作区修改不会改变这一版本。
+- v1 在窗口开始前因补上“原始 BBO 序号先审计再采样”而被 v2 取代；v1 的 policy 和追加记录全部保留，未采集验证数据、未生成结果。只停止了本轮两个尚在等待的 v1 进程。
+- 新任务设置 14 GiB 磁盘余量与 2.5 GiB 采集文件预算；触发后只停止自己的任务，记为 incomplete，不能拼短段补足。为控制体量，新十小时 Binance 仅 ETH/NVDA/SNDK；BTC 同机 Binance 本轮仍只有短探测。
+- 原 `core-rh-prospective-10h-20261114T044946Z` 采集 PID 337404 仍在运行，策略哈希仍为 `9dea62dc023728e154c5a2295ecc50439b7fe6497f926f27a8acac9ca3163f35`；未改其二进制、配置或原始数据。
+
+### 验证
+
+Mac：`make fmt-check`、`make check`、`make test`、`make build` 和 research release 构建通过；Rust **561 通过、6 忽略**，Python research **111 通过**，Go 全部 race checks 通过。新增回归覆盖时钟/进程混用、向上取整、原始序号回退、采样不能回填、保留减仓、A 组现金不变、未知币种配对不得执行、错过 warm-up 不重排窗口等。
+
+Oasis 独立目录、单核低优先级离线 release 构建通过；Rust **563 通过、7 忽略**。第一次 Linux 测试有四项因为上传包遗漏 `deploy/oasis/fixtures` 的既有合成夹具失败，补齐后完整重跑通过；失败日志保留，没有修改实现或测试来回避失败。构建源码、验证二进制与日志保留，只清理本轮可再生 target 缓存。Go Linux 采集器还完成上述真实公开流探测。
+
+所有测试与短探测均不证明真实执行延迟、限流可行性、奖励资格或策略盈利。新过滤目前只进入 maker replay；双腿套利与激励 turnover 的新 Binance 执行消融仍属于后续独立工作，不能把 quant 的结果转记过去。

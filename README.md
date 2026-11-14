@@ -96,6 +96,7 @@ Lighter Robinhood, starting with local pricing versus Binance risk filtering.
 Execution-clock diagnostics distinguish delayed trade receipt from modeled
 cancellation timing; exact cash proofs govern turnover cost reporting.
 [Priority venue design](docs/PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md) ·
+[Binance capture and frozen A/B](docs/BINANCE_REFERENCE_AB.md) ·
 [Execution and cash audit](docs/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
 
 ## Architecture

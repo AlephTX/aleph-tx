@@ -786,6 +786,16 @@ impl PairConfig {
     }
 
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
+        self.validate_markets(registry, false)
+    }
+
+    /// Book-only compilation preserves each settlement asset. It cannot
+    /// authorize cross-currency execution or construct a RelativeValue engine.
+    pub(crate) fn validate_independent_books(&self, registry: &VenueRegistry) -> Result<()> {
+        self.validate_markets(registry, true)
+    }
+
+    fn validate_markets(&self, registry: &VenueRegistry, independent_books: bool) -> Result<()> {
         self.planner.validate()?;
         if let Some(policy) = self.funding_carry_policy {
             ensure!(
@@ -914,7 +924,7 @@ impl PairConfig {
         ensure!(
             a.underlying_id == b.underlying_id
                 && a.payoff_id == b.payoff_id
-                && a.settlement == b.settlement,
+                && (independent_books || a.settlement == b.settlement),
             "different underlying, payoff or settlement conventions"
         );
         ensure!(

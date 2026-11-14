@@ -26,6 +26,9 @@ use timing::{TimingHistogram, TimingSummary};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureConfig {
+    /// Compile independent local books without asserting settlement parity.
+    #[serde(default)]
+    pub independent_books: bool,
     pub pair: PairConfig,
     pub one_way_latency_ms: u64,
     pub trade_from_ms: Option<u64>,
@@ -171,6 +174,8 @@ pub struct ReferenceObservation {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
+    #[serde(rename = "capture_timing")]
+    _capture_timing: Option<serde_json::Value>,
     source: String,
     event: String,
     received_at_ms: u64,
@@ -215,6 +220,8 @@ pub struct Coverage {
 
 #[derive(Serialize)]
 struct Header<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    independent_books: Option<bool>,
     pair: &'a PairConfig,
     one_way_latency_ms: u64,
     trade_from_ms: Option<u64>,
@@ -256,7 +263,15 @@ fn fresh(timestamp: u64, now: u64, age: u64) -> bool {
 
 impl CaptureConfig {
     fn validate(&self, registry: &VenueRegistry) -> Result<()> {
-        RelativeValue::new(self.pair.clone(), registry)?;
+        if self.independent_books {
+            ensure!(
+                !self.paper_entries,
+                "independent books cannot enable pair paper entries"
+            );
+            self.pair.validate_independent_books(registry)?;
+        } else {
+            RelativeValue::new(self.pair.clone(), registry)?;
+        }
         validate_funding_guard(self.funding_guard_ms, &self.pair.legs)?;
         ensure!(
             (100..=60_000).contains(&self.sample_ms),
@@ -491,12 +506,16 @@ impl<'a> Compiler<'a> {
                     | "extended_trades"
                     | "lighter_trades"
                     | "coinbase"
+                    | "binance"
             ),
             "unsupported capture source"
         );
         match (row.event.as_str(), row.payload) {
             ("connected", None)
-                if matches!(row.source.as_str(), "hyperliquid" | "hyperliquid_trades") => {}
+                if matches!(
+                    row.source.as_str(),
+                    "hyperliquid" | "hyperliquid_trades" | "binance"
+                ) => {}
             ("subscribed", Some(_))
                 if matches!(row.source.as_str(), "hyperliquid" | "hyperliquid_trades") => {}
             ("disconnect" | "clock_refresh", None) => {
@@ -809,6 +828,7 @@ pub fn compile(
     line(
         &mut output,
         &Header {
+            independent_books: config.independent_books.then_some(true),
             pair: &config.pair,
             one_way_latency_ms: config.one_way_latency_ms,
             trade_from_ms: config.trade_from_ms,

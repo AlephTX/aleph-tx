@@ -28,7 +28,7 @@
 | Entropy (`io`) | `io:SNDK`、`io:NVDA`，AAPL 作候选对照 | 与同股 XYZ 的基差、时段和资金费差；条件化报价 | 已确认 Early bird 自返费计划；返费比例作用于 Entropy 的费用份额。需建号、等级和领取证据。自身 token/points 计划本轮未证实，不记作确定无币或确定有积分。[E1–E3] |
 | TradeXYZ (`xyz`) | `xyz:SNDK`、`xyz:NVDA` 等同股；商品另列 | 主平台量化和相对价值研究；可同时承担其他平台的对冲腿 | 当前查到费用、合约与时段规则；自身 token/points 奖励未核实。保留在激励核查队列，现阶段不为未知奖励增加交易量。[X1–X4] |
 | BULK | BTC/ETH；有完整同标的规则后再扩展 TradFi | 条件化做市、跨市场价格信号、完整资金费差 | 当前 Challenger Series 有 Trading AURA 和 USDC 奖池，但排除做市商。已生效 Maker 返费按实际资格/入账计算；Alpha Program 尚未启动。token 发行状态未获充分官方证据。[U1–U3] |
-| Lighter RH | BTC/ETH；RWA 独立配对与单位核查 | 本地报价配 Binance 辅助过滤；RH/Core 相对价值 | 活跃 Live/Weekly Points；LIT 已存在，不能归类为等待 RH 单独发币。Standard-to-Standard 不计分；API 量不能假定 Wallet 2x。按实际积分变化、周度结算、可撤销状态分层记录，不能认定每笔都合格。[L1, L2] |
+| Lighter RH | BTC/ETH；RWA 独立配对与单位核查 | 本地报价配 Binance 辅助过滤；RH/Core 相对价值 | 活跃 Live/Weekly Points；LIT 已存在，不能归类为等待 RH 单独发币。Standard-to-Standard 限制存在来源和术语定义争议，暂不作为确定模型规则；API 量不能假定 Wallet 2x。按实际积分变化、周度结算、可撤销状态分层记录，不能认定每笔都合格。[L1, L2] |
 
 ### 2.1 会改变成本模型的当前规则
 

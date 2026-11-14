@@ -461,6 +461,8 @@ pub struct InventoryNeutralMM {
     quote_participation: Option<replay::recorded::QuoteParticipation>,
     #[cfg(feature = "research-replay")]
     local_participation: Option<replay::recorded::local_signal::LocalParticipation>,
+    #[cfg(feature = "research-replay")]
+    binance_participation: Option<replay::recorded::binance_signal::Participation>,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -562,6 +564,8 @@ impl InventoryNeutralMM {
             quote_participation: None,
             #[cfg(feature = "research-replay")]
             local_participation: None,
+            #[cfg(feature = "research-replay")]
+            binance_participation: None,
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -2130,6 +2134,22 @@ impl InventoryNeutralMM {
 
         #[cfg(feature = "research-replay")]
         let plan = if let Some(policy) = &mut self.local_participation {
+            let mut plan = plan;
+            policy.apply(
+                &mut plan.target,
+                [
+                    self.account_stats.position,
+                    self.order_tracker.confirmed_position(),
+                ],
+                &runtime_config,
+            );
+            plan
+        } else {
+            plan
+        };
+
+        #[cfg(feature = "research-replay")]
+        let plan = if let Some(policy) = &mut self.binance_participation {
             let mut plan = plan;
             policy.apply(
                 &mut plan.target,

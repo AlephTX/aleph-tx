@@ -588,3 +588,7 @@ as follows.
 NVDA's one scored holdout frame had an absolute z-score of about 0.266,
 below the configured 2.5 entry threshold. TSLA's holdout never reached
 scoring. Neither sample reached the net edge calculation.
+
+## Binance same-process reference capture
+
+The opt-in `-binance ETHUSDT,NVDAUSDT,SNDKUSDT` sources preserve native BBO fields and enable precise wall/monotonic receipt and availability clocks for every source in the same collector. They do not change the live SHM feeder. See [Binance A/B runbook](BINANCE_REFERENCE_AB.md) for independent-book compilation, frozen windows, provenance and resource limits.

@@ -290,3 +290,13 @@ The objective is positive net execution economics under independently
 verified assumptions. Missing data, zero trades and negative runs are valid
 findings. Neither theoretical plausibility nor a selected winning window is
 a promise of profitable live trading.
+
+## Binance 同机参考新增来源（2026-11-14）
+
+- 公开 USD-M 单币 `bookTicker`：`binance/usdm/binance`，原生符号 ETHUSDT/BTCUSDT/NVDAUSDT/SNDKUSDT；四者均完成 90 秒同机探测。新的十小时主验证仅 ETH，BTC 的 Binance 覆盖仍只有本轮探测，不能当作十小时数据。
+- 原始 E/T/u、精确字符串 BBO 与本机 receipt/available wall+monotonic ns、进程序列、重连 epoch 分开记录。全归档同进程身份检查；向上取整可用毫秒，25 ms 完结桶仅用于派生回放输入，原始消息不抽样。
+- 公开合约元数据 `https://fapi.binance.com/fapi/v1/exchangeInfo` 于本轮探测保存，SHA-256 `a400fdd57eea6280e38a2d7dd27394c7e5093e9d85f69f998ae1eeaa0c9c91d7`。NVDA/SNDK 标为 TRADIFI_PERPETUAL，但跨平台单位/时段映射尚未通过，不进入套利收益。
+- 主机外的历史 aggTrades 不具备 Oasis receipt time，不能替代此来源；本轮未下载或用于十小时验证。
+- 同机目标流：RH/Core ETH 盘口与公开逐笔，Arcus/BULK BTC/ETH 盘口，Entropy/TradeXYZ NVDA/SNDK 盘口与公开逐笔。Arcus/BULK 逐笔与资金费缺口未因新增 Binance 而解决。
+- 90 秒探测位于 Git 外 `~/aleph-tx-research/binance-reference-probe-20261114`；完整消息 127,842 条。时间字段全局序列、身份和归档校验通过。只有短回放链路验证，没有新十小时收益。
+- [运行协议和可用性规则](BINANCE_REFERENCE_AB.md)。每轮 `capture-plan.json`、`campaign-events.ndjson`、封存 manifest、冻结 policy 和输入 hash 保留在独立 campaign，不进 Git。

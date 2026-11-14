@@ -5,7 +5,7 @@ import json
 from archive_public_capture import records
 
 
-def trade_events(archive, venue, market, leg):
+def trade_events(archive, venue, market, leg, *, precise_times=False):
     """Yield maker replay events from acknowledged public trade subscriptions."""
     sources = {'lighter': 'lighter_trades', 'lighter_robinhood': 'lighter_robinhood_trades',
                'extended': 'extended_trades', 'hyperliquid': 'hyperliquid_trades',
@@ -18,6 +18,9 @@ def trade_events(archive, venue, market, leg):
         if row['source'] != source or row.get('market') not in (None, market):
             continue
         at, event = row['available_at_ms'], row['event']
+        if precise_times:
+            from capture_timing import precise_available_ms
+            at = precise_available_ms(row)
         if event in ('disconnect', 'clock_refresh'):
             online_since = None
             yield {'kind': 'trade_feed', 'at_ms': at, 'leg': leg, 'online': False}

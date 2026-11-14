@@ -22,7 +22,7 @@ import stat
 
 
 CAMPAIGN_PREFIXES = ("2026-", "extended-lighter-", "extended-index-smoke-", "robinhood-",
-                     "hyperliquid-public-", "public-venues-")
+                     "hyperliquid-public-", "public-venues-", "binance-reference-")
 PRIVATE_NAME = re.compile(
     r"(?:^|[-_.])(?:private|account|accounts|orders|fills|balance|balances|telemetry|"
     r"recovery|debug|auth|authenticated|signed|credential|credentials|secret|secrets|"
@@ -55,7 +55,7 @@ def source_family_hint(name):
     lower = name.lower()
     for prefix, family in (
         ("lighter_robinhood", "lighter_robinhood"), ("lighter-robinhood", "lighter_robinhood"),
-        ("hyperliquid", "hyperliquid"), ("coinbase", "coinbase"), ("lighter", "lighter"),
+        ("binance", "binance"), ("hyperliquid", "hyperliquid"), ("coinbase", "coinbase"), ("lighter", "lighter"),
         ("extended", "extended"), ("entropy", "entropy"), ("tradexyz", "trade_xyz"),
         ("trade_xyz", "trade_xyz"), ("arcus", "arcus"), ("bulk", "bulk"),
     ):

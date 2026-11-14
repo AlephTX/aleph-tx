@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 HOUR_MS = 3_600_000
 MAX_ROW = 2 * 1024 * 1024
 SOURCES = {
+    'binance': ('binance', 'usdm'),
     'lighter': ('lighter', 'core'), 'lighter_trades': ('lighter', 'core'),
     'lighter_robinhood': ('lighter', 'robinhood'), 'lighter_robinhood_trades': ('lighter', 'robinhood'),
     'extended': ('extended', 'mainnet'), 'extended_trades': ('extended', 'mainnet'),
@@ -192,7 +193,7 @@ def records(root, *, source=None):
         raise ValueError('capture stream hash mismatch')
 
 
-def compile_archive(archive, engine, config, output):
+def compile_archive(archive, engine, config, output, *, precise_times=False):
     """Build a reusable market tape. Publish only after the source verifies."""
     output = output.absolute()
     if not output.name.endswith('.ndjson.zst'):
@@ -200,6 +201,8 @@ def compile_archive(archive, engine, config, output):
     evidence = output.with_suffix('.provenance.json')
     if output.exists() or evidence.exists():
         raise FileExistsError('compiled output already exists')
+    from capture_timing import ClockAudit
+    clock = ClockAudit() if precise_times else None
     archive_id = digest(archive / 'manifest.json')
     engine_id, config_id = digest(engine), digest(config)
     with TemporaryDirectory(dir=output.parent) as directory:
@@ -212,6 +215,10 @@ def compile_archive(archive, engine, config, output):
             try:
                 with process.stdin:
                     for raw in records(archive):
+                        if clock is not None:
+                            row = json.loads(raw)
+                            row["available_at_ms"] = clock.observe(row)
+                            raw = (json.dumps(row, separators=(",", ":")) + "\n").encode()
                         process.stdin.write(raw)
                 if process.wait() != 0:
                     raise RuntimeError('public capture compiler rejected archive')
@@ -224,6 +231,9 @@ def compile_archive(archive, engine, config, output):
         report = {'archive_manifest_sha256': archive_id, 'engine_sha256': engine_id, 'config_sha256': config_id,
                   'decoded_sha256': digest(tape), 'compressed_sha256': digest(compressed),
                   'coverage': json.loads(coverage_path.read_text())}
+        if clock is not None:
+            report.update(availability_rule='ceil_available_wall_ns_to_ms', capture_run_id=clock.run_id,
+                          precise_records=clock.sequence)
         provenance.write_text(json.dumps(report, indent=2) + '\n')
         os.link(compressed, output)
         try:

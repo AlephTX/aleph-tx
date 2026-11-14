@@ -29,6 +29,9 @@ import (
 )
 
 type record struct {
+	Timing        *captureTiming `json:"capture_timing,omitempty"`
+	received      time.Time
+	epoch         uint64
 	Source        string          `json:"source"`
 	Event         string          `json:"event"`
 	ReceivedAt    int64           `json:"received_at_ms"`
@@ -264,7 +267,8 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 			return fmt.Errorf("snapshot %s: %w", coin, err)
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
-		received := time.Now().UnixMilli()
+		receivedTime := time.Now()
+		received := receivedTime.UnixMilli()
 		closeErr := response.Body.Close()
 		if err := errors.Join(readErr, closeErr); err != nil {
 			return err
@@ -273,7 +277,7 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 			return fmt.Errorf("invalid %s for %s: HTTP %d", source.source, coin, response.StatusCode)
 		}
 		if source.source == "hyperliquid_funding" {
-			if err := emitHyperliquidFunding(source, coin, sent, received, body, emit); err != nil {
+			if err := emitHyperliquidFunding(source, coin, sent, received, body, func(row record) error { row.received = receivedTime; return emit(row) }); err != nil {
 				return err
 			}
 		} else {
@@ -288,7 +292,7 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 			if err != nil {
 				return err
 			}
-			if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, Payload: payload}); err != nil {
+			if err := emit(record{Source: source.source, Event: "message", ReceivedAt: received, received: receivedTime, Payload: payload}); err != nil {
 				return err
 			}
 		}
@@ -311,8 +315,9 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
-	if source.isHyperliquidWS() {
-		if err := emit(record{Source: source.source, Market: source.market, Event: "connected", ReceivedAt: time.Now().UnixMilli()}); err != nil {
+	if source.isHyperliquidWS() || source.source == "binance" {
+		now := time.Now()
+		if err := emit(record{Source: source.source, Market: source.market, Event: "connected", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
 			return err
 		}
 	}
@@ -369,6 +374,11 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			return errors.New("public subscription rejected")
 		}
 		switch source.source {
+		case "binance":
+			raw, err = publicBinanceBBO(raw, source.market)
+			if err != nil {
+				return err
+			}
 		case "hyperliquid", "hyperliquid_trades":
 			publication, err := hyperliquidPublication(source, header.Channel, raw, acknowledged)
 			if err != nil {
@@ -376,6 +386,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			}
 			if publication.Event != "" {
 				publication.ReceivedAt = received.UnixMilli()
+				publication.received = received
 				if err := emit(publication); err != nil {
 					return err
 				}
@@ -416,7 +427,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				}
 			}
 		}
-		row := record{Source: source.source, Market: source.market, Event: "message", ReceivedAt: received.UnixMilli(), Payload: raw}
+		row := record{Source: source.source, Market: source.market, Event: "message", ReceivedAt: received.UnixMilli(), received: received, Payload: raw}
 		if isLighterBookSource(source.source) && strings.HasPrefix(header.Type, "subscribed/") {
 			channel := strings.Replace(header.Channel, ":", "/", 1)
 			if sent, ok := subscriptionSends[channel]; ok {
@@ -468,6 +479,14 @@ func runSource(ctx context.Context, source subscription, emit func(record) error
 }
 
 func capture(ctx context.Context, sources []subscription, out syncWriter) error {
+	return captureWithTiming(ctx, sources, out, false)
+}
+
+func captureWithTiming(ctx context.Context, sources []subscription, out syncWriter, precise bool) error {
+	clock, err := newCaptureClock()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	queue := make(chan record, 4096)
@@ -487,9 +506,12 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 	for _, source := range sources {
 		workers.Go(func() {
 			backoff := time.Second
+			var epoch uint64
 			for ctx.Err() == nil {
 				start := time.Now()
-				err := runSource(ctx, source, emit)
+				epoch++
+				epochEmit := func(row record) error { row.epoch = epoch; return emit(row) }
+				err := runSource(ctx, source, epochEmit)
 				if ctx.Err() != nil {
 					return
 				}
@@ -498,7 +520,8 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 				if errors.Is(err, errClockRefresh) {
 					event = "clock_refresh"
 				}
-				if emit(record{Source: source.source, Market: source.market, Event: event, ReceivedAt: time.Now().UnixMilli()}) != nil {
+				now := time.Now()
+				if epochEmit(record{Source: source.source, Market: source.market, Event: event, ReceivedAt: now.UnixMilli(), received: now}) != nil {
 					return
 				}
 				if event == "clock_refresh" {
@@ -526,7 +549,13 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 	var last int64
 	counts := make(map[string]int)
 	write := func(row record) error {
-		row.AvailableAt = time.Now().UnixMilli()
+		now := time.Now()
+		row.AvailableAt = now.UnixMilli()
+		if precise {
+			if err := clock.stamp(&row, now); err != nil {
+				return err
+			}
+		}
 		if row.AvailableAt < last || row.AvailableAt < row.ReceivedAt {
 			return errors.New("wall clock moved backwards during capture")
 		}
@@ -560,7 +589,8 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 			return fmt.Errorf("no publications from %s %s", source.source, source.market)
 		}
 	}
-	if err := write(record{Source: "collector", Event: "end", ReceivedAt: time.Now().UnixMilli()}); err != nil {
+	now := time.Now()
+	if err := write(record{Source: "collector", Event: "end", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
 		return err
 	}
 	if err := writer.Flush(); err != nil {
@@ -574,6 +604,8 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 }
 
 func run() error {
+	binance := flag.String("binance", "", "comma-separated Binance USD-M USDT symbols; enables precise timing for all sources")
+	precise := flag.Bool("precise-times", false, "record process identity, sequence, connection epoch and wall/monotonic nanoseconds")
 	lighter := flag.String("lighter", "", "comma-separated Lighter market IDs")
 	rh := flag.String("lighter-robinhood", "", "comma-separated Robinhood Chain Lighter market IDs (independent domain)")
 	rhTrades := flag.Bool("lighter-robinhood-trades", false, "record Robinhood Chain Lighter public trades")
@@ -644,6 +676,11 @@ func run() error {
 		}
 		sources = append(sources, extra...)
 	}
+	extraBinance, err := binanceSubscriptions(*binance)
+	if err != nil {
+		return err
+	}
+	sources = append(sources, extraBinance...)
 	if len(sources) == 0 {
 		return errors.New("configure at least one public market")
 	}
@@ -655,7 +692,7 @@ func run() error {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *duration)
 	defer cancel()
-	return errors.Join(capture(ctx, sources, out), out.Close())
+	return errors.Join(captureWithTiming(ctx, sources, out, *precise || *binance != ""), out.Close())
 }
 
 func main() {

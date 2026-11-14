@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use tokio::sync::watch;
 
+pub(in crate::strategy::inventory_neutral_mm) mod binance_signal;
 mod cancel_timing;
 #[cfg(test)]
 mod cancel_timing_tests;
@@ -237,6 +238,8 @@ pub struct RecordedMakerConfig {
     hyperliquid_obi_filter: Option<HyperliquidObiFilter>,
     #[serde(default)]
     local_reversal_filter: Option<local_signal::LocalReversalFilter>,
+    #[serde(default)]
+    binance_risk_filter: Option<binance_signal::Policy>,
     /// Research-only Core data ablation; external books are not published.
     #[serde(default)]
     core_only: bool,
@@ -376,6 +379,15 @@ impl RecordedMakerConfig {
             }),
             "invalid Hyperliquid OBI filter threshold or reference age"
         );
+        if let Some(policy) = self.binance_risk_filter {
+            policy.validate()?;
+            ensure!(
+                self.core_only
+                    && self.local_reversal_filter.is_none()
+                    && self.hyperliquid_obi_filter.is_none(),
+                "Binance A/B requires local pricing and separate filters"
+            );
+        }
         if let Some(policy) = self.local_reversal_filter {
             policy.validate()?;
             ensure!(
@@ -474,6 +486,13 @@ enum Aggressor {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Event {
+    Binance {
+        at_ms: u64,
+        observed_ms: u64,
+        epoch: u64,
+        mid: Option<f64>,
+        update_id: Option<u64>,
+    },
     TradeFeed {
         at_ms: u64,
         online: bool,
@@ -496,7 +515,8 @@ enum Event {
 impl Event {
     fn at_ms(&self) -> u64 {
         match *self {
-            Self::Book { at_ms, .. }
+            Self::Binance { at_ms, .. }
+            | Self::Book { at_ms, .. }
             | Self::Trade { at_ms, .. }
             | Self::TradeFeed { at_ms, .. } => at_ms,
         }
@@ -1317,6 +1337,8 @@ pub struct RecordedMakerReport {
     quote_participation: Option<QuoteParticipation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_participation: Option<local_signal::LocalParticipation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binance_participation: Option<binance_signal::Participation>,
 }
 
 #[derive(Serialize)]
@@ -1430,6 +1452,15 @@ async fn drive(
     let local_signal = config
         .local_reversal_filter
         .map(|policy| Arc::new(PlMutex::new(local_signal::LocalSignal::new(policy))));
+    let binance_signal = config
+        .binance_risk_filter
+        .map(|policy| Arc::new(PlMutex::new(binance_signal::Signal::new(policy))));
+    strategy.binance_participation = config.binance_risk_filter.map(|policy| {
+        binance_signal::Participation::new(
+            policy,
+            Arc::clone(binance_signal.as_ref().expect("configured reference")),
+        )
+    });
     if config.core_only {
         strategy.use_local_fair_value();
     }
@@ -1504,6 +1535,19 @@ async fn drive(
                 tokio::time::sleep_until(start + Duration::from_millis(at - config.start_ms)).await;
                 matching.market.lock().last_event_ms = at;
                 match event {
+                    Event::Binance {
+                        observed_ms,
+                        epoch,
+                        mid,
+                        update_id,
+                        ..
+                    } => {
+                        if let Some(signal) = &binance_signal {
+                            signal
+                                .lock()
+                                .update(at, observed_ms, epoch, mid, update_id)?;
+                        }
+                    }
                     Event::TradeFeed { online, .. } => {
                         if let Some(signal) = &local_signal {
                             signal.lock().feed(at, online);
@@ -1732,6 +1776,7 @@ async fn drive(
         cross_market_attribution,
         quote_participation: strategy.quote_participation,
         local_participation: strategy.local_participation,
+        binance_participation: strategy.binance_participation,
     })
 }
 
@@ -1775,6 +1820,7 @@ mod tests {
             diagnose_cross_market: false,
             hyperliquid_obi_filter: None,
             local_reversal_filter: None,
+            binance_risk_filter: None,
             core_only: false,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
@@ -2085,6 +2131,32 @@ mod tests {
             data.push('\n');
         }
         data
+    }
+
+    #[test]
+    fn binance_record_only_preserves_complete_control_ledger() {
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.diagnose_cross_market = true;
+        let data = tape(&cfg, true);
+        let control =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.diagnose_cross_market = true;
+        cfg.binance_risk_filter = Some(binance_signal::Policy {
+            enabled: false,
+            lookback_ms: 1_000,
+            max_age_ms: 500,
+            shock_bps: 1.0,
+        });
+        let mut monitored =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        monitored
+            .as_object_mut()
+            .unwrap()
+            .remove("binance_participation");
+        assert_eq!(control, monitored);
     }
 
     #[test]

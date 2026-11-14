@@ -737,3 +737,57 @@ fn hyperliquid_public_evidence_compiles_without_becoming_a_funding_payment() {
             .unwrap()
     );
 }
+
+#[test]
+fn precise_binance_archive_does_not_reprice_local_books() {
+    let base = vec![
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        footer(T + 200),
+    ];
+    let (_, expected) = replay(&config(), &base);
+    let mut extra = base[..2].to_vec();
+    extra.push(
+        json!({"source":"binance","event":"connected","market":"ETHUSDT",
+        "received_at_ms":T,"available_at_ms":T,"capture_timing":{"run_id":"synthetic"}}),
+    );
+    extra.push(row(
+        "binance",
+        T,
+        json!({"e":"bookTicker","s":"ETHUSDT","b":"1","a":"2"}),
+    ));
+    extra.push(footer(T + 200));
+    let (coverage, actual) = replay(&config(), &extra);
+    assert_eq!(expected, actual);
+    assert_eq!(coverage.source_messages["binance"], 1);
+}
+
+#[test]
+fn independent_book_compilation_does_not_authorize_cross_currency_pairs() {
+    let mut c = config();
+    c.pair.legs[1].quote = "USDG".into();
+    c.pair.legs[1].settlement = "USDG".into();
+    assert!(c.validate(&VenueRegistry::default()).is_err());
+    c.independent_books = true;
+    c.validate(&VenueRegistry::default()).unwrap();
+    assert!(RelativeValue::new(c.pair.clone(), &VenueRegistry::default()).is_err());
+    let mut output = Vec::new();
+    compile(
+        &c,
+        text(&[
+            lighter(T, T - 1, 10, 0, true),
+            hl("hyperliquid", T),
+            footer(T + 200),
+        ])
+        .as_bytes(),
+        &mut output,
+        &VenueRegistry::default(),
+    )
+    .unwrap();
+    let header: Value =
+        serde_json::from_slice(output.split(|&c| c == b'\n').next().unwrap()).unwrap();
+    assert_eq!(header["independent_books"], true);
+    assert_eq!(header["pair"]["legs"][1]["settlement"], "USDG");
+    c.paper_entries = true;
+    assert!(c.validate(&VenueRegistry::default()).is_err());
+}
