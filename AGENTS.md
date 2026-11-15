@@ -34,6 +34,12 @@ testnet work, and every branch, tag, and commit in a proposed push.
   also submit orders. Read the [trading runbook](docs/LIVE_TRADING.md) before
   operating them.
 - Preserve local changes and runtime evidence.
+- Read `AGENT_HANDOFF.md` (when present) before starting work for live
+  multi-agent state, active host or file locks, and pending handoff items.
+  Update `AGENT_HANDOFF.md` after each milestone (refresh the top live-state
+  section and prepend a concise log entry; archive entries past the latest 10
+  under `.agent-state/archive/`). Never stage, force-add, or commit
+  `AGENT_HANDOFF.md` or `.agent-state/`, and keep them free of secrets.
 - Commit and push when requested for the current change. Verify the
   destination and use a Conventional Commit subject.
 
@@ -46,7 +52,7 @@ testnet work, and every branch, tag, and commit in a proposed push.
 | Hedge and recovery audit | [live hedge](src/live_hedge.rs), [journal](src/live_hedge/journal.rs), [audit](src/live_hedge/audit.rs) |
 | Go/Rust IPC | [Go writers](feeder/shm/), [Rust BBO reader](src/shm_reader.rs), [private events](src/types/events.rs) |
 | Telemetry and console | [Rust writer](src/telemetry_sink.rs), [Python monitor and store](deploy/oasis/), [React dashboard](dashboard/) |
-| Capture and research | [cross-venue CLI](src/bin/cross_venue.rs), [recording guide](docs/PERP_RECORDING.md), [paper replay guide](docs/PERP_RELATIVE_VALUE.md) |
+| Capture, lakehouse, and research | [cross-venue CLI](src/bin/cross_venue.rs), [recording guide](docs/PERP_RECORDING.md), [paper replay guide](docs/PERP_RELATIVE_VALUE.md), [lakehouse & WSL guide](docs/QUANT_DATA_LAKEHOUSE.md) |
 
 ## Strategy research contract
 

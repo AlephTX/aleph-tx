@@ -66,6 +66,8 @@ skills-lock.json
 claude_prompt.md
 deep_review_*.md
 .gstack/
+AGENT_HANDOFF.md
+.agent-state/
 
 # Python
 __pycache__/
