@@ -636,11 +636,9 @@ pub(super) async fn launch(
             trading.validate_symbol(symbol)?;
             trading.validate_precision(profile.strategy.tick_size, profile.strategy.step_size)?;
             trading.set_supervised_quote_expiry();
-            if profile.strategy.max_position_notional_usd == 0.0 {
-                trading.set_max_worst_case_position(
-                    profile.strategy.max_position * profile.strategy.max_portfolio_scale.max(1.0),
-                );
-            }
+            trading.set_max_worst_case_position(
+                profile.strategy.max_position * profile.strategy.max_portfolio_scale.max(1.0),
+            );
             let (orders, position) =
                 tokio::try_join!(trading.get_active_orders(), trading.signed_position())?;
             ensure!(

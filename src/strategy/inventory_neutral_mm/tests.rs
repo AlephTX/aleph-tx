@@ -1675,11 +1675,9 @@ async fn cancellation_acknowledgement_does_not_release_unknown_submission() {
     std::fs::create_dir(&directory).unwrap();
     let matrix_path = directory.join("matrix");
     let account_path = directory.join("account");
-    std::fs::write(
-        &matrix_path,
-        vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64],
-    )
-    .unwrap();
+    let mut matrix_init = vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64];
+    matrix_init[2048 * 8 + 48..2048 * 8 + 64].copy_from_slice(&crate::shm_reader::SHM_MAGIC_V12);
+    std::fs::write(&matrix_path, matrix_init).unwrap();
     std::fs::write(&account_path, [0u8; 128]).unwrap();
     let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
     let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();
@@ -1812,11 +1810,9 @@ fn wake_test_strategy(
     std::fs::create_dir(&directory).unwrap();
     let matrix_path = directory.join("matrix");
     let account_path = directory.join("account");
-    std::fs::write(
-        &matrix_path,
-        vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64],
-    )
-    .unwrap();
+    let mut matrix_init = vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64];
+    matrix_init[2048 * 8 + 48..2048 * 8 + 64].copy_from_slice(&crate::shm_reader::SHM_MAGIC_V12);
+    std::fs::write(&matrix_path, matrix_init).unwrap();
     std::fs::write(&account_path, [0u8; 128]).unwrap();
     let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
     let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();

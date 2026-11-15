@@ -17,7 +17,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -600,6 +600,9 @@ impl SigningLane {
     }
 }
 
+/// Sentinel bit pattern (`f64` quiet negative NaN) indicating no cap is set yet.
+const UNSET_POSITION_CAP_BITS: u64 = u64::MAX;
+
 /// Lighter 交易客户端（币种无关，支持 Maker / Cancel / Taker 多 API Key 隔离）
 pub struct LighterTrading {
     maker_lane: SigningLane,
@@ -617,8 +620,8 @@ pub struct LighterTrading {
     client_order_counter: AtomicI64,
     /// Optional order tracker for per-order state machine (v5.0.0)
     order_tracker: Option<Arc<OrderTracker>>,
-    /// Execution-boundary hard ceiling on worst-case single-leg position (base units).
-    max_worst_case_position: Option<f64>,
+    /// Lock-free execution-boundary ceiling on worst-case single-leg position (base units).
+    max_worst_case_position_bits: AtomicU64,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
     quote_expiry: Option<Duration>,
@@ -696,6 +699,10 @@ impl Exchange for LighterTrading {
         self.limit_order_type
     }
 
+    fn set_max_worst_case_position(&self, max_position: f64) {
+        LighterTrading::set_max_worst_case_position(self, max_position);
+    }
+
     async fn get_account_stats(
         &self,
     ) -> Result<crate::strategy::inventory_neutral_mm::AccountStats> {
@@ -750,7 +757,7 @@ impl LighterTrading {
             price_multiplier: 100.0,
             client_order_counter: AtomicI64::new(43),
             order_tracker: None,
-            max_worst_case_position: None,
+            max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -793,7 +800,7 @@ impl LighterTrading {
             price_multiplier: 100.0,
             client_order_counter: AtomicI64::new(1000),
             order_tracker: None,
-            max_worst_case_position: None,
+            max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -902,7 +909,7 @@ impl LighterTrading {
             price_multiplier,
             client_order_counter: AtomicI64::new(counter_start),
             order_tracker: None,
-            max_worst_case_position: None,
+            max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
             limit_order_type: OrderType::Limit,
             quote_expiry: None,
             #[cfg(test)]
@@ -1142,14 +1149,22 @@ impl LighterTrading {
     /// Enforce an execution-boundary hard ceiling on directional worst-case
     /// exposure (`worst_case_long` for buys, `-worst_case_short` for sells)
     /// before any non-reduce-only transaction is dispatched to Lighter.
-    pub fn set_max_worst_case_position(&mut self, max_position: f64) {
+    /// Accepts `&self` via lock-free atomic bits so USD-notional profiles can
+    /// refresh the base-unit cap every quote cycle as mid price moves.
+    pub fn set_max_worst_case_position(&self, max_position: f64) {
         if max_position.is_finite() && max_position > 0.0 {
-            self.max_worst_case_position = Some(max_position);
+            self.max_worst_case_position_bits
+                .store(max_position.to_bits(), Ordering::Release);
         }
     }
 
+    fn max_worst_case_position(&self) -> Option<f64> {
+        let bits = self.max_worst_case_position_bits.load(Ordering::Acquire);
+        (bits != UNSET_POSITION_CAP_BITS).then(|| f64::from_bits(bits))
+    }
+
     fn ensure_side_exposure_within_cap(&self, side: Side) -> Result<()> {
-        if let (Some(tracker), Some(cap)) = (&self.order_tracker, self.max_worst_case_position) {
+        if let (Some(tracker), Some(cap)) = (&self.order_tracker, self.max_worst_case_position()) {
             let tol = 0.5 / self.size_multiplier.max(1.0) + 1e-9;
             match side {
                 Side::Buy => {
@@ -2843,6 +2858,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.place_results.len(), 1);
+
+        // Dynamic USD-notional cap updates through `&dyn Exchange` tighten the
+        // base-unit ceiling without requiring mutable ownership.
+        let shared = Arc::new(trading);
+        let as_exchange: Arc<dyn Exchange> = Arc::clone(&shared) as Arc<dyn Exchange>;
+        as_exchange.set_max_worst_case_position(0.10);
+        // Confirming +0.10 flat and trying to buy +0.02 now breaches the tightened 0.10 cap.
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.10));
+        let tightened_err = shared
+            .submit_prepared(
+                vec![(14, "{}".into())],
+                vec![PlaceResult {
+                    client_order_index: 503,
+                    side: Side::Buy,
+                    price: 2000.0,
+                    size: 0.02,
+                }],
+                0,
+                true,
+                |_, _| async { Ok(()) },
+                |_| async { panic!("wire send must not be called after dynamic cap tighten") },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            tightened_err
+                .to_string()
+                .contains("Execution-boundary long cap breached")
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

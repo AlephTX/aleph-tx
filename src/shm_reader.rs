@@ -50,7 +50,7 @@ impl ShmReader {
         let magic_offset = NUM_SYMBOLS * VERSION_SIZE + 48;
         let magic = &mmap[magic_offset..magic_offset + 16];
         anyhow::ensure!(
-            magic == [0u8; 16] || magic == SHM_MAGIC_V12,
+            magic == SHM_MAGIC_V12,
             "BBO shared memory ABI magic mismatch"
         );
 
@@ -246,6 +246,10 @@ mod tests {
     fn rejects_mismatched_magic_and_misaddressed_slot() {
         let path = std::env::temp_dir().join(format!("aleph-bbo-magic-{}", uuid::Uuid::new_v4()));
         let mut buf = vec![0u8; NUM_SYMBOLS * VERSION_SIZE + 2 * NUM_EXCHANGES * SLOT_SIZE];
+        // Zeroed/unstamped SHM files are rejected.
+        std::fs::write(&path, &buf).unwrap();
+        assert!(ShmReader::open(path.to_str().unwrap(), 2).is_err());
+
         let magic_offset = NUM_SYMBOLS * VERSION_SIZE + 48;
         buf[magic_offset..magic_offset + 16].copy_from_slice(b"ALEPHTX_SHM_V07\0");
         std::fs::write(&path, &buf).unwrap();

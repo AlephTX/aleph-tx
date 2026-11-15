@@ -77,7 +77,7 @@ func NewMatrix(name string) (*Matrix, error) {
 	path := Path(name)
 	shmSize := unsafe.Sizeof(ShmMarketState{})
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -94,7 +94,39 @@ func NewMatrix(name string) (*Matrix, error) {
 	}
 
 	shm := (*ShmMarketState)(unsafe.Pointer(&data[0]))
-	shm.BboMatrix[0][0]._Reserved = MagicV12
+	// Clear any pre-existing slots via seqlock instead of O_TRUNC so live
+	// mmap readers never observe a zero-length file (SIGBUS) or stale quotes.
+	for sym := range NumSymbols {
+		for ex := range NumExchanges {
+			slot := &shm.BboMatrix[sym][ex]
+			seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
+			cur := atomic.LoadUint32(seqAddr)
+			if (sym == 0 && ex == 0) || cur != 0 || slot.TimestampNs != 0 {
+				step := uint32(1)
+				if cur&1 == 1 {
+					step = 2 // Recover crashed odd writer to next odd epoch
+				}
+				odd := atomic.AddUint32(seqAddr, step)
+				slot.MsgType = 0
+				slot.ExchangeID = 0
+				slot.SymbolID = 0
+				slot.TimestampNs = 0
+				slot.BidPrice = 0
+				slot.BidSize = 0
+				slot.AskPrice = 0
+				slot.AskSize = 0
+				if sym == 0 && ex == 0 {
+					slot._Reserved = MagicV12
+				} else {
+					slot._Reserved = [16]byte{}
+				}
+				atomic.StoreUint32(seqAddr, odd+1)
+			}
+		}
+		if atomic.LoadUint64(&shm.SymbolVersions[sym]) != 0 {
+			atomic.AddUint64(&shm.SymbolVersions[sym], 1)
+		}
+	}
 
 	return &Matrix{data: data, shm: shm}, nil
 }

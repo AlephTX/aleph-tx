@@ -1468,3 +1468,156 @@ fn fee_and_size_totals_are_summed_exactly() {
         Some(Decimal::ZERO)
     );
 }
+
+#[test]
+fn expires_after_ms_reconciles_unknown_oid_only_with_post_expiry_dual_evidence() {
+    let intent_with_expiry = |exp: Option<u64>| {
+        JournalRecord::Intent(IntentRecord {
+            cloid: CLOID.into(),
+            coin: "ETH".into(),
+            submitted_at_ms: 1_000,
+            expires_after_ms: exp,
+            is_buy: false,
+            size: d("0.01"),
+            limit_price: d("1998"),
+            reduce_only: false,
+            primary_position: d("0.01"),
+            hedge_position: d("0"),
+            primary_observation: None,
+        })
+    };
+
+    // 1. Intent contract: expires_after_ms must strictly exceed submitted_at_ms.
+    for bad_exp in [999, 1_000] {
+        let report = audit(
+            &journal(&[start(Some(1)), intent_with_expiry(Some(bad_exp))]),
+            None,
+        );
+        assert_eq!(report.status, AuditStatus::Invalid);
+        assert!(kinds(&report).contains(&"invalid_intent"));
+    }
+
+    // 2. Journaled `expired_unknown` terminal contract.
+    let valid_expired_terminal = || TerminalRecord {
+        cloid: CLOID.into(),
+        filled: Decimal::ZERO,
+        average_price: None,
+        position: Decimal::ZERO,
+        terminal_source: Some("expired_unknown".into()),
+        terminal_at_ms: Some(6_001),
+        account_time_ms: Some(6_500),
+    };
+    let good_journal = journal(&[
+        start(Some(1)),
+        intent_with_expiry(Some(6_000)),
+        JournalRecord::Terminal(valid_expired_terminal()),
+    ]);
+    assert_eq!(
+        audit(&good_journal, None).status,
+        AuditStatus::JournalRecorded
+    );
+    // Post-expiry unknownOid corroborates `expired_unknown`.
+    let corroborated = audit(
+        &good_journal,
+        Some(&evidence(
+            vec![lookup(json!({"status": "unknownOid"}), 8_001)],
+            Some(snapshot("0", 6_500)),
+        )),
+    );
+    assert_eq!(corroborated.status, AuditStatus::JournalRecorded);
+    assert_eq!(corroborated.orders[0].evidence, "lookup_agrees");
+
+    // Violations of `expired_unknown` invariants are rejected.
+    assert_eq!(
+        audit(
+            &journal(&[
+                start(Some(1)),
+                intent_with_expiry(None),
+                JournalRecord::Terminal(valid_expired_terminal()),
+            ]),
+            None,
+        )
+        .status,
+        AuditStatus::Invalid
+    );
+    for mutate in [
+        (|t: &mut TerminalRecord| t.terminal_at_ms = Some(6_000)) as fn(&mut TerminalRecord),
+        |t| t.account_time_ms = Some(6_000),
+        |t| {
+            t.filled = d("0.004");
+            t.position = d("-0.004");
+        },
+        |t| t.average_price = Some(d("1999")),
+    ] {
+        let mut bad = valid_expired_terminal();
+        mutate(&mut bad);
+        let report = audit(
+            &journal(&[
+                start(Some(1)),
+                intent_with_expiry(Some(6_000)),
+                JournalRecord::Terminal(bad),
+            ]),
+            None,
+        );
+        assert_eq!(report.status, AuditStatus::Invalid);
+    }
+
+    // 3. Crash before terminal: frozen `unknownOid` + post-expiry snapshot.
+    let crashed = journal(&[start(Some(1)), intent_with_expiry(Some(6_000))]);
+    let step = |observed_at_ms: u64, snap: Option<SnapshotEvidence>| {
+        let report = audit(
+            &crashed,
+            Some(&evidence(
+                vec![lookup(json!({"status": "unknownOid"}), observed_at_ms)],
+                snap,
+            )),
+        );
+        let o = &report.orders[0];
+        (report.status, o.status, o.evidence, o.filled)
+    };
+    // Lookup at or inside `expires_after_ms + CLOCK_TOLERANCE_MS` (8_000) stays Pending.
+    assert_eq!(
+        step(8_000, Some(snapshot("0", 8_000))),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_unknown",
+            None
+        )
+    );
+    // Lookup past tolerance without snapshot stays Pending.
+    assert_eq!(
+        step(8_001, None),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_unknown",
+            None
+        )
+    );
+    // Snapshot not strictly after `expires_after_ms` stays Pending.
+    assert_eq!(
+        step(8_001, Some(snapshot("0", 6_000))),
+        (
+            AuditStatus::Unresolved,
+            OrderStatus::Pending,
+            "lookup_unknown",
+            None
+        )
+    );
+    // Changed position alongside post-expiry `unknownOid` is flagged Invalid conflict.
+    assert_eq!(
+        step(8_001, Some(snapshot("-0.004", 6_500))),
+        (AuditStatus::Invalid, OrderStatus::Invalid, "conflict", None)
+    );
+    // Post-expiry `unknownOid` + post-expiry unchanged position matches zero fill cleanly.
+    assert_eq!(
+        step(8_001, Some(snapshot("0", 6_500))),
+        (
+            AuditStatus::EvidenceMatched,
+            OrderStatus::Matched,
+            "matched",
+            Some(Decimal::ZERO),
+        )
+    );
+}

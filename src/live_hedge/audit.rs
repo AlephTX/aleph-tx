@@ -548,6 +548,14 @@ impl State {
         if intent.size <= Decimal::ZERO || intent.limit_price <= Decimal::ZERO {
             invalid.push("non-positive size or limit price".into());
         }
+        if let Some(expires_after_ms) = intent.expires_after_ms
+            && expires_after_ms <= intent.submitted_at_ms
+        {
+            invalid.push(format!(
+                "expires_after_ms {expires_after_ms} must exceed submitted_at_ms {}",
+                intent.submitted_at_ms
+            ));
+        }
         let (primary_status, primary_reasons) = self.primary_contract(&intent);
         if primary_status == "invalid" {
             invalid.extend(
@@ -840,6 +848,30 @@ fn terminal_time_contract(
                 intent.submitted_at_ms
             ))
         }
+        (Some("expired_unknown"), at) => {
+            match intent.expires_after_ms {
+                None => invalid.push("expired_unknown terminal requires intent expires_after_ms".into()),
+                Some(exp) => {
+                    let want = exp.saturating_add(1);
+                    if let Some(at) = at
+                        && at != want
+                    {
+                        invalid.push(format!(
+                            "expired_unknown terminal time {at} is not expires_after_ms + 1 ({want})"
+                        ));
+                    }
+                }
+            }
+            if !terminal.filled.is_zero() {
+                invalid.push(format!(
+                    "expired_unknown terminal filled {} must be 0",
+                    terminal.filled
+                ));
+            }
+            if terminal.average_price.is_some() {
+                invalid.push("expired_unknown terminal cannot carry an average_price".into());
+            }
+        }
         (Some("response" | "lookup"), _) => {}
         (Some(source), _) => invalid.push(format!("unknown terminal_source `{source}`")),
         (None, Some(_)) => invalid.push("terminal_at_ms without terminal_source".into()),
@@ -884,8 +916,10 @@ fn load_snapshot(evidence: &SnapshotEvidence, coin: &str) -> Result<Snapshot> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LookupView {
     None,
-    /// Only `unknownOid` responses: proves nothing about acceptance.
-    Unknown,
+    /// Only `unknownOid` responses, carrying the latest capture timestamp.
+    Unknown {
+        latest_observed_at_ms: u64,
+    },
     /// Latest non-terminal view is resting at the venue.
     Open,
     Terminal {
@@ -910,14 +944,14 @@ fn evaluate_lookups(
     };
     let mut terminal: Option<(u64, u64, Decimal)> = None; // (captured, status at, filled)
     let mut last_open: Option<u64> = None;
-    let mut unknown = false;
+    let mut latest_unknown: Option<u64> = None;
     let mut oid: Option<u64> = None;
     for lookup in lookups {
         let parsed = OrderLookup::from_response(lookup.response.clone())
             .map_err(|e| format!("lookup at {}: {e:#}", lookup.observed_at_ms))?;
         let located = match parsed {
             OrderLookup::Unknown => {
-                unknown = true;
+                latest_unknown = latest_unknown.max(Some(lookup.observed_at_ms));
                 continue;
             }
             OrderLookup::Found(located) => located,
@@ -964,11 +998,13 @@ fn evaluate_lookups(
     {
         return Err("an open lookup was captured after a terminal one".into());
     }
-    let view = match (terminal, last_open, unknown) {
+    let view = match (terminal, last_open, latest_unknown) {
         (Some((_, at_ms, filled)), _, _) => LookupView::Terminal { at_ms, filled },
         (None, Some(_), _) => LookupView::Open,
-        (None, None, true) => LookupView::Unknown,
-        (None, None, false) => LookupView::None,
+        (None, None, Some(latest_observed_at_ms)) => LookupView::Unknown {
+            latest_observed_at_ms,
+        },
+        (None, None, None) => LookupView::None,
     };
     Ok((view, oid))
 }
@@ -1489,6 +1525,15 @@ fn order_report(
         } else if view == LookupView::Open {
             report.evidence = "conflict";
             reasons.push("journal records a terminal but the venue shows the IOC open".into());
+        } else if let LookupView::Unknown {
+            latest_observed_at_ms,
+        } = view
+            && terminal.terminal_source.as_deref() == Some("expired_unknown")
+            && intent
+                .expires_after_ms
+                .is_some_and(|exp| latest_observed_at_ms > exp.saturating_add(CLOCK_TOLERANCE_MS))
+        {
+            report.evidence = "lookup_agrees";
         }
         let bounds = range(Some(terminal.filled));
         if bounds.is_none() {
@@ -1509,15 +1554,57 @@ fn order_report(
     report.evidence = match (report.evidence, view) {
         ("conflict", _) => "conflict",
         (_, LookupView::None) => "none",
-        (_, LookupView::Unknown) => "lookup_unknown",
+        (_, LookupView::Unknown { .. }) => "lookup_unknown",
         (_, LookupView::Open) => "lookup_open",
         (_, LookupView::Terminal { .. }) => "lookup_terminal",
     };
     match view {
         LookupView::None => reasons.push("no venue lookup supplied for this cloid".into()),
-        LookupView::Unknown => reasons.push(
-            "lookup returned unknownOid; this does not prove the IOC was never accepted".into(),
-        ),
+        LookupView::Unknown {
+            latest_observed_at_ms,
+        } => match intent.expires_after_ms {
+            Some(exp) if latest_observed_at_ms > exp.saturating_add(CLOCK_TOLERANCE_MS) => {
+                let expired_at_ms = exp.saturating_add(1);
+                match snapshot {
+                    None => reasons.push(format!(
+                        "lookup returned unknownOid after expires_after_ms {exp}; supply an account snapshot taken after {exp} to confirm zero fill"
+                    )),
+                    Some(snapshot) => match account_confirmed_fill(
+                        intent.is_buy,
+                        intent.hedge_position,
+                        intent.size,
+                        expired_at_ms,
+                        Decimal::ZERO,
+                        snapshot.position,
+                        snapshot.time_ms,
+                    ) {
+                        Err(error) => {
+                            report.evidence = "conflict";
+                            reasons.push(format!("{error:#}"));
+                        }
+                        Ok(None) if snapshot.time_ms < expired_at_ms => reasons.push(format!(
+                            "account snapshot at {} does not postdate expires_after_ms {exp}",
+                            snapshot.time_ms
+                        )),
+                        Ok(None) => {
+                            report.evidence = "conflict";
+                            reasons.push(format!(
+                                "lookup returned unknownOid after expires_after_ms {exp}, but snapshot position {} differs from planned {}",
+                                snapshot.position, intent.hedge_position
+                            ));
+                        }
+                        Ok(Some(fill)) => {
+                            report.evidence = "matched";
+                            report.filled = Some(fill);
+                            report.position_after = Some(snapshot.position);
+                        }
+                    },
+                }
+            }
+            _ => reasons.push(
+                "lookup returned unknownOid; this does not prove the IOC was never accepted".into(),
+            ),
+        },
         LookupView::Open => reasons.push(
             "venue shows the IOC open; it must reach a terminal state at the venue".into(),
         ),

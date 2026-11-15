@@ -175,3 +175,90 @@ func BenchmarkMatrixPublish(b *testing.B) {
 		m.WriteBBO(2, 1002, uint64(i+1), 100, 1, 101, 2)
 	}
 }
+
+func TestShmReopenInvalidatesWithoutTruncatingAndRecoversOddSeqlocks(t *testing.T) {
+	shmDir := t.TempDir()
+	t.Setenv("ALEPH_SHM_DIR", shmDir)
+
+	// 1. Matrix: populate slot + simulate crashed odd seqlock, then reopen while mapped.
+	m1, err := NewMatrix("aleph-matrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m1.Close()
+	m1.WriteBBO(2, 1002, 500, 2000, 1.5, 2001, 2.0)
+	atomic.StoreUint32(&m1.shm.BboMatrix[7][6].Seqlock, 3) // simulated crashed writer
+	m1.shm.BboMatrix[7][6].TimestampNs = 999
+
+	m2, err := NewMatrix("aleph-matrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+
+	// Live mapping m1 remains valid (no O_TRUNC SIGBUS), stale BBO is cleared,
+	// odd seqlock recovered to even, and MagicV12 stays stamped.
+	if _, ok := m1.ReadBBO(2, 1002); ok {
+		t.Fatal("stale BBO survived matrix reopen")
+	}
+	if seq := atomic.LoadUint32(&m1.shm.BboMatrix[7][6].Seqlock); seq&1 != 0 || seq != 6 {
+		t.Fatalf("crashed odd seqlock not recovered cleanly: seq=%d", seq)
+	}
+	if m2.shm.BboMatrix[0][0]._Reserved != MagicV12 {
+		t.Fatal("MagicV12 missing after reopen")
+	}
+	if m2.GetVersion(1002) != 2 {
+		t.Fatalf("symbol version not bumped on reopen: got %d", m2.GetVersion(1002))
+	}
+
+	// 2. Depth: populate + simulate crashed odd seqlock, then reopen while mapped.
+	depthPath := filepath.Join(shmDir, "aleph-depth")
+	d1, err := NewDepthWriter(depthPath, NumSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d1.Close()
+	bids := [DepthLevels]PriceLevel{{Price: 100, Size: 1}}
+	asks := [DepthLevels]PriceLevel{{Price: 101, Size: 1}}
+	d1.WriteDepth(5, 2, 777, bids, asks)
+	atomic.StoreUint32(&d1.data.DepthMatrix[9][1].Seqlock, 5)
+	d1.data.DepthMatrix[9][1].TimestampNs = 888
+
+	d2, err := NewDepthWriter(depthPath, NumSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	if d1.data.DepthMatrix[5][2].TimestampNs != 0 || d2.GetVersion(5) != 2 {
+		t.Fatal("stale depth survived reopen")
+	}
+	if seq := atomic.LoadUint32(&d1.data.DepthMatrix[9][1].Seqlock); seq&1 != 0 || seq != 8 {
+		t.Fatalf("crashed depth odd seqlock not recovered: seq=%d", seq)
+	}
+	var gotDepthMagic [16]byte
+	copy(gotDepthMagic[:], d2.data.DepthMatrix[0][0]._Reserved[:16])
+	if gotDepthMagic != DepthMagicV12 {
+		t.Fatal("DepthMagicV12 missing after reopen")
+	}
+
+	// 3. AccountStats: preserve Position across reopen while clearing freshness & recovering odd Version.
+	a1, err := NewAccountStatsWriter("aleph-account-stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a1.Close()
+	a1.WriteStatsWithPosition(500, 500, 1, 450, 0.1, 900, -0.25, 1234)
+	atomic.StoreUint64(&a1.stats.Version, 7) // simulated crashed odd version
+
+	a2, err := NewAccountStatsWriter("aleph-account-stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a2.Close()
+	if ver := a2.GetVersion(); ver&1 != 0 || ver != 10 {
+		t.Fatalf("crashed odd account version not recovered: %d", ver)
+	}
+	if a1.stats.Position != -0.25 || a1.stats.UpdatedAt != 0 || a1.stats.PositionUpdatedAt != 0 {
+		t.Fatalf("account reopen corrupted position or retained stale freshness: %+v", a1.stats)
+	}
+}

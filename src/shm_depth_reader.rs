@@ -6,7 +6,7 @@ const NUM_EXCHANGES: usize = 12;
 const DEPTH_LEVELS: usize = 5;
 const HEADER_SIZE: usize = NUM_SYMBOLS * std::mem::size_of::<u64>();
 const SLOT_SIZE: usize = 256; // 256 bytes per snapshot
-const DEPTH_MAGIC_V12: [u8; 16] = *b"ALEPHTX_DEP_V12\0";
+pub const DEPTH_MAGIC_V12: [u8; 16] = *b"ALEPHTX_DEP_V12\0";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -80,7 +80,7 @@ impl ShmDepthReader {
         }
         let magic_offset = HEADER_SIZE + std::mem::offset_of!(ShmDepthSnapshot, _reserved);
         let magic = &mmap[magic_offset..magic_offset + 16];
-        if magic != [0u8; 16] && magic != DEPTH_MAGIC_V12 {
+        if magic != DEPTH_MAGIC_V12 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Depth shared memory ABI magic mismatch",
@@ -210,5 +210,23 @@ mod tests {
         assert!(reader.read_depth(1, 2).is_none());
         assert!(reader.read_depth(0, NUM_EXCHANGES as u8).is_none());
         assert!(reader.read_depth(u16::MAX, u8::MAX).is_none());
+    }
+
+    #[test]
+    fn open_requires_v12_depth_magic() {
+        let path = std::env::temp_dir().join(format!("aleph-dep-magic-{}", uuid::Uuid::new_v4()));
+        let mut buf = vec![0u8; HEADER_SIZE + NUM_EXCHANGES * SLOT_SIZE];
+        std::fs::write(&path, &buf).unwrap();
+        assert!(ShmDepthReader::open(path.to_str().unwrap(), 1).is_err());
+
+        let magic_offset = HEADER_SIZE + std::mem::offset_of!(ShmDepthSnapshot, _reserved);
+        buf[magic_offset..magic_offset + 16].copy_from_slice(b"ALEPHTX_DEP_V07\0");
+        std::fs::write(&path, &buf).unwrap();
+        assert!(ShmDepthReader::open(path.to_str().unwrap(), 1).is_err());
+
+        buf[magic_offset..magic_offset + 16].copy_from_slice(&DEPTH_MAGIC_V12);
+        std::fs::write(&path, &buf).unwrap();
+        assert!(ShmDepthReader::open(path.to_str().unwrap(), 1).is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -120,8 +120,10 @@ pub struct TerminalRecord {
     /// Hyperliquid position in the account snapshot that confirmed the fill.
     #[serde(with = "rust_decimal::serde::str")]
     pub position: Decimal,
-    /// `response` (synchronous order reply, local dispatch time) or `lookup`
-    /// (venue order status, venue status timestamp). Absent in legacy files.
+    /// `response` (synchronous order reply, local dispatch time), `lookup`
+    /// (venue order status, venue status timestamp), or `expired_unknown`
+    /// (post-expiry `unknownOid` + matching flat position delta). Absent in
+    /// legacy files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

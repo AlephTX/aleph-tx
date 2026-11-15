@@ -136,4 +136,8 @@ pub trait Exchange: Send + Sync {
 
     /// 获取限价单类型（PostOnly 或 Limit）
     fn limit_order_type(&self) -> OrderType;
+
+    /// Update the execution-boundary ceiling on worst-case single-leg position
+    /// (base units) so USD-notional profiles refresh the hard cap dynamically.
+    fn set_max_worst_case_position(&self, _max_position: f64) {}
 }

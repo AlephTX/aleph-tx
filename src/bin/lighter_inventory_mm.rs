@@ -233,13 +233,10 @@ async fn run_existing_feeder() -> Result<()> {
         let _ = stop.send(true);
     });
     let account = credentials.account_index();
-    let mut trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
+    let trading = LighterTrading::with_credentials(config.market_id, credentials).await?;
     trading.validate_symbol(&symbol)?;
     trading.validate_precision(config.tick_size, config.step_size)?;
-    if config.max_position_notional_usd == 0.0 {
-        trading
-            .set_max_worst_case_position(config.max_position * config.max_portfolio_scale.max(1.0));
-    }
+    trading.set_max_worst_case_position(config.max_position * config.max_portfolio_scale.max(1.0));
     let telemetry = TelemetrySink::from_env(&SessionInfo {
         session_id: uuid::Uuid::new_v4().to_string(),
         network: format!("{network:?}"),

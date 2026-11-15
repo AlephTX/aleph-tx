@@ -644,6 +644,10 @@ impl ShmFiles {
         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
         let matrix = File::create_new(directory.join("matrix"))?;
         matrix.set_len((NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 64) as u64)?;
+        matrix.write_all_at(
+            &crate::shm_reader::SHM_MAGIC_V12,
+            (NUM_SYMBOLS * 8 + 48) as u64,
+        )?;
         let account = File::create_new(directory.join("account"))?;
         account.set_len(128)?;
         Ok(Self {
@@ -1584,11 +1588,11 @@ mod tests {
         use crate::shm_depth_reader::ShmDepthReader;
         let shm = ShmFiles::create();
         let depth_path = shm.path("depth");
-        std::fs::write(
-            &depth_path,
-            vec![0u8; NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 256],
-        )
-        .unwrap();
+        let mut depth_init = vec![0u8; NUM_SYMBOLS * 8 + NUM_SYMBOLS * NUM_EXCHANGES * 256];
+        let depth_magic_offset = NUM_SYMBOLS * 8 + 184;
+        depth_init[depth_magic_offset..depth_magic_offset + 16]
+            .copy_from_slice(&crate::shm_depth_reader::DEPTH_MAGIC_V12);
+        std::fs::write(&depth_path, depth_init).unwrap();
         let write_depth = |ts_ns: u64, size: f64| {
             let mut slot = [0u8; 256];
             slot[0..4].copy_from_slice(&2u32.to_le_bytes());

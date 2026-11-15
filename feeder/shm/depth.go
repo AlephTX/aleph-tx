@@ -68,7 +68,7 @@ func NewDepthWriter(shmPath string, numSymbols int) (*DepthWriter, error) {
 	}
 	expectedSize := int(unsafe.Sizeof(ShmDepthState{}))
 
-	file, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	file, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open shm: %w", err)
 	}
@@ -91,7 +91,36 @@ func NewDepthWriter(shmPath string, numSymbols int) (*DepthWriter, error) {
 	}
 
 	data := (*ShmDepthState)(unsafe.Pointer(&mmap[0]))
-	copy(data.DepthMatrix[0][0]._Reserved[:16], DepthMagicV12[:])
+	// Clear any pre-existing depth slots via seqlock instead of O_TRUNC so
+	// concurrent mmap readers never hit SIGBUS or read pre-restart books.
+	for sym := range NumSymbols {
+		for ex := range NumExchanges {
+			slot := &data.DepthMatrix[sym][ex]
+			seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
+			cur := atomic.LoadUint32(seqAddr)
+			if (sym == 0 && ex == 0) || cur != 0 || slot.TimestampNs != 0 {
+				step := uint32(1)
+				if cur&1 == 1 {
+					step = 2
+				}
+				odd := atomic.AddUint32(seqAddr, step)
+				slot.ExchangeID = 0
+				slot.SymbolID = 0
+				slot._Padding1 = 0
+				slot.TimestampNs = 0
+				slot.Bids = [DepthLevels]PriceLevel{}
+				slot.Asks = [DepthLevels]PriceLevel{}
+				slot._Reserved = [72]byte{}
+				if sym == 0 && ex == 0 {
+					copy(slot._Reserved[:16], DepthMagicV12[:])
+				}
+				atomic.StoreUint32(seqAddr, odd+1)
+			}
+		}
+		if atomic.LoadUint64(&data.SymbolVersions[sym]) != 0 {
+			atomic.AddUint64(&data.SymbolVersions[sym], 1)
+		}
+	}
 
 	return &DepthWriter{
 		file: file,

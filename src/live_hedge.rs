@@ -160,6 +160,11 @@ struct PendingIoc {
     before: Decimal,
     order: PerpOrder,
     sent_at_ms: u64,
+    expires_after_ms: u64,
+    /// Set once an authenticated Hyperliquid account snapshot reports
+    /// `state.time > expires_after_ms`, proving in causal time that the
+    /// venue clock has passed the signed `expiresAfter` deadline.
+    venue_past_expiry: bool,
     terminal: Option<Terminal>,
     cancel_sent: bool,
 }
@@ -168,7 +173,8 @@ struct Terminal {
     at_ms: u64,
     filled: Decimal,
     price: Option<Decimal>,
-    /// `response` (synchronous order reply) or `lookup` (order status).
+    /// `response` (synchronous order reply), `lookup` (order status), or
+    /// `expired_unknown` (post-expiry `unknownOid` + matching flat delta).
     source: &'static str,
 }
 
@@ -599,6 +605,11 @@ impl LiveInventoryHedge {
             "Hyperliquid account snapshot is stale"
         );
         let hedge = self.hedge_position(&state)?;
+        if let Some(pending) = &mut self.pending
+            && state.time > pending.expires_after_ms
+        {
+            pending.venue_past_expiry = true;
+        }
         if let Some(pending) = &self.pending {
             let Some(fill) = pending.confirmed_fill(hedge, state.time)? else {
                 return Ok(None);
@@ -739,6 +750,8 @@ impl LiveInventoryHedge {
             before: observed.hedge,
             order,
             sent_at_ms,
+            expires_after_ms,
+            venue_past_expiry: false,
             terminal: None,
             cancel_sent: false,
         });
@@ -794,7 +807,12 @@ impl LiveInventoryHedge {
     }
 
     async fn refresh_terminal(&mut self) -> Result<()> {
-        let Some(pending) = self.pending.as_mut().filter(|p| p.terminal.is_none()) else {
+        let Some(pending) = self.pending.as_mut().filter(|p| {
+            p.terminal.is_none()
+                || p.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.source == "expired_unknown")
+        }) else {
             return Ok(());
         };
         let located = match self
@@ -804,9 +822,24 @@ impl LiveInventoryHedge {
         {
             OrderLookup::Found(located) => located,
             OrderLookup::Unknown => {
-                // Intent time is before journal fsync and signing, so it does
-                // not establish the request's expiry. Absence from a lookup
-                // must not release exposure or prevent later reconciliation.
+                // Only after an earlier `clearinghouseState` proved Hyperliquid's
+                // venue clock passed the signed `expiresAfter` deadline AND local
+                // time also passed `expiresAfter + CLOCK_TOLERANCE_MS` can a
+                // subsequent `unknownOid` lookup establish non-acceptance. Even
+                // then, `accept_snapshot` still requires `account_confirmed_fill`
+                // (`state.time > expires_after_ms` and unchanged position) before
+                // releasing exposure.
+                let now = unix_ms()?;
+                if pending.venue_past_expiry
+                    && now > pending.expires_after_ms.saturating_add(CLOCK_TOLERANCE_MS)
+                {
+                    pending.terminal = Some(Terminal {
+                        at_ms: pending.expires_after_ms.saturating_add(1),
+                        filled: Decimal::ZERO,
+                        price: None,
+                        source: "expired_unknown",
+                    });
+                }
                 return Ok(());
             }
         };

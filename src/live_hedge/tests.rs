@@ -142,6 +142,8 @@ fn ack_and_timeout_reserve_exposure_until_terminal_and_account_agree() {
         before: Decimal::ZERO,
         order,
         sent_at_ms: 100,
+        expires_after_ms: 5_100,
+        venue_past_expiry: false,
         terminal: None,
         cancel_sent: false,
     };
@@ -996,4 +998,209 @@ fn primary_age_boundary_matches_between_writer_and_audit() {
     // A writer configured above the live limit rejects its own record too.
     let over = primary_observation(&evidence, budget + us, requested_at + budget - us).unwrap();
     assert!(!over.budget_allowed() && !over.within_budget());
+}
+
+#[tokio::test]
+async fn expired_unknown_ioc_requires_causal_venue_clock_and_unchanged_position() {
+    use parking_lot::Mutex;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let hl_position = Arc::new(Mutex::new(String::from("0")));
+    let server_hl_pos = Arc::clone(&hl_position);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let hl_pos = Arc::clone(&server_hl_pos);
+            tokio::spawn(async move {
+                let mut socket = BufReader::new(stream);
+                let mut request = String::new();
+                if socket.read_line(&mut request).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut size = 0usize;
+                loop {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        size = val.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; size];
+                socket.read_exact(&mut body).await.unwrap();
+                if request.starts_with("POST /exchange ") {
+                    // Simulate dropped connection (lost ACK; order never accepted by HL).
+                    return;
+                }
+                let now = unix_ms().unwrap();
+                let response = if request.starts_with("GET /api/v1/account?") {
+                    json!({"code":200,"accounts":[{"index":1,"transaction_time":30,"positions":[{
+                        "market_id":0,"symbol":"ETH","sign":1,"position":"0.03",
+                        "avg_entry_price":"2000","unrealized_pnl":"0","liquidation_price":"0"
+                    }]}]})
+                } else {
+                    let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    match query["type"].as_str().unwrap() {
+                        "clearinghouseState" => {
+                            let szi = hl_pos.lock().clone();
+                            json!({"time":now,"withdrawable":"100","marginSummary":{
+                                "accountValue":"100","totalNtlPos":"0","totalMarginUsed":"0"},
+                                "assetPositions":[{"position":{"coin":"ETH","szi":szi,"unrealizedPnl":"0"}}]})
+                        }
+                        "l2Book" => json!({"coin":"ETH","time":now,
+                            "levels":[[{"px":"2000","sz":"0.08"}],[{"px":"2001","sz":"0.12"}]]}),
+                        "orderStatus" => json!({"status":"unknownOid"}),
+                        kind => panic!("unexpected info request {kind}"),
+                    }
+                }
+                .to_string();
+                let _ = socket
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let journal_path =
+        std::env::temp_dir().join(format!("aleph-expired-ioc-{}.jsonl", uuid::Uuid::new_v4()));
+    let mut journal = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&journal_path)
+        .unwrap();
+    let hedge_account = format!("0x{:040x}", 9);
+    journal
+        .write_all(
+            &JournalRecord::Start(journal::StartRecord {
+                session_id: "exp-1".into(),
+                network: "Testnet".into(),
+                lighter_account_index: 1,
+                hyperliquid_account: Some(hedge_account.clone()),
+                symbol: "ETH".into(),
+                journal_schema: Some(journal::JOURNAL_SCHEMA),
+                lighter_market_id: Some(0),
+            })
+            .to_line()
+            .unwrap(),
+        )
+        .unwrap();
+    let info = HyperliquidInfo::new(Network::Testnet)
+        .unwrap()
+        .with_test_url(base_url.clone());
+    let trading = HyperliquidTrading::unsigned_for_test(info.clone());
+    let mut hedge = LiveInventoryHedge {
+        limits: limits(),
+        primary: Arc::new(LighterTrading::offline_test_client(&base_url).with_test_account(1)),
+        info,
+        trading,
+        market: market(),
+        account: hedge_account,
+        start_equity: d("100"),
+        confirmed: Decimal::ZERO,
+        pending: None,
+        journal,
+        last_poll: None,
+        quote_poll: None,
+        last_rebalance: None,
+        allowance: None,
+        blocked_since: None,
+        telemetry: None,
+        max_primary_age: Duration::from_millis(MAX_ACCOUNT_AGE_MS),
+    };
+
+    let observed = hedge.observe(false).await.unwrap().unwrap();
+    hedge.execute(observed, false).await.unwrap();
+    assert!(hedge.pending.is_some());
+
+    // 1. Before `expires_after_ms`: `unknownOid` never releases exposure.
+    assert!(hedge.observe(false).await.unwrap().is_none());
+    assert!(!hedge.pending.as_ref().unwrap().venue_past_expiry);
+
+    // Rewrite the journaled intent and in-memory pending deadline into the past
+    // (`now - 4_000 ms`, beyond `CLOCK_TOLERANCE_MS`) so we exercise causal expiry
+    // without sleeping 7 seconds in unit tests.
+    let expired_deadline = unix_ms().unwrap() - 4_000;
+    let submitted = expired_deadline - 5_000;
+    {
+        let text = std::fs::read_to_string(&journal_path).unwrap();
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if !line.contains("hedge_intent") {
+                    return line.to_owned();
+                }
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["submitted_at_ms"] = submitted.into();
+                v["expires_after_ms"] = expired_deadline.into();
+                v.to_string()
+            })
+            .collect();
+        std::fs::write(&journal_path, rewritten.join("\n") + "\n").unwrap();
+        hedge.journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        let p = hedge.pending.as_mut().unwrap();
+        p.sent_at_ms = submitted;
+        p.expires_after_ms = expired_deadline;
+    }
+
+    // 2. First poll after deadline: `refresh_terminal` ran BEFORE `clearinghouseState`
+    // proved `state.time > expires_after_ms`, so `pending` stays reserved while
+    // `venue_past_expiry` flips to `true`.
+    assert!(hedge.observe(false).await.unwrap().is_none());
+    assert!(hedge.pending.as_ref().unwrap().venue_past_expiry);
+    assert!(hedge.pending.as_ref().unwrap().terminal.is_none());
+
+    // 3. If the venue position moved (`-0.004`) despite `unknownOid`, dual-evidence
+    // reconciliation refuses to release exposure as zero fill.
+    *hl_position.lock() = "-0.004".into();
+    assert!(hedge.observe(false).await.unwrap().is_none());
+    assert!(hedge.pending.is_some());
+
+    // 4. With `venue_past_expiry == true`, subsequent `unknownOid`, and unchanged
+    // flat position (`0`), the unaccepted expired IOC reconciles cleanly to 0 fill
+    // and passes the offline journal audit.
+    *hl_position.lock() = "0".into();
+    let recovered = hedge.observe(false).await.unwrap().unwrap();
+    assert_eq!(recovered.hedge, Decimal::ZERO);
+    assert!(hedge.pending.is_none());
+
+    let raw = std::fs::read(&journal_path).unwrap();
+    let report = audit::audit(&raw, None);
+    assert_eq!(report.status, audit::AuditStatus::JournalRecorded);
+    assert_eq!(report.orders[0].filled, Some(Decimal::ZERO));
+    let terminal_line = std::fs::read_to_string(&journal_path)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("hedge_terminal"))
+        .unwrap()
+        .to_owned();
+    let terminal_json: serde_json::Value = serde_json::from_str(&terminal_line).unwrap();
+    assert_eq!(terminal_json["terminal_source"], "expired_unknown");
+    assert_eq!(
+        terminal_json["terminal_at_ms"].as_u64(),
+        Some(expired_deadline + 1)
+    );
+
+    let _ = Ordering::Acquire;
+    server.abort();
+    let _ = std::fs::remove_file(journal_path);
 }

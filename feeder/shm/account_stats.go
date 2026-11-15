@@ -47,7 +47,7 @@ type AccountStatsWriter struct {
 func NewAccountStatsWriter(name string) (*AccountStatsWriter, error) {
 	path := Path(name)
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -64,6 +64,19 @@ func NewAccountStatsWriter(name string) (*AccountStatsWriter, error) {
 	}
 
 	stats := (*ShmAccountStats)(unsafe.Pointer(&data[0]))
+	// Avoid O_TRUNC (which causes SIGBUS on live mmaps); invalidate freshness
+	// timestamps under seqlock while preserving last Position across restarts.
+	cur := atomic.LoadUint64(&stats.Version)
+	if cur != 0 || stats.UpdatedAt != 0 || stats.PositionUpdatedAt != 0 {
+		step := uint64(1)
+		if cur&1 == 1 {
+			step = 2
+		}
+		odd := atomic.AddUint64(&stats.Version, step)
+		stats.UpdatedAt = 0
+		stats.PositionUpdatedAt = 0
+		atomic.StoreUint64(&stats.Version, odd+1)
+	}
 
 	return &AccountStatsWriter{data: data, stats: stats}, nil
 }
@@ -100,9 +113,8 @@ func (w *AccountStatsWriter) writeStatsLocked(
 	if timestampNs == 0 || timestampNs < w.stats.UpdatedAt {
 		return
 	}
-	// Increment version first (acts as a write lock indicator)
-	version := atomic.LoadUint64(&w.stats.Version)
-	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
+	// Increment version first (AddUint64 provides acquire-release ordering on ARM64)
+	odd := atomic.AddUint64(&w.stats.Version, 1) // Odd = writing
 
 	// Write all fields
 	w.stats.Collateral = collateral
@@ -116,7 +128,7 @@ func (w *AccountStatsWriter) writeStatsLocked(
 	w.stats.UpdatedAt = timestampNs
 
 	// Increment version again to signal write complete
-	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
+	atomic.StoreUint64(&w.stats.Version, odd+1) // Even = complete
 }
 
 // WritePosition updates only position, preserving the full-account freshness timestamp.
@@ -131,13 +143,12 @@ func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64)
 	if timestampNs < w.stats.PositionUpdatedAt {
 		return
 	}
-	version := atomic.LoadUint64(&w.stats.Version)
-	atomic.StoreUint64(&w.stats.Version, version+1) // Odd = writing
+	odd := atomic.AddUint64(&w.stats.Version, 1) // Odd = writing
 
 	w.stats.Position = position
 	w.stats.PositionUpdatedAt = timestampNs
 
-	atomic.StoreUint64(&w.stats.Version, version+2) // Even = complete
+	atomic.StoreUint64(&w.stats.Version, odd+1) // Even = complete
 }
 
 func (w *AccountStatsWriter) PositionNeedsRefresh(now, maxAge uint64) bool {
@@ -169,8 +180,7 @@ func (w *AccountStatsWriter) Close() error {
 func (w *AccountStatsWriter) InvalidatePosition() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	version := atomic.LoadUint64(&w.stats.Version)
-	atomic.StoreUint64(&w.stats.Version, version+1)
+	odd := atomic.AddUint64(&w.stats.Version, 1)
 	w.stats.PositionUpdatedAt = 0
-	atomic.StoreUint64(&w.stats.Version, version+2)
+	atomic.StoreUint64(&w.stats.Version, odd+1)
 }

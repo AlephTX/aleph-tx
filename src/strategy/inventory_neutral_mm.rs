@@ -749,6 +749,7 @@ impl InventoryNeutralMM {
             let max_position =
                 scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid)
                     .max(self.config.step_size);
+            self.trading.set_max_worst_case_position(max_position);
             let mut runtime_config = self.config.runtime_copy();
             runtime_config.max_position = max_position;
             runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
