@@ -103,14 +103,19 @@ func (w *DepthWriter) WriteDepth(
 	timestampNs uint64,
 	bids, asks [DepthLevels]PriceLevel,
 ) {
-	if symbolID >= NumSymbols || exchangeID >= NumExchanges || timestampNs == 0 {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges || timestampNs == 0 ||
+		!validDepthSides(bids, asks) {
 		return
 	}
 	slot := &w.data.DepthMatrix[symbolID][exchangeID]
+	if timestampNs < slot.TimestampNs {
+		return // Delayed/replayed updates cannot make an older depth snapshot current.
+	}
+	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 
 	// Seqlock write protocol: odd -> write -> even
-	seq := atomic.LoadUint32(&slot.Seqlock)
-	atomic.StoreUint32(&slot.Seqlock, seq+1) // now odd → write in progress
+	seq := atomic.LoadUint32(seqAddr)
+	atomic.StoreUint32(seqAddr, seq+1) // now odd → write in progress
 
 	slot.ExchangeID = exchangeID
 	slot.SymbolID = symbolID
@@ -118,10 +123,66 @@ func (w *DepthWriter) WriteDepth(
 	slot.Bids = bids
 	slot.Asks = asks
 
-	atomic.StoreUint32(&slot.Seqlock, seq+2) // now even → write complete
+	atomic.StoreUint32(seqAddr, seq+2) // now even → write complete
 
 	// Increment version counter for cache invalidation
 	atomic.AddUint64(&w.data.SymbolVersions[symbolID], 1)
+}
+
+// InvalidateDepth makes a disconnected or incomplete depth book unavailable immediately.
+// The adapter owning this exchange/symbol slot must be its only writer.
+func (w *DepthWriter) InvalidateDepth(symbolID uint16, exchangeID uint8) {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges {
+		return
+	}
+	slot := &w.data.DepthMatrix[symbolID][exchangeID]
+	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
+	seq := atomic.LoadUint32(seqAddr)
+	atomic.StoreUint32(seqAddr, seq+1)
+	slot.TimestampNs = 0
+	slot.Bids = [DepthLevels]PriceLevel{}
+	slot.Asks = [DepthLevels]PriceLevel{}
+	atomic.StoreUint32(seqAddr, seq+2)
+	atomic.AddUint64(&w.data.SymbolVersions[symbolID], 1)
+}
+
+// GetVersion returns the current depth version for a symbol (for diagnostics).
+func (w *DepthWriter) GetVersion(symbolID uint16) uint64 {
+	if symbolID >= NumSymbols {
+		return 0
+	}
+	return atomic.LoadUint64(&w.data.SymbolVersions[symbolID])
+}
+
+func validDepthSides(bids, asks [DepthLevels]PriceLevel) bool {
+	if !validPositive(bids[0].Price) || !validPositive(bids[0].Size) ||
+		!validPositive(asks[0].Price) || !validPositive(asks[0].Size) ||
+		bids[0].Price >= asks[0].Price {
+		return false
+	}
+	return validDepthLevels(bids, true) && validDepthLevels(asks, false)
+}
+
+func validDepthLevels(levels [DepthLevels]PriceLevel, descending bool) bool {
+	seenEmpty := false
+	for i, lvl := range levels {
+		if lvl.Price == 0 && lvl.Size == 0 {
+			seenEmpty = true
+			continue
+		}
+		if seenEmpty || !validPositive(lvl.Price) || !validPositive(lvl.Size) {
+			return false
+		}
+		if i > 0 {
+			if descending && lvl.Price >= levels[i-1].Price {
+				return false
+			}
+			if !descending && lvl.Price <= levels[i-1].Price {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Close unmaps and closes the SHM file.

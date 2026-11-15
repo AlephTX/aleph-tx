@@ -25,4 +25,5 @@ pub mod venues;
 pub use exchanges::backpack as backpack_api;
 pub use exchanges::edgex as edgex_api;
 pub use exchanges::lighter::ffi as lighter_ffi;
+pub use exchanges::lighter::risk as lighter_risk;
 pub use exchanges::lighter::trading as lighter_trading;

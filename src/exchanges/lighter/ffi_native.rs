@@ -167,6 +167,8 @@ impl SignedTxResponse {
 pub struct LighterSigner {
     api_key_index: i64,
     account_index: i64,
+    #[cfg(test)]
+    mock_only: bool,
 }
 
 impl LighterSigner {
@@ -175,6 +177,16 @@ impl LighterSigner {
         Self {
             api_key_index: 0,
             account_index: 0,
+            mock_only: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_for_test(api_key_index: i64, account_index: i64) -> Self {
+        Self {
+            api_key_index,
+            account_index,
+            mock_only: true,
         }
     }
 
@@ -212,6 +224,8 @@ impl LighterSigner {
         Ok(Self {
             api_key_index,
             account_index,
+            #[cfg(test)]
+            mock_only: false,
         })
     }
 
@@ -234,6 +248,32 @@ impl LighterSigner {
         let market_index = market_index.into();
         if !super::super::valid_market_id(market_index) {
             return Err("Invalid Lighter market ID".into());
+        }
+        #[cfg(test)]
+        if self.mock_only {
+            let tx_info = serde_json::json!({
+                "AccountIndex": self.account_index,
+                "ApiKeyIndex": self.api_key_index,
+                "MarketIndex": market_index,
+                "ClientOrderIndex": client_order_index,
+                "BaseAmount": base_amount,
+                "Price": price,
+                "IsAsk": u8::from(is_ask),
+                "Type": order_type,
+                "TimeInForce": time_in_force,
+                "ReduceOnly": u8::from(reduce_only),
+                "OrderExpiry": order_expiry,
+                "Nonce": nonce,
+            })
+            .to_string();
+            return Ok(SignedTransaction {
+                tx_type: 14,
+                tx_info,
+                tx_hash: format!(
+                    "mock-create-{}-{nonce}-{client_order_index}",
+                    self.api_key_index
+                ),
+            });
         }
         // SAFETY: argument widths and order match the v1.0.12 release header.
         unsafe {
@@ -274,6 +314,22 @@ impl LighterSigner {
         if !super::super::valid_market_id(market_index) {
             return Err("Invalid Lighter market ID".into());
         }
+        #[cfg(test)]
+        if self.mock_only {
+            let tx_info = serde_json::json!({
+                "AccountIndex": self.account_index,
+                "ApiKeyIndex": self.api_key_index,
+                "MarketIndex": market_index,
+                "Index": order_index,
+                "Nonce": nonce,
+            })
+            .to_string();
+            return Ok(SignedTransaction {
+                tx_type: 15,
+                tx_info,
+                tx_hash: format!("mock-cancel-{}-{nonce}-{order_index}", self.api_key_index),
+            });
+        }
         // SAFETY: argument widths and order match the v1.0.12 release header.
         unsafe {
             let response = SignCancelOrder(
@@ -291,6 +347,13 @@ impl LighterSigner {
 
     /// Create authentication token for WebSocket
     pub fn create_auth_token(&self, deadline_secs: i64) -> Result<String, String> {
+        #[cfg(test)]
+        if self.mock_only {
+            return Ok(format!(
+                "{deadline_secs}:{}:{}:mock",
+                self.account_index, self.api_key_index
+            ));
+        }
         unsafe {
             let response = CreateAuthToken(
                 deadline_secs,

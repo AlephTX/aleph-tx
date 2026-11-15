@@ -10,16 +10,22 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const maxLighterBookLevels = 10_000
+
 // lighterBook reconstructs the full price-level book. Lighter update/order_book
 // messages are deltas: omitted levels remain, and size=0 deletes a level.
 // See the official SDK's WsClient.update_order_book_state/update_orders:
 // https://github.com/elliottech/lighter-python/blob/main/lighter/ws_client.py
 // Each side stays sorted so extracting L1-L5 costs O(5), with no hot-path sort.
 type lighterBook struct {
-	bids, asks  []shm.PriceLevel
-	initialized bool
-	offset      int64
-	hasOffset   bool
+	bids, asks       []shm.PriceLevel
+	initialized      bool
+	offset           int64
+	hasOffset        bool
+	nonce            int64
+	hasNonce         bool
+	lastUpdatedAt    int64
+	hasLastUpdatedAt bool
 }
 
 func validBookLevel(level gjson.Result) (shm.PriceLevel, error) {
@@ -38,9 +44,38 @@ func (b *lighterBook) apply(book gjson.Result, snapshot bool) (bool, error) {
 	if !snapshot && !b.initialized {
 		return false, fmt.Errorf("book delta before snapshot")
 	}
+	nonce := book.Get("nonce")
+	if nonce.Exists() && nonce.Int() <= 0 {
+		return false, fmt.Errorf("invalid book nonce")
+	}
+	beginNonce := book.Get("begin_nonce")
+	if beginNonce.Exists() && beginNonce.Int() <= 0 {
+		return false, fmt.Errorf("invalid book begin_nonce")
+	}
+	lastUpdatedAt := book.Get("last_updated_at")
+	if lastUpdatedAt.Exists() && lastUpdatedAt.Int() <= 0 {
+		return false, fmt.Errorf("invalid book last_updated_at")
+	}
 	offset := book.Get("offset")
-	if !snapshot && offset.Exists() && b.hasOffset && offset.Int() <= b.offset {
-		return false, nil // Duplicate or reordered frame; never roll back the book.
+	if !snapshot {
+		if nonce.Exists() && b.hasNonce && nonce.Int() <= b.nonce {
+			return false, nil // Duplicate or reordered frame; never roll back the book.
+		}
+		if offset.Exists() && b.hasOffset && offset.Int() <= b.offset {
+			return false, nil // Duplicate or reordered frame; never roll back the book.
+		}
+		if b.hasNonce || beginNonce.Exists() {
+			if !b.hasNonce || !nonce.Exists() || !beginNonce.Exists() || beginNonce.Int() != b.nonce {
+				prev := b.nonce
+				*b = lighterBook{}
+				return false, fmt.Errorf("book nonce gap: expected begin_nonce=%d, got begin_nonce=%s nonce=%s", prev, beginNonce.Raw, nonce.Raw)
+			}
+		}
+		if lastUpdatedAt.Exists() && b.hasLastUpdatedAt && lastUpdatedAt.Int() < b.lastUpdatedAt {
+			prev := b.lastUpdatedAt
+			*b = lighterBook{}
+			return false, fmt.Errorf("book timestamp regression: %d < %d", lastUpdatedAt.Int(), prev)
+		}
 	}
 	bids, asks := book.Get("bids"), book.Get("asks")
 	// Validate the whole message before changing either side.
@@ -62,12 +97,25 @@ func (b *lighterBook) apply(book gjson.Result, snapshot bool) (bool, error) {
 	}
 	b.bids = updateBookSide(b.bids, bids, true)
 	b.asks = updateBookSide(b.asks, asks, false)
+	if len(b.bids) > maxLighterBookLevels || len(b.asks) > maxLighterBookLevels {
+		*b = lighterBook{}
+		return false, fmt.Errorf("reconstructed book exceeds %d levels", maxLighterBookLevels)
+	}
+	if len(b.bids) > 0 && len(b.asks) > 0 && b.bids[0].Price >= b.asks[0].Price {
+		*b = lighterBook{}
+		return false, fmt.Errorf("crossed reconstructed book")
+	}
 	b.initialized = true
 	b.hasOffset = offset.Exists()
 	b.offset = offset.Int()
-	if len(b.bids) > 0 && len(b.asks) > 0 && b.bids[0].Price >= b.asks[0].Price {
-		b.initialized = false
-		return false, fmt.Errorf("crossed reconstructed book")
+	b.hasNonce = nonce.Exists()
+	b.nonce = nonce.Int()
+	if snapshot {
+		b.hasLastUpdatedAt = lastUpdatedAt.Exists()
+		b.lastUpdatedAt = lastUpdatedAt.Int()
+	} else if lastUpdatedAt.Exists() {
+		b.hasLastUpdatedAt = true
+		b.lastUpdatedAt = lastUpdatedAt.Int()
 	}
 	return true, nil
 }

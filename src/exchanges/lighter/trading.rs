@@ -9,7 +9,7 @@
 //! - cancel_order / cancel_all — 撤单
 //! - get_order / get_active_orders / verify_order — 查询验证
 
-use super::error::LighterErrorResponse;
+use super::error::{LighterErrorCode, LighterErrorResponse};
 use crate::error::TradingError;
 use crate::order_tracker::{OrderSide as TrackerSide, OrderTracker};
 
@@ -175,17 +175,145 @@ struct MarketDetail {
     price_decimals: u8,
 }
 
+/// Lighter execution and settlement domain.
+///
+/// Core Mainnet (Chain ID 304, USDC collateral) and Robinhood Chain Mainnet
+/// (Chain ID 466324, USDG collateral) share `Network::Mainnet` reference feeds
+/// and wire format, but operate independent order books, sequencers, collateral
+/// pools, and account namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LighterDomain {
+    CoreMainnet,
+    RobinhoodMainnet,
+    CoreTestnet,
+}
+
+impl LighterDomain {
+    pub const fn network(self) -> crate::exchanges::hyperliquid::Network {
+        use crate::exchanges::hyperliquid::Network;
+        match self {
+            Self::CoreMainnet | Self::RobinhoodMainnet => Network::Mainnet,
+            Self::CoreTestnet => Network::Testnet,
+        }
+    }
+
+    pub const fn chain_id(self) -> i32 {
+        match self {
+            Self::CoreMainnet => 304,
+            Self::RobinhoodMainnet => 466324,
+            Self::CoreTestnet => 300,
+        }
+    }
+
+    pub const fn rest_url(self) -> &'static str {
+        match self {
+            Self::CoreMainnet => "https://mainnet.zklighter.elliot.ai",
+            Self::RobinhoodMainnet => "https://api.rh.lighter.xyz",
+            Self::CoreTestnet => "https://testnet.zklighter.elliot.ai",
+        }
+    }
+
+    pub const fn ws_url(self) -> &'static str {
+        match self {
+            Self::CoreMainnet => "wss://mainnet.zklighter.elliot.ai/stream",
+            Self::RobinhoodMainnet => "wss://api.rh.lighter.xyz/stream",
+            Self::CoreTestnet => "wss://testnet.zklighter.elliot.ai/stream",
+        }
+    }
+
+    /// Filesystem-safe domain slug for `/dev/shm` account locks and daily-loss state.
+    /// Keeps `"Mainnet"` and `"Testnet"` identical for backward compatibility while
+    /// isolating `"Robinhood"` state onto its own files.
+    pub const fn lock_slug(self) -> &'static str {
+        match self {
+            Self::CoreMainnet => "Mainnet",
+            Self::RobinhoodMainnet => "Robinhood",
+            Self::CoreTestnet => "Testnet",
+        }
+    }
+
+    pub const fn telemetry_exchange(self) -> &'static str {
+        match self {
+            Self::CoreMainnet | Self::CoreTestnet => "lighter",
+            Self::RobinhoodMainnet => "lighter_robinhood",
+        }
+    }
+
+    pub const fn valid_api_key_index(chain_id: i32, api_key_index: i64) -> bool {
+        api_key_index >= 0 && api_key_index <= 254 && !(chain_id == 466324 && api_key_index == 157)
+    }
+}
+
+#[derive(Clone)]
+struct ApiKeyCredentials {
+    private_key: String,
+    api_key_index: i64,
+}
+
 pub struct LighterCredentials {
     base_url: String,
-    private_key: String,
     chain_id: i32,
-    api_key_index: i64,
     account_index: i64,
+    maker_key: ApiKeyCredentials,
+    cancel_key: Option<ApiKeyCredentials>,
+    taker_key: Option<ApiKeyCredentials>,
 }
 
 impl LighterCredentials {
     pub fn account_index(&self) -> i64 {
         self.account_index
+    }
+
+    pub fn has_cancel_lane(&self) -> bool {
+        self.cancel_key.is_some()
+    }
+
+    pub fn has_taker_lane(&self) -> bool {
+        self.taker_key.is_some()
+    }
+
+    fn parse_api_key(
+        private_key_raw: &str,
+        api_key_index_raw: &str,
+        chain_id: i32,
+        label: &str,
+    ) -> Result<ApiKeyCredentials> {
+        let private_key = private_key_raw
+            .strip_prefix("0x")
+            .unwrap_or(private_key_raw);
+        anyhow::ensure!(
+            private_key.len() == 80 && private_key.bytes().all(|c| c.is_ascii_hexdigit()),
+            "Lighter {label} API private key must be 40 bytes in hex"
+        );
+        let api_key_index: i64 = api_key_index_raw.parse()?;
+        anyhow::ensure!(
+            !(chain_id == 466324 && api_key_index == 157),
+            "Lighter {label} API key index 157 is reserved on Robinhood Chain (466324)"
+        );
+        anyhow::ensure!(
+            LighterDomain::valid_api_key_index(chain_id, api_key_index),
+            "Invalid Lighter {label} API key index"
+        );
+        Ok(ApiKeyCredentials {
+            private_key: private_key.to_owned(),
+            api_key_index,
+        })
+    }
+
+    fn parse_optional_lane(
+        get: &impl Fn(&str) -> Option<String>,
+        key_env: &str,
+        index_env: &str,
+        chain_id: i32,
+        label: &str,
+    ) -> Result<Option<ApiKeyCredentials>> {
+        let key = get(key_env).filter(|s| !s.is_empty());
+        let index = get(index_env).filter(|s| !s.is_empty());
+        match (key, index) {
+            (None, None) => Ok(None),
+            (Some(k), Some(idx)) => Ok(Some(Self::parse_api_key(&k, &idx, chain_id, label)?)),
+            _ => anyhow::bail!("{key_env} and {index_env} must be configured together"),
+        }
     }
 
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
@@ -194,42 +322,83 @@ impl LighterCredentials {
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("{key} is required"))
         };
-        let private_key =
+        let chain_id: i32 = get("LIGHTER_CHAIN_ID")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "304".into())
+            .parse()?;
+        let account_index: i64 = required("LIGHTER_ACCOUNT_INDEX")?.parse()?;
+        anyhow::ensure!(account_index > 0, "Invalid Lighter account index");
+
+        let primary_key =
             required("LIGHTER_PRIVATE_KEY").or_else(|_| required("API_KEY_PRIVATE_KEY"))?;
-        let private_key = private_key.strip_prefix("0x").unwrap_or(&private_key);
-        anyhow::ensure!(
-            private_key.len() == 80 && private_key.bytes().all(|c| c.is_ascii_hexdigit()),
-            "Lighter API private key must be 40 bytes in hex"
-        );
-        let account_index = required("LIGHTER_ACCOUNT_INDEX")?.parse()?;
-        let api_key_index = required("LIGHTER_API_KEY_INDEX")?.parse()?;
-        anyhow::ensure!(
-            account_index > 0 && (0..=254).contains(&api_key_index),
-            "Invalid Lighter account or API key index"
-        );
+        let primary_index = required("LIGHTER_API_KEY_INDEX")?;
+        let maker_key = Self::parse_api_key(&primary_key, &primary_index, chain_id, "maker")?;
+        let cancel_key = Self::parse_optional_lane(
+            &get,
+            "LIGHTER_CANCEL_PRIVATE_KEY",
+            "LIGHTER_CANCEL_API_KEY_INDEX",
+            chain_id,
+            "cancel",
+        )?;
+        let taker_key = Self::parse_optional_lane(
+            &get,
+            "LIGHTER_TAKER_PRIVATE_KEY",
+            "LIGHTER_TAKER_API_KEY_INDEX",
+            chain_id,
+            "taker",
+        )?;
+
+        if let Some(ref cancel) = cancel_key {
+            anyhow::ensure!(
+                cancel.api_key_index != maker_key.api_key_index,
+                "Lighter cancel lane must use a distinct API key index from maker lane"
+            );
+        }
+        if let Some(ref taker) = taker_key {
+            anyhow::ensure!(
+                taker.api_key_index != maker_key.api_key_index,
+                "Lighter taker lane must use a distinct API key index from maker lane"
+            );
+            if let Some(ref cancel) = cancel_key {
+                anyhow::ensure!(
+                    taker.api_key_index != cancel.api_key_index,
+                    "Lighter taker lane must use a distinct API key index from cancel lane"
+                );
+            }
+        }
+
+        let default_url = if chain_id == 466324 {
+            LighterDomain::RobinhoodMainnet.rest_url()
+        } else {
+            LighterDomain::CoreMainnet.rest_url()
+        };
         Ok(Self {
             base_url: get("LIGHTER_BASE_URL")
-                .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai".into())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default_url.into())
                 .trim_end_matches('/')
                 .to_owned(),
-            private_key: private_key.to_owned(),
-            chain_id: get("LIGHTER_CHAIN_ID")
-                .unwrap_or_else(|| "304".into())
-                .parse()?,
+            chain_id,
             account_index,
-            api_key_index,
+            maker_key,
+            cancel_key,
+            taker_key,
         })
     }
 
-    pub fn network(&self) -> Result<crate::exchanges::hyperliquid::Network> {
-        use crate::exchanges::hyperliquid::Network;
+    pub fn domain(&self) -> Result<LighterDomain> {
         match (self.base_url.as_str(), self.chain_id) {
-            ("https://mainnet.zklighter.elliot.ai", 304) => Ok(Network::Mainnet),
-            ("https://testnet.zklighter.elliot.ai", 300) => Ok(Network::Testnet),
+            ("https://mainnet.zklighter.elliot.ai", 304) => Ok(LighterDomain::CoreMainnet),
+            ("https://api.rh.lighter.xyz", 466324) => Ok(LighterDomain::RobinhoodMainnet),
+            ("https://testnet.zklighter.elliot.ai", 300) => Ok(LighterDomain::CoreTestnet),
             _ => anyhow::bail!(
                 "Lighter REST endpoint and chain ID must identify the same supported network"
             ),
         }
+    }
+
+    pub fn network(&self) -> Result<crate::exchanges::hyperliquid::Network> {
+        Ok(self.domain()?.network())
     }
 }
 
@@ -264,23 +433,187 @@ impl Drop for SubmissionGuard<'_> {
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
-/// Lighter 交易客户端（币种无关）
-pub struct LighterTrading {
+/// Per-API-key signing and submission lane.
+///
+/// Isolates `api_key_index`, monotonic `nonce`, and HTTP submission lock so
+/// Lighter's taker speed-bump queue (140-300 ms on IOC/Market orders) cannot
+/// head-of-line block 0 ms `PostOnly` maker quotes or emergency cancellations
+/// when dedicated API keys are configured.
+struct SigningLane {
     signer: Arc<super::ffi::LighterSigner>,
+    api_key_index: i64,
+    submission_lock: TokioMutex<()>,
+    nonce: AtomicI64,
+    nonce_init: TokioMutex<bool>,
+}
+
+impl SigningLane {
+    fn new(signer: Arc<super::ffi::LighterSigner>, api_key_index: i64) -> Self {
+        Self {
+            signer,
+            api_key_index,
+            submission_lock: TokioMutex::new(()),
+            nonce: AtomicI64::new(0),
+            nonce_init: TokioMutex::new(false),
+        }
+    }
+
+    async fn fetch_nonce(
+        &self,
+        client: &Client,
+        base_url: &str,
+        account_index: i64,
+    ) -> Result<i64> {
+        let url = format!(
+            "{}/api/v1/nextNonce?account_index={}&api_key_index={}",
+            base_url, account_index, self.api_key_index
+        );
+        let resp = client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch nonce: HTTP {}", resp.status());
+        }
+        let nonce_resp: NonceResponse = resp.json().await?;
+        anyhow::ensure!(
+            nonce_resp.nonce >= 0 && nonce_resp.nonce <= i64::MAX - 1024,
+            "Invalid server nonce"
+        );
+        Ok(nonce_resp.nonce)
+    }
+
+    async fn get_nonce(&self, client: &Client, base_url: &str, account_index: i64) -> Result<i64> {
+        {
+            let mut initialized = self.nonce_init.lock().await;
+            if !*initialized {
+                let server_nonce = self.fetch_nonce(client, base_url, account_index).await?;
+                self.nonce.store(server_nonce, Ordering::Release);
+                *initialized = true;
+                tracing::info!(
+                    api_key_index = self.api_key_index,
+                    nonce = server_nonce,
+                    "Nonce initialized from server"
+                );
+                return Ok(server_nonce);
+            }
+        }
+        Ok(self.nonce.load(Ordering::SeqCst))
+    }
+
+    fn increment_nonce(&self) {
+        self.nonce.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn send_tx(
+        &self,
+        client: &Client,
+        send_tx_url: &str,
+        tx_type: u8,
+        tx_info: String,
+    ) -> Result<SendTxResponse> {
+        let form = reqwest::multipart::Form::new()
+            .text("tx_type", tx_type.to_string())
+            .text("tx_info", tx_info);
+
+        // Invalidate before the request: cancellation/timeouts can leave a consumed
+        // nonce even when no response reaches this process. Remember whether our
+        // local nonce was synchronized so definitive pre-application rejections
+        // (where Lighter did not consume the nonce) can restore it without burning
+        // an extra `/api/v1/nextNonce` HTTP round-trip.
+        let was_initialized = std::mem::replace(&mut *self.nonce_init.lock().await, false);
+        let resp = client
+            .post(send_tx_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        if let Err(failure) = classify_submission_response(status, &body) {
+            if was_initialized && failure.preserves_unconsumed_single_tx_nonce() {
+                *self.nonce_init.lock().await = true;
+            }
+            return Err(failure.into_error());
+        }
+        let parsed: SendTxResponse = serde_json::from_str(&body)
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        if parsed.tx_hash.as_ref().is_none_or(String::is_empty) {
+            return Err(
+                TradingError::SubmissionUncertain("Missing transaction hash".into()).into(),
+            );
+        }
+        self.increment_nonce();
+        *self.nonce_init.lock().await = true;
+
+        Ok(parsed)
+    }
+
+    async fn send_tx_batch(
+        &self,
+        client: &Client,
+        send_tx_batch_url: &str,
+        txs: &[(u8, String)],
+    ) -> Result<SendTxBatchResponse> {
+        // Python SDK: json.dumps([14, 14]) and json.dumps(["{...}", "{...}"])
+        let tx_types_vec: Vec<u8> = txs.iter().map(|(t, _)| *t).collect();
+        let tx_infos_vec: Vec<&str> = txs.iter().map(|(_, info)| info.as_str()).collect();
+
+        let tx_types_json = serde_json::to_string(&tx_types_vec)?;
+        let tx_infos_json = serde_json::to_string(&tx_infos_vec)?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("tx_types", tx_types_json)
+            .text("tx_infos", tx_infos_json);
+
+        // Invalidate before the request: cancellation/timeouts or partial batch
+        // acceptance can consume a subset of nonces. Always resync after a failed batch.
+        *self.nonce_init.lock().await = false;
+        let resp = client
+            .post(send_tx_batch_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        validate_submission_response(status, &body)?;
+        let parsed: SendTxBatchResponse = serde_json::from_str(&body)
+            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
+        if parsed
+            .tx_hash
+            .as_ref()
+            .is_none_or(|hashes| hashes.len() != txs.len() || hashes.iter().any(String::is_empty))
+        {
+            return Err(TradingError::SubmissionUncertain(
+                "Incomplete batch acknowledgement".into(),
+            )
+            .into());
+        }
+        self.nonce.fetch_add(txs.len() as i64, Ordering::SeqCst);
+        *self.nonce_init.lock().await = true;
+
+        Ok(parsed)
+    }
+}
+
+/// Lighter 交易客户端（币种无关，支持 Maker / Cancel / Taker 多 API Key 隔离）
+pub struct LighterTrading {
+    maker_lane: SigningLane,
+    cancel_lane: Option<SigningLane>,
+    taker_lane: Option<SigningLane>,
     client: Client,
     base_url: String,
     send_tx_url: String,
     send_tx_batch_url: String,
     account_index: i64,
-    api_key_index: i64,
     market_id: i64,
     market_symbol: String,
     size_multiplier: f64,
     price_multiplier: f64,
-    /// Serialize nonce allocation, signing and submission across all writers.
-    submission_lock: TokioMutex<()>,
-    nonce: AtomicI64,
-    nonce_init: TokioMutex<bool>,
     client_order_counter: AtomicI64,
     /// Optional order tracker for per-order state machine (v5.0.0)
     order_tracker: Option<Arc<OrderTracker>>,
@@ -394,24 +727,68 @@ impl LighterTrading {
     #[cfg(test)]
     pub(crate) fn offline_test_client(base_url: &str) -> Self {
         Self {
-            signer: Arc::new(super::ffi::LighterSigner::offline_for_test()),
+            maker_lane: SigningLane::new(
+                Arc::new(super::ffi::LighterSigner::offline_for_test()),
+                0,
+            ),
+            cancel_lane: None,
+            taker_lane: None,
             client: Client::builder()
                 .timeout(Duration::from_millis(500))
+                .no_proxy()
                 .build()
                 .unwrap(),
             base_url: base_url.to_owned(),
             send_tx_url: format!("{base_url}/api/v1/sendTx"),
             send_tx_batch_url: format!("{base_url}/api/v1/sendTxBatch"),
             account_index: 0,
-            api_key_index: 0,
             market_id: 0,
             market_symbol: "ETH".into(),
             size_multiplier: 1e6,
             price_multiplier: 100.0,
-            submission_lock: TokioMutex::new(()),
-            nonce: AtomicI64::new(0),
-            nonce_init: TokioMutex::new(false),
             client_order_counter: AtomicI64::new(43),
+            order_tracker: None,
+            limit_order_type: OrderType::PostOnly,
+            quote_expiry: None,
+            test_auth_token: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_multi_lane_test_client(
+        base_url: &str,
+        account_index: i64,
+        maker_key_index: i64,
+        cancel_key_index: Option<i64>,
+        taker_key_index: Option<i64>,
+    ) -> Self {
+        let make_lane = |key_idx| {
+            SigningLane::new(
+                Arc::new(super::ffi::LighterSigner::mock_for_test(
+                    key_idx,
+                    account_index,
+                )),
+                key_idx,
+            )
+        };
+        Self {
+            maker_lane: make_lane(maker_key_index),
+            cancel_lane: cancel_key_index.map(make_lane),
+            taker_lane: taker_key_index.map(make_lane),
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .no_proxy()
+                .build()
+                .unwrap(),
+            base_url: base_url.to_owned(),
+            send_tx_url: format!("{base_url}/api/v1/sendTx"),
+            send_tx_batch_url: format!("{base_url}/api/v1/sendTxBatch"),
+            account_index,
+            market_id: 0,
+            market_symbol: "ETH".into(),
+            size_multiplier: 1e6,
+            price_multiplier: 100.0,
+            client_order_counter: AtomicI64::new(1000),
             order_tracker: None,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
@@ -442,22 +819,30 @@ impl LighterTrading {
         );
         let LighterCredentials {
             base_url,
-            private_key,
             chain_id,
-            api_key_index,
             account_index,
+            maker_key,
+            cancel_key,
+            taker_key,
         } = credentials;
 
-        let signer = Arc::new(
-            super::ffi::LighterSigner::new(
-                &base_url,
-                &private_key,
-                chain_id,
-                api_key_index,
-                account_index,
-            )
-            .map_err(|e| anyhow::anyhow!("Signer init failed: {}", e))?,
-        );
+        let init_lane = |key: ApiKeyCredentials, role: &str| -> Result<SigningLane> {
+            let signer = Arc::new(
+                super::ffi::LighterSigner::new(
+                    &base_url,
+                    &key.private_key,
+                    chain_id,
+                    key.api_key_index,
+                    account_index,
+                )
+                .map_err(|e| anyhow::anyhow!("{role} signer init failed: {e}"))?,
+            );
+            Ok(SigningLane::new(signer, key.api_key_index))
+        };
+
+        let maker_lane = init_lane(maker_key, "Maker")?;
+        let cancel_lane = cancel_key.map(|k| init_lane(k, "Cancel")).transpose()?;
+        let taker_lane = taker_key.map(|k| init_lane(k, "Taker")).transpose()?;
 
         let client = Client::builder()
             .pool_max_idle_per_host(10)
@@ -478,11 +863,14 @@ impl LighterTrading {
             ..
         } = Self::fetch_market_with_retry(&client, &base_url, market_id).await?;
         tracing::info!(
-            "Market {} ({}) decimals: size={} price={}",
             market_id,
-            market_symbol,
+            %market_symbol,
             size_decimals,
-            price_decimals
+            price_decimals,
+            maker_api_key = maker_lane.api_key_index,
+            cancel_api_key = cancel_lane.as_ref().map(|l| l.api_key_index),
+            taker_api_key = taker_lane.as_ref().map(|l| l.api_key_index),
+            "Lighter market and signing lanes initialized"
         );
 
         let counter_start = SystemTime::now()
@@ -496,20 +884,18 @@ impl LighterTrading {
         let price_multiplier = 10f64.powi(price_decimals as i32);
 
         Ok(Self {
-            signer,
+            maker_lane,
+            cancel_lane,
+            taker_lane,
             client,
             base_url,
             send_tx_url,
             send_tx_batch_url,
             account_index,
-            api_key_index,
             market_id,
             market_symbol,
             size_multiplier,
             price_multiplier,
-            submission_lock: TokioMutex::new(()),
-            nonce: AtomicI64::new(0),
-            nonce_init: TokioMutex::new(false),
             client_order_counter: AtomicI64::new(counter_start),
             order_tracker: None,
             limit_order_type: OrderType::Limit,
@@ -596,44 +982,36 @@ impl LighterTrading {
         self.quote_expiry = Some(Duration::from_secs(600));
     }
 
-    // ─── Nonce 管理 ────────────────────────────────────────────────────────
+    // ─── Lane Routing & Nonce 管理 ──────────────────────────────────────────
 
-    /// 从服务器获取 nonce
-    async fn fetch_nonce(&self) -> Result<i64> {
-        let url = format!(
-            "{}/api/v1/nextNonce?account_index={}&api_key_index={}",
-            self.base_url, self.account_index, self.api_key_index
-        );
-        let resp = self.client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("Failed to fetch nonce: HTTP {}", resp.status());
-        }
-        let nonce_resp: NonceResponse = resp.json().await?;
-        anyhow::ensure!(
-            nonce_resp.nonce >= 0 && nonce_resp.nonce <= i64::MAX - 1024,
-            "Invalid server nonce"
-        );
-        Ok(nonce_resp.nonce)
-    }
-
-    /// 获取当前 nonce（不递增）
-    async fn get_nonce(&self) -> Result<i64> {
-        {
-            let mut initialized = self.nonce_init.lock().await;
-            if !*initialized {
-                let server_nonce = self.fetch_nonce().await?;
-                self.nonce.store(server_nonce, Ordering::Release);
-                *initialized = true;
-                tracing::info!("Nonce initialized from server: {}", server_nonce);
-                return Ok(server_nonce);
+    fn lane_for_order(&self, order_type: OrderType) -> &SigningLane {
+        match order_type {
+            OrderType::Ioc | OrderType::Market => {
+                self.taker_lane.as_ref().unwrap_or(&self.maker_lane)
             }
+            OrderType::Limit | OrderType::PostOnly => &self.maker_lane,
         }
-        Ok(self.nonce.load(Ordering::SeqCst))
     }
 
-    /// 递增 nonce（仅在交易成功提交后调用）
-    fn increment_nonce(&self) {
-        self.nonce.fetch_add(1, Ordering::SeqCst);
+    fn cancel_lane(&self) -> &SigningLane {
+        self.cancel_lane.as_ref().unwrap_or(&self.maker_lane)
+    }
+
+    fn lane_for_batch(&self, actions: &[BatchAction]) -> &SigningLane {
+        if actions.iter().all(|a| matches!(a, BatchAction::Cancel(_))) {
+            return self.cancel_lane();
+        }
+        let any_taker = actions.iter().any(|a| {
+            matches!(
+                a,
+                BatchAction::Place(p)
+                    if matches!(p.order_type, OrderType::Ioc | OrderType::Market)
+            )
+        });
+        if any_taker {
+            return self.lane_for_order(OrderType::Ioc);
+        }
+        &self.maker_lane
     }
 
     /// 生成唯一 client_order_index
@@ -656,30 +1034,32 @@ impl LighterTrading {
             .as_secs() as i64
             + 600;
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        self.signer
+        self.maker_lane
+            .signer
             .create_auth_token(deadline_secs)
             .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))
     }
 
     // ─── 签名 + 发送 ─────────────────────────────────────────────────────
 
-    /// 签名一笔订单（使用指定的 nonce）
-    async fn sign_order_with_nonce(
+    /// 签名一笔订单（在指定的 signing lane 上使用指定的 nonce）
+    async fn sign_order_with_nonce_on_lane(
         &self,
-        side: Side,
-        price: f64,
-        size: f64,
-        order_type: OrderType,
-        reduce_only: bool,
+        lane: &SigningLane,
+        params: &OrderParams,
         nonce: i64,
     ) -> Result<(u8, String, String, i64)> {
         let client_order_index = self.next_client_order_index();
 
         // 使用 round() 防止浮点截断: 2085.87 * 100 = 208587.0 而非 208586
-        let (price_int, base_amount) =
-            encode_order(price, size, self.price_multiplier, self.size_multiplier)?;
+        let (price_int, base_amount) = encode_order(
+            params.price,
+            params.size,
+            self.price_multiplier,
+            self.size_multiplier,
+        )?;
 
-        let (ot, tif, mut expiry) = order_wire_policy(order_type);
+        let (ot, tif, mut expiry) = order_wire_policy(params.order_type);
         if expiry < 0
             && let Some(ttl) = self.quote_expiry
         {
@@ -688,10 +1068,10 @@ impl LighterTrading {
         }
 
         let market_id = self.market_id;
-        let is_ask = side == Side::Sell;
+        let is_ask = params.side == Side::Sell;
 
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        let signed = self
+        let signed = lane
             .signer
             .sign_create_order(
                 market_id,
@@ -701,7 +1081,7 @@ impl LighterTrading {
                 is_ask,
                 ot,
                 tif,
-                reduce_only,
+                params.reduce_only,
                 0u32,
                 expiry,
                 nonce,
@@ -709,6 +1089,7 @@ impl LighterTrading {
             .map_err(|e| anyhow::anyhow!("Sign failed: {}", e))?;
 
         tracing::debug!(
+            api_key_index = lane.api_key_index,
             "Signed: tx_type={} price_int={} base_amount={} is_ask={} nonce={}",
             signed.tx_type,
             price_int,
@@ -726,100 +1107,23 @@ impl LighterTrading {
     }
 
     /// 签名一笔订单，返回 (tx_type, tx_info, tx_hash, client_order_index)
-    /// Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-    async fn sign_order(
+    async fn sign_order_on_lane(
         &self,
-        side: Side,
-        price: f64,
-        size: f64,
-        order_type: OrderType,
-        reduce_only: bool,
+        lane: &SigningLane,
+        params: &OrderParams,
     ) -> Result<(u8, String, String, i64)> {
-        let nonce = self.get_nonce().await?;
-        self.sign_order_with_nonce(side, price, size, order_type, reduce_only, nonce)
+        let nonce = lane
+            .get_nonce(&self.client, &self.base_url, self.account_index)
+            .await?;
+        self.sign_order_with_nonce_on_lane(lane, params, nonce)
             .await
     }
 
-    /// 发送单笔交易到 sendTx
+    #[cfg(test)]
     async fn send_tx(&self, tx_type: u8, tx_info: String) -> Result<SendTxResponse> {
-        let form = reqwest::multipart::Form::new()
-            .text("tx_type", tx_type.to_string())
-            .text("tx_info", tx_info);
-
-        // Invalidate before the request: cancellation/timeouts can leave a consumed
-        // nonce even when no response reaches this process.
-        *self.nonce_init.lock().await = false;
-        let resp = self
-            .client
-            .post(&self.send_tx_url)
-            .multipart(form)
-            .send()
+        self.maker_lane
+            .send_tx(&self.client, &self.send_tx_url, tx_type, tx_info)
             .await
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        validate_submission_response(status, &body)?;
-        let parsed: SendTxResponse = serde_json::from_str(&body)
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        if parsed.tx_hash.as_ref().is_none_or(String::is_empty) {
-            return Err(
-                TradingError::SubmissionUncertain("Missing transaction hash".into()).into(),
-            );
-        }
-        self.increment_nonce();
-        *self.nonce_init.lock().await = true;
-
-        Ok(parsed)
-    }
-
-    /// 发送批量交易到 sendTxBatch
-    async fn send_tx_batch(&self, txs: &[(u8, String)]) -> Result<SendTxBatchResponse> {
-        // Python SDK: json.dumps([14, 14]) and json.dumps(["{...}", "{...}"])
-        let tx_types_vec: Vec<u8> = txs.iter().map(|(t, _)| *t).collect();
-        let tx_infos_vec: Vec<&str> = txs.iter().map(|(_, info)| info.as_str()).collect();
-
-        let tx_types_json = serde_json::to_string(&tx_types_vec)?;
-        let tx_infos_json = serde_json::to_string(&tx_infos_vec)?;
-
-        let form = reqwest::multipart::Form::new()
-            .text("tx_types", tx_types_json)
-            .text("tx_infos", tx_infos_json);
-
-        // Invalidate before the request: cancellation/timeouts can leave a consumed
-        // nonce even when no response reaches this process.
-        *self.nonce_init.lock().await = false;
-        let resp = self
-            .client
-            .post(&self.send_tx_batch_url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        validate_submission_response(status, &body)?;
-        let parsed: SendTxBatchResponse = serde_json::from_str(&body)
-            .map_err(|e| TradingError::SubmissionUncertain(e.to_string()))?;
-        if parsed
-            .tx_hash
-            .as_ref()
-            .is_none_or(|hashes| hashes.len() != txs.len() || hashes.iter().any(String::is_empty))
-        {
-            return Err(TradingError::SubmissionUncertain(
-                "Incomplete batch acknowledgement".into(),
-            )
-            .into());
-        }
-        self.nonce.fetch_add(txs.len() as i64, Ordering::SeqCst);
-        *self.nonce_init.lock().await = true;
-
-        Ok(parsed)
     }
 
     // ─── 公开交易接口 ─────────────────────────────────────────────────────
@@ -862,20 +1166,14 @@ impl LighterTrading {
         Ok(())
     }
 
-    /// 通用下单 (v5.0.0: per-order tracking)
+    /// 通用下单 (v5.0.0: per-order tracking + multi-key lane isolation)
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
-        let _submission = self.submission_lock.lock().await;
         let params = self.normalize_order(params)?;
+        let lane = self.lane_for_order(params.order_type);
+        let _submission = lane.submission_lock.lock().await;
         self.ensure_can_place(&params)?;
-        let (tx_type, tx_info, tx_hash, client_order_index) = self
-            .sign_order(
-                params.side,
-                params.price,
-                params.size,
-                params.order_type,
-                params.reduce_only,
-            )
-            .await?;
+        let (tx_type, tx_info, tx_hash, client_order_index) =
+            self.sign_order_on_lane(lane, &params).await?;
         self.ensure_can_place(&params)?;
 
         // Optimistic accounting: register per-order BEFORE API call
@@ -888,10 +1186,17 @@ impl LighterTrading {
                 tracker.start_tracking(client_order_index, tracker_side, params.price, params.size),
                 "Tracker refused order reservation"
             );
+            // Re-verify reconciliation state after reserving so concurrent lane
+            // failures cannot slip new exposure across the lock boundary.
+            if let Err(err) = self.ensure_can_place(&params) {
+                tracker.mark_failed(client_order_index);
+                return Err(err);
+            }
             tracker.mark_submission_uncertain(client_order_index);
         }
 
         tracing::info!(
+            api_key_index = lane.api_key_index,
             "Signed {} order: price={} size={} type={:?} tx_hash={} coi={}",
             params.side,
             params.price,
@@ -902,7 +1207,10 @@ impl LighterTrading {
         );
 
         let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
-        match self.send_tx(tx_type, tx_info).await {
+        match lane
+            .send_tx(&self.client, &self.send_tx_url, tx_type, tx_info)
+            .await
+        {
             Ok(_) => {
                 guard.disarm();
                 tracing::info!("Order submitted: tx_hash={}", tx_hash);
@@ -953,7 +1261,8 @@ impl LighterTrading {
         &self,
         params: BatchOrderParams,
     ) -> Result<crate::exchange::BatchOrderResult> {
-        let _submission = self.submission_lock.lock().await;
+        let lane = self.lane_for_order(self.limit_order_type);
+        let _submission = lane.submission_lock.lock().await;
         self.ensure_open_risk_allowed()?;
         let bid = self.normalize_order(OrderParams {
             side: Side::Buy,
@@ -976,34 +1285,23 @@ impl LighterTrading {
             ask_size: ask.size,
         };
         // Get base nonce for batch
-        let base_nonce = self.get_nonce().await?;
+        let base_nonce = lane
+            .get_nonce(&self.client, &self.base_url, self.account_index)
+            .await?;
 
         // 签名买单 (nonce = base_nonce)
         let (bid_type, bid_info, _bid_hash, bid_coi) = self
-            .sign_order_with_nonce(
-                Side::Buy,
-                params.bid_price,
-                params.bid_size,
-                self.limit_order_type,
-                false,
-                base_nonce,
-            )
+            .sign_order_with_nonce_on_lane(lane, &bid, base_nonce)
             .await?;
 
         // 签名卖单 (nonce = base_nonce + 1)
         let (ask_type, ask_info, _ask_hash, ask_coi) = self
-            .sign_order_with_nonce(
-                Side::Sell,
-                params.ask_price,
-                params.ask_size,
-                self.limit_order_type,
-                false,
-                base_nonce + 1,
-            )
+            .sign_order_with_nonce_on_lane(lane, &ask, base_nonce + 1)
             .await?;
         self.ensure_open_risk_allowed()?;
 
         tracing::info!(
+            api_key_index = lane.api_key_index,
             "Signed batch: bid={} @ {} x {} / ask={} @ {} x {}",
             bid_coi,
             params.bid_price,
@@ -1033,6 +1331,11 @@ impl LighterTrading {
                 tracker.mark_failed(bid_coi);
                 anyhow::bail!("Tracker refused ask reservation");
             }
+            if let Err(err) = self.ensure_open_risk_allowed() {
+                tracker.mark_failed(bid_coi);
+                tracker.mark_failed(ask_coi);
+                return Err(err);
+            }
         }
 
         if let Some(tracker) = &self.order_tracker {
@@ -1040,8 +1343,12 @@ impl LighterTrading {
             tracker.mark_submission_uncertain(ask_coi);
         }
         let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
-        match self
-            .send_tx_batch(&[(bid_type, bid_info), (ask_type, ask_info)])
+        match lane
+            .send_tx_batch(
+                &self.client,
+                &self.send_tx_batch_url,
+                &[(bid_type, bid_info), (ask_type, ask_info)],
+            )
             .await
         {
             Ok(batch_resp) => {
@@ -1056,7 +1363,6 @@ impl LighterTrading {
                 })
             }
             Err(e) => {
-                // Rollback: mark both orders as failed
                 // A batch may have been partially accepted. Keep every reservation
                 // until authoritative order events/reconciliation resolve it.
                 Err(e)
@@ -1064,9 +1370,8 @@ impl LighterTrading {
         }
     }
 
-    /// 核心：通用批量执行（支持混合 挂单/撤单），并在单一 RTT 内提交
+    /// 核心：通用批量执行（支持混合 挂单/撤单，纯撤单自动路由至 cancel_lane）
     pub async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
-        let _submission = self.submission_lock.lock().await;
         if actions.is_empty() {
             return Ok(BatchResult {
                 tx_hashes: vec![],
@@ -1078,6 +1383,8 @@ impl LighterTrading {
             actions.len() <= 50,
             "At most 50 actions per transaction batch"
         );
+        let lane = self.lane_for_batch(&actions);
+        let _submission = lane.submission_lock.lock().await;
         let mut txs = Vec::with_capacity(actions.len());
         let mut place_results = Vec::new();
         let market_id = self.market_id;
@@ -1086,7 +1393,9 @@ impl LighterTrading {
             .any(|action| matches!(action, BatchAction::Place(order) if !order.reduce_only));
 
         // 获取起始 Nonce
-        let base_nonce = self.get_nonce().await?;
+        let base_nonce = lane
+            .get_nonce(&self.client, &self.base_url, self.account_index)
+            .await?;
 
         for (i, action) in actions.into_iter().enumerate() {
             let nonce = base_nonce + (i as i64);
@@ -1095,14 +1404,7 @@ impl LighterTrading {
                     let params = self.normalize_order(params)?;
                     self.ensure_can_place(&params)?;
                     let (tx_type, tx_info, _hash, coi) = self
-                        .sign_order_with_nonce(
-                            params.side,
-                            params.price,
-                            params.size,
-                            params.order_type,
-                            params.reduce_only,
-                            nonce,
-                        )
+                        .sign_order_with_nonce_on_lane(lane, &params, nonce)
                         .await?;
 
                     txs.push((tx_type, tx_info));
@@ -1114,7 +1416,7 @@ impl LighterTrading {
                     });
                 }
                 BatchAction::Cancel(order_index) => {
-                    let signed = self
+                    let signed = lane
                         .signer
                         .sign_cancel_order(market_id, order_index, nonce)
                         .map_err(|e| anyhow::anyhow!("Sign batch cancel failed: {}", e))?;
@@ -1130,7 +1432,10 @@ impl LighterTrading {
             cancels,
             opens_risk,
             |_, _| std::future::ready(Ok(())),
-            |txs| async move { self.send_tx_batch(&txs).await },
+            |txs| async move {
+                lane.send_tx_batch(&self.client, &self.send_tx_batch_url, &txs)
+                    .await
+            },
         )
         .await
     }
@@ -1180,6 +1485,12 @@ impl LighterTrading {
                 }
                 tracker.mark_submission_uncertain(order.client_order_index);
             }
+            if opens_risk && let Err(err) = self.ensure_open_risk_allowed() {
+                for order in &place_results {
+                    tracker.mark_failed(order.client_order_index);
+                }
+                return Err(err);
+            }
         }
 
         let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
@@ -1215,25 +1526,61 @@ impl LighterTrading {
 
     // ─── 撤单 ────────────────────────────────────────────────────────────
 
-    /// 撤销单笔订单
+    /// 撤销单笔订单（支持 cancel_lane 独立队列与 InvalidNonce 单次自愈重同步）
     pub async fn cancel_order(&self, order_index: i64) -> Result<()> {
-        let _submission = self.submission_lock.lock().await;
-        let nonce = self.get_nonce().await?;
+        let lane = self.cancel_lane();
+        let _submission = lane.submission_lock.lock().await;
         let market_id = self.market_id;
-        // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        let signed = self
-            .signer
-            .sign_cancel_order(market_id, order_index, nonce)
-            .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
 
-        let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
-        self.send_tx(signed.tx_type, signed.tx_info).await?;
-        guard.disarm();
-        tracing::info!(
-            "Submitted cancellation for order: order_index={}",
-            order_index
-        );
-        Ok(())
+        for attempt in 0..2 {
+            let nonce = lane
+                .get_nonce(&self.client, &self.base_url, self.account_index)
+                .await?;
+            let signed = lane
+                .signer
+                .sign_cancel_order(market_id, order_index, nonce)
+                .map_err(|e| anyhow::anyhow!("Sign cancel failed: {}", e))?;
+
+            let mut guard = SubmissionGuard::new(self.order_tracker.as_deref());
+            match lane
+                .send_tx(
+                    &self.client,
+                    &self.send_tx_url,
+                    signed.tx_type,
+                    signed.tx_info,
+                )
+                .await
+            {
+                Ok(_) => {
+                    guard.disarm();
+                    tracing::info!(
+                        api_key_index = lane.api_key_index,
+                        order_index,
+                        "Submitted cancellation for order"
+                    );
+                    return Ok(());
+                }
+                Err(err) if attempt == 0 && is_invalid_nonce_rejection(&err) => {
+                    // Definitive 21104 InvalidNonce: nothing executed and `send_tx`
+                    // left `nonce_init = false`, so the retry fetches `nextNonce`.
+                    guard.disarm();
+                    tracing::warn!(
+                        api_key_index = lane.api_key_index,
+                        order_index,
+                        stale_nonce = nonce,
+                        "Cancel rejected with InvalidNonce; resyncing nextNonce once"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    if !is_uncertain(&err) {
+                        guard.disarm();
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!("cancel_order loop returns within 2 attempts")
     }
 
     /// 撤销所有活跃订单 (Batched for speed)
@@ -1534,26 +1881,87 @@ fn is_uncertain(error: &anyhow::Error) -> bool {
     )
 }
 
-fn validate_submission_response(status: reqwest::StatusCode, body: &str) -> Result<()> {
+#[derive(Debug)]
+struct LighterRejectedSubmission {
+    code: i32,
+    error_code: LighterErrorCode,
+    message: Option<String>,
+}
+
+impl std::fmt::Display for LighterRejectedSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Lighter rejected submission code={}: {}",
+            self.code,
+            self.message.as_deref().unwrap_or("unknown")
+        )
+    }
+}
+
+impl std::error::Error for LighterRejectedSubmission {}
+
+enum SubmissionFailure {
+    Uncertain(String),
+    Margin,
+    Rejected(LighterRejectedSubmission),
+}
+
+impl SubmissionFailure {
+    fn preserves_unconsumed_single_tx_nonce(&self) -> bool {
+        match self {
+            Self::Uncertain(_) => false,
+            Self::Margin => true,
+            Self::Rejected(rej) => rej.error_code.preserves_unconsumed_single_tx_nonce(),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Uncertain(msg) => TradingError::SubmissionUncertain(msg).into(),
+            Self::Margin => TradingError::InsufficientMargin.into(),
+            Self::Rejected(rej) => rej.into(),
+        }
+    }
+}
+
+fn is_invalid_nonce_rejection(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<LighterRejectedSubmission>(),
+        Some(rej) if rej.error_code == LighterErrorCode::InvalidNonce
+    )
+}
+
+fn classify_submission_response(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> std::result::Result<(), SubmissionFailure> {
     if status.is_server_error() {
-        return Err(TradingError::SubmissionUncertain(format!("HTTP {status}")).into());
+        return Err(SubmissionFailure::Uncertain(format!("HTTP {status}")));
     }
     let response: LighterErrorResponse = serde_json::from_str(body)
-        .map_err(|e| TradingError::SubmissionUncertain(format!("HTTP {status}: {e}")))?;
+        .map_err(|e| SubmissionFailure::Uncertain(format!("HTTP {status}: {e}")))?;
     if response.code == 200 && status.is_success() {
         return Ok(());
     }
     if response.code == 200 {
-        return Err(TradingError::SubmissionUncertain(format!("Conflicting HTTP {status}")).into());
+        return Err(SubmissionFailure::Uncertain(format!(
+            "Conflicting HTTP {status}"
+        )));
     }
-    if response.error_code().is_margin_error() {
-        return Err(TradingError::InsufficientMargin.into());
+    let error_code = response.error_code();
+    if error_code.is_margin_error() {
+        return Err(SubmissionFailure::Margin);
     }
-    anyhow::bail!(
-        "Lighter rejected submission code={}: {}",
-        response.code,
-        response.message.as_deref().unwrap_or("unknown")
-    )
+    Err(SubmissionFailure::Rejected(LighterRejectedSubmission {
+        code: response.code,
+        error_code,
+        message: response.message,
+    }))
+}
+
+fn validate_submission_response(status: reqwest::StatusCode, body: &str) -> Result<()> {
+    classify_submission_response(status, body).map_err(SubmissionFailure::into_error)
 }
 
 /// Exactly one account with `index`; an empty, foreign or duplicated list
@@ -1825,14 +2233,426 @@ mod tests {
         assert!(tracker.start_tracking(42, TrackerSide::Buy, 100.0, 1.0));
         tracker.mark_submission_uncertain(42);
         let mut trading = LighterTrading::offline_test_client("http://127.0.0.1:1");
-        trading.nonce.store(9, Ordering::Release);
-        *trading.nonce_init.lock().await = true;
+        trading.maker_lane.nonce.store(9, Ordering::Release);
+        *trading.maker_lane.nonce_init.lock().await = true;
         trading.set_order_tracker(Arc::clone(&tracker));
         let error = trading.send_tx(14, "{}".into()).await.err().unwrap();
         assert!(is_uncertain(&error));
-        assert!(!*trading.nonce_init.lock().await);
-        assert_eq!(trading.nonce.load(Ordering::Acquire), 9);
+        assert!(!*trading.maker_lane.nonce_init.lock().await);
+        assert_eq!(trading.maker_lane.nonce.load(Ordering::Acquire), 9);
         assert_eq!(tracker.worst_case_long(), 1.0);
+    }
+
+    #[test]
+    fn robinhood_domain_resolves_466324_and_rejects_reserved_api_key_157() {
+        use crate::exchanges::hyperliquid::Network;
+        let hex_a = "01".repeat(40);
+        let hex_b = "02".repeat(40);
+        let hex_c = "03".repeat(40);
+        let creds = LighterCredentials::from_env(|key| match key {
+            "LIGHTER_PRIVATE_KEY" => Some(hex_a.clone()),
+            "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+            "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+            "LIGHTER_CHAIN_ID" => Some("466324".into()),
+            "LIGHTER_BASE_URL" => Some("https://api.rh.lighter.xyz/".into()),
+            "LIGHTER_CANCEL_PRIVATE_KEY" => Some(hex_b.clone()),
+            "LIGHTER_CANCEL_API_KEY_INDEX" => Some("8".into()),
+            "LIGHTER_TAKER_PRIVATE_KEY" => Some(hex_c.clone()),
+            "LIGHTER_TAKER_API_KEY_INDEX" => Some("9".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(creds.domain().unwrap(), LighterDomain::RobinhoodMainnet);
+        assert_eq!(creds.network().unwrap(), Network::Mainnet);
+        assert_eq!(LighterDomain::RobinhoodMainnet.lock_slug(), "Robinhood");
+        assert_eq!(
+            LighterDomain::RobinhoodMainnet.telemetry_exchange(),
+            "lighter_robinhood"
+        );
+        assert!(creds.has_cancel_lane() && creds.has_taker_lane());
+
+        // Reserved key 157 on Robinhood Chain (466324) must fail closed on every lane.
+        for (idx_key, idx_val) in [
+            ("LIGHTER_API_KEY_INDEX", "157"),
+            ("LIGHTER_CANCEL_API_KEY_INDEX", "157"),
+            ("LIGHTER_TAKER_API_KEY_INDEX", "157"),
+        ] {
+            let err = LighterCredentials::from_env(|key| match key {
+                k if k == idx_key => Some(idx_val.into()),
+                "LIGHTER_PRIVATE_KEY" => Some(hex_a.clone()),
+                "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+                "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+                "LIGHTER_CHAIN_ID" => Some("466324".into()),
+                "LIGHTER_CANCEL_PRIVATE_KEY" => Some(hex_b.clone()),
+                "LIGHTER_CANCEL_API_KEY_INDEX" => Some("8".into()),
+                "LIGHTER_TAKER_PRIVATE_KEY" => Some(hex_c.clone()),
+                "LIGHTER_TAKER_API_KEY_INDEX" => Some("9".into()),
+                _ => None,
+            })
+            .err()
+            .expect("reserved key 157 must fail");
+            assert!(err.to_string().contains("157"), "{err}");
+        }
+
+        // Duplicate API key index across lanes must fail closed.
+        let dup = LighterCredentials::from_env(|key| match key {
+            "LIGHTER_PRIVATE_KEY" => Some(hex_a.clone()),
+            "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+            "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+            "LIGHTER_CANCEL_PRIVATE_KEY" => Some(hex_b.clone()),
+            "LIGHTER_CANCEL_API_KEY_INDEX" => Some("7".into()),
+            _ => None,
+        });
+        assert!(dup.is_err());
+
+        // Cross-domain URL / chain_id mismatch must fail closed.
+        let mismatch = LighterCredentials::from_env(|key| match key {
+            "LIGHTER_PRIVATE_KEY" => Some(hex_a.clone()),
+            "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+            "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+            "LIGHTER_CHAIN_ID" => Some("466324".into()),
+            "LIGHTER_BASE_URL" => Some("https://mainnet.zklighter.elliot.ai".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(mismatch.domain().is_err());
+    }
+
+    #[tokio::test]
+    async fn pre_application_rejection_preserves_cached_nonce_while_invalid_nonce_resyncs() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let nonce_fetches = Arc::new(AtomicUsize::new(0));
+        let fetches = Arc::clone(&nonce_fetches);
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::clone(&send_calls);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let fetches = Arc::clone(&fetches);
+                let sends = Arc::clone(&sends);
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut req_line = String::new();
+                    socket.read_line(&mut req_line).await.unwrap();
+                    let path = req_line.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut len = 0usize;
+                    loop {
+                        let mut hdr = String::new();
+                        socket.read_line(&mut hdr).await.unwrap();
+                        if hdr.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = hdr.split_once(':')
+                            && k.eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let body_str = String::from_utf8_lossy(&body);
+
+                    let (status, resp) = match path.split('?').next().unwrap() {
+                        "/api/v1/nextNonce" => {
+                            let n = fetches.fetch_add(1, Ordering::AcqRel);
+                            let server_nonce = if n == 0 { 50 } else { 88 };
+                            (200, serde_json::json!({"nonce": server_nonce}).to_string())
+                        }
+                        "/api/v1/sendTx" => {
+                            let step = sends.fetch_add(1, Ordering::AcqRel);
+                            let tx_line =
+                                body_str.lines().find(|line| line.starts_with('{')).unwrap();
+                            let tx: serde_json::Value = serde_json::from_str(tx_line).unwrap();
+                            match step {
+                                // Step 0: InsufficientMargin (21301) at nonce 50 -> unconsumed!
+                                0 => {
+                                    assert_eq!(tx["Nonce"], 50);
+                                    (
+                                        200,
+                                        serde_json::json!({"code": 21301, "message": "margin"})
+                                            .to_string(),
+                                    )
+                                }
+                                // Step 1: RateLimited (23000) HTTP 429 at SAME nonce 50 -> unconsumed!
+                                1 => {
+                                    assert_eq!(tx["Nonce"], 50);
+                                    (
+                                        429,
+                                        serde_json::json!({"code": 23000, "message": "rate limit"})
+                                            .to_string(),
+                                    )
+                                }
+                                // Step 2: Succeeds at SAME cached nonce 50 without any extra nextNonce GET!
+                                2 => {
+                                    assert_eq!(tx["Nonce"], 50);
+                                    (
+                                        200,
+                                        serde_json::json!({"code": 200, "tx_hash": "ok-50"})
+                                            .to_string(),
+                                    )
+                                }
+                                // Step 3: InvalidNonce (21104) at nonce 51 -> invalidates cache!
+                                3 => {
+                                    assert_eq!(tx["Nonce"], 51);
+                                    (
+                                        200,
+                                        serde_json::json!({"code": 21104, "message": "bad nonce"})
+                                            .to_string(),
+                                    )
+                                }
+                                // Step 4: Resynced via second nextNonce GET -> nonce 88!
+                                4 => {
+                                    assert_eq!(tx["Nonce"], 88);
+                                    (
+                                        200,
+                                        serde_json::json!({"code": 200, "tx_hash": "ok-88"})
+                                            .to_string(),
+                                    )
+                                }
+                                other => panic!("unexpected send step {other}"),
+                            }
+                        }
+                        other => panic!("unexpected endpoint {other}"),
+                    };
+                    socket
+                        .get_mut()
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                                resp.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let mut trading = LighterTrading::mock_multi_lane_test_client(&url, 10, 7, None, None);
+        let tracker = Arc::new(OrderTracker::new());
+        trading.set_order_tracker(Arc::clone(&tracker));
+
+        let order = OrderParams {
+            size: 0.01,
+            price: 2000.0,
+            side: Side::Buy,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        };
+        // 1. Margin error releases reservation AND preserves cached nonce 50.
+        let e1 = trading.place_order(order.clone()).await.unwrap_err();
+        assert!(matches!(
+            e1.downcast_ref::<TradingError>(),
+            Some(TradingError::InsufficientMargin)
+        ));
+        assert_eq!(nonce_fetches.load(Ordering::Acquire), 1);
+        assert!(!tracker.needs_reconciliation());
+        assert_eq!(tracker.worst_case_long(), 0.0);
+
+        // 2. Rate-limit error preserves cached nonce 50 with zero extra nextNonce GETs.
+        assert!(trading.place_order(order.clone()).await.is_err());
+        assert_eq!(nonce_fetches.load(Ordering::Acquire), 1);
+
+        // 3. Next order succeeds immediately at cached nonce 50 (still only 1 nextNonce GET!).
+        let ok1 = trading.place_order(order.clone()).await.unwrap();
+        assert_eq!(nonce_fetches.load(Ordering::Acquire), 1);
+        tracker.mark_failed(ok1.client_order_index);
+
+        // 4. InvalidNonce invalidates local cache, so order #5 fetches nextNonce=88 and succeeds.
+        assert!(trading.place_order(order.clone()).await.is_err());
+        assert!(!*trading.maker_lane.nonce_init.lock().await);
+        let ok2 = trading.place_order(order).await.unwrap();
+        assert_eq!(nonce_fetches.load(Ordering::Acquire), 2);
+        assert_eq!(trading.maker_lane.nonce.load(Ordering::Acquire), 89);
+        tracker.mark_failed(ok2.client_order_index);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_key_lanes_isolate_taker_speed_bump_and_auto_heal_cancel_nonce() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let cancel_attempts = Arc::new(AtomicUsize::new(0));
+        let cancels = Arc::clone(&cancel_attempts);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let cancels = Arc::clone(&cancels);
+                tokio::spawn(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut req_line = String::new();
+                    socket.read_line(&mut req_line).await.unwrap();
+                    let path = req_line.split_whitespace().nth(1).unwrap().to_owned();
+                    let mut len = 0usize;
+                    loop {
+                        let mut hdr = String::new();
+                        socket.read_line(&mut hdr).await.unwrap();
+                        if hdr.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = hdr.split_once(':')
+                            && k.eq_ignore_ascii_case("content-length")
+                        {
+                            len = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let body_str = String::from_utf8_lossy(&body).into_owned();
+
+                    let resp = match path.split('?').next().unwrap() {
+                        "/api/v1/nextNonce" => {
+                            let nonce = if path.contains("api_key_index=7") {
+                                100
+                            } else if path.contains("api_key_index=8") {
+                                if cancels.load(Ordering::Acquire) == 0 {
+                                    200
+                                } else {
+                                    205
+                                }
+                            } else if path.contains("api_key_index=9") {
+                                300
+                            } else {
+                                panic!("unexpected nonce query: {path}");
+                            };
+                            serde_json::json!({"nonce": nonce}).to_string()
+                        }
+                        "/api/v1/sendTx" => {
+                            let tx_line =
+                                body_str.lines().find(|line| line.starts_with('{')).unwrap();
+                            let tx: serde_json::Value = serde_json::from_str(tx_line).unwrap();
+                            let key = tx["ApiKeyIndex"].as_i64().unwrap();
+                            if key == 9 {
+                                // Simulate Lighter's 200ms taker speed-bump on api_key_index=9.
+                                assert_eq!(tx["Nonce"], 300);
+                                assert_eq!(tx["TimeInForce"], 0);
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                serde_json::json!({"code": 200, "tx_hash": "taker-300"}).to_string()
+                            } else if key == 7 {
+                                assert_eq!(tx["Nonce"], 100);
+                                assert_eq!(tx["TimeInForce"], 2);
+                                serde_json::json!({"code": 200, "tx_hash": "maker-100"}).to_string()
+                            } else if key == 8 {
+                                let attempt = cancels.fetch_add(1, Ordering::AcqRel);
+                                if attempt == 0 {
+                                    assert_eq!(tx["Nonce"], 200);
+                                    serde_json::json!({"code": 21104, "message": "drifted"})
+                                        .to_string()
+                                } else {
+                                    assert_eq!(tx["Nonce"], 205);
+                                    serde_json::json!({"code": 200, "tx_hash": "cancel-205"})
+                                        .to_string()
+                                }
+                            } else {
+                                panic!("unexpected api_key_index {key}");
+                            }
+                        }
+                        "/api/v1/sendTxBatch" => {
+                            // Pure cancel batch must route to cancel_lane (api_key_index=8, nonce=206).
+                            assert!(body_str.contains(r#"\"ApiKeyIndex\":8"#), "{body_str}");
+                            assert!(body_str.contains(r#"\"Nonce\":206"#), "{body_str}");
+                            serde_json::json!({"code": 200, "tx_hash": ["batch-cancel-206"]})
+                                .to_string()
+                        }
+                        other => panic!("unexpected endpoint {other}"),
+                    };
+                    socket
+                        .get_mut()
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                                resp.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let trading = Arc::new(LighterTrading::mock_multi_lane_test_client(
+            &url,
+            10,
+            7,
+            Some(8),
+            Some(9),
+        ));
+
+        let start = Instant::now();
+        let t_taker = {
+            let trading = Arc::clone(&trading);
+            tokio::spawn(async move {
+                trading
+                    .place_order(OrderParams {
+                        size: 0.01,
+                        price: 2010.0,
+                        side: Side::Buy,
+                        order_type: OrderType::Ioc,
+                        reduce_only: true,
+                    })
+                    .await
+                    .unwrap();
+                start.elapsed()
+            })
+        };
+        // Give taker IOC 15ms head-start so it holds taker_lane's submission_lock in-flight.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let maker_start = Instant::now();
+        trading
+            .place_order(OrderParams {
+                size: 0.01,
+                price: 1990.0,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            })
+            .await
+            .unwrap();
+        let maker_elapsed = maker_start.elapsed();
+
+        let cancel_start = Instant::now();
+        // First cancel attempt gets 21104 at nonce 200, auto-resyncs to 205, and succeeds!
+        trading.cancel_order(777).await.unwrap();
+        // Pure-cancel batch also routes to cancel_lane (nonce 206) without waiting on taker!
+        trading
+            .execute_batch(vec![BatchAction::Cancel(778)])
+            .await
+            .unwrap();
+        let cancel_elapsed = cancel_start.elapsed();
+
+        let taker_elapsed = t_taker.await.unwrap();
+        assert!(
+            taker_elapsed >= Duration::from_millis(190),
+            "taker={taker_elapsed:?}"
+        );
+        assert!(
+            maker_elapsed < Duration::from_millis(120),
+            "maker blocked by taker speed-bump: {maker_elapsed:?}"
+        );
+        assert!(
+            cancel_elapsed < Duration::from_millis(120),
+            "cancel blocked by taker speed-bump: {cancel_elapsed:?}"
+        );
+        assert_eq!(cancel_attempts.load(Ordering::Acquire), 2);
+        server.abort();
     }
 
     #[test]
@@ -1911,13 +2731,17 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn native_signer_preserves_mainnet_and_testnet_market_ids_offline() {
-        for (chain, account, markets) in [(304, 1001, [0, 1]), (300, 1002, [4095, 4096])] {
+    fn native_signer_preserves_mainnet_robinhood_and_testnet_market_ids_offline() {
+        for (chain, account, key_idx, markets) in [
+            (304, 1001, 7, [0, 1]),
+            (466324, 1003, 8, [0, 104]),
+            (300, 1002, 9, [4095, 4096]),
+        ] {
             let signer = crate::lighter_ffi::LighterSigner::new(
                 "http://127.0.0.1:1",
                 &"01".repeat(40),
                 chain,
-                7,
+                key_idx,
                 account,
             )
             .unwrap();
@@ -1934,7 +2758,7 @@ mod tests {
                 assert_eq!(tx["OrderExpiry"], 0);
                 assert_eq!(tx["ReduceOnly"], 1);
                 assert_eq!(tx["AccountIndex"], account);
-                assert_eq!(tx["ApiKeyIndex"], 7);
+                assert_eq!(tx["ApiKeyIndex"], key_idx);
                 assert_eq!(tx["Nonce"], 19);
 
                 let order_index = (1i64 << 48) + 7;

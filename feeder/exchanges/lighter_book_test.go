@@ -75,6 +75,43 @@ func TestLighterBookCrossedAndChannelValidation(t *testing.T) {
 	}
 }
 
+func TestLighterBookNonceContinuityAndTimestampGuard(t *testing.T) {
+	var book lighterBook
+	snap := gjson.Parse(`{"nonce":100,"begin_nonce":95,"last_updated_at":1700000000000000,"bids":[{"price":"100","size":"2"}],"asks":[{"price":"101","size":"3"}]}`)
+	if changed, err := book.apply(snap, true); err != nil || !changed {
+		t.Fatalf("snapshot failed: changed=%v err=%v", changed, err)
+	}
+	// Contiguous delta (begin_nonce == previous nonce) succeeds.
+	delta1 := gjson.Parse(`{"nonce":105,"begin_nonce":100,"last_updated_at":1700000000001000,"bids":[{"price":"99.5","size":"4"}],"asks":[]}`)
+	if changed, err := book.apply(delta1, false); err != nil || !changed {
+		t.Fatalf("contiguous delta failed: changed=%v err=%v", changed, err)
+	}
+	// Duplicate / older nonce is ignored without rolling back or erroring.
+	if changed, err := book.apply(delta1, false); err != nil || changed {
+		t.Fatalf("duplicate nonce reapplied: changed=%v err=%v", changed, err)
+	}
+	// Sequence gap (begin_nonce != 105) fails closed and invalidates initialized state.
+	gapDelta := gjson.Parse(`{"nonce":108,"begin_nonce":106,"last_updated_at":1700000000002000,"bids":[{"price":"99","size":"1"}],"asks":[]}`)
+	if _, err := book.apply(gapDelta, false); err == nil {
+		t.Fatal("nonce gap accepted")
+	}
+	if book.initialized {
+		t.Fatal("nonce gap left book initialized")
+	}
+	// Subsequent delta before fresh snapshot must be rejected.
+	if _, err := book.apply(gjson.Parse(`{"nonce":109,"begin_nonce":108,"bids":[],"asks":[]}`), false); err == nil {
+		t.Fatal("delta accepted after gap without snapshot")
+	}
+	// Fresh snapshot recovers cleanly; timestamp regression afterwards fails closed.
+	if _, err := book.apply(snap, true); err != nil {
+		t.Fatalf("recovery snapshot failed: %v", err)
+	}
+	regressed := gjson.Parse(`{"nonce":101,"begin_nonce":100,"last_updated_at":1699999999999999,"bids":[],"asks":[]}`)
+	if _, err := book.apply(regressed, false); err == nil || book.initialized {
+		t.Fatalf("timestamp regression accepted: err=%v initialized=%v", err, book.initialized)
+	}
+}
+
 func TestConnectionLoopDoesNotDialAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -82,6 +119,20 @@ func TestConnectionLoopDoesNotDialAfterCancellation(t *testing.T) {
 	err := RunConnectionLoop(ctx, "test", func(context.Context) error { called = true; return nil })
 	if called || err != context.Canceled {
 		t.Fatalf("called=%v err=%v", called, err)
+	}
+}
+
+func TestLighterAuthRejectsReservedKey157OnRobinhoodChain(t *testing.T) {
+	t.Setenv("LIGHTER_PRIVATE_KEY", "01010101010101010101010101010101010101010101010101010101010101010101010101010101")
+	t.Setenv("LIGHTER_ACCOUNT_INDEX", "42")
+	t.Setenv("LIGHTER_API_KEY_INDEX", "157")
+	t.Setenv("LIGHTER_CHAIN_ID", "466324")
+	if _, err := LoadLighterAuthFromEnv(); err == nil {
+		t.Fatal("accepted reserved API key index 157 on Robinhood Chain 466324")
+	}
+	t.Setenv("LIGHTER_API_KEY_INDEX", "7")
+	if _, err := LoadLighterAuthFromEnv(); err != nil {
+		t.Fatalf("rejected valid Robinhood API key index 7: %v", err)
 	}
 }
 

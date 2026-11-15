@@ -1,5 +1,6 @@
 pub mod error;
 pub mod ffi;
+pub mod risk;
 pub mod trading;
 
 pub(crate) fn valid_market_id(id: i64) -> bool {

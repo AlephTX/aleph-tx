@@ -51,12 +51,30 @@ func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.
 }
 
 func (l *Lighter) Run(ctx context.Context) error {
+	l.invalidateAll()
 	// Only run public orderbook stream
 	// Private events are handled by LighterPrivate in lighter_private.go
 	return RunConnectionLoop(ctx, "lighter-public", l.connectPublic)
 }
 
+func (l *Lighter) invalidateBook(symbolID uint16) {
+	if l.matrix != nil {
+		l.matrix.InvalidateBBO(ExchangeLighter, symbolID)
+	}
+	if l.depthWriter != nil {
+		l.depthWriter.InvalidateDepth(symbolID, ExchangeLighter)
+	}
+}
+
+func (l *Lighter) invalidateAll() {
+	for _, symbolID := range l.mktMap {
+		l.invalidateBook(symbolID)
+	}
+}
+
 func (l *Lighter) connectPublic(ctx context.Context) error {
+	defer l.invalidateAll()
+
 	c, _, err := websocket.Dial(ctx, l.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -78,11 +96,6 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 	// Reconnection always starts from a fresh snapshot. Never reuse a book
 	// across a disconnect, during which arbitrary deltas may have been lost.
 	books := make(map[int]*lighterBook, len(l.mktMap))
-	defer func() {
-		for _, symbolID := range l.mktMap {
-			l.matrix.InvalidateBBO(ExchangeLighter, symbolID)
-		}
-	}()
 	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-public", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
@@ -130,7 +143,7 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 		}
 		bids, asks := book.depth()
 		if bids[0].Size == 0 || asks[0].Size == 0 {
-			l.matrix.InvalidateBBO(ExchangeLighter, symID)
+			l.invalidateBook(symID)
 			continue
 		}
 		tsMs := result.Get("timestamp").Int()

@@ -6,7 +6,7 @@ mod session;
 use aleph_tx::account_stats_reader::AccountStatsReader;
 use aleph_tx::config::InventoryNeutralMMConfig;
 use aleph_tx::exchanges::hyperliquid::Network;
-use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
+use aleph_tx::lighter_trading::{LighterCredentials, LighterDomain, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
 use aleph_tx::shm_depth_reader::ShmDepthReader;
 use aleph_tx::shm_event_reader::ShmEventReaderV2;
@@ -40,12 +40,14 @@ async fn wait_for_resource<T>(path: &Path, open: impl Fn(&str) -> Result<T>) -> 
 async fn connect_strategy(
     config: InventoryNeutralMMConfig,
     mut trading: LighterTrading,
-    network: Network,
+    domain: LighterDomain,
     ipc: &Path,
     telemetry: Option<TelemetrySink>,
 ) -> Result<(InventoryNeutralMM, Arc<LighterTrading>)> {
+    let network = domain.network();
     let daily_loss_state = PathBuf::from(format!(
-        "pids/daily-loss-{network:?}-{}-{}.json",
+        "pids/daily-loss-{}-{}-{}.json",
+        domain.lock_slug(),
         trading.account_index(),
         config.market_id
     ));
@@ -145,8 +147,8 @@ async fn main() -> Result<()> {
                 .deployment()
                 .map_or("unspecified", |d| d.scenario.as_str());
             println!(
-                "Configuration OK: {:?} Lighter {} market {}, strategy_mode={}, scenario={}",
-                profile.network,
+                "Configuration OK: {} Lighter {} market {}, strategy_mode={}, scenario={}",
+                profile.domain.lock_slug(),
                 profile.symbol,
                 profile.strategy.market_id,
                 profile.strategy_mode(),
@@ -169,8 +171,8 @@ async fn main() -> Result<()> {
                     .deployment()
                     .map_or("default_l1", |d| d.l1_group.as_str());
                 println!(
-                    "Configuration OK: {path} -> {:?} Lighter {} market {}, strategy_mode={}, scenario={}, l1_group={}",
-                    profile.network,
+                    "Configuration OK: {path} -> {} Lighter {} market {}, strategy_mode={}, scenario={}, l1_group={}",
+                    profile.domain.lock_slug(),
                     profile.symbol,
                     profile.strategy.market_id,
                     profile.strategy_mode(),
@@ -209,15 +211,16 @@ async fn run_existing_feeder() -> Result<()> {
         "Use make trade MODE=live for the inventory hedge"
     );
     let credentials = LighterCredentials::from_env(|key| std::env::var(key).ok())?;
-    let network = credentials.network()?;
+    let domain = credentials.domain()?;
+    let network = domain.network();
     anyhow::ensure!(
-        profile.network == network,
-        "Lighter feeder and signer must use the same network"
+        profile.domain == domain,
+        "Lighter feeder and signer must use the same domain"
     );
     profile.verify_account_binding(credentials.account_index())?;
     let symbol = profile.symbol;
     let config = profile.strategy;
-    let _lock = session::lock_account(&credentials, network)?;
+    let _lock = session::lock_account(&credentials, domain)?;
     anyhow::ensure!(
         !Path::new("pids/aleph-trade.active.jsonl").try_exists()?,
         "Previous supervised trading session still requires reconciliation"
@@ -236,13 +239,13 @@ async fn run_existing_feeder() -> Result<()> {
     let telemetry = TelemetrySink::from_env(&SessionInfo {
         session_id: uuid::Uuid::new_v4().to_string(),
         network: format!("{network:?}"),
-        exchange: "lighter".into(),
+        exchange: domain.telemetry_exchange().into(),
         symbol: symbol.clone(),
         market_id: config.market_id as u64,
         account,
         hedge_account: None,
     });
     let (mut strategy, _) =
-        connect_strategy(config, trading, network, &shm_dir(), telemetry).await?;
+        connect_strategy(config, trading, domain, &shm_dir(), telemetry).await?;
     strategy.run(Some(shutdown)).await
 }

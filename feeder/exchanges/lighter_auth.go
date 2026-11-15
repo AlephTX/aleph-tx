@@ -69,6 +69,9 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	if apiKeyIndexInt < 0 || apiKeyIndexInt > 254 {
 		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX is outside the signing range")
 	}
+	if os.Getenv("LIGHTER_CHAIN_ID") == "466324" && apiKeyIndexInt == 157 {
+		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX 157 is reserved on Lighter Robinhood Chain")
+	}
 	apiKeyIndex := uint8(apiKeyIndexInt)
 
 	return &LighterAuth{

@@ -14,7 +14,7 @@ pub struct PriceLevel {
     pub size: f64,
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct ShmDepthSnapshot {
     pub seqlock: u32,                     // 4 bytes
@@ -44,6 +44,7 @@ impl Default for ShmDepthSnapshot {
 
 const _: () = {
     assert!(std::mem::size_of::<ShmDepthSnapshot>() == SLOT_SIZE);
+    assert!(std::mem::align_of::<ShmDepthSnapshot>() == 64);
     assert!(std::mem::offset_of!(ShmDepthSnapshot, timestamp_ns) == 16);
     assert!(std::mem::offset_of!(ShmDepthSnapshot, bids) == 24);
     assert!(std::mem::offset_of!(ShmDepthSnapshot, asks) == 104);

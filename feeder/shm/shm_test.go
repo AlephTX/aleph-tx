@@ -38,6 +38,20 @@ func TestDepthMappingLayoutAndLastSlot(t *testing.T) {
 	}
 	w.WriteDepth(NumSymbols, 0, 42, bids, asks)
 	w.WriteDepth(0, NumExchanges, 42, bids, asks)
+	// Stale, crossed, NaN, and empty-top depth updates are rejected without bumping version.
+	verBefore := w.GetVersion(NumSymbols - 1)
+	w.WriteDepth(NumSymbols-1, NumExchanges-1, 41, bids, asks)
+	w.WriteDepth(NumSymbols-1, NumExchanges-1, 43, asks, bids)
+	w.WriteDepth(NumSymbols-1, NumExchanges-1, 43, [DepthLevels]PriceLevel{{Price: math.NaN(), Size: 1}}, asks)
+	w.WriteDepth(NumSymbols-1, NumExchanges-1, 43, [DepthLevels]PriceLevel{}, asks)
+	if got := w.GetVersion(NumSymbols - 1); got != verBefore {
+		t.Fatalf("invalid or stale depth published: version=%d, want %d", got, verBefore)
+	}
+	w.InvalidateDepth(NumSymbols-1, NumExchanges-1)
+	slot = w.data.DepthMatrix[NumSymbols-1][NumExchanges-1]
+	if slot.TimestampNs != 0 || slot.Bids[0].Size != 0 || slot.Asks[0].Size != 0 || w.GetVersion(NumSymbols-1) != verBefore+1 {
+		t.Fatalf("depth slot not invalidated: %+v", slot)
+	}
 	if _, err := NewDepthWriter(filepath.Join(t.TempDir(), "bad"), 1); err == nil {
 		t.Fatal("accepted incompatible symbol count")
 	}

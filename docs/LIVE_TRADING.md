@@ -40,8 +40,13 @@ cargo run --bin lighter_inventory_mm -- --check \
 2. Configure a dedicated Lighter account in a local environment file. The
    launcher reads `LIGHTER_PRIVATE_KEY` (40-byte hex),
    `LIGHTER_ACCOUNT_INDEX` and `LIGHTER_API_KEY_INDEX`. It also recognizes
-   the existing `API_KEY_PRIVATE_KEY` name. Startup requires a flat position
-   and zero open orders on the selected Lighter market.
+   the existing `API_KEY_PRIVATE_KEY` name. Optional speed-bump isolation
+   lanes may be configured on the same account via paired
+   `LIGHTER_CANCEL_PRIVATE_KEY` + `LIGHTER_CANCEL_API_KEY_INDEX` (pure cancel
+   lane) and `LIGHTER_TAKER_PRIVATE_KEY` + `LIGHTER_TAKER_API_KEY_INDEX`
+   (IOC/market taker lane); configured lane indices must be pairwise distinct,
+   and extra lane keys are stripped from the child feeder environment. Startup
+   requires a flat position and zero open orders on the selected Lighter market.
 3. For `inventory_hedge`, review the base cap, residual tolerance, maximum
    IOC notional, available balance and slippage. Set
    `HYPERLIQUID_ACCOUNT_ADDRESS` to the funded account and
@@ -85,6 +90,17 @@ value. The hedge uses the Hyperliquid book for its own limits.
 make trade MODE=check CONFIG=config.testnet.toml
 make trade MODE=testnet
 ```
+
+### Lighter Robinhood Chain (`466324`)
+
+Set `[lighter].feeder_ws_url` to `wss://api.rh.lighter.xyz/stream`,
+`LIGHTER_BASE_URL=https://api.rh.lighter.xyz`, and `LIGHTER_CHAIN_ID=466324`.
+API key index `157` is reserved on Robinhood Chain and rejected at startup in
+both Go and Rust. Because Robinhood Chain settles in USDG rather than USDC,
+`[inventory_hedge]` against USDC Hyperliquid is rejected by `Profile::load`;
+use `strategy_mode = "quant"`. Host account locks and UTC daily-loss state use
+the `Robinhood` domain slug so they cannot collide with Lighter Core (`Mainnet`)
+state on the same integer `account_index`.
 
 ### Shutdown and restart
 

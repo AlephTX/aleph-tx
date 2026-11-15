@@ -2,7 +2,7 @@ use aleph_tx::config::{
     AppConfig, DeploymentIsolationConfig, EXCH_LIGHTER, InventoryNeutralMMConfig, ResearchScenario,
 };
 use aleph_tx::exchanges::hyperliquid::{HyperliquidSigner, Network, validate_hex};
-use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
+use aleph_tx::lighter_trading::{LighterCredentials, LighterDomain, LighterTrading};
 use aleph_tx::live_hedge::journal::{JOURNAL_SCHEMA, JournalRecord, StartRecord};
 use aleph_tx::live_hedge::{HedgeLimits, LiveInventoryHedge};
 use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
@@ -47,6 +47,7 @@ struct Feeds {
 
 pub(super) struct Profile {
     pub strategy: InventoryNeutralMMConfig,
+    pub domain: LighterDomain,
     pub network: Network,
     /// Ticker of the strategy symbol, resolved from `[symbols]`.
     pub symbol: String,
@@ -66,15 +67,25 @@ impl Profile {
                 "strategy_mode=inventory_hedge requires [inventory_hedge]; strategy_mode=quant requires its absence"
             );
         }
-        let (network, hedge_ws) = match feeds.lighter.feeder_ws_url.as_str() {
+        let (domain, hedge_ws) = match feeds.lighter.feeder_ws_url.as_str() {
             "wss://mainnet.zklighter.elliot.ai/stream" => {
-                (Network::Mainnet, "wss://api.hyperliquid.xyz/ws")
+                (LighterDomain::CoreMainnet, "wss://api.hyperliquid.xyz/ws")
             }
-            "wss://testnet.zklighter.elliot.ai/stream" => {
-                (Network::Testnet, "wss://api.hyperliquid-testnet.xyz/ws")
-            }
+            "wss://api.rh.lighter.xyz/stream" => (
+                LighterDomain::RobinhoodMainnet,
+                "wss://api.hyperliquid.xyz/ws",
+            ),
+            "wss://testnet.zklighter.elliot.ai/stream" => (
+                LighterDomain::CoreTestnet,
+                "wss://api.hyperliquid-testnet.xyz/ws",
+            ),
             _ => anyhow::bail!("Unsupported Lighter websocket endpoint"),
         };
+        let network = domain.network();
+        ensure!(
+            !(domain == LighterDomain::RobinhoodMainnet && feeds.inventory_hedge.is_some()),
+            "Lighter Robinhood Chain (USDG collateral) forbids [inventory_hedge] until cross-collateral settlement is promoted"
+        );
         let app: AppConfig = toml::from_str(&contents)?;
         app.validate()?;
         let strategy = app
@@ -172,6 +183,7 @@ impl Profile {
         let feeder_config = toml::to_string(&feeder)?;
         Ok(Self {
             strategy,
+            domain,
             network,
             symbol,
             app,
@@ -200,14 +212,17 @@ impl Profile {
         for i in 0..profiles.len() {
             let (name_a, prof_a) = &profiles[i];
             for (name_b, prof_b) in &profiles[(i + 1)..] {
-                if prof_a.network != prof_b.network {
-                    continue;
+                if prof_a.domain == prof_b.domain {
+                    AppConfig::validate_fleet_isolation([
+                        (*name_a, &prof_a.app),
+                        (*name_b, &prof_b.app),
+                    ])?;
                 }
-                AppConfig::validate_fleet_isolation([
-                    (*name_a, &prof_a.app),
-                    (*name_b, &prof_b.app),
-                ])?;
-                if prof_a.has_hedge() && prof_b.has_hedge() && prof_a.symbol == prof_b.symbol {
+                if prof_a.network == prof_b.network
+                    && prof_a.has_hedge()
+                    && prof_b.has_hedge()
+                    && prof_a.symbol == prof_b.symbol
+                {
                     let slot_a = prof_a
                         .deployment()
                         .and_then(|d| d.hedge_account_slot.as_deref());
@@ -248,13 +263,19 @@ impl Profile {
     }
 }
 
-const LIGHTER_ENV: &[&str] = &[
+const LIGHTER_FEEDER_ENV: &[&str] = &[
     "LIGHTER_PRIVATE_KEY",
     "API_KEY_PRIVATE_KEY",
     "LIGHTER_ACCOUNT_INDEX",
     "LIGHTER_API_KEY_INDEX",
     "LIGHTER_BASE_URL",
     "LIGHTER_CHAIN_ID",
+];
+const LIGHTER_EXTRA_LANE_ENV: &[&str] = &[
+    "LIGHTER_CANCEL_PRIVATE_KEY",
+    "LIGHTER_CANCEL_API_KEY_INDEX",
+    "LIGHTER_TAKER_PRIVATE_KEY",
+    "LIGHTER_TAKER_API_KEY_INDEX",
 ];
 const HEDGE_ACCOUNT: &str = "HYPERLIQUID_ACCOUNT_ADDRESS";
 const HEDGE_KEY: &str = "HYPERLIQUID_AGENT_PRIVATE_KEY";
@@ -270,6 +291,12 @@ struct HedgeSetup {
 #[allow(deprecated)]
 fn read_env(path: &Path) -> Result<HashMap<String, String>> {
     let mut values = HashMap::new();
+    let known = |k: &str| {
+        LIGHTER_FEEDER_ENV.contains(&k)
+            || LIGHTER_EXTRA_LANE_ENV.contains(&k)
+            || k == HEDGE_ACCOUNT
+            || k == HEDGE_KEY
+    };
     if path != Path::new("-") {
         let entries =
             dotenv::from_path_iter(path).with_context(|| format!("Open {}", path.display()))?;
@@ -277,7 +304,7 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
             // Dotenv parse errors can contain the original secret-bearing line.
             let (key, value) = entry
                 .map_err(|_| anyhow::anyhow!("Invalid dotenv syntax in {}", path.display()))?;
-            if LIGHTER_ENV.contains(&key.as_str()) || key == HEDGE_ACCOUNT || key == HEDGE_KEY {
+            if known(&key) {
                 ensure!(
                     values.insert(key, value).is_none(),
                     "Duplicate trading credential in {}",
@@ -286,9 +313,10 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
             }
         }
     }
-    for key in LIGHTER_ENV
+    for key in LIGHTER_FEEDER_ENV
         .iter()
         .copied()
+        .chain(LIGHTER_EXTRA_LANE_ENV.iter().copied())
         .chain([HEDGE_ACCOUNT, HEDGE_KEY])
     {
         if !values.contains_key(key)
@@ -308,9 +336,13 @@ pub(super) fn require_platform() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn lock_account(credentials: &LighterCredentials, network: Network) -> Result<File> {
+pub(super) fn lock_account(
+    credentials: &LighterCredentials,
+    domain: LighterDomain,
+) -> Result<File> {
     account_lock(&format!(
-        "/dev/shm/aleph-tx-lighter-{network:?}-{}.lock",
+        "/dev/shm/aleph-tx-lighter-{}-{}.lock",
+        domain.lock_slug(),
         credentials.account_index()
     ))
 }
@@ -432,10 +464,11 @@ pub(super) async fn launch(
     require_platform()?;
     let env = read_env(dotenv)?;
     let credentials = LighterCredentials::from_env(|key| env.get(key).cloned())?;
-    let network = credentials.network()?;
+    let domain = credentials.domain()?;
+    let network = domain.network();
     ensure!(
-        profile.network == network,
-        "Lighter feeder and signer must use the same network"
+        profile.domain == domain,
+        "Lighter feeder and signer must use the same domain"
     );
     profile.verify_account_binding(credentials.account_index())?;
     let hedge = profile
@@ -459,7 +492,7 @@ pub(super) async fn launch(
             })
         })
         .transpose()?;
-    let _account_lock = lock_account(&credentials, network)?;
+    let _account_lock = lock_account(&credentials, domain)?;
     let _hedge_lock = hedge
         .as_ref()
         .map(|setup| {
@@ -480,10 +513,13 @@ pub(super) async fn launch(
         return Err(error.into());
     }
     let mut feeder = Command::new(feeder_bin);
-    for key in LIGHTER_ENV {
+    for key in LIGHTER_FEEDER_ENV {
         if let Some(value) = env.get(*key) {
             feeder.env(key, value);
         }
+    }
+    for key in LIGHTER_EXTRA_LANE_ENV {
+        feeder.env_remove(key);
     }
     let feeder = feeder
         .env("ALEPH_FEEDER_CONFIG", &feeder_config)
@@ -533,20 +569,15 @@ pub(super) async fn launch(
             let telemetry = TelemetrySink::from_env(&SessionInfo {
                 session_id: session.id.to_string(),
                 network: format!("{network:?}"),
-                exchange: "lighter".into(),
+                exchange: domain.telemetry_exchange().into(),
                 symbol: symbol.into(),
                 market_id: profile.strategy.market_id as u64,
                 account,
                 hedge_account: hedge.as_ref().map(|setup| setup.account.clone()),
             });
-            let (mut strategy, trading) = super::connect_strategy(
-                profile.strategy,
-                trading,
-                network,
-                &session.ipc,
-                telemetry,
-            )
-            .await?;
+            let (mut strategy, trading) =
+                super::connect_strategy(profile.strategy, trading, domain, &session.ipc, telemetry)
+                    .await?;
             if let Some(setup) = hedge {
                 strategy = strategy.with_inventory_hedge(
                     LiveInventoryHedge::connect(
@@ -864,6 +895,57 @@ taker_fee_bps = 4.5
             ])
             .is_err()
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn robinhood_profile_allows_quant_forbids_hedge_and_isolates_domain_from_core() {
+        let example = include_str!("../../../config.example.toml");
+        let rh_quant = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"quant_profit\"\nl1_group = \"primary_l1\"\nsubaccount_slot = \"sub_eth_rh\"\nexpected_account_index = 10\n",
+            example.replace(
+                "wss://mainnet.zklighter.elliot.ai/stream",
+                "wss://api.rh.lighter.xyz/stream"
+            )
+        );
+        let dir = std::env::temp_dir().join(format!("aleph-rh-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let rh_path = dir.join("rh_eth.toml");
+        fs::write(&rh_path, &rh_quant).unwrap();
+        let rh_profile = Profile::load(&rh_path).unwrap();
+        assert_eq!(rh_profile.domain, LighterDomain::RobinhoodMainnet);
+        assert_eq!(rh_profile.network, Network::Mainnet);
+        assert_eq!(rh_profile.domain.telemetry_exchange(), "lighter_robinhood");
+
+        // Core Mainnet profile on the same market_id=0 and expected_account_index=10
+        // does not collide with RobinhoodMainnet because they are separate domains.
+        let core_path = dir.join("core_eth.toml");
+        let core_quant = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"quant_profit\"\nl1_group = \"primary_l1\"\nsubaccount_slot = \"sub_eth_core\"\nexpected_account_index = 10\n",
+            example
+        );
+        fs::write(&core_path, &core_quant).unwrap();
+        let core_profile = Profile::load(&core_path).unwrap();
+        Profile::validate_isolation(&[("rh_eth", rh_profile), ("core_eth", core_profile)]).unwrap();
+
+        // Inventory hedge (USDC Hyperliquid) must fail closed on Robinhood (USDG).
+        let rh_hedged = format!(
+            "{}\n[inventory_hedge]\nmax_unhedged_base = \"0.01\"\ndeadband_base = \"0.001\"\nmax_order_notional_usd = \"20\"\nmin_available_usd = \"50\"\nslippage_bps = 1\ntaker_fee_bps = 0\n",
+            rh_quant
+                .replace(
+                    "strategy_mode = \"quant\"",
+                    "strategy_mode = \"inventory_hedge\""
+                )
+                .replace(
+                    "scenario = \"quant_profit\"",
+                    "scenario = \"hedge_arbitrage\""
+                )
+        );
+        let rh_hedged_path = dir.join("rh_hedged.toml");
+        fs::write(&rh_hedged_path, rh_hedged).unwrap();
+        assert!(Profile::load(&rh_hedged_path).is_err());
 
         fs::remove_dir_all(dir).unwrap();
     }

@@ -19,6 +19,8 @@ pub enum LighterErrorCode {
     InvalidOrderAmount = 21706,
     /// 21739: Not enough margin to create the order
     NotEnoughMargin = 21739,
+    /// 23000: Gateway / API key rate limit exceeded
+    RateLimited = 23000,
     /// Unknown error code
     Unknown,
 }
@@ -33,6 +35,7 @@ impl LighterErrorCode {
             21301 => Self::InsufficientMargin,
             21706 => Self::InvalidOrderAmount,
             21739 => Self::NotEnoughMargin,
+            23000 => Self::RateLimited,
             _ => Self::Unknown,
         }
     }
@@ -40,6 +43,20 @@ impl LighterErrorCode {
     /// Check if this error requires nonce reset
     pub fn requires_nonce_reset(self) -> bool {
         matches!(self, Self::InvalidNonce | Self::InvalidExpiry)
+    }
+
+    /// True when a definitive single-transaction rejection happened before
+    /// sequencer nonce consumption, so a previously synchronized cached nonce
+    /// remains valid without spending a `/api/v1/nextNonce` round-trip.
+    pub fn preserves_unconsumed_single_tx_nonce(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidSignature
+                | Self::InsufficientMargin
+                | Self::InvalidOrderAmount
+                | Self::NotEnoughMargin
+                | Self::RateLimited
+        )
     }
 
     /// Check if this error is a margin issue
@@ -101,7 +118,33 @@ mod tests {
     #[test]
     fn test_margin_error_check() {
         assert!(LighterErrorCode::InsufficientMargin.is_margin_error());
+        assert!(LighterErrorCode::NotEnoughMargin.is_margin_error());
         assert!(!LighterErrorCode::InvalidNonce.is_margin_error());
         assert!(!LighterErrorCode::InvalidSignature.is_margin_error());
+    }
+
+    #[test]
+    fn test_unconsumed_single_tx_nonce_preservation() {
+        assert_eq!(
+            LighterErrorCode::from_code(23000),
+            LighterErrorCode::RateLimited
+        );
+        for preserved in [
+            LighterErrorCode::InsufficientMargin,
+            LighterErrorCode::NotEnoughMargin,
+            LighterErrorCode::InvalidOrderAmount,
+            LighterErrorCode::InvalidSignature,
+            LighterErrorCode::RateLimited,
+        ] {
+            assert!(preserved.preserves_unconsumed_single_tx_nonce());
+            assert!(!preserved.requires_nonce_reset());
+        }
+        for unpreserved in [
+            LighterErrorCode::InvalidNonce,
+            LighterErrorCode::InvalidExpiry,
+            LighterErrorCode::Unknown,
+        ] {
+            assert!(!unpreserved.preserves_unconsumed_single_tx_nonce());
+        }
     }
 }
