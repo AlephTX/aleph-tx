@@ -143,11 +143,11 @@ func TestLighterRobinhoodUsesDedicatedExchangeSlot(t *testing.T) {
 			return
 		}
 		_ = wsjson.Write(r.Context(), c, map[string]any{
-			"type":      "subscribed/order_book",
-			"channel":   "order_book:0",
-			"timestamp": tsMs,
+			"type":    "subscribed/order_book",
+			"channel": "order_book:0",
 			"order_book": map[string]any{
 				"nonce":           10,
+				"begin_nonce":     0,
 				"offset":          1,
 				"last_updated_at": tsMs * 1000,
 				"bids":            []map[string]string{{"price": "2451.10", "size": "2.5"}},

@@ -49,11 +49,19 @@ func (b *lighterBook) apply(book gjson.Result, snapshot bool) (bool, error) {
 		return false, fmt.Errorf("invalid book nonce")
 	}
 	beginNonce := book.Get("begin_nonce")
-	if beginNonce.Exists() && beginNonce.Int() <= 0 {
+	if snapshot {
+		if beginNonce.Exists() && beginNonce.Int() < 0 {
+			return false, fmt.Errorf("invalid book begin_nonce")
+		}
+	} else if beginNonce.Exists() && beginNonce.Int() <= 0 {
 		return false, fmt.Errorf("invalid book begin_nonce")
 	}
 	lastUpdatedAt := book.Get("last_updated_at")
-	if lastUpdatedAt.Exists() && lastUpdatedAt.Int() <= 0 {
+	if snapshot {
+		if lastUpdatedAt.Exists() && lastUpdatedAt.Int() < 0 {
+			return false, fmt.Errorf("invalid book last_updated_at")
+		}
+	} else if lastUpdatedAt.Exists() && lastUpdatedAt.Int() <= 0 {
 		return false, fmt.Errorf("invalid book last_updated_at")
 	}
 	offset := book.Get("offset")
@@ -111,7 +119,7 @@ func (b *lighterBook) apply(book gjson.Result, snapshot bool) (bool, error) {
 	b.hasNonce = nonce.Exists()
 	b.nonce = nonce.Int()
 	if snapshot {
-		b.hasLastUpdatedAt = lastUpdatedAt.Exists()
+		b.hasLastUpdatedAt = lastUpdatedAt.Exists() && lastUpdatedAt.Int() > 0
 		b.lastUpdatedAt = lastUpdatedAt.Int()
 	} else if lastUpdatedAt.Exists() {
 		b.hasLastUpdatedAt = true

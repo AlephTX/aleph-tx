@@ -155,6 +155,9 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			continue
 		}
 		tsMs := result.Get("timestamp").Int()
+		if tsMs <= 0 && book.hasLastUpdatedAt {
+			tsMs = book.lastUpdatedAt / 1000
+		}
 		if tsMs <= 0 {
 			tsMs = time.Now().UnixMilli()
 		}

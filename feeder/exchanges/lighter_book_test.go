@@ -77,7 +77,8 @@ func TestLighterBookCrossedAndChannelValidation(t *testing.T) {
 
 func TestLighterBookNonceContinuityAndTimestampGuard(t *testing.T) {
 	var book lighterBook
-	snap := gjson.Parse(`{"nonce":100,"begin_nonce":95,"last_updated_at":1700000000000000,"bids":[{"price":"100","size":"2"}],"asks":[{"price":"101","size":"3"}]}`)
+	// Production subscribed/order_book snapshots emit begin_nonce = 0.
+	snap := gjson.Parse(`{"nonce":100,"begin_nonce":0,"last_updated_at":1700000000000000,"bids":[{"price":"100","size":"2"}],"asks":[{"price":"101","size":"3"}]}`)
 	if changed, err := book.apply(snap, true); err != nil || !changed {
 		t.Fatalf("snapshot failed: changed=%v err=%v", changed, err)
 	}
