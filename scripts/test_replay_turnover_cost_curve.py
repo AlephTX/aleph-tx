@@ -47,7 +47,9 @@ class CostCurveTests(unittest.TestCase):
         self.assertEqual(len(grid), 36)
         caps = {p["pair"]["mode"]["incentive"]["max_cost_bps"] for _, p in grid}
         self.assertEqual(caps, set(COST_CAPS))
-        self.assertEqual({p["maker_cancel_delay_ms"] for _, p in grid}, {300})
+        self.assertEqual({p["maker_create_delay_ms"] for _, p in grid}, {200})
+        self.assertEqual({p["maker_cancel_delay_ms"] for _, p in grid}, {200})
+        self.assertEqual({tuple(p["taker_delay_ms"]) for _, p in grid}, {(300, 300)})
         self.assertEqual({p["trade_delivery_grace_ms"] for _, p in grid}, {750})
 
     def test_zero_volume_has_no_cost_estimate_and_incomplete_is_not_zero(self):

@@ -540,29 +540,33 @@ participation cap).
 | `S3_ModeA_L1k_200s_Std_8bps` | `BTC` / `ETH` | `92,790` / `103,515` | `-3.3110` / **`+0.6728`** raw | `+35.68` / **`-6.50`** | `89,618` / `119,955` | `-5.7343` / `-7.9323` raw | `+63.99` / `+66.13` |
 | **`S3_ModeA_RH_FlowPatient` (`short_first`)** | **RH `ETH`** | `399.90` (`199.95` RH) | `-0.0131` / `-0.0231` | `+32.70` | **`1,598.46` (`799.24` RH)** | **`+0.0055`** / `-0.0345` | **`-3.43` (`-0.034 bps` profit)** |
 
-### 11.2 Mode B — Ultra-Low-Cost / Negative-Cost High Volume (`$50,000` Capital, Target `<= $2.00 / $1M` = `<= $100 / $50M`)
+### 11.2 Mode B — High-Volume Turnover Diagnostic (`$50,000` Capital, Target `<= $2.00 / $1M` Net Cost)
 
-| Venue & Arm | Symbol | `W1` Gross 10h (`$`) | `W1` Raw / Net025 (`$`) | `W1` Cost (`$ / $1M`) | `W2` Gross 10h (`$`) | `W2` Raw / Net025 (`$`) | `W2` Cost (`$ / $1M`) |
+| Venue & Arm | Symbol | `W1` Gross 10h (`$`) | `W1` Raw / Net025 (`$`) | `W1` Raw / Net025 (`$ / $1M`) | `W2` Gross 10h (`$`) | `W2` Raw / Net025 (`$`) | `W2` Raw / Net025 (`$ / $1M`) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`S3_ModeB_L50k_5000s_FR_16bps`** | **`BTC`** | **`275,641.43`** | **`+9.0215` / `+2.1305`** | **`-32.73` (profit)** | **`326,105.00` (`~782.7k/d`)** | **`+11.4565` / `+3.3039`** | **`-35.13` (`+$1,757` profit / `$50M`!)** |
-| **`S3_ModeB_L50k_5000s_FR_20bps`** | **`BTC`** | — | — | — | **`213,429.02` (`~512.2k/d`)** | **`+3.9643`** / `-1.3714` | **`-18.57` (`+$929` profit / `$50M`)** |
-| `S3_ModeB_L50k_5000s_FR_12bps` | `BTC` | **`646,777.58`** | **`+8.2247`** / `-7.9447` | **`-12.72` (profit)** | `766,484.19` (`~1.84M/d`) | `-51.7420` / `-70.9041` | `+67.51` |
-| `S3_ModeB_L50k_5000s_Std_20bps` | `BTC` | — | — | — | `180,528.11` | `-1.9789` / `-6.4921` | `+10.96` |
-| `S3_ModeB_L50k_5000s_Std_20bps` | `ETH` | `181,662.83` | **`+22.9328` / `+18.3912`** | **`-126.24` (profit)** | `582,268.00` | `-29.9644` / `-44.5211` | `+51.46` (cascade size impact) |
-| `S3_ModeB_L50k_5000s_FR_20bps` / `FR_16bps` | `ETH` | `193,668` / `372,810` | **`+17.8340`** / `-19.3651` raw | **`-92.09`** / `+51.94` | `660,866` / `950,969` | `-81.4912` / `-258.0451` raw | `+123.31` / `+271.35` |
-| `S3_ModeB_Inst50k_CoreTailHedge_p2_6` | `BTC` / `ETH` | `138,303` / `202,684` | `-0.7812` / `-17.1692` raw | **`+5.65`** / `+84.71` | `77,708` / `197,536` | `-6.1618` / `-17.3861` raw | `+79.29` / `+88.02` |
+| **`S3_ModeB_L50k_5000s_FR_16bps`** | **`BTC`** | **`275,641.43`** | **`+9.0215` / `+2.1305`** | **`-32.73` / `-7.73` (profit)** | **`326,105.00` (`~782.7k/d`)** | **`+11.4565` / `+3.3039`** | **`-35.13` / `-10.13` (profit on `$326.1k`)** |
+| **`S3_ModeB_L50k_5000s_FR_20bps`** | **`BTC`** | — | — | — | **`213,429.02` (`~512.2k/d`)** | **`+3.9643`** / `-1.3714` | `-18.57` / **`+6.43` (net025 cost)** |
+| `S3_ModeB_L50k_5000s_FR_12bps` | `BTC` | **`646,777.58`** | **`+8.2247`** / `-7.9447` | `-12.72` / `+12.28` | `766,484.19` (`~1.84M/d`) | `-51.7420` / `-70.9041` | `+67.51` / `+92.51` |
+| `S3_ModeB_L50k_5000s_Std_20bps` | `BTC` | — | — | — | `180,528.11` | `-1.9789` / `-6.4921` | `+10.96` / `+35.96` |
+| `S3_ModeB_L50k_5000s_Std_20bps` | `ETH` | `181,662.83` | **`+22.9328` / `+18.3912`** | `-126.24` / `-101.24` (profit) | `582,268.00` | `-29.9644` / `-44.5211` | `+51.46` / `+76.46` (cascade size impact) |
+| `S3_ModeB_L50k_5000s_FR_20bps` / `FR_16bps` | `ETH` | `193,668` / `372,810` | **`+17.8340`** / `-19.3651` raw | `-92.09` / `+51.94` raw | `660,866` / `950,969` | `-81.4912` / `-258.0451` raw | `+123.31` / `+271.35` raw |
+| `S3_ModeB_Inst50k_CoreTailHedge_p2_6` | `BTC` / `ETH` | `138,303` / `202,684` | `-0.7812` / `-17.1692` raw | **`+5.65`** / `+84.71` raw | `77,708` / `197,536` | `-6.1618` / `-17.3861` raw | `+79.29` / `+88.02` raw |
 
-**Key Mode B Operational Finding (`BTC` vs. `ETH` Order-Clip Allocation)**:
-`S3_ModeB_L50k_5000s_FR_16bps__BTC` (`$5,000` clip) achieved **strictly negative
-cost (net cash profit even after `0.25 bps` overhead!) across both `W1` and `W2`**,
-generating `$275.6k–$326.1k` per 10h (`~$660k–$783k/day` on a single market) while
-**earning `+$32.73` to `+$35.13` per `$1M` volume** (`+$1,636` to `+$1,757` net
-cash profit per `$50M` volume vs. the `-$100 / $50M` budget). By contrast, `$5,000`
-clips on thinner `ETH` books suffered heavy adverse selection during `W2`'s
-liquidation cascade (`+$51.46–$271.35 / $1M` cost), whereas `$200` `ETH` clips
-(`S3_ModeA_L1k_200s_FR_16bps__ETH`) earned `+$0.2976` profit (`-$9.17 / $1M`) on
-the exact same `W2` tape. High-volume institutional turnover should therefore
-route `$2,500–$5,000` clips to `BTC` and cap `ETH` clips at `$200–$1,000`.
+**Key Mode B Operational Finding (`BTC` vs. `ETH` Order-Clip Allocation & Nonlinear Scaling Caveat)**:
+On historical Taiwan `W1` and `W2` replays (`$275.6k` and `$326.1k` realized 10h gross
+turnover), `S3_ModeB_L50k_5000s_FR_16bps__BTC` (`$5,000` clip) remained cash-positive
+both pre-overhead (`+$32.73` and `+$35.13 / $1M`) and **after `0.25 bps` (`$25 / $1M`)
+operational overhead (`+$7.73` and `+$10.13 / $1M` `net025`, i.e. `+$2.13` and `+$3.30`
+per 10h window)**. Note that `S3_ModeB_L50k_5000s_FR_20bps__BTC` was `+$18.57 / $1M`
+pre-overhead on `W2` (`$213.4k` turnover) but `-$6.43 / $1M` (`+$6.43 / $1M` cost)
+after `0.25 bps` overhead. Because queue depletion and market impact scale nonlinearly
+with clip size and participation rate, `$326k / 10h` unit margins **must not** be
+linearly extrapolated to `$50M` volume. By contrast, `$5,000` clips on thinner `ETH`
+books suffered heavy adverse selection during `W2`'s liquidation cascade (`+$51.46–$271.35 / $1M`
+raw cost), whereas `$200` `ETH` clips (`S3_ModeA_L1k_200s_FR_16bps__ETH`) earned `+$0.2976`
+raw (`-$0.5139` `net025`, `+$15.83 / $1M` `net025` cost) on the exact same `W2` tape.
+High-volume turnover trials on Tokyo OOS windows should therefore test `$2,500–$5,000`
+clips on `BTC` separately from `$200–$1,000` clips on `ETH` without linear volume extrapolation.
 
 ---
 
@@ -641,7 +645,7 @@ SHA-256: `26106e202e0f498669e649ed7bc4cc446d3cfb6b9ba2c48b57cb770c4b6d514d`) and
 `W2` (Oasis summary SHA-256:
 `24aa0a59bc78337a058fc7c0e00274234c4f6a0287d4725ade3b61af13327c65`):
 
-| Arm & Market (`$1,000` unless noted) | Mode (`Delay / Cancel`) | `W1` Net @ `0.25 bps` (`$`) | `W1` Overlap Fills | `W2` Raw / Net025 (`$`) | `W2` Overlap Fills | `W2` `post_only_rejected` (`cross / beyond / new`) | `W2` Cost @ `0.25` (`bps` elig) |
+| Arm & Market (`$1,000` unless noted) | Mode (`Delay / Cancel`) | `W1` Net @ `0.25 bps` (`$`) | `W1` Overlap Fills | `W2` Raw / Net025 (`$`) | `W2` Overlap Fills | `W2` `post_only_rejected` (`cross / beyond / new`) | `W2` Cost @ `0.25` (`bps` target TO) |
 | --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
 | **`S2_V2_TailHedge_primary` (`BTC`)** | `strict_300ms` | `0.0000` | `0` | **`+0.2069` / `+0.1969`** | **`0`** | `10 (3 / 7 / 0)` | **`-4.933` (profit)** |
 | **`S2_V2_TailHedge_primary` (`BTC`)** | `guard_300ms` | `0.0000` | `0` | **`+0.2069` / `+0.1969`** | **`0`** | `10 (3 / 7 / 0)` | **`-4.933` (profit)** |
@@ -662,13 +666,16 @@ SHA-256: `26106e202e0f498669e649ed7bc4cc446d3cfb6b9ba2c48b57cb770c4b6d514d`) and
    even under adversarial `conservative_cancel_guard = true`. By contrast,
    high-churn `Paired_CoreMaker` and `Paired_RHMaker` (`48–177` cancels/10h) flip
    from positive under `strict` to negative under `guard`.
-2. **Official RH `200 ms` Delay Unlocks Sub-`0.60 bps` Scenario 3 RH Execution**:
-   Lowering RH's modeled Standard delay from `300 ms` to the documented `200 ms`
-   cuts `S3_ModeA_RH_FlowPatient` `ETH` raw loss on `W2` **47-fold** (`-$0.3138` ->
-   **`-$0.0067`** on `$999.35` RH Maker / `$1,998.69` gross turnover, **`0.567 bps`**
-   all-in after `0.25 bps` overhead, and **`1.346 bps`** even under adversarial
-   `guard_rh200ms`), and reduces `W1` costs to **`0.397 bps` (`BTC`)** and
-   **`0.478 bps` (`ETH`)**.
+2. **Methodological Caveat on Historical `rh200ms` Runs (`200 / 200 / 300 ms` Official RH Standard Profile)**:
+   Official Lighter Robinhood Chain Standard sequencer speed-bumps are **`200 ms`
+   Maker order / `200 ms` Cancel / `300 ms` Taker**. The historical `rh200ms` runs
+   above lowered both `maker_cancel_delay_ms` and RH `taker_delay_ms` to `200 ms`
+   while omitting `maker_create_delay_ms = 200` (which was not yet modeled in
+   `MakerFirstConfig`). `MakerFirstConfig` and `scripts/replay_ten_hour_scenarios.py`
+   now enforce exact `maker_create_delay_ms = 200`, `maker_cancel_delay_ms = 200`,
+   and `taker_delay_ms = [300, 300]`; the historical `47x` `W2 ETH` cost drop
+   (`-$0.3138` -> `-$0.0067` raw) is therefore uncertified until re-run under the
+   exact `200 / 200 / 300 ms` profile on Tokyo `w01+` tapes.
 3. **Exact `post_only_rejected` Attribution**: `83.7%` (`272 / 325` on `W2 ETH`) to
    `86.2%` (`232 / 269` on `W1 ETH`) of RH `post_only` rejections are
    `post_only_rejected_new_level` (conservative paper rule refusing to synthesize an
@@ -686,12 +693,12 @@ SHA-256: `79469efd724d51cea62903b5072b7d0f9d2182a904a3fd462d4d5f5b6b3e5b08`;
 classified `36,043` live unique trades (`$89.15M` notional) by public wire
 `maker_fee` and `taker_fee` integers:
 
-| Book (`21.41 min` Live) | Unique Trades / Notional | Maker Premium Share | Taker Standard `0 bps` Share (`p_std`) | Taker Premium / Plus Share | Standard Taker `1s / 5s` Mid Move (`bps`) | Premium Taker `1s / 5s` Mid Move (`bps`) | Max Raw Cost (`bps` of Total Maker TO) for `2.0 bps` Eligible Cap |
+| Book (`21.41 min` Live) | Unique Trades / Notional | Maker Premium Share | Taker Standard `0 bps` Share (`p_std`) | Taker Premium / Plus Share | Standard Taker `1s / 5s` Mid Move (`bps`) | Premium Taker `1s / 5s` Mid Move (`bps`) | Non-Standard Taker Share (`1 - p_std`) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `lighter:BTC` | `18,412` / `$53.63M` | `93.32%` | **`89.61%`** | `7.42%` / `2.25%` | **`-0.19` / `+0.16`** | `+0.73` / `+0.11` (Plus `+2.36`) | **`1.792 bps`** |
-| `lighter:ETH` | `9,401` / `$23.61M` | `97.61%` | **`80.44%`** | `18.19%` / `1.09%` | **`+0.59` / `+0.65`** | **`+1.72` / `+4.54`** (Plus `+4.71`) | **`1.609 bps`** |
-| `lighter_robinhood:BTC` | `3,358` / `$6.49M` | `98.68%` | **`90.63%`** | `9.20%` / `0.08%` | **`+0.03` / `-0.14`** | `+0.16` / **`+1.26`** | **`1.813 bps`** |
-| **`lighter_robinhood:ETH`** | `4,872` / `$5.42M` | `98.38%` | **`52.48%`** | **`47.14%`** / `0.13%` | **`+0.13` / `+0.45`** | **`+0.61` / `+0.59`** | **`1.050 bps`** |
+| `lighter:BTC` | `18,412` / `$53.63M` | `93.32%` | **`89.61%`** | `7.42%` / `2.25%` | **`-0.19` / `+0.16`** | `+0.73` / `+0.11` (Plus `+2.36`) | **`10.39%`** |
+| `lighter:ETH` | `9,401` / `$23.61M` | `97.61%` | **`80.44%`** | `18.19%` / `1.09%` | **`+0.59` / `+0.65`** | **`+1.72` / `+4.54`** (Plus `+4.71`) | **`19.56%`** |
+| `lighter_robinhood:BTC` | `3,358` / `$6.49M` | `98.68%` | **`90.63%`** | `9.20%` / `0.08%` | **`+0.03` / `-0.14`** | `+0.16` / **`+1.26`** | **`9.37%`** |
+| **`lighter_robinhood:ETH`** | `4,872` / `$5.42M` | `98.38%` | **`52.48%`** | **`47.14%`** / `0.13%` | **`+0.13` / `+0.45`** | **`+0.61` / `+0.59`** | **`47.52%`** |
 
 **Strategic Implications**:
 - **Why `550 ms` Tight-Spread MM Loses on Lighter**: `93.3%–98.7%` of Maker notional
@@ -700,13 +707,17 @@ classified `36,043` live unique trades (`$89.15M` notional) by public wire
   `ETH`**) generate `+1.72` to `+4.71 bps` adverse `1 s / 5 s` mid moves, whereas
   Standard `0 bps` retail Takers exhibit benign or mean-reverting price markouts
   (`-0.77 bps` `1 s` price markout on `lighter:BTC`, `-0.77 bps` on `RH:ETH`).
-- **Scenario 3 Eligibility Dilution Check**: Even under `lighter_robinhood:ETH`'s
-  `47.52%` non-Standard Taker dilution (`p_std = 52.48%`), `S3_ModeA_RH_FlowPatient`
-  at official `rh200ms` (`0.067 bps` raw / `0.567 bps` `net025` per total RH Maker
-  turnover on `W2`, `-0.004 bps` raw / `0.478 bps` `net025` on `W1`) translates to
-  **`0.128 bps` raw / `1.080 bps` all-in per Standard-Taker-matched RH turnover**,
-  comfortably inside the `2.0 bps` Scenario 3 ceiling (`BTC` has minimal `9.37%`
-  dilution).
+- **Scenario 3 Eligibility & Adverse-Selection Tension (`Standard-to-Standard` Unrewarded)**:
+  Under Lighter's official points rules, **Standard-to-Standard (`0 bps` Maker matched
+  against `0 bps` Standard Taker) trades earn no points**. An earlier draft inverted
+  this denominator by dividing by `p_std`; in fact, a `0 bps` Standard Maker only has
+  potential counterparty eligibility against **non-Standard (Premium/Plus) Takers**
+  (`1 - p_std`: `47.52%` on `RH:ETH`, and only `9.37%` on `RH:BTC`), which is also
+  the higher-toxicity Taker cohort! Moreover, market-wide public fee shares cannot
+  certify the counterparty tier of our own resting fills because informed flow selects
+  passive quotes asymmetrically. All Scenario 3 replay metrics are therefore reported
+  strictly as **`cost per $1M modeled target turnover`** (`$ / $1M` break-even point
+  valuation), never as certified `eligible turnover`.
 
 ---
 

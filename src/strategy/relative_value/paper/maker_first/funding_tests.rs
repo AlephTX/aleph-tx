@@ -32,6 +32,7 @@ fn cycle(at: u64) -> Cycle {
         paired_at_ms: None,
         hedge_fill_at_ms: None,
         paired_basis_bps: None,
+        paired_mids: [None, None],
         closing_maker_filled: false,
         forced_ioc_filled: false,
     }

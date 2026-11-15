@@ -51,7 +51,8 @@ class ContinuousSourceTests(unittest.TestCase):
                     target='lighter_robinhood', target_market_id=42)
             self.assertEqual(report['explicit_feed_states_by_leg'], [2, 2])
             for _, policy in turnover_policies(pair, window, ('0', '0')):
-                self.assertEqual(policy['maker_cancel_delay_ms'], 300)
+                self.assertEqual(policy['maker_create_delay_ms'], 200)
+                self.assertEqual(policy['maker_cancel_delay_ms'], 200)
                 self.assertEqual(policy['taker_delay_ms'], [300, 300])
             with self.assertRaisesRegex(ValueError, 'native market ID'):
                 turnover_input(root, 'BTC', window, root/'invalid.ndjson', target='lighter_robinhood')

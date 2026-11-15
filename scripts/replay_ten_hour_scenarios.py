@@ -279,7 +279,11 @@ def turnover_policies(pair, window, fees, trade_delivery_ms=750, cost_caps=(0, 4
     start, end, stop = (window[k] for k in ("start_ms", "end_ms", "drain_until_ms"))
     if pair["legs"][0]["venue"] != "lighter" or pair["legs"][1]["venue"] not in ("arcus", "extended", "hyperliquid", "lighter_robinhood"):
         raise ValueError("expected Core Lighter hedge and a supported target domain")
-    target_delay = 300 if pair["legs"][1]["venue"] == "lighter_robinhood" else 0
+    is_rh = pair["legs"][1]["venue"] == "lighter_robinhood"
+    # Official Lighter Robinhood Standard sequencer speed-bumps: 200ms Maker / 200ms Cancel / 300ms Taker.
+    maker_create_delay = 200 if is_rh else 0
+    maker_cancel_delay = 200 if is_rh else 0
+    target_taker_delay = 300 if is_rh else 0
     for capital, size in CAPITAL_SIZES:
         for posture in POSTURES:
             for cost in cost_caps:
@@ -293,8 +297,10 @@ def turnover_policies(pair, window, fees, trade_delivery_ms=750, cost_caps=(0, 4
                                       "eligible_until_ms": end, "max_cost_bps": str(cost)}}
                 yield label, {"pair": pair | {"legs": legs, "mode": mode},
                     "maker_leg": 1, "start_ms": start, "end_ms": stop,
-                    "transport_ms": 250, "fill_notice_ms": 100, "maker_cancel_delay_ms": target_delay,
-                    "taker_delay_ms": [300, target_delay], "trade_clock_guard_ms": 100,
+                    "transport_ms": 250, "fill_notice_ms": 100,
+                    "maker_create_delay_ms": maker_create_delay,
+                    "maker_cancel_delay_ms": maker_cancel_delay,
+                    "taker_delay_ms": [300, target_taker_delay], "trade_clock_guard_ms": 100,
                     "trade_delivery_grace_ms": trade_delivery_ms, "quote_lifetime_ms": 800,
                     "reprice_ms": 100, "hold_ms": 15_000, "unhedged_timeout_ms": 2500,
                     "drain_ms": 15_000, "require_net_edge": True,

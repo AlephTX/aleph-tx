@@ -223,6 +223,8 @@ pub struct RecordedMakerConfig {
     initial_equity: f64,
     order_entry_ms: u64,
     #[serde(default)]
+    venue_maker_delay_ms: u64,
+    #[serde(default)]
     venue_cancel_delay_ms: u64,
     #[serde(default)]
     venue_taker_delay_ms: u64,
@@ -350,6 +352,7 @@ impl RecordedMakerConfig {
             (0.0..=100_000_000.0).contains(&self.initial_equity)
                 && self.initial_equity > 0.0
                 && (1..=2_000).contains(&self.order_entry_ms)
+                && self.venue_maker_delay_ms <= 2_000
                 && self.venue_cancel_delay_ms <= 2_000
                 && self.venue_taker_delay_ms <= 2_000
                 && self.market_data_delay_ms <= 2_000
@@ -685,7 +688,11 @@ impl Matching {
                 }),
                 ..Default::default()
             }),
-            entry: Duration::from_millis(config.order_entry_ms),
+            entry: Duration::from_millis(
+                config
+                    .order_entry_ms
+                    .saturating_add(config.venue_maker_delay_ms),
+            ),
             cancel_transport: Duration::from_millis(
                 config.cancel_transport_ms.unwrap_or(config.order_entry_ms),
             ),
@@ -1821,6 +1828,7 @@ mod tests {
             drain_until_ms: START + 2_000,
             initial_equity: 1_000.0,
             order_entry_ms: 250,
+            venue_maker_delay_ms: 0,
             venue_cancel_delay_ms: 300,
             venue_taker_delay_ms: 140,
             market_data_delay_ms: 0,

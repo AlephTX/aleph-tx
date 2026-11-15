@@ -451,6 +451,10 @@ pub struct InventoryNeutralMM {
     shm_depth_reader: Option<crate::shm_depth_reader::ShmDepthReader>,
     account_stats_reader: AccountStatsReader,
     account_stats: AccountStats,
+    /// Fair-mark anchor (`Decimal`) latched on the first price evaluation after each
+    /// `AccountStats` update so intra-snapshot price drops immediately adjust unrealized
+    /// equity in `lighter::risk::evaluate_margin_health` without double-counting Lighter's mark.
+    account_stats_fair_mark_anchor: Option<rust_decimal::Decimal>,
     micro: MicrostructureTracker,
     sigma: TimeScaledVolatility,
     basis: BasisTracker,
@@ -589,6 +593,7 @@ impl InventoryNeutralMM {
             shm_depth_reader,
             account_stats_reader,
             account_stats: AccountStats::default(),
+            account_stats_fair_mark_anchor: None,
             active_orders: Vec::with_capacity(32),
             session_start_balance: 0.0,
             daily_loss_state: None,
@@ -688,6 +693,7 @@ impl InventoryNeutralMM {
         self.refresh_active_orders_from_tracker();
         if let Some(stats) = self.account_stats_reader.read_if_updated() {
             self.account_stats = stats.into();
+            self.account_stats_fair_mark_anchor = None;
         }
 
         if self.order_tracker.needs_reconciliation() {
@@ -766,6 +772,27 @@ impl InventoryNeutralMM {
         };
 
         self.update_episode_cost_basis();
+
+        if let Some((fair_mark_f64, margin_health)) = self.evaluate_lighter_margin_health(&inputs)
+            && margin_health.regime != crate::exchanges::lighter::risk::MarginRegime::Healthy
+        {
+            warn!(
+                "Lighter Fair-Mark margin guard ({:?}): equity=${} mult={:?} fair_mark={:.4} partial_liq={:?} zero_px={:?}; deleveraging proactively",
+                margin_health.regime,
+                margin_health.account_value.round_dp(2),
+                margin_health.maintenance_multiple.map(|m| m.round_dp(3)),
+                fair_mark_f64,
+                margin_health
+                    .partial_liquidation_mark
+                    .map(|m| m.round_dp(2)),
+                margin_health.zero_price_trigger_mark.map(|m| m.round_dp(2)),
+            );
+            self.handle_low_margin_flatten(fair_mark_f64).await;
+            if self.hedged_low_margin {
+                anyhow::bail!("Low margin while hedged; unwinding both legs");
+            }
+            return Ok(CycleOutcome::Quoted);
+        }
 
         // Inventory age follows the exposure episode, not the last fill.
         // Adding to a stuck position must never renew its timeout.
@@ -847,6 +874,67 @@ impl InventoryNeutralMM {
                 .context("Lighter daily loss check failed")?;
         }
         Ok(())
+    }
+
+    /// Evaluates exact Lighter 3-way median Fair Mark Price and `1.8x` maintenance-margin
+    /// pre-liquidation regime (`crate::exchanges::lighter::risk`), adjusting reported
+    /// `portfolio_value` for intra-snapshot Fair Mark drift while clamping spoofed local books.
+    fn evaluate_lighter_margin_health(
+        &mut self,
+        inputs: &PricingInputs,
+    ) -> Option<(f64, crate::exchanges::lighter::risk::AccountMarginHealth)> {
+        use crate::exchanges::lighter::risk::{
+            DEFAULT_IMPACT_CLAMP_RATIO, evaluate_margin_health, fair_mark_price,
+        };
+        use rust_decimal::{Decimal, prelude::ToPrimitive};
+
+        let index_px = Decimal::from_f64_retain(inputs.pricing_mid)?;
+        let impact_bid = Decimal::from_f64_retain(inputs.bid_touch)?;
+        let impact_ask = Decimal::from_f64_retain(inputs.ask_touch)?;
+        let ema_raw = if self.micro.ema_initialized
+            && self.micro.ema_slow.is_finite()
+            && self.micro.ema_slow > 0.0
+        {
+            self.micro.ema_slow
+        } else {
+            inputs.mid
+        };
+        let ema_px = Decimal::from_f64_retain(ema_raw)?;
+        let fair_mark = fair_mark_price(
+            index_px,
+            impact_bid,
+            impact_ask,
+            ema_px,
+            DEFAULT_IMPACT_CLAMP_RATIO,
+        )
+        .ok()?;
+        let anchor_mark = *self.account_stats_fair_mark_anchor.get_or_insert(fair_mark);
+
+        let pos_f64 = if self.account_stats.position.abs() >= self.config.step_size {
+            self.account_stats.position
+        } else {
+            0.0
+        };
+        let signed_pos = Decimal::from_f64_retain(pos_f64)?;
+        let snapshot_equity =
+            Decimal::from_f64_retain(self.account_stats.portfolio_value.max(0.0))?;
+        let mmf_f64 = self.config.effective_maintenance_margin_fraction();
+        let mmf = Decimal::from_f64_retain(mmf_f64)?;
+        let close_out = mmf / Decimal::TWO;
+        let safety_mult = Decimal::from_f64_retain(self.config.pre_liquidation_safety_multiple)?;
+
+        let health = evaluate_margin_health(
+            snapshot_equity,
+            signed_pos,
+            anchor_mark,
+            fair_mark,
+            mmf,
+            close_out,
+            safety_mult,
+        )
+        .ok()?;
+        let fair_mark_f64 = fair_mark.to_f64().unwrap_or(inputs.pricing_mid);
+        Some((fair_mark_f64, health))
     }
 
     fn quote_allowance(&self, confirmed: f64, short: f64, long: f64) -> Option<QuoteAllowance> {
@@ -1327,6 +1415,7 @@ impl InventoryNeutralMM {
                 .is_none_or(|required| snapshot.position_updated_at >= required);
             if stats.is_usable() && after_actions {
                 self.account_stats = stats;
+                self.account_stats_fair_mark_anchor = None;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1561,6 +1650,7 @@ impl InventoryNeutralMM {
             // fallback API here because LighterTrading currently returns placeholders.
             if let Some(stats) = self.account_stats_reader.read_if_updated() {
                 self.account_stats = stats.into();
+                self.account_stats_fair_mark_anchor = None;
                 self.check_daily_loss()?;
             }
 
@@ -2701,6 +2791,7 @@ impl InventoryNeutralMM {
 
         if let Some(stats) = self.account_stats_reader.read_if_updated() {
             self.account_stats = stats.into();
+            self.account_stats_fair_mark_anchor = None;
         }
         let position = position_for_quoting(
             &self.config,

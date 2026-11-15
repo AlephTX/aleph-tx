@@ -394,6 +394,14 @@ pub struct InventoryNeutralMMConfig {
     /// Fraction of leveraged usable balance targeted by resting top-level quotes.
     #[serde(default = "default_target_resting_margin_utilization")]
     pub target_resting_margin_utilization: f64, // default: 0.35
+    /// Optional explicit Lighter maintenance margin fraction (e.g. `0.012` for 1.2% ETH/BTC MMF).
+    /// When `None`, derived conservatively from `max_leverage` as
+    /// `(0.25 / max_leverage).min(0.8 / (max_leverage * pre_liquidation_safety_multiple))`.
+    #[serde(default)]
+    pub maintenance_margin_fraction: Option<f64>,
+    /// Proactive deleverage multiple over maintenance margin (`1.8` = exit before 1% LLP fee zone).
+    #[serde(default = "default_pre_liquidation_safety_multiple")]
+    pub pre_liquidation_safety_multiple: f64,
     // Post-Only: use ALO (Add Liquidity Only) to guarantee maker fees
     #[serde(default)]
     pub use_post_only: bool, // default: false (GTC), true = Post-Only
@@ -733,6 +741,21 @@ impl InventoryNeutralMMConfig {
             "{name}: target_resting_margin_utilization must be in (0, 1]"
         );
         anyhow::ensure!(
+            self.pre_liquidation_safety_multiple.is_finite()
+                && self.pre_liquidation_safety_multiple > 1.0
+                && self.pre_liquidation_safety_multiple <= 10.0,
+            "{name}: pre_liquidation_safety_multiple must be in (1.0, 10.0]"
+        );
+        if let Some(mmf) = self.maintenance_margin_fraction {
+            anyhow::ensure!(
+                mmf.is_finite()
+                    && mmf > 0.0
+                    && mmf < 0.5
+                    && mmf * self.pre_liquidation_safety_multiple < 1.0,
+                "{name}: maintenance_margin_fraction must be in (0.0, 0.5) with mmf * safety_multiple < 1.0"
+            );
+        }
+        anyhow::ensure!(
             (self.exchange_id == EXCH_LIGHTER || self.exchange_id == EXCH_LIGHTER_ROBINHOOD)
                 && (1..MAX_SYMBOL_ID).contains(&self.symbol_id),
             "{name}: expected Lighter (2 or 8) and an SHM symbol ID in 1..{}",
@@ -862,6 +885,8 @@ impl InventoryNeutralMMConfig {
             local_staleness_ms: self.local_staleness_ms,
             stale_bbo_cancel_ms: self.stale_bbo_cancel_ms,
             target_resting_margin_utilization: self.target_resting_margin_utilization,
+            maintenance_margin_fraction: self.maintenance_margin_fraction,
+            pre_liquidation_safety_multiple: self.pre_liquidation_safety_multiple,
             use_post_only: self.use_post_only,
             poll_interval_ms: self.poll_interval_ms,
             min_cycle_interval_ms: self.min_cycle_interval_ms,
@@ -882,6 +907,20 @@ impl InventoryNeutralMMConfig {
     pub fn primary_reference_exchange_id(&self) -> u8 {
         self.primary_reference_exchange.unwrap_or(EXCH_HYPERLIQUID)
     }
+
+    /// Maintenance margin fraction used by runtime `lighter::risk::evaluate_margin_health`.
+    #[inline]
+    pub fn effective_maintenance_margin_fraction(&self) -> f64 {
+        self.maintenance_margin_fraction.unwrap_or_else(|| {
+            let from_lev = 0.25 / self.max_leverage;
+            let below_imf = 0.80 / (self.max_leverage * self.pre_liquidation_safety_multiple);
+            from_lev.min(below_imf).clamp(0.005, 0.25)
+        })
+    }
+}
+
+fn default_pre_liquidation_safety_multiple() -> f64 {
+    1.8
 }
 
 impl Default for InventoryNeutralMMConfig {
@@ -938,6 +977,8 @@ impl Default for InventoryNeutralMMConfig {
             local_staleness_ms: default_local_staleness_ms(),
             stale_bbo_cancel_ms: default_stale_bbo_cancel_ms(),
             target_resting_margin_utilization: default_target_resting_margin_utilization(),
+            maintenance_margin_fraction: None,
+            pre_liquidation_safety_multiple: default_pre_liquidation_safety_multiple(),
             use_post_only: false,
             poll_interval_ms: 100,
             min_cycle_interval_ms: default_min_cycle_interval_ms(),
@@ -1140,19 +1181,26 @@ impl AppConfig {
                     );
                 }
 
-                // 2. Within the same L1 master wallet, Lighter enforces cross-subaccount STP:
-                //    two subaccounts cannot rest/take on the same market_id or symbol simultaneously,
-                //    nor share the same logical subaccount_slot.
-                if l1_a == l1_b && mm_a.exchange_id == mm_b.exchange_id {
+                // 2. Owner-wide self-trade & wash-trade block:
+                //    Lighter native STP only prevents self-trades within a single account
+                //    (not across subaccounts), and Lighter Terms & Points rules prohibit
+                //    wash/self-trading across ANY commonly-controlled accounts regardless
+                //    of whether they share an L1 wallet (`l1_group`) or use separate wallets.
+                //    Therefore, no two profiles in an operator-controlled fleet on the same
+                //    venue domain may trade the same `market_id` or `symbol` simultaneously.
+                if mm_a.exchange_id == mm_b.exchange_id {
                     anyhow::ensure!(
                         mm_a.market_id != mm_b.market_id
                             && mm_a.symbol_id != mm_b.symbol_id
                             && sym_a != sym_b,
-                        "Cross-subaccount STP market collision in L1 group '{l1_a}' between {name_a} ({sym_a}, market_id={}) and {name_b} ({sym_b}, market_id={}): use distinct markets or separate L1 wallets",
+                        "Common-control self-trade / wash-trade market collision between {name_a} ({sym_a}, market_id={}, l1_group='{l1_a}') and {name_b} ({sym_b}, market_id={}, l1_group='{l1_b}'): operator-controlled fleet profiles cannot trade the same venue market simultaneously even across separate subaccounts or L1 wallets",
                         mm_a.market_id,
                         mm_b.market_id
                     );
-                    if let (Some(slot_a), Some(slot_b)) = (
+                }
+                if l1_a == l1_b
+                    && mm_a.exchange_id == mm_b.exchange_id
+                    && let (Some(slot_a), Some(slot_b)) = (
                         cfg_a
                             .deployment
                             .as_ref()
@@ -1161,12 +1209,12 @@ impl AppConfig {
                             .deployment
                             .as_ref()
                             .and_then(|d| d.subaccount_slot.as_deref()),
-                    ) {
-                        anyhow::ensure!(
-                            slot_a != slot_b,
-                            "Subaccount slot collision in L1 group '{l1_a}' between {name_a} and {name_b}: both claim subaccount_slot='{slot_a}'"
-                        );
-                    }
+                    )
+                {
+                    anyhow::ensure!(
+                        slot_a != slot_b,
+                        "Subaccount slot collision in L1 group '{l1_a}' between {name_a} and {name_b}: both claim subaccount_slot='{slot_a}'"
+                    );
                 }
             }
         }
@@ -1377,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_isolation_rejects_same_l1_stp_collision_and_accepts_disjoint_markets_or_l1s() {
+    fn fleet_isolation_rejects_same_market_across_any_l1_and_accepts_disjoint_markets() {
         let eth_quant = AppConfig {
             deployment: Some(DeploymentIsolationConfig {
                 scenario: ResearchScenario::QuantProfit,
@@ -1402,11 +1450,29 @@ mod tests {
             hedge_account_slot: Some("hl_btc_hedge".into()),
         });
 
-        // Disjoint markets under the same L1 pass STP check.
-        AppConfig::validate_fleet_isolation([("eth_quant", &eth_quant), ("btc_hedge", &btc_hedge)])
-            .unwrap();
+        let mut sol_turnover = AppConfig::default();
+        sol_turnover.symbols.insert("SOL".into(), 1003);
+        if let Some(mm) = &mut sol_turnover.inventory_neutral_mm {
+            mm.symbol_id = 1003;
+            mm.market_id = 2;
+        }
+        sol_turnover.deployment = Some(DeploymentIsolationConfig {
+            scenario: ResearchScenario::IncentiveTurnover,
+            l1_group: "turnover_l1".into(),
+            subaccount_slot: Some("sub_1_sol_turnover".into()),
+            expected_account_index: Some(201),
+            hedge_account_slot: None,
+        });
 
-        // Same market under a DIFFERENT L1 wallet also passes STP check.
+        // Disjoint markets pass fleet isolation across both same and separate L1 groups.
+        AppConfig::validate_fleet_isolation([
+            ("eth_quant", &eth_quant),
+            ("btc_hedge", &btc_hedge),
+            ("sol_turnover", &sol_turnover),
+        ])
+        .unwrap();
+
+        // Same market under a DIFFERENT L1 wallet MUST FAIL common-control wash/self-trade block!
         let eth_turnover_other_l1 = AppConfig {
             deployment: Some(DeploymentIsolationConfig {
                 scenario: ResearchScenario::IncentiveTurnover,
@@ -1417,25 +1483,35 @@ mod tests {
             }),
             ..AppConfig::default()
         };
-        AppConfig::validate_fleet_isolation([
+        let err_other_l1 = AppConfig::validate_fleet_isolation([
             ("eth_quant", &eth_quant),
-            ("btc_hedge", &btc_hedge),
             ("eth_turnover", &eth_turnover_other_l1),
         ])
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            err_other_l1
+                .to_string()
+                .contains("Common-control self-trade / wash-trade market collision"),
+            "{err_other_l1}"
+        );
 
-        // Same market under the SAME L1 wallet fails STP check!
+        // Same market under the SAME L1 wallet also fails!
         let mut eth_collision = eth_turnover_other_l1.clone();
         eth_collision.deployment.as_mut().unwrap().l1_group = "primary_l1".into();
-        let err = AppConfig::validate_fleet_isolation([
+        let err_same_l1 = AppConfig::validate_fleet_isolation([
             ("eth_quant", &eth_quant),
             ("eth_collision", &eth_collision),
         ])
         .unwrap_err();
-        assert!(err.to_string().contains("STP market collision"));
+        assert!(
+            err_same_l1
+                .to_string()
+                .contains("Common-control self-trade / wash-trade market collision"),
+            "{err_same_l1}"
+        );
 
-        // Duplicate expected_account_index fails even across L1 labels!
-        let mut dup_idx = eth_turnover_other_l1.clone();
+        // Duplicate expected_account_index fails even across disjoint markets and L1 labels!
+        let mut dup_idx = sol_turnover.clone();
         dup_idx.deployment.as_mut().unwrap().expected_account_index = Some(101);
         assert!(
             AppConfig::validate_fleet_isolation([("eth_quant", &eth_quant), ("dup_idx", &dup_idx)])

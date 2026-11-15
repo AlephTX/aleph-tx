@@ -313,6 +313,7 @@ feed post-trade attribution on `aleph` with zero impact on order/cancel latency:
    ~/aleph-tx-lakehouse/.venv/bin/python scripts/live_attribution.py \
      --telemetry-db ~/aleph-tx-lakehouse/private_telemetry/telemetry-latest.sqlite3.gz \
      --duckdb "$ALEPH_DUCKDB_PATH" \
+     --collector-region tokyo \
      --local-market lighter_robinhood:robinhood:1 \
      --reference-markets binance:usdm:BTCUSDT arcus:mainnet:BTC-USD trade_xyz:hip3-xyz:xyz:NVDA \
      --markdown-out ~/aleph-tx-lakehouse/private_telemetry/attribution_latest.md

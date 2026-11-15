@@ -950,34 +950,39 @@ taker_fee_bps = 4.5
         fs::write(&p_hedge_btc_path, &hedge_btc_toml).unwrap();
         let p_hedge_btc = Profile::load(&p_hedge_btc_path).unwrap();
 
-        let p_turnover_path = dir.join("turnover_separate_l1.toml");
-        let turnover_toml = format!(
-            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"incentive_turnover\"\nl1_group = \"turnover_l1\"\nsubaccount_slot = \"sub_eth_turnover\"\nexpected_account_index = 20\n",
-            example
+        let p_turnover_rh_path = dir.join("turnover_rh_eth.toml");
+        let turnover_rh_toml = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"incentive_turnover\"\nl1_group = \"turnover_l1\"\nsubaccount_slot = \"sub_eth_rh_turnover\"\nexpected_account_index = 20\n",
+            example.replace(
+                "wss://mainnet.zklighter.elliot.ai/stream",
+                "wss://api.rh.lighter.xyz/stream"
+            )
         );
-        fs::write(&p_turnover_path, &turnover_toml).unwrap();
-        let p_turnover = Profile::load(&p_turnover_path).unwrap();
+        fs::write(&p_turnover_rh_path, &turnover_rh_toml).unwrap();
+        let p_turnover_rh = Profile::load(&p_turnover_rh_path).unwrap();
 
         Profile::validate_isolation(&[
             ("quant_eth", p_quant),
             ("hedge_btc", p_hedge_btc),
-            ("turnover_eth", p_turnover),
+            ("turnover_rh_eth", p_turnover_rh),
         ])
         .unwrap();
 
-        // Same L1 + same market (ETH market_id=0) must be rejected for STP collision.
-        let p_collision_path = dir.join("collision_eth.toml");
-        fs::write(
-            &p_collision_path,
-            turnover_toml.replace("turnover_l1", "primary_l1"),
-        )
-        .unwrap();
+        // Same domain (CoreMainnet) + same market (ETH market_id=0) MUST be rejected even
+        // when configured on a DIFFERENT L1 group (`turnover_l1`), preventing common-control
+        // self-trading / wash-trading across operator-owned accounts.
+        let p_other_l1_collision_path = dir.join("collision_other_l1_eth.toml");
+        let other_l1_collision_toml = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"incentive_turnover\"\nl1_group = \"turnover_l1\"\nsubaccount_slot = \"sub_eth_turnover\"\nexpected_account_index = 20\n",
+            example
+        );
+        fs::write(&p_other_l1_collision_path, &other_l1_collision_toml).unwrap();
         let p_quant_again = Profile::load(&p_quant_path).unwrap();
-        let p_collision = Profile::load(&p_collision_path).unwrap();
+        let p_other_l1_collision = Profile::load(&p_other_l1_collision_path).unwrap();
         assert!(
             Profile::validate_isolation(&[
                 ("quant_eth", p_quant_again),
-                ("collision", p_collision)
+                ("collision_other_l1", p_other_l1_collision)
             ])
             .is_err()
         );

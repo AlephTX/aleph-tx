@@ -1,14 +1,17 @@
-# Scenario 3 (Incentive Turnover) — Isolated Zero-Fee Maker Turnover Template
-# Bound to a separate L1 group ("turnover_l1") so ETH quoting never triggers
-# Lighter cross-subaccount STP against Scenario 1 ("primary_l1") and maintains
-# an independent capital, loss, and turnover ledger.
+# Scenario 3 (Incentive Turnover) — Isolated Robinhood Chain Zero-Fee Maker Turnover Template
+# Targets Lighter Robinhood Chain (`wss://api.rh.lighter.xyz/stream`, `chain_id = 466324`),
+# a distinct orderbook/domain from Scenario 1 (`CoreMainnet ETH`), with an independent
+# capital, loss, and turnover ledger (`l1_group = "turnover_l1"`).
+# NOTE: Lighter native STP is single-account only (not cross-subaccount), and Lighter Terms &
+# Points rules prohibit wash/self-trading across ALL commonly-controlled accounts regardless of
+# L1 wallet. Never run two operator-controlled profiles on the same `(domain, market_id)`.
 
 strategy_mode = "quant"
 
 [deployment]
 scenario = "incentive_turnover"
 l1_group = "turnover_l1"
-subaccount_slot = "sub_eth_turnover"
+subaccount_slot = "sub_eth_rh_turnover"
 
 [symbols]
 BTC = 1001
@@ -16,7 +19,7 @@ ETH = 1002
 
 [lighter]
 feeder_enabled = true
-feeder_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+feeder_ws_url = "wss://api.rh.lighter.xyz/stream"
 feeder_symbols = { ETH = "0" }
 exchange_id = 2
 

@@ -36,10 +36,14 @@ class LiveAttributionTests(unittest.TestCase):
         avail_ms: int,
         bid: float,
         ask: float,
+        collector_region: str = "tokyo",
+        campaign_id: str = "tokyo-w01",
     ) -> dict:
         mid = (bid + ask) / 2.0
         spread_bps = ((ask - bid) / mid) * 10_000.0
         return {
+            "campaign_id": campaign_id,
+            "collector_region": collector_region,
             "venue": venue,
             "domain": domain,
             "market": market,
@@ -256,6 +260,244 @@ class LiveAttributionTests(unittest.TestCase):
                             self.assertIsNone(d_val)
                         else:
                             self.assertAlmostEqual(d_val, p_val, places=9)
+
+    def test_horizon_lag_caps_region_isolation_and_disconnect_barriers(self) -> None:
+        telemetry = {
+            "session": {
+                "session_id": "live-guard-01",
+                "exchange": "lighter",
+                "symbol": "NVDA",
+            },
+            "orders": {201: {"client_order_id": 201, "created_ms": self.t0 + 800}},
+            "hedge_fills": [],
+            "fills": [
+                {
+                    "trade_id": 9001,
+                    "client_order_id": 201,
+                    "side": "buy",
+                    "price": 100.0,
+                    "size": 1.0,
+                    "notional": 100.0,
+                    "ts_ms": self.t0 + 1000,
+                    "exchange_ts_ns": (self.t0 + 1000) * 1_000_000,
+                    "fee": 0.0,
+                    "fee_source": "explicit_zero",
+                }
+            ],
+        }
+
+        # 1) Querying DuckDB or Parquet without explicit collector_region MUST fail fast.
+        with self.assertRaises(ValueError):
+            attribute_session(
+                telemetry,
+                duckdb_path=self.root / "dummy.duckdb",
+                local_market_key="lighter_robinhood:robinhood:1",
+                reference_market_keys=["arcus:mainnet:NVDA-USD"],
+            )
+        with self.assertRaises(ValueError):
+            attribute_session(
+                telemetry,
+                parquet_bbo_glob=str(self.root / "*.parquet"),
+                local_market_key="lighter_robinhood:robinhood:1",
+                reference_market_keys=["arcus:mainnet:NVDA-USD"],
+            )
+
+        # 2) Region isolation + horizon-proportional lag cap + disconnect barriers:
+        #    - Taiwan quote at t0+1105 MUST be ignored when collector_region='tokyo'.
+        #    - Tokyo Arcus quote at t0+5100 (+4,000ms after +100ms target) MUST NOT match
+        #      +100ms (max_lag=50ms) or +500ms (max_lag=250ms), only +5000ms if post-5000ms!
+        #      Add a valid +6020ms quote (+20ms lag on +5000ms <= 2500ms).
+        #    - Shared Hyperliquid WS disconnect at t0+1300 (`venue='hyperliquid', domain='shared',
+        #      raw_source='hyperliquid', market=None`) MUST leave `trade_xyz` +100ms (t0+1110)
+        #      intact while invalidating `trade_xyz` +500ms (t0+1510) and +5000ms (t0+6015)!
+        #    - Local `lighter_robinhood` disconnect at t0+998 (between q0=t0+990 and fill=t0+1000)
+        #      MUST invalidate `at_fill` on `local_book`!
+        bbo_rows = [
+            self._bbo_row(
+                seq=1,
+                venue="lighter_robinhood",
+                domain="robinhood",
+                market="1",
+                avail_ms=self.t0 + 990,
+                bid=99.95,
+                ask=100.05,
+                collector_region="tokyo",
+            ),
+            self._bbo_row(
+                seq=2,
+                venue="arcus",
+                domain="mainnet",
+                market="NVDA-USD",
+                avail_ms=self.t0 + 995,
+                bid=99.90,
+                ask=100.10,
+                collector_region="tokyo",
+            ),
+            # Taiwan quote right on +100ms target (t0+1105) — must NOT leak into Tokyo attribution!
+            self._bbo_row(
+                seq=3,
+                venue="arcus",
+                domain="mainnet",
+                market="NVDA-USD",
+                avail_ms=self.t0 + 1105,
+                bid=90.00,
+                ask=90.10,
+                collector_region="taiwan",
+            ),
+            # Late Tokyo Arcus quote at t0+5100 (+4,000ms after +100ms; before +5000ms=t0+6000)
+            self._bbo_row(
+                seq=4,
+                venue="arcus",
+                domain="mainnet",
+                market="NVDA-USD",
+                avail_ms=self.t0 + 5100,
+                bid=98.00,
+                ask=98.20,
+                collector_region="tokyo",
+            ),
+            # Timely Tokyo Arcus quote for +5000ms (t0+6020 -> lag=20ms <= 2500ms)
+            self._bbo_row(
+                seq=5,
+                venue="arcus",
+                domain="mainnet",
+                market="NVDA-USD",
+                avail_ms=self.t0 + 6020,
+                bid=99.70,
+                ask=99.90,
+                collector_region="tokyo",
+            ),
+            # TradeXYZ quotes before fill, at +110ms (before t0+1300 disconnect), and at +510ms / +5015ms (after disconnect)
+            self._bbo_row(
+                seq=6,
+                venue="trade_xyz",
+                domain="hip3-xyz",
+                market="xyz:NVDA",
+                avail_ms=self.t0 + 996,
+                bid=99.95,
+                ask=100.05,
+                collector_region="tokyo",
+            ),
+            self._bbo_row(
+                seq=7,
+                venue="trade_xyz",
+                domain="hip3-xyz",
+                market="xyz:NVDA",
+                avail_ms=self.t0 + 1110,
+                bid=99.85,
+                ask=99.95,
+                collector_region="tokyo",
+            ),
+            self._bbo_row(
+                seq=8,
+                venue="trade_xyz",
+                domain="hip3-xyz",
+                market="xyz:NVDA",
+                avail_ms=self.t0 + 1510,
+                bid=97.00,
+                ask=97.10,
+                collector_region="tokyo",
+            ),
+            self._bbo_row(
+                seq=9,
+                venue="trade_xyz",
+                domain="hip3-xyz",
+                market="xyz:NVDA",
+                avail_ms=self.t0 + 6015,
+                bid=96.00,
+                ask=96.10,
+                collector_region="tokyo",
+            ),
+        ]
+        lifecycle_rows = [
+            {
+                "campaign_id": "tokyo-w01",
+                "collector_region": "tokyo",
+                "venue": "lighter_robinhood",
+                "domain": "robinhood",
+                "raw_source": "lighter_robinhood",
+                "market": None,
+                "sequence": 10,
+                "available_at_ms": self.t0 + 998,
+                "event": "disconnect",
+            },
+            {
+                "campaign_id": "tokyo-w01",
+                "collector_region": "tokyo",
+                "venue": "hyperliquid",
+                "domain": "shared",
+                "raw_source": "hyperliquid",
+                "market": None,
+                "sequence": 11,
+                "available_at_ms": self.t0 + 1300,
+                "event": "disconnect",
+            },
+        ]
+        bbo_path = self.root / "guard_bbo.ndjson"
+        lfc_path = self.root / "guard_lifecycle.ndjson"
+        bbo_path.write_text("".join(json.dumps(r) + "\n" for r in bbo_rows), encoding="utf-8")
+        lfc_path.write_text(
+            "".join(json.dumps(r) + "\n" for r in lifecycle_rows), encoding="utf-8"
+        )
+
+        py_rep = attribute_session(
+            telemetry,
+            bbo_ndjson_path=bbo_path,
+            lifecycle_ndjson_path=lfc_path,
+            collector_region="tokyo",
+            campaign_id="tokyo-w01",
+            local_market_key="lighter_robinhood:robinhood:1",
+            reference_market_keys=["arcus:mainnet:NVDA-USD", "trade_xyz:hip3-xyz:xyz:NVDA"],
+            horizons_ms=(100, 500, 5_000),
+            prefer_duckdb=False,
+        )
+        fill = py_rep["fills"][0]
+        # Pre-fill disconnect at t0+998 invalidated local q0=t0+990
+        self.assertIsNone(fill["local_book"]["at_fill_mid"])
+        # Arcus: Taiwan t0+1105 and late Tokyo t0+5100 both rejected on 100ms & 500ms; 5000ms matched t0+6020 (lag 20ms)
+        arcus_ref = fill["references"]["arcus:mainnet:NVDA-USD"]
+        self.assertAlmostEqual(arcus_ref["at_fill_mid"], 100.0)
+        self.assertIsNone(arcus_ref["markouts_bps"]["100ms"])
+        self.assertIsNone(arcus_ref["markouts_bps"]["500ms"])
+        self.assertAlmostEqual(arcus_ref["markouts_bps"]["5000ms"], -20.0)
+        self.assertEqual(arcus_ref["markouts_lag_ms"]["5000ms"], 20)
+        # TradeXYZ: +100ms (t0+1110, lag 10ms) before t0+1300 disconnect succeeds; +500ms & +5000ms after disconnect are invalidated!
+        xyz_ref = fill["references"]["trade_xyz:hip3-xyz:xyz:NVDA"]
+        self.assertAlmostEqual(xyz_ref["markouts_bps"]["100ms"], -10.0)
+        self.assertEqual(xyz_ref["markouts_lag_ms"]["100ms"], 10)
+        self.assertIsNone(xyz_ref["markouts_bps"]["500ms"])
+        self.assertIsNone(xyz_ref["markouts_bps"]["5000ms"])
+
+        has_duck = (
+            live_attribution._duckdb_mod is not None
+            or shutil.which("duckdb") is not None
+            or (Path.home() / ".local" / "bin" / "duckdb").is_file()
+        )
+        if has_duck:
+            duck_rep = attribute_session(
+                telemetry,
+                bbo_ndjson_path=bbo_path,
+                lifecycle_ndjson_path=lfc_path,
+                collector_region="tokyo",
+                campaign_id="tokyo-w01",
+                local_market_key="lighter_robinhood:robinhood:1",
+                reference_market_keys=["arcus:mainnet:NVDA-USD", "trade_xyz:hip3-xyz:xyz:NVDA"],
+                horizons_ms=(100, 500, 5_000),
+                prefer_duckdb=True,
+            )
+            self.assertEqual(duck_rep["engine"], "duckdb_asof")
+            self.assertIsNone(duck_rep["fills"][0]["local_book"]["at_fill_mid"])
+            for rk in ("arcus:mainnet:NVDA-USD", "trade_xyz:hip3-xyz:xyz:NVDA"):
+                self.assertEqual(
+                    duck_rep["fills"][0]["references"][rk]["markouts_lag_ms"],
+                    py_rep["fills"][0]["references"][rk]["markouts_lag_ms"],
+                )
+                for hk in ("100ms", "500ms", "5000ms"):
+                    p_v = py_rep["fills"][0]["references"][rk]["markouts_bps"][hk]
+                    d_v = duck_rep["fills"][0]["references"][rk]["markouts_bps"][hk]
+                    if p_v is None:
+                        self.assertIsNone(d_v)
+                    else:
+                        self.assertAlmostEqual(d_v, p_v, places=9)
 
 
 if __name__ == "__main__":

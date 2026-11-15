@@ -30,6 +30,21 @@ from archive_public_capture import digest, records
 
 LIGHTER_RATE_TO_BPS = Decimal("100")       # 1% / hour = 100 bps / hour
 HYPERLIQUID_RATE_TO_BPS = Decimal("10000") # 1.0 / hour = 10000 bps / hour
+TEN_HOUR_MS = 10 * 3_600_000
+TEN_MIN_BUCKET_MS = 10 * 60_000
+REQUIRED_10M_BUCKETS = 60
+BOOK_SOURCES = frozenset(
+    {
+        "lighter",
+        "lighter_robinhood",
+        "binance",
+        "coinbase",
+        "hyperliquid",
+        "arcus",
+        "extended",
+        "bulk",
+    }
+)
 
 
 def _iter_raw_lines(target: Path):
@@ -134,9 +149,15 @@ def audit_readiness(
     *,
     lighter_leverage: Decimal = Decimal("5"),
     hedge_leverage: Decimal = Decimal("5"),
+    max_overall_gap_ms: int = 15_000,
+    max_source_gap_ms: int = 60_000,
+    session_gated_sources: tuple[str, ...] = (),
 ) -> dict:
     if lighter_leverage <= 0 or hedge_leverage <= 0:
         raise ValueError("leverages must be positive")
+    if max_overall_gap_ms <= 0 or max_source_gap_ms <= 0:
+        raise ValueError("gap limits must be positive")
+    session_gated_set = {s.strip() for s in session_gated_sources if s and s.strip()}
     target = target.resolve(strict=True)
     manifest_sha256 = (
         digest(target / "manifest.json")
@@ -146,6 +167,14 @@ def audit_readiness(
 
     latencies: dict[str, list[float]] = {}
     source_counts: dict[str, dict[str, int]] = {}
+    source_first_ms: dict[str, int] = {}
+    source_last_ms: dict[str, int] = {}
+    source_max_seen_ms: dict[str, int] = {}
+    source_max_inter_gap_ms: dict[str, int] = {}
+    source_buckets: dict[str, set[int]] = {}
+    overall_buckets: set[int] = set()
+    overall_max_seen_ms: int | None = None
+    max_overall_gap_observed: int = 0
     zero_price_tape: dict[str, dict[str, int]] = {
         "lighter_trades": {"live_trades": 0, "zero_price_liquidations": 0},
         "lighter_robinhood_trades": {"live_trades": 0, "zero_price_liquidations": 0},
@@ -170,19 +199,47 @@ def audit_readiness(
         if source == "collector":
             continue
 
-        first_receipt_ms = receipt if first_receipt_ms is None else min(first_receipt_ms, receipt)
-        last_receipt_ms = receipt if last_receipt_ms is None else max(last_receipt_ms, receipt)
-
         counters = source_counts.setdefault(
             source,
             {"messages": 0, "disconnects": 0, "clock_ahead_samples": 0, "latency_samples": 0},
         )
         if event in ("disconnect", "clock_refresh"):
             counters["disconnects"] += 1
+            first_receipt_ms = receipt if first_receipt_ms is None else min(first_receipt_ms, receipt)
+            last_receipt_ms = receipt if last_receipt_ms is None else max(last_receipt_ms, receipt)
             continue
         if event not in ("message", "subscribed"):
             continue
         counters["messages"] += 1
+
+        first_receipt_ms = receipt if first_receipt_ms is None else min(first_receipt_ms, receipt)
+        last_receipt_ms = receipt if last_receipt_ms is None else max(last_receipt_ms, receipt)
+        if overall_max_seen_ms is not None and receipt > overall_max_seen_ms:
+            max_overall_gap_observed = max(
+                max_overall_gap_observed, receipt - overall_max_seen_ms
+            )
+        overall_max_seen_ms = (
+            receipt if overall_max_seen_ms is None else max(overall_max_seen_ms, receipt)
+        )
+        bucket_idx = max(0, receipt - first_receipt_ms) // TEN_MIN_BUCKET_MS
+        if bucket_idx < REQUIRED_10M_BUCKETS:
+            overall_buckets.add(bucket_idx)
+            source_buckets.setdefault(source, set()).add(bucket_idx)
+
+        source_first_ms[source] = (
+            receipt if source not in source_first_ms else min(source_first_ms[source], receipt)
+        )
+        source_last_ms[source] = (
+            receipt if source not in source_last_ms else max(source_last_ms[source], receipt)
+        )
+        prev_src_max = source_max_seen_ms.get(source)
+        if prev_src_max is not None and receipt > prev_src_max:
+            source_max_inter_gap_ms[source] = max(
+                source_max_inter_gap_ms.get(source, 0), receipt - prev_src_max
+            )
+        source_max_seen_ms[source] = (
+            receipt if prev_src_max is None else max(prev_src_max, receipt)
+        )
 
         payload = row.get("payload")
         if not isinstance(payload, dict):
@@ -245,8 +302,40 @@ def audit_readiness(
         p50 = _quantile(vals, 0.50)
         p95 = _quantile(vals, 0.95)
         p99 = _quantile(vals, 0.99)
+        s_first = source_first_ms.get(source)
+        s_last = source_last_ms.get(source)
+        s_span_hours = (
+            round((s_last - s_first) / 3_600_000.0, 4)
+            if s_first is not None and s_last is not None
+            else 0.0
+        )
+        lead_gap = (
+            max(0, s_first - first_receipt_ms)
+            if s_first is not None and first_receipt_ms is not None
+            else None
+        )
+        trail_gap = (
+            max(0, last_receipt_ms - s_last)
+            if s_last is not None and last_receipt_ms is not None
+            else None
+        )
+        s_max_gap = (
+            max(
+                source_max_inter_gap_ms.get(source, 0),
+                lead_gap or 0,
+                trail_gap or 0,
+            )
+            if s_first is not None and s_last is not None
+            else None
+        )
+        s_buckets = len(source_buckets.get(source, set()))
         source_summaries[source] = {
             **source_counts[source],
+            "first_receipt_ms": s_first,
+            "last_receipt_ms": s_last,
+            "span_hours": s_span_hours,
+            "max_gap_ms": s_max_gap,
+            "covered_10m_buckets": s_buckets,
             "p50_ms": p50,
             "p95_ms": p95,
             "p99_ms": p99,
@@ -308,6 +397,43 @@ def audit_readiness(
         else 0.0
     )
 
+    continuity_blockers: list[str] = []
+    if not source_summaries or first_receipt_ms is None or last_receipt_ms is None:
+        continuity_blockers.append("empty_capture")
+    else:
+        if duration_hours < 10.0:
+            continuity_blockers.append(f"duration_hours_below_10h:{duration_hours}")
+        if len(overall_buckets) < REQUIRED_10M_BUCKETS:
+            continuity_blockers.append(
+                f"covered_10m_buckets_incomplete:{len(overall_buckets)}/{REQUIRED_10M_BUCKETS}"
+            )
+        if max_overall_gap_observed > max_overall_gap_ms:
+            continuity_blockers.append(
+                f"max_overall_gap_ms_exceeded:{max_overall_gap_observed}>{max_overall_gap_ms}"
+            )
+        active_book_sources = 0
+        for src, summary in source_summaries.items():
+            if src in session_gated_set:
+                continue
+            if summary["disconnects"] > 0:
+                continuity_blockers.append(f"source_disconnects:{src}:{summary['disconnects']}")
+            if src in BOOK_SOURCES:
+                active_book_sources += 1
+                if summary["span_hours"] < 9.95:
+                    continuity_blockers.append(
+                        f"source_span_below_9.95h:{src}:{summary['span_hours']}"
+                    )
+                if summary["covered_10m_buckets"] < REQUIRED_10M_BUCKETS:
+                    continuity_blockers.append(
+                        f"source_10m_buckets_incomplete:{src}:{summary['covered_10m_buckets']}/{REQUIRED_10M_BUCKETS}"
+                    )
+                if summary["max_gap_ms"] is None or summary["max_gap_ms"] > max_source_gap_ms:
+                    continuity_blockers.append(
+                        f"source_max_gap_ms_exceeded:{src}:{summary['max_gap_ms']}>{max_source_gap_ms}"
+                    )
+        if active_book_sources == 0:
+            continuity_blockers.append("no_uninterrupted_book_source")
+
     return {
         "schema": "tokyo_selection_readiness_v1",
         "manifest_sha256": manifest_sha256,
@@ -315,7 +441,14 @@ def audit_readiness(
             "first_receipt_ms": first_receipt_ms,
             "last_receipt_ms": last_receipt_ms,
             "duration_hours": duration_hours,
-            "continuous_ten_hour_unit_satisfied": duration_hours >= 10.0,
+            "covered_10m_buckets": len(overall_buckets),
+            "required_10m_buckets": REQUIRED_10M_BUCKETS,
+            "max_overall_gap_ms": max_overall_gap_observed,
+            "max_overall_gap_limit_ms": max_overall_gap_ms,
+            "max_source_gap_limit_ms": max_source_gap_ms,
+            "session_gated_sources": sorted(session_gated_set),
+            "continuity_blockers": continuity_blockers,
+            "continuous_ten_hour_unit_satisfied": len(continuity_blockers) == 0,
         },
         "domain_comparison": {
             "lighter_core_p50_ms": core_p50,
@@ -344,12 +477,23 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     parser.add_argument("--lighter-leverage", type=Decimal, default=Decimal("5"))
     parser.add_argument("--hedge-leverage", type=Decimal, default=Decimal("5"))
+    parser.add_argument("--max-overall-gap-ms", type=int, default=15_000)
+    parser.add_argument("--max-source-gap-ms", type=int, default=60_000)
+    parser.add_argument(
+        "--session-gated-sources",
+        nargs="*",
+        default=(),
+        help="Optional sources with scheduled market-hours halts (recorded in window.session_gated_sources)",
+    )
     args = parser.parse_args()
 
     report = audit_readiness(
         args.capture,
         lighter_leverage=args.lighter_leverage,
         hedge_leverage=args.hedge_leverage,
+        max_overall_gap_ms=args.max_overall_gap_ms,
+        max_source_gap_ms=args.max_source_gap_ms,
+        session_gated_sources=tuple(args.session_gated_sources),
     )
     if args.output:
         write_report(report, args.output)

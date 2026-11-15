@@ -23,9 +23,12 @@ credentials or starting the feeder. [Example profile](../config.example.toml).
 make trade MODE=check CONFIG=config.example.toml
 ```
 
-To verify multiple isolated scenario profiles together (for example, checking
-that concurrent profiles on the same Lighter L1 wallet do not collide on a
-market or account slot), pass multiple files to `--check`:
+To verify multiple isolated scenario profiles together (ensuring owner-wide
+common-control self-trade prevention so no two operator-controlled profiles
+trade the same `(domain, market_id / symbol)` even across separate subaccounts
+or L1 wallets, since Lighter native STP is single-account only and Lighter
+Terms/Points forbid common-control wash trading), pass multiple files to
+`--check`:
 
 ```sh
 cargo run --bin lighter_inventory_mm -- --check \

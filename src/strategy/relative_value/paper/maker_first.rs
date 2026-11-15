@@ -49,6 +49,10 @@ pub struct MakerFirstConfig {
     pub end_ms: u64,
     pub transport_ms: u64,
     pub fill_notice_ms: u64,
+    /// Venue-enforced speed-bump before a passive Maker order activates on the book
+    /// (e.g. `200 ms` on Lighter Robinhood Standard, `0 ms` on Lighter Core Standard).
+    #[serde(default)]
+    pub maker_create_delay_ms: u64,
     pub maker_cancel_delay_ms: u64,
     pub taker_delay_ms: [u64; 2],
     pub trade_clock_guard_ms: u64,
@@ -151,8 +155,15 @@ pub struct HedgedExit {
     /// double-IOC unwind of a delta-neutral (`net == 0`) hedged cycle. Stale books
     /// (`> max_quote_age_ms`) still immediately cancel resting Maker quotes and block
     /// new quotes, without prematurely liquidating hedged positions across quiet books.
+    /// Aborts immediately if both legs go stale simultaneously, if single-leg adverse
+    /// drift exceeds `max_hedged_leg_adverse_bps` (default `150 bps`), or if isolated
+    /// per-leg margin breaches `lighter::risk::evaluate_margin_health` `1.8x` safety.
     #[serde(default)]
     pub max_hedged_book_stale_ms: Option<u64>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub max_hedged_leg_adverse_bps: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub hedged_leg_collateral_quote: Option<Decimal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,6 +488,7 @@ struct Cycle {
     maker_turnover: Decimal,
     passive_side: Option<usize>,
     entry_ref_mid: Option<Decimal>,
+    paired_mids: [Option<Decimal>; 2],
     paired_at_ms: Option<u64>,
     hedge_fill_at_ms: Option<u64>,
     paired_basis_bps: Option<Decimal>,
@@ -601,6 +613,11 @@ fn min_reduce_ioc_base(terms: &MarketTerms, limit: Decimal) -> Decimal {
 }
 
 impl MakerFirstConfig {
+    #[inline]
+    fn maker_arrival_delay_ms(&self) -> u64 {
+        self.transport_ms.saturating_add(self.maker_create_delay_ms)
+    }
+
     fn entry_horizon_ms(&self) -> u64 {
         let hold_ms = self.hedged_exit.map_or(self.hold_ms, |p| {
             if p.use_cycle_deadline {
@@ -611,6 +628,7 @@ impl MakerFirstConfig {
         });
         self.drain_ms
             .saturating_add(hold_ms)
+            .saturating_add(self.maker_create_delay_ms)
             .saturating_add(self.quote_lifetime_ms)
     }
 
@@ -643,6 +661,7 @@ impl MakerFirstConfig {
                 && self.start_ms < self.end_ms
                 && (1..=2_000).contains(&self.transport_ms)
                 && self.fill_notice_ms <= 2_000
+                && self.maker_create_delay_ms <= 2_000
                 && self.maker_cancel_delay_ms <= 2_000
                 && self.taker_delay_ms.iter().all(|d| *d <= 2_000)
                 && self.trade_clock_guard_ms <= 1_000
@@ -689,7 +708,7 @@ impl MakerFirstConfig {
                     && offset.max_wait_ms <= self.unhedged_timeout_ms
                     && offset.max_wait_ms < self.hold_ms
                     && offset.max_wait_ms
-                        > 2 * cancel_window + self.transport_ms + self.fill_notice_ms
+                        > 2 * cancel_window + self.maker_arrival_delay_ms() + self.fill_notice_ms
                     && (1..=MAX_LEVELS).contains(&offset.offset_max_levels)
                     && offset
                         .offset_quote_lifetime_ms
@@ -739,6 +758,12 @@ impl MakerFirstConfig {
                     && policy
                         .max_hedged_book_stale_ms
                         .is_none_or(|ms| (100..=180_000).contains(&ms))
+                    && policy
+                        .max_hedged_leg_adverse_bps
+                        .is_none_or(|bps| bps > Decimal::ZERO && bps <= max_bps)
+                    && policy
+                        .hedged_leg_collateral_quote
+                        .is_none_or(|col| col > Decimal::ZERO && bounded(col))
                     && policy.patience_ms <= policy.max_hold_ms
                     && (1..=MAX_FEEDBACK_LEVELS).contains(&policy.closing_max_levels)
                     && policy
@@ -1311,6 +1336,7 @@ impl Replay<'_> {
                 maker_turnover: Decimal::ZERO,
                 passive_side,
                 entry_ref_mid: reference_mids[1 - i],
+                paired_mids: reference_mids,
                 paired_at_ms: None,
                 hedge_fill_at_ms: None,
                 paired_basis_bps: None,
@@ -2149,7 +2175,7 @@ impl Replay<'_> {
                     + self.config.trade_clock_guard_ms,
             )
         });
-        if now + self.config.transport_ms < cancel_by {
+        if now + self.config.maker_arrival_delay_ms() < cancel_by {
             self.post(now, best, cancel_by);
         }
         Ok(())
@@ -2160,7 +2186,7 @@ impl Replay<'_> {
     }
 
     fn post(&mut self, now: u64, candidate: Candidate, cancel_by: u64) {
-        let arrival_ms = now + self.config.transport_ms;
+        let arrival_ms = now + self.config.maker_arrival_delay_ms();
         let closing = self.cycle.is_some();
         let lifetime_ms = self.quote_lifetime_ms(closing);
         self.quote = Some(Quote {
@@ -2188,7 +2214,7 @@ impl Replay<'_> {
             || self.ioc.is_some()
             || !self.notices.is_empty()
             || now < self.next_quote_ms
-            || now + self.config.transport_ms >= cancel_by
+            || now + self.config.maker_arrival_delay_ms() >= cancel_by
             || self.report.incomplete.is_some()
         {
             return;
@@ -2292,6 +2318,9 @@ impl Replay<'_> {
             .config
             .hedged_exit
             .and_then(|_| self.paired_basis_bps(now));
+        let fresh_pair_mids = self
+            .pair_books(now)
+            .map(|b| [Some(b[0].mid()), Some(b[1].mid())]);
         let cycle = self
             .cycle
             .as_mut()
@@ -2303,11 +2332,85 @@ impl Replay<'_> {
             return;
         }
         if !cycle.draining {
+            if cycle.paired_at_ms.is_none()
+                && let Some(mids) = fresh_pair_mids
+            {
+                cycle.paired_mids = mids;
+            }
             cycle.paired_at_ms.get_or_insert(now);
             if cycle.paired_basis_bps.is_none() {
                 cycle.paired_basis_bps = basis;
             }
         }
+    }
+
+    fn hedged_single_leg_margin_or_drift_breached(
+        &self,
+        now: u64,
+        cycle: &Cycle,
+        policy: HedgedExit,
+    ) -> bool {
+        use crate::exchanges::lighter::risk::{
+            DEFAULT_PRE_LIQUIDATION_SAFETY_MULTIPLE, MarginRegime, evaluate_margin_health,
+        };
+
+        let fresh_mids = [
+            self.fresh(0, now).map(Book::mid),
+            self.fresh(1, now).map(Book::mid),
+        ];
+        // Never tolerate extended bad-book waiting when BOTH legs are simultaneously stale.
+        if fresh_mids[0].is_none() && fresh_mids[1].is_none() {
+            return true;
+        }
+
+        let max_adverse_bps = policy
+            .max_hedged_leg_adverse_bps
+            .unwrap_or_else(|| Decimal::from(150));
+        let mmf = Decimal::new(2, 2); // 2.0% isolated maintenance margin baseline
+        let close_out = Decimal::new(1, 2); // 1.0% close-out baseline
+
+        for leg in [0usize, 1usize] {
+            let pos = self.ledger.positions[leg];
+            if pos.is_zero() {
+                continue;
+            }
+            let Some(entry_mid) = cycle.paired_mids[leg] else {
+                continue;
+            };
+            // Observe direct fresh mid on `leg`, or infer implied same-underlying mark from
+            // the fresh companion leg (`1 - leg`) when `leg`'s own book is temporarily stale.
+            let implied_mid = fresh_mids[leg].or_else(|| {
+                let comp_now = fresh_mids[1 - leg]?;
+                let comp_entry = cycle.paired_mids[1 - leg]?;
+                (comp_entry > Decimal::ZERO).then(|| entry_mid * comp_now / comp_entry)
+            });
+            let Some(mark_mid) = implied_mid else {
+                continue;
+            };
+            let adverse_bps = if pos > Decimal::ZERO {
+                (entry_mid - mark_mid) / entry_mid * BPS
+            } else {
+                (mark_mid - entry_mid) / entry_mid * BPS
+            };
+            if adverse_bps > max_adverse_bps {
+                return true;
+            }
+            if let Some(collateral) = policy.hedged_leg_collateral_quote
+                && let Ok(health) = evaluate_margin_health(
+                    collateral,
+                    pos,
+                    entry_mid,
+                    mark_mid,
+                    mmf,
+                    close_out,
+                    DEFAULT_PRE_LIQUIDATION_SAFETY_MULTIPLE,
+                )
+                && health.regime != MarginRegime::Healthy
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn paired_stop(&self, now: u64) -> (bool, bool, bool) {
@@ -2329,18 +2432,19 @@ impl Replay<'_> {
         // RTT-probe `tradable=false` blips alone cannot generate new quotes or a
         // basis observation. When configured on a balanced (`net == 0`) hedged
         // cycle, `max_hedged_book_stale_ms` avoids forcing an irreversible
-        // double-IOC drain unless book usability or timestamp freshness has been
-        // absent longer than `max_hedged_book_stale_ms`.
+        // double-IOC drain unless book usability/freshness exceeds `max_stale_ms`,
+        // both legs go blind simultaneously, or single-leg valuation/margin breaches.
         let book = if let Some(max_stale_ms) = policy
             .max_hedged_book_stale_ms
             .filter(|_| self.net().is_zero())
         {
-            [0, 1].into_iter().any(|i| {
-                self.last_usable_at_ms[i]
-                    .is_none_or(|last_ok| now.saturating_sub(last_ok) > max_stale_ms)
-                    || self.last_source_ms[i] == 0
-                    || now.saturating_sub(self.last_source_ms[i]) > max_stale_ms
-            })
+            self.hedged_single_leg_margin_or_drift_breached(now, cycle, policy)
+                || [0, 1].into_iter().any(|i| {
+                    self.last_usable_at_ms[i]
+                        .is_none_or(|last_ok| now.saturating_sub(last_ok) > max_stale_ms)
+                        || self.last_source_ms[i] == 0
+                        || now.saturating_sub(self.last_source_ms[i]) > max_stale_ms
+                })
         } else {
             self.fresh(0, now).is_none() || self.fresh(1, now).is_none()
         };
@@ -2994,6 +3098,7 @@ mod tests {
             end_ms: 1_025_000,
             transport_ms: 100,
             fill_notice_ms: 100,
+            maker_create_delay_ms: 0,
             maker_cancel_delay_ms: 100,
             taker_delay_ms: [0; 2],
             trade_clock_guard_ms: 0,
@@ -3286,6 +3391,8 @@ mod tests {
             target_cycle_edge_bps: None,
             closing_max_levels: 1,
             max_hedged_book_stale_ms: None,
+            max_hedged_leg_adverse_bps: None,
+            hedged_leg_collateral_quote: None,
         });
         let start = cfg.start_ms;
         let run = |cfg: &MakerFirstConfig, opening_fill, hedge_fill| {
@@ -3367,6 +3474,8 @@ mod tests {
             target_cycle_edge_bps: None,
             closing_max_levels: 1,
             max_hedged_book_stale_ms: None,
+            max_hedged_leg_adverse_bps: None,
+            hedged_leg_collateral_quote: None,
         });
         let t = cfg.start_ms;
         let registry = VenueRegistry::default();
@@ -3844,6 +3953,8 @@ mod tests {
             target_cycle_edge_bps: None,
             closing_max_levels: 1,
             max_hedged_book_stale_ms: None,
+            max_hedged_leg_adverse_bps: None,
+            hedged_leg_collateral_quote: None,
         });
         c.turnover_posture = Some(TurnoverPosturePolicy {
             initial: posture,
@@ -4106,6 +4217,8 @@ mod tests {
             target_cycle_edge_bps: Some(d("1.5")),
             closing_max_levels: 4,
             max_hedged_book_stale_ms: None,
+            max_hedged_leg_adverse_bps: None,
+            hedged_leg_collateral_quote: None,
         });
 
         let mut improved = config();
@@ -4277,6 +4390,8 @@ mod tests {
             target_cycle_edge_bps: Some(d("1.0")),
             closing_max_levels: 4,
             max_hedged_book_stale_ms: None,
+            max_hedged_leg_adverse_bps: None,
+            hedged_leg_collateral_quote: None,
         });
         cfg.basis_reversion = Some(MakerBasisReversion {
             warmup_ms: 5_000,
@@ -4597,6 +4712,8 @@ mod tests {
                 target_cycle_edge_bps: None,
                 closing_max_levels: 1,
                 max_hedged_book_stale_ms,
+                max_hedged_leg_adverse_bps: None,
+                hedged_leg_collateral_quote: None,
             });
             c
         };
@@ -4794,6 +4911,133 @@ mod tests {
             rep_ttl.opening_cancel_requested.get("quote_ttl").copied(),
             Some(1),
             "{rep_ttl:?}"
+        );
+    }
+
+    #[test]
+    fn maker_create_delay_ms_enforces_robinhood_standard_200_200_300_latency_profile() {
+        let mut cfg = config();
+        cfg.transport_ms = 10;
+        cfg.maker_create_delay_ms = 200;
+        cfg.maker_cancel_delay_ms = 200;
+        cfg.taker_delay_ms = [300, 300];
+        cfg.quote_lifetime_ms = 1_000;
+        let start = cfg.start_ms;
+
+        // Quote submitted at `start` arrives at `start + 10 + 200 = start + 210`.
+        // A trade print at `start + 120` (after `transport_ms = 10`, but BEFORE `210`)
+        // must NOT fill the unactivated Maker quote; once activated at `start + 210`,
+        // a trade print at `start + 250` fills it cleanly and routes the `300 ms` Taker hedge!
+        let rep = run_maker_first(
+            &cfg,
+            [
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start,
+                    leg: 0,
+                    online: true,
+                },
+                books(&cfg, start, "999.8"),
+                books(&cfg, start + 50, "999.8"),
+                print_against(start + 120, HedgeSide::Buy, "999.7", "0.04"),
+                books(&cfg, start + 210, "999.8"),
+                print_against(start + 250, HedgeSide::Buy, "999.7", "0.04"),
+                // Fill notice at `250 + 100 = 350` submits Taker hedge arriving at `350 + 10 + 300 = 660`.
+                books(&cfg, start + 350, "999.8"),
+                books(&cfg, start + 660, "999.8"),
+                books(&cfg, start + 2_500, "999.8"),
+                books(&cfg, start + 3_000, "999.8"),
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start + 3_100,
+                    leg: 0,
+                    online: false,
+                },
+                books(&cfg, start + 3_500, "999.8"),
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ]
+            .into_iter()
+            .map(Ok),
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(rep.quotes_accepted, 1, "{rep:?}");
+        assert_eq!(rep.maker_fills, 1, "{rep:?}");
+        assert!(rep.ioc_fills >= 1, "{rep:?}");
+    }
+
+    #[test]
+    fn max_hedged_book_stale_ms_aborts_on_single_leg_margin_breach_or_dual_blindness() {
+        let mut cfg = passive_config(HedgeSide::Buy);
+        cfg.passive_offset = None;
+        cfg.pair.limit_buffer_bps = 0.0;
+        cfg.pair.strategy = Strategy::BasisReversion;
+        cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.planner.min_net_edge_bps = 0.0;
+        cfg.pair.planner.max_quote_age_ms = 1_000;
+        cfg.pair.planner.max_quote_skew_ms = 500;
+        cfg.require_net_edge = false;
+        cfg.maker_fee_bps = Decimal::ZERO;
+        cfg.end_ms = cfg.start_ms + 30_000;
+        cfg.hedged_exit = Some(HedgedExit {
+            max_hold_ms: 15_000,
+            min_saving_bps: Decimal::ZERO,
+            max_adverse_basis_bps: d("20"),
+            use_cycle_deadline: false,
+            closing_quote_lifetime_ms: Some(4_000),
+            patience_ms: 0,
+            target_cycle_edge_bps: None,
+            closing_max_levels: 1,
+            max_hedged_book_stale_ms: Some(150_000),
+            max_hedged_leg_adverse_bps: Some(d("500")),
+            // 0.04 base @ ~$1000 = $40 notional; $2.00 isolated collateral -> 20x leverage!
+            // A +3.0% (+300 bps) rally on fresh Leg 0 implies -$1.20 loss on Short Leg 1 -> $0.80 equity
+            // vs $41.20 * 2% = $0.824 MM (< 1.8x MM!), forcing immediate hedged book stop!
+            hedged_leg_collateral_quote: Some(d("2.0")),
+        });
+        let start = cfg.start_ms;
+        let mut stale_leg1_rally = books(&cfg, start + 2_000, "1030.0");
+        if let MakerFirstEvent::Book {
+            books: ref mut b, ..
+        } = stale_leg1_rally
+        {
+            b[0].asks = vec![Level {
+                price: d("1030.4"),
+                contracts: d("1"),
+            }];
+            b[1].timestamp_ms = start + 310; // Leg 1 stale > 1,000ms while Leg 0 rallies +3%!
+        }
+        let rep = run_maker_first(
+            &cfg,
+            [
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start,
+                    leg: 0,
+                    online: true,
+                },
+                books(&cfg, start, "999.8"),
+                books(&cfg, start + 100, "999.8"),
+                print_against(start + 110, HedgeSide::Buy, "999.7", "0.04"),
+                books(&cfg, start + 210, "999.8"),
+                books(&cfg, start + 310, "999.8"),
+                stale_leg1_rally,
+                books(&cfg, start + 2_200, "1030.0"),
+                books(&cfg, start + 2_500, "1030.0"),
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start + 2_600,
+                    leg: 0,
+                    online: false,
+                },
+                books(&cfg, start + 18_000, "1030.0"),
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ]
+            .into_iter()
+            .map(Ok),
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        assert!(
+            rep.cycle_attribution.hedged_book_stops >= 1 || rep.forced_closes >= 1,
+            "150s bad-book tolerance must abort immediately when isolated leg margin breaches 1.8x MM: {rep:?}"
         );
     }
 }

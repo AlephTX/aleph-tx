@@ -2328,3 +2328,71 @@ fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing
 
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn lighter_fair_mark_margin_guard_clamps_spoofed_book_and_triggers_pre_liquidation_deleverage() {
+    use crate::exchanges::lighter::risk::MarginRegime;
+
+    let (mut strategy, _tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.step_size = 0.01;
+    strategy.config.tick_size = 0.1;
+    strategy.config.max_leverage = 10.0;
+    strategy.config.maintenance_margin_fraction = Some(0.02);
+    strategy.config.pre_liquidation_safety_multiple = 1.8;
+
+    // Snapshot arrives at t=0: Long 1.0 ETH @ $2000 with $100 equity (`2.5x` MM > `1.8x` -> Healthy).
+    strategy.account_stats = AccountStats {
+        available_balance: 50.0,
+        portfolio_value: 100.0,
+        position: 1.0,
+        leverage: 20.0,
+        margin_usage: 0.4,
+        last_update: Instant::now(),
+    };
+    strategy.account_stats_fair_mark_anchor = None;
+    strategy.micro.ema_initialized = true;
+    strategy.micro.ema_slow = 2000.0;
+
+    let initial_inputs = PricingInputs {
+        mid: 2000.0,
+        pricing_mid: 2000.0,
+        bid_touch: 1999.9,
+        ask_touch: 2000.1,
+        vol_bps: 4.0,
+        sigma_per_sqrt_sec: 0.0002,
+        as_score: 0.2,
+        using_external_fair_value: true,
+        order_flow_bps: 0.0,
+        cross_market_bps: 0.0,
+        volatility_pressure: 0.0,
+        #[cfg(feature = "research-replay")]
+        participation_bbo: None,
+    };
+    let (mark0, health0) = strategy
+        .evaluate_lighter_margin_health(&initial_inputs)
+        .expect("healthy initial margin");
+    assert!((mark0 - 2000.0).abs() < 1e-6);
+    assert_eq!(health0.regime, MarginRegime::Healthy);
+
+    // Intra-snapshot crash: external index drops to $1960 and EMA slow tracks $1962,
+    // EVEN WHILE local Lighter book is spoofed at $2050/$2052!
+    // Fair Mark clamps local impact to $1969.80 and takes median(1960, 1962, 1969.80) = $1962,
+    // dropping real-time equity from $100 to $62 (`1.58x` MM < `1.8x` -> PreLiquidationDeleverage!).
+    strategy.micro.ema_slow = 1962.0;
+    let spoofed_crash_inputs = PricingInputs {
+        mid: 2051.0,
+        pricing_mid: 1960.0,
+        bid_touch: 2050.0,
+        ask_touch: 2052.0,
+        ..initial_inputs
+    };
+    let (mark1, health1) = strategy
+        .evaluate_lighter_margin_health(&spoofed_crash_inputs)
+        .expect("spoof-clamped pre-liquidation detection");
+    assert!((mark1 - 1962.0).abs() < 1e-6, "got mark1={mark1}");
+    assert_eq!(health1.regime, MarginRegime::PreLiquidationDeleverage);
+    assert!(health1.partial_liquidation_mark.is_some());
+    assert!(health1.zero_price_trigger_mark.is_some());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}

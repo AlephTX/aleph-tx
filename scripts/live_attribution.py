@@ -35,6 +35,72 @@ except ModuleNotFoundError:
 
 DEFAULT_HORIZONS_MS = (100, 500, 1_000, 5_000, 30_000)
 RATED_FEE_SOURCES = ("rate_derived", "explicit_zero")
+BARRIER_EVENTS = (
+    "disconnect",
+    "clock_refresh",
+    "sequence_gap",
+    "end",
+    "segment_start",
+    "segment_end",
+)
+
+
+def horizon_max_lag_ms(horizon_ms: int, max_quote_age_ms: int) -> int:
+    """Cap post-fill markout lookup slack proportionally to `horizon_ms`."""
+    if horizon_ms <= 0:
+        raise ValueError("horizon_ms must be positive")
+    if max_quote_age_ms <= 0:
+        raise ValueError("max_quote_age_ms must be positive")
+    return min(max_quote_age_ms, max(50, horizon_ms // 2))
+
+
+def _bbo_raw_source(venue: str, domain: str) -> str | None:
+    if (
+        venue in ("hyperliquid", "trade_xyz", "entropy")
+        or domain.startswith("hip3-")
+        or venue.startswith("hyperliquid_")
+    ):
+        return "hyperliquid"
+    mapping = {
+        ("binance", "usdm"): "binance",
+        ("lighter", "core"): "lighter",
+        ("lighter_robinhood", "robinhood"): "lighter_robinhood",
+        ("extended", "mainnet"): "extended",
+        ("arcus", "mainnet"): "arcus",
+        ("bulk", "mainnet"): "bulk",
+        ("coinbase", "spot"): "coinbase",
+    }
+    return mapping.get((venue, domain))
+
+
+def _lifecycle_row_matches_key(
+    row: dict,
+    *,
+    venue: str,
+    domain: str,
+    market: str,
+    collector_region: str | None,
+    campaign_id: str | None,
+) -> bool:
+    if row.get("event") not in BARRIER_EVENTS:
+        return False
+    if type(row.get("available_at_ms")) is not int:
+        return False
+    if collector_region is not None and row.get("collector_region") != collector_region:
+        return False
+    if campaign_id is not None and row.get("campaign_id") != campaign_id:
+        return False
+    bbo_raw = _bbo_raw_source(venue, domain)
+    r_venue = row.get("venue")
+    r_domain = row.get("domain")
+    r_raw = row.get("raw_source")
+    r_mkt = row.get("market")
+    mkt_ok = r_mkt is None or r_mkt == "" or r_mkt == market
+    raw_ok = r_raw is None or r_raw == "" or bbo_raw is None or r_raw == bbo_raw
+    is_collector = r_venue == "collector" or r_raw == "collector"
+    is_direct = r_venue == venue and r_domain == domain and mkt_ok and raw_ok
+    is_hl_shared = bbo_raw == "hyperliquid" and r_raw == "hyperliquid" and mkt_ok
+    return is_collector or is_direct or is_hl_shared
 
 
 def _open_sqlite_readonly(db_or_gz: Path) -> tuple[sqlite3.Connection, TemporaryDirectory | None]:
@@ -102,7 +168,12 @@ def load_session_telemetry(db_path: Path, *, session_id: str | None = None) -> d
             tmp.cleanup()
 
 
-def load_bbo_series_from_ndjson(bbo_ndjson_path: Path) -> dict[str, tuple[list[int], list[dict]]]:
+def load_bbo_series_from_ndjson(
+    bbo_ndjson_path: Path,
+    *,
+    collector_region: str | None = None,
+    campaign_id: str | None = None,
+) -> dict[str, tuple[list[int], list[dict]]]:
     """Load tradable BBO series keyed by `venue:domain:market`, sorted by `available_at_ms`."""
     opener = gzip.open if bbo_ndjson_path.suffix == ".gz" else open
     grouped: dict[str, list[dict]] = {}
@@ -111,6 +182,10 @@ def load_bbo_series_from_ndjson(bbo_ndjson_path: Path) -> dict[str, tuple[list[i
             if not line.strip():
                 continue
             row = json.loads(line)
+            if collector_region is not None and row.get("collector_region") != collector_region:
+                continue
+            if campaign_id is not None and row.get("campaign_id") != campaign_id:
+                continue
             if not row.get("tradable"):
                 continue
             mid = row.get("mid_px_f64")
@@ -136,6 +211,39 @@ def load_bbo_series_from_ndjson(bbo_ndjson_path: Path) -> dict[str, tuple[list[i
     return indexed
 
 
+def load_lifecycle_barriers_from_ndjson(
+    lifecycle_ndjson_path: Path | None,
+    *,
+    keys: list[str],
+    collector_region: str | None = None,
+    campaign_id: str | None = None,
+) -> dict[str, list[int]]:
+    """Load sorted stream-interruption barrier timestamps (`available_at_ms`) per market key."""
+    barriers_by_key: dict[str, list[int]] = {k: [] for k in keys}
+    if lifecycle_ndjson_path is None:
+        return barriers_by_key
+    parsed_keys = [(k, *k.split(":", 2)) for k in keys]
+    opener = gzip.open if lifecycle_ndjson_path.suffix == ".gz" else open
+    with opener(lifecycle_ndjson_path, "rt", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            for full_key, venue, domain, market in parsed_keys:
+                if _lifecycle_row_matches_key(
+                    row,
+                    venue=venue,
+                    domain=domain,
+                    market=market,
+                    collector_region=collector_region,
+                    campaign_id=campaign_id,
+                ):
+                    barriers_by_key[full_key].append(int(row["available_at_ms"]))
+    for full_key in barriers_by_key:
+        barriers_by_key[full_key].sort()
+    return barriers_by_key
+
+
 def generate_duckdb_asof_sql(
     *,
     fills_json_path: Path,
@@ -143,23 +251,90 @@ def generate_duckdb_asof_sql(
     venue_key: str,
     max_quote_age_ms: int,
     horizons_ms: tuple[int, ...] = DEFAULT_HORIZONS_MS,
+    collector_region: str | None = None,
+    campaign_id: str | None = None,
+    lifecycle_source_expr: str | None = None,
 ) -> str:
     """Generate exact DuckDB `ASOF JOIN` SQL for pre-fill lead/lag and post-fill markouts."""
     venue, domain, market = venue_key.split(":", 2)
+    bbo_raw = _bbo_raw_source(venue, domain)
     esc = lambda s: s.replace("'", "''")
     fills_esc = esc(str(fills_json_path.resolve()))
+
+    region_pred = (
+        f"\n      AND collector_region = '{esc(collector_region)}'"
+        if collector_region is not None
+        else ""
+    )
+    campaign_pred = (
+        f"\n      AND campaign_id = '{esc(campaign_id)}'"
+        if campaign_id is not None
+        else ""
+    )
+
+    if lifecycle_source_expr is not None:
+        events_sql = ", ".join(f"'{e}'" for e in BARRIER_EVENTS)
+        raw_clause = (
+            "TRUE"
+            if bbo_raw is None
+            else f"(raw_source IS NULL OR raw_source = '' OR raw_source = '{esc(bbo_raw)}')"
+        )
+        hl_clause = (
+            f"(raw_source = 'hyperliquid' AND (market IS NULL OR market = '' OR market = '{esc(market)}'))"
+            if bbo_raw == "hyperliquid"
+            else "FALSE"
+        )
+        barriers_cte = f"""SELECT DISTINCT CAST(available_at_ms AS BIGINT) AS available_at_ms
+    FROM {lifecycle_source_expr}
+    WHERE event IN ({events_sql})
+      AND available_at_ms IS NOT NULL{region_pred}{campaign_pred}
+      AND (
+          venue = 'collector'
+          OR raw_source = 'collector'
+          OR (
+              venue = '{esc(venue)}'
+              AND domain = '{esc(domain)}'
+              AND (market IS NULL OR market = '' OR market = '{esc(market)}')
+              AND {raw_clause}
+          )
+          OR {hl_clause}
+      )"""
+    else:
+        barriers_cte = "SELECT CAST(NULL AS BIGINT) AS available_at_ms WHERE FALSE"
+
+    q0_valid = (
+        f"q0.available_at_ms IS NOT NULL "
+        f"AND f.fill_alignment_ms - q0.available_at_ms <= {max_quote_age_ms} "
+        f"AND NOT EXISTS ("
+        f"SELECT 1 FROM barriers AS b "
+        f"WHERE b.available_at_ms > q0.available_at_ms "
+        f"AND b.available_at_ms <= f.fill_alignment_ms)"
+    )
 
     horizon_joins = []
     horizon_selects = []
     for h in horizons_ms:
         alias = f"q_h{h}"
+        max_lag = horizon_max_lag_ms(h, max_quote_age_ms)
+        qh_valid = (
+            f"{alias}.available_at_ms IS NOT NULL "
+            f"AND {alias}.available_at_ms <= f.fill_alignment_ms + {h + max_lag} "
+            f"AND NOT EXISTS ("
+            f"SELECT 1 FROM barriers AS b "
+            f"WHERE b.available_at_ms >= f.fill_alignment_ms "
+            f"AND b.available_at_ms <= {alias}.available_at_ms)"
+        )
         horizon_selects.append(
             f"""CASE
-                WHEN {alias}.available_at_ms IS NOT NULL
-                     AND {alias}.available_at_ms <= f.fill_alignment_ms + {h + max_quote_age_ms}
+                WHEN {qh_valid}
                 THEN f.sign * (({alias}.mid_px_f64 - f.fill_price) / f.fill_price) * 10000.0
                 ELSE NULL
-            END AS markout_{h}ms_bps"""
+            END AS markout_{h}ms_bps,
+        CASE
+                WHEN {qh_valid}
+                THEN {alias}.available_at_ms - (f.fill_alignment_ms + {h})
+                ELSE NULL
+            END AS markout_{h}ms_lag_ms"""
         )
         horizon_joins.append(
             f"""ASOF LEFT JOIN quotes AS {alias}
@@ -181,8 +356,11 @@ def generate_duckdb_asof_sql(
     WHERE tradable = true
       AND venue = '{esc(venue)}'
       AND domain = '{esc(domain)}'
-      AND market = '{esc(market)}'
+      AND market = '{esc(market)}'{region_pred}{campaign_pred}
     ORDER BY available_at_ms ASC, sequence ASC
+),
+barriers AS (
+    {barriers_cte}
 ),
 fills_in AS (
     SELECT
@@ -200,20 +378,17 @@ fills_in AS (
 SELECT
     f.fill_idx,
     CASE
-        WHEN q0.available_at_ms IS NOT NULL
-             AND f.fill_alignment_ms - q0.available_at_ms <= {max_quote_age_ms}
+        WHEN {q0_valid}
         THEN q0.mid_px_f64
         ELSE NULL
     END AS at_fill_mid,
     CASE
-        WHEN q0.available_at_ms IS NOT NULL
-             AND f.fill_alignment_ms - q0.available_at_ms <= {max_quote_age_ms}
+        WHEN {q0_valid}
         THEN f.fill_alignment_ms - q0.available_at_ms
         ELSE NULL
     END AS at_fill_age_ms,
     CASE
-        WHEN q0.available_at_ms IS NOT NULL
-             AND f.fill_alignment_ms - q0.available_at_ms <= {max_quote_age_ms}
+        WHEN {q0_valid}
         THEN f.sign * ((q0.mid_px_f64 - f.fill_price) / f.fill_price) * 10000.0
         ELSE NULL
     END AS vs_fill_bps,
@@ -245,6 +420,29 @@ def _run_duckdb_query_json(sql: str, *, db_path: Path | None = None) -> list[dic
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     out = proc.stdout.strip()
     return json.loads(out) if out else []
+
+
+def _duckdb_table_or_view_exists(db_path: Path, name: str) -> bool:
+    esc = name.replace("'", "''")
+    rows = _run_duckdb_query_json(
+        f"SELECT table_name FROM information_schema.tables WHERE table_name = '{esc}' LIMIT 1;",
+        db_path=db_path,
+    )
+    return bool(rows)
+
+
+def _has_barrier_after_up_to(barriers: list[int], lo_exclusive: int, hi_inclusive: int) -> bool:
+    if not barriers or lo_exclusive >= hi_inclusive:
+        return False
+    return bisect_right(barriers, lo_exclusive) < bisect_right(barriers, hi_inclusive)
+
+
+def _has_barrier_between_inclusive(
+    barriers: list[int], lo_inclusive: int, hi_inclusive: int
+) -> bool:
+    if not barriers or lo_inclusive > hi_inclusive:
+        return False
+    return bisect_left(barriers, lo_inclusive) < bisect_right(barriers, hi_inclusive)
 
 
 def _asof_at_or_before(
@@ -281,6 +479,10 @@ def attribute_session(
     bbo_ndjson_path: Path | None = None,
     duckdb_path: Path | None = None,
     parquet_bbo_glob: str | None = None,
+    lifecycle_ndjson_path: Path | None = None,
+    parquet_lifecycle_glob: str | None = None,
+    collector_region: str | None = None,
+    campaign_id: str | None = None,
     local_market_key: str,
     reference_market_keys: list[str],
     max_quote_age_ms: int = 5_000,
@@ -288,6 +490,15 @@ def attribute_session(
     prefer_duckdb: bool = True,
 ) -> dict:
     """Attribute every fill in `telemetry` against local and external BBO streams."""
+    if (duckdb_path is not None or parquet_bbo_glob is not None) and not collector_region:
+        raise ValueError(
+            "collector_region (e.g. 'tokyo') is required when querying DuckDB or Parquet lakehouse tables"
+        )
+    if max_quote_age_ms <= 0:
+        raise ValueError("max_quote_age_ms must be positive")
+    for h in horizons_ms:
+        horizon_max_lag_ms(h, max_quote_age_ms)
+
     session = telemetry["session"]
     fills = telemetry["fills"]
     orders = telemetry["orders"]
@@ -312,6 +523,7 @@ def attribute_session(
 
     use_duck = False
     bbo_expr = ""
+    lifecycle_expr: str | None = None
     if prefer_duckdb and (_duckdb_mod is not None or shutil.which("duckdb") or (Path.home() / ".local" / "bin" / "duckdb").is_file()):
         if duckdb_path is not None:
             use_duck = True
@@ -325,10 +537,27 @@ def attribute_session(
             esc_nd = str(bbo_ndjson_path.resolve()).replace("'", "''")
             bbo_expr = (
                 f"read_json('{esc_nd}', format='newline_delimited', columns={{"
+                "campaign_id:'VARCHAR', collector_region:'VARCHAR', "
                 "venue:'VARCHAR', domain:'VARCHAR', market:'VARCHAR', sequence:'BIGINT', "
                 "available_at_ms:'BIGINT', source_time_ms:'BIGINT', bid_px_f64:'DOUBLE', "
                 "ask_px_f64:'DOUBLE', mid_px_f64:'DOUBLE', tradable:'BOOLEAN'})"
             )
+        if use_duck:
+            if lifecycle_ndjson_path is not None:
+                esc_lfc = str(lifecycle_ndjson_path.resolve()).replace("'", "''")
+                lifecycle_expr = (
+                    f"read_json('{esc_lfc}', format='newline_delimited', columns={{"
+                    "campaign_id:'VARCHAR', collector_region:'VARCHAR', "
+                    "venue:'VARCHAR', domain:'VARCHAR', raw_source:'VARCHAR', market:'VARCHAR', "
+                    "sequence:'BIGINT', available_at_ms:'BIGINT', event:'VARCHAR'})"
+                )
+            elif parquet_lifecycle_glob is not None:
+                esc_lfc_glob = parquet_lifecycle_glob.replace("'", "''")
+                lifecycle_expr = f"read_parquet('{esc_lfc_glob}', hive_partitioning=true)"
+            elif duckdb_path is not None and _duckdb_table_or_view_exists(
+                duckdb_path, "v_feed_lifecycle"
+            ):
+                lifecycle_expr = "v_feed_lifecycle"
 
     per_venue_metrics: dict[str, list[dict]] = {}
     if use_duck and fill_inputs:
@@ -344,20 +573,38 @@ def attribute_session(
                     venue_key=key,
                     max_quote_age_ms=max_quote_age_ms,
                     horizons_ms=horizons_ms,
+                    collector_region=collector_region,
+                    campaign_id=campaign_id,
+                    lifecycle_source_expr=lifecycle_expr,
                 )
                 per_venue_metrics[key] = _run_duckdb_query_json(sql, db_path=duckdb_path)
     else:
         if bbo_ndjson_path is None:
             raise ValueError("bbo_ndjson_path is required when DuckDB is unavailable")
-        series_map = load_bbo_series_from_ndjson(bbo_ndjson_path)
+        series_map = load_bbo_series_from_ndjson(
+            bbo_ndjson_path,
+            collector_region=collector_region,
+            campaign_id=campaign_id,
+        )
+        barriers_map = load_lifecycle_barriers_from_ndjson(
+            lifecycle_ndjson_path,
+            keys=all_keys,
+            collector_region=collector_region,
+            campaign_id=campaign_id,
+        )
         for key in all_keys:
             times, rows = series_map.get(key, ([], []))
+            barriers = barriers_map.get(key, [])
             venue_rows = []
             for item in fill_inputs:
                 align_ms = item["fill_alignment_ms"]
                 sign = item["sign"]
                 px = item["fill_price"]
                 q0 = _asof_at_or_before(times, rows, align_ms, max_quote_age_ms)
+                if q0 is not None and _has_barrier_after_up_to(
+                    barriers, q0["available_at_ms"], align_ms
+                ):
+                    q0 = None
                 rec: dict = {
                     "fill_idx": item["fill_idx"],
                     "at_fill_mid": q0["mid_px_f64"] if q0 else None,
@@ -367,9 +614,17 @@ def attribute_session(
                     ),
                 }
                 for h in horizons_ms:
-                    qh = _asof_at_or_after(times, rows, align_ms + h, max_quote_age_ms)
+                    max_lag = horizon_max_lag_ms(h, max_quote_age_ms)
+                    qh = _asof_at_or_after(times, rows, align_ms + h, max_lag)
+                    if qh is not None and _has_barrier_between_inclusive(
+                        barriers, align_ms, qh["available_at_ms"]
+                    ):
+                        qh = None
                     rec[f"markout_{h}ms_bps"] = (
                         sign * ((qh["mid_px_f64"] - px) / px) * 10_000.0 if qh else None
+                    )
+                    rec[f"markout_{h}ms_lag_ms"] = (
+                        (qh["available_at_ms"] - (align_ms + h)) if qh else None
                     )
                 venue_rows.append(rec)
             per_venue_metrics[key] = venue_rows
@@ -426,6 +681,9 @@ def attribute_session(
                 "markouts_bps": {
                     f"{h}ms": rm.get(f"markout_{h}ms_bps") for h in horizons_ms
                 },
+                "markouts_lag_ms": {
+                    f"{h}ms": rm.get(f"markout_{h}ms_lag_ms") for h in horizons_ms
+                },
             }
 
         primary_m = per_venue_metrics[primary_ref_key][idx]
@@ -434,6 +692,7 @@ def attribute_session(
             toxic_500ms_count += 1
 
         local_markouts = {f"{h}ms": local_m.get(f"markout_{h}ms_bps") for h in horizons_ms}
+        local_markouts_lag = {f"{h}ms": local_m.get(f"markout_{h}ms_lag_ms") for h in horizons_ms}
         net_primary_markouts = {
             f"{h}ms": (
                 primary_m.get(f"markout_{h}ms_bps") - fee_bps
@@ -464,6 +723,7 @@ def attribute_session(
                     "at_fill_age_ms": local_m.get("at_fill_age_ms"),
                     "vs_fill_bps": local_m.get("vs_fill_bps"),
                     "markouts_bps": local_markouts,
+                    "markouts_lag_ms": local_markouts_lag,
                 },
                 "references": refs_out,
                 "net_primary_markouts_after_fee_bps": net_primary_markouts,
@@ -503,6 +763,11 @@ def attribute_session(
     return {
         "schema_version": 1,
         "engine": "duckdb_asof" if use_duck else "python_causal_bisect",
+        "collector_region": collector_region,
+        "campaign_id": campaign_id,
+        "horizon_max_lag_ms": {
+            f"{h}ms": horizon_max_lag_ms(h, max_quote_age_ms) for h in horizons_ms
+        },
         "session_id": session["session_id"],
         "exchange": session.get("exchange"),
         "symbol": session.get("symbol"),
@@ -554,6 +819,10 @@ def main() -> None:
     parser.add_argument("--duckdb", type=Path, default=None, help="Path to lakehouse.duckdb containing v_bbo_quotes")
     parser.add_argument("--parquet-bbo-glob", default=None, help="Optional Parquet glob for bbo_quotes")
     parser.add_argument("--bbo-ndjson", type=Path, default=None, help="Optional Silver staging bbo_quotes.ndjson.gz")
+    parser.add_argument("--lifecycle-ndjson", type=Path, default=None, help="Optional Silver staging feed_lifecycle.ndjson.gz")
+    parser.add_argument("--parquet-lifecycle-glob", default=None, help="Optional Parquet glob for feed_lifecycle")
+    parser.add_argument("--collector-region", default=None, help="Collector region filter (required for --duckdb / --parquet-bbo-glob, e.g. tokyo)")
+    parser.add_argument("--campaign-id", default=None, help="Optional campaign_id filter")
     parser.add_argument("--local-market", required=True, help="venue:domain:market, e.g. lighter:core:0")
     parser.add_argument("--reference-markets", nargs="+", required=True, help="Reference venue:domain:market keys")
     parser.add_argument("--max-quote-age-ms", type=int, default=5_000)
@@ -566,6 +835,10 @@ def main() -> None:
         bbo_ndjson_path=args.bbo_ndjson,
         duckdb_path=args.duckdb,
         parquet_bbo_glob=args.parquet_bbo_glob,
+        lifecycle_ndjson_path=args.lifecycle_ndjson,
+        parquet_lifecycle_glob=args.parquet_lifecycle_glob,
+        collector_region=args.collector_region,
+        campaign_id=args.campaign_id,
         local_market_key=args.local_market,
         reference_market_keys=args.reference_markets,
         max_quote_age_ms=args.max_quote_age_ms,
