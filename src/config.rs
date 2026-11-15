@@ -7,6 +7,7 @@ pub const EXCH_LIGHTER: u8 = 2;
 pub const EXCH_EDGEX: u8 = 3;
 pub const EXCH_HYPERLIQUID: u8 = 1;
 pub const EXCH_BACKPACK: u8 = 5;
+pub const EXCH_BINANCE: u8 = 6;
 
 pub const SYM_BTC: u16 = 1001;
 pub const SYM_ETH: u16 = 1002;
@@ -264,6 +265,9 @@ fn default_max_spread_bps() -> f64 {
 fn default_min_inventory_notional_usd() -> f64 {
     10.0
 }
+fn default_flatten_age_start_fraction() -> f64 {
+    1.0
+}
 
 /// Inventory Neutral Market Maker 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -401,6 +405,45 @@ pub struct InventoryNeutralMMConfig {
     /// Adjust inventory-adding quotes using completed external price ranges.
     #[serde(default)]
     pub volatility_regime: Option<VolatilityRegimeConfig>,
+    /// Decouple resting cancel edge floor and passive inventory-flattening bounds
+    /// from new-quote placement edge for 50ms+ latency regimes.
+    #[serde(default)]
+    pub quote_hysteresis: Option<QuoteHysteresisConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteHysteresisConfig {
+    pub cancel_min_profit_bps: f64,
+    pub flatten_min_profit_bps: f64,
+    #[serde(default = "default_flatten_age_start_fraction")]
+    pub flatten_age_start_fraction: f64,
+    #[serde(default)]
+    pub per_side_bound_cancel: bool,
+    /// Optional shorter minimum order lifetime (seconds) for the unambiguous
+    /// inventory-reducing side while keeping `order_ttl_secs` on entries.
+    #[serde(default)]
+    pub reducing_order_ttl_secs: Option<u64>,
+    /// Optional tighter price tolerance (bps) for re-anchoring reducing quotes.
+    #[serde(default)]
+    pub reducing_requote_threshold_bps: Option<f64>,
+    /// Activate passive flattening immediately for any confirmed inventory >= step_size.
+    #[serde(default)]
+    pub zero_deadband_flatten: bool,
+    /// Optional round-trip profit floor (bps over episode average entry + fees)
+    /// held during the initial `breakeven_hold_fraction` of `position_timeout_secs`.
+    #[serde(default)]
+    pub breakeven_exit_bps: Option<f64>,
+    #[serde(default)]
+    pub breakeven_hold_fraction: f64,
+    /// Optional causal local EMA momentum gate (bps) blocking only inventory-adding
+    /// quotes during sharp directional cascades while keeping reducing quotes active.
+    #[serde(default)]
+    pub max_local_momentum_bps: Option<f64>,
+    /// Anchor inventory-adding bounds to `min(pricing_mid, local_mid)` on bids and
+    /// `max(pricing_mid, local_mid)` on asks so entries require edge against both books.
+    #[serde(default)]
+    pub conservative_dual_anchor: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -595,6 +638,40 @@ impl InventoryNeutralMMConfig {
                 "{name}: invalid volatility regime"
             );
         }
+        if let Some(hysteresis) = self.quote_hysteresis {
+            nonnegative(
+                name,
+                &[
+                    hysteresis.cancel_min_profit_bps,
+                    hysteresis.flatten_min_profit_bps,
+                ],
+            )?;
+            anyhow::ensure!(
+                hysteresis.cancel_min_profit_bps <= self.min_profit_bps
+                    && hysteresis.flatten_min_profit_bps <= self.min_profit_bps
+                    && hysteresis.flatten_age_start_fraction.is_finite()
+                    && (0.0..=1.0).contains(&hysteresis.flatten_age_start_fraction)
+                    && hysteresis
+                        .reducing_order_ttl_secs
+                        .is_none_or(|secs| secs > 0 && secs <= self.order_ttl_secs)
+                    && hysteresis
+                        .reducing_requote_threshold_bps
+                        .is_none_or(|bps| bps.is_finite()
+                            && bps > 0.0
+                            && bps <= self.max_spread_bps)
+                    && hysteresis.breakeven_exit_bps.is_none_or(
+                        |bps| bps.is_finite() && (-100.0..=self.max_spread_bps).contains(&bps)
+                    )
+                    && hysteresis.breakeven_hold_fraction.is_finite()
+                    && (0.0..=1.0).contains(&hysteresis.breakeven_hold_fraction)
+                    && hysteresis
+                        .max_local_momentum_bps
+                        .is_none_or(|bps| bps.is_finite() && (0.1..=1_000.0).contains(&bps))
+                    && 2.0 * self.maker_fee_bps + hysteresis.cancel_min_profit_bps >= 0.0
+                    && 2.0 * self.maker_fee_bps + hysteresis.flatten_min_profit_bps >= 0.0,
+                "{name}: invalid quote hysteresis"
+            );
+        }
         anyhow::ensure!(
             self.min_portfolio_scale <= self.max_portfolio_scale,
             "{name}: portfolio scale bounds reversed"
@@ -723,7 +800,77 @@ impl Default for InventoryNeutralMMConfig {
             order_flow_reserve: None,
             cross_market_reserve: None,
             volatility_regime: None,
+            quote_hysteresis: None,
         }
+    }
+}
+
+/// Independent strategy program owning a profile's execution state, capital, and loss budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchScenario {
+    QuantProfit,
+    HedgeArbitrage,
+    IncentiveTurnover,
+}
+
+impl ResearchScenario {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuantProfit => "quant_profit",
+            Self::HedgeArbitrage => "hedge_arbitrage",
+            Self::IncentiveTurnover => "incentive_turnover",
+        }
+    }
+}
+
+/// Optional deployment isolation metadata preventing Lighter cross-subaccount STP
+/// collisions and cross-scenario capital/ledger contamination.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentIsolationConfig {
+    /// Independent program owning this profile's risk and ledger budget.
+    pub scenario: ResearchScenario,
+    /// Logical L1 master-wallet group (e.g. `"primary_l1"`, `"turnover_l1"`).
+    /// Lighter enforces Self-Trade Prevention (STP) across all subaccounts under the
+    /// same L1 address, so two profiles in the same `l1_group` cannot trade the same market.
+    pub l1_group: String,
+    /// Logical Lighter subaccount slot label within `l1_group` (e.g. `"sub_eth_quant"`).
+    #[serde(default)]
+    pub subaccount_slot: Option<String>,
+    /// Optional pinned Lighter integer account index checked against `.env` at launch.
+    #[serde(default)]
+    pub expected_account_index: Option<i64>,
+    /// Optional logical hedge account/vault slot when `[inventory_hedge]` is active.
+    #[serde(default)]
+    pub hedge_account_slot: Option<String>,
+}
+
+impl DeploymentIsolationConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.l1_group.trim().is_empty(),
+            "deployment.l1_group must be a non-empty identifier"
+        );
+        if let Some(slot) = &self.subaccount_slot {
+            anyhow::ensure!(
+                !slot.trim().is_empty(),
+                "deployment.subaccount_slot must not be empty when set"
+            );
+        }
+        if let Some(idx) = self.expected_account_index {
+            anyhow::ensure!(
+                idx >= 0,
+                "deployment.expected_account_index must be non-negative"
+            );
+        }
+        if let Some(hedge_slot) = &self.hedge_account_slot {
+            anyhow::ensure!(
+                !hedge_slot.trim().is_empty(),
+                "deployment.hedge_account_slot must not be empty when set"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -737,6 +884,8 @@ pub struct AppConfig {
     pub edgex: ExchangeConfig,
     #[serde(default)]
     pub inventory_neutral_mm: Option<InventoryNeutralMMConfig>,
+    #[serde(default)]
+    pub deployment: Option<DeploymentIsolationConfig>,
 }
 
 impl AppConfig {
@@ -779,6 +928,90 @@ impl AppConfig {
                 "inventory_neutral_mm: symbol_id {} is not in [symbols]",
                 config.symbol_id
             );
+        }
+        if let Some(deployment) = &self.deployment {
+            deployment.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Validates that a fleet of concurrent Lighter profiles is free of cross-subaccount
+    /// Self-Trade Prevention (STP) collisions, shared subaccount locks, and cross-scenario
+    /// budget sharing. Profiles omitting `[deployment]` default to `"default_l1"`.
+    pub fn validate_fleet_isolation<'a>(
+        profiles: impl IntoIterator<Item = (&'a str, &'a Self)>,
+    ) -> anyhow::Result<()> {
+        let items: Vec<(&str, &Self)> = profiles.into_iter().collect();
+        for i in 0..items.len() {
+            let (name_a, cfg_a) = items[i];
+            cfg_a
+                .validate()
+                .map_err(|e| anyhow::anyhow!("{name_a}: {e}"))?;
+            let Some(mm_a) = &cfg_a.inventory_neutral_mm else {
+                continue;
+            };
+            let sym_a = cfg_a.symbol_name(mm_a.symbol_id).unwrap_or("UNKNOWN");
+            let l1_a = cfg_a
+                .deployment
+                .as_ref()
+                .map_or("default_l1", |d| d.l1_group.as_str());
+
+            for &(name_b, cfg_b) in &items[(i + 1)..] {
+                let Some(mm_b) = &cfg_b.inventory_neutral_mm else {
+                    continue;
+                };
+                let sym_b = cfg_b.symbol_name(mm_b.symbol_id).unwrap_or("UNKNOWN");
+                let l1_b = cfg_b
+                    .deployment
+                    .as_ref()
+                    .map_or("default_l1", |d| d.l1_group.as_str());
+
+                // 1. Pinned Lighter integer account_index cannot be shared by two active processes.
+                if let (Some(idx_a), Some(idx_b)) = (
+                    cfg_a
+                        .deployment
+                        .as_ref()
+                        .and_then(|d| d.expected_account_index),
+                    cfg_b
+                        .deployment
+                        .as_ref()
+                        .and_then(|d| d.expected_account_index),
+                ) {
+                    anyhow::ensure!(
+                        idx_a != idx_b,
+                        "Account collision between {name_a} and {name_b}: both bind expected_account_index={idx_a}"
+                    );
+                }
+
+                // 2. Within the same L1 master wallet, Lighter enforces cross-subaccount STP:
+                //    two subaccounts cannot rest/take on the same market_id or symbol simultaneously,
+                //    nor share the same logical subaccount_slot.
+                if l1_a == l1_b && mm_a.exchange_id == mm_b.exchange_id {
+                    anyhow::ensure!(
+                        mm_a.market_id != mm_b.market_id
+                            && mm_a.symbol_id != mm_b.symbol_id
+                            && sym_a != sym_b,
+                        "Cross-subaccount STP market collision in L1 group '{l1_a}' between {name_a} ({sym_a}, market_id={}) and {name_b} ({sym_b}, market_id={}): use distinct markets or separate L1 wallets",
+                        mm_a.market_id,
+                        mm_b.market_id
+                    );
+                    if let (Some(slot_a), Some(slot_b)) = (
+                        cfg_a
+                            .deployment
+                            .as_ref()
+                            .and_then(|d| d.subaccount_slot.as_deref()),
+                        cfg_b
+                            .deployment
+                            .as_ref()
+                            .and_then(|d| d.subaccount_slot.as_deref()),
+                    ) {
+                        anyhow::ensure!(
+                            slot_a != slot_b,
+                            "Subaccount slot collision in L1 group '{l1_a}' between {name_a} and {name_b}: both claim subaccount_slot='{slot_a}'"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -849,6 +1082,7 @@ impl Default for AppConfig {
                 fee_rate: Some(0.0005),
             },
             inventory_neutral_mm: Some(InventoryNeutralMMConfig::default()),
+            deployment: None,
         }
     }
 }
@@ -1012,5 +1246,68 @@ mod tests {
         let text = include_str!("../config.example.toml")
             .replace("poll_interval_ms = 300", "poll_interval_typo = 300");
         assert!(toml::from_str::<AppConfig>(&text).is_err());
+    }
+
+    #[test]
+    fn fleet_isolation_rejects_same_l1_stp_collision_and_accepts_disjoint_markets_or_l1s() {
+        let mut eth_quant = AppConfig::default();
+        eth_quant.deployment = Some(DeploymentIsolationConfig {
+            scenario: ResearchScenario::QuantProfit,
+            l1_group: "primary_l1".into(),
+            subaccount_slot: Some("sub_1_eth_quant".into()),
+            expected_account_index: Some(101),
+            hedge_account_slot: None,
+        });
+
+        let mut btc_hedge = AppConfig::default();
+        if let Some(mm) = &mut btc_hedge.inventory_neutral_mm {
+            mm.symbol_id = SYM_BTC;
+            mm.market_id = 1;
+        }
+        btc_hedge.deployment = Some(DeploymentIsolationConfig {
+            scenario: ResearchScenario::HedgeArbitrage,
+            l1_group: "primary_l1".into(),
+            subaccount_slot: Some("sub_2_btc_hedge".into()),
+            expected_account_index: Some(102),
+            hedge_account_slot: Some("hl_btc_hedge".into()),
+        });
+
+        // Disjoint markets under the same L1 pass STP check.
+        AppConfig::validate_fleet_isolation([("eth_quant", &eth_quant), ("btc_hedge", &btc_hedge)])
+            .unwrap();
+
+        // Same market under a DIFFERENT L1 wallet also passes STP check.
+        let mut eth_turnover_other_l1 = AppConfig::default();
+        eth_turnover_other_l1.deployment = Some(DeploymentIsolationConfig {
+            scenario: ResearchScenario::IncentiveTurnover,
+            l1_group: "turnover_l1".into(),
+            subaccount_slot: Some("sub_1_eth_turnover".into()),
+            expected_account_index: Some(201),
+            hedge_account_slot: None,
+        });
+        AppConfig::validate_fleet_isolation([
+            ("eth_quant", &eth_quant),
+            ("btc_hedge", &btc_hedge),
+            ("eth_turnover", &eth_turnover_other_l1),
+        ])
+        .unwrap();
+
+        // Same market under the SAME L1 wallet fails STP check!
+        let mut eth_collision = eth_turnover_other_l1.clone();
+        eth_collision.deployment.as_mut().unwrap().l1_group = "primary_l1".into();
+        let err = AppConfig::validate_fleet_isolation([
+            ("eth_quant", &eth_quant),
+            ("eth_collision", &eth_collision),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("STP market collision"));
+
+        // Duplicate expected_account_index fails even across L1 labels!
+        let mut dup_idx = eth_turnover_other_l1.clone();
+        dup_idx.deployment.as_mut().unwrap().expected_account_index = Some(101);
+        assert!(
+            AppConfig::validate_fleet_isolation([("eth_quant", &eth_quant), ("dup_idx", &dup_idx)])
+                .is_err()
+        );
     }
 }

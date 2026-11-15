@@ -101,6 +101,14 @@ vol_window = 120
 balance_refresh_secs = 60
 
 # ============================================================================
+# Binance USD-M Futures - Public Reference BBO Feeder (Optional)
+# ============================================================================
+[binance]
+feeder_enabled = false
+feeder_ws_url = "wss://fstream.binance.com"
+feeder_symbols = { ETH = "ETHUSDT", BTC = "BTCUSDT" }
+
+# ============================================================================
 # Inventory-Neutral MM Strategy (Lighter DEX)
 # ============================================================================
 [inventory_neutral_mm]

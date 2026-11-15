@@ -1,4 +1,6 @@
-use aleph_tx::config::{AppConfig, EXCH_LIGHTER, InventoryNeutralMMConfig};
+use aleph_tx::config::{
+    AppConfig, DeploymentIsolationConfig, EXCH_LIGHTER, InventoryNeutralMMConfig, ResearchScenario,
+};
 use aleph_tx::exchanges::hyperliquid::{HyperliquidSigner, Network, validate_hex};
 use aleph_tx::lighter_trading::{LighterCredentials, LighterTrading};
 use aleph_tx::live_hedge::journal::{JOURNAL_SCHEMA, JournalRecord, StartRecord};
@@ -39,6 +41,7 @@ struct Feeds {
     strategy_mode: Option<StrategyMode>,
     lighter: FeederMarket,
     hyperliquid: Option<FeederMarket>,
+    binance: Option<FeederMarket>,
     inventory_hedge: Option<HedgeLimits>,
 }
 
@@ -47,6 +50,7 @@ pub(super) struct Profile {
     pub network: Network,
     /// Ticker of the strategy symbol, resolved from `[symbols]`.
     pub symbol: String,
+    pub app: AppConfig,
     feeds: Feeds,
     feeder_config: String,
 }
@@ -114,6 +118,19 @@ impl Profile {
                 "Hyperliquid feeder network differs from Lighter"
             );
         }
+        if let Some(bn) = feeds.binance.as_ref().filter(|bn| bn.feeder_enabled) {
+            ensure!(
+                network == Network::Mainnet && bn.feeder_ws_url == "wss://fstream.binance.com",
+                "Binance reference feeder requires Mainnet and wss://fstream.binance.com"
+            );
+            ensure!(
+                !bn.feeder_symbols.is_empty()
+                    && bn.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && *market == format!("{ticker}USDT")
+                    }),
+                "Binance feeder must map registered symbols to <SYMBOL>USDT perpetuals"
+            );
+        }
         if let Some(hedge) = &feeds.inventory_hedge {
             hedge.validate()?;
             ensure!(
@@ -128,19 +145,85 @@ impl Profile {
                 "Maximum strategy spread is below the configured round-trip cost"
             );
         }
-        // The supervised quote path accepts only the matched Lighter and
-        // Hyperliquid books as pricing inputs. Serialize that exact validated
-        // profile to the private session directory before the feeder starts.
+        if let Some(dep) = &app.deployment {
+            match dep.scenario {
+                ResearchScenario::HedgeArbitrage => ensure!(
+                    feeds.inventory_hedge.is_some(),
+                    "deployment.scenario=hedge_arbitrage requires [inventory_hedge]"
+                ),
+                ResearchScenario::QuantProfit => ensure!(
+                    feeds.inventory_hedge.is_none(),
+                    "deployment.scenario=quant_profit forbids [inventory_hedge]"
+                ),
+                ResearchScenario::IncentiveTurnover => {}
+            }
+            if feeds.inventory_hedge.is_none() {
+                ensure!(
+                    dep.hedge_account_slot.is_none(),
+                    "deployment.hedge_account_slot requires [inventory_hedge]"
+                );
+            }
+        }
+        // The supervised quote path accepts only the validated Lighter,
+        // Hyperliquid, and optional Binance reference books as inputs. Serialize
+        // that exact validated profile to the private session directory before the feeder starts.
         let mut feeder: toml::Table = toml::from_str(&contents)?;
-        feeder.retain(|key, _| matches!(key, "lighter" | "hyperliquid" | "symbols"));
+        feeder.retain(|key, _| matches!(key, "lighter" | "hyperliquid" | "binance" | "symbols"));
         let feeder_config = toml::to_string(&feeder)?;
         Ok(Self {
             strategy,
             network,
             symbol,
+            app,
             feeds,
             feeder_config,
         })
+    }
+
+    pub fn deployment(&self) -> Option<&DeploymentIsolationConfig> {
+        self.app.deployment.as_ref()
+    }
+
+    pub fn verify_account_binding(&self, account_index: i64) -> Result<()> {
+        if let Some(expected) = self.deployment().and_then(|dep| dep.expected_account_index) {
+            ensure!(
+                account_index == expected,
+                "Profile binds expected_account_index={expected}, but credentials resolved account_index={account_index}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validates that a fleet of supervised profiles has zero cross-subaccount STP
+    /// collisions, network mismatches, or shared hedge position slots.
+    pub fn validate_isolation(profiles: &[(&str, Self)]) -> Result<()> {
+        for i in 0..profiles.len() {
+            let (name_a, prof_a) = &profiles[i];
+            for (name_b, prof_b) in &profiles[(i + 1)..] {
+                if prof_a.network != prof_b.network {
+                    continue;
+                }
+                AppConfig::validate_fleet_isolation([
+                    (*name_a, &prof_a.app),
+                    (*name_b, &prof_b.app),
+                ])?;
+                if prof_a.has_hedge() && prof_b.has_hedge() && prof_a.symbol == prof_b.symbol {
+                    let slot_a = prof_a
+                        .deployment()
+                        .and_then(|d| d.hedge_account_slot.as_deref());
+                    let slot_b = prof_b
+                        .deployment()
+                        .and_then(|d| d.hedge_account_slot.as_deref());
+                    ensure!(
+                        matches!((slot_a, slot_b), (Some(a), Some(b)) if a != b),
+                        "Hedge position collision on {:?} {} between {name_a} and {name_b}: concurrent hedged profiles on the same symbol must declare distinct deployment.hedge_account_slot values",
+                        prof_a.network,
+                        prof_a.symbol
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn has_hedge(&self) -> bool {
@@ -354,6 +437,7 @@ pub(super) async fn launch(
         profile.network == network,
         "Lighter feeder and signer must use the same network"
     );
+    profile.verify_account_binding(credentials.account_index())?;
     let hedge = profile
         .feeds
         .inventory_hedge
@@ -706,5 +790,81 @@ taker_fee_bps = 0
         .await
         .unwrap_err();
         assert!(error.to_string().contains("Feeder exited"));
+    }
+
+    #[test]
+    fn fleet_profile_validation_enforces_stp_and_binance_and_hedge_isolation() {
+        let example = include_str!("../../../config.example.toml");
+        let dir = std::env::temp_dir().join(format!("aleph-fleet-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let p_quant_path = dir.join("quant_eth.toml");
+        let quant_toml = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"quant_profit\"\nl1_group = \"primary_l1\"\nsubaccount_slot = \"sub_eth_quant\"\nexpected_account_index = 10\n",
+            example.replace(
+                "feeder_enabled = false\nfeeder_ws_url = \"wss://fstream.binance.com\"",
+                "feeder_enabled = true\nfeeder_ws_url = \"wss://fstream.binance.com\""
+            )
+        );
+        fs::write(&p_quant_path, &quant_toml).unwrap();
+        let p_quant = Profile::load(&p_quant_path).unwrap();
+        assert!(p_quant.feeder_config.contains("[binance]"));
+        assert!(p_quant.verify_account_binding(10).is_ok());
+        assert!(p_quant.verify_account_binding(11).is_err());
+
+        let hedge_block = r#"
+[inventory_hedge]
+max_unhedged_base = "0.002"
+deadband_base = "0.0005"
+max_order_notional_usd = "25"
+min_available_usd = "50"
+slippage_bps = 5
+taker_fee_bps = 4.5
+"#;
+        let p_hedge_btc_path = dir.join("hedge_btc.toml");
+        let hedge_btc_toml = format!(
+            "strategy_mode = \"inventory_hedge\"\n{}{}\n[deployment]\nscenario = \"hedge_arbitrage\"\nl1_group = \"primary_l1\"\nsubaccount_slot = \"sub_btc_hedge\"\nexpected_account_index = 11\nhedge_account_slot = \"hl_btc_primary\"\n",
+            example
+                .replace("ETH = \"0\"", "BTC = \"1\"")
+                .replace("symbol_id = 1002         # ETH-PERP", "symbol_id = 1001")
+                .replace("market_id = 0", "market_id = 1"),
+            hedge_block
+        );
+        fs::write(&p_hedge_btc_path, &hedge_btc_toml).unwrap();
+        let p_hedge_btc = Profile::load(&p_hedge_btc_path).unwrap();
+
+        let p_turnover_path = dir.join("turnover_separate_l1.toml");
+        let turnover_toml = format!(
+            "strategy_mode = \"quant\"\n{}\n[deployment]\nscenario = \"incentive_turnover\"\nl1_group = \"turnover_l1\"\nsubaccount_slot = \"sub_eth_turnover\"\nexpected_account_index = 20\n",
+            example
+        );
+        fs::write(&p_turnover_path, &turnover_toml).unwrap();
+        let p_turnover = Profile::load(&p_turnover_path).unwrap();
+
+        Profile::validate_isolation(&[
+            ("quant_eth", p_quant),
+            ("hedge_btc", p_hedge_btc),
+            ("turnover_eth", p_turnover),
+        ])
+        .unwrap();
+
+        // Same L1 + same market (ETH market_id=0) must be rejected for STP collision.
+        let p_collision_path = dir.join("collision_eth.toml");
+        fs::write(
+            &p_collision_path,
+            turnover_toml.replace("turnover_l1", "primary_l1"),
+        )
+        .unwrap();
+        let p_quant_again = Profile::load(&p_quant_path).unwrap();
+        let p_collision = Profile::load(&p_collision_path).unwrap();
+        assert!(
+            Profile::validate_isolation(&[
+                ("quant_eth", p_quant_again),
+                ("collision", p_collision)
+            ])
+            .is_err()
+        );
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

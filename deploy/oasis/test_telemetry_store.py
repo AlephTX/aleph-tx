@@ -605,5 +605,90 @@ class DashboardContractTest(unittest.TestCase):
                    self.query("fee_source_session.jsonl", lambda store: store.fills()))
 
 
+class MultiSessionAndMarketsTest(unittest.TestCase):
+    def test_session_scoped_summary_and_pnl_series_isolate_multi_scenario_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "s_quant.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": 1_000, "exchange": "lighter", "symbol": "ETH", "account": 10},
+                fill(10_000, "buy", 2000.0, 0.1, 0.0, 101, fee_source="explicit_zero"),
+                fill(70_000, "sell", 2020.0, 0.1, 0.0, 102, coid=2, fee_source="explicit_zero"),
+                {"type": "snapshot", "ts_ms": 75_000, "equity": 1002.0, "session_start_equity": 1000.0,
+                 "mid": 2020.0, "daily_loss_day_start_ms": 0, "daily_loss_start_equity": 1000.0,
+                 "daily_loss_limit_pct": 0.03},
+            )) + "\n")
+            (root / "s_hedge.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": 80_000, "exchange": "lighter", "symbol": "BTC",
+                 "account": 20, "hedge_account": "0x1111111111111111111111111111111111111111"},
+                fill(90_000, "buy", 68000.0, 0.01, 0.0, 201, fee_source="explicit_zero"),
+                fill(130_000, "sell", 68100.0, 0.01, 0.0, 202, coid=2, fee_source="explicit_zero"),
+                {"type": "snapshot", "ts_ms": 135_000, "equity": 501.0, "session_start_equity": 500.0,
+                 "mid": 68100.0},
+            )) + "\n")
+            store = TelemetryStore(":memory:", root)
+            try:
+                store.ingest()
+                # Default summary points to latest session (`s_hedge`) with global windows.
+                latest = store.summary(now_ms=140_000)
+                self.assertEqual(latest["session"]["session_id"], "s_hedge")
+                self.assertEqual(latest["windows"]["all"]["fills"], 4)
+
+                # Scoped summary isolates `s_quant` session, snapshot, and windows.
+                quant = store.summary(now_ms=140_000, session_id="s_quant")
+                self.assertEqual(quant["session"]["session_id"], "s_quant")
+                self.assertAlmostEqual(quant["session"]["net_pnl"], 2.0)
+                self.assertEqual(quant["windows"]["all"]["fills"], 2)
+                self.assertAlmostEqual(quant["windows"]["all"]["net_pnl"], 2.0)
+                self.assertAlmostEqual(quant["snapshot"]["daily_loss_limit_pct"], 0.03)
+
+                # Scoped PnL series isolates `s_quant` buckets and equity snapshots.
+                series_q = store.pnl_series("1m", since_ms=0, session_id="s_quant")
+                self.assertEqual([r["cumulative"] for r in series_q["pnl"]], [0.0, 2.0])
+                self.assertEqual([r["equity"] for r in series_q["equity"]], [1002.0])
+
+                series_h = store.pnl_series("1m", since_ms=0, session_id="s_hedge")
+                self.assertEqual([r["cumulative"] for r in series_h["pnl"]], [0.0, 1.0])
+                self.assertEqual([r["equity"] for r in series_h["equity"]], [501.0])
+
+                with self.assertRaises(ValueError):
+                    store.summary(now_ms=140_000, session_id="missing_session")
+                with self.assertRaises(ValueError):
+                    store.pnl_series("1m", session_id="missing_session")
+            finally:
+                store.db.close()
+
+    def test_monitor_markets_reads_binance_lighter_hyperliquid_shm_slots(self):
+        import os
+        import monitor
+
+        self.assertIn(("Binance", "ETH", 6, 1002), monitor.MARKETS)
+        self.assertIn(("Binance", "BTC", 6, 1001), monitor.MARKETS)
+        self.assertIn(("Lighter", "BTC", 2, 1001), monitor.MARKETS)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shm_path = Path(tmp) / "matrix"
+            now_ns = 1_700_000_000 * 10**9
+            max_offset = 2048 * 8 + (1002 * 7 + 6 + 1) * monitor.BBO.size
+            shm_path.write_bytes(b"\x00" * max_offset)
+            fd = os.open(shm_path, os.O_RDWR)
+            try:
+                # Write valid Binance ETH BBO (exchange=6, symbol=1002) with even seqlock seq=4
+                offset = 2048 * 8 + (1002 * 7 + 6) * monitor.BBO.size
+                packed = monitor.BBO.pack(4, 1, 6, 1002, now_ns - 25_000_000, 2500.0, 12.5, 2500.1, 8.0)
+                os.pwrite(fd, packed, offset)
+                quote = monitor.read_quote(fd, 6, 1002, now_ns)
+                self.assertEqual(quote["state"], "live")
+                self.assertEqual(quote["age_ms"], 25)
+                self.assertAlmostEqual(quote["bid"], 2500.0)
+                self.assertAlmostEqual(quote["ask"], 2500.1)
+
+                # Odd seqlock sequence (write in progress) is rejected
+                odd_packed = monitor.BBO.pack(5, 1, 6, 1002, now_ns - 25_000_000, 2500.0, 12.5, 2500.1, 8.0)
+                os.pwrite(fd, odd_packed, offset)
+                self.assertIsNone(monitor.read_quote(fd, 6, 1002, now_ns))
+            finally:
+                os.close(fd)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,9 @@
 use super::ActiveOrder;
 use super::components::{
-    FLOAT_EPSILON, build_grid_plan, inventory_deadband_size, min_quotable_size, reconcile_side_plan,
+    FLOAT_EPSILON, build_grid_plan, inventory_deadband_size, min_quotable_size,
+    reconcile_side_plan_with_options,
 };
+use super::pricing::MakerPriceBounds;
 use crate::config::InventoryNeutralMMConfig;
 use crate::error::TradingError;
 use crate::exchange::{BatchResult, OrderParams, OrderType, Side};
@@ -11,7 +13,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 const CALM_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 1;
-const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
+pub(super) const URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE: usize = 2;
 const CALM_SIZE_TOLERANCE_RATIO: f64 = 0.25;
 const PRE_URGENCY_SIZE_TOLERANCE_RATIO: f64 = 0.18;
 const ACTIVE_SIZE_TOLERANCE_RATIO: f64 = 0.12;
@@ -70,6 +72,7 @@ pub(super) fn classify_batch_failure(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_side_execution_plan(
     config: &InventoryNeutralMMConfig,
@@ -81,6 +84,65 @@ pub(super) fn build_side_execution_plan(
     threshold: f64,
     size_tolerance_ratio: f64,
     max_replacements_per_cycle: usize,
+) -> SideExecutionPlan {
+    build_side_execution_plan_with_bounds(
+        config,
+        active_orders,
+        order_type,
+        side,
+        target_px,
+        total_sz,
+        threshold,
+        size_tolerance_ratio,
+        max_replacements_per_cycle,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_side_execution_plan_with_bounds(
+    config: &InventoryNeutralMMConfig,
+    active_orders: &[ActiveOrder],
+    order_type: OrderType,
+    side: Side,
+    target_px: f64,
+    total_sz: f64,
+    threshold: f64,
+    size_tolerance_ratio: f64,
+    max_replacements_per_cycle: usize,
+    cancel_bounds: Option<MakerPriceBounds>,
+) -> SideExecutionPlan {
+    build_side_execution_plan_with_options(
+        config,
+        active_orders,
+        order_type,
+        side,
+        target_px,
+        total_sz,
+        threshold,
+        size_tolerance_ratio,
+        max_replacements_per_cycle,
+        cancel_bounds,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_side_execution_plan_with_options(
+    config: &InventoryNeutralMMConfig,
+    active_orders: &[ActiveOrder],
+    order_type: OrderType,
+    side: Side,
+    target_px: f64,
+    total_sz: f64,
+    threshold: f64,
+    size_tolerance_ratio: f64,
+    max_replacements_per_cycle: usize,
+    cancel_bounds: Option<MakerPriceBounds>,
+    min_lifetime_override: Option<Duration>,
+    fast_reducing: bool,
 ) -> SideExecutionPlan {
     let order_side = match side {
         Side::Buy => OrderSide::Buy,
@@ -111,13 +173,22 @@ pub(super) fn build_side_execution_plan(
     let desired_quotes = build_grid_plan(config, side, order_type, target_px, total_sz);
     if desired_quotes.is_empty() {
         return SideExecutionPlan {
-            to_cancel: Vec::new(),
+            to_cancel: side_orders
+                .iter()
+                .filter(|order| {
+                    cancel_bounds.is_some_and(|bounds| !bounds.allows(order.side, order.price))
+                        && order.order_index.is_some()
+                        && order.lifecycle != OrderLifecycle::PendingCancel
+                })
+                .filter_map(|order| order.order_index)
+                .collect(),
             to_place: Vec::new(),
         };
     }
 
-    let min_lifetime = Duration::from_secs(config.order_ttl_secs.max(1));
-    let (to_cancel, to_place) = reconcile_side_plan(
+    let min_lifetime =
+        min_lifetime_override.unwrap_or_else(|| Duration::from_secs(config.order_ttl_secs.max(1)));
+    let (to_cancel, to_place) = reconcile_side_plan_with_options(
         &side_orders,
         &desired_quotes,
         threshold,
@@ -125,6 +196,8 @@ pub(super) fn build_side_execution_plan(
         size_tolerance_ratio,
         min_lifetime,
         max_replacements_per_cycle,
+        cancel_bounds,
+        fast_reducing,
     );
 
     SideExecutionPlan {

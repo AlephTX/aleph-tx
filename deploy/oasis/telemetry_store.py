@@ -398,6 +398,11 @@ class TelemetryStore:
         return dict(row) if row else None
 
     @locked
+    def session(self, session_id):
+        row = self.db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    @locked
     def sessions(self, limit=50):
         rows = self._rows("SELECT * FROM sessions ORDER BY started_ms DESC LIMIT ?", (limit,))
         for row in rows:
@@ -411,7 +416,9 @@ class TelemetryStore:
                               (session_id,)).fetchone()
         return dict(row) if row else None
 
-    def _window(self, since_ms):
+    def _window(self, since_ms, session_id=None):
+        where = "ts_ms>=?" if session_id is None else "ts_ms>=? AND session_id=?"
+        args = (since_ms,) if session_id is None else (since_ms, session_id)
         row = self.db.execute(
             "SELECT count(*) AS fills, coalesce(sum(notional),0) AS volume,"
             " coalesce(sum(realized_delta),0) AS realized, coalesce(sum(fee),0) AS fees,"
@@ -420,7 +427,7 @@ class TelemetryStore:
             " coalesce(sum(CASE WHEN side='sell' THEN notional ELSE 0 END),0) AS sell_volume,"
             " coalesce(sum(CASE WHEN realized_delta>0 THEN 1 ELSE 0 END),0) AS winning,"
             " coalesce(sum(CASE WHEN realized_delta<0 THEN 1 ELSE 0 END),0) AS losing"
-            " FROM fills WHERE ts_ms>=?", (since_ms,)).fetchone()
+            f" FROM fills WHERE {where}", args).fetchone()
         result = dict(row)
         result["net_pnl"] = result["realized"] - result["fees"]
         closes = result["winning"] + result["losing"]
@@ -571,10 +578,15 @@ class TelemetryStore:
         }
 
     @locked
-    def summary(self, now_ms=None):
+    def summary(self, now_ms=None, session_id=None):
         now_ms = now_ms or int(time.time() * 1000)
         day_start = now_ms - now_ms % 86_400_000
-        session = self.latest_session()
+        if session_id is None:
+            session = self.latest_session()
+        else:
+            session = self.session(session_id)
+            if session is None:
+                raise ValueError("unknown session")
         snapshot = self.latest_snapshot(session["session_id"]) if session else None
         current = None
         if session:
@@ -583,10 +595,10 @@ class TelemetryStore:
                            "SELECT count(*) FROM orders WHERE session_id=? AND status IN ('open','partial')",
                            (session["session_id"],)).fetchone()[0]}
         return {"session": current, "snapshot": snapshot,
-                "windows": {"today": self._window(day_start),
-                            "24h": self._window(now_ms - 86_400_000),
-                            "7d": self._window(now_ms - 7 * 86_400_000),
-                            "all": self._window(0)}}
+                "windows": {"today": self._window(day_start, session_id=session_id),
+                            "24h": self._window(now_ms - 86_400_000, session_id=session_id),
+                            "7d": self._window(now_ms - 7 * 86_400_000, session_id=session_id),
+                            "all": self._window(0, session_id=session_id)}}
 
     @locked
     def fills(self, limit=200, before_ms=None, session_id=None):
@@ -620,21 +632,29 @@ class TelemetryStore:
                           (session_id, limit))
 
     @locked
-    def pnl_series(self, bucket="5m", since_ms=0):
+    def pnl_series(self, bucket="5m", since_ms=0, session_id=None):
         width = self.BUCKETS[bucket]
-        # Cumulative net PnL across sessions at the end of each bucket.
+        if session_id is not None and self.session(session_id) is None:
+            raise ValueError("unknown session")
+        fill_where = "ts_ms>=?" if session_id is None else "ts_ms>=? AND session_id=?"
+        fill_args = (width, width, since_ms) if session_id is None else (width, width, since_ms, session_id)
+        base_where = "ts_ms<?" if session_id is None else "ts_ms<? AND session_id=?"
+        base_args = (since_ms,) if session_id is None else (since_ms, session_id)
+        snap_where = "ts_ms>=? AND equity>0" if session_id is None else "ts_ms>=? AND equity>0 AND session_id=?"
+        snap_args = (width, width, since_ms) if session_id is None else (width, width, since_ms, session_id)
+        # Cumulative net PnL across sessions (or within the requested session) at the end of each bucket.
         rows = self._rows(
-            "SELECT (ts_ms/?)*? AS t, sum(realized_delta - fee) AS net, sum(notional) AS volume,"
-            " count(*) AS fills FROM fills WHERE ts_ms>=? GROUP BY t ORDER BY t", (width, width, since_ms))
-        base = self.db.execute("SELECT coalesce(sum(realized_delta - fee),0) FROM fills WHERE ts_ms<?",
-                               (since_ms,)).fetchone()[0]
+            f"SELECT (ts_ms/?)*? AS t, sum(realized_delta - fee) AS net, sum(notional) AS volume,"
+            f" count(*) AS fills FROM fills WHERE {fill_where} GROUP BY t ORDER BY t", fill_args)
+        base = self.db.execute(f"SELECT coalesce(sum(realized_delta - fee),0) FROM fills WHERE {base_where}",
+                               base_args).fetchone()[0]
         cumulative = base
         for row in rows:
             cumulative += row["net"]
             row["cumulative"] = cumulative
         equity = self._rows(
             # SQLite returns bare columns from the row holding max(ts_ms).
-            "SELECT (ts_ms/?)*? AS t, max(ts_ms) AS last_ts, equity, exchange_position AS position,"
-            " mid FROM snapshots WHERE ts_ms>=? AND equity>0 GROUP BY t ORDER BY t",
-            (width, width, since_ms))
+            f"SELECT (ts_ms/?)*? AS t, max(ts_ms) AS last_ts, equity, exchange_position AS position,"
+            f" mid FROM snapshots WHERE {snap_where} GROUP BY t ORDER BY t",
+            snap_args)
         return {"bucket": bucket, "pnl": rows, "equity": equity}

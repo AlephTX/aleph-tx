@@ -1,6 +1,10 @@
 //! Offline, receipt-causal risk filter. Binance never supplies quote prices.
 use super::*;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Policy {
@@ -8,6 +12,10 @@ pub(super) struct Policy {
     pub lookback_ms: u64,
     pub max_age_ms: u64,
     pub shock_bps: f64,
+    #[serde(default = "default_true")]
+    pub block_unavailable: bool,
+    #[serde(default = "default_true")]
+    pub block_shock: bool,
 }
 
 impl Policy {
@@ -173,7 +181,12 @@ impl Participation {
         if !self.policy.enabled {
             return;
         }
-        let [buy, sell] = ready.unwrap_or([false; 2]);
+        let [buy, sell] = match ready {
+            Some(sides) if self.policy.block_shock => sides,
+            Some(_) => [true; 2],
+            None if self.policy.block_unavailable => [false; 2],
+            None => [true; 2],
+        };
         // Never suppress a potential reduction when account and fill evidence
         // disagree. Existing execution planning retains pending cancel exposure.
         if !buy
@@ -206,6 +219,8 @@ mod tests {
             lookback_ms: 1_000,
             max_age_ms: 500,
             shock_bps: 1.0,
+            block_unavailable: true,
+            block_shock: true,
         }
     }
 
@@ -329,5 +344,70 @@ mod tests {
             gate.withdrawn_ask_targets,
             gate.withdrawn_ask_targets_by_shock + gate.withdrawn_ask_targets_by_unavailable
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_only_and_shock_only_isolate_factorial_arms() {
+        let _clock = ReplayClock::open(2000, false);
+        let config = InventoryNeutralMMConfig::default();
+        let target = || QuoteTarget {
+            bid_price: 100.0,
+            ask_price: 101.0,
+            bid_size: 1.0,
+            ask_size: 1.0,
+        };
+
+        // Shock-only: blocks directional shock when fresh, ignores staleness.
+        let shock_only = Policy {
+            block_unavailable: false,
+            block_shock: true,
+            ..policy()
+        };
+        let sig_s = Arc::new(PlMutex::new(Signal::new(shock_only)));
+        sig_s
+            .lock()
+            .update(1000, 1000, 1, Some(100.0), Some(1))
+            .unwrap();
+        sig_s
+            .lock()
+            .update(2000, 2000, 1, Some(99.98), Some(2))
+            .unwrap();
+        let mut gate_s = Participation::new(shock_only, sig_s);
+        let mut t1 = target();
+        gate_s.apply(&mut t1, [0.0; 2], &config);
+        assert_eq!([t1.bid_size, t1.ask_size], [0.0, 1.0]);
+
+        // Stale-only: ignores directional shock when fresh, blocks when stale.
+        let stale_only = Policy {
+            block_unavailable: true,
+            block_shock: false,
+            ..policy()
+        };
+        let sig_u = Arc::new(PlMutex::new(Signal::new(stale_only)));
+        sig_u
+            .lock()
+            .update(1000, 1000, 1, Some(100.0), Some(1))
+            .unwrap();
+        sig_u
+            .lock()
+            .update(2000, 2000, 1, Some(99.98), Some(2))
+            .unwrap();
+        let mut gate_u = Participation::new(stale_only, sig_u);
+        let mut t2 = target();
+        gate_u.apply(&mut t2, [0.0; 2], &config);
+        assert_eq!([t2.bid_size, t2.ask_size], [1.0, 1.0]);
+
+        tokio::time::advance(Duration::from_millis(501)).await;
+        let mut t1_stale = target();
+        gate_s.apply(&mut t1_stale, [0.0; 2], &config);
+        assert_eq!([t1_stale.bid_size, t1_stale.ask_size], [1.0, 1.0]);
+        assert_eq!(gate_s.withdrawn_bid_targets_by_unavailable, 0);
+        assert_eq!(gate_s.withdrawn_bid_targets_by_shock, 1);
+
+        let mut t2_stale = target();
+        gate_u.apply(&mut t2_stale, [0.0; 2], &config);
+        assert_eq!([t2_stale.bid_size, t2_stale.ask_size], [0.0, 0.0]);
+        assert_eq!(gate_u.withdrawn_bid_targets_by_shock, 0);
+        assert_eq!(gate_u.withdrawn_bid_targets_by_unavailable, 1);
     }
 }

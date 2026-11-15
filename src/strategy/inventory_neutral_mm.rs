@@ -33,11 +33,11 @@ use components::{
     toxicity_spread_multiplier, usable_balance_fraction, utilization_floor_base_order_size,
 };
 use execution::{
-    BatchFailureAction, InventoryContext, apply_batch_success, build_side_execution_plan,
-    classify_batch_failure, max_side_requote_replacements_per_cycle,
-    resolve_cancel_client_order_ids, should_defer_cancel_only_refresh, should_defer_micro_refresh,
-    should_defer_one_sided_requote, should_defer_post_fill_replenishment,
-    size_tolerance_ratio_for_requote,
+    BatchFailureAction, InventoryContext, URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE,
+    apply_batch_success, build_side_execution_plan_with_options, classify_batch_failure,
+    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
+    should_defer_cancel_only_refresh, should_defer_micro_refresh, should_defer_one_sided_requote,
+    should_defer_post_fill_replenishment, size_tolerance_ratio_for_requote,
 };
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
@@ -491,6 +491,8 @@ pub struct InventoryNeutralMM {
     margin_cooldown_until: Instant,
     stale_bbo_since_ns: Option<u64>,
     inventory_age: InventoryAge,
+    episode_flat_cash_flow: Option<f64>,
+    episode_direction: f64,
     position_confirmation_after_ns: Option<u64>,
 
     // Telemetry
@@ -601,6 +603,8 @@ impl InventoryNeutralMM {
             margin_cooldown_until: Instant::now(),
             stale_bbo_since_ns: None,
             inventory_age: InventoryAge::default(),
+            episode_flat_cash_flow: None,
+            episode_direction: 0.0,
             position_confirmation_after_ns: None,
             telemetry: TelemetryCollector::new(),
             telemetry_sink: None,
@@ -749,20 +753,39 @@ impl InventoryNeutralMM {
             )
         };
 
+        self.update_episode_cost_basis();
+
         // Inventory age follows the exposure episode, not the last fill.
         // Adding to a stuck position must never renew its timeout.
-        let deadband = inventory_deadband_size(
-            &self.config,
-            scaled_base_order_size(&self.config, self.account_stats.portfolio_value, inputs.mid)
-                .max(self.config.step_size),
-            scaled_inventory_urgency_threshold(
+        let deadband = if self.hedge.is_none()
+            && self
+                .config
+                .quote_hysteresis
+                .is_some_and(|h| h.zero_deadband_flatten)
+        {
+            (self.config.step_size * 0.5).max(components::FLOAT_EPSILON)
+        } else {
+            inventory_deadband_size(
                 &self.config,
-                self.account_stats.portfolio_value,
+                scaled_base_order_size(
+                    &self.config,
+                    self.account_stats.portfolio_value,
+                    inputs.mid,
+                )
+                .max(self.config.step_size),
+                scaled_inventory_urgency_threshold(
+                    &self.config,
+                    self.account_stats.portfolio_value,
+                    inputs.mid,
+                    scaled_max_position(
+                        &self.config,
+                        self.account_stats.portfolio_value,
+                        inputs.mid,
+                    ),
+                ),
                 inputs.mid,
-                scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid),
-            ),
-            inputs.mid,
-        );
+            )
+        };
         let now = Instant::now();
         self.inventory_age.observe(quoting_position, deadband, now);
         // With a live hedge, Lighter inventory is offset on Hyperliquid;
@@ -966,6 +989,24 @@ impl InventoryNeutralMM {
         }
     }
 
+    fn update_episode_cost_basis(&mut self) {
+        let half_step = (self.config.step_size * 0.5).max(components::FLOAT_EPSILON);
+        let confirmed_pos = self.order_tracker.confirmed_position();
+        let account_pos = self.account_stats.position;
+        if confirmed_pos.abs() < half_step && account_pos.abs() < half_step {
+            self.episode_flat_cash_flow = Some(self.order_tracker.trade_cash_flow());
+            self.episode_direction = 0.0;
+        } else if confirmed_pos.abs() >= half_step {
+            if (account_pos - confirmed_pos).abs() > self.config.step_size
+                || (self.episode_direction != 0.0
+                    && confirmed_pos.signum() != self.episode_direction)
+            {
+                self.episode_flat_cash_flow = None;
+            }
+            self.episode_direction = confirmed_pos.signum();
+        }
+    }
+
     fn build_quote_target(
         &mut self,
         our_bid: f64,
@@ -979,8 +1020,25 @@ impl InventoryNeutralMM {
         self.telemetry
             .update_adverse_selection(self.micro.adverse_selection_score());
 
-        let min_spread_bps = self.minimum_spread_bps();
-        if spread_bps < min_spread_bps {
+        let hysteresis = self
+            .config
+            .quote_hysteresis
+            .filter(|_| self.hedge.is_none());
+        let min_spread_bps = if let Some(policy) = hysteresis {
+            let mut runtime_config = self.config.clone();
+            runtime_config.inventory_urgency_threshold = risk.inventory_urgency_threshold;
+            let urgency_ratio = inventory_skew_ratio(&runtime_config, risk.position_for_quoting);
+            let ([bid_flatten, ask_flatten], _) =
+                self.flattening_progress(risk.position_for_quoting, mid, urgency_ratio, policy);
+            if policy.zero_deadband_flatten && (bid_flatten > 0.0 || ask_flatten > 0.0) {
+                (self.config.maker_fee_bps * 2.0 + policy.flatten_min_profit_bps).max(0.0)
+            } else {
+                self.minimum_spread_bps()
+            }
+        } else {
+            self.minimum_spread_bps()
+        };
+        if our_ask <= our_bid || spread_bps + components::FLOAT_EPSILON < min_spread_bps {
             debug!(
                 "Skipping quote target: spread_bps={:.2} below min_spread_bps={:.2}",
                 spread_bps, min_spread_bps
@@ -999,14 +1057,24 @@ impl InventoryNeutralMM {
         let position = risk.position_for_quoting;
         let bid_scale = if position >= 0.0 { regime_scale } else { 1.0 };
         let ask_scale = if position <= 0.0 { regime_scale } else { 1.0 };
-        let bid_size = components::round_down_to_step(
+        let mut bid_size = components::round_down_to_step(
             bid_size * toxicity_scale * bid_scale,
             self.config.step_size,
         );
-        let ask_size = components::round_down_to_step(
+        let mut ask_size = components::round_down_to_step(
             ask_size * toxicity_scale * ask_scale,
             self.config.step_size,
         );
+        if let Some(max_mom) = hysteresis.and_then(|policy| policy.max_local_momentum_bps) {
+            let mom = self.micro.momentum_bps();
+            let half_step = (self.config.step_size * 0.5).max(components::FLOAT_EPSILON);
+            if mom < -max_mom && position >= -half_step {
+                bid_size = 0.0;
+            }
+            if mom > max_mom && position <= half_step {
+                ask_size = 0.0;
+            }
+        }
 
         Some(QuoteTarget {
             bid_price: our_bid,
@@ -1880,6 +1948,79 @@ impl InventoryNeutralMM {
         ]
     }
 
+    /// Unambiguous reducing progress (`[bid_progress, ask_progress]`) and age
+    /// urgency in `[0, 1]` when unhedged inventory exceeds the deadband and
+    /// neither account nor fill tracker disagrees on position direction.
+    fn flattening_progress(
+        &self,
+        q: f64,
+        mid: f64,
+        urgency_ratio: f64,
+        hysteresis: crate::config::QuoteHysteresisConfig,
+    ) -> ([f64; 2], f64) {
+        if self.hedge.is_some() || !q.is_finite() {
+            return ([0.0; 2], 0.0);
+        }
+        let max_pos = scaled_max_position(&self.config, self.account_stats.portfolio_value, mid);
+        let urgency_threshold = scaled_inventory_urgency_threshold(
+            &self.config,
+            self.account_stats.portfolio_value,
+            mid,
+            max_pos,
+        );
+        let deadband = if hysteresis.zero_deadband_flatten {
+            (self.config.step_size * 0.5).max(components::FLOAT_EPSILON)
+        } else {
+            inventory_deadband_size(
+                &self.config,
+                scaled_base_order_size(&self.config, self.account_stats.portfolio_value, mid)
+                    .max(self.config.step_size),
+                urgency_threshold,
+                mid,
+            )
+        };
+        if q.abs() <= deadband {
+            return ([0.0; 2], 0.0);
+        }
+        let account_pos = self.account_stats.position;
+        let confirmed_pos = self.order_tracker.confirmed_position();
+        let step = self.config.step_size;
+        let age_urgency = if hysteresis.flatten_age_start_fraction < 1.0
+            && self.inventory_age.direction == q.signum()
+            && let Some(opened) = self.inventory_age.opened_at
+        {
+            let age_frac = (Instant::now()
+                .saturating_duration_since(opened)
+                .as_secs_f64()
+                / (self.config.position_timeout_secs.max(1) as f64))
+                .clamp(0.0, 1.0);
+            if age_frac > hysteresis.flatten_age_start_fraction {
+                ((age_frac - hysteresis.flatten_age_start_fraction)
+                    / (1.0 - hysteresis.flatten_age_start_fraction))
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let size_progress = if hysteresis.zero_deadband_flatten {
+            (q.abs() / urgency_threshold.max(step)).clamp(0.0, 1.0)
+        } else {
+            urgency_ratio.abs().clamp(0.0, 1.0)
+        };
+        let progress = size_progress
+            .max(urgency_ratio.abs().clamp(0.0, 1.0))
+            .max(age_urgency);
+        if q > deadband && account_pos > -step && confirmed_pos > -step {
+            ([0.0, progress], age_urgency)
+        } else if q < -deadband && account_pos < step && confirmed_pos < step {
+            ([progress, 0.0], age_urgency)
+        } else {
+            ([0.0; 2], 0.0)
+        }
+    }
+
     /// Avellaneda-Stoikov pricing logic (v6.0.0)
     ///
     /// Uses external fair value as pricing_mid. Kappa is used directly from config
@@ -1890,7 +2031,7 @@ impl InventoryNeutralMM {
         inputs: &PricingInputs,
         q: f64,
     ) -> Option<(f64, f64, MakerPriceBounds)> {
-        let (sell_proceeds, buy_cost) = if let Some(hedge) = &self.hedge {
+        let (mut sell_proceeds, mut buy_cost) = if let Some(hedge) = &self.hedge {
             let allowance = hedge.allowance()?;
             (
                 inputs.pricing_mid.min(allowance.sell_proceeds),
@@ -1899,13 +2040,6 @@ impl InventoryNeutralMM {
         } else {
             (inputs.pricing_mid, inputs.pricing_mid)
         };
-        let bounds = MakerPriceBounds::new(
-            sell_proceeds,
-            buy_cost,
-            self.config.maker_fee_bps,
-            self.config.min_profit_bps,
-            self.config.tick_size,
-        )?;
         let markout_mult = if self.config.use_markout_spread {
             self.markout.spread_multiplier()
         } else {
@@ -1941,6 +2075,55 @@ impl InventoryNeutralMM {
         let reservation_price =
             inputs.pricing_mid * (1.0 - gamma * sigma * sigma * q * time_horizon - inventory_skew);
 
+        let hysteresis = self
+            .config
+            .quote_hysteresis
+            .filter(|_| self.hedge.is_none());
+        let ([bid_flatten, ask_flatten], age_urgency) = hysteresis
+            .map(|policy| self.flattening_progress(q, inputs.mid, urgency_ratio, policy))
+            .unwrap_or(([0.0; 2], 0.0));
+        let (bid_profit_bps, ask_profit_bps) = if let Some(policy) = hysteresis {
+            let span = (self.config.min_profit_bps - policy.flatten_min_profit_bps).max(0.0);
+            (
+                self.config.min_profit_bps - bid_flatten * span,
+                self.config.min_profit_bps - ask_flatten * span,
+            )
+        } else {
+            (self.config.min_profit_bps, self.config.min_profit_bps)
+        };
+        if hysteresis.is_some_and(|policy| policy.conservative_dual_anchor)
+            && inputs.using_external_fair_value
+            && inputs.mid.is_finite()
+            && inputs.mid > 0.0
+        {
+            if bid_flatten == 0.0 {
+                sell_proceeds = sell_proceeds.min(inputs.mid);
+            }
+            if ask_flatten == 0.0 {
+                buy_cost = buy_cost.max(inputs.mid);
+            }
+        }
+        let placement_bounds = MakerPriceBounds::new_asymmetric(
+            sell_proceeds,
+            buy_cost,
+            self.config.maker_fee_bps,
+            bid_profit_bps,
+            ask_profit_bps,
+            self.config.tick_size,
+        )?;
+        let cancel_bounds = if let Some(policy) = hysteresis {
+            MakerPriceBounds::new_asymmetric(
+                sell_proceeds,
+                buy_cost,
+                self.config.maker_fee_bps,
+                policy.cancel_min_profit_bps.min(bid_profit_bps),
+                policy.cancel_min_profit_bps.min(ask_profit_bps),
+                self.config.tick_size,
+            )?
+        } else {
+            placement_bounds
+        };
+
         // Spread logic: use config kappa directly (no fill-rate scaling)
         let kappa = self.config.as_kappa;
         let gamma_safe = gamma.max(1e-6);
@@ -1964,6 +2147,97 @@ impl InventoryNeutralMM {
             self.micro.momentum_bps(),
             self.config.momentum_skew_scale,
         );
+        if bid_flatten > 0.0 {
+            let floor_bps = (2.0 * self.config.maker_fee_bps + bid_profit_bps).max(0.0);
+            let reducing_base = fee_aware_half_spread(
+                half_spread_raw * toxicity_spread_mult,
+                inputs.pricing_mid,
+                floor_bps,
+                vol_cap_bps.max(floor_bps),
+            )?;
+            let (mut reducing_bid, _) = momentum_half_spreads(
+                reducing_base,
+                self.micro.momentum_bps(),
+                self.config.momentum_skew_scale,
+            );
+            let min_half = inputs.pricing_mid * floor_bps / 20_000.0;
+            reducing_bid -= age_urgency * (reducing_bid - min_half).max(0.0);
+            bid_half_spread = bid_half_spread.min(reducing_bid);
+        }
+        if ask_flatten > 0.0 {
+            let floor_bps = (2.0 * self.config.maker_fee_bps + ask_profit_bps).max(0.0);
+            let reducing_base = fee_aware_half_spread(
+                half_spread_raw * toxicity_spread_mult,
+                inputs.pricing_mid,
+                floor_bps,
+                vol_cap_bps.max(floor_bps),
+            )?;
+            let (_, mut reducing_ask) = momentum_half_spreads(
+                reducing_base,
+                self.micro.momentum_bps(),
+                self.config.momentum_skew_scale,
+            );
+            let min_half = inputs.pricing_mid * floor_bps / 20_000.0;
+            reducing_ask -= age_urgency * (reducing_ask - min_half).max(0.0);
+            ask_half_spread = ask_half_spread.min(reducing_ask);
+        }
+        if let Some(policy) = hysteresis
+            && let Some(be_bps) = policy.breakeven_exit_bps
+            && policy.breakeven_hold_fraction > 0.0
+            && let Some(flat_cash) = self.episode_flat_cash_flow
+        {
+            let age_frac = if self.inventory_age.direction == q.signum()
+                && let Some(opened) = self.inventory_age.opened_at
+            {
+                (Instant::now()
+                    .saturating_duration_since(opened)
+                    .as_secs_f64()
+                    / (self.config.position_timeout_secs.max(1) as f64))
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let hold_weight = if age_frac <= policy.breakeven_hold_fraction {
+                1.0
+            } else {
+                ((1.0 - age_frac) / (1.0 - policy.breakeven_hold_fraction).max(1e-6))
+                    .clamp(0.0, 1.0)
+            };
+            if hold_weight > 0.0 {
+                let confirmed_pos = self.order_tracker.confirmed_position();
+                let delta_cash = self.order_tracker.trade_cash_flow() - flat_cash;
+                let max_half_frac = 0.5 * self.config.max_spread_bps / 10_000.0;
+                if ask_flatten > 0.0 && confirmed_pos >= self.config.step_size {
+                    let fee_factor = (1.0 - self.config.maker_fee_bps / 10_000.0).max(0.5);
+                    let be_ask = ((-delta_cash)
+                        + confirmed_pos * inputs.pricing_mid * (be_bps / 10_000.0))
+                        / (confirmed_pos * fee_factor);
+                    if be_ask.is_finite() {
+                        let clamped_ask = be_ask.clamp(
+                            inputs.pricing_mid,
+                            inputs.pricing_mid * (1.0 + max_half_frac),
+                        );
+                        let base_ask = reservation_price + ask_half_spread;
+                        let target_ask = base_ask + hold_weight * (clamped_ask - base_ask).max(0.0);
+                        ask_half_spread = (target_ask - reservation_price).max(ask_half_spread);
+                    }
+                } else if bid_flatten > 0.0 && confirmed_pos <= -self.config.step_size {
+                    let abs_pos = -confirmed_pos;
+                    let fee_factor = (1.0 + self.config.maker_fee_bps / 10_000.0).max(0.5);
+                    let be_bid = (delta_cash - abs_pos * inputs.pricing_mid * (be_bps / 10_000.0))
+                        / (abs_pos * fee_factor);
+                    if be_bid.is_finite() {
+                        let clamped_bid = be_bid.clamp(
+                            inputs.pricing_mid * (1.0 - max_half_frac).max(0.1),
+                            inputs.pricing_mid,
+                        );
+                        let base_bid = reservation_price - bid_half_spread;
+                        let target_bid = base_bid - hold_weight * (base_bid - clamped_bid).max(0.0);
+                        bid_half_spread = (reservation_price - target_bid).max(bid_half_spread);
+                    }
+                }
+            }
+        }
         let regime_reserve = self.config.volatility_regime.map_or(0.0, |regime| {
             regime.max_widen_bps * inputs.volatility_pressure
         });
@@ -2021,9 +2295,9 @@ impl InventoryNeutralMM {
             self.config.tick_size,
         ) {
             Some((stable_bid, stable_ask)) => {
-                let bid = stable_bid.min(bounds.max_bid);
-                let ask = stable_ask.max(bounds.min_ask);
-                Some((bid, ask, bounds))
+                let bid = stable_bid.min(placement_bounds.max_bid);
+                let ask = stable_ask.max(placement_bounds.min_ask);
+                Some((bid, ask, cancel_bounds))
             }
             None => {
                 debug!(
@@ -2051,11 +2325,20 @@ impl InventoryNeutralMM {
             return;
         }
         self.refresh_active_orders_from_tracker();
-        if self
+        let breaching_any = self
             .active_orders
             .iter()
-            .any(|order| !bounds.allows(order.side, order.price))
-        {
+            .any(|order| !bounds.allows(order.side, order.price));
+        let per_side_bound_cancel = self.hedge.is_none()
+            && self
+                .config
+                .quote_hysteresis
+                .is_some_and(|h| h.per_side_bound_cancel)
+            && self
+                .active_orders
+                .iter()
+                .all(|order| bounds.allows(order.side, order.price) || order.order_index.is_some());
+        if breaching_any && !per_side_bound_cancel {
             // A requote tolerance must never retain a price below the
             // current edge floor, even during the minimum order lifetime.
             self.cancel_all_and_sync("maker edge below floor").await;
@@ -2167,31 +2450,84 @@ impl InventoryNeutralMM {
         let max_side_replacements = max_side_requote_replacements_per_cycle(&inv_ctx);
         let size_tolerance_ratio = size_tolerance_ratio_for_requote(&inv_ctx);
 
-        let bid_plan = build_side_execution_plan(
+        let hysteresis = self
+            .config
+            .quote_hysteresis
+            .filter(|_| self.hedge.is_none());
+        let ([bid_flatten, ask_flatten], _) = hysteresis
+            .map(|policy| {
+                let urgency_ratio =
+                    inventory_skew_ratio(&runtime_config, risk.position_for_quoting);
+                self.flattening_progress(risk.position_for_quoting, mid, urgency_ratio, policy)
+            })
+            .unwrap_or(([0.0; 2], 0.0));
+        let fast_reducing_enabled = hysteresis.is_some_and(|policy| {
+            policy.reducing_order_ttl_secs.is_some()
+                || policy.reducing_requote_threshold_bps.is_some()
+                || policy.zero_deadband_flatten
+        });
+        let bid_fast_reducing = fast_reducing_enabled && bid_flatten > 0.0;
+        let ask_fast_reducing = fast_reducing_enabled && ask_flatten > 0.0;
+        let reducing_ttl = hysteresis
+            .and_then(|policy| policy.reducing_order_ttl_secs)
+            .map(|secs| Duration::from_secs(secs.max(1)));
+        let reducing_threshold = hysteresis
+            .and_then(|policy| policy.reducing_requote_threshold_bps)
+            .map(|bps| mid * bps / 10_000.0);
+
+        let side_cancel_bounds = per_side_bound_cancel.then_some(bounds);
+        let bid_plan = build_side_execution_plan_with_options(
             &runtime_config,
             &self.active_orders,
             self.trading.limit_order_type(),
             Side::Buy,
             plan.target.bid_price,
             plan.target.bid_size,
-            plan.requote_threshold,
+            if bid_fast_reducing {
+                reducing_threshold.unwrap_or(plan.requote_threshold)
+            } else {
+                plan.requote_threshold
+            },
             size_tolerance_ratio,
-            max_side_replacements,
+            if bid_fast_reducing {
+                URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE
+            } else {
+                max_side_replacements
+            },
+            side_cancel_bounds,
+            bid_fast_reducing.then_some(reducing_ttl).flatten(),
+            bid_fast_reducing,
         );
-        let ask_plan = build_side_execution_plan(
+        let ask_plan = build_side_execution_plan_with_options(
             &runtime_config,
             &self.active_orders,
             self.trading.limit_order_type(),
             Side::Sell,
             plan.target.ask_price,
             plan.target.ask_size,
-            plan.requote_threshold,
+            if ask_fast_reducing {
+                reducing_threshold.unwrap_or(plan.requote_threshold)
+            } else {
+                plan.requote_threshold
+            },
             size_tolerance_ratio,
-            max_side_replacements,
+            if ask_fast_reducing {
+                URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE
+            } else {
+                max_side_replacements
+            },
+            side_cancel_bounds,
+            ask_fast_reducing.then_some(reducing_ttl).flatten(),
+            ask_fast_reducing,
         );
 
-        let risk_reducing = plan.target.bid_size
-            < components::min_quotable_size(&runtime_config, our_bid)
+        let reducing_activity = (bid_fast_reducing
+            && (!bid_plan.to_cancel.is_empty() || !bid_plan.to_place.is_empty()))
+            || (ask_fast_reducing
+                && (!ask_plan.to_cancel.is_empty() || !ask_plan.to_place.is_empty()));
+        let risk_reducing = breaching_any
+            || reducing_activity
+            || plan.target.bid_size < components::min_quotable_size(&runtime_config, our_bid)
             || plan.target.ask_size < components::min_quotable_size(&runtime_config, our_ask);
         if !risk_reducing && should_defer_one_sided_requote(&inv_ctx, &bid_plan, &ask_plan) {
             debug!(

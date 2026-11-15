@@ -137,7 +137,7 @@ configuration values. [Shared-memory ABI](docs/DUAL_TRACK_IPC.md) ·
 | Session lifecycle | Start from verified flat positions and no open orders in the configured scope. Stop through the supervisor and verify cleanup before restarting. | [Launch and shutdown](docs/LIVE_TRADING.md#start-and-stop) |
 | Exposure and recovery | Persist the UTC daily loss baseline and hedge intents. Retain reservations through ambiguous outcomes. An active journal blocks restart pending reconciliation. | [Execution and recovery](docs/LIVE_TRADING.md#execution-and-recovery) |
 | Audit and observability | Bind fee evidence to exact order identity. Track venue-reported fees, modeled costs, trade PnL and account equity separately. | [Fee evidence](docs/LIVE_TRADING.md#bind-and-measure-fee-evidence) · [Oasis runbook](deploy/oasis/README.md) |
-| Research acceptance | Preserve source and availability times, freeze parameters before the holdout, and report entry rejections, costs, residual exposure and final inventory. | [Recording](docs/PERP_RECORDING.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) |
+| Research acceptance | Preserve source and availability times, freeze parameters before the holdout, and report entry rejections, costs, residual exposure and final inventory. | [Recording](docs/PERP_RECORDING.md) · [Lakehouse](docs/QUANT_DATA_LAKEHOUSE.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) · [10h validation](docs/FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md) |
 
 The 20-hour Oasis campaign measures cross-venue basis and funding alongside
 a production-quote replay on public books and trades. Its holdout reports

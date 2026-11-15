@@ -2089,3 +2089,238 @@ async fn wake_latency_distribution_vs_fixed_sleep() {
     assert!(e50 < f50);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn quote_hysteresis_validates_bounds_and_cancels_only_breaching_side_immediately() {
+    use crate::config::QuoteHysteresisConfig;
+
+    let mut cfg = InventoryNeutralMMConfig {
+        min_profit_bps: 12.0,
+        maker_fee_bps: 0.0,
+        grid_levels: 1,
+        ..Default::default()
+    };
+    cfg.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 14.0,
+        flatten_min_profit_bps: 2.0,
+        flatten_age_start_fraction: 0.5,
+        per_side_bound_cancel: true,
+        reducing_order_ttl_secs: None,
+        reducing_requote_threshold_bps: None,
+        zero_deadband_flatten: false,
+        breakeven_exit_bps: None,
+        breakeven_hold_fraction: 0.0,
+        max_local_momentum_bps: None,
+        conservative_dual_anchor: false,
+    });
+    assert!(
+        cfg.validate().is_err(),
+        "cancel floor above placement floor must fail"
+    );
+
+    cfg.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 4.0,
+        flatten_min_profit_bps: 1.0,
+        flatten_age_start_fraction: 0.25,
+        per_side_bound_cancel: true,
+        reducing_order_ttl_secs: Some(2),
+        reducing_requote_threshold_bps: Some(0.5),
+        zero_deadband_flatten: true,
+        breakeven_exit_bps: Some(1.0),
+        breakeven_hold_fraction: 0.4,
+        max_local_momentum_bps: Some(4.0),
+        conservative_dual_anchor: true,
+    });
+    cfg.validate().unwrap();
+
+    // Fresh buy order at 1999.80 breaches cancel max_bid (1999.60) even when inside
+    // price threshold (1.00) and age=0s; fresh sell order at 2001.20 stays untouched.
+    let cancel_bounds = MakerPriceBounds::new_asymmetric(2000.0, 2000.0, 0.0, 4.0, 4.0, 0.01)
+        .expect("valid asymmetric bounds");
+    assert!((cancel_bounds.max_bid - 1999.60).abs() < 1e-9);
+    assert!((cancel_bounds.min_ask - 2000.41).abs() < 1e-9);
+
+    let fresh_buy = active_order(1, 101, OrderSide::Buy, 1999.80, 0.02, 0);
+    let fresh_sell = active_order(2, 202, OrderSide::Sell, 2001.20, 0.02, 0);
+    let orders = vec![fresh_buy, fresh_sell];
+
+    let bid_plan = execution::build_side_execution_plan_with_bounds(
+        &cfg,
+        &orders,
+        OrderType::PostOnly,
+        Side::Buy,
+        1998.80,
+        0.02,
+        1.5,
+        0.25,
+        1,
+        Some(cancel_bounds),
+    );
+    let ask_plan = execution::build_side_execution_plan_with_bounds(
+        &cfg,
+        &orders,
+        OrderType::PostOnly,
+        Side::Sell,
+        2001.20,
+        0.02,
+        1.5,
+        0.25,
+        1,
+        Some(cancel_bounds),
+    );
+    assert_eq!(
+        bid_plan.to_cancel,
+        vec![101],
+        "breaching buy must cancel at age=0"
+    );
+    assert_eq!(bid_plan.to_place.len(), 1);
+    assert_eq!(bid_plan.to_place[0].price, 1998.80);
+    assert!(
+        ask_plan.to_cancel.is_empty(),
+        "healthy sell queue must survive"
+    );
+    assert!(ask_plan.to_place.is_empty());
+}
+
+#[test]
+fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing_requote() {
+    use crate::config::QuoteHysteresisConfig;
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.grid_levels = 1;
+    strategy.config.min_profit_bps = 12.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.order_ttl_secs = 25;
+    strategy.config.position_timeout_secs = 120;
+    strategy.config.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 3.0,
+        flatten_min_profit_bps: 1.0,
+        flatten_age_start_fraction: 0.25,
+        per_side_bound_cancel: true,
+        reducing_order_ttl_secs: Some(2),
+        reducing_requote_threshold_bps: Some(0.5),
+        zero_deadband_flatten: true,
+        breakeven_exit_bps: Some(1.0),
+        breakeven_hold_fraction: 0.5,
+        max_local_momentum_bps: Some(2.0),
+        conservative_dual_anchor: true,
+    });
+
+    // Record flat cash baseline, then apply a buy fill at 2000.0 (0.01 units -> -$20 cash).
+    strategy.account_stats.portfolio_value = 1000.0;
+    strategy.account_stats.available_balance = 950.0;
+    strategy.account_stats.position = 0.0;
+    strategy.update_episode_cost_basis();
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.01;
+    strategy.update_episode_cost_basis();
+    strategy
+        .inventory_age
+        .observe(0.01, 0.00005, Instant::now());
+
+    // Fair value dips to 1999.0 (-5 bps): breakeven exit floor holds ask near >= 2000.20,
+    // and flattened quote target succeeds even when total spread < 12.0 bps.
+    for sample in [2002.0, 2001.0, 2000.0, 1999.5, 1999.0] {
+        strategy.micro.update(sample);
+    }
+    let inputs = PricingInputs {
+        mid: 1999.0,
+        pricing_mid: 1999.0,
+        bid_touch: 1998.9,
+        ask_touch: 1999.1,
+        vol_bps: 1.5,
+        sigma_per_sqrt_sec: 0.00015,
+        as_score: 0.0,
+        using_external_fair_value: true,
+        order_flow_bps: 0.0,
+        cross_market_bps: 0.0,
+        volatility_pressure: 0.0,
+        #[cfg(feature = "research-replay")]
+        participation_bbo: None,
+    };
+    let (bid, ask, _) = strategy
+        .calculate_optimal_quotes(&inputs, 0.01)
+        .expect("optimal quotes while flattening");
+    assert!(
+        ask >= 2000.19,
+        "breakeven floor must lift ask toward entry cost + 1 bps, got ask={ask}"
+    );
+    assert!(
+        bid <= 1997.80,
+        "inventory-adding bid must stay >= 6 bps below min(pricing_mid, local_mid), got bid={bid}"
+    );
+
+    // When external fair value spikes above local mid while flat, conservative_dual_anchor
+    // prevents the opening bid from climbing above local_mid - half_spread.
+    let spiked_external = PricingInputs {
+        mid: 2000.0,
+        pricing_mid: 2003.0,
+        bid_touch: 1999.9,
+        ask_touch: 2000.1,
+        ..inputs
+    };
+    let (flat_bid, flat_ask, _) = strategy
+        .calculate_optimal_quotes(&spiked_external, 0.0)
+        .expect("optimal quotes while flat with spiked external mid");
+    assert!(
+        flat_bid <= 1998.80,
+        "dual anchor must cap opening bid against local_mid=2000.0, got flat_bid={flat_bid}"
+    );
+    assert!(
+        flat_ask >= 2004.20,
+        "dual anchor must floor opening ask against pricing_mid=2003.0, got flat_ask={flat_ask}"
+    );
+
+    // Even when a tightened asymmetric quote has 6.5 bps spread (< 12 bps min_profit_bps),
+    // build_quote_target keeps it alive and suppresses only the toxic opening buy side.
+    let risk = strategy.build_risk_snapshot(1999.0);
+    let target = strategy
+        .build_quote_target(1998.70, 2000.00, 1999.0, &risk, 0.0)
+        .expect("tightened flattening quote target must not be dropped");
+    assert_eq!(
+        target.bid_size, 0.0,
+        "negative momentum beyond max_local_momentum_bps suppresses opening buy"
+    );
+    assert!(
+        target.ask_size > 0.0,
+        "reducing sell side must remain active during adverse momentum"
+    );
+
+    // Fast reducing TTL (2s) requotes a 3s-old sell immediately while opening buy holds 25s TTL.
+    let stale_sell = active_order(11, 501, OrderSide::Sell, 2002.0, 0.01, 3);
+    let calm_buy = active_order(12, 502, OrderSide::Buy, 1997.0, 0.01, 3);
+    let orders = vec![stale_sell, calm_buy];
+    let reducing_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &orders,
+        OrderType::PostOnly,
+        Side::Sell,
+        2000.2,
+        0.01,
+        0.10,
+        0.12,
+        2,
+        None,
+        Some(Duration::from_secs(2)),
+        true,
+    );
+    let opening_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &orders,
+        OrderType::PostOnly,
+        Side::Buy,
+        1996.9,
+        0.01,
+        1.00,
+        0.25,
+        1,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(reducing_plan.to_cancel, vec![501]);
+    assert_eq!(reducing_plan.to_place.len(), 1);
+    assert!(opening_plan.to_cancel.is_empty());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}

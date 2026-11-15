@@ -9,22 +9,48 @@ const SLOW = 15_000
 export const useStatus = () =>
   useQuery({ queryKey: ['status'], queryFn: api.status, refetchInterval: FAST })
 
-export const useSummary = () =>
-  useQuery({ queryKey: ['summary'], queryFn: api.summary, refetchInterval: FAST })
-
-export const useOpenOrders = () =>
-  useQuery({ queryKey: ['orders', 'open'], queryFn: () => api.orders('open'), refetchInterval: FAST })
-
-export const useFills = (limit = 100) =>
-  useQuery({ queryKey: ['fills', limit], queryFn: () => api.fills(limit), refetchInterval: FAST })
-
-export const useSessions = () =>
-  useQuery({ queryKey: ['sessions'], queryFn: () => api.sessions(30), refetchInterval: SLOW })
-
-export const usePnl = (bucket: Bucket, since: number) =>
+export const useSummary = (session?: string) =>
   useQuery({
-    queryKey: ['pnl', bucket, since],
-    queryFn: () => api.pnl(bucket, since),
+    queryKey: ['summary', session ?? 'latest'],
+    queryFn: () => api.summary(session),
+    refetchInterval: FAST,
+  })
+
+export const useOrders = (status: 'open' | 'all' = 'open', limit = 200, session?: string) =>
+  useQuery({
+    queryKey: ['orders', status, limit, session ?? 'latest'],
+    queryFn: () => api.orders(status, limit, session),
+    refetchInterval: FAST,
+  })
+
+export const useOpenOrders = (session?: string) => useOrders('open', 200, session)
+
+export const useFills = (limit = 150, session?: string) =>
+  useQuery({
+    queryKey: ['fills', limit, session ?? 'latest'],
+    queryFn: () => api.fills(limit, undefined, session),
+    refetchInterval: FAST,
+  })
+
+export const useHedgeFills = (limit = 150, session?: string, enabled = true) =>
+  useQuery({
+    queryKey: ['hedge_fills', limit, session ?? 'latest'],
+    queryFn: () => api.hedgeFills(limit, undefined, session),
+    refetchInterval: FAST,
+    enabled,
+  })
+
+export const useSessions = (limit = 100) =>
+  useQuery({
+    queryKey: ['sessions', limit],
+    queryFn: () => api.sessions(limit),
+    refetchInterval: SLOW,
+  })
+
+export const usePnl = (bucket: Bucket, since: number, session?: string) =>
+  useQuery({
+    queryKey: ['pnl', bucket, since, session ?? 'all'],
+    queryFn: () => api.pnl(bucket, since, session),
     refetchInterval: SLOW,
   })
 

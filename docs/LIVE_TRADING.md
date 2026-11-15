@@ -23,6 +23,17 @@ credentials or starting the feeder. [Example profile](../config.example.toml).
 make trade MODE=check CONFIG=config.example.toml
 ```
 
+To verify multiple isolated scenario profiles together (for example, checking
+that concurrent profiles on the same Lighter L1 wallet do not collide on a
+market or account slot), pass multiple files to `--check`:
+
+```sh
+cargo run --bin lighter_inventory_mm -- --check \
+  profiles/scenario1_quant_eth.example.toml \
+  profiles/scenario2_hedge_btc.example.toml \
+  profiles/scenario3_turnover_separate_l1.example.toml
+```
+
 1. Copy the example to a local profile. Set the Lighter market ID, symbol
    mapping, tick and lot from venue metadata. The shared-memory symbol ID
    and venue market ID are separate values.

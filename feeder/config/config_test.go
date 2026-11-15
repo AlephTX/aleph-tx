@@ -53,7 +53,13 @@ func TestEnabledFeederSymbolsMustBeRegistered(t *testing.T) {
 }
 
 func TestRepositoryConfigsLoad(t *testing.T) {
-	for _, path := range []string{"../../config.example.toml", "../../deploy/oasis/feeder.toml"} {
+	for _, path := range []string{
+		"../../config.example.toml",
+		"../../deploy/oasis/feeder.toml",
+		"../../profiles/scenario1_quant_eth.example.toml",
+		"../../profiles/scenario2_hedge_btc.example.toml",
+		"../../profiles/scenario3_turnover_separate_l1.example.toml",
+	} {
 		c, err := Load(path)
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)

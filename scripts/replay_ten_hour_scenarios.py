@@ -83,13 +83,20 @@ def time_window(campaign, symbol, compiled=None, start_ms=None):
             "end_ms": end, "drain_until_ms": end + 15_000}
 
 
-def quant_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None):
+def quant_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None,
+                exclude_zero_price_transfers=False):
     files = sorted((campaign / "raw").glob("lighter-trades-*.jsonl.gz"))
     if public_archive is None and not files:
         raise ValueError("missing Lighter public trade files")
     first, stop = window["warmup_start_ms"], window["drain_until_ms"]
-    prints = (strict_trade_rows(files, symbol, 0, stop) if public_archive is None else
-              trade_events(public_archive, "lighter", str(lighter_id), 0))
+    excluded = [] if exclude_zero_price_transfers else None
+    if public_archive is None:
+        prints = strict_trade_rows(files, symbol, 0, stop)
+    elif exclude_zero_price_transfers:
+        prints = trade_events(public_archive, "lighter", str(lighter_id), 0,
+                              excluded_zero_price_transfers=excluded)
+    else:
+        prints = trade_events(public_archive, "lighter", str(lighter_id), 0)
     timeline = merge(books(campaign, symbol, compiled), prints,
                      key=lambda row: (row["at_ms"], row["kind"] == "book"))
     online = False
@@ -124,11 +131,14 @@ def quant_input(campaign, symbol, window, output, *, compiled=None, public_archi
                       "aggressor": row["aggressor"]})
             else:
                 emit(row)
-    return {"events": counts, "explicit_feed_states": states,
-            "compiled_sha256": digest(compiled or campaign / "results/final" / f"{symbol}-freshest.ndjson.zst"),
-            "public_trade_files_sha256": ({path.name: digest(path) for path in files} if public_archive is None else
-                                          {"manifest.json": digest(public_archive / "manifest.json")}),
-            "input_sha256": digest(output)}
+    result = {"events": counts, "explicit_feed_states": states,
+              "compiled_sha256": digest(compiled or campaign / "results/final" / f"{symbol}-freshest.ndjson.zst"),
+              "public_trade_files_sha256": ({path.name: digest(path) for path in files} if public_archive is None else
+                                            {"manifest.json": digest(public_archive / "manifest.json")}),
+              "input_sha256": digest(output)}
+    if excluded is not None:
+        result["excluded_zero_price_transfers"] = excluded
+    return result
 
 
 
@@ -148,7 +158,7 @@ def robinhood_market_id(config, lineage, symbol, core_market_id):
 
 
 def turnover_input(campaign, symbol, window, output, *, compiled=None, public_archive=None, lighter_id=None,
-                   target="arcus", target_market_id=None):
+                   target="arcus", target_market_id=None, exclude_zero_price_transfers=False):
     if target == "lighter_robinhood" and (public_archive is None or type(target_market_id) is not int
                                           or not 0 <= target_market_id <= 65535):
         raise ValueError("Robinhood requires its archived native market ID and public archive")
@@ -159,6 +169,7 @@ def turnover_input(campaign, symbol, window, output, *, compiled=None, public_ar
     book_span = [None, None]
     info, counts = {}, {"book": 0, "trade": 0, "trade_feed": 0}
     explicit_feed_states = [0, 0]
+    excluded = [] if exclude_zero_price_transfers else None
     with unseal(source) as stream:
         pair = json.loads(next(stream))["pair"]
         if [leg["venue"] for leg in pair["legs"]] != ["lighter", target]:
@@ -191,7 +202,11 @@ def turnover_input(campaign, symbol, window, output, *, compiled=None, public_ar
                 info[venue] = {"manifest.json": digest(public_archive / "manifest.json")}
                 market = str(lighter_id) if leg == 0 else (
                     str(target_market_id) if venue == "lighter_robinhood" else terms["market"])
-                events = trade_events(public_archive, venue, market, leg)
+                if exclude_zero_price_transfers:
+                    events = trade_events(public_archive, venue, market, leg,
+                                          excluded_zero_price_transfers=excluded)
+                else:
+                    events = trade_events(public_archive, venue, market, leg)
             for event in events:
                 if event["kind"] == "trade_feed":
                     explicit_feed_states[leg] += 1
@@ -228,12 +243,15 @@ def turnover_input(campaign, symbol, window, output, *, compiled=None, public_ar
                     or any(a is None or a > start or b < stop for a, b in spans)):
                 raise ValueError("turnover source lacks requested book/trade envelope")
             emit({"kind": "end", "at_ms": stop})
-    return pair, {"public_trade_files_sha256": info, "compiled_sha256": digest(source),
+    provenance = {"public_trade_files_sha256": info, "compiled_sha256": digest(source),
                   "input_sha256": digest(output), "book_envelope_ms": book_span,
                   "trade_envelopes_ms": spans, "events": counts,
                   "explicit_feed_states_by_leg": explicit_feed_states,
                   "availability_assumption": "150 quote units per leg; raw depth unchanged",
                   "stream_quality_verified": False}
+    if excluded is not None:
+        provenance["excluded_zero_price_transfers"] = excluded
+    return pair, provenance
 
 
 def quant_policy(base, market, symbol, window, capital, size):

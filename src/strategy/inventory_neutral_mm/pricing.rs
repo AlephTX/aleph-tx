@@ -176,13 +176,14 @@ pub(super) fn momentum_half_spreads(half_spread: f64, momentum_bps: f64, scale: 
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct MakerPriceBounds {
     pub max_bid: f64,
     pub min_ask: f64,
 }
 
 impl MakerPriceBounds {
+    #[cfg(test)]
     pub fn new(
         sell_proceeds: f64,
         buy_cost: f64,
@@ -190,18 +191,39 @@ impl MakerPriceBounds {
         min_profit_bps: f64,
         tick: f64,
     ) -> Option<Self> {
+        Self::new_asymmetric(
+            sell_proceeds,
+            buy_cost,
+            maker_fee_bps,
+            min_profit_bps,
+            min_profit_bps,
+            tick,
+        )
+    }
+
+    pub fn new_asymmetric(
+        sell_proceeds: f64,
+        buy_cost: f64,
+        maker_fee_bps: f64,
+        bid_min_profit_bps: f64,
+        ask_min_profit_bps: f64,
+        tick: f64,
+    ) -> Option<Self> {
         // The config's profit target is per round trip. Reserve half on
         // each fill, including fees charged on that fill's own notional.
-        let reserve = (maker_fee_bps + min_profit_bps / 2.0) / 10_000.0;
-        if !reserve.is_finite()
-            || !(0.0..1.0).contains(&reserve)
+        let bid_reserve = (maker_fee_bps + bid_min_profit_bps / 2.0) / 10_000.0;
+        let ask_reserve = (maker_fee_bps + ask_min_profit_bps / 2.0) / 10_000.0;
+        if !bid_reserve.is_finite()
+            || !ask_reserve.is_finite()
+            || !(0.0..1.0).contains(&bid_reserve)
+            || !(0.0..1.0).contains(&ask_reserve)
             || !tick.is_finite()
             || tick <= 0.0
         {
             return None;
         }
-        let max_bid = (sell_proceeds / (1.0 + reserve) / tick).floor() * tick;
-        let min_ask = (buy_cost / (1.0 - reserve) / tick).ceil() * tick;
+        let max_bid = (sell_proceeds / (1.0 + bid_reserve) / tick).floor() * tick;
+        let min_ask = (buy_cost / (1.0 - ask_reserve) / tick).ceil() * tick;
         (max_bid.is_finite() && min_ask.is_finite() && max_bid > 0.0 && min_ask >= max_bid)
             .then_some(Self { max_bid, min_ask })
     }

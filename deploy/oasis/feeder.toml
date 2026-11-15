@@ -1,3 +1,4 @@
+# Lighter SHM account position is single-market; switch ETH = "0" to BTC = "1" for BTC sessions.
 [lighter]
 feeder_enabled = true
 feeder_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
@@ -7,3 +8,8 @@ feeder_symbols = { ETH = "0" }
 feeder_enabled = true
 feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
 feeder_symbols = { ETH = "ETH", BTC = "BTC" }
+
+[binance]
+feeder_enabled = true
+feeder_ws_url = "wss://fstream.binance.com"
+feeder_symbols = { ETH = "ETHUSDT", BTC = "BTCUSDT" }

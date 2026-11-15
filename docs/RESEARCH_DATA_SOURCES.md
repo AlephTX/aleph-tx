@@ -172,14 +172,54 @@ numeraire**; conversion costs and account eligibility are not certified.
 The manifest and `inventory-entry.json` preserve these limitations outside
 Git. A complete paper ledger does not remove them.
 
-`core-rh-prospective-10h-20261114T044946Z` is a new public source for the
-fixed November 14 13:00–23:00 Beijing quant window. Six ETH policies were
-frozen before recording. Raw Core/RH BTC/ETH books and acknowledged trades,
-HL books and Coinbase references share original receipt ordering; native
-market mappings come from that campaign's metadata. On natural completion,
-the driver verifies the full gzip stream and writes a new archive and
-capture inventory before replay. Until then it is an active partial, not
-usable holdout evidence. [Frozen study](RESEARCH_PROGRESS_2026_11_14.md#prospective-window-already-frozen)
+`core-rh-prospective-10h-20261114T044946Z` is a public source for the fixed
+November 14 13:00–23:00 Beijing (`05:00–15:00 UTC`) window. Six ETH policies
+were frozen before recording. Raw Core/RH BTC/ETH books and acknowledged trades,
+HL books and Coinbase references share original receipt ordering; native market
+mappings come from that campaign's metadata. The capture has now naturally
+completed and sealed (`manifest.json` SHA-256
+`b5baf44aa18085da7b9778c457d3ec843a27df20b2b422982b59540ecd1124fe`,
+`capture-inventory-entry.json` SHA-256
+`c75cb1c93c9a0df2891be14a57ca6a3e887bdc765aceb4bde8b40eceb813f070`). Two
+empirical source properties were discovered on holdout evaluation and preserved:
+(1) Lighter Core `trade:0` (ETH) emitted one off-book zero-price bankruptcy
+transfer (`trade_id: 40254475639`, `source_ms: 1794664911937`,
+`at_ms: 1794664911987`, `price: "0.00"`, `size: "0.0102"`) while L2 bids at
+`$1,865.79` remained untouched, causing raw unmodified ETH replay inputs to
+fail closed at minute 541; BTC had zero such transfers (`210,837` trades).
+(2) Robinhood Chain BTC public trades exceeded the `750 ms` delivery bound near
+an hourly boundary (`funding_trade_delivery_bound_violated`), blocking strict
+flat-verified BTC RH/Core replay while ETH RH/Core passed all 11 funding slots.
+Both the raw fail-closed outcomes and the provenance-audited CLOB-filtered ETH
+inputs (`excluded_zero_price_transfers` count = 1) are bound in
+`~/aleph-tx-research/fifty-ms-strategy-20261114/manifest.json` (SHA-256
+`a5d72c5a18812e4d524adfbfb5e0c8576dba894deb9f95d8e4ef3107a5b8add9`, frozen
+policy SHA-256
+`7a4a57fea7288b7646d9b454b49aa5fd3be27c198ff0d4491afac3e9b298fa4b`).
+
+Phase 2 (`~/aleph-tx-research/fifty-ms-strategy-20261115-v2/`, `manifest.json`
+SHA-256 `b59cc2415ab0809773bbe10038539922e67b0415b5ac23aabf440cd8be1dd708`,
+`frozen_v2_policy.json` SHA-256
+`a4e0aa9e8c287501a2df3ee8a8def6091e7e19e73581f712c13248b0414eb9ec`,
+`inventory-entry.json` SHA-256
+`2918d5c7a30bbae673417a85ff9620358b6a85e1bd9fe034a9aa53cad5ad80ff`) preserves
+the original V1 directory untouched and records two additional 10-hour holdout
+consumptions:
+(1) `extended-lighter-index-10h-20261113T174747Z` (`W3_holdout`,
+`2026-11-13 17:57:40–2026-11-14 03:57:40 UTC`, status SHA-256
+`13add4cd211039660fb86d1e5197ee8e595dd2e0aefeebc6c4debebde264f3be`): all `32/32`
+runs finished `incomplete = null`, `10/10` funding slots verified, and `100%`
+terminal flat, while `lighter_trades` recorded `2` public WebSocket reconnects
+(`trade_feed_gaps = 2`), so strict `net_liquidation_pnl` remains intentionally
+uncertified (`null`).
+(2) `public-venues-fast-10h-20261113T183526Z` (`80d94600...`) joined with
+`2026-11-12-20h-full` HIP-3 public trades (`d2489f22...`) for `NVDA` selection
+(`5b9e4a46...`) and untouched `SNDK` 10-hour MakerFirst holdout (`98c55de7...`,
+summary `317d3bf3...`, `3` trade disconnects per leg preserved, `8/8` runs
+`incomplete = null` and `10/10` slots verified across `0.001` vs. `0.0001` lot
+asymmetry).
+[Frozen study](RESEARCH_PROGRESS_2026_11_14.md#prospective-window-already-frozen) ·
+[50 ms holdout results](FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md)
 
 ### November 14 public incentive and execution rules
 
@@ -330,3 +370,12 @@ a promise of profitable live trading.
 - 同机目标流：RH/Core ETH 盘口与公开逐笔，Arcus/BULK BTC/ETH 盘口，Entropy/TradeXYZ NVDA/SNDK 盘口与公开逐笔。Arcus/BULK 逐笔与资金费缺口未因新增 Binance 而解决。
 - 90 秒探测位于 Git 外 `~/aleph-tx-research/binance-reference-probe-20261114`；完整消息 127,842 条。时间字段全局序列、身份和归档校验通过。只有短回放链路验证，没有新十小时收益。
 - [运行协议和可用性规则](BINANCE_REFERENCE_AB.md)。每轮 `capture-plan.json`、`campaign-events.ndjson`、封存 manifest、冻结 policy 和输入 hash 保留在独立 campaign，不进 Git。
+
+## November 15 Step 1 & Step 2 Diagnostic and Multi-Venue Reuse
+
+- **`public-fee-observability-20261114T134000Z/public.ndjson.gz.partial` (`21.41 min` diagnostic capture)**:
+  Stopped cleanly by the Oasis disk-reserve guard after `21.41` minutes of live post-subscribe trade & order-book capture across `lighter` and `lighter_robinhood` (`BTC` and `ETH`, `36,043` deduplicated live trades, `$89.15M` public notional; `capture_sha256 = 84471a3bacd4050e6c3df3358403317760f3a8455c8322011f101c9fc5a4b21e`, `archive_manifest_sha256 = bddc0138675c413462270d57bd26485fd731681fb1197579c580fd54fce95684`). Used exclusively for public wire `maker_fee` / `taker_fee` tier-share and `1 s / 5 s` markout diagnostics (`scope = diagnostic_21m_public_fee_observability_not_10h_qualification`), never promoted as a 10-hour validation unit.
+- **`binance-reference-ab-20261114T152000Z-v2/public.ndjson.gz.partial` (`6.63 h` total / `6.45 h` continuous interior diagnostic)**:
+  Stopped by the Oasis disk-reserve guard at `6.63` hours (`26,531,201` records; `capture_sha256 = d3872fd7b224fb0c73001b173fbfbd9de5546612daa3655f9d5174def15af0ae`, `archive_manifest_sha256 = 84eef9e60e4cfd6cb47d54ff81b2e72ddbbd31cc4489598c8ca2923f1d32686c`). Evaluated over its continuous `6.45 h` interior (`1794669600000`–`1794692820000`, `6` verified hourly funding boundaries, `21,504,622` valid `ETHUSDT` BBOs, `785,699` valid `NVDAUSDT` BBOs, `2,452,224` valid `SNDKUSDT` BBOs) under `ceil_available_wall_ns_to_ms` and `25 ms` bucket coalescing (`lighter` input SHA-256 `f1ec10f2a08447e1a9fdd992afc93df62a27e8eea7429b73920eb8b8550cbc28`; `lighter_robinhood` input SHA-256 `5b0915d5cc408701ece77a9025c644b4e977d14c1a4dd6ffd0edf50110a46090`). Because the capture ended before `10.0 h` and recorded `1` Lighter public trade WebSocket reconnect (`trade_feed_gaps = 1`), `maker_replay` withholds `net_liquidation_pnl = None` across all 32 `2x2` factorial runs (`scope = diagnostic_6_43h_continuous_binance_2x2_not_10h_qualification`).
+- **`public-venues-10h-20261113T183044Z/venue-archive` + `arcus-funding-supplement-20261114T025903Z` (`10.25 h` Arcus L2 & Funding Audit)**:
+  Reused without recapture (`archive_manifest_sha256 = 32b9efc3bb97e49060fc0d81d94ee6a8e9c0f97dcb72a45728ab2db0d4633940`) to audit `10.25 h` L2 spreads, depths, `5 s` realized volatility, cross-venue HIP-3 basis (`NVDA-USD`, `SNDK-USD`), and `1,000` hourly funding intervals across `BTC-USD`, `MU-USD`, `NVDA-USD`, `QQQ-USD`, `SNDK-USD`, and `SPY-USD`. Because `known_missing = ["trade_stream", "funding_history"]` in the contemporaneous archive, `trade_fills_simulated = false` and `execution_qualified = false` are preserved. See [FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md](FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md#14-phase-3-step-1--step-2-execution-sensitivity-fee-dilution--multi-venue-audits-2026-11-15).

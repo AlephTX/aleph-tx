@@ -1324,6 +1324,8 @@ pub struct RecordedMakerReport {
     maker_fees: f64,
     taker_fees: f64,
     net_liquidation_pnl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_tape_unverified_cash_pnl: Option<f64>,
     final_position: f64,
     max_drawdown: f64,
     max_inventory_notional: f64,
@@ -1765,6 +1767,12 @@ async fn drive(
             && !needs_reconciliation
             && funding_safe)
             .then_some(ledger.cash),
+        observed_tape_unverified_cash_pnl: (final_position == 0.0
+            && resting_orders == 0
+            && !needs_reconciliation
+            && !funding_safe
+            && halted.is_none())
+        .then_some(ledger.cash),
         final_position,
         max_drawdown: risk.max_drawdown,
         max_inventory_notional: risk.max_inventory_notional,
@@ -1798,6 +1806,7 @@ pub fn run_recorded_maker(
 mod tests {
     use super::*;
     use crate::exchange::OrderParams;
+    use crate::strategy::inventory_neutral_mm::execution::build_side_execution_plan;
 
     pub(super) const START: u64 = 1_800_000_000_000;
 
@@ -2149,6 +2158,8 @@ mod tests {
             lookback_ms: 1_000,
             max_age_ms: 500,
             shock_bps: 1.0,
+            block_unavailable: true,
+            block_shock: true,
         });
         let mut monitored =
             serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();

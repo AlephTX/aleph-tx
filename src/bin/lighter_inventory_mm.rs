@@ -141,12 +141,46 @@ async fn main() -> Result<()> {
     match args.as_slice() {
         [flag, path] if flag == "--check" => {
             let profile = session::Profile::load(Path::new(path))?;
+            let scenario = profile
+                .deployment()
+                .map_or("unspecified", |d| d.scenario.as_str());
             println!(
-                "Configuration OK: {:?} Lighter {} market {}, strategy_mode={}",
+                "Configuration OK: {:?} Lighter {} market {}, strategy_mode={}, scenario={}",
                 profile.network,
                 profile.symbol,
                 profile.strategy.market_id,
-                profile.strategy_mode()
+                profile.strategy_mode(),
+                scenario
+            );
+            Ok(())
+        }
+        [flag, paths @ ..] if flag == "--check" && paths.len() >= 2 => {
+            let mut loaded = Vec::with_capacity(paths.len());
+            for path in paths {
+                let profile = session::Profile::load(Path::new(path))?;
+                loaded.push((path.as_str(), profile));
+            }
+            session::Profile::validate_isolation(&loaded)?;
+            for (path, profile) in &loaded {
+                let scenario = profile
+                    .deployment()
+                    .map_or("unspecified", |d| d.scenario.as_str());
+                let l1 = profile
+                    .deployment()
+                    .map_or("default_l1", |d| d.l1_group.as_str());
+                println!(
+                    "Configuration OK: {path} -> {:?} Lighter {} market {}, strategy_mode={}, scenario={}, l1_group={}",
+                    profile.network,
+                    profile.symbol,
+                    profile.strategy.market_id,
+                    profile.strategy_mode(),
+                    scenario,
+                    l1
+                );
+            }
+            println!(
+                "Fleet isolation OK: {} profiles verified (zero cross-subaccount STP or hedge slot collisions)",
+                loaded.len()
             );
             Ok(())
         }
@@ -161,7 +195,7 @@ async fn main() -> Result<()> {
         }
         [] => run_existing_feeder().await,
         _ => bail!(
-            "Usage: lighter_inventory_mm --check CONFIG | (--live | --testnet) CONFIG DOTENV FEEDER"
+            "Usage: lighter_inventory_mm --check CONFIG [CONFIG2 ...] | (--live | --testnet) CONFIG DOTENV FEEDER"
         ),
     }
 }
@@ -174,14 +208,15 @@ async fn run_existing_feeder() -> Result<()> {
         !profile.has_hedge(),
         "Use make trade MODE=live for the inventory hedge"
     );
-    let symbol = profile.symbol;
-    let config = profile.strategy;
     let credentials = LighterCredentials::from_env(|key| std::env::var(key).ok())?;
     let network = credentials.network()?;
     anyhow::ensure!(
         profile.network == network,
         "Lighter feeder and signer must use the same network"
     );
+    profile.verify_account_binding(credentials.account_index())?;
+    let symbol = profile.symbol;
+    let config = profile.strategy;
     let _lock = session::lock_account(&credentials, network)?;
     anyhow::ensure!(
         !Path::new("pids/aleph-trade.active.jsonl").try_exists()?,

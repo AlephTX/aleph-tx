@@ -5,12 +5,14 @@ import json
 from archive_public_capture import records
 
 
-def trade_events(archive, venue, market, leg, *, precise_times=False):
+def trade_events(archive, venue, market, leg, *, precise_times=False,
+                 excluded_zero_price_transfers=None):
     """Yield maker replay events from acknowledged public trade subscriptions."""
     sources = {'lighter': 'lighter_trades', 'lighter_robinhood': 'lighter_robinhood_trades',
                'extended': 'extended_trades', 'hyperliquid': 'hyperliquid_trades',
                'entropy': 'hyperliquid_trades', 'trade_xyz': 'hyperliquid_trades'}
     source = sources[venue]
+    lighter_domain = source in ('lighter_trades', 'lighter_robinhood_trades')
     online_since = None
     seen = {}
     for raw in records(archive, source=source):
@@ -61,6 +63,18 @@ def trade_events(archive, venue, market, leg, *, precise_times=False):
             # Lighter and Extended mark subscription snapshots on the wire.
             # Keep the conservative cutoff for unmarked Hyperliquid trade batches.
             if not subscribed and (source != 'hyperliquid_trades' or stamp >= online_since):
+                if excluded_zero_price_transfers is not None and Decimal(str(price)) == 0:
+                    if not lighter_domain or Decimal(str(size)) <= 0:
+                        raise ValueError('invalid zero-price public trade')
+                    excluded_zero_price_transfers.append({
+                        'trade_id': identifier,
+                        'at_ms': at,
+                        'source_ms': stamp,
+                        'leg': leg,
+                        'aggressor': side,
+                        'size': str(size),
+                    })
+                    continue
                 yield {'kind': 'trade', 'at_ms': at, 'leg': leg, 'source_ms': stamp,
                        'aggressor': side, 'price': str(price), 'contracts': str(size)}
 

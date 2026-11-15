@@ -23,8 +23,10 @@ Set `strategy_mode` at the TOML root, before the first table.
 | `[symbols]` | Maps tickers to Go and Rust shared-memory IDs. |
 | `[lighter]` | Enable the feeder and map exactly one configured ticker to its native Lighter market ID. |
 | `[hyperliquid]` | For hedging, enable the feed and map the same ticker to its native perpetual on the same network. |
-| `[inventory_neutral_mm]` | Set the exchange and symbol IDs, Lighter market ID, native tick and step, maker fee, quote size and position and loss limits. |
+| `[binance]` | Optional public USD-M `bookTicker` reference feed (`feeder_enabled`, `feeder_ws_url`, `feeder_symbols`) written into `EXCH_BINANCE = 6` SHM slots. |
+| `[inventory_neutral_mm]` | Set the exchange and symbol IDs, Lighter market ID, native tick and step, maker fee, quote size, decoupled reducing TTL/hysteresis (`reducing_order_ttl_secs`, `reducing_requote_threshold_bps`), local shock gate (`max_local_momentum_bps`), and position and loss limits. |
 | `[inventory_hedge]` | Set `max_unhedged_base`, `deadband_base`, per-IOC notional, minimum available balance, limit slippage and taker fee. |
+| `[deployment]` | Optional multi-profile isolation metadata (`scenario`, `l1_group`, `subaccount_slot`, `expected_account_index`, `hedge_account_slot`) validated offline when passing two or more profiles to `lighter_inventory_mm --check`. |
 
 A shared-memory symbol ID identifies a local slot. A venue market ID
 identifies an instrument in the venue protocol and can differ between

@@ -143,6 +143,37 @@ func (m *Matrix) GetVersion(symbolID uint16) uint64 {
 	return atomic.LoadUint64(&m.shm.SymbolVersions[symbolID])
 }
 
+// ReadBBO reads a consistent snapshot of a single BBO slot using the seqlock protocol.
+func (m *Matrix) ReadBBO(exchangeID uint8, symbolID uint16) (ShmBboMessage, bool) {
+	if symbolID >= NumSymbols || exchangeID >= NumExchanges {
+		return ShmBboMessage{}, false
+	}
+	slot := &m.shm.BboMatrix[symbolID][exchangeID]
+	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
+	for range 8 {
+		before := atomic.LoadUint32(seqAddr)
+		if before&1 != 0 {
+			continue
+		}
+		snap := ShmBboMessage{
+			Seqlock:     before,
+			MsgType:     slot.MsgType,
+			ExchangeID:  slot.ExchangeID,
+			SymbolID:    slot.SymbolID,
+			TimestampNs: slot.TimestampNs,
+			BidPrice:    slot.BidPrice,
+			BidSize:     slot.BidSize,
+			AskPrice:    slot.AskPrice,
+			AskSize:     slot.AskSize,
+		}
+		after := atomic.LoadUint32(seqAddr)
+		if before == after {
+			return snap, snap.TimestampNs != 0
+		}
+	}
+	return ShmBboMessage{}, false
+}
+
 // Close unmaps the shared memory.
 func (m *Matrix) Close() error {
 	return syscall.Munmap(m.data)

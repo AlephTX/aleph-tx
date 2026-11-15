@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 const LIGHTER: u8 = crate::config::EXCH_LIGHTER;
 #[cfg(test)]
-const BINANCE: u8 = 6;
+const BINANCE: u8 = crate::config::EXCH_BINANCE;
 #[cfg(test)]
 const SYMBOL: u16 = crate::config::SYM_ETH;
 

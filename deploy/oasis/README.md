@@ -1,16 +1,16 @@
 # AlephTX on Oasis
 
-Oasis (`asia-east1-b`) runs the public feeder and a loopback-only dashboard as systemd services. The Lighter ETH and Hyperliquid ETH/BTC perpetual quotes come from the feeder's shared memory. The strategy binaries are installed, and `aleph-tx-live.service` is available for manual operation. This deployment starts the feeder and dashboard only.
+Oasis (`asia-east1-b`) runs the public feeder and a loopback-only dashboard as systemd services. The Lighter ETH/BTC, Hyperliquid ETH/BTC, and Binance USD-M ETH/BTC reference perpetual quotes come from the feeder's shared memory. The strategy binaries are installed, and `aleph-tx-live.service` is available for manual operation. This deployment starts the feeder and dashboard only.
 
 From your Mac, run `bash deploy/oasis/dashboard.sh` and open [the dashboard](http://127.0.0.1:8765/). The Google Cloud CLI connects via IAP, and SSH forwards the remote loopback port to the local loopback port. No dashboard port is exposed on the VM's public interface. Stop the command with Ctrl+C when finished. If a tunnel is already running, open the dashboard directly.
 
-The console (`dashboard/`, Vite + React) shows service state, quotes, exchange positions, open orders, fills, PnL and equity charts, per-session history, and journal logs. Status, orders, and fills refresh every three seconds; quotes older than 15 seconds are labelled delayed. A failed account request is shown separately from a successful request with no open positions.
+The console (`dashboard/`, Vite + React 19 + TypeScript) organizes monitoring into four accessible workspaces: overview and risk guards (persisted UTC daily loss breaker, EWMA post-fill markout quality, and per-session unit cost per `$1M` gross turnover), orders and dual-leg fills (`fills` and `hedge_fills` with IOC price/fee provenance badges), a sortable multi-session matrix with one-click session pinning (`?session=<id>`), and shared-memory market basis alongside journal logs. Status, orders, and fills refresh every three seconds; quotes older than 15 seconds are labelled delayed. A failed account request is shown separately from a successful request with no open positions.
 
 ## Telemetry and history
 
 When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file per session (orders, fills, risk snapshots) to `/var/lib/aleph-tx-telemetry`. Writes go through a bounded queue off the trading path; dropped records are counted and shown on the console. The monitor ingests those files incrementally into SQLite at `/var/lib/aleph-tx-monitor/telemetry.sqlite3`, so history survives restarts and the database can be deleted and rebuilt from the JSONL files. PnL uses average cost, includes fees and rebates, and marks open inventory to the latest snapshot mid.
 
-API: `/api/status`, `/api/summary`, `/api/alerts`, `/api/orders?status=open|all`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|1h|1d&since=`, `/api/sessions`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
+API: `/api/status`, `/api/summary?session=`, `/api/alerts`, `/api/orders?status=open|all&limit=&session=`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|15m|1h|1d&since=&session=`, `/api/sessions?limit=`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
 Lighter trade PnL covers Lighter fills, fees and rebates. Each Lighter fee
 is the rate its trade declares for the account's role times price and size,

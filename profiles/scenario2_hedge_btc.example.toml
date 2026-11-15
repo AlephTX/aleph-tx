@@ -1,0 +1,106 @@
+# Scenario 2 (Hedge Arbitrage) — Isolated Lighter BTC Maker + Hyperliquid IOC Hedge Template
+# Uses BTC (market_id = 1) so it is strictly market-disjoint from ETH under primary_l1
+# (preventing Lighter cross-subaccount Self-Trade Prevention collisions).
+
+strategy_mode = "inventory_hedge"
+
+[deployment]
+scenario = "hedge_arbitrage"
+l1_group = "primary_l1"
+subaccount_slot = "sub_btc_hedge"
+hedge_account_slot = "hl_btc_hedge_primary"
+
+[symbols]
+BTC = 1001
+ETH = 1002
+
+[lighter]
+feeder_enabled = true
+feeder_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
+feeder_symbols = { BTC = "1" }
+exchange_id = 2
+
+[hyperliquid]
+feeder_enabled = true
+feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
+feeder_symbols = { BTC = "BTC", ETH = "ETH" }
+exchange_id = 1
+symbol_id = 1001
+risk_fraction = 0.20
+min_spread_bps = 5.0
+vol_multiplier = 2.5
+stop_loss_pct = 0.005
+requote_interval_ms = 2000
+
+[binance]
+feeder_enabled = true
+feeder_ws_url = "wss://fstream.binance.com"
+feeder_symbols = { BTC = "BTCUSDT", ETH = "ETHUSDT" }
+
+[edgex]
+feeder_enabled = false
+feeder_ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
+feeder_rest_url = "https://pro.edgex.exchange"
+feeder_symbols = { ETH = "10000002", BTC = "10000001" }
+risk_fraction = 0.10
+min_spread_bps = 8.0
+vol_multiplier = 3.0
+stop_loss_pct = 0.005
+requote_interval_ms = 5000
+
+[backpack]
+feeder_enabled = false
+feeder_ws_url = "wss://ws.backpack.exchange"
+feeder_symbols = { ETH = "ETH_USDC_PERP", BTC = "BTC_USDC_PERP" }
+risk_fraction = 0.20
+min_spread_bps = 6.0
+vol_multiplier = 2.5
+stop_loss_pct = 0.005
+requote_interval_ms = 3000
+
+[inventory_neutral_mm]
+exchange_id = 2
+symbol_id = 1001
+market_id = 1
+tick_size = 0.1
+step_size = 0.00001
+
+maker_fee_bps = 0.0
+min_profit_bps = 1.5
+max_spread_bps = 25.0
+
+penny_ticks = 1.0
+inventory_skew_bps = 3.0
+
+base_order_size = 0.001
+max_position = 0.005
+inventory_urgency_threshold = 0.002
+
+adverse_selection_threshold = 2.0
+requote_threshold_bps = 2.0
+order_ttl_secs = 15
+max_leverage = 5.0
+min_available_balance = 50.0
+max_daily_loss_pct = 0.05
+use_post_only = true
+poll_interval_ms = 250
+min_cycle_interval_ms = 50
+
+grid_levels = 1
+sigmoid_steepness = 1.5
+flattening_cap_mult = 2.0
+
+micro_samples = 200
+ema_fast_period = 5
+ema_slow_period = 20
+use_depth_pricing = true
+vol_spread_scale = 0.5
+momentum_skew_scale = 0.3
+
+[inventory_hedge]
+max_unhedged_base = "0.002"
+deadband_base = "0.0005"
+max_order_notional_usd = "100"
+min_available_usd = "100"
+slippage_bps = 5
+taker_fee_bps = 4.5

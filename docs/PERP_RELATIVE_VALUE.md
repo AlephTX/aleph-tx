@@ -1161,7 +1161,143 @@ python3 scripts/replay_extended_lighter.py target/release/cross_venue \
 | Extended × Lighter BTC 15-minute replay | `aef41a6b4b22b2e8129874afdd40dc360123349ce8fe91190221f3c00a9b628d` |
 | Extended × Lighter ETH 15-minute replay | `49a187f1b581341c02bba2a31933ef9779fa74fff81495d9e95724ad02a1be77` |
 
+## Profitability postmortem, 2026-11-13
+
+### ETH Standard trade selection
+
+On the same two 12:00–13:50 windows, the 250 ms Standard control with a
+2 bps quote floor traded $29,081 across 610 fills and lost $2.129
+(−0.73 bps of gross turnover). At a 12 bps floor the corresponding
+control traded $2,039 across 54 fills and earned $0.293 (+1.44 bps).
+Both used zero regular-order fees. The ETH Premium 2 bps control lost
+$2.796, of which $1.898 came from execution prices before fees and
+$0.898 from fees. Four of the 32 matched control and signal
+configurations earned money. All four were ETH Standard 12 bps
+variants on the same two windows.
+
+In a separate calibrated study, the ETH Standard 12 bps/250 ms policy
+earned $0.106 on its earlier holdout and lost $0.201 in an independently
+sealed later hour. BTC went from −$0.082 to +$0.293 in that comparison.
+These policies differ from the minute-range configurations above. The
+results support testing which fills are worth taking across independent
+sessions. They leave deployable net profit and capacity unverified.
+[Earlier calibrated windows](#market-selection-and-execution-sensitivity-2026-11-13)
+
+At 250 ms, 28 of 42 maker fills in the signal attribution baseline
+occurred after a cancel request. Adding 250 ms to cancellation raised
+this to 42 of 55 and increased peak inventory from $64.92 to $99.97.
+The replay delays a mixed batch to its slowest action, so this also
+moves replacement placement. The quant simulator removes the queue
+when cancellation becomes effective. A public print received after
+that time can miss a fill that occurred before it. It also permits
+reduce-only IOC in the simulator without applying the normal entry
+minimums. The price and time impact of these assumptions remains
+unmeasured. Markout and IOC slippage are diagnostics already reflected
+in trade cash flows and are never deducted again.
+[Exchange latency experiment](https://doi.org/10.1080/14697688.2025.2515933) ·
+[Lighter fees and venue delays](https://docs.lighter.xyz/trading/trading-fees)
+
+### Cross-venue losses by cash component
+
+The denominator is completed-cycle target-venue turnover, including
+target exits. The price component is the entire cycle before fees.
+Overhead is 0.25 bps of both venues' gross turnover.
+
+| Baseline | Target turnover | Price loss | Fees | Overhead | Total cost |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Extended BTC, 8 bps entry cap | $298.09 | 1.09 bps | 1.25 bps | 0.49 bps | 2.82 bps |
+| Extended ETH, 4 bps entry cap | $117.40 | 3.83 bps | 1.25 bps | 0.50 bps | 5.58 bps |
+| Arcus BTC, 250 ms transport | $1,897.31 | 0.50 bps | 3.00 bps | 0.50 bps | 4.00 bps |
+
+Closing quote attribution counts each order once at each stage. In the
+first full Extended BTC shard at the 8 bps cap, the legacy arm had
+16 submitted, 14 accepted, zero touched and zero filled closing quotes.
+The 180-second arm had 78 submitted, 75 accepted, one touched and zero
+filled. Quote lifetime generated 63 first cancel requests and hedge
+protection generated 14. In the Arcus BTC 250 ms control, 41 closing
+quotes were accepted with zero touches. The 180-second arm reached
+208 accepted closing quotes and two touches, both filled. The
+sample points to sparse executable contra-flow during the life of a
+closing order. More time in paired inventory alone yielded little
+additional fill opportunity.
+
+Raising the order lifetime from 0.8 to 3 seconds for both entry and
+exit increased touches in the BTC 8 bps replays. In the first shard,
+each of the paired 60 and 180 second arms gained one Maker close.
+Complete costs rose from 2.52 to 4.76 bps and from 2.28 to 5.55 bps
+respectively. All three longer-lifetime arms in the second shard
+still used forced exits and cost 1.87–2.15 bps. This check also
+changes entry participation, so the cost change measures the
+policy as a whole.
+
+In the Extended BTC baseline every cycle used a forced IOC exit.
+IOC execution was 0.32 bps better than its submission touch, while
+the complete cycle still lost $0.0324 before fees. On the same
+15-minute tape, replaying the BTC 8 bps policy with zero explicit
+fees and overhead lost $0.0463 across two cycles. Removing the
+additional 300 ms Lighter IOC delay as well still lost $0.0395 on
+$399.43 of target turnover, or 0.99 bps. These counterfactuals rerun
+entry and change which orders trade. A separate static fee add-back
+to the original three cycles leaves the original $0.0324 price loss.
+To reproduce on the archived 8 bps legacy config, set both leg taker
+fees, the maker fee and turnover overhead to zero. Set
+`taker_delay_ms` to `[0, 0]` for the final counterfactual. Keep the
+250 ms transport and original event tape.
+[Extended fees](https://docs.extended.exchange/extended-resources/trading/trading-fees-and-rebates) ·
+[Lighter fees and venue delays](https://docs.lighter.xyz/trading/trading-fees)
+
+At the 0 bps entry cap, BTC's best projected cost was +0.051 bps
+before the 0.25 bps feedback reserve. ETH's best projection was
+−0.342 bps and the only submitted quote was withdrawn before
+activation. At 4 bps, BTC had 156 accepted quotes and zero prints
+at those prices while the quotes were eligible to fill. The 4 and
+8 bps turnover policies explicitly permit projected cost up to
+those levels. Their fill activity measures execution and exit cost.
+
+The next sealed 15-minute shard had 8,186 BTC and 8,182 ETH synchronized
+frames out of 8,206. Both 0 bps arms again had no accepted orders.
+BTC at 4 bps accepted 146 quotes with no fills. At 8 bps one small
+BTC cycle required a forced close and cost 2.08 bps on $15.22 of
+Extended turnover. The 4 and 8 bps ETH legacy windows were incomplete
+due to a trade-feed gap with a resting order. This shard used the
+collector preceding the trade-stream idle handling change.
+
+### Carry and capacity
+
+The best observed eight-hour gross carry was 0.669 bps on BTC and
+0.442 bps on ETH, versus a 9 bps fee floor for four Lighter Standard
+and native Hyperliquid taker fills. The six-hour witnessed causal
+replay had no entries, with best net estimates of −15.23 and
+−16.60 bps. It provides little evidence on holding for several days.
+The NVDA hindsight depth ceiling also failed to translate into
+causal entries. Capacity estimates based on displayed depth require
+matched terms and realized two-leg execution.
+[Carry and market selection](#market-selection-and-execution-sensitivity-2026-11-13)
+
+Keep the no-signal Standard controls frozen for the next independent
+sessions. Compare an entry filter scored on completed-cycle cash PnL
+against those controls under the same capital, queue and latency
+assumptions. Report net profit per hour and in bps of actual turnover,
+including forced exits and periods with zero fills. For the cross-venue
+route, keep the zero-cost cap for economic acceptance and use the 4 and
+8 bps arms to identify execution failures. Longer carry requires the
+same-window executable entry and exit depth, witnessed payment prices
+and an explicit capital denominator.
+
+| Oasis postmortem aggregate | SHA-256 |
+| --- | --- |
+| First full shard BTC with closing attribution | `d0e2bf02d7572d60f1e9f6579691f169d0b8a1f9f0978d477d6960571683c4bd` |
+| Arcus exits with closing attribution | `a5bf3b30265cf8de109e8ceb78c96a65256aad866c8eaa7edd8f9a254c060c13` |
+| Fee and delay counterfactuals | `d51dee0d57b0b2dcca69ffad3f5f5920025f0cb1116a74288ebd071491e38e82` |
+| Second full shard BTC | `3e59357b473300e7a774fc15321a1d31b79598f4aed84e205d1d7f32e405d940` |
+| Second full shard ETH | `14b8a66af29f5506d1f7b7156ad4c09f751c87afad3a39c61175c808d96cdfaa` |
+| BTC quote lifetime comparison | `23864cc45deedb83f48e5558b7097739ddd4680211696a31fa9070e55b1e3d02` |
+
 ## Research acceptance
+
+For the subsequent $500–$1,000 research scope, additional Oasis basis
+diagnostics, and strategies that explicitly account for finite latency, see
+[strategy research, 2026-11-13](STRATEGY_RESEARCH_2026_11_13.md).
 
 Archive the raw file, compile profile and report, simulation input and
 report, code revision, and checksums. Freeze thresholds before the holdout.

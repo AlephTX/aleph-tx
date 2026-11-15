@@ -2,6 +2,7 @@
 
 import type {
   Fill,
+  HedgeFill,
   LogLine,
   Order,
   PnLResp,
@@ -40,16 +41,24 @@ const qs = (params: Record<string, string | number | undefined>) => {
   return q.toString()
 }
 
+const withQuery = (path: string, params: Record<string, string | number | undefined>) => {
+  const query = qs(params)
+  return query ? `${path}?${query}` : path
+}
+
 export const api = {
   status: () => call<StatusResp>('/status'),
-  summary: () => call<SummaryResp>('/summary'),
+  summary: (session?: string) => call<SummaryResp>(withQuery('/summary', { session })),
   fills: (limit = 200, before?: number, session?: string) =>
-    call<{ fills: Fill[] }>(`/fills?${qs({ limit, before, session })}`),
+    call<{ fills: Fill[] }>(withQuery('/fills', { limit, before, session })),
+  hedgeFills: (limit = 200, before?: number, session?: string) =>
+    call<{ fills: HedgeFill[] }>(withQuery('/hedge_fills', { limit, before, session })),
   orders: (status: 'open' | 'all' = 'open', limit = 200, session?: string) =>
-    call<{ orders: Order[] }>(`/orders?${qs({ status, limit, session })}`),
-  pnl: (bucket: string, since = 0) => call<PnLResp>(`/pnl?${qs({ bucket, since })}`),
-  sessions: (limit = 50) => call<{ sessions: Session[] }>(`/sessions?${qs({ limit })}`),
-  logs: (unit: string, lines = 200) => call<{ logs: LogLine[] }>(`/logs?${qs({ unit, lines })}`),
+    call<{ orders: Order[] }>(withQuery('/orders', { status, limit, session })),
+  pnl: (bucket: string, since = 0, session?: string) =>
+    call<PnLResp>(withQuery('/pnl', { bucket, since, session })),
+  sessions: (limit = 50) => call<{ sessions: Session[] }>(withQuery('/sessions', { limit })),
+  logs: (unit: string, lines = 200) => call<{ logs: LogLine[] }>(withQuery('/logs', { unit, lines })),
   stopLive: (token: string) =>
     call<StopResp>('/live/stop', { method: 'POST', headers: { 'X-Aleph-Control': token } }),
 }

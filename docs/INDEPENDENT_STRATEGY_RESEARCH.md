@@ -6,7 +6,13 @@ RH/Core incentive replay. It preserves the original exit and hedge policy;
 its reused ten-hour sample is historical selection, not a new holdout.
 The [follow-up review](INDEPENDENT_RESEARCH_REVIEW_2026_11_14.md) records the
 measured basis distribution, separate Binance attribution audit, and distinct
-quant, arbitrage and incentive experiment identities.
+quant, arbitrage and incentive experiment identities. The [50 ms latency-adapted study](FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md) records
+asymmetric quote hysteresis, decoupled fast inventory-reducing TTLs, local
+momentum shock gating, causal EWMA basis reversion, hedge-leg entry-flow gating,
+lot-exact reduce-only dust sweeps, sub-second RTT-probe blip immunity while
+hedged, and their continuous ten-hour selection (`W1`), prospective (`W2`),
+untouched RWA (`SNDK`), and untouched execution/continuity (`W3_holdout`)
+evaluations (`fifty-ms-strategy-20261114` and `fifty-ms-strategy-20261115-v2`).
 
 The three objectives share data and execution primitives but have separate
 profiles, ledgers, risk budgets and acceptance criteria. A profitable run
@@ -366,3 +372,52 @@ three full-hedge cycles, compatibility with legacy entry-side execution,
 expiry, replayed controls, future controls, risk-field rejection and late
 fills after a posture change. Existing Lighter and Hyperliquid regressions
 remain enabled. These checks did not start a live trading session.
+
+## Step 1 & Step 2 Execution Sensitivity and Multi-Venue Audits — 2026-11-15
+
+Subsequent `50 ms` network / `200–300 ms` venue-delay follow-up experiments
+(`fifty-ms-strategy-20261115-step1-step2`) extended the independent three-scenario
+validation without cross-subsidy (`"0"` points cash value) and recorded exact
+reproducibility hashes in the external campaign inventory:
+
+1. **Bidirectional Cancel-Overlap & Official RH `200 ms` Delay Sensitivity (`80`
+   continuous `10 h` runs across `W1` and `W2`)**: Comparing `strict` vs.
+   `conservative_cancel_guard = true` (`300 ms` Core vs. official `200 ms` RH
+   Standard action delay) confirmed that asymmetric `S2_V2_TailHedge_primary`
+   incurred `0` cancel-overlap fills across all four `W2` cells (`BTC` and `ETH`,
+   `$1,000` and `$500`), whereas high-churn symmetric paired makers suffered `2–9`
+   adverse overlap fills. Switching RH's modeled Standard delay from `300 ms` to
+   the official `200 ms` schedule reduced `S3_ModeA_RH_FlowPatient` realized cost
+   after `0.25 bps` overhead to `0.397 bps` (`W1 BTC`), `0.478 bps` (`W1 ETH`),
+   and `0.567 bps` (`W2 ETH`, down from `3.593 bps` at `300 ms`), while exact
+   `post_only_rejected_{crossed,beyond_depth,new_level}` counters showed that
+   `83.7%–86.2%` of RH `post_only` rejections were conservative `new_level`
+   spread-interior paper rejections rather than crossed-book races.
+2. **Diagnostic Sub-10h Fee-Dilution & Binance `2x2` Mechanism Studies (Explicitly
+   Non-Qualification)**:
+   - On the `21.41 min` live post-subscribe capture
+     `public-fee-observability-20261114T134000Z` (`$89.15M` public notional),
+     Standard `0 bps` Taker notional share was `89.61%` (`lighter:BTC`), `80.44%`
+     (`lighter:ETH`), `90.63%` (`lighter_robinhood:BTC`), and **`52.48%`
+     (`lighter_robinhood:ETH`, vs. `47.14%` Premium API Takers)**, tightening the
+     `2.0 bps` per-eligible-turnover raw cost ceiling on `lighter_robinhood:ETH`
+     to **`1.050 bps`** of total RH Maker volume and confirming positive `1 s / 5 s`
+     adverse markouts on Premium/Plus Taker flow.
+   - On the `6.45 h` continuous interior of `binance-reference-ab-20261114T152000Z-v2`
+     (`32` runs across `A_control`, `B_combined`, `C_stale_only`, `D_shock_only`;
+     `trade_feed_gaps = 1` -> `net_liquidation_pnl = None`), `C_stale_only`
+     (`500 ms`) withdrew only `7–14` targets (`99.96%+` fresh `ETHUSDT` coverage),
+     whereas `D_shock_only` (`1.0 bps / 1,000 ms`) drove `>99.9%` of quote
+     withdrawals — reducing loss on tight `12 bps` Core quotes (`-$1.75` -> `-$0.14`
+     unverified cash on `$500`) but over-filtering `70%–75%` of fills on `20 bps`
+     wide-spread and `lighter_robinhood` arms.
+3. **HIP-3 `0 ms` Cancel-Priority `ALO` (`84` runs) & Arcus `10.25 h` L2 Audit**:
+   Single-venue HIP-3 `ALO` (`venue_cancel_delay_ms = 0`) remained negative in
+   `81/84` raw and `83/84` `net025` runs (`trade_feed_gaps = 3` -> diagnostic),
+   confirming standalone intraday HIP-3 `ALO` MM as **NO-GO**. Arcus RWA markets
+   (`NVDA-USD`, `SNDK-USD`, `MU-USD`, `QQQ-USD`, `SPY-USD`) verified `0.00 bps`
+   Maker / `2.25 bps` Taker fees and `-3.09 bps` (`NVDA`) / `-7.34 bps` (`SNDK`)
+   median basis vs. `xyz`, but remain `execution_qualified = false` until a live
+   Arcus `trade_stream` capture and Rulebook Annex C §8(c) low-churn gates are
+   validated. Full tables and SHA-256 digests are recorded in
+   [FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md](FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md#14-phase-3-step-1--step-2-execution-sensitivity-fee-dilution--multi-venue-audits-2026-11-15).

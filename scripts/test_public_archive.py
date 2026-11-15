@@ -124,3 +124,36 @@ class PublicArchiveTests(unittest.TestCase):
         self.assertTrue((self.root / paths[2]).exists())
         restore(self.root, store, paths[0])
         self.assertEqual(digest(self.root / paths[0]), expected)
+
+    def test_lighter_zero_price_bankruptcy_transfer_is_audited_when_excluded(self):
+        rows = [
+            self.row('lighter_trades', 'message', 10, payload={
+                'type': 'subscribed/trade', 'channel': 'trade:0',
+                'trades': [{'trade_id': 1, 'market_id': 0, 'timestamp': self.t + 5,
+                            'price': '1865.92', 'size': '0.1', 'is_maker_ask': True}],
+            }),
+            self.row('lighter_trades', 'message', 20, payload={
+                'type': 'update/trade', 'channel': 'trade:0',
+                'trades': [
+                    {'trade_id': 2, 'market_id': 0, 'timestamp': self.t + 15,
+                     'price': '0.00', 'size': '0.0102', 'is_maker_ask': False},
+                    {'trade_id': 3, 'market_id': 0, 'timestamp': self.t + 16,
+                     'price': '1865.79', 'size': '2.0', 'is_maker_ask': False},
+                ],
+            }),
+            self.row('collector', 'end', 30),
+        ]
+        _, archive = self.capture(rows)
+        # Default preserves raw zero-price print so unmodified callers still fail closed.
+        raw_trades = [e for e in trade_events(archive, 'lighter', '0', 0) if e['kind'] == 'trade']
+        self.assertEqual([t['price'] for t in raw_trades], ['0.00', '1865.79'])
+
+        excluded = []
+        filtered = [
+            e for e in trade_events(archive, 'lighter', '0', 0, excluded_zero_price_transfers=excluded)
+            if e['kind'] == 'trade'
+        ]
+        self.assertEqual([t['price'] for t in filtered], ['1865.79'])
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]['trade_id'], 2)
+        self.assertEqual(excluded[0]['size'], '0.0102')

@@ -1,7 +1,15 @@
 // Turns the server's cost provenance labels into display badges and notes.
 import type { BadgeTone } from './components/ui'
 import { duration } from './format'
-import type { LegValuation, LighterFeeSource, Mark, Quality, Session } from './types'
+import type {
+  HedgeFeeSource,
+  HedgePriceSource,
+  LegValuation,
+  LighterFeeSource,
+  Mark,
+  Quality,
+  Session,
+} from './types'
 
 export interface QualityBadge {
   label: string
@@ -33,6 +41,31 @@ export function feeSourceBadge(source: LighterFeeSource | null | undefined): Qua
   return source && Object.hasOwn(FEE_SOURCES, source)
     ? FEE_SOURCES[source]
     : { label: '来源未知', tone: 'bad' }
+}
+
+const HEDGE_PRICE_BADGES: Record<HedgePriceSource, QualityBadge | null> = {
+  fill: null,
+  limit: { label: 'IOC限价估算', tone: 'warn' },
+}
+
+/** Hedge fill price provenance: venue fill reports need no badge; IOC limit
+ * fallbacks are marked as estimates; legacy/unknown rows are flagged. */
+export function hedgePriceSourceBadge(source: HedgePriceSource | null | undefined): QualityBadge | null {
+  return source && Object.hasOwn(HEDGE_PRICE_BADGES, source)
+    ? HEDGE_PRICE_BADGES[source]
+    : { label: '价源未知', tone: 'bad' }
+}
+
+const HEDGE_FEE_BADGES: Record<HedgeFeeSource, QualityBadge | null> = {
+  configured_rate: { label: '配置费率', tone: 'warn' },
+}
+
+/** Hedge fill fee provenance: configured taker rate is an estimate, while
+ * legacy rows without `fee_source` remain unknown. */
+export function hedgeFeeSourceBadge(source: HedgeFeeSource | null | undefined): QualityBadge | null {
+  return source && Object.hasOwn(HEDGE_FEE_BADGES, source)
+    ? HEDGE_FEE_BADGES[source]
+    : { label: '费源未知', tone: 'bad' }
 }
 
 const FUNDING_NOTE = '资金费未计入'

@@ -28,6 +28,7 @@ fn cycle(at: u64) -> Cycle {
         externalizing: false,
         maker_turnover: Decimal::ZERO,
         passive_side: None,
+        entry_ref_mid: None,
         paired_at_ms: None,
         hedge_fill_at_ms: None,
         paired_basis_bps: None,

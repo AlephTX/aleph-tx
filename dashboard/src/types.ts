@@ -126,6 +126,12 @@ export interface LighterValuation extends LegValuation {
  * ppm rate · role_unknown: the maker side was guessed. null: older writer. */
 export type LighterFeeSource = 'rate_derived' | 'explicit_zero' | 'missing' | 'invalid' | 'role_unknown'
 
+/** Hedge fill price provenance from telemetry_store.py (HEDGE_PRICE_SOURCES). */
+export type HedgePriceSource = 'fill' | 'limit'
+
+/** Hedge fill fee provenance from telemetry_store.py (HEDGE_FEE_SOURCES). */
+export type HedgeFeeSource = 'configured_rate'
+
 /** observed: feed <= sample <= now holds · historical: same, for the last
  * mark of a stopped session · unknown: a sample or feed time is missing
  * (legacy) · clock_mismatch: the known times break that order, so ages are
@@ -164,6 +170,7 @@ export interface Valuation {
 }
 
 export interface Snapshot {
+  ts_ms?: number
   equity: number
   session_start_equity: number
   daily_loss_day_start_ms?: number | null
@@ -178,6 +185,9 @@ export interface Snapshot {
   worst_case_long: number
   worst_case_short: number
   mid: number
+  mark_source?: string | null
+  mark_sampled_ms?: number | null
+  mark_feed_ms?: number | null
   spread_bps: number
   adverse_selection: number
   trade_cash_flow: number
@@ -187,6 +197,13 @@ export interface Snapshot {
   orders_rejected: number
   active_orders: number
   dropped: number
+  /** Post-fill markout diagnostics; null on legacy snapshots or before warm-up. */
+  markout_marked?: number | null
+  markout_expired?: number | null
+  markout_overwritten?: number | null
+  markout_missed?: number | null
+  markout_last_delay_ms?: number | null
+  markout_ewma_bps?: number | null
 }
 
 export interface Window {
@@ -228,6 +245,25 @@ export interface Fill {
   net_pnl_after: number
   /** Absent from older servers; null for older writers. Both are unknown. */
   fee_source?: LighterFeeSource | null
+}
+
+export interface HedgeFill {
+  session_id: string
+  offset: number
+  ts_ms: number
+  venue: string
+  client_order_id: string
+  side: 'buy' | 'sell'
+  price: number
+  /** 'fill' = venue fill report; 'limit' = IOC limit-price fallback; null = legacy unknown. */
+  price_source?: HedgePriceSource | null
+  size: number
+  notional: number
+  fee: number
+  realized_delta: number
+  position_after: number
+  /** 'configured_rate' = estimated from configured taker bps; null = legacy unknown. */
+  fee_source?: HedgeFeeSource | null
 }
 
 export interface Order {

@@ -28,10 +28,12 @@ SERVICES = ("aleph-tx-feeder", "aleph-tx-monitor", "aleph-tx-live")
 # Layout in feeder/shm/matrix.go; symbol and exchange IDs in feeder/exchanges/common.go.
 BBO = struct.Struct("<IBBHQdddd16x")
 SEQUENCE = struct.Struct("<I")
-MARKETS = (("Lighter", "ETH", 2, 1002), ("Hyperliquid", "ETH", 1, 1002),
-           ("Hyperliquid", "BTC", 1, 1001))
+MARKETS = (("Lighter", "ETH", 2, 1002), ("Lighter", "BTC", 2, 1001),
+           ("Hyperliquid", "ETH", 1, 1002), ("Hyperliquid", "BTC", 1, 1001),
+           ("Binance", "ETH", 6, 1002), ("Binance", "BTC", 6, 1001))
 ACCOUNT_REFRESH = 20
-STATIC = Path(os.environ.get("ALEPH_DASHBOARD_DIR", ROOT / "dashboard")).resolve()
+DEFAULT_STATIC = ROOT / "dashboard" if (ROOT / "dashboard").is_dir() else ROOT.parents[1] / "dashboard" / "dist"
+STATIC = Path(os.environ.get("ALEPH_DASHBOARD_DIR", DEFAULT_STATIC)).resolve()
 TELEMETRY_DIR = os.environ.get("ALEPH_TELEMETRY_DIR", "/var/lib/aleph-tx-telemetry")
 DB_PATH = os.environ.get("ALEPH_MONITOR_DB", "/var/lib/aleph-tx-monitor/telemetry.sqlite3")
 CONTROL_TOKEN = os.environ.get("ALEPH_MONITOR_CONTROL_TOKEN", "")
@@ -260,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/alerts":
             return {"alerts": self.server.alerter.snapshot(), "webhook": bool(ALERT_WEBHOOK)}
         if route == "/api/summary":
-            return store.summary()
+            return store.summary(session_id=q.get("session"))
         if route == "/api/fills":
             return {"fills": store.fills(limit=bounded(q.get("limit"), 200, 1000),
                                          before_ms=int(q["before"]) if "before" in q else None,
@@ -280,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
             if bucket not in store.BUCKETS:
                 raise ValueError("unsupported bucket")
             since = int(q.get("since", 0))
-            return store.pnl_series(bucket, since)
+            return store.pnl_series(bucket, since, session_id=q.get("session"))
         if route == "/api/sessions":
             return {"sessions": store.sessions(limit=bounded(q.get("limit"), 50, 500))}
         if route == "/api/logs":

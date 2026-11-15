@@ -1,5 +1,6 @@
 use super::ActiveOrder;
 use super::execution::InventoryContext;
+use super::pricing::MakerPriceBounds;
 use crate::config::InventoryNeutralMMConfig;
 use crate::exchange::{OrderParams, OrderType, Side};
 use crate::order_tracker::OrderLifecycle;
@@ -302,6 +303,7 @@ pub(super) fn build_grid_plan(
     quotes
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_side_plan(
     existing_orders: &[ActiveOrder],
     desired_quotes: &[OrderParams],
@@ -311,14 +313,65 @@ pub(super) fn reconcile_side_plan(
     min_lifetime: Duration,
     max_replacements_per_cycle: usize,
 ) -> (Vec<i64>, Vec<OrderParams>) {
+    reconcile_side_plan_with_bounds(
+        existing_orders,
+        desired_quotes,
+        threshold,
+        step_size,
+        size_tolerance_ratio,
+        min_lifetime,
+        max_replacements_per_cycle,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconcile_side_plan_with_bounds(
+    existing_orders: &[ActiveOrder],
+    desired_quotes: &[OrderParams],
+    threshold: f64,
+    step_size: f64,
+    size_tolerance_ratio: f64,
+    min_lifetime: Duration,
+    max_replacements_per_cycle: usize,
+    cancel_bounds: Option<MakerPriceBounds>,
+) -> (Vec<i64>, Vec<OrderParams>) {
+    reconcile_side_plan_with_options(
+        existing_orders,
+        desired_quotes,
+        threshold,
+        step_size,
+        size_tolerance_ratio,
+        min_lifetime,
+        max_replacements_per_cycle,
+        cancel_bounds,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reconcile_side_plan_with_options(
+    existing_orders: &[ActiveOrder],
+    desired_quotes: &[OrderParams],
+    threshold: f64,
+    step_size: f64,
+    size_tolerance_ratio: f64,
+    min_lifetime: Duration,
+    max_replacements_per_cycle: usize,
+    cancel_bounds: Option<MakerPriceBounds>,
+    fast_reducing: bool,
+) -> (Vec<i64>, Vec<OrderParams>) {
     let mut matched_existing = vec![false; existing_orders.len()];
     let mut to_place = Vec::new();
-    let calm_mode = max_replacements_per_cycle <= 1;
+    let calm_mode = !fast_reducing && max_replacements_per_cycle <= 1;
 
     for (level_idx, desired) in desired_quotes.iter().enumerate() {
         // Top-of-book queue is the most expensive to churn away.
         // Keep calm-market levels stickier so small touch drift does not constantly reset queue priority.
-        let level_threshold = if calm_mode && level_idx < 2 {
+        let level_threshold = if fast_reducing {
+            threshold
+        } else if calm_mode && level_idx < 2 {
             threshold * 2.0
         } else if calm_mode || level_idx < 2 {
             threshold * 1.5
@@ -330,8 +383,11 @@ pub(super) fn reconcile_side_plan(
             .enumerate()
             .filter(|(idx, _)| !matched_existing[*idx])
             .find(|(_, order)| {
+                let within_bounds =
+                    cancel_bounds.is_none_or(|bounds| bounds.allows(order.side, order.price));
                 let size_tolerance = (desired.size * size_tolerance_ratio).max(step_size);
-                (order.price - desired.price).abs() <= level_threshold
+                within_bounds
+                    && (order.price - desired.price).abs() <= level_threshold
                     && (order.size - desired.size).abs() <= size_tolerance
             })
         {
@@ -341,7 +397,18 @@ pub(super) fn reconcile_side_plan(
         }
     }
 
-    let recent_same_side_refresh = max_replacements_per_cycle <= 1
+    let forced_cancels: Vec<i64> = existing_orders
+        .iter()
+        .filter(|order| {
+            cancel_bounds.is_some_and(|bounds| !bounds.allows(order.side, order.price))
+                && order.order_index.is_some()
+                && order.lifecycle != OrderLifecycle::PendingCancel
+        })
+        .filter_map(|order| order.order_index)
+        .collect();
+
+    let recent_same_side_refresh = !fast_reducing
+        && max_replacements_per_cycle <= 1
         && existing_orders
             .iter()
             .any(|order| order.placed_at.elapsed() < CALM_SIDE_REQUOTE_COOLDOWN);
@@ -352,11 +419,13 @@ pub(super) fn reconcile_side_plan(
         min_lifetime
     };
 
-    let mut to_cancel: Vec<i64> = existing_orders
+    let mut normal_cancels: Vec<i64> = existing_orders
         .iter()
         .enumerate()
         .filter(|(idx, order)| {
-            !matched_existing[*idx] && order.placed_at.elapsed() >= replacement_min_lifetime
+            !matched_existing[*idx]
+                && cancel_bounds.is_none_or(|bounds| bounds.allows(order.side, order.price))
+                && order.placed_at.elapsed() >= replacement_min_lifetime
         })
         .filter(|_| !recent_same_side_refresh)
         .filter(|(_, order)| {
@@ -364,9 +433,12 @@ pub(super) fn reconcile_side_plan(
         })
         .filter_map(|(_, order)| order.order_index)
         .collect();
-    if to_cancel.len() > max_replacements_per_cycle {
-        to_cancel.truncate(max_replacements_per_cycle);
+    let remaining_cap = max_replacements_per_cycle.saturating_sub(forced_cancels.len());
+    if normal_cancels.len() > remaining_cap {
+        normal_cancels.truncate(remaining_cap);
     }
+    let mut to_cancel = forced_cancels;
+    to_cancel.extend(normal_cancels);
 
     let remaining_existing = existing_orders.len().saturating_sub(to_cancel.len());
     let placement_capacity = desired_quotes.len().saturating_sub(remaining_existing);
