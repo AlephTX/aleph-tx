@@ -46,7 +46,7 @@ The current official account-types page specifies 200 ms additional
 Maker/Cancel latency for RH Standard. This newly checked rule does not
 rewrite the older 300 ms research assumption or the frozen prospective run.
 Binance A/B requires separate receipt/availability evidence and a new frozen
-window. See the [execution audit](EXECUTION_CLOCK_REVIEW_2026_11_14.md) and
+window. See the [execution audit](archive/EXECUTION_CLOCK_REVIEW_2026_11_14.md) and
 [priority venue design](PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md).
 
 ## Execution and incentive review

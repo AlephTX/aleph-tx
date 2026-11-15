@@ -120,4 +120,19 @@ func TestPreciseClockRejectsBackdatingAndClockSteps(t *testing.T) {
 	if c.stamp(&row, time.Now()) == nil {
 		t.Fatal("missing socket receipt accepted")
 	}
+	c2, err := newCaptureClock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 256 {
+		recv := consistentNow()
+		avail := consistentNow()
+		r := record{Source: "binance", Market: "ETHUSDT", Event: "message", ReceivedAt: recv.UnixMilli(), received: recv}
+		if err := c2.stamp(&r, avail); err != nil {
+			t.Fatalf("consistentNow stamp failed: %v", err)
+		}
+		if delta := clockDeltaNS(avail, c2.start); delta < -50_000 || delta > 50_000 {
+			t.Fatalf("consistentNow exceeded 50us VDSO bound: %d ns", delta)
+		}
+	}
 }

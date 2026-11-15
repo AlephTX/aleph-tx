@@ -330,7 +330,7 @@ policy SHA-256 is
 Source/config/executable hashes and outcomes are appended outside Git in
 `basis-risk-selection-20261114/inventory-start.json` and its completion record.
 The superseded first attempt is retained. See the
-[mechanism and comparison design](BASIS_RISK_SELECTION_2026_11_14.md).
+[mechanism and comparison design](archive/BASIS_RISK_SELECTION_2026_11_14.md).
 
 Before consumption, each imported or newly sealed archive must have:
 

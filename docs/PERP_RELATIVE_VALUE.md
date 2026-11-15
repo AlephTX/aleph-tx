@@ -1297,7 +1297,7 @@ and an explicit capital denominator.
 
 For the subsequent $500–$1,000 research scope, additional Oasis basis
 diagnostics, and strategies that explicitly account for finite latency, see
-[strategy research, 2026-11-13](STRATEGY_RESEARCH_2026_11_13.md).
+[strategy research, 2026-11-13](archive/STRATEGY_RESEARCH_2026_11_13.md).
 
 Archive the raw file, compile profile and report, simulation input and
 report, code revision, and checksums. Freeze thresholds before the holdout.

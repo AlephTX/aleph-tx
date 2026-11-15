@@ -1,75 +1,54 @@
 ---
-description: Go feeder - WebSocket ingestion, CGO FFI exports, shared memory IPC writers
+description: Go market-data feeder and multi-venue public recorder (perp-capture)
 alwaysApply: true
 ---
 
 # feeder/
 
-> Go-based market data feeder: multi-exchange WS ingestion -> shared memory BBO matrix + V2 private event ring + account stats.
+> Go real-time ingestion (`feeder-app`) for `/dev/shm` IPC and standalone multi-venue public recorder (`cmd/perp-capture`) with VDSO-consistent monotonic/wall clock guards.
 
-## Key Files
+## Key Entry Points
 
-| File | Description |
+| Path | Description |
 |------|-------------|
-| main.go | Entry point - spawns goroutines per exchange, initializes matrix + V1/V2 events + account stats + depth |
-| config.toml | Exchange enable/disable, WS URLs, symbol mappings |
-
-## Subdirectories
-
-| Directory | Description |
-|-----------|-------------|
-| config/ | TOML config loader (`ExchangeConfig` struct) |
-| exchanges/ | Exchange adapters (Lighter, Hyperliquid, Binance, Backpack, EdgeX, 01) |
-| shm/ | Shared memory writers - BBO matrix, V1/V2 event rings, account stats, depth |
+| `main.go` (`feeder-app`) | Supervised/public SHM feeder for Lighter (public book + private V2 events + account stats), Hyperliquid, and Binance |
+| `cmd/perp-capture/` (`perp-capture`) | Continuous public NDJSON.gz recorder across Lighter Core, Lighter Robinhood, Hyperliquid Native, Entropy (`km`), TradeXYZ (`xyz`), Arcus (`-arcus-trades` + books), BULK, and Binance `bookTicker` |
+| `config/` | Shared TOML loader (`[symbols]`, `[lighter]`, `[hyperliquid]`, `[binance]`) |
+| `exchanges/` | Active WebSocket adapters (`lighter*`, `hyperliquid`, `binance`) — legacy v3 adapters (`backpack`, `edgex`, `01`) archived under `../legacy/v3_archive/feeder/exchanges/` |
+| `shm/` | Lock-free shared-memory writers (`matrix.go`, `depth.go`, `events.go`, `events_v2.go`, `account_stats.go`) |
 
 ## Architecture
 
 ```mermaid
 graph TD
-    subgraph "Go Feeder (main.go)"
-        CFG[config.toml] --> MAIN[main.go]
-        MAIN --> BN[Binance Futures WS]
-        MAIN --> HL[Hyperliquid WS]
-        MAIN --> LT[Lighter WS Public]
-        MAIN --> LP[Lighter WS Private]
-        MAIN --> LA[Lighter Account Stats]
-        MAIN --> BP[Backpack WS]
-        MAIN --> EX[EdgeX WS]
-        MAIN --> O1[01 WS]
+    subgraph "Go Feeder (feeder-app)"
+        CFG[config.toml / feeder.toml] --> MAIN[main.go]
+        MAIN --> BN[Binance bookTicker WS]
+        MAIN --> HL[Hyperliquid l2Book WS]
+        MAIN --> LT[Lighter Public Orderbook WS]
+        MAIN --> LP[Lighter Private WS]
+        MAIN --> LA[Lighter Account Stats WS+REST]
     end
 
-    subgraph "Shared Memory"
-        HL & LT & BP & EX & O1 & BN -->|Seqlock Write| MTX["/dev/shm/aleph-matrix (917KB, 7 exchanges)"]
-        LP -->|Ring Buffer Write| EVT["/dev/shm/aleph-events (64KB)"]
-        LA -->|Versioned Write| ACC["/dev/shm/aleph-account-stats (128B)"]
+    subgraph "Shared Memory (/dev/shm)"
+        BN & HL & LT -->|Seqlock| MTX["aleph-matrix (BBO, 7 slots)"]
+        LT -->|Top-5 Seqlock + Integrity Guard| DEP["aleph-depth"]
+        LP -->|128B SPSC + Gen Seqlock| EVT["aleph-events-v2"]
+        LA -->|128B Versioned| ACC["aleph-account-stats"]
     end
 
-    MTX & EVT & ACC -->|Lock-free Read| RUST[Rust Strategy Engine]
+    MTX & DEP & EVT & ACC --> RUST[Rust Execution & Monitor]
 ```
 
-## CGO Export Constraints (CRITICAL)
+## Critical Invariants
 
-- **String Allocation**: When returning strings to Rust via `C.CString`, MUST provide `FreeCString()` for cleanup.
-- **No Go Pointers in C**: Never pass Go GC-managed memory to C/Rust.
-- **Error Handling**: CGO doesn't support multiple return values - use C-structs or error buffer pointers.
+- **Shared C-ABI Layout**: Every struct in `shm/` is pinned by cross-language size and offset tests against Rust (`src/types/events.rs`, `src/shm_*.rs`). Never alter field order or sizes independently.
+- **Full-Book Continuity (`exchanges/lighter.go`)**: Verify `offset == prevOffset + 1` (or snapshot reset), reject crossed/NaN books, and invalidate both `aleph-matrix` and `aleph-depth` immediately on sequence gaps or disconnects so Rust never quotes off a stale book.
+- **Precise Capture Clock (`cmd/perp-capture/timing.go`)**: Sample `time.Now()` via `consistentNow()` (`<= 25 us` paired VDSO span) so KVM hypervisor preemptions between `CLOCK_REALTIME` and `CLOCK_MONOTONIC` cannot trigger false wall/monotonic divergence aborts during 10-hour captures.
 
-## Shared Memory Writers (IPC)
-
-- **C-ABI Layout**: Structs shared with Rust MUST match byte-for-byte. Insert explicit padding to ensure exact sizes (64 bytes for events, 128 bytes for account stats).
-- **Seqlock Protocol**: `Seq++ (Odd) -> Write Payload -> Seq++ (Even)`.
-- **Atomic Operations**: Use `sync/atomic` for ring buffer `write_idx` and matrix versions.
-
-## WebSocket Management
-
-- **No Blocking**: WS read loops must not block on channel writes.
-- **Auto-Reconnect**: All connections use `RunConnectionLoop` pattern with backoff.
-- **SDK Usage**: Prefer official SDKs (e.g., `lighter-go`) for auth and stream parsing.
-
-## Testing
+## Verification
 
 ```bash
-make build-feeder   # Build Go feeder
-make test-up        # Start feeder + test strategy
-make test-logs      # Monitor logs
-make test-down      # Stop and clean up
+cd feeder && go test -race ./...
+make build-feeder
 ```

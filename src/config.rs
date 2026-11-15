@@ -880,8 +880,12 @@ pub struct AppConfig {
     /// Ticker -> global SHM symbol ID, shared with the Go feeder.
     #[serde(default = "default_symbols")]
     pub symbols: BTreeMap<String, u16>,
-    pub backpack: ExchangeConfig,
-    pub edgex: ExchangeConfig,
+    /// Legacy optional `[backpack]` section retained for profile compatibility.
+    #[serde(default)]
+    pub backpack: Option<ExchangeConfig>,
+    /// Legacy optional `[edgex]` section retained for profile compatibility.
+    #[serde(default)]
+    pub edgex: Option<ExchangeConfig>,
     #[serde(default)]
     pub inventory_neutral_mm: Option<InventoryNeutralMMConfig>,
     #[serde(default)]
@@ -919,8 +923,12 @@ impl AppConfig {
             );
             anyhow::ensure!(seen.insert(*id), "symbols: duplicate id {id}");
         }
-        self.backpack.validate("backpack")?;
-        self.edgex.validate("edgex")?;
+        if let Some(backpack) = &self.backpack {
+            backpack.validate("backpack")?;
+        }
+        if let Some(edgex) = &self.edgex {
+            edgex.validate("edgex")?;
+        }
         if let Some(config) = &self.inventory_neutral_mm {
             config.validate()?;
             anyhow::ensure!(
@@ -1029,58 +1037,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             symbols: default_symbols(),
-            backpack: ExchangeConfig {
-                risk_fraction: 0.10,
-                min_spread_bps: 12.0,
-                vol_multiplier: 3.0,
-                stop_loss_pct: 0.003,
-                requote_interval_ms: 2000,
-                momentum_threshold_bps: 8.0,
-                momentum_spread_mult: 2.0,
-                vol_window: 120,
-                balance_refresh_secs: 60,
-                min_order_size: 0.0,
-                tick_size: 0.01,
-                step_size: 0.01,
-                gamma: 0.1,
-                time_horizon_sec: 60.0,
-                requote_threshold_bps: 2.0,
-                contract_id: None,
-                synthetic_asset_id: None,
-                collateral_asset_id: None,
-                fee_asset_id: None,
-                price_decimals: None,
-                size_decimals: None,
-                resolution: None,
-                collateral_resolution: None,
-                fee_rate: None,
-            },
-            edgex: ExchangeConfig {
-                risk_fraction: 0.08,
-                min_spread_bps: 20.0,
-                vol_multiplier: 3.5,
-                stop_loss_pct: 0.003,
-                requote_interval_ms: 3000,
-                momentum_threshold_bps: 8.0,
-                momentum_spread_mult: 2.0,
-                vol_window: 120,
-                balance_refresh_secs: 60,
-                min_order_size: 0.1,
-                tick_size: 0.01,
-                step_size: 0.01,
-                gamma: 0.1,
-                time_horizon_sec: 60.0,
-                requote_threshold_bps: 2.0,
-                contract_id: Some(1),
-                synthetic_asset_id: Some("0x4554482d3130000000000000000000".to_string()),
-                collateral_asset_id: Some("0x555344432d36000000000000000000".to_string()),
-                fee_asset_id: Some("0x555344432d36000000000000000000".to_string()),
-                price_decimals: Some(2),
-                size_decimals: Some(4),
-                resolution: Some(1000000000),
-                collateral_resolution: Some(1000000),
-                fee_rate: Some(0.0005),
-            },
+            backpack: None,
+            edgex: None,
             inventory_neutral_mm: Some(InventoryNeutralMMConfig::default()),
             deployment: None,
         }
@@ -1121,14 +1079,30 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config_has_new_fields() {
+    fn test_default_config_and_legacy_optional_sections() {
         let cfg = AppConfig::default();
-        assert_eq!(cfg.backpack.tick_size, 0.01);
-        assert_eq!(cfg.backpack.step_size, 0.01);
-        assert_eq!(cfg.backpack.gamma, 0.1);
-        assert_eq!(cfg.backpack.time_horizon_sec, 60.0);
-        assert_eq!(cfg.edgex.tick_size, 0.01);
-        assert_eq!(cfg.edgex.gamma, 0.1);
+        assert!(cfg.backpack.is_none());
+        assert!(cfg.edgex.is_none());
+        assert!(cfg.inventory_neutral_mm.is_some());
+
+        // Legacy profiles that still carry [backpack] or [edgex] continue to parse and validate.
+        let legacy: AppConfig = toml::from_str(
+            r#"
+            [backpack]
+            risk_fraction = 0.10
+            min_spread_bps = 6.0
+            vol_multiplier = 2.5
+            stop_loss_pct = 0.005
+            requote_interval_ms = 2000
+            "#,
+        )
+        .unwrap();
+        legacy.validate().unwrap();
+        let bp = legacy.backpack.unwrap();
+        assert_eq!(bp.tick_size, 0.01);
+        assert_eq!(bp.step_size, 0.01);
+        assert_eq!(bp.gamma, 0.1);
+        assert_eq!(bp.time_horizon_sec, 60.0);
     }
     #[test]
     fn example_and_default_configuration_validate() {

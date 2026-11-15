@@ -22,64 +22,6 @@ feeder_symbols = { ETH = "0" }
 exchange_id = 2
 
 # ============================================================================
-# EdgeX - Feeder + Strategy
-# ============================================================================
-[edgex]
-# Feeder settings
-feeder_enabled = true
-feeder_ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
-feeder_rest_url = "https://pro.edgex.exchange"
-feeder_symbols = { ETH = "10000002", BTC = "10000001" }
-
-# Strategy settings
-exchange_id = 3
-symbol_id = 1002
-
-# L2 Signature Configuration (ETH-USDC Perpetual)
-contract_id = 10000002
-synthetic_asset_id = "0x4554482d3900000000000000000000"
-collateral_asset_id = "0x555344432d36000000000000000000"
-fee_asset_id = "0x555344432d36000000000000000000"
-price_decimals = 2
-size_decimals = 4
-resolution = 1000000000
-collateral_resolution = 1000000
-fee_rate = 0.00038
-
-# Trading parameters (EdgeX: ~3.4bps maker, rate limit: 2 req/2s)
-risk_fraction = 0.10
-min_spread_bps = 8.0
-vol_multiplier = 3.0
-stop_loss_pct = 0.005
-requote_interval_ms = 5000
-momentum_threshold_bps = 10.0
-momentum_spread_mult = 2.0
-vol_window = 120
-balance_refresh_secs = 60
-min_order_size = 0.1
-
-# ============================================================================
-# Backpack - Feeder + Strategy
-# ============================================================================
-[backpack]
-feeder_enabled = false
-feeder_ws_url = "wss://ws.backpack.exchange"
-feeder_symbols = { ETH = "ETH_USDC_PERP", BTC = "BTC_USDC_PERP" }
-
-exchange_id = 5
-symbol_id = 1002
-
-risk_fraction = 0.20
-min_spread_bps = 6.0
-vol_multiplier = 2.5
-stop_loss_pct = 0.005
-requote_interval_ms = 3000
-momentum_threshold_bps = 8.0
-momentum_spread_mult = 2.0
-vol_window = 120
-balance_refresh_secs = 60
-
-# ============================================================================
 # Hyperliquid - Feeder + Strategy
 # ============================================================================
 [hyperliquid]

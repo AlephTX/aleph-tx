@@ -136,28 +136,11 @@ func main() {
 		}
 	}
 
-	if bpCfg, ok := exchangeConfigs["backpack"]; ok && bpCfg.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			bp := exchanges.NewBackpack(bpCfg, matrix)
-			log.Println("🔌 Backpack: starting...")
-			if err := bp.Run(ctx); err != nil && err != context.Canceled {
-				log.Printf("Backpack: %v", err)
-			}
-		}()
+	if cfg.Backpack.FeederEnabled {
+		log.Println("⚠️ [backpack] feeder_enabled=true ignored (archived under legacy/v3_archive)")
 	}
-
-	if edgexCfg, ok := exchangeConfigs["edgex"]; ok && edgexCfg.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ex := exchanges.NewEdgeX(edgexCfg, matrix)
-			log.Println("🔌 EdgeX: starting...")
-			if err := ex.Run(ctx); err != nil && err != context.Canceled {
-				log.Printf("EdgeX: %v", err)
-			}
-		}()
+	if cfg.EdgeX.FeederEnabled {
+		log.Println("⚠️ [edgex] feeder_enabled=true ignored (archived under legacy/v3_archive)")
 	}
 
 	wg.Wait()

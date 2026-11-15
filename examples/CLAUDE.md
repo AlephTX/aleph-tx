@@ -1,48 +1,27 @@
 ---
-description: Example programs - debug utilities, signature tests, and benchmarks
+description: Offline replay fixtures, capture compile profiles, and SHM inspection examples
 alwaysApply: true
 ---
 
 # examples/
 
-> Debugging, testing, and benchmark utilities. Production strategy binaries live in `src/bin/`.
+> Synthetic replay fixtures (`*.json`), multi-venue book compilation profiles, and local SHM inspection utilities. Historical EdgeX StarkEx Pedersen debug examples are archived under `../legacy/v3_archive/examples/`.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| test_account_stats.rs | Simple account stats SHM reader demo |
+| `hedge_replay.json` | Deterministic lost-ack and partial-fill recovery fixture for `cross_venue hedge-replay` |
+| `crypto_funding_paper.json` | Two-leg crypto funding carry fixture for `cross_venue perp-replay` |
+| `equity_basis_paper.json` | Equity perpetual session-aware basis reversion fixture for `cross_venue perp-replay` |
+| `eth_core_rh_books.json` | Independent-domain Lighter Core (USDC) + Robinhood (USDG) book compilation profile |
+| `*_compile.json` | Venue pair compilation templates (Entropy, Arcus, TradeXYZ, BULK, Hyperliquid) |
+| `test_account_stats.rs` | Read-only `/dev/shm/aleph-account-stats` diagnostic example |
 
-### EdgeX Debugging & Signature Verification
-
-| File | Description |
-|------|-------------|
-| debug_edgex_signature.rs | Debug L2 signature generation step-by-step |
-| test_edgex_auth.rs | Test EdgeX API authentication flow |
-| test_edgex_order.rs | End-to-end EdgeX order placement test |
-| test_edgex_pedersen.rs | Verify EdgeX-compatible Pedersen hash output |
-| check_edgex_key.rs | Validate EdgeX StarkNet key format |
-| test_l2_signature.rs | L2 signature correctness test |
-| test_signature_format.rs | Signature encoding format validation |
-| test_order_simple.rs | Minimal order placement test |
-| diagnostic_l2_hash.rs | Diagnostic output for L2 hash computation |
-| verify_packing.rs | Verify field packing for L2 signature |
-| test_packing.rs | Test shift-and-add field packing |
-
-### Benchmarks
-
-| File | Description |
-|------|-------------|
-| bench_pedersen.rs | Pedersen hash performance benchmark |
-| bench_signature.rs | Full L2 signature pipeline benchmark |
-| test_pedersen.rs | Pedersen hash correctness test |
-
-## Usage
+## Offline Verification
 
 ```bash
-# Run a test/debug example
-cargo run --release --example test_edgex_order
-
-# Run a benchmark
-cargo run --release --example bench_pedersen
+target/release/cross_venue hedge-replay examples/hedge_replay.json
+target/release/cross_venue perp-replay examples/crypto_funding_paper.json
+target/release/cross_venue perp-replay examples/equity_basis_paper.json
 ```

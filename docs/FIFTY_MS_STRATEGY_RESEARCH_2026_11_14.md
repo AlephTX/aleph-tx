@@ -11,7 +11,7 @@ action delay = **`550 ms` effective cancel/taker action latency**, with explicit
 Related documents:
 [Independent strategy research](INDEPENDENT_STRATEGY_RESEARCH.md) ·
 [Ten-hour research protocol](TEN_HOUR_RESEARCH.md) ·
-[Basis-risk selection](BASIS_RISK_SELECTION_2026_11_14.md) ·
+[Basis-risk selection](archive/BASIS_RISK_SELECTION_2026_11_14.md) ·
 [Research data-source registry](RESEARCH_DATA_SOURCES.md) ·
 [Relative-value replay](PERP_RELATIVE_VALUE.md)
 

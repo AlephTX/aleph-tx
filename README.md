@@ -7,7 +7,9 @@
   <a href="docs/LIVE_TRADING.md">Trading and recovery</a> ·
   <a href="docs/CROSS_VENUE.md">Venue coverage</a> ·
   <a href="docs/PERP_RECORDING.md">Market data</a> ·
-  <a href="docs/PERP_RELATIVE_VALUE.md">Paper execution</a>
+  <a href="docs/QUANT_DATA_LAKEHOUSE.md">Lakehouse</a> ·
+  <a href="docs/PERP_RELATIVE_VALUE.md">Paper execution</a> ·
+  <a href="docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md">Tokyo roadmap</a>
 </p>
 
 AlephTX runs inventory-aware market making on Lighter, with an optional
@@ -67,15 +69,26 @@ explicit shared-risk opt-in. [Trading runbook](docs/LIVE_TRADING.md) ·
 Quant profit, arbitrage and incentive turnover use independent experiments
 and ledgers. User or external decisions can select a turnover posture through
 a versioned, expiring replay control; they cannot change risk limits.
-Lighter Core and Robinhood Chain are separate data domains. Robinhood
-support currently covers public capture and offline compilation.
+Lighter Core (`chain_id = 304`) and Robinhood Chain (`chain_id = 466324`) are
+separate settlement and data domains: supervised `quant` execution supports
+both domains with multi-lane API-key pools, dual-state (`pending`/`confirmed`)
+nonce recovery, exact isolated/cross liquidation distance (`lighter_risk`),
+and full-book SHM offset integrity checks, while `inventory_hedge` remains
+Core-only so USDG and USDC settlement legs are never mixed implicitly.
 [Independent research and controls](docs/INDEPENDENT_STRATEGY_RESEARCH.md)
 
 Validation uses continuous **10-hour units**, with warm-up and final exits
 accounted separately. Quant, arbitrage and turnover retain independent
 state and cash ledgers; shared tape is counted once as market evidence.
+Public capture on `oasis-tokyo` (`asia-northeast1`, `<10 ms` to Lighter
+CloudFront/ap-northeast-1) records Lighter Core, Lighter Robinhood, Native
+Hyperliquid, Entropy, TradeXYZ, Arcus (`-arcus-trades` + books), BULK and
+Binance Futures `bookTicker` with VDSO-consistent monotonic/wall clock guards,
+seals immutable Bronze archives into the 3-tier Medallion Lakehouse, and syncs
+directly to `aleph` for continuous 10-hour selection and holdout evaluation.
 [Ten-hour validation and current limits](docs/TEN_HOUR_RESEARCH.md) ·
-[Data-source registry](docs/RESEARCH_DATA_SOURCES.md)
+[Data-source registry](docs/RESEARCH_DATA_SOURCES.md) ·
+[Lakehouse pipeline](docs/QUANT_DATA_LAKEHOUSE.md)
 
 Research programs can run independently on the shared tapes. Maker trade
 timing is checked before a turnover matrix, and signal reports expose fresh
@@ -91,13 +104,16 @@ ledgers. Target turnover is reported separately from unknown reward
 eligibility; points have no assumed cash value.
 [Current results and source gaps](docs/RESEARCH_PROGRESS_2026_11_14.md)
 
-The next research design prioritizes Arcus, Entropy, TradeXYZ, BULK and
-Lighter Robinhood, starting with local pricing versus Binance risk filtering.
-Execution-clock diagnostics distinguish delayed trade receipt from modeled
-cancellation timing; exact cash proofs govern turnover cost reporting.
+The active research queue prioritizes Tokyo `<10 ms` 10-hour re-calibration
+across Arcus, Entropy, TradeXYZ, BULK and Lighter Core/Robinhood, starting
+with measured per-venue latency quantiles, local pricing versus Binance risk
+filtering, and counterparty defense guardrails. Execution-clock diagnostics
+distinguish delayed trade receipt from modeled cancellation timing; exact cash
+proofs govern turnover cost reporting.
+[Tokyo research and execution queue](docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md) ·
 [Priority venue design](docs/PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md) ·
 [Binance capture and frozen A/B](docs/BINANCE_REFERENCE_AB.md) ·
-[Execution and cash audit](docs/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
+[Execution and cash audit](docs/archive/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
 
 ## Architecture
 
@@ -168,9 +184,10 @@ Prospective venue rewards have zero value in the model.
 | Go feeds and shared memory | [feeder/](feeder/) |
 | Durable recovery and evidence | [src/live_hedge/](src/live_hedge/) |
 | Monitoring and console | [deploy/oasis/](deploy/oasis/) · [dashboard/](dashboard/) |
-| Synthetic scenarios and capture profiles | [examples/](examples/) |
+| Synthetic scenarios and capture profiles | [examples/](examples/) · [profiles/](profiles/) |
+| Historical docs and v3/v4 code archives | [docs/archive/](docs/archive/) · [legacy/v3_archive/](legacy/v3_archive/) |
 
 Keep credentials and private operational records outside Git. Review
 the staged blobs and every outgoing commit before publishing.
 [Engineering rules](AGENTS.md#sensitive-data-and-git) ·
-[Benchmark context](docs/AUDIT_2026_11.md) · [MIT license](LICENSE)
+[Benchmark context](docs/archive/AUDIT_2026_11.md) · [MIT license](LICENSE)

@@ -6,8 +6,6 @@
 .PHONY: trade
 .PHONY: dashboard-install dashboard-build dashboard-check dashboard-dev test-python test-research
 .PHONY: lighter-up lighter-down lighter-logs
-.PHONY: backpack-up backpack-down backpack-logs
-.PHONY: edgex-up edgex-down edgex-logs
 
 # Configuration
 STRATEGY      ?= lighter_inventory_mm
@@ -45,8 +43,8 @@ help:
 	@echo "  make trade MODE=testnet - Run the isolated Lighter/Hyperliquid testnet profile"
 	@echo ""
 	@echo "$(YELLOW)Exchange Commands (<exchange>-up/down/logs):$(NC)"
-	@echo "  Target exchanges: lighter, backpack, edgex"
-	@echo "  Example: make lighter-up STRATEGY=lighter_adaptive_mm"
+	@echo "  Target exchanges: lighter"
+	@echo "  Example: make lighter-up"
 	@echo ""
 	@echo "$(YELLOW)Monitoring:$(NC)"
 	@echo "  make status         - Show all running components"
@@ -215,26 +213,6 @@ lighter-down:
 
 lighter-logs:
 	@tail -f $(LOG_DIR)/feeder-lighter.log $(LOG_DIR)/lighter-*.log
-
-backpack-up: build-feeder
-	$(call exchange_up,backpack,.env.backpack)
-backpack-up: STRATEGY := $(if $(filter lighter_inventory_mm,$(STRATEGY)),backpack_mm,$(STRATEGY))
-
-backpack-down:
-	$(call exchange_down,backpack)
-
-backpack-logs:
-	@tail -f $(LOG_DIR)/feeder-backpack.log $(LOG_DIR)/backpack-*.log
-
-edgex-up: build-feeder
-	$(call exchange_up,edgex,.env.edgex)
-edgex-up: STRATEGY := $(if $(filter lighter_inventory_mm,$(STRATEGY)),edgex_mm,$(STRATEGY))
-
-edgex-down:
-	$(call exchange_down,edgex)
-
-edgex-logs:
-	@tail -f $(LOG_DIR)/feeder-edgex.log $(LOG_DIR)/edgex-*.log
 
 status:
 	@echo "$(BLUE)📊 AlephTX System Status$(NC)"

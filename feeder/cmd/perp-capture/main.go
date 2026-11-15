@@ -257,7 +257,7 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 	ticker := time.NewTicker(source.interval)
 	defer ticker.Stop()
 	for {
-		sent := time.Now().UnixMilli()
+		sent := consistentNow().UnixMilli()
 		request, err := snapshotRequest(ctx, source, coin, sent)
 		if err != nil {
 			return err
@@ -267,7 +267,7 @@ func pollSnapshotCoin(ctx context.Context, source subscription, coin string, cli
 			return fmt.Errorf("snapshot %s: %w", coin, err)
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
-		receivedTime := time.Now()
+		receivedTime := consistentNow()
 		received := receivedTime.UnixMilli()
 		closeErr := response.Body.Close()
 		if err := errors.Join(readErr, closeErr); err != nil {
@@ -316,7 +316,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
 	if source.isHyperliquidWS() || source.source == "binance" || source.source == "arcus_trades" {
-		now := time.Now()
+		now := consistentNow()
 		if err := emit(record{Source: source.source, Market: source.market, Event: "connected", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
 			return err
 		}
@@ -324,7 +324,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	subscriptionSends := make(map[string]time.Time)
 	for _, request := range source.requests {
 		if sub, ok := request.(lighterSubscription); ok {
-			subscriptionSends[sub.Channel] = time.Now()
+			subscriptionSends[sub.Channel] = consistentNow()
 		}
 		if err := wsjson.Write(ctx, conn, request); err != nil {
 			return fmt.Errorf("subscribe: %w", err)
@@ -348,7 +348,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 		// An inactive market can have no trades while the transport is healthy.
 		// The keepalive closes an unresponsive connection and wakes this read.
 		_, raw, err := conn.Read(readCtx)
-		received := time.Now()
+		received := consistentNow()
 		cancelRead()
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
@@ -521,7 +521,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 			backoff := time.Second
 			var epoch uint64
 			for ctx.Err() == nil {
-				start := time.Now()
+				start := consistentNow()
 				epoch++
 				epochEmit := func(row record) error { row.epoch = epoch; return emit(row) }
 				err := runSource(ctx, source, epochEmit)
@@ -533,7 +533,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 				if errors.Is(err, errClockRefresh) {
 					event = "clock_refresh"
 				}
-				now := time.Now()
+				now := consistentNow()
 				if epochEmit(record{Source: source.source, Market: source.market, Event: event, ReceivedAt: now.UnixMilli(), received: now}) != nil {
 					return
 				}
@@ -562,7 +562,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 	var last int64
 	counts := make(map[string]int)
 	write := func(row record) error {
-		now := time.Now()
+		now := consistentNow()
 		row.AvailableAt = now.UnixMilli()
 		if precise {
 			if err := clock.stamp(&row, now); err != nil {
@@ -602,7 +602,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 			return fmt.Errorf("no publications from %s %s", source.source, source.market)
 		}
 	}
-	now := time.Now()
+	now := consistentNow()
 	if err := write(record{Source: "collector", Event: "end", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
 		return err
 	}

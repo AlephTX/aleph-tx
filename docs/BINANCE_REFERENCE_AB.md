@@ -42,7 +42,7 @@ Binance 原生 `E`、`T`、`u`、符号与精确字符串 BBO 保留；缺失不
 
 新窗口使用 RH Standard Maker/Cancel/Taker 附加延迟 200/200/300 ms；Core 为 0/300/300 ms。另加独立 250 ms transport 假设，因此 RH 新单为 450 ms，RH 取消为 450 ms，Core 取消为 550 ms。这些不是账户实测。网络、响应、成交 clock guard、真实执行、滚动限流/volume quota 尚未校准，输出固定标记 `execution_qualified=false`。
 
-当前官方账户表的 RH Premium 最低量档为 1.2/3.5 bps，Core Premium 零质押档为 0.4/2.8 bps，不能混用。本轮不变更账户等级。依据为 [11 月 14 日执行审计](EXECUTION_CLOCK_REVIEW_2026_11_14.md)及其[官方账户类型来源](https://docs.lighter.xyz/developers/reference/account-types.md)；当前重新拉取页面失败，不能声称又独立验证了新的生效日期。
+当前官方账户表的 RH Premium 最低量档为 1.2/3.5 bps，Core Premium 零质押档为 0.4/2.8 bps，不能混用。本轮不变更账户等级。依据为 [11 月 14 日执行审计](archive/EXECUTION_CLOCK_REVIEW_2026_11_14.md)及其[官方账户类型来源](https://docs.lighter.xyz/developers/reference/account-types.md)；当前重新拉取页面失败，不能声称又独立验证了新的生效日期。
 
 后续公开费率审计已成功归档 [RH overview](https://docs.lighter.xyz/developers/robinhood-chain/overview.md)，确认该页列出的 Standard Maker/Cancel/Taker 附加延迟为 200/200/300 ms，Premium 最低量档为 1.2/3.5 bps。这是新的公开来源快照，不是账户实测，也没有改写上述冻结配置；早先访问失败的记录继续保留。
 

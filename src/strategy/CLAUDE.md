@@ -1,72 +1,24 @@
 ---
-description: Trading strategies - arbitrage, market making (EdgeX, Backpack, Lighter), adaptive MM
+description: Active trading and research strategies - Lighter inventory-neutral MM and causal two-leg relative-value replay
 alwaysApply: true
 ---
 
 # src/strategy/
 
-> Strategy implementations sharing the common `Strategy` trait. Each strategy reads SHM and executes orders directly.
+> Active supervised quoting (`inventory_neutral_mm`) and causal cross-venue paper replay (`relative_value/`, `cross_venue`, `matched_settlement`). Legacy v3 single-venue strategies (`backpack_mm`, `edgex_mm`, `lighter_adaptive_mm`, `arbitrage`) are archived in `../../legacy/v3_archive/src/strategy/`.
 
-## Key Files
+## Key Modules
 
-| File | Description |
+| Path | Description |
 |------|-------------|
-| mod.rs | `Strategy` trait definition (`on_bbo_update`, `on_idle`, `on_shutdown`) |
-| arbitrage.rs | Cross-exchange statistical arbitrage scanner (25 bps threshold) |
-| edgex_mm.rs | EdgeX market maker V3 (EWMA volatility, dynamic sizing, legacy direct API) |
-| backpack_mm.rs | Backpack market maker (Ed25519 auth, momentum-based spread) |
-| lighter_adaptive_mm.rs | Lighter DEX adaptive MM (premium account, fee-aware, microstructure signals) |
-| inventory_neutral_mm.rs | Inventory-Neutral MM v6.0 - production HFT (external fair value anchor, A-S pricing, momentum spread, position timeout) |
+| `mod.rs` | Common `Strategy` trait (`on_bbo_update`, `on_idle`, `on_shutdown`) |
+| `inventory_neutral_mm.rs` | Production Lighter market maker: external fair-value anchor (Hyperliquid + Binance median with causal EWMA basis), A-S spread + quote hysteresis, directional markout/order-flow/cross-market reserves, bilateral `OrderTracker` accounting, and persistent daily loss guard |
+| `relative_value/` | Causal two-leg paper execution engine (`pair_hedge`, maker-first queue simulation, `turnover` cost-budget & posture controls, exact cash/fee reconciliation, and cancel-window attribution) |
+| `cross_venue.rs` | Cross-venue spread, carry, and instrument equivalence evaluation |
+| `matched_settlement.rs` | Collateral and settlement-domain compatibility checks (preventing unapproved cross-currency pairing such as USDG vs USDC) |
 
-## Strategy Trait
+## Key Design Invariants
 
-```rust
-pub trait Strategy {
-    fn name(&self) -> &str;
-    fn on_bbo_update(&mut self, symbol_id: u16, exchange_id: u8, bbo: &ShmBboMessage);
-    fn on_idle(&mut self);
-    fn on_shutdown(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-}
-```
-
-## Architecture
-
-```mermaid
-graph TD
-    TRAIT[Strategy Trait] --> ARB[ArbitrageEngine]
-    TRAIT --> MM[MarketMaker - EdgeX]
-    TRAIT --> BPM[BackpackMM]
-    TRAIT --> LMM[InventoryNeutralMM v6.0]
-    TRAIT --> AMM[AdaptiveMM]
-
-    SHM[SHM BBO Matrix 7 exchanges] --> ARB & MM & BPM & LMM & AMM
-    BIN[Binance+HL+EdgeX] -->|external_fair_value_mid| LMM
-    ACC[SHM Account Stats] --> AMM
-    OT[OrderTracker v5.0.0] --> LMM & AMM
-
-    LMM & AMM -->|FFI + HTTP| LIGHTER[Lighter API]
-    MM -->|REST| EDGEX[EdgeX API]
-    BPM -->|REST| BACKPACK[Backpack API]
-```
-
-## Key Design Patterns
-
-- **No Boomerang**: Strategies fire HTTP orders directly, never send commands back to Go.
-- **External Fair Value Anchor (v6.0.0)**: `InventoryNeutralMM` uses median of Binance/HL/EdgeX mid-prices as primary fair value. Lighter local BBO only for touch positioning.
-- **Momentum-Aware Spread (v6.0.0)**: Asymmetric half-spreads widen against momentum direction to reduce adverse selection.
-- **Position Timeout Flatten (v6.0.0)**: Positions held >2min beyond deadband trigger IOC flatten.
-- **Optimistic Accounting (v5.0.0)**: Per-order `start_tracking()` before API call. `mark_failed()` on error. Reconciled via `OrderTracker.apply_event()` from V2 event ring buffer.
-- **Incremental Quoting**: Only requote when price moves past threshold (reduces API load).
-- **Fee-Aware Spread** (adaptive_mm): Ensures spread > round-trip fee (0.76 bps for Premium).
-
-## Key Structs (v6.0.0)
-
-- `InventoryContext`: Shared (config, position, base_size, urgency, mid) for defer/sizing functions
-- `AnchorParams`: Quote anchoring parameters for `anchor_quotes_to_touch`
-- `TelemetrySync`: Telemetry snapshot fields for `sync_telemetry_snapshot`
-
-## Gotchas
-
-- `lighter_mm.rs` has been deleted. `inventory_neutral_mm.rs` is the production replacement.
-- `adaptive_mm.rs`: Uses `MicrostructureTracker` (EWMA fast/slow, realized vol, adverse selection).
-- Order TTL: Stale orders canceled after 6s to prevent position drift.
+- **Direct Execution (No Boomerang)**: `InventoryNeutralMM` signs and dispatches orders directly from Rust while consuming 64-byte BBO, depth, and 128-byte V2 private events from shared memory.
+- **Three-Scenario Non-Subsidy Contract**: Quant profit, hedge arbitrage, and incentive turnover use separate configurations, state, capital/loss budgets, and ledgers (`[deployment]` STP & subaccount isolation in `src/config.rs`).
+- **Causal Replay Fidelity**: `relative_value` advances state strictly by local receipt/availability time (`available_at_ms`), never backdating delayed feeds or valuing unconfirmed venue points above zero.

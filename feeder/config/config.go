@@ -43,8 +43,9 @@ type ExchangeConfig struct {
 	Symbols map[string]string `toml:"symbols"`
 }
 
-// ToExchangeMap converts the new unified config to the legacy map format
-// This allows existing feeder code to work without changes
+// ToExchangeMap converts the unified config to the active feeder map.
+// Legacy [edgex] and [backpack] sections remain accepted in TOML for backward
+// compatibility while their adapters reside in legacy/v3_archive.
 func (c *Config) ToExchangeMap() map[string]ExchangeConfig {
 	return map[string]ExchangeConfig{
 		"lighter": {
@@ -52,18 +53,6 @@ func (c *Config) ToExchangeMap() map[string]ExchangeConfig {
 			WSURL:   c.Lighter.FeederWSURL,
 			RESTURL: c.Lighter.FeederRESTURL,
 			Symbols: c.Lighter.FeederSymbols,
-		},
-		"edgex": {
-			Enabled: c.EdgeX.FeederEnabled,
-			WSURL:   c.EdgeX.FeederWSURL,
-			RESTURL: c.EdgeX.FeederRESTURL,
-			Symbols: c.EdgeX.FeederSymbols,
-		},
-		"backpack": {
-			Enabled: c.Backpack.FeederEnabled,
-			WSURL:   c.Backpack.FeederWSURL,
-			RESTURL: c.Backpack.FeederRESTURL,
-			Symbols: c.Backpack.FeederSymbols,
 		},
 		"hyperliquid": {
 			Enabled: c.Hyperliquid.FeederEnabled,

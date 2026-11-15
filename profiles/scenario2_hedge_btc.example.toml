@@ -37,27 +37,6 @@ feeder_enabled = true
 feeder_ws_url = "wss://fstream.binance.com"
 feeder_symbols = { BTC = "BTCUSDT", ETH = "ETHUSDT" }
 
-[edgex]
-feeder_enabled = false
-feeder_ws_url = "wss://quote.edgex.exchange/api/v1/public/ws"
-feeder_rest_url = "https://pro.edgex.exchange"
-feeder_symbols = { ETH = "10000002", BTC = "10000001" }
-risk_fraction = 0.10
-min_spread_bps = 8.0
-vol_multiplier = 3.0
-stop_loss_pct = 0.005
-requote_interval_ms = 5000
-
-[backpack]
-feeder_enabled = false
-feeder_ws_url = "wss://ws.backpack.exchange"
-feeder_symbols = { ETH = "ETH_USDC_PERP", BTC = "BTC_USDC_PERP" }
-risk_fraction = 0.20
-min_spread_bps = 6.0
-vol_multiplier = 2.5
-stop_loss_pct = 0.005
-requote_interval_ms = 3000
-
 [inventory_neutral_mm]
 exchange_id = 2
 symbol_id = 1001

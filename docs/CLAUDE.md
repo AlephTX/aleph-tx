@@ -20,5 +20,5 @@ owning runbook for operations.
 | QUICK_REFERENCE.md | Execution invariants and verification entry points |
 | RESEARCH_DATA_SOURCES.md and QUANT_DATA_LAKEHOUSE.md | Durable public archive registry and 3-tier Medallion data lakehouse pipeline |
 | INDEPENDENT_STRATEGY_RESEARCH.md and FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md | Isolated 3-scenario research contract and 10-hour validation reports |
-| WORKFLOW.md | Pointer to current repository-wide engineering rules |
-| CLAUDE_MD_CONVENTIONS.md | How shared and scoped agent instructions fit together |
+| TOKYO_RESEARCH_AND_EXECUTION_TODO.md | Post-Tokyo `<10 ms` prioritized action queue, counterparty defense guardrails, and engineering backlog |
+| archive/ | Historical point-in-time engineering audits and intermediate stage reviews (`archive/README.md`) |

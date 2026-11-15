@@ -54,24 +54,8 @@ path = "src/lib.rs"
 cc = "1.0"
 
 [[bin]]
-name = "aleph-tx"
-path = "src/main.rs"
-
-[[bin]]
 name = "lighter_inventory_mm"
 path = "src/bin/lighter_inventory_mm.rs"
-
-[[bin]]
-name = "lighter_adaptive_mm"
-path = "src/bin/lighter_adaptive_mm.rs"
-
-[[bin]]
-name = "backpack_mm"
-path = "src/bin/backpack_mm.rs"
-
-[[bin]]
-name = "edgex_mm"
-path = "src/bin/edgex_mm.rs"
 
 [[bin]]
 name = "maker_replay"

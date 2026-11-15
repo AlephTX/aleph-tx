@@ -1,10 +1,10 @@
 # Independent strategy research
 
-The [November 14 basis-risk selection](BASIS_RISK_SELECTION_2026_11_14.md)
+The [November 14 basis-risk selection](archive/BASIS_RISK_SELECTION_2026_11_14.md)
 adds an optional entry-only reserve and matched warm-up controls to the
 RH/Core incentive replay. It preserves the original exit and hedge policy;
 its reused ten-hour sample is historical selection, not a new holdout.
-The [follow-up review](INDEPENDENT_RESEARCH_REVIEW_2026_11_14.md) records the
+The [follow-up review](archive/INDEPENDENT_RESEARCH_REVIEW_2026_11_14.md) records the
 measured basis distribution, separate Binance attribution audit, and distinct
 quant, arbitrage and incentive experiment identities. The [50 ms latency-adapted study](FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md) records
 asymmetric quote hysteresis, decoupled fast inventory-reducing TTLs, local

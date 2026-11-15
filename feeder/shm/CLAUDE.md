@@ -1,84 +1,25 @@
 ---
-description: Shared memory IPC writers - BBO matrix (seqlock), event ring buffer, account stats
+description: Shared memory IPC writers - BBO matrix, top-5 depth, V1/V2 private event rings, and account stats
 alwaysApply: true
 ---
 
 # feeder/shm/
 
-> Lock-free shared memory writers for Go->Rust IPC. Three memory regions for state, events, and account data.
+> Lock-free shared-memory writers for Go -> Rust IPC. Every byte offset and atomic publication sequence is a shared contract with `src/shm_*.rs` and `src/types/events.rs`.
 
 ## Key Files
 
 | File | Description |
 |------|-------------|
-| matrix.go | BBO matrix writer (917KB, seqlock protocol, 2048 symbols x 7 exchanges) |
-| events.go | Private event ring buffer writer (64KB, 1024 slots, SPSC) |
-| account_stats.go | Account statistics writer (128 bytes, versioned odd/even) |
+| `matrix.go` | BBO matrix writer (`aleph-matrix`, 2,048 symbols × 7 exchanges, 64-byte seqlock cells) |
+| `depth.go` | Top-5 orderbook depth writer (`aleph-depth`, 16,384-byte version header + 2,048 `ShmDepthSnapshot` slots) |
+| `events_v2.go` | 128-byte V2 private event ring writer (`aleph-events-v2`, generation seqlock + `FeeSource` byte at offset 112) |
+| `events.go` | Legacy 64-byte V1 event ring writer (`aleph-events`, retained for backward compatibility) |
+| `account_stats.go` | 128-byte account stats writer (`aleph-account-stats`, serialized odd/even versioned writes with independent equity & position timestamps) |
+| `path_*.go` | Platform-resolved SHM backing paths (`/dev/shm` on Linux, temp-backed mmap on macOS tests) |
 
-## Memory Layouts
+## ABI & Publication Invariants
 
-### BBO Matrix (`/dev/shm/aleph-matrix`, ~917 KB)
-```
-SymbolVersions[2048]  : 16 KB   (atomic u64, cache invalidation)
-BboMatrix[2048][7]    : 896 KB  (64-byte ShmBboMessage per cell, 7 exchanges)
-```
-
-### ShmBboMessage (64 bytes, cache-line aligned)
-```
-Offset  Type      Field
-0..4    uint32    Seqlock (odd=writing, even=done)
-4       uint8     MsgType (always 1)
-5       uint8     ExchangeID
-6..8    uint16    SymbolID
-8..16   uint64    TimestampNs
-16..24  float64   BidPrice
-24..32  float64   BidSize
-32..40  float64   AskPrice
-40..48  float64   AskSize
-48..64  [16]byte  Reserved
-```
-
-### ShmPrivateEvent (64 bytes, C-ABI)
-```
-Offset  Type      Field
-0..8    uint64    Sequence
-8       uint8     ExchangeID
-9       uint8     EventType (1=Created, 2=Filled, 3=Canceled, 4=Rejected)
-10..12  uint16    SymbolID
-12..16  uint32    _pad1
-16..24  uint64    OrderID
-24..32  float64   FillPrice
-32..40  float64   FillSize
-40..48  float64   RemainingSize
-48..56  float64   FeePaid
-56..64  [8]byte   _padding
-```
-
-### ShmAccountStats (128 bytes)
-```
-Offset  Type      Field
-0..8    uint64    Version (odd=writing, even=done)
-8..56   float64x6 Collateral, PortfolioValue, Leverage, AvailableBalance, MarginUsage, BuyingPower
-56..64  uint64    UpdatedAt (ns)
-64..72  float64   Position
-72..128 [56]byte  Reserved
-```
-
-### ShmPrivateEventV2 tail (128 bytes total)
-```
-Offset    Type      Field
-96..104   uint64    TimestampNs (feeder wall clock)
-104..112  uint64    TradeID
-112       uint8     FeeSource (0 unknown, 1 rate_derived, 2 explicit_zero,
-                    3 missing, 4 invalid, 5 role_unknown)
-113..128  [15]byte  _reserved (always 0)
-```
-`TestEventV2LayoutMatchesRust` pins every offset. FeeSource was reserved and
-always 0 before, so 0 must stay unknown.
-
-## Gotchas
-
-- **C-ABI Alignment**: `ShmPrivateEvent` MUST be exactly 64 bytes. Assert in `init()` with `unsafe.Sizeof`.
-- **Seqlock Write Order**: `Seq++ (Odd) -> Write -> Seq++ (Even)`. Violating this causes torn reads.
-- **Single Writer**: Each SHM region has exactly one writer goroutine. No mutex needed.
-- **Atomic Operations**: Use `sync/atomic` for `write_idx` and version counters.
+- **Exact Struct Sizes**: `ShmBboMessage = 64B`, `ShmPrivateEvent = 64B`, `ShmPrivateEventV2 = 128B`, `ShmAccountStats = 128B`. Verified by Go and Rust unit tests (`TestEventV2LayoutMatchesRust`).
+- **Seqlock Order**: Increment sequence to odd -> write payload -> atomic store even sequence. Never mutate payload under an even sequence.
+- **FeeSource Compatibility**: Byte `112` of `ShmPrivateEventV2` uses `0 = Unknown` so zero-initialized rings never masquerade as explicit zero-fee fills.

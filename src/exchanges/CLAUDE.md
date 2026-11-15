@@ -1,104 +1,36 @@
 ---
-description: Exchange-specific trading clients with unified Exchange trait abstraction
+description: Active exchange clients and research adapters (Lighter Core/Robinhood, Hyperliquid, Arcus, BULK, Variational)
 alwaysApply: true
 ---
 
 # src/exchanges/
 
-> Modular exchange integrations - each exchange in its own subdirectory with gateway implementing Exchange trait.
+> Modular venue clients for supervised execution (`lighter`, `hyperliquid`) and public-data capture/metadata (`arcus`, `bulk`, `variational`). Legacy v3 adapters (`backpack`, `edgex`) are preserved in `../../legacy/v3_archive/src/exchanges/`.
 
-## Architecture
+## Directory Layout
 
 ```
 src/exchanges/
-  mod.rs                    # pub mod lighter; pub mod backpack; pub mod edgex;
+  mod.rs          # pub mod arcus, bulk, hyperliquid, lighter, variational
   lighter/
-    mod.rs                  # pub mod ffi; pub mod trading;
-    ffi.rs                  # FFI bindings to Go signer (lighter-signer-linux-amd64.so)
-    trading.rs              # Lighter DEX trading client (implements Exchange trait)
-  backpack/
-    mod.rs                  # pub mod client; pub mod gateway; pub mod model;
-    client.rs               # BackpackClient - REST client with Ed25519 auth
-    gateway.rs              # BackpackGateway - Exchange trait implementation
-    model.rs                # Data structures (BackpackOrderRequest, BackpackPosition, etc.)
-    CLAUDE.md               # Backpack-specific documentation
-  edgex/
-    mod.rs                  # pub mod client; pub mod gateway; pub mod model; pub mod signature; pub mod pedersen;
-    client.rs               # EdgeXClient - REST client with L2 auth
-    gateway.rs              # EdgeXGateway - Exchange trait implementation (buy/sell/cancel/batch)
-    model.rs                # Data structures (CreateOrderRequest, OpenOrder, Position, etc.)
-    signature.rs            # SignatureManager - StarkNet Pedersen hash + EC_ORDER reduction + local verify
-    pedersen/mod.rs         # EdgeX-compatible Pedersen hash implementation
-    pedersen/pedersen_points.rs  # Pre-computed constant points for Pedersen hash
-    CLAUDE.md               # EdgeX-specific documentation
+    mod.rs        # LighterNetwork (Mainnet 304, Testnet 300, RobinhoodMainnet 466324), market validation
+    ffi.rs        # CGO signer bindings + SigningLanePool (round-robin multi-API-key lanes)
+    risk.rs       # Isolated/cross liquidation price, cross-market MMR, post-fill safety guards
+    trading.rs    # LighterTrading client, dual-state (pending/confirmed) nonce manager, batch/cancel APIs
+  hyperliquid/    # Native Hyperliquid + HIP-3 DEX (km / xyz) EIP-712 signing, IOC hedge client, clearinghouse queries
+  arcus/          # Arcus public orderbook, market trades, and contract metadata client
+  bulk/           # BULK public orderbook, trades, funding, and ticker metadata client
+  variational/    # Variational public quote/metadata client
 ```
 
-## Exchange Trait Abstraction
+## Key Execution Capabilities
 
-All exchanges implement the unified `Exchange` trait defined in `src/exchange.rs`:
+### Lighter (`lighter/`)
+- **Domains**: `Mainnet` (`chain_id = 304`, USDC), `Testnet` (`chain_id = 300`), and `RobinhoodMainnet` (`chain_id = 466324`, USDG, supervised `quant` mode + public research).
+- **Multi-Key Signing Pool**: `SigningLanePool` binds `1..N` `(api_key_index, private_key)` lanes (`LIGHTER_EXTRA_LANES` or `LIGHTER_API_KEY_INDICES` + `LIGHTER_PRIVATE_KEYS`) with independent per-lane nonce state to multiply rate-limit headroom without cross-key nonce races.
+- **Dual-State Nonce Recovery**: Separates `confirmed_nonce` from `pending_nonce`, rolls back locally on transport failure before server ingestion, and resyncs via `/api/v1/nextNonce` on `21104` / `21711`.
+- **Liquidation & Margin Math (`risk.rs`)**: Exact isolated/cross liquidation price, bps-to-liquidation buffer, and cross-market maintenance margin requirement (`portfolio_cross_mmr_usd`).
 
-```rust
-#[async_trait]
-pub trait Exchange: Send + Sync {
-    async fn buy(&self, size: f64, price: f64) -> Result<OrderResult>;
-    async fn sell(&self, size: f64, price: f64) -> Result<OrderResult>;
-    async fn place_batch(&self, params: BatchOrderParams) -> Result<BatchOrderResult>;
-    async fn cancel_order(&self, order_id: i64) -> Result<()>;
-    async fn cancel_all(&self) -> Result<u32>;
-    async fn get_active_orders(&self) -> Result<Vec<OrderInfo>>;
-    async fn close_all_positions(&self, current_price: f64) -> Result<()>;
-}
-```
-
-## Implementation Status
-
-| Exchange | Client | Gateway | Status |
-|----------|--------|---------|--------|
-| Lighter  | ✅ trading.rs | ✅ (native impl) | Production-ready |
-| Backpack | ✅ client.rs | ✅ gateway.rs | Functional (no batch API) |
-| EdgeX    | ✅ client.rs | ✅ gateway.rs | Functional (L2 Pedersen signature complete) |
-
-## Backward Compatibility
-
-`src/lib.rs` provides re-exports for seamless migration:
-
-```rust
-pub use exchanges::lighter::ffi as lighter_ffi;
-pub use exchanges::lighter::trading as lighter_trading;
-pub use exchanges::backpack as backpack_api;
-pub use exchanges::edgex as edgex_api;
-```
-
-Existing code using `crate::lighter_trading::*` continues to work without changes.
-
-## Key Differences
-
-### Lighter DEX
-- **Native batch API**: `sendTxBatch` for atomic bid+ask placement
-- **FFI signing**: Go signer via CGO for Poseidon2 + EdDSA
-- **Nonce management**: Auto-reset on 21711 (invalid nonce) errors
-- **Optimistic accounting**: Integrates with Shadow Ledger for `in_flight_pos` tracking
-
-### Backpack
-- **Ed25519 auth**: Pure Rust signing with `ed25519_dalek`
-- **No batch API**: Sequential execution of bid/ask orders
-- **String-based IDs**: Order IDs are strings, not integers
-
-### EdgeX
-- **L2 StarkNet auth**: Pedersen hash + Stark curve signing
-- **Complex signature**: Requires `calc_limit_order_hash` with asset IDs, nonce, expiry
-- **Pedersen hash**: Uses EdgeX-specific constant points (not standard StarkNet), with EC_ORDER modular reduction
-
-## Testing
-
-```bash
-make build                              # Build all exchanges
-make test-up                            # Integration test (Lighter DEX)
-make lighter-up STRATEGY=adaptive_mm    # Production adaptive MM (Lighter DEX)
-```
-
-## Future Work
-
-1. **Config-driven factory**: `main.rs` should instantiate exchanges based on `config.toml`
-2. **Dynamic Makefile**: `make run EXCHANGE=backpack STRATEGY=inventory_neutral_mm`
-3. **Cross-exchange strategies**: Arbitrage between Lighter/Backpack/EdgeX
+### Hyperliquid (`hyperliquid/`)
+- **Native IOC Hedging**: EIP-712 signed reduce-only and hedging IOC orders paired with `src/live_hedge/` durable write-ahead journaling and clearinghouse position reconciliation.
+- **HIP-3 Perp DEX Support**: Public capture and metadata resolution across native Hyperliquid, Entropy (`km`), and TradeXYZ (`xyz`).

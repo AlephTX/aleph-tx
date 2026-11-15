@@ -13,15 +13,15 @@ Core 是本实验的对冲腿。量化盈利、对冲套利、激励产出分别
 
 这些是不同阶段的研究动作，不代表另外两个场景已经获得新收益验证。
 调研附件与上一轮内容相同；平台规则仍以已核查的
-[研究设计](PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md)和
-[Binance 实验说明](BINANCE_REFERENCE_AB.md)为准。成本曲线输出中的
+[研究设计](../PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md)和
+[Binance 实验说明](../BINANCE_REFERENCE_AB.md)为准。成本曲线输出中的
 `standard_to_standard_rewarded` 修为 `null`，附带来源/定义待核实状态。
 旧结果和原先使用过的规则假设保留，未替换成已确认奖励。
 
 两点不直接照搬调研建议：旧 RH 账本中八组完整且有成交的实验，只有两组发生了
 强制平仓，不能先认定强平是普遍主因。另一个是“把门槛随波动提高”可能同时消灭
 有效成交，必须和固定门槛及相同数据预热对照，而不是只看亏损总额下降。
-对账依据见 [原执行与激励审计](RESEARCH_PROGRESS_2026_11_14.md#execution-and-incentive-review)。
+对账依据见 [原执行与激励审计](../RESEARCH_PROGRESS_2026_11_14.md#execution-and-incentive-review)。
 本次重新请求官方账户/积分页面返回 403，未获得新的独立规则证据。
 
 ## 机制与安全边界

@@ -27,7 +27,7 @@ consistent economic interpretation:
   selection risk. Neither statistic alone determines complete-cycle PnL.
   Price effects already in fill cash flows must not be deducted twice.
 
-See the [profitability postmortem](PERP_RELATIVE_VALUE.md#profitability-postmortem-2026-11-13)
+See the [profitability postmortem](../PERP_RELATIVE_VALUE.md#profitability-postmortem-2026-11-13)
 for archived execution results and their limitations.
 
 ## What the current strategies actually test
