@@ -1,76 +1,150 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 304" role="img" aria-labelledby="title desc">
-  <title id="title">AlephTX</title>
-  <desc id="desc">Perpetual futures execution and research. Two paths show supervised trading from venue feeds through Go and Rust, and public L2 data through compilation to paper replay.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 336" role="img" aria-labelledby="title desc">
+  <title id="title">AlephTX · Institutional Perpetual Execution &amp; Quantitative Lakehouse Engine</title>
+  <desc id="desc">Sub-10ms Go/Rust shared-memory perpetual execution on oasis-tokyo, 24x7 rolling multi-venue capture, and 10-hour causal replay and post-trade attribution on the aleph lakehouse workstation.</desc>
   <defs>
-    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop stop-color="#0b0f14"/>
-      <stop offset="1" stop-color="#0c1d22"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070b10"/>
+      <stop offset="55%" stop-color="#0a131c"/>
+      <stop offset="100%" stop-color="#0b1d22"/>
     </linearGradient>
-    <linearGradient id="accent">
-      <stop stop-color="#3ee6a8"/>
-      <stop offset="1" stop-color="#5ccfd3"/>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3ee6a8"/>
+      <stop offset="50%" stop-color="#4dd7c0"/>
+      <stop offset="100%" stop-color="#5ccfd3"/>
     </linearGradient>
-    <pattern id="grid" width="22" height="22" patternUnits="userSpaceOnUse">
-      <path d="M 22 0 H 0 V 22" fill="none" stroke="#78adae" stroke-opacity=".14"/>
+    <linearGradient id="cardGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#112229" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#0c181e" stop-opacity="0.92"/>
+    </linearGradient>
+    <radialGradient id="glowLeft" cx="0.2" cy="0.25" r="0.55">
+      <stop offset="0%" stop-color="#3ee6a8" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#3ee6a8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowRight" cx="0.82" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#5ccfd3" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#5ccfd3" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 H 0 V 24" fill="none" stroke="#6ab5ae" stroke-opacity="0.09"/>
     </pattern>
     <clipPath id="frame">
-      <rect width="1120" height="304" rx="24"/>
+      <rect width="1120" height="336" rx="22"/>
     </clipPath>
-    <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-      <path d="M0 0 6 3 0 6Z" fill="#6ab5ae"/>
+    <marker id="arrowGreen" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0 6 3 0 6Z" fill="#3ee6a8"/>
+    </marker>
+    <marker id="arrowCyan" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0 6 3 0 6Z" fill="#5ccfd3"/>
+    </marker>
+    <marker id="arrowAmber" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0 6 3 0 6Z" fill="#f2b866"/>
     </marker>
   </defs>
 
   <g clip-path="url(#frame)">
-    <rect width="1120" height="304" fill="url(#background)"/>
-    <rect x="626" width="494" height="304" fill="url(#grid)"/>
-    <path d="M626 0V304" stroke="#27454a"/>
-    <path d="M48 0H182" stroke="url(#accent)" stroke-width="4"/>
+    <rect width="1120" height="336" fill="url(#bg)"/>
+    <rect width="1120" height="336" fill="url(#grid)"/>
+    <rect width="1120" height="336" fill="url(#glowLeft)"/>
+    <rect width="1120" height="336" fill="url(#glowRight)"/>
+    <path d="M568 0V336" stroke="#1f3b42" stroke-width="1.2"/>
+    <rect x="44" y="0" width="168" height="4" fill="url(#accent)"/>
   </g>
-  <rect x=".5" y=".5" width="1119" height="303" rx="24" fill="none" stroke="#315258"/>
+  <rect x="0.75" y="0.75" width="1118.5" height="334.5" rx="21.5" fill="none" stroke="#284850" stroke-width="1.5"/>
 
-  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace">
-    <rect x="48" y="42" width="46" height="46" rx="12" fill="#112621" stroke="#285d4d"/>
-    <text x="71" y="75" text-anchor="middle" font-size="32" font-weight="700" fill="#3ee6a8">α</text>
-    <text x="111" y="70" font-size="13" font-weight="600" letter-spacing="2.4" fill="#8fbbb4">PERPETUAL FUTURES ENGINE</text>
-  </g>
-  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
-    <text x="45" y="177" font-size="88" font-weight="700" letter-spacing="-5" fill="#f1f9f7">Aleph<tspan fill="#3ee6a8">TX</tspan></text>
-    <text x="49" y="222" font-size="24" font-weight="500" fill="#c6ded9">Execution and relative-value research</text>
-  </g>
-  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" font-weight="600" letter-spacing="1.5">
-    <circle cx="54" cy="259" r="4" fill="#3ee6a8"/>
-    <text x="68" y="263" fill="#8fbbb4">GO FEEDS</text>
-    <circle cx="175" cy="259" r="4" fill="#3ee6a8"/>
-    <text x="189" y="263" fill="#8fbbb4">RUST EXECUTION</text>
-    <circle cx="344" cy="259" r="4" fill="#5ccfd3"/>
-    <text x="358" y="263" fill="#8fbbb4">OFFLINE REPLAY</text>
+  <!-- Left Column: Brand & Core Engineering Specs -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace">
+    <rect x="44" y="34" width="44" height="44" rx="11" fill="#0f2622" stroke="#2d6a56" stroke-width="1.5"/>
+    <text x="66" y="65" text-anchor="middle" font-size="29" font-weight="700" fill="#3ee6a8">α</text>
+    <rect x="102" y="39" width="388" height="34" rx="8" fill="#0d1d22" stroke="#214248"/>
+    <circle cx="118" cy="56" r="4" fill="#3ee6a8"/>
+    <text x="131" y="60" font-size="11.5" font-weight="700" letter-spacing="1.8" fill="#9ec8c2">QUANTITATIVE PERP EXECUTION &amp; LAKEHOUSE</text>
   </g>
 
-  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace">
-    <text x="652" y="55" font-size="13" font-weight="700" letter-spacing="1.8" fill="#3ee6a8">01 / SUPERVISED</text>
-    <text x="652" y="169" font-size="13" font-weight="700" letter-spacing="1.8" fill="#5ccfd3">02 / RESEARCH</text>
-    <g fill="#132a2c" stroke="#37605d">
-      <rect x="652" y="72" width="128" height="56" rx="8"/>
-      <rect x="801" y="72" width="128" height="56" rx="8"/>
-      <rect x="950" y="72" width="128" height="56" rx="8"/>
-      <rect x="652" y="186" width="128" height="56" rx="8"/>
-      <rect x="801" y="186" width="128" height="56" rx="8"/>
-      <rect x="950" y="186" width="128" height="56" rx="8"/>
+  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+    <text x="42" y="158" font-size="82" font-weight="800" letter-spacing="-4.2" fill="#f3fbf9">Aleph<tspan fill="url(#accent)">TX</tspan></text>
+    <text x="46" y="196" font-size="19.5" font-weight="500" fill="#c7e0dc">Sub-10ms Multi-Venue CLOB Execution · Causal Research Engine</text>
+    <text x="46" y="222" font-size="14" font-weight="400" fill="#82a8a4">Lighter Core &amp; Robinhood · Arcus · Entropy · TradeXYZ · Hyperliquid · Extended · BULK</text>
+  </g>
+
+  <!-- Telemetry Spec Pills -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" letter-spacing="0.6">
+    <rect x="44" y="246" width="236" height="28" rx="6" fill="#0e2024" stroke="#264b50"/>
+    <circle cx="58" cy="260" r="3.5" fill="#3ee6a8"/>
+    <text x="69" y="264" fill="#b7dcd6">12-SLOT SHM ABI (64B / 256B)</text>
+
+    <rect x="290" y="246" width="248" height="28" rx="6" fill="#0e2024" stroke="#264b50"/>
+    <circle cx="304" cy="260" r="3.5" fill="#3ee6a8"/>
+    <text x="315" y="264" fill="#b7dcd6">TOKYO &lt;10MS · 3-LANE SIGNER</text>
+
+    <rect x="44" y="282" width="236" height="28" rx="6" fill="#0e2024" stroke="#264b50"/>
+    <circle cx="58" cy="296" r="3.5" fill="#5ccfd3"/>
+    <text x="69" y="300" fill="#b7dcd6">24×7 ROLLING 10H15M CAPTURE</text>
+
+    <rect x="290" y="282" width="248" height="28" rx="6" fill="#0e2024" stroke="#264b50"/>
+    <circle cx="304" cy="296" r="3.5" fill="#f2b866"/>
+    <text x="315" y="300" fill="#b7dcd6">DUCKDB ASOF + CUDA LAKEHOUSE</text>
+  </g>
+
+  <!-- Right Column: Three-Plane Architecture Diagram -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <!-- Plane 01 -->
+    <text x="594" y="38" font-size="11.5" font-weight="700" letter-spacing="1.6" fill="#3ee6a8">01 / SUPERVISED LOW-LATENCY EXECUTION (OASIS-TOKYO)</text>
+    <g fill="url(#cardGrad)" stroke="#2d6359" stroke-width="1.2">
+      <rect x="594" y="48" width="150" height="54" rx="8"/>
+      <rect x="766" y="48" width="150" height="54" rx="8"/>
+      <rect x="938" y="48" width="150" height="54" rx="8"/>
     </g>
-    <g fill="none" stroke="#6ab5ae" stroke-width="1.4" marker-end="url(#arrow)">
-      <path d="M782 100H796"/>
-      <path d="M931 100H945"/>
-      <path d="M782 214H796"/>
-      <path d="M931 214H945"/>
+    <g fill="none" stroke="#3ee6a8" stroke-width="1.5" marker-end="url(#arrowGreen)">
+      <path d="M746 75H761"/>
+      <path d="M918 75H933"/>
     </g>
-    <g fill="#e0f0ec" font-size="15" font-weight="600" text-anchor="middle">
-      <text x="716" y="105">Venue feeds</text>
-      <text x="865" y="105">Go / SHM</text>
-      <text x="1014" y="105">Rust orders</text>
-      <text x="716" y="219">Public L2</text>
-      <text x="865" y="219">Compile</text>
-      <text x="1014" y="219">Paper fills</text>
+    <g text-anchor="middle">
+      <text x="669" y="71" font-size="13" font-weight="700" fill="#e9f7f4">Go Feeder</text>
+      <text x="669" y="89" font-size="10.5" fill="#8ab5af">8 Venues · V2 Events</text>
+      <text x="841" y="71" font-size="13" font-weight="700" fill="#e9f7f4">Lock-Free SHM</text>
+      <text x="841" y="89" font-size="10.5" fill="#8ab5af">Matrix + Top-5 Depth</text>
+      <text x="1013" y="71" font-size="13" font-weight="700" fill="#e9f7f4">Rust Executor</text>
+      <text x="1013" y="89" font-size="10.5" fill="#8ab5af">MM · IOC · WAL Guard</text>
+    </g>
+
+    <!-- Plane 02 -->
+    <text x="594" y="138" font-size="11.5" font-weight="700" letter-spacing="1.6" fill="#5ccfd3">02 / 24×7 ISOLATED ROLLING CAPTURE &amp; DATA FLYWHEEL</text>
+    <g fill="url(#cardGrad)" stroke="#2c5b6c" stroke-width="1.2">
+      <rect x="594" y="148" width="150" height="54" rx="8"/>
+      <rect x="766" y="148" width="150" height="54" rx="8"/>
+      <rect x="938" y="148" width="150" height="54" rx="8"/>
+    </g>
+    <g fill="none" stroke="#5ccfd3" stroke-width="1.5" marker-end="url(#arrowCyan)">
+      <path d="M746 175H761"/>
+      <path d="M918 175H933"/>
+    </g>
+    <g text-anchor="middle">
+      <text x="669" y="171" font-size="13" font-weight="700" fill="#e9f7f4">3-Stream Capture</text>
+      <text x="669" y="189" font-size="10.5" fill="#8ab5af">Crypto · RWA · BULK</text>
+      <text x="841" y="171" font-size="13" font-weight="700" fill="#e9f7f4">VDSO &lt;25µs Seal</text>
+      <text x="841" y="189" font-size="10.5" fill="#8ab5af">10h15m Rolling Units</text>
+      <text x="1013" y="171" font-size="13" font-weight="700" fill="#e9f7f4">20TB Lakehouse</text>
+      <text x="1013" y="189" font-size="10.5" fill="#8ab5af">SCHED_IDLE Zero-Egress</text>
+    </g>
+
+    <!-- Plane 03 -->
+    <text x="594" y="238" font-size="11.5" font-weight="700" letter-spacing="1.6" fill="#f2b866">03 / CAUSAL BACKTEST &amp; POST-TRADE ATTRIBUTION (ALEPH)</text>
+    <g fill="url(#cardGrad)" stroke="#635133" stroke-width="1.2">
+      <rect x="594" y="248" width="150" height="54" rx="8"/>
+      <rect x="766" y="248" width="150" height="54" rx="8"/>
+      <rect x="938" y="248" width="150" height="54" rx="8"/>
+    </g>
+    <g fill="none" stroke="#f2b866" stroke-width="1.5" marker-end="url(#arrowAmber)">
+      <path d="M746 275H761"/>
+      <path d="M918 275H933"/>
+    </g>
+    <g text-anchor="middle">
+      <text x="669" y="271" font-size="13" font-weight="700" fill="#e9f7f4">Silver Parquet</text>
+      <text x="669" y="289" font-size="10.5" fill="#c7b597">3-Tier NVMe + DuckDB</text>
+      <text x="841" y="271" font-size="13" font-weight="700" fill="#e9f7f4">Causal Compiler</text>
+      <text x="841" y="289" font-size="10.5" fill="#c7b597">ASOF Join · GPU ML</text>
+      <text x="1013" y="271" font-size="13" font-weight="700" fill="#e9f7f4">3 Track Ledgers</text>
+      <text x="1013" y="289" font-size="10.5" fill="#c7b597">Quant · Arb · Turnover</text>
     </g>
   </g>
 </svg>

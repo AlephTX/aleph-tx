@@ -1675,7 +1675,11 @@ async fn cancellation_acknowledgement_does_not_release_unknown_submission() {
     std::fs::create_dir(&directory).unwrap();
     let matrix_path = directory.join("matrix");
     let account_path = directory.join("account");
-    std::fs::write(&matrix_path, vec![0u8; 2048 * 8 + 7 * 64]).unwrap();
+    std::fs::write(
+        &matrix_path,
+        vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64],
+    )
+    .unwrap();
     std::fs::write(&account_path, [0u8; 128]).unwrap();
     let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
     let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();
@@ -1808,7 +1812,11 @@ fn wake_test_strategy(
     std::fs::create_dir(&directory).unwrap();
     let matrix_path = directory.join("matrix");
     let account_path = directory.join("account");
-    std::fs::write(&matrix_path, vec![0u8; 2048 * 8 + 7 * 64]).unwrap();
+    std::fs::write(
+        &matrix_path,
+        vec![0u8; 2048 * 8 + crate::shm_reader::NUM_EXCHANGES * 64],
+    )
+    .unwrap();
     std::fs::write(&account_path, [0u8; 128]).unwrap();
     let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
     let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();

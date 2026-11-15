@@ -1,0 +1,33 @@
+[Unit]
+Description=AlephTX Idle-Priority Lakehouse Bronze Seal, Upload & Free-Space Eviction Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aleph-tx
+Group=aleph-tx
+Environment="RCLONE_CONFIG=/etc/aleph-tx/rclone.conf"
+Environment="ALEPH_CAPTURE_DIR=/var/lib/aleph-tx-captures"
+Environment="ALEPH_PUBLIC_BRONZE_REMOTE="
+Environment="ALEPH_COLLECTOR_REGION=tokyo"
+Environment="ALEPH_SPLIT_ROLE=selection_dev"
+EnvironmentFile=-/etc/aleph-tx/flywheel.env
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+Nice=19
+CPUQuota=15%
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aleph-tx-captures
+ExecStart=/usr/bin/python3 /opt/aleph-tx/current/scripts/flywheel_sync.py ship-public \
+  --capture-dir "${ALEPH_CAPTURE_DIR}" \
+  --remote-dir "${ALEPH_PUBLIC_BRONZE_REMOTE}" \
+  --collector-region "${ALEPH_COLLECTOR_REGION}" \
+  --split-role "${ALEPH_SPLIT_ROLE}" \
+  --bwlimit 3M \
+  --drive-chunk-size 64M \
+  --evict-below-free-gib 16.0 \
+  --min-evict-age-secs 600

@@ -118,9 +118,17 @@ separate entry points.
 ## Execution and recovery
 
 - Both a single leg and worst-case net exposure, including all resting Lighter
-  bids or asks that could fill, are capped by `max_unhedged_base`. The hedge
-  waits for confirmed Lighter cancellations and reads actual venue positions
-  before sending a bounded IOC. Position reductions use reduce-only orders.
+  bids or asks that could fill, are capped by `max_unhedged_base` (and enforced
+  directionally at the `LighterTrading` execution boundary before wire dispatch,
+  blocking exposure expansion while still permitting position-reducing orders).
+  The hedge waits for confirmed Lighter cancellations and reads actual venue
+  positions before sending a bounded IOC. Position reductions use reduce-only
+  orders.
+- By default (`require_external_fair_value = true`, `local_staleness_ms = 1000`,
+  `stale_bbo_cancel_ms = 2500`), missing or stale external reference feeds
+  withdraw resting quotes rather than silently falling back to the local book,
+  while absorbing up to `500 ms` of benign exchange-to-host NTP skew without
+  mutating recorded source timestamps.
 - Quote allowances are refreshed by a single background REST observation.
   The strategy uses an allowance only while its Lighter position, Hyperliquid
   account and book evidence remain fresh. It can withdraw known Lighter

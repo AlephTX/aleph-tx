@@ -377,15 +377,21 @@ impl LiveInventoryHedge {
         );
         let lot = Decimal::new(1, market.asset.sz_decimals);
         ensure!(
-            limits
-                .deadband_base
-                .checked_add(lot)
-                .is_some_and(|min| min <= limits.max_unhedged_base)
+            (limits.deadband_base.is_zero()
+                || (limits.deadband_base >= lot
+                    && book
+                        .bid
+                        .checked_mul(limits.deadband_base)
+                        .is_some_and(|value| value >= Decimal::TEN)))
+                && limits
+                    .deadband_base
+                    .checked_add(lot)
+                    .is_some_and(|min| min <= limits.max_unhedged_base)
                 && book
                     .bid
                     .checked_mul(limits.max_unhedged_base)
                     .is_some_and(|value| value >= Decimal::TEN),
-            "Net-exposure limit must leave room for a tradable hedge lot"
+            "Deadband (when non-zero) and net-exposure limit must each cover Hyperliquid's $10 / 1-lot minimum"
         );
         let trading = HyperliquidTrading::new(info.clone(), signer, None)?;
         Ok(Self {
@@ -538,22 +544,27 @@ impl LiveInventoryHedge {
     /// Called only after Lighter's own cleanup has confirmed canceled orders.
     pub(crate) async fn finish(&mut self) -> Result<()> {
         self.stop_quote_poll();
-        // Allow terminal lookups and account snapshots time to converge.
+        // Allow terminal lookups, Lighter REST convergence, and HL open-order
+        // clearing time to converge instead of stranding a naked HL leg on the
+        // first transient poll.
         let deadline = Instant::now() + FINISH_DEADLINE;
         while Instant::now() < deadline {
             if let Some(observed) = self.observe(true).await? {
-                ensure!(
-                    observed.primary.is_zero(),
-                    "Lighter still has inventory after cleanup"
-                );
-                if observed.hedge.is_zero() {
-                    ensure!(
-                        self.info.open_orders(&self.account).await?.is_empty(),
-                        "Hyperliquid still reports active orders"
+                if !observed.primary.is_zero() {
+                    tracing::warn!(
+                        primary = %observed.primary,
+                        "Lighter still reports inventory after cleanup; waiting for REST convergence"
                     );
-                    return Ok(());
+                } else if observed.hedge.is_zero() {
+                    if self.info.open_orders(&self.account).await?.is_empty() {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "Hyperliquid still reports active orders during shutdown; retrying"
+                    );
+                } else {
+                    self.execute(observed, true).await?;
                 }
-                self.execute(observed, true).await?;
             }
             tokio::time::sleep(POLL).await;
         }
@@ -620,10 +631,15 @@ impl LiveInventoryHedge {
             self.pending = None;
             self.confirmed = hedge;
         }
-        ensure!(
-            hedge == self.confirmed,
-            "Unexplained Hyperliquid position change"
-        );
+        if hedge != self.confirmed {
+            ensure!(closing, "Unexplained Hyperliquid position change");
+            tracing::warn!(
+                confirmed = %self.confirmed,
+                observed = %hedge,
+                "Hyperliquid position drifted before shutdown; adopting observed position to flatten reduce-only"
+            );
+            self.confirmed = hedge;
+        }
         // The joined requests finish together; a primary value that waited
         // on slower Hyperliquid replies (or was slow itself) is too old to
         // plan against. No observation: callers retry, blocked deadlines run.
@@ -678,6 +694,7 @@ impl LiveInventoryHedge {
             return Ok(());
         };
         let sent_at_ms = unix_ms()?;
+        let expires_after_ms = sent_at_ms.checked_add(5_000).context("Expiry overflow")?;
         ensure!(
             fresh(sent_at_ms, observed.book.timestamp_ms, MAX_QUOTE_AGE_MS),
             "Hyperliquid book is stale at hedge dispatch"
@@ -708,6 +725,7 @@ impl LiveInventoryHedge {
             cloid: id.clone(),
             coin: self.market.asset.name.clone(),
             submitted_at_ms: sent_at_ms,
+            expires_after_ms: Some(expires_after_ms),
             is_buy: order.is_buy,
             size: order.size,
             limit_price: order.limit_price,
@@ -725,7 +743,10 @@ impl LiveInventoryHedge {
             cancel_sent: false,
         });
 
-        let result = self.trading.submit_orders(&action).await;
+        let result = self
+            .trading
+            .submit_orders_with_expiry(&action, Some(expires_after_ms))
+            .await;
         let pending = self.pending.as_mut().context("Missing IOC reservation")?;
         match result.as_deref() {
             Ok(

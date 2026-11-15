@@ -77,6 +77,31 @@ hourly flat-start replays are diagnostics, not ten-hour validation units.
 See [the current execution limits and Oasis study](TEN_HOUR_RESEARCH.md)
 and the durable [source registry](RESEARCH_DATA_SOURCES.md).
 
+### In-process rolling segments (`-segment-duration`)
+
+When running continuous capture alongside live monitoring (the
+[Live-as-Data-Flywheel](QUANT_DATA_LAKEHOUSE.md#5-live-as-data-flywheel--post-trade-attribution)
+workflow), pass `-segment-duration 1h` (or `2h`) with `-duration 10h15m -gzip`:
+
+```sh
+feeder/perp-capture -duration 10h15m -segment-duration 1h -gzip \
+  -binance BTCUSDT,ETHUSDT -lighter 0,1 -lighter-robinhood 0,1 \
+  -arcus-ws NVDA-USD,BTC-USD,ETH-USD -arcus-trades \
+  -hyperliquid BTC,ETH,io:NVDA,xyz:NVDA -hl-trades \
+  -output recordings/tokyo-flywheel.ndjson.gz
+```
+
+`perp-capture` writes each active slice to
+`recordings/tokyo-flywheel.segNNNN.ndjson.gz.partial` and atomically renames it
+to `.segNNNN.ndjson.gz` upon rotation **inside the same process** — WebSocket
+connections, reconstructed L2 books, `capture_timing.run_id`, and monotonic
+`sequence` numbers remain completely unbroken across segment boundaries. An
+individual segment (`coverage_class = "rolling_segment"`) never certifies a
+10-hour validation unit on its own; run
+`python3 scripts/quant_lakehouse.py seal-segment-chain` over the full contiguous
+chain (`seg0000`..`segNNNN`) to verify `run_id` and `sequence` continuity before
+normalization or causal compilation (`cross_venue perp-compile config.json seg0.ndjson,seg1.ndjson out.ndjson`).
+
 ## Lighter Core and Robinhood Chain
 
 Capture the two deployments with explicit source identities:

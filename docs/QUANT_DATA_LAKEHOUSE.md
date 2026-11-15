@@ -278,3 +278,47 @@ ORDER BY notional_usd DESC;
    strategy arm (`01_quant_profit`, `02_hedge_arbitrage`, `03_incentive_turnover`),
    storing resulting manifests and reports in the matching subfolder under
    `40_gold_experiments/`.
+
+---
+
+## 5. Live-as-Data-Flywheel & Post-Trade Attribution
+
+During live or shadow operations on `oasis-tokyo`, public multi-venue market
+slices and strictly isolated private telemetry snapshots ship asynchronously to
+feed post-trade attribution on `aleph` with zero impact on order/cancel latency:
+
+1. **In-Process Zero-Gap Rolling Capture (`perp-capture -segment-duration 1h`)**:
+   - Rotates active `.segNNNN.ndjson.gz.partial` slices into immutable
+     `.segNNNN.ndjson.gz` files every 1–2 hours without dropping WebSockets or
+     resetting L2 delta books, `run_id`, or `sequence`.
+   - Individual segments record `coverage_class = "rolling_segment"` and
+     `meets_ten_hour_validation_unit = false`; `quant_lakehouse.py seal-segment-chain`
+     certifies a continuous 10-hour unit only after verifying unbroken `run_id`
+     and `sequence` continuity (`seg[k].last_sequence + 1 == seg[k+1].first_sequence`).
+2. **Linux Idle-Priority Shipper & Isolated Private Hot-Backup ([flywheel_sync.py](../scripts/flywheel_sync.py))**:
+   - **Public Bronze (`ship-public`)**: Runs under `chrt -i 0 nice -n 19 ionice -c 3`
+     with `rclone copyto --bwlimit 3M --drive-chunk-size 64M`, verifies remote
+     size and SHA-256 into `.upload_receipt.json`, and evicts local `.ndjson.gz`
+     slices after `--min-evict-age-secs` (see opt-in unit templates
+     [aleph-tx-flywheel.service](../deploy/oasis/aleph-tx-flywheel.service) and
+     [aleph-tx-flywheel.timer](../deploy/oasis/aleph-tx-flywheel.timer)).
+   - **Private Telemetry (`backup-private`)**: Hard-blocks any destination path
+     matching public Lakehouse folders (`10_bronze_raw`, `20_silver_normalized`,
+     `public`, etc.). Uses SQLite's online `Connection.backup()` API (`0600`
+     `.sqlite3.gz`) and archives only completed `<session_id>.jsonl` files with a
+     terminal `stopped` marker to `~/aleph-tx-lakehouse/private_telemetry/` (or
+     an isolated `rclone crypt` remote).
+3. **Millisecond Causal `ASOF JOIN` Attribution ([live_attribution.py](../scripts/live_attribution.py))**:
+   ```bash
+   ~/aleph-tx-lakehouse/.venv/bin/python scripts/live_attribution.py \
+     --telemetry-db ~/aleph-tx-lakehouse/private_telemetry/telemetry-latest.sqlite3.gz \
+     --duckdb "$ALEPH_DUCKDB_PATH" \
+     --local-market lighter_robinhood:robinhood:1 \
+     --reference-markets binance:usdm:BTCUSDT arcus:mainnet:BTC-USD trade_xyz:hip3-xyz:xyz:NVDA \
+     --markdown-out ~/aleph-tx-lakehouse/private_telemetry/attribution_latest.md
+   ```
+   - Aligns each fill at `exchange_ts_ns // 1_000_000` (when venue-reported) or
+     `telemetry_ts_ms` (explicitly labeled in `alignment_clock`), computing
+     at-fill cross-venue lead/lag (`available_at_ms <= fill_alignment_ms`),
+     `+100ms / +500ms / +1s / +5s / +30s` realized markouts, `<250ms` sniped-fill
+     ratios, and rated-only fee attribution (`role_unknown`/`missing` stay `null`).

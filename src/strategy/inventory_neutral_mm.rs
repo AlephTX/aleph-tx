@@ -2,7 +2,7 @@
 //! post-only quotes and bounded inventory recovery.
 
 use crate::account_stats_reader::{AccountStatsReader, AccountStatsSnapshot};
-use crate::config::{EXCH_HYPERLIQUID, InventoryNeutralMMConfig};
+use crate::config::InventoryNeutralMMConfig;
 use crate::exchange::{BatchAction, Exchange, OrderType, Side};
 use crate::live_hedge::{LiveInventoryHedge, QuoteAllowance};
 use crate::order_tracker::{OrderLifecycle, OrderSide, OrderTracker};
@@ -42,7 +42,7 @@ use execution::{
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
     BasisTracker, CrossMarketPressure, MarketState, OrderFlow, StaleBboAction, build_market_state,
-    classify_stale_bbo, data_age_ms, external_fair_value_mid, select_exchange_bbo,
+    classify_stale_bbo, data_age_ms, select_exchange_bbo,
 };
 use pricing::{
     AnchorParams, MakerPriceBounds, anchor_quotes_to_touch, cleanup_reference_mid,
@@ -729,6 +729,17 @@ impl InventoryNeutralMM {
         // Phase 3: Signal Processing & Fair Price Determination
         let inputs = self.calculate_pricing_inputs(&market_state.exchanges, &market_state.bbo);
 
+        if self.use_external_fair_value
+            && self.config.require_external_fair_value
+            && !inputs.using_external_fair_value
+        {
+            tracing::warn!(
+                "All external fair-value references are stale or unavailable; canceling quotes instead of quoting off local Lighter book"
+            );
+            self.cancel_all_orders().await;
+            return Ok(CycleOutcome::Backoff(Duration::from_millis(250)));
+        }
+
         if inputs.mid <= 0.0 || inputs.mid.is_nan() || inputs.mid.is_infinite() {
             tracing::warn!("⚠️ Invalid mid price: {:.4}, skipping cycle", inputs.mid);
             return Ok(CycleOutcome::Backoff(Duration::from_millis(100)));
@@ -738,7 +749,7 @@ impl InventoryNeutralMM {
             let max_position =
                 scaled_max_position(&self.config, self.account_stats.portfolio_value, inputs.mid)
                     .max(self.config.step_size);
-            let mut runtime_config = self.config.clone();
+            let mut runtime_config = self.config.runtime_copy();
             runtime_config.max_position = max_position;
             runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
                 &self.config,
@@ -931,7 +942,7 @@ impl InventoryNeutralMM {
         let min_available_balance =
             scaled_min_available_balance(&self.config, self.account_stats.portfolio_value);
 
-        let mut runtime_config = self.config.clone();
+        let mut runtime_config = self.config.runtime_copy();
         runtime_config.max_position = max_position;
         runtime_config.inventory_urgency_threshold = inventory_urgency_threshold;
         let position_for_quoting =
@@ -1025,7 +1036,7 @@ impl InventoryNeutralMM {
             .quote_hysteresis
             .filter(|_| self.hedge.is_none());
         let min_spread_bps = if let Some(policy) = hysteresis {
-            let mut runtime_config = self.config.clone();
+            let mut runtime_config = self.config.runtime_copy();
             runtime_config.inventory_urgency_threshold = risk.inventory_urgency_threshold;
             let urgency_ratio = inventory_skew_ratio(&runtime_config, risk.position_for_quoting);
             let ([bid_flatten, ask_flatten], _) =
@@ -1756,11 +1767,12 @@ impl InventoryNeutralMM {
         // External fair value: primary pricing anchor
         let now_ns = wall_time_ns();
         let external_fair = if self.use_external_fair_value {
-            external_fair_value_mid(
+            market_state::external_fair_value_mid_filtered(
                 exchanges,
                 self.config.exchange_id,
                 now_ns,
                 self.config.external_staleness_ms,
+                self.config.external_reference_mask(),
             )
         } else {
             None
@@ -1837,10 +1849,15 @@ impl InventoryNeutralMM {
         // Per-sample signals (EMA periods, per-sample vol, toxicity) were
         // calibrated at the poll cadence; sample them at that rate only.
         let now = Instant::now();
-        if self.last_micro_sample.is_none_or(|last| {
-            now.saturating_duration_since(last)
-                >= Duration::from_millis(self.config.poll_interval_ms)
-        }) {
+        let allow_local_sample = using_external
+            || !self.use_external_fair_value
+            || !self.config.require_external_fair_value;
+        if allow_local_sample
+            && self.last_micro_sample.is_none_or(|last| {
+                now.saturating_duration_since(last)
+                    >= Duration::from_millis(self.config.poll_interval_ms)
+            })
+        {
             self.micro.update(pricing_mid);
             self.last_micro_sample = Some(now);
             // Mirror the tracker: only an accepted sample becomes evidence.
@@ -1854,7 +1871,9 @@ impl InventoryNeutralMM {
             }
         }
         let vol_bps = self.micro.volatility_bps();
-        self.sigma.update(pricing_mid, now);
+        if allow_local_sample {
+            self.sigma.update(pricing_mid, now);
+        }
         // Mark only against an independent fresh external fair value; the
         // local fallback mid reflects our own quotes. NaN lets due fills wait
         // within tolerance or expire.
@@ -1864,9 +1883,10 @@ impl InventoryNeutralMM {
             f64::NAN
         };
         self.markout.update(&self.order_tracker, markout_fair, now);
+        let primary_ref = self.config.primary_reference_exchange_id();
         let order_flow_bps = self.config.order_flow_reserve.map_or(0.0, |reserve| {
             let book = if using_external {
-                select_exchange_bbo(exchanges, EXCH_HYPERLIQUID)
+                select_exchange_bbo(exchanges, primary_ref)
             } else {
                 None
             };
@@ -1879,7 +1899,7 @@ impl InventoryNeutralMM {
         });
         let cross_market_bps = self.config.cross_market_reserve.map_or(0.0, |reserve| {
             let external = using_external
-                .then(|| select_exchange_bbo(exchanges, EXCH_HYPERLIQUID))
+                .then(|| select_exchange_bbo(exchanges, primary_ref))
                 .flatten();
             self.cross_market_pressure.observe(
                 bbo,
@@ -1894,7 +1914,7 @@ impl InventoryNeutralMM {
         });
         let volatility_pressure = self.config.volatility_regime.map_or(0.0, |regime| {
             self.volatility_regime.observe(
-                select_exchange_bbo(exchanges, EXCH_HYPERLIQUID).as_ref(),
+                select_exchange_bbo(exchanges, primary_ref).as_ref(),
                 now_ns,
                 self.config.external_staleness_ms,
             );
@@ -1922,7 +1942,7 @@ impl InventoryNeutralMM {
             participation_bbo: self
                 .quote_participation
                 .as_ref()
-                .and_then(|_| select_exchange_bbo(exchanges, EXCH_HYPERLIQUID)),
+                .and_then(|_| select_exchange_bbo(exchanges, primary_ref)),
         }
     }
 
@@ -2063,7 +2083,7 @@ impl InventoryNeutralMM {
 
         // Reservation price: external fair value shifted by inventory risk plus
         // an explicit urgency skew to bias quotes toward flattening.
-        let mut runtime_config = self.config.clone();
+        let mut runtime_config = self.config.runtime_copy();
         runtime_config.inventory_urgency_threshold = scaled_inventory_urgency_threshold(
             &self.config,
             self.account_stats.portfolio_value,
@@ -2362,7 +2382,7 @@ impl InventoryNeutralMM {
             self.account_stats.position,
             self.order_tracker.effective_position(),
         );
-        let mut runtime_config = self.config.clone();
+        let mut runtime_config = self.config.runtime_copy();
         runtime_config.base_order_size = risk.base_order_size;
         runtime_config.min_available_balance = risk.min_available_balance;
         let inv_ctx = InventoryContext {

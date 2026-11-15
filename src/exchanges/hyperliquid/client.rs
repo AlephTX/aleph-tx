@@ -273,6 +273,15 @@ impl HyperliquidTrading {
     /// Caller must durably reserve exposure and persist IDs before awaiting this.
     /// A partial batch is represented by one status for each input order.
     pub async fn submit_orders(&self, action: &OrderAction) -> Result<Vec<ExecutionStatus>> {
+        self.submit_orders_with_expiry(action, None).await
+    }
+
+    /// Submit orders with an explicit caller-journaled `expiresAfter` deadline (ms).
+    pub async fn submit_orders_with_expiry(
+        &self,
+        action: &OrderAction,
+        explicit_expires_after: Option<u64>,
+    ) -> Result<Vec<ExecutionStatus>> {
         ensure!(
             !action.orders.is_empty() && action.orders.len() <= 100,
             "Order batch must contain 1..=100 orders"
@@ -290,7 +299,8 @@ impl HyperliquidTrading {
             ids.len() == action.orders.len(),
             "Duplicate client order ID within batch"
         );
-        self.submit(action, "order", action.orders.len()).await
+        self.submit(action, "order", action.orders.len(), explicit_expires_after)
+            .await
     }
 
     pub async fn cancel_orders(&self, action: &CancelAction) -> Result<Vec<ExecutionStatus>> {
@@ -298,7 +308,8 @@ impl HyperliquidTrading {
             !action.cancels.is_empty() && action.cancels.len() <= 100,
             "Cancel batch must contain 1..=100 orders"
         );
-        self.submit(action, "cancel", action.cancels.len()).await
+        self.submit(action, "cancel", action.cancels.len(), None)
+            .await
     }
 
     async fn submit<T: Serialize>(
@@ -306,11 +317,15 @@ impl HyperliquidTrading {
         action: &T,
         response_type: &str,
         expected: usize,
+        explicit_expires_after: Option<u64>,
     ) -> Result<Vec<ExecutionStatus>> {
         let _submission = self.submission.lock().await;
         let now = unix_ms()?;
         let nonce = next_nonce(&self.nonce, now)?;
-        let expires_after = now.checked_add(5_000).context("Expiry overflow")?;
+        let expires_after = match explicit_expires_after {
+            Some(exp) => exp,
+            None => now.checked_add(5_000).context("Expiry overflow")?,
+        };
         // Guard against runaway local nonce generation or clock rollback.
         ensure!(
             nonce < expires_after,

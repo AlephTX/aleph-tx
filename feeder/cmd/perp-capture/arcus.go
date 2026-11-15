@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -54,20 +55,24 @@ func arcusTradeSubscriptions(arcusWS, arcusREST string, enabled bool) ([]subscri
 	if len(coins) == 0 {
 		return nil, errors.New("Arcus trades require -arcus-ws or -arcus markets")
 	}
-	if len(coins) > 8 {
-		return nil, errors.New("at most eight markets per source")
+	if len(coins) > maxMarketsPerSource {
+		return nil, errors.New("too many Arcus trade markets per source")
 	}
-	sources := make([]subscription, 0, len(coins))
+	requests := make([]any, 0, len(coins))
 	for _, coin := range coins {
-		sources = append(sources, subscription{
-			source:   "arcus_trades",
-			url:      "wss://api.arcus.xyz/v1/ws",
-			market:   coin,
-			coins:    []string{coin},
-			requests: []any{arcusTradeSubscribe{Type: "subscribe", Channel: "trades", ID: coin}},
-		})
+		requests = append(requests, arcusTradeSubscribe{Type: "subscribe", Channel: "trades", ID: coin})
 	}
-	return sources, nil
+	market := ""
+	if len(coins) == 1 {
+		market = coins[0]
+	}
+	return []subscription{{
+		source:   "arcus_trades",
+		url:      "wss://api.arcus.xyz/v1/ws",
+		market:   market,
+		coins:    coins,
+		requests: requests,
+	}}, nil
 }
 
 func isValidPositiveDecimalString(s string) bool {
@@ -105,25 +110,27 @@ func arcusTradePublication(source subscription, raw []byte, acknowledged map[str
 	case "connected":
 		return record{}, nil
 	case "subscribed":
-		if message.Channel != "trades" || message.ID != source.market {
+		if message.Channel != "trades" || !slices.Contains(source.coins, message.ID) ||
+			(source.market != "" && message.ID != source.market) {
 			return record{}, errors.New("invalid Arcus trade subscription acknowledgment")
 		}
 		payload, err := json.Marshal(arcusSubscribedAck{
 			Channel: "trades",
-			ID:      source.market,
+			ID:      message.ID,
 		})
 		if err != nil {
 			return record{}, err
 		}
-		acknowledged[source.market] = true
+		acknowledged[message.ID] = true
 		return record{
 			Source:  source.source,
-			Market:  source.market,
+			Market:  message.ID,
 			Event:   "subscribed",
 			Payload: payload,
 		}, nil
 	case "channel_data":
-		if message.Channel != "trades" || message.ID != source.market || !acknowledged[source.market] {
+		if message.Channel != "trades" || !slices.Contains(source.coins, message.ID) ||
+			(source.market != "" && message.ID != source.market) || !acknowledged[message.ID] {
 			return record{}, errors.New("Arcus trades without matching subscription acknowledgment")
 		}
 		var trades []arcusPublicTrade
@@ -131,7 +138,7 @@ func arcusTradePublication(source subscription, raw []byte, acknowledged map[str
 			return record{}, errors.New("invalid Arcus trade batch")
 		}
 		for _, trade := range trades {
-			if trade.MarketDisplayName != source.market ||
+			if trade.MarketDisplayName != message.ID ||
 				trade.MarketID == 0 ||
 				(trade.Side != "BUY" && trade.Side != "SELL") ||
 				trade.TradeID == "" ||
@@ -147,7 +154,7 @@ func arcusTradePublication(source subscription, raw []byte, acknowledged map[str
 			Contents []arcusPublicTrade `json:"contents"`
 		}{
 			Channel:  "trades",
-			ID:       source.market,
+			ID:       message.ID,
 			Contents: trades,
 		})
 		if err != nil {
@@ -155,7 +162,7 @@ func arcusTradePublication(source subscription, raw []byte, acknowledged map[str
 		}
 		return record{
 			Source:  source.source,
-			Market:  source.market,
+			Market:  message.ID,
 			Event:   "message",
 			Payload: payload,
 		}, nil

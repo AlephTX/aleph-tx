@@ -855,6 +855,12 @@ fn audit_primary_observation(journal_path: &std::path::Path) {
         .lines()
         .position(|l| l.contains("hedge_intent"))
         .unwrap();
+    let intent_json: serde_json::Value =
+        serde_json::from_str(text.lines().nth(intent_line).unwrap()).unwrap();
+    assert_eq!(
+        intent_json["expires_after_ms"].as_u64(),
+        Some(intent_json["submitted_at_ms"].as_u64().unwrap() + 5_000)
+    );
     let edit = |change: &dyn Fn(&mut serde_json::Value)| {
         let lines: Vec<String> = text
             .lines()
@@ -965,6 +971,7 @@ fn primary_age_boundary_matches_between_writer_and_audit() {
             cloid: format!("0x{}", "aa".repeat(16)),
             coin: "ETH".into(),
             submitted_at_ms: 2_000_000_000_000,
+            expires_after_ms: Some(2_000_000_005_000),
             is_buy: false,
             size: d("0.01"),
             limit_price: d("2000"),

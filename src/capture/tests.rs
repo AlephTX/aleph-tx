@@ -802,3 +802,50 @@ fn independent_book_compilation_does_not_authorize_cross_currency_pairs() {
     c.paper_entries = true;
     assert!(c.validate(&VenueRegistry::default()).is_err());
 }
+
+#[test]
+fn rolling_segment_markers_preserve_stateful_lighter_delta_books() {
+    let continuous = vec![
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        lighter(T + 100, T + 99, 11, 10, false),
+        hl("hyperliquid", T + 100),
+        footer(T + 200),
+    ];
+    let (_, expected_frames) = replay(&config(), &continuous);
+
+    let segmented = vec![
+        json!({"source":"collector","event":"segment_start","received_at_ms":T,"available_at_ms":T,"payload":{"segment_index":0}}),
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        json!({"source":"collector","event":"segment_end","received_at_ms":T+50,"available_at_ms":T+50,"payload":{"segment_index":0,"continued":true}}),
+        json!({"source":"collector","event":"segment_start","received_at_ms":T+50,"available_at_ms":T+50,"payload":{"segment_index":1,"prev_segment":"flywheel.seg0000.ndjson.gz"}}),
+        lighter(T + 100, T + 99, 11, 10, false),
+        hl("hyperliquid", T + 100),
+        json!({"source":"collector","event":"segment_end","received_at_ms":T+200,"available_at_ms":T+200,"payload":{"segment_index":1,"continued":false}}),
+        footer(T + 200),
+    ];
+    let (seg_cov, seg_frames) = replay(&config(), &segmented);
+    assert_eq!(expected_frames, seg_frames);
+    assert_eq!(seg_cov.leg_book_updates, [2, 2]);
+
+    // Timestamp regression across segment boundaries is rejected.
+    let regressed = vec![
+        json!({"source":"collector","event":"segment_start","received_at_ms":T,"available_at_ms":T,"payload":{"segment_index":0}}),
+        lighter(T, T - 1, 10, 0, true),
+        hl("hyperliquid", T),
+        json!({"source":"collector","event":"segment_end","received_at_ms":T+80,"available_at_ms":T+80,"payload":{"segment_index":0,"continued":true}}),
+        json!({"source":"collector","event":"segment_start","received_at_ms":T+70,"available_at_ms":T+70,"payload":{"segment_index":1,"prev_segment":"flywheel.seg0000.ndjson.gz"}}),
+        footer(T + 200),
+    ];
+    let mut out = Vec::new();
+    assert!(
+        compile(
+            &config(),
+            text(&regressed).as_bytes(),
+            &mut out,
+            &VenueRegistry::default()
+        )
+        .is_err()
+    );
+}

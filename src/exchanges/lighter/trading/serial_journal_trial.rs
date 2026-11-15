@@ -103,6 +103,7 @@ fn hedge_pair(round: u64, before: Decimal) -> (JournalRecord, JournalRecord, Dec
         cloid: cloid.clone(),
         coin: "ETH".into(),
         submitted_at_ms: at,
+        expires_after_ms: Some(at + 5_000),
         is_buy: false,
         size,
         limit_price: Decimal::new(1998, 0),

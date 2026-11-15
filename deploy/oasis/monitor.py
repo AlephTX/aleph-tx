@@ -11,6 +11,10 @@ import struct
 import subprocess
 import threading
 import time
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
 from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,11 +30,17 @@ ROOT = Path(__file__).resolve().parent
 MATRIX = "/run/aleph-tx-market/aleph-matrix"
 SERVICES = ("aleph-tx-feeder", "aleph-tx-monitor", "aleph-tx-live")
 # Layout in feeder/shm/matrix.go; symbol and exchange IDs in feeder/exchanges/common.go.
+NUM_SYMBOLS = 2048
+NUM_EXCHANGES = 12
 BBO = struct.Struct("<IBBHQdddd16x")
 SEQUENCE = struct.Struct("<I")
 MARKETS = (("Lighter", "ETH", 2, 1002), ("Lighter", "BTC", 2, 1001),
            ("Hyperliquid", "ETH", 1, 1002), ("Hyperliquid", "BTC", 1, 1001),
            ("Binance", "ETH", 6, 1002), ("Binance", "BTC", 6, 1001))
+VENUE_SECTIONS = (("lighter", "Lighter", 2), ("lighter_robinhood", "LighterRH", 8),
+                  ("hyperliquid", "Hyperliquid", 1), ("binance", "Binance", 6),
+                  ("arcus", "Arcus", 7), ("entropy", "Entropy", 9), ("tradexyz", "TradeXYZ", 10))
+FEEDER_CONFIG = os.environ.get("ALEPH_FEEDER_CONFIG", "/etc/aleph-tx/feeder.toml")
 ACCOUNT_REFRESH = 20
 DEFAULT_STATIC = ROOT / "dashboard" if (ROOT / "dashboard").is_dir() else ROOT.parents[1] / "dashboard" / "dist"
 STATIC = Path(os.environ.get("ALEPH_DASHBOARD_DIR", DEFAULT_STATIC)).resolve()
@@ -54,7 +64,9 @@ def now_iso():
 
 
 def read_quote(fd, exchange, symbol, now_ns):
-    offset = 2048 * 8 + (symbol * 7 + exchange) * BBO.size
+    if not (0 <= symbol < NUM_SYMBOLS and 0 <= exchange < NUM_EXCHANGES):
+        return None
+    offset = NUM_SYMBOLS * 8 + (symbol * NUM_EXCHANGES + exchange) * BBO.size
     for _ in range(4):
         before = os.pread(fd, SEQUENCE.size, offset)
         raw = os.pread(fd, BBO.size, offset)
@@ -75,7 +87,34 @@ def read_quote(fd, exchange, symbol, now_ns):
     return None
 
 
-def markets():
+def configured_markets(config_path=None):
+    target = Path(FEEDER_CONFIG if config_path is None else config_path)
+    if tomllib is None or not target.is_file():
+        return [(venue, sym, exch, sym_id, False) for venue, sym, exch, sym_id in MARKETS]
+    try:
+        cfg = tomllib.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [(venue, sym, exch, sym_id, False) for venue, sym, exch, sym_id in MARKETS]
+    symbols = cfg.get("symbols") or {"BTC": 1001, "ETH": 1002}
+    rows = []
+    seen = set()
+    for section, label, exch_id in VENUE_SECTIONS:
+        sec = cfg.get(section) or {}
+        if not sec.get("feeder_enabled"):
+            continue
+        primary_syms = sec.get("feeder_symbols") or {}
+        merged = dict(sec.get("feeder_public_symbols") or {})
+        merged.update(primary_syms)
+        for ticker in sorted(merged):
+            sym_id = symbols.get(ticker)
+            if isinstance(sym_id, int) and 0 < sym_id < NUM_SYMBOLS and (exch_id, sym_id) not in seen:
+                seen.add((exch_id, sym_id))
+                is_optional = section not in ("lighter", "hyperliquid", "binance") or ticker not in primary_syms
+                rows.append((label, ticker, exch_id, sym_id, is_optional))
+    return rows or [(venue, sym, exch, sym_id, False) for venue, sym, exch, sym_id in MARKETS]
+
+
+def markets(config_path=None):
     fd = None
     try:
         fd = os.open(MATRIX, os.O_RDONLY)
@@ -83,9 +122,15 @@ def markets():
         pass
     try:
         clock = time.time_ns()
-        return [{"venue": venue, "symbol": symbol, **(
-            (read_quote(fd, exchange_id, symbol_id, clock) if fd is not None else None)
-            or {"state": "waiting"})} for venue, symbol, exchange_id, symbol_id in MARKETS]
+        out = []
+        for venue, symbol, exchange_id, symbol_id, is_optional in configured_markets(config_path):
+            entry = {"venue": venue, "symbol": symbol, **(
+                (read_quote(fd, exchange_id, symbol_id, clock) if fd is not None else None)
+                or {"state": "waiting"})}
+            if is_optional:
+                entry["optional"] = True
+            out.append(entry)
+        return out
     finally:
         if fd is not None:
             os.close(fd)

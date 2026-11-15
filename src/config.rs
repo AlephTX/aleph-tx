@@ -3,11 +3,17 @@
 //! Loads from `config.toml` at the project root.
 //! All trading parameters are runtime-configurable — no recompilation needed.
 
+pub const EXCH_HYPERLIQUID: u8 = 1;
 pub const EXCH_LIGHTER: u8 = 2;
 pub const EXCH_EDGEX: u8 = 3;
-pub const EXCH_HYPERLIQUID: u8 = 1;
+pub const EXCH_01: u8 = 4;
 pub const EXCH_BACKPACK: u8 = 5;
 pub const EXCH_BINANCE: u8 = 6;
+pub const EXCH_ARCUS: u8 = 7;
+pub const EXCH_LIGHTER_ROBINHOOD: u8 = 8;
+pub const EXCH_ENTROPY: u8 = 9;
+pub const EXCH_TRADEXYZ: u8 = 10;
+pub const EXCH_EXTENDED: u8 = 11;
 
 pub const SYM_BTC: u16 = 1001;
 pub const SYM_ETH: u16 = 1002;
@@ -191,10 +197,13 @@ fn default_position_timeout_secs() -> u64 {
     60
 }
 fn default_local_staleness_ms() -> u64 {
-    5000
+    1000
 }
 fn default_stale_bbo_cancel_ms() -> u64 {
-    15000
+    2500
+}
+fn default_require_external_fair_value() -> bool {
+    true
 }
 fn default_target_resting_margin_utilization() -> f64 {
     0.35
@@ -332,6 +341,20 @@ pub struct InventoryNeutralMMConfig {
     // External fair value anchor (v6.0.0)
     #[serde(default = "default_external_staleness_ms")]
     pub external_staleness_ms: u64, // default: 2000 (max age for external BBO in ms)
+    /// Cancel resting quotes instead of falling back to Lighter's own mid when
+    /// all configured external fair-value references are stale or unavailable.
+    #[serde(default = "default_require_external_fair_value")]
+    pub require_external_fair_value: bool,
+    /// Optional allowlist of SHM exchange IDs (1..NUM_EXCHANGES) included in the
+    /// external fair-value median. When omitted, only Core Hyperliquid (1),
+    /// Lighter Core (2), and Binance USD-M (6) contribute so USDG/RWA domains
+    /// never enter the median unless explicitly listed.
+    #[serde(default)]
+    pub external_reference_exchanges: Option<Vec<u8>>,
+    /// Primary external SHM exchange ID used by order-flow, cross-market, and
+    /// volatility-regime reserves. Defaults to EXCH_HYPERLIQUID (1) when unset.
+    #[serde(default)]
+    pub primary_reference_exchange: Option<u8>,
     /// EWMA time constant for the Lighter-vs-external basis correction.
     #[serde(default = "default_basis_tau_secs")]
     pub basis_tau_secs: f64, // default: 300
@@ -710,10 +733,39 @@ impl InventoryNeutralMMConfig {
             "{name}: target_resting_margin_utilization must be in (0, 1]"
         );
         anyhow::ensure!(
-            self.exchange_id == EXCH_LIGHTER && (1..MAX_SYMBOL_ID).contains(&self.symbol_id),
-            "{name}: expected Lighter and an SHM symbol ID in 1..{}",
+            (self.exchange_id == EXCH_LIGHTER || self.exchange_id == EXCH_LIGHTER_ROBINHOOD)
+                && (1..MAX_SYMBOL_ID).contains(&self.symbol_id),
+            "{name}: expected Lighter (2 or 8) and an SHM symbol ID in 1..{}",
             MAX_SYMBOL_ID - 1
         );
+        let max_exch = crate::shm_reader::NUM_EXCHANGES as u8;
+        if let Some(primary) = self.primary_reference_exchange {
+            anyhow::ensure!(
+                (1..max_exch).contains(&primary) && primary != self.exchange_id,
+                "{name}: primary_reference_exchange {primary} must be in 1..{} and != exchange_id",
+                max_exch - 1
+            );
+        }
+        if let Some(refs) = &self.external_reference_exchanges {
+            anyhow::ensure!(
+                !refs.is_empty(),
+                "{name}: external_reference_exchanges must not be empty when set"
+            );
+            let mut seen_refs = 0u16;
+            for &exch in refs {
+                anyhow::ensure!(
+                    (1..max_exch).contains(&exch) && exch != self.exchange_id,
+                    "{name}: external_reference_exchanges entry {exch} must be in 1..{} and != exchange_id",
+                    max_exch - 1
+                );
+                let bit = 1u16 << exch;
+                anyhow::ensure!(
+                    seen_refs & bit == 0,
+                    "{name}: duplicate exchange {exch} in external_reference_exchanges"
+                );
+                seen_refs |= bit;
+            }
+        }
         anyhow::ensure!(
             crate::exchanges::lighter::valid_market_id(self.market_id),
             "{name}: invalid Lighter market ID"
@@ -735,6 +787,100 @@ impl InventoryNeutralMMConfig {
             );
         }
         Ok(())
+    }
+
+    /// Stack-friendly bitmask of SHM exchange slots eligible for the external
+    /// fair-value median. Defaults to Core Hyperliquid (1), Lighter Core (2),
+    /// and Binance USD-M (6) so USDG/RWA slots never enter unless opted in.
+    #[inline]
+    pub fn external_reference_mask(&self) -> u16 {
+        match &self.external_reference_exchanges {
+            None => (1u16 << EXCH_HYPERLIQUID) | (1u16 << EXCH_LIGHTER) | (1u16 << EXCH_BINANCE),
+            Some(list) => list.iter().fold(0u16, |acc, &id| {
+                if (id as usize) < crate::shm_reader::NUM_EXCHANGES {
+                    acc | (1u16 << id)
+                } else {
+                    acc
+                }
+            }),
+        }
+    }
+
+    /// Zero-allocation stack copy of all scalar sizing/risk fields for hot-path
+    /// per-cycle overrides (`external_reference_exchanges` is omitted).
+    #[inline]
+    pub fn runtime_copy(&self) -> Self {
+        Self {
+            exchange_id: self.exchange_id,
+            symbol_id: self.symbol_id,
+            market_id: self.market_id,
+            tick_size: self.tick_size,
+            step_size: self.step_size,
+            maker_fee_bps: self.maker_fee_bps,
+            min_profit_bps: self.min_profit_bps,
+            penny_ticks: self.penny_ticks,
+            inventory_skew_bps: self.inventory_skew_bps,
+            grid_levels: self.grid_levels,
+            grid_spacing_bps: self.grid_spacing_bps,
+            grid_size_decay: self.grid_size_decay,
+            base_order_size: self.base_order_size,
+            max_position: self.max_position,
+            inventory_urgency_threshold: self.inventory_urgency_threshold,
+            base_order_notional_usd: self.base_order_notional_usd,
+            max_position_notional_usd: self.max_position_notional_usd,
+            inventory_urgency_notional_usd: self.inventory_urgency_notional_usd,
+            min_inventory_notional_usd: self.min_inventory_notional_usd,
+            reference_portfolio_value: self.reference_portfolio_value,
+            min_portfolio_scale: self.min_portfolio_scale,
+            max_portfolio_scale: self.max_portfolio_scale,
+            sigmoid_steepness: self.sigmoid_steepness,
+            flattening_cap_mult: self.flattening_cap_mult,
+            micro_samples: self.micro_samples,
+            ema_fast_period: self.ema_fast_period,
+            ema_slow_period: self.ema_slow_period,
+            use_depth_pricing: self.use_depth_pricing,
+            vol_spread_scale: self.vol_spread_scale,
+            momentum_skew_scale: self.momentum_skew_scale,
+            external_staleness_ms: self.external_staleness_ms,
+            require_external_fair_value: self.require_external_fair_value,
+            external_reference_exchanges: None,
+            primary_reference_exchange: self.primary_reference_exchange,
+            basis_tau_secs: self.basis_tau_secs,
+            max_basis_bps: self.max_basis_bps,
+            as_gamma: self.as_gamma,
+            as_time_horizon_sec: self.as_time_horizon_sec,
+            as_kappa: self.as_kappa,
+            max_spread_bps: self.max_spread_bps,
+            adverse_selection_threshold: self.adverse_selection_threshold,
+            requote_threshold_bps: self.requote_threshold_bps,
+            order_ttl_secs: self.order_ttl_secs,
+            max_leverage: self.max_leverage,
+            min_available_balance: self.min_available_balance,
+            margin_cooldown_secs: self.margin_cooldown_secs,
+            max_daily_loss_pct: self.max_daily_loss_pct,
+            position_timeout_secs: self.position_timeout_secs,
+            local_staleness_ms: self.local_staleness_ms,
+            stale_bbo_cancel_ms: self.stale_bbo_cancel_ms,
+            target_resting_margin_utilization: self.target_resting_margin_utilization,
+            use_post_only: self.use_post_only,
+            poll_interval_ms: self.poll_interval_ms,
+            min_cycle_interval_ms: self.min_cycle_interval_ms,
+            use_markout_spread: self.use_markout_spread,
+            markout_horizon_secs: self.markout_horizon_secs,
+            markout_halflife_fills: self.markout_halflife_fills,
+            markout_threshold_bps: self.markout_threshold_bps,
+            markout_reserve: self.markout_reserve,
+            order_flow_reserve: self.order_flow_reserve,
+            cross_market_reserve: self.cross_market_reserve,
+            volatility_regime: self.volatility_regime,
+            quote_hysteresis: self.quote_hysteresis,
+        }
+    }
+
+    /// Primary external SHM slot for directional order-flow / cross-market reserves.
+    #[inline]
+    pub fn primary_reference_exchange_id(&self) -> u8 {
+        self.primary_reference_exchange.unwrap_or(EXCH_HYPERLIQUID)
     }
 }
 
@@ -762,6 +908,9 @@ impl Default for InventoryNeutralMMConfig {
             vol_spread_scale: 0.5,
             momentum_skew_scale: 0.3,
             external_staleness_ms: 2000,
+            require_external_fair_value: default_require_external_fair_value(),
+            external_reference_exchanges: None,
+            primary_reference_exchange: None,
             basis_tau_secs: default_basis_tau_secs(),
             max_basis_bps: default_max_basis_bps(),
             as_gamma: 5000.0,
@@ -1173,8 +1322,13 @@ mod tests {
         let config = InventoryNeutralMMConfig::default();
         assert_eq!(config.max_daily_loss_pct, 0.05);
         assert_eq!(config.position_timeout_secs, 60);
-        assert_eq!(config.local_staleness_ms, 5000);
-        assert_eq!(config.stale_bbo_cancel_ms, 15000);
+        assert_eq!(config.local_staleness_ms, 1000);
+        assert_eq!(config.stale_bbo_cancel_ms, 2500);
+        assert!(config.require_external_fair_value);
+        assert_eq!(
+            config.external_reference_mask(),
+            (1u16 << EXCH_HYPERLIQUID) | (1u16 << EXCH_LIGHTER) | (1u16 << EXCH_BINANCE)
+        );
         assert_eq!(config.target_resting_margin_utilization, 0.35);
         assert_eq!(config.max_basis_bps, 20.0);
         assert_eq!(config.min_cycle_interval_ms, 50);
@@ -1193,7 +1347,7 @@ mod tests {
                 ..Default::default()
             },
             InventoryNeutralMMConfig {
-                stale_bbo_cancel_ms: 1000,
+                stale_bbo_cancel_ms: 500,
                 ..Default::default()
             },
             InventoryNeutralMMConfig {
@@ -1224,14 +1378,16 @@ mod tests {
 
     #[test]
     fn fleet_isolation_rejects_same_l1_stp_collision_and_accepts_disjoint_markets_or_l1s() {
-        let mut eth_quant = AppConfig::default();
-        eth_quant.deployment = Some(DeploymentIsolationConfig {
-            scenario: ResearchScenario::QuantProfit,
-            l1_group: "primary_l1".into(),
-            subaccount_slot: Some("sub_1_eth_quant".into()),
-            expected_account_index: Some(101),
-            hedge_account_slot: None,
-        });
+        let eth_quant = AppConfig {
+            deployment: Some(DeploymentIsolationConfig {
+                scenario: ResearchScenario::QuantProfit,
+                l1_group: "primary_l1".into(),
+                subaccount_slot: Some("sub_1_eth_quant".into()),
+                expected_account_index: Some(101),
+                hedge_account_slot: None,
+            }),
+            ..AppConfig::default()
+        };
 
         let mut btc_hedge = AppConfig::default();
         if let Some(mm) = &mut btc_hedge.inventory_neutral_mm {
@@ -1251,14 +1407,16 @@ mod tests {
             .unwrap();
 
         // Same market under a DIFFERENT L1 wallet also passes STP check.
-        let mut eth_turnover_other_l1 = AppConfig::default();
-        eth_turnover_other_l1.deployment = Some(DeploymentIsolationConfig {
-            scenario: ResearchScenario::IncentiveTurnover,
-            l1_group: "turnover_l1".into(),
-            subaccount_slot: Some("sub_1_eth_turnover".into()),
-            expected_account_index: Some(201),
-            hedge_account_slot: None,
-        });
+        let eth_turnover_other_l1 = AppConfig {
+            deployment: Some(DeploymentIsolationConfig {
+                scenario: ResearchScenario::IncentiveTurnover,
+                l1_group: "turnover_l1".into(),
+                subaccount_slot: Some("sub_1_eth_turnover".into()),
+                expected_account_index: Some(201),
+                hedge_account_slot: None,
+            }),
+            ..AppConfig::default()
+        };
         AppConfig::validate_fleet_isolation([
             ("eth_quant", &eth_quant),
             ("btc_hedge", &btc_hedge),

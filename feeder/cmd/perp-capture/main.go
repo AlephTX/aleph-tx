@@ -53,7 +53,10 @@ type subscription struct {
 	coins        []string
 	interval     time.Duration
 	clockRefresh time.Duration
+	readTimeout  time.Duration
 }
+
+const maxMarketsPerSource = 32
 
 var errClockRefresh = errors.New("refresh Lighter subscription clock evidence")
 
@@ -62,8 +65,8 @@ func symbols(raw string) ([]string, error) {
 		return nil, nil
 	}
 	items := strings.Split(raw, ",")
-	if len(items) > 8 {
-		return nil, fmt.Errorf("at most eight markets per source")
+	if len(items) > maxMarketsPerSource {
+		return nil, fmt.Errorf("at most %d markets per source", maxMarketsPerSource)
 	}
 	seen := make(map[string]bool)
 	for _, item := range items {
@@ -213,8 +216,18 @@ func pollSnapshots(ctx context.Context, source subscription, emit func(record) e
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	var workers sync.WaitGroup
-	for _, coin := range source.coins {
+	for idx, coin := range source.coins {
 		workers.Go(func() {
+			if idx > 0 && source.source == "hyperliquid_funding" {
+				timer := time.NewTimer(time.Duration(idx) * 80 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					cancel(ctx.Err())
+					return
+				case <-timer.C:
+				}
+			}
 			cancel(pollSnapshotCoin(ctx, source, coin, client, emit))
 		})
 	}
@@ -342,8 +355,16 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	acknowledged := make(map[string]bool)
 	for {
 		readCtx, cancelRead := ctx, func() {}
-		if source.source != "extended_trades" && source.source != "hyperliquid_trades" && source.source != "arcus_trades" {
-			readCtx, cancelRead = context.WithTimeout(ctx, 30*time.Second)
+		isTradeStream := source.source == "extended_trades" || source.source == "hyperliquid_trades" ||
+			source.source == "arcus_trades" || source.source == "lighter_trades" || source.source == "lighter_robinhood_trades"
+		if !isTradeStream {
+			timeout := source.readTimeout
+			if timeout == 0 {
+				timeout = 30 * time.Second
+			}
+			if timeout > 0 {
+				readCtx, cancelRead = context.WithTimeout(ctx, timeout)
+			}
 		}
 		// An inactive market can have no trades while the transport is healthy.
 		// The keepalive closes an unresponsive connection and wakes this read.
@@ -496,13 +517,20 @@ func capture(ctx context.Context, sources []subscription, out syncWriter) error 
 }
 
 func captureWithTiming(ctx context.Context, sources []subscription, out syncWriter, precise bool) error {
+	return captureWithRotation(ctx, sources, out, nil, precise, 0)
+}
+
+func captureWithRotation(ctx context.Context, sources []subscription, out syncWriter, rolling *rollingCaptureOutput, precise bool, segmentDuration time.Duration) error {
+	if rolling != nil {
+		out = rolling
+	}
 	clock, err := newCaptureClock()
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	queue := make(chan record, 4096)
+	queue := make(chan record, 16384)
 	emit := func(row record) error {
 		select {
 		case queue <- row:
@@ -561,8 +589,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 	encoder := json.NewEncoder(writer)
 	var last int64
 	counts := make(map[string]int)
-	write := func(row record) error {
-		now := consistentNow()
+	writeAt := func(row record, now time.Time) error {
 		row.AvailableAt = now.UnixMilli()
 		if precise {
 			if err := clock.stamp(&row, now); err != nil {
@@ -575,8 +602,68 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 		last = row.AvailableAt
 		return encoder.Encode(row)
 	}
+
+	segStarted := consistentNow()
+	segIdx := 0
+	if rolling != nil && segmentDuration > 0 {
+		startPayload, _ := json.Marshal(map[string]any{"segment_index": 0})
+		if err := writeAt(record{
+			Source:     "collector",
+			Event:      "segment_start",
+			ReceivedAt: segStarted.UnixMilli(),
+			received:   segStarted,
+			Payload:    startPayload,
+		}, segStarted); err != nil {
+			cancel(err)
+			return err
+		}
+	}
+
 	for row := range queue {
-		if err := write(row); err != nil {
+		now := consistentNow()
+		if rolling != nil && segmentDuration > 0 && now.Sub(segStarted) >= segmentDuration {
+			endPayload, _ := json.Marshal(map[string]any{"segment_index": segIdx, "continued": true})
+			if err := writeAt(record{
+				Source:     "collector",
+				Event:      "segment_end",
+				ReceivedAt: now.UnixMilli(),
+				received:   now,
+				Payload:    endPayload,
+			}, now); err != nil {
+				cancel(err)
+				return err
+			}
+			if err := writer.Flush(); err != nil {
+				cancel(err)
+				return err
+			}
+			prevBase, nextIdx, err := rolling.Rotate()
+			if err != nil {
+				cancel(err)
+				return err
+			}
+			segIdx = nextIdx
+			writer.Reset(rolling)
+			encoder = json.NewEncoder(writer)
+			segStarted = consistentNow()
+			startPayload, _ := json.Marshal(map[string]any{
+				"segment_index": segIdx,
+				"prev_segment":  prevBase,
+			})
+			if err := writeAt(record{
+				Source:     "collector",
+				Event:      "segment_start",
+				ReceivedAt: segStarted.UnixMilli(),
+				received:   segStarted,
+				Payload:    startPayload,
+			}, segStarted); err != nil {
+				cancel(err)
+				return err
+			}
+			log.Printf("sealed rolling segment %s -> opened segment %d", prevBase, segIdx)
+			now = consistentNow()
+		}
+		if err := writeAt(row, now); err != nil {
 			cancel(err)
 			return err
 		}
@@ -590,7 +677,8 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 	}
 	for _, source := range sources {
 		market := source.market
-		if source.source == "hyperliquid" || source.source == "hyperliquid_funding" {
+		if source.source == "hyperliquid" || source.source == "hyperliquid_funding" ||
+			source.source == "hyperliquid_trades" || source.source == "arcus_trades" {
 			for _, coin := range source.coins {
 				if counts[source.source+"\x00"+coin] == 0 {
 					return fmt.Errorf("no publications from %s %s", source.source, coin)
@@ -602,14 +690,31 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 			return fmt.Errorf("no publications from %s %s", source.source, source.market)
 		}
 	}
+	if rolling != nil && segmentDuration > 0 {
+		segEndNow := consistentNow()
+		endPayload, _ := json.Marshal(map[string]any{"segment_index": segIdx, "continued": false})
+		if err := writeAt(record{
+			Source:     "collector",
+			Event:      "segment_end",
+			ReceivedAt: segEndNow.UnixMilli(),
+			received:   segEndNow,
+			Payload:    endPayload,
+		}, segEndNow); err != nil {
+			return err
+		}
+	}
 	now := consistentNow()
-	if err := write(record{Source: "collector", Event: "end", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
+	if err := writeAt(record{Source: "collector", Event: "end", ReceivedAt: now.UnixMilli(), received: now}, now); err != nil {
 		return err
 	}
 	if err := writer.Flush(); err != nil {
 		return err
 	}
-	if err := out.Sync(); err != nil {
+	if rolling != nil {
+		if _, err := rolling.sealCurrent(); err != nil {
+			return err
+		}
+	} else if err := out.Sync(); err != nil {
 		return err
 	}
 	log.Printf("recorded publications %v", counts)
@@ -637,12 +742,20 @@ func run() error {
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")
 	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
 	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
+	idleReadTimeout := flag.Duration("idle-read-timeout", 30*time.Second, "per-message WebSocket read timeout for non-trade streams (0 disables app timeout while 15s Ping/Pong keepalive remains active)")
 	duration := flag.Duration("duration", time.Minute, "recording duration")
-	path := flag.String("output", "", "new output NDJSON file")
+	segmentDuration := flag.Duration("segment-duration", 0, "optional in-process rolling segment duration (e.g. 1h); 0 writes a single file")
+	path := flag.String("output", "", "new output NDJSON file (or base stem for rolling segments)")
 	compressed := flag.Bool("gzip", false, "stream gzip-compressed NDJSON to the output file")
 	flag.Parse()
 	if *path == "" || *duration < time.Second || *duration > 24*time.Hour {
 		return errors.New("provide -output and a duration from 1s to 24h")
+	}
+	if *segmentDuration < 0 || (*segmentDuration > 0 && (*segmentDuration < time.Second || *segmentDuration > *duration)) {
+		return errors.New("-segment-duration must be 0 or between 1s and -duration")
+	}
+	if *idleReadTimeout < 0 || *idleReadTimeout > time.Hour {
+		return errors.New("-idle-read-timeout must be 0 or up to 1h")
 	}
 	if *clockRefresh != 0 && ((*lighter == "" && *rh == "") || *clockRefresh < 30*time.Second || *clockRefresh > 9*time.Minute) {
 		return errors.New("clock refresh needs Lighter markets and an interval from 30s to 9m")
@@ -703,15 +816,33 @@ func run() error {
 	if len(sources) == 0 {
 		return errors.New("configure at least one public market")
 	}
-	out, err := openCaptureOutput(*path, *compressed)
-	if err != nil {
-		return err
+	resolvedReadTimeout := *idleReadTimeout
+	if resolvedReadTimeout == 0 {
+		resolvedReadTimeout = -1 // explicitly disable app read timeout while keeping 15s RFC6455 Ping/Pong
 	}
+	for i := range sources {
+		sources[i].readTimeout = resolvedReadTimeout
+	}
+	usePrecise := *precise || *binance != "" || *segmentDuration > 0
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *duration)
 	defer cancel()
-	return errors.Join(captureWithTiming(ctx, sources, out, *precise || *binance != ""), out.Close())
+	if *segmentDuration > 0 {
+		rolling, err := openRollingCaptureOutput(*path, *compressed)
+		if err != nil {
+			return err
+		}
+		if err := captureWithRotation(ctx, sources, nil, rolling, usePrecise, *segmentDuration); err != nil {
+			return errors.Join(err, rolling.Abort())
+		}
+		return nil
+	}
+	out, err := openCaptureOutput(*path, *compressed)
+	if err != nil {
+		return err
+	}
+	return errors.Join(captureWithTiming(ctx, sources, out, usePrecise), out.Close())
 }
 
 func main() {

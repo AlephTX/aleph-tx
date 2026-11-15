@@ -89,6 +89,9 @@ pub struct IntentRecord {
     pub coin: String,
     /// Local time when the intent was formed, before fsync and signing.
     pub submitted_at_ms: u64,
+    /// Signed Hyperliquid `expiresAfter` deadline (ms) bound into the L1 signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after_ms: Option<u64>,
     pub is_buy: bool,
     #[serde(with = "rust_decimal::serde::str")]
     pub size: Decimal,

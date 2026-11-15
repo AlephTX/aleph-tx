@@ -1,0 +1,38 @@
+[Unit]
+Description=AlephTX 24x7 Rolling 10h15m Public Capture (BULK Physically Isolated Stream)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aleph-tx
+Group=aleph-tx
+Nice=10
+CPUQuota=35%
+Environment="RCLONE_CONFIG=/etc/aleph-tx/rclone.conf"
+Environment="ALEPH_PUBLIC_BRONZE_REMOTE="
+EnvironmentFile=-/etc/aleph-tx/flywheel.env
+WorkingDirectory=/var/lib/aleph-tx-captures/bulk
+ExecStart=/usr/bin/python3 /opt/aleph-tx/current/scripts/perp_rolling_runner.py \
+  --stream-name bulk \
+  --output-dir /var/lib/aleph-tx-captures/bulk \
+  --quarantine-dir /var/lib/aleph-tx-captures/quarantine \
+  --window-duration 36900s \
+  --collector-region tokyo \
+  --split-role selection_dev \
+  --evict-below-free-gib 16.0 \
+  -- \
+  -binance BTCUSDT,ETHUSDT \
+  -bulk-ws BTC-USD,ETH-USD,SOL-USD,NVDA-USD,SNDK-USD,TSLA-USD,MU-USD,QQQ-USD,US500-USD,MSTR-USD,CRCL-USD,SOXL-USD,PAXG-USD,HYPE-USD \
+  -idle-read-timeout 5m
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aleph-tx-captures
+
+[Install]
+WantedBy=multi-user.target

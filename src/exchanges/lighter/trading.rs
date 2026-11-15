@@ -617,6 +617,8 @@ pub struct LighterTrading {
     client_order_counter: AtomicI64,
     /// Optional order tracker for per-order state machine (v5.0.0)
     order_tracker: Option<Arc<OrderTracker>>,
+    /// Execution-boundary hard ceiling on worst-case single-leg position (base units).
+    max_worst_case_position: Option<f64>,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
     quote_expiry: Option<Duration>,
@@ -748,6 +750,7 @@ impl LighterTrading {
             price_multiplier: 100.0,
             client_order_counter: AtomicI64::new(43),
             order_tracker: None,
+            max_worst_case_position: None,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -790,6 +793,7 @@ impl LighterTrading {
             price_multiplier: 100.0,
             client_order_counter: AtomicI64::new(1000),
             order_tracker: None,
+            max_worst_case_position: None,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -898,6 +902,7 @@ impl LighterTrading {
             price_multiplier,
             client_order_counter: AtomicI64::new(counter_start),
             order_tracker: None,
+            max_worst_case_position: None,
             limit_order_type: OrderType::Limit,
             quote_expiry: None,
             #[cfg(test)]
@@ -1134,6 +1139,38 @@ impl LighterTrading {
         Ok(())
     }
 
+    /// Enforce an execution-boundary hard ceiling on directional worst-case
+    /// exposure (`worst_case_long` for buys, `-worst_case_short` for sells)
+    /// before any non-reduce-only transaction is dispatched to Lighter.
+    pub fn set_max_worst_case_position(&mut self, max_position: f64) {
+        if max_position.is_finite() && max_position > 0.0 {
+            self.max_worst_case_position = Some(max_position);
+        }
+    }
+
+    fn ensure_side_exposure_within_cap(&self, side: Side) -> Result<()> {
+        if let (Some(tracker), Some(cap)) = (&self.order_tracker, self.max_worst_case_position) {
+            let tol = 0.5 / self.size_multiplier.max(1.0) + 1e-9;
+            match side {
+                Side::Buy => {
+                    let worst_long = tracker.worst_case_long();
+                    anyhow::ensure!(
+                        worst_long <= cap + tol,
+                        "Execution-boundary long cap breached: worst_case_long={worst_long:.6} > cap={cap:.6}"
+                    );
+                }
+                Side::Sell => {
+                    let worst_short = tracker.worst_case_short();
+                    anyhow::ensure!(
+                        -worst_short <= cap + tol,
+                        "Execution-boundary short cap breached: worst_case_short={worst_short:.6} < -{cap:.6}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_symbol(&self, symbol: &str) -> Result<()> {
         anyhow::ensure!(
             self.market_symbol == symbol,
@@ -1186,9 +1223,16 @@ impl LighterTrading {
                 tracker.start_tracking(client_order_index, tracker_side, params.price, params.size),
                 "Tracker refused order reservation"
             );
-            // Re-verify reconciliation state after reserving so concurrent lane
-            // failures cannot slip new exposure across the lock boundary.
-            if let Err(err) = self.ensure_can_place(&params) {
+            // Re-verify reconciliation state and execution-boundary exposure cap
+            // after reserving so concurrent lane failures or strategy bugs cannot
+            // slip excess exposure across the wire boundary.
+            if let Err(err) = self.ensure_can_place(&params).and_then(|()| {
+                if params.reduce_only {
+                    Ok(())
+                } else {
+                    self.ensure_side_exposure_within_cap(params.side)
+                }
+            }) {
                 tracker.mark_failed(client_order_index);
                 return Err(err);
             }
@@ -1331,7 +1375,11 @@ impl LighterTrading {
                 tracker.mark_failed(bid_coi);
                 anyhow::bail!("Tracker refused ask reservation");
             }
-            if let Err(err) = self.ensure_open_risk_allowed() {
+            if let Err(err) = self
+                .ensure_open_risk_allowed()
+                .and_then(|()| self.ensure_side_exposure_within_cap(Side::Buy))
+                .and_then(|()| self.ensure_side_exposure_within_cap(Side::Sell))
+            {
                 tracker.mark_failed(bid_coi);
                 tracker.mark_failed(ask_coi);
                 return Err(err);
@@ -1485,11 +1533,19 @@ impl LighterTrading {
                 }
                 tracker.mark_submission_uncertain(order.client_order_index);
             }
-            if opens_risk && let Err(err) = self.ensure_open_risk_allowed() {
-                for order in &place_results {
-                    tracker.mark_failed(order.client_order_index);
+            if opens_risk {
+                let cap_check = self.ensure_open_risk_allowed().and_then(|()| {
+                    for order in &place_results {
+                        self.ensure_side_exposure_within_cap(order.side)?;
+                    }
+                    Ok(())
+                });
+                if let Err(err) = cap_check {
+                    for order in &place_results {
+                        tracker.mark_failed(order.client_order_index);
+                    }
+                    return Err(err);
                 }
-                return Err(err);
             }
         }
 
@@ -2727,6 +2783,66 @@ mod tests {
         assert_eq!(order_wire_policy(OrderType::Market), (1, 0, 0));
         assert_eq!(order_wire_policy(OrderType::Limit), (0, 1, -1));
         assert_eq!(order_wire_policy(OrderType::PostOnly), (0, 2, -1));
+    }
+
+    #[tokio::test]
+    async fn execution_boundary_position_cap_blocks_excess_and_allows_flattening() {
+        let tracker = Arc::new(OrderTracker::new());
+        let mut trading = LighterTrading::offline_test_client("http://127.0.0.1:1");
+        trading.set_order_tracker(Arc::clone(&tracker));
+        trading.set_max_worst_case_position(0.20);
+
+        // Simulate being long +0.21 (1 step above cap): new buys must be blocked
+        // and rolled back before touching the network, while a flattening sell of
+        // 0.05 (leaving worst_case_short = +0.16) passes the directional cap check.
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.21));
+
+        let blocked_buy = vec![PlaceResult {
+            client_order_index: 501,
+            side: Side::Buy,
+            price: 2000.0,
+            size: 0.02,
+        }];
+        let err = trading
+            .submit_prepared(
+                vec![(14, "{}".into())],
+                blocked_buy,
+                0,
+                true,
+                |_, _| async { Ok(()) },
+                |_| async { panic!("wire send must not be called when cap breached") },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Execution-boundary long cap breached")
+        );
+        assert!(!tracker.needs_reconciliation());
+        assert!((tracker.worst_case_long() - 0.21).abs() < 1e-9);
+
+        let allowed_flatten_sell = vec![PlaceResult {
+            client_order_index: 502,
+            side: Side::Sell,
+            price: 2001.0,
+            size: 0.05,
+        }];
+        let res = trading
+            .submit_prepared(
+                vec![(14, "{}".into())],
+                allowed_flatten_sell,
+                0,
+                true,
+                |_, _| async { Ok(()) },
+                |_| async {
+                    Ok(SendTxBatchResponse {
+                        tx_hash: Some(vec!["0xok".into()]),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.place_results.len(), 1);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

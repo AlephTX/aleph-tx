@@ -14,10 +14,40 @@ absent. [Supervised launch and cleanup](LIVE_TRADING.md#shutdown-and-restart).
 | Market and account observations | BBO, depth and account statistics | Check source and observation age before quoting or sizing. Keep the shared-memory symbol and exchange IDs separate from the venue market ID. |
 | Lighter private events | A single-writer ring of creates, fills, cancels, rejects and private stream loss events | Apply events in sequence and reconcile authoritative state after an integrity alarm or a stream gap. |
 
+## Multi-venue exchange slot ABI (`NUM_EXCHANGES = 12`)
+
+Both `aleph-matrix` (`2,048` symbols × `12` exchanges × `64` bytes + `16,384`-byte
+version header = `1,589,248` bytes) and `aleph-depth` (`2,048` symbols × `12`
+exchanges × `256` bytes + `16,384`-byte version header) share one canonical
+exchange slot table across Go (`feeder/exchanges/common.go`), Rust
+(`src/shm_reader.rs`, `src/config.rs`), and Python (`deploy/oasis/monitor.py`):
+
+| Slot ID | Venue / Domain | Config Section | Notes |
+| --- | --- | --- | --- |
+| `1` | Hyperliquid (Core) | `[hyperliquid]` | Multiplexed with `[entropy]` and `[tradexyz]` over one WebSocket per `ws_url` |
+| `2` | Lighter (Core) | `[lighter]` | Private account stats keep single-symbol ABI; extra public BBOs use `feeder_public_symbols` |
+| `3`..`5` | Legacy reserved | — | Preserved ABI slots (`EdgeX`, `01`, `Backpack` in `legacy/v3_archive/`) |
+| `6` | Binance USD-M | `[binance]` | `bookTicker` lead-lag shield & fair-value reference |
+| `7` | Arcus | `[arcus]` | `l2Orderbook` (`nLevels: 20`) BBO + top-5 `aleph-depth` |
+| `8` | Lighter Robinhood | `[lighter_robinhood]` | Independent `wss://api.rh.lighter.xyz/stream` public BBO + top-5 `aleph-depth` |
+| `9` | Entropy (`io:*`) | `[entropy]` | HIP-3 RWA/perp coins (`io:NVDA`, `io:SNDK`, etc.) isolated from Core & TradeXYZ |
+| `10` | TradeXYZ (`xyz:*`) | `[tradexyz]` | HIP-3 RWA/perp coins (`xyz:NVDA`, `xyz:SNDK`, etc.) isolated from Core & Entropy |
+| `11` | Extended | — | Reserved slot |
+
+In `[strategy]`, `external_reference_exchanges = [6, 7, 8, 9, 10]` optionally
+selects which non-local slots enter the zero-allocation median fair-value and
+per-side adverse-selection cancel shield (when omitted, it defaults
+conservatively to Core USDC/USDT slots `[1, 2, 6]` so USDG and RWA feeds are
+opt-in), and `primary_reference_exchange` selects the primary toxicity/basis
+anchor (defaults to `1` = Hyperliquid Core). Both `aleph-matrix`
+(`ALEPHTX_SHM_V12\0`) and `aleph-depth` (`ALEPHTX_DEP_V12\0`) verify header
+magic on reader startup and enforce per-slot `(msg_type, exchange_id, symbol_id)`
+identity under acquire-release seqlock barriers.
+
 ## Depth and book continuity
 
-The Lighter public adapter reconstructs full sorted depth in Go and publishes
-top-5 levels into `aleph-depth` (`ShmDepthSnapshot`: 256 bytes, C layout with
+The Lighter Core (`2`), Lighter Robinhood (`8`), and Arcus (`7`) public adapters
+publish top-5 levels into `aleph-depth` (`ShmDepthSnapshot`: 256 bytes, C layout with
 64-byte alignment) alongside `aleph-matrix` (`ShmBboMessage`: 64 bytes).
 
 - **Delta sequence continuity**: `lighterBook.apply` validates `nonce`,

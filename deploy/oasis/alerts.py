@@ -36,6 +36,8 @@ def evaluate(status, summary, now_ms):
                              f"实盘策略异常退出 ({live.get('Result', 'unknown')})"))
 
     for market in (status or {}).get("markets", []):
+        if market.get("optional"):
+            continue
         state, venue, symbol = market.get("state"), market.get("venue"), market.get("symbol")
         if live_active and state in ("stale", "waiting"):
             alerts.append(_alert(f"quote_{venue}_{symbol}", WARNING,

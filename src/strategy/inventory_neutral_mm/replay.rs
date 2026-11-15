@@ -1416,7 +1416,12 @@ mod tests {
     /// cancel at stale_bbo_cancel_ms → requote only after the feed recovers.
     #[tokio::test(start_paused = true)]
     async fn stale_bbo_freezes_then_cancels_and_recovers() {
-        let cfg = config();
+        let cfg = InventoryNeutralMMConfig {
+            local_staleness_ms: 5_000,
+            stale_bbo_cancel_ms: 15_000,
+            require_external_fair_value: false,
+            ..config()
+        };
         let silent = Frame {
             bbo_live: false,
             ..quiet(1_000)
@@ -1613,6 +1618,7 @@ mod tests {
             InventoryNeutralMMConfig {
                 use_depth_pricing: true,
                 poll_interval_ms: 0, // accept every sample
+                local_staleness_ms: 5_000,
                 ..config()
             },
             venue as Arc<dyn Exchange>,
@@ -1842,7 +1848,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exported_mark_evidence_ages_instead_of_refreshing() {
-        let cfg = config();
+        let cfg = InventoryNeutralMMConfig {
+            local_staleness_ms: 5_000,
+            stale_bbo_cancel_ms: 15_000,
+            require_external_fair_value: false,
+            ..config()
+        };
         let dir = std::env::temp_dir().join(format!("aleph-mark-{}", uuid::Uuid::new_v4()));
         let info = crate::telemetry_sink::SessionInfo {
             session_id: "mark".into(),
@@ -1938,5 +1949,29 @@ mod tests {
         assert_eq!(source_new, "external_median");
         assert!(feed_new > feed0 && sampled_new > sampled_frozen);
         assert!(mid_new > mid0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_external_fair_value_cancels_resting_quotes_by_default() {
+        let cfg = InventoryNeutralMMConfig {
+            local_staleness_ms: 10_000,
+            stale_bbo_cancel_ms: 20_000,
+            external_staleness_ms: 1_500,
+            ..config()
+        };
+        assert!(cfg.require_external_fair_value);
+        // Publish live quotes at t=1 s, then keep feed silent for 2 s (> external_staleness_ms=1.5s,
+        // still well below local_staleness_ms=10s): require_external_fair_value must pull quotes!
+        let silent = Frame {
+            bbo_live: false,
+            ..quiet(1_000)
+        };
+        let frames = vec![quiet(1_000), silent, silent];
+        let outcome = run(cfg, &frames, 1_000.0, check).await;
+        outcome.assert_complete();
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(places(&outcome.actions).len(), 4);
+        assert_eq!(cancels(&outcome.actions).len(), 4);
+        assert!(outcome.resting.is_empty());
     }
 }

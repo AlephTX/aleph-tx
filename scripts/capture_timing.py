@@ -22,8 +22,10 @@ def precise_available_ms(row):
 
 
 class ClockAudit:
-    def __init__(self):
+    def __init__(self, *, allow_segment_offset=False):
+        self.allow_segment_offset = allow_segment_offset
         self.run_id = None
+        self.first_sequence = None
         self.sequence = 0
         self.last_wall = 0
         self.last_mono = 0
@@ -36,6 +38,9 @@ class ClockAudit:
         if self.run_id is None:
             self.run_id = t['run_id']
             self.origin = t['available_wall_ns'] - t['available_monotonic_ns']
+            if self.allow_segment_offset and t['sequence'] > 1:
+                self.sequence = t['sequence'] - 1
+            self.first_sequence = t['sequence']
         key = row['source'], row.get('market')
         if (t['run_id'] != self.run_id or t['sequence'] != self.sequence + 1
                 or t['available_wall_ns'] < self.last_wall

@@ -2,7 +2,8 @@
 use std::sync::atomic::{Ordering, fence};
 
 pub const NUM_SYMBOLS: usize = 2048;
-pub const NUM_EXCHANGES: usize = 7; // Padding, HL, Lighter, EdgeX, 01, Backpack, Binance
+pub const NUM_EXCHANGES: usize = 12; // 0=pad, 1=HL, 2=Lighter, 3..5=legacy, 6=Binance, 7=Arcus, 8=LighterRH, 9=Entropy, 10=TradeXYZ, 11=Extended
+pub const SHM_MAGIC_V12: [u8; 16] = *b"ALEPHTX_SHM_V12\0";
 const SLOT_SIZE: usize = 64;
 const VERSION_SIZE: usize = 8;
 
@@ -45,6 +46,12 @@ impl ShmReader {
         anyhow::ensure!(
             mmap.len() >= expected_size,
             "BBO shared memory is truncated"
+        );
+        let magic_offset = NUM_SYMBOLS * VERSION_SIZE + 48;
+        let magic = &mmap[magic_offset..magic_offset + 16];
+        anyhow::ensure!(
+            magic == [0u8; 16] || magic == SHM_MAGIC_V12,
+            "BBO shared memory ABI magic mismatch"
         );
 
         let data = mmap.as_ptr();
@@ -152,6 +159,22 @@ impl ShmReader {
                 }
             }
 
+            if msg.timestamp_ns != 0
+                && (msg.msg_type != 1
+                    || msg.exchange_id != exch as u8
+                    || msg.symbol_id != symbol_id)
+            {
+                tracing::error!(
+                    "SHM BBO slot identity mismatch: expected sym={} exch={} got msg_type={} sym={} exch={}",
+                    symbol_id,
+                    exch,
+                    msg.msg_type,
+                    msg.symbol_id,
+                    msg.exchange_id
+                );
+                msg = ShmBboMessage::default();
+            }
+
             *item = (exch as u8, msg);
         }
         result
@@ -216,6 +239,29 @@ mod tests {
         std::fs::write(&path, [0u8; 64]).unwrap();
         assert!(ShmReader::open(path.to_str().unwrap(), 1).is_err());
         assert!(ShmReader::open(path.to_str().unwrap(), NUM_SYMBOLS + 1).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_magic_and_misaddressed_slot() {
+        let path = std::env::temp_dir().join(format!("aleph-bbo-magic-{}", uuid::Uuid::new_v4()));
+        let mut buf = vec![0u8; NUM_SYMBOLS * VERSION_SIZE + 2 * NUM_EXCHANGES * SLOT_SIZE];
+        let magic_offset = NUM_SYMBOLS * VERSION_SIZE + 48;
+        buf[magic_offset..magic_offset + 16].copy_from_slice(b"ALEPHTX_SHM_V07\0");
+        std::fs::write(&path, &buf).unwrap();
+        assert!(ShmReader::open(path.to_str().unwrap(), 2).is_err());
+
+        buf[magic_offset..magic_offset + 16].copy_from_slice(&SHM_MAGIC_V12);
+        let slot_offset = NUM_SYMBOLS * VERSION_SIZE + (NUM_EXCHANGES + 2) * SLOT_SIZE;
+        buf[slot_offset..slot_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        buf[slot_offset + 4] = 1;
+        buf[slot_offset + 5] = 6; // wrong exchange_id in slot 2
+        buf[slot_offset + 6..slot_offset + 8].copy_from_slice(&1u16.to_le_bytes());
+        buf[slot_offset + 8..slot_offset + 16].copy_from_slice(&999u64.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut r = ShmReader::open(path.to_str().unwrap(), 2).unwrap();
+        assert_eq!(r.read_all_exchanges(1)[2].1.timestamp_ns, 0);
         std::fs::remove_file(path).unwrap();
     }
 }

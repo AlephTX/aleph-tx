@@ -841,6 +841,7 @@ pub fn compile(
     )?;
     let mut bytes = Vec::new();
     let mut group = 0;
+    let mut last_available_ms = 0;
     let mut ended = false;
     while let Some(row) = read_record::<Record>(&mut input, &mut bytes)
         .with_context(|| format!("capture line {}", compiler.coverage.records + 1))?
@@ -850,6 +851,7 @@ pub fn compile(
         ensure!(
             row.received_at_ms > 0
                 && now >= row.received_at_ms
+                && now >= last_available_ms
                 && now >= group
                 && row.request_sent_at_ms.is_none_or(|sent| {
                     matches!(
@@ -861,7 +863,17 @@ pub fn compile(
                 }),
             "invalid capture arrival order"
         );
+        last_available_ms = now;
         compiler.coverage.records += 1;
+        if row.source == "collector"
+            && matches!(row.event.as_str(), "segment_start" | "segment_end")
+        {
+            ensure!(
+                row.payload.is_some(),
+                "collector segment boundary missing payload"
+            );
+            continue;
+        }
         if row.source == "collector" && row.event == "end" && row.payload.is_none() {
             compiler.emit(group, &mut output, true)?;
             ended = true;

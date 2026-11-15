@@ -36,12 +36,18 @@ func hyperliquidExtraSources(markets string, trades bool, funding time.Duration)
 	}
 	var sources []subscription
 	if trades {
+		requests := make([]any, 0, len(coins))
 		for _, coin := range coins {
-			sources = append(sources, subscription{
-				source: "hyperliquid_trades", url: "wss://api.hyperliquid.xyz/ws", market: coin,
-				coins: []string{coin}, requests: []any{hyperliquidSubscribe{"subscribe", hyperliquidSubscription{"trades", coin}}},
-			})
+			requests = append(requests, hyperliquidSubscribe{"subscribe", hyperliquidSubscription{"trades", coin}})
 		}
+		market := ""
+		if len(coins) == 1 {
+			market = coins[0]
+		}
+		sources = append(sources, subscription{
+			source: "hyperliquid_trades", url: "wss://api.hyperliquid.xyz/ws", market: market,
+			coins: coins, requests: requests,
+		})
 	}
 	if funding != 0 {
 		if funding < time.Minute {
@@ -98,15 +104,19 @@ func hyperliquidPublication(source subscription, channel string, raw []byte, ack
 		row.Payload = payload
 		acknowledged[row.Market] = true
 	case "trades":
-		if source.source != "hyperliquid_trades" || !acknowledged[source.market] {
-			return record{}, errors.New("Hyperliquid trades without subscription acknowledgment")
+		if source.source != "hyperliquid_trades" {
+			return record{}, errors.New("Hyperliquid trades on unexpected source")
 		}
 		var trades []hyperliquidTrade
 		if err := json.Unmarshal(message.Data, &trades); err != nil || len(trades) == 0 {
 			return record{}, errors.New("invalid Hyperliquid trade batch")
 		}
+		coin := trades[0].Coin
+		if !slices.Contains(source.coins, coin) || (source.market != "" && coin != source.market) || !acknowledged[coin] {
+			return record{}, errors.New("Hyperliquid trades without subscription acknowledgment")
+		}
 		for _, trade := range trades {
-			if trade.Coin != source.market || trade.Time <= 0 || trade.ID == 0 ||
+			if trade.Coin != coin || trade.Time <= 0 || trade.ID == 0 ||
 				(trade.Side != "B" && trade.Side != "A") || trade.Px == "" || trade.Sz == "" {
 				return record{}, errors.New("invalid Hyperliquid trade identity or fields")
 			}
@@ -118,7 +128,7 @@ func hyperliquidPublication(source subscription, channel string, raw []byte, ack
 		if err != nil {
 			return record{}, err
 		}
-		row.Market, row.Event, row.Payload = source.market, "message", payload
+		row.Market, row.Event, row.Payload = coin, "message", payload
 	case "l2Book", "activeAssetCtx":
 		var data struct {
 			Coin string `json:"coin"`

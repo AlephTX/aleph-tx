@@ -27,6 +27,8 @@ struct FeederMarket {
     feeder_ws_url: String,
     #[serde(default)]
     feeder_symbols: BTreeMap<String, String>,
+    #[serde(default)]
+    feeder_public_symbols: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -40,7 +42,11 @@ enum StrategyMode {
 struct Feeds {
     strategy_mode: Option<StrategyMode>,
     lighter: FeederMarket,
+    lighter_robinhood: Option<FeederMarket>,
     hyperliquid: Option<FeederMarket>,
+    entropy: Option<FeederMarket>,
+    tradexyz: Option<FeederMarket>,
+    arcus: Option<FeederMarket>,
     binance: Option<FeederMarket>,
     inventory_hedge: Option<HedgeLimits>,
 }
@@ -107,9 +113,65 @@ impl Profile {
                     .lighter
                     .feeder_symbols
                     .get(&symbol)
-                    .is_some_and(|market| market == &strategy.market_id.to_string()),
+                    .is_some_and(|market| market == &strategy.market_id.to_string())
+                && feeds
+                    .lighter
+                    .feeder_public_symbols
+                    .iter()
+                    .all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker)
+                            && market.parse::<u16>().is_ok()
+                            && (ticker != &symbol || market == &strategy.market_id.to_string())
+                    }),
             "Lighter feeder must publish exactly the strategy's symbol and market ID"
         );
+        if let Some(rh) = feeds
+            .lighter_robinhood
+            .as_ref()
+            .filter(|rh| rh.feeder_enabled)
+        {
+            ensure!(
+                network == Network::Mainnet
+                    && domain != LighterDomain::RobinhoodMainnet
+                    && rh.feeder_ws_url == "wss://api.rh.lighter.xyz/stream"
+                    && !rh.feeder_symbols.is_empty()
+                    && rh.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && market.parse::<u16>().is_ok()
+                    }),
+                "Lighter Robinhood reference feeder requires Core Mainnet primary and wss://api.rh.lighter.xyz/stream"
+            );
+        }
+        if let Some(arcus) = feeds.arcus.as_ref().filter(|a| a.feeder_enabled) {
+            ensure!(
+                network == Network::Mainnet
+                    && arcus.feeder_ws_url == "wss://api.arcus.xyz/v1/ws"
+                    && !arcus.feeder_symbols.is_empty()
+                    && arcus.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && *market == format!("{ticker}-USD")
+                    }),
+                "Arcus reference feeder requires Mainnet, wss://api.arcus.xyz/v1/ws, and <TICKER>-USD symbols"
+            );
+        }
+        if let Some(entropy) = feeds.entropy.as_ref().filter(|e| e.feeder_enabled) {
+            ensure!(
+                entropy.feeder_ws_url == hedge_ws
+                    && !entropy.feeder_symbols.is_empty()
+                    && entropy.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && *market == format!("io:{ticker}")
+                    }),
+                "Entropy feeder must match Hyperliquid WS network and map symbols to io:<TICKER>"
+            );
+        }
+        if let Some(xyz) = feeds.tradexyz.as_ref().filter(|x| x.feeder_enabled) {
+            ensure!(
+                xyz.feeder_ws_url == hedge_ws
+                    && !xyz.feeder_symbols.is_empty()
+                    && xyz.feeder_symbols.iter().all(|(ticker, market)| {
+                        app.symbols.contains_key(ticker) && *market == format!("xyz:{ticker}")
+                    }),
+                "TradeXYZ feeder must match Hyperliquid WS network and map symbols to xyz:<TICKER>"
+            );
+        }
         let has_hl = feeds
             .hyperliquid
             .as_ref()
@@ -144,6 +206,16 @@ impl Profile {
         }
         if let Some(hedge) = &feeds.inventory_hedge {
             hedge.validate()?;
+            if let Some(primary_step) = rust_decimal::Decimal::from_f64_retain(strategy.step_size)
+                && !hedge.deadband_base.is_zero()
+            {
+                ensure!(
+                    hedge.deadband_base >= primary_step,
+                    "Inventory hedge deadband_base ({}) must be >= primary step_size ({})",
+                    hedge.deadband_base,
+                    strategy.step_size
+                );
+            }
             ensure!(
                 has_hl && strategy.use_post_only,
                 "Inventory hedge requires the Hyperliquid feeder and post-only primary quotes"
@@ -175,11 +247,22 @@ impl Profile {
                 );
             }
         }
-        // The supervised quote path accepts only the validated Lighter,
-        // Hyperliquid, and optional Binance reference books as inputs. Serialize
-        // that exact validated profile to the private session directory before the feeder starts.
+        // Serialize only the validated feeder sections and symbol registry to
+        // the private session directory before the supervised feeder starts.
         let mut feeder: toml::Table = toml::from_str(&contents)?;
-        feeder.retain(|key, _| matches!(key, "lighter" | "hyperliquid" | "binance" | "symbols"));
+        feeder.retain(|key, _| {
+            matches!(
+                key,
+                "lighter"
+                    | "lighter_robinhood"
+                    | "hyperliquid"
+                    | "binance"
+                    | "arcus"
+                    | "entropy"
+                    | "tradexyz"
+                    | "symbols"
+            )
+        });
         let feeder_config = toml::to_string(&feeder)?;
         Ok(Self {
             strategy,
@@ -553,6 +636,11 @@ pub(super) async fn launch(
             trading.validate_symbol(symbol)?;
             trading.validate_precision(profile.strategy.tick_size, profile.strategy.step_size)?;
             trading.set_supervised_quote_expiry();
+            if profile.strategy.max_position_notional_usd == 0.0 {
+                trading.set_max_worst_case_position(
+                    profile.strategy.max_position * profile.strategy.max_portfolio_scale.max(1.0),
+                );
+            }
             let (orders, position) =
                 tokio::try_join!(trading.get_active_orders(), trading.signed_position())?;
             ensure!(

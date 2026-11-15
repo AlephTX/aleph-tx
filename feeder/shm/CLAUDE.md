@@ -11,8 +11,8 @@ alwaysApply: true
 
 | File | Description |
 |------|-------------|
-| `matrix.go` | BBO matrix writer (`aleph-matrix`, 2,048 symbols × 7 exchanges, 64-byte seqlock cells) |
-| `depth.go` | Top-5 orderbook depth writer (`aleph-depth`, 16,384-byte version header + 2,048 `ShmDepthSnapshot` slots) |
+| `matrix.go` | BBO matrix writer (`aleph-matrix`, 2,048 symbols × 12 exchanges = 1,552 KB, 64-byte seqlock cells) |
+| `depth.go` | Top-5 orderbook depth writer (`aleph-depth`, 16,384-byte version header + 2,048 × 12 `ShmDepthSnapshot` slots) |
 | `events_v2.go` | 128-byte V2 private event ring writer (`aleph-events-v2`, generation seqlock + `FeeSource` byte at offset 112) |
 | `events.go` | Legacy 64-byte V1 event ring writer (`aleph-events`, retained for backward compatibility) |
 | `account_stats.go` | 128-byte account stats writer (`aleph-account-stats`, serialized odd/even versioned writes with independent equity & position timestamps) |

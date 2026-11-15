@@ -31,6 +31,7 @@ fn pending_intent() -> JournalRecord {
         cloid: CLOID.into(),
         coin: "ETH".into(),
         submitted_at_ms: 1_000,
+        expires_after_ms: None,
         is_buy: false,
         size: d("0.01"),
         limit_price: d("1998"),

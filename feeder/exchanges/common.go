@@ -1,14 +1,20 @@
 // Package exchanges defines exchange IDs and symbol mappings.
 package exchanges
 
-// Exchange IDs — must match Rust arbitrage.rs constants.
+// Exchange IDs — must match Rust src/config.rs and Python deploy/oasis/monitor.py.
+// Slots 3..5 remain reserved for archived legacy venues so historical IDs never alias.
 const (
-	ExchangeHyperliquid uint8 = 1
-	ExchangeLighter     uint8 = 2
-	ExchangeEdgeX       uint8 = 3
-	Exchange01          uint8 = 4
-	ExchangeBackpack    uint8 = 5
-	ExchangeBinance     uint8 = 6
+	ExchangeHyperliquid      uint8 = 1
+	ExchangeLighter          uint8 = 2
+	ExchangeEdgeX            uint8 = 3
+	Exchange01               uint8 = 4
+	ExchangeBackpack         uint8 = 5
+	ExchangeBinance          uint8 = 6
+	ExchangeArcus            uint8 = 7
+	ExchangeLighterRobinhood uint8 = 8
+	ExchangeEntropy          uint8 = 9
+	ExchangeTradeXYZ         uint8 = 10
+	ExchangeExtended         uint8 = 11
 )
 
 // Symbol IDs — global normalized IDs.

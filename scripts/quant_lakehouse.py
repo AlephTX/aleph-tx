@@ -297,6 +297,9 @@ def seal_bronze_capture(
     first_at: int | None = None
     last_at: int | None = None
     ended = False
+    segment_index: int | None = None
+    segment_continued: bool | None = None
+    prev_segment_name: str | None = None
     precise_clock: ClockAudit | None = None
     precise_records = 0
     source_counts: Counter[str] = Counter()
@@ -312,14 +315,30 @@ def seal_bronze_capture(
                 raise ValueError("capture violated receipt/availability order or wrote past collector/end")
             raw_source = row.get("source", "")
             event = row.get("event", "")
-            if event not in ("message", "connected", "subscribed", "disconnect", "clock_refresh", "end"):
+            if event not in ("message", "connected", "subscribed", "disconnect", "clock_refresh", "segment_start", "segment_end", "end"):
                 raise ValueError(f"unsupported public event: {event!r}")
-            if (raw_source == "collector") != (event == "end"):
-                raise ValueError("invalid collector/end footer record")
+            if (raw_source == "collector") != (event in ("segment_start", "segment_end", "end")):
+                raise ValueError("invalid collector lifecycle/footer record")
+
+            if event == "segment_start":
+                payload = row.get("payload")
+                if record_count != 0 or not isinstance(payload, dict) or type(payload.get("segment_index")) is not int or payload["segment_index"] < 0:
+                    raise ValueError("invalid collector/segment_start header")
+                segment_index = payload["segment_index"]
+                prev_segment_name = payload.get("prev_segment")
+                if (segment_index > 0) != bool(prev_segment_name):
+                    raise ValueError("segment_start prev_segment mismatch")
+            elif event == "segment_end":
+                payload = row.get("payload")
+                if not isinstance(payload, dict) or payload.get("segment_index") != segment_index or type(payload.get("continued")) is not bool:
+                    raise ValueError("invalid collector/segment_end footer")
+                segment_continued = payload["continued"]
+                if segment_continued:
+                    ended = True
 
             if "capture_timing" in row:
                 if precise_clock is None:
-                    precise_clock = ClockAudit()
+                    precise_clock = ClockAudit(allow_segment_offset=(segment_index is not None and segment_index > 0))
                 precise_clock.observe(row)
                 precise_records += 1
 
@@ -351,7 +370,10 @@ def seal_bronze_capture(
                 first_at = at
             last_at = at
             previous_at = at
-            ended = event == "end"
+            if event == "end":
+                if segment_index is not None and segment_continued is not False:
+                    raise ValueError("rolling terminal segment lacked segment_end(continued=false) before end")
+                ended = True
             record_count += 1
             stream_hash.update(raw_line)
 
@@ -361,10 +383,21 @@ def seal_bronze_capture(
     if not ended or record_count <= 1 or first_at is None or last_at is None:
         raise ValueError("capture missing valid publications or collector/end footer")
 
+    is_rolling_segment = segment_index is not None
     span_ms = last_at - first_at
+    # An individual rolling segment never certifies a 10h validation unit on its own;
+    # contiguous chains are certified via seal_bronze_segment_chain.
+    meets_ten_hour = (not is_rolling_segment) and (span_ms >= TEN_HOUR_MS)
+    if is_rolling_segment:
+        coverage_class = "rolling_segment"
+    elif meets_ten_hour:
+        coverage_class = "ten_hour_candidate"
+    else:
+        coverage_class = "diagnostic_short_window"
+
     manifest = {
         "schema_version": 1,
-        "artifact_kind": "bronze_public_capture",
+        "artifact_kind": "bronze_public_segment" if is_rolling_segment else "bronze_public_capture",
         "campaign_id": campaign_id,
         "collector_region": collector_region,
         "split_role": split_role,
@@ -375,8 +408,125 @@ def seal_bronze_capture(
         "records": record_count,
         "precise_timing_records": precise_records,
         "capture_run_id": precise_clock.run_id if precise_clock is not None else None,
+        "first_sequence": precise_clock.first_sequence if precise_clock is not None else None,
+        "last_sequence": precise_clock.sequence if precise_clock is not None else None,
+        "segment_index": segment_index,
+        "segment_continued": segment_continued,
+        "prev_segment": prev_segment_name,
         "first_available_ms": first_at,
         "last_available_ms": last_at,
+        "span_ms": span_ms,
+        "meets_ten_hour_validation_unit": meets_ten_hour,
+        "coverage_class": coverage_class,
+        "stream_record_counts": dict(sorted(source_counts.items())),
+        "disconnect_counts": dict(sorted(disconnect_counts.items())),
+        "markets_observed": sorted(markets_seen),
+    }
+    if manifest_out is not None:
+        write_immutable_json(manifest_out, manifest)
+    return manifest
+
+
+def seal_bronze_segment_chain(
+    segment_paths: list[Path],
+    *,
+    campaign_id: str,
+    collector_region: str,
+    split_role: str,
+    manifest_out: Path | None = None,
+) -> dict:
+    """Verify an unbroken in-process rolling segment chain (e.g. 10 x 1h -> 10h unit)."""
+    if not segment_paths:
+        raise ValueError("segment_paths must not be empty")
+    if collector_region not in VALID_REGIONS:
+        raise ValueError(f"invalid collector_region {collector_region!r}")
+    if split_role not in VALID_ROLES:
+        raise ValueError(f"invalid split_role {split_role!r}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,120}", campaign_id) or PRIVATE_NAME.search(campaign_id):
+        raise ValueError(f"invalid or private-indicating campaign_id: {campaign_id!r}")
+
+    seg_manifests = []
+    expected_run_id: str | None = None
+    prev_last_seq: int | None = None
+    prev_last_at: int | None = None
+    prev_filename: str | None = None
+    total_records = 0
+    total_bytes = 0
+    source_counts: Counter[str] = Counter()
+    disconnect_counts: Counter[str] = Counter()
+    markets_seen: set[str] = set()
+
+    for expected_idx, seg_path in enumerate(segment_paths):
+        seg_meta = seal_bronze_capture(
+            seg_path,
+            campaign_id=campaign_id,
+            collector_region=collector_region,
+            split_role=split_role,
+        )
+        if seg_meta["artifact_kind"] != "bronze_public_segment" or seg_meta["segment_index"] != expected_idx:
+            raise ValueError(f"segment {seg_path} has segment_index={seg_meta.get('segment_index')}, expected {expected_idx}")
+        run_id = seg_meta["capture_run_id"]
+        first_seq = seg_meta["first_sequence"]
+        last_seq = seg_meta["last_sequence"]
+        if not run_id or first_seq is None or last_seq is None:
+            raise ValueError(f"segment {seg_path} lacks precise capture_timing run_id/sequence")
+        if expected_idx == 0:
+            if first_seq != 1:
+                raise ValueError(f"segment 0 must start at sequence 1, got {first_seq}")
+            expected_run_id = run_id
+        else:
+            if run_id != expected_run_id:
+                raise ValueError(f"run_id changed across segments ({expected_run_id} -> {run_id}); state reset forbidden")
+            if first_seq != (prev_last_seq or 0) + 1:
+                raise ValueError(f"sequence gap between segments {expected_idx - 1} and {expected_idx}: {prev_last_seq} -> {first_seq}")
+            if seg_meta["prev_segment"] != prev_filename:
+                raise ValueError(f"prev_segment pointer mismatch on segment {expected_idx}")
+            if seg_meta["first_available_ms"] < (prev_last_at or 0):
+                raise ValueError(f"available_at_ms regressed across segment boundary at {expected_idx}")
+        is_last = expected_idx == len(segment_paths) - 1
+        if not is_last and seg_meta["segment_continued"] is not True:
+            raise ValueError(f"non-final segment {expected_idx} was already marked terminal")
+        if is_last and seg_meta["segment_continued"] is not False:
+            raise ValueError(f"final segment {expected_idx} lacks terminal collector/end")
+
+        prev_last_seq = last_seq
+        prev_last_at = seg_meta["last_available_ms"]
+        prev_filename = seg_meta["capture_filename"]
+        total_records += seg_meta["records"]
+        total_bytes += seg_meta["capture_bytes"]
+        source_counts.update(seg_meta["stream_record_counts"])
+        disconnect_counts.update(seg_meta["disconnect_counts"])
+        markets_seen.update(seg_meta["markets_observed"])
+        seg_manifests.append({
+            "segment_index": expected_idx,
+            "capture_filename": seg_meta["capture_filename"],
+            "capture_sha256": seg_meta["capture_sha256"],
+            "capture_bytes": seg_meta["capture_bytes"],
+            "records": seg_meta["records"],
+            "first_sequence": first_seq,
+            "last_sequence": last_seq,
+            "first_available_ms": seg_meta["first_available_ms"],
+            "last_available_ms": seg_meta["last_available_ms"],
+        })
+
+    first_ms = seg_manifests[0]["first_available_ms"]
+    last_ms = seg_manifests[-1]["last_available_ms"]
+    span_ms = last_ms - first_ms
+    chain_manifest = {
+        "schema_version": 1,
+        "artifact_kind": "bronze_public_segment_chain",
+        "campaign_id": campaign_id,
+        "collector_region": collector_region,
+        "split_role": split_role,
+        "capture_run_id": expected_run_id,
+        "segment_count": len(seg_manifests),
+        "segments": seg_manifests,
+        "total_records": total_records,
+        "total_capture_bytes": total_bytes,
+        "first_sequence": seg_manifests[0]["first_sequence"],
+        "last_sequence": seg_manifests[-1]["last_sequence"],
+        "first_available_ms": first_ms,
+        "last_available_ms": last_ms,
         "span_ms": span_ms,
         "meets_ten_hour_validation_unit": span_ms >= TEN_HOUR_MS,
         "coverage_class": "ten_hour_candidate" if span_ms >= TEN_HOUR_MS else "diagnostic_short_window",
@@ -385,8 +535,8 @@ def seal_bronze_capture(
         "markets_observed": sorted(markets_seen),
     }
     if manifest_out is not None:
-        write_immutable_json(manifest_out, manifest)
-    return manifest
+        write_immutable_json(manifest_out, chain_manifest)
+    return chain_manifest
 
 
 def evict_local_capture(
@@ -438,9 +588,22 @@ def _iter_source_lines(input_path: Path):
     resolved = reject_unsafe_path(input_path, allow_directory=True)
     if resolved.is_dir():
         yield from archive_records(resolved)
-    else:
-        with open_capture(resolved) as handle:
-            yield from stream_rows(handle)
+        return
+    if resolved.suffix == ".json":
+        doc = json.loads(resolved.read_text(encoding="utf-8"))
+        if doc.get("artifact_kind") != "bronze_public_segment_chain":
+            raise ValueError(f"unsupported JSON input artifact_kind: {doc.get('artifact_kind')!r}")
+        parent = resolved.parent
+        for entry in doc["segments"]:
+            seg_file = reject_unsafe_path(parent / entry["capture_filename"])
+            sha, size = digest_unchanged(seg_file)
+            if sha != entry["capture_sha256"] or size != entry["capture_bytes"]:
+                raise ValueError(f"segment {seg_file} digest/size mismatch against chain manifest")
+            with open_capture(seg_file) as handle:
+                yield from stream_rows(handle)
+        return
+    with open_capture(resolved) as handle:
+        yield from stream_rows(handle)
 
 
 def _emit_bbo_row(
@@ -544,6 +707,7 @@ def normalize_capture(
     trade_seen: dict[tuple[str, str], dict] = {}
     ended = False
     previous_at = 0
+    clock_audit = ClockAudit() if precise_times else None
 
     with ExitStack() as stack:
         writers = {}
@@ -564,7 +728,11 @@ def normalize_capture(
             raw_source = row["source"]
             event = row["event"]
             received_ms = row["received_at_ms"]
-            avail_ms = precise_available_ms(row) if (precise_times and "capture_timing" in row) else row["available_at_ms"]
+            avail_ms = (
+                clock_audit.observe(row)
+                if (clock_audit is not None and "capture_timing" in row)
+                else (precise_available_ms(row) if (precise_times and "capture_timing" in row) else row["available_at_ms"])
+            )
             if type(avail_ms) is not int or type(received_ms) is not int or received_ms <= 0 or avail_ms < previous_at or ended:
                 raise ValueError("capture receipt/availability invariant violated during normalization")
             previous_at = avail_ms
@@ -576,6 +744,28 @@ def normalize_capture(
             req_sent_ms = row.get("request_sent_at_ms")
             payload = row.get("payload")
             market = row.get("market")
+
+            if raw_source == "collector" and event in ("segment_start", "segment_end"):
+                emit(
+                    "feed_lifecycle",
+                    {
+                        "campaign_id": campaign_id,
+                        "collector_region": collector_region,
+                        "utc_date": utc_date_str(avail_ms),
+                        "venue": "collector",
+                        "domain": "session",
+                        "raw_source": "collector",
+                        "market": None,
+                        "sequence": seq,
+                        "available_at_ms": avail_ms,
+                        "received_at_ms": received_ms,
+                        "request_sent_at_ms": None,
+                        "connection_epoch": conn_epoch,
+                        "event": event,
+                        "detail": str(payload.get("segment_index")) if isinstance(payload, dict) else None,
+                    },
+                )
+                continue
 
             if raw_source == "collector" and event == "end":
                 ended = True
@@ -866,8 +1056,9 @@ def normalize_capture(
                     stats = payload["market_stats"]
                     oracle_dec = parse_positive_dec(stats["index_price"])
                     mark_dec = parse_positive_dec(stats["mark_price"]) if stats.get("mark_price") else None
+                    # Lighter current_funding_rate is reported in %/hour (e.g. "0.0012" = 0.0012%/h = 0.12 bps/h).
                     rate_dec = Decimal(str(stats["current_funding_rate"])) if stats.get("current_funding_rate") is not None else None
-                    rate_bps = rate_dec * Decimal("10000") if rate_dec is not None else None
+                    rate_bps = rate_dec * Decimal("100") if rate_dec is not None else None
                     pub_ms = int(payload["timestamp"]) if payload.get("timestamp") is not None else None
                     emit(
                         "funding_and_ctx",
@@ -1779,10 +1970,25 @@ def main() -> None:
     p_unpack.add_argument("--manifest", type=Path, required=True)
     p_unpack.add_argument("--target-dir", type=Path, required=True)
 
+    p_chain = sub.add_parser("seal-segment-chain", help="Verify contiguous rolling segments into one unbroken Bronze chain manifest")
+    p_chain.add_argument("--segments", type=Path, nargs="+", required=True)
+    p_chain.add_argument("--campaign-id", required=True)
+    p_chain.add_argument("--collector-region", choices=VALID_REGIONS, required=True)
+    p_chain.add_argument("--split-role", choices=VALID_ROLES, required=True)
+    p_chain.add_argument("--manifest-out", type=Path, required=True)
+
     args = parser.parse_args()
     if args.command == "seal-bronze":
         result = seal_bronze_capture(
             args.capture,
+            campaign_id=args.campaign_id,
+            collector_region=args.collector_region,
+            split_role=args.split_role,
+            manifest_out=args.manifest_out,
+        )
+    elif args.command == "seal-segment-chain":
+        result = seal_bronze_segment_chain(
+            args.segments,
             campaign_id=args.campaign_id,
             collector_region=args.collector_region,
             split_role=args.split_role,

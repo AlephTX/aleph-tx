@@ -11,10 +11,10 @@ alwaysApply: true
 
 | Path | Description |
 |------|-------------|
-| `main.go` (`feeder-app`) | Supervised/public SHM feeder for Lighter (public book + private V2 events + account stats), Hyperliquid, and Binance |
-| `cmd/perp-capture/` (`perp-capture`) | Continuous public NDJSON.gz recorder across Lighter Core, Lighter Robinhood, Hyperliquid Native, Entropy (`km`), TradeXYZ (`xyz`), Arcus (`-arcus-trades` + books), BULK, and Binance `bookTicker` |
-| `config/` | Shared TOML loader (`[symbols]`, `[lighter]`, `[hyperliquid]`, `[binance]`) |
-| `exchanges/` | Active WebSocket adapters (`lighter*`, `hyperliquid`, `binance`) — legacy v3 adapters (`backpack`, `edgex`, `01`) archived under `../legacy/v3_archive/feeder/exchanges/` |
+| `main.go` (`feeder-app`) | Supervised/public SHM feeder across Lighter Core, Lighter Robinhood, Arcus, Hyperliquid Core, Entropy (`io:*`), TradeXYZ (`xyz:*`), and Binance (plus Lighter private V2 events & account stats) |
+| `cmd/perp-capture/` (`perp-capture`) | Continuous or in-process rolling (`-segment-duration`) public NDJSON.gz recorder across Lighter Core, Lighter Robinhood, Hyperliquid Core, Entropy (`io:*`), TradeXYZ (`xyz:*`), Arcus (`-arcus-trades` + books), BULK, Extended, and Binance `bookTicker` |
+| `config/` | Shared TOML loader (`[symbols]`, `[lighter]` + `feeder_public_symbols`, `[lighter_robinhood]`, `[arcus]`, `[hyperliquid]`, `[entropy]`, `[tradexyz]`, `[binance]`) |
+| `exchanges/` | Active WebSocket adapters (`lighter*`, `arcus`, `hyperliquid`, `binance`) — legacy v3 adapters (`backpack`, `edgex`, `01`) archived under `../legacy/v3_archive/feeder/exchanges/` |
 | `shm/` | Lock-free shared-memory writers (`matrix.go`, `depth.go`, `events.go`, `events_v2.go`, `account_stats.go`) |
 
 ## Architecture
@@ -24,15 +24,16 @@ graph TD
     subgraph "Go Feeder (feeder-app)"
         CFG[config.toml / feeder.toml] --> MAIN[main.go]
         MAIN --> BN[Binance bookTicker WS]
-        MAIN --> HL[Hyperliquid l2Book WS]
-        MAIN --> LT[Lighter Public Orderbook WS]
+        MAIN --> HL["Hyperliquid / Entropy / TradeXYZ WS"]
+        MAIN --> AR[Arcus l2Orderbook WS]
+        MAIN --> LT["Lighter Core & Robinhood Public WS"]
         MAIN --> LP[Lighter Private WS]
         MAIN --> LA[Lighter Account Stats WS+REST]
     end
 
     subgraph "Shared Memory (/dev/shm)"
-        BN & HL & LT -->|Seqlock| MTX["aleph-matrix (BBO, 7 slots)"]
-        LT -->|Top-5 Seqlock + Integrity Guard| DEP["aleph-depth"]
+        BN & HL & AR & LT -->|Seqlock| MTX["aleph-matrix (BBO, 12 slots)"]
+        AR & LT -->|Top-5 Seqlock + Integrity Guard| DEP["aleph-depth"]
         LP -->|128B SPSC + Gen Seqlock| EVT["aleph-events-v2"]
         LA -->|128B Versioned| ACC["aleph-account-stats"]
     end

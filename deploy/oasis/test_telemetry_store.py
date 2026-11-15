@@ -668,12 +668,12 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             shm_path = Path(tmp) / "matrix"
             now_ns = 1_700_000_000 * 10**9
-            max_offset = 2048 * 8 + (1002 * 7 + 6 + 1) * monitor.BBO.size
+            max_offset = monitor.NUM_SYMBOLS * 8 + (1004 * monitor.NUM_EXCHANGES) * monitor.BBO.size
             shm_path.write_bytes(b"\x00" * max_offset)
             fd = os.open(shm_path, os.O_RDWR)
             try:
                 # Write valid Binance ETH BBO (exchange=6, symbol=1002) with even seqlock seq=4
-                offset = 2048 * 8 + (1002 * 7 + 6) * monitor.BBO.size
+                offset = monitor.NUM_SYMBOLS * 8 + (1002 * monitor.NUM_EXCHANGES + 6) * monitor.BBO.size
                 packed = monitor.BBO.pack(4, 1, 6, 1002, now_ns - 25_000_000, 2500.0, 12.5, 2500.1, 8.0)
                 os.pwrite(fd, packed, offset)
                 quote = monitor.read_quote(fd, 6, 1002, now_ns)
@@ -682,10 +682,48 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
                 self.assertAlmostEqual(quote["bid"], 2500.0)
                 self.assertAlmostEqual(quote["ask"], 2500.1)
 
+                # Write valid Arcus NVDA (exchange=7, symbol=1003) and TradeXYZ NVDA (exchange=10, symbol=1003)
+                for exch_id, bid_px, ask_px in ((7, 145.10, 145.15), (8, 2501.0, 2501.2), (9, 145.00, 145.10), (10, 145.05, 145.12)):
+                    sym_id = 1002 if exch_id == 8 else 1003
+                    slot_off = monitor.NUM_SYMBOLS * 8 + (sym_id * monitor.NUM_EXCHANGES + exch_id) * monitor.BBO.size
+                    os.pwrite(fd, monitor.BBO.pack(2, 1, exch_id, sym_id, now_ns - 10_000_000, bid_px, 5.0, ask_px, 6.0), slot_off)
+                    q = monitor.read_quote(fd, exch_id, sym_id, now_ns)
+                    self.assertEqual(q["state"], "live")
+                    self.assertAlmostEqual(q["bid"], bid_px)
+
                 # Odd seqlock sequence (write in progress) is rejected
                 odd_packed = monitor.BBO.pack(5, 1, 6, 1002, now_ns - 25_000_000, 2500.0, 12.5, 2500.1, 8.0)
                 os.pwrite(fd, odd_packed, offset)
                 self.assertIsNone(monitor.read_quote(fd, 6, 1002, now_ns))
+
+                # Configured feeder.toml parses all multi-venue sections cleanly
+                feeder_toml = Path(__file__).resolve().parent / "feeder.toml"
+                cfg_rows = monitor.configured_markets(feeder_toml)
+                venues = {(v, s, e) for v, s, e, _, _ in cfg_rows}
+                self.assertIn(("Arcus", "NVDA", 7), venues)
+                self.assertIn(("LighterRH", "ETH", 8), venues)
+                self.assertIn(("Entropy", "NVDA", 9), venues)
+                self.assertIn(("TradeXYZ", "NVDA", 10), venues)
+
+                # Primary non-BTC/ETH symbols (e.g. SOL) on core venues must stay non-optional,
+                # whereas feeder_public_symbols and RWA/USDG sections stay optional.
+                sol_cfg = Path(tmp) / "feeder_sol.toml"
+                sol_cfg.write_text(
+                    '[symbols]\nSOL = 1005\nNVDA = 1003\n\n'
+                    '[lighter]\nfeeder_enabled = true\n'
+                    'feeder_symbols = { SOL = 2 }\n'
+                    'feeder_public_symbols = { NVDA = 110 }\n\n'
+                    '[binance]\nfeeder_enabled = true\n'
+                    'feeder_symbols = { SOL = "SOLUSDT" }\n\n'
+                    '[arcus]\nfeeder_enabled = true\n'
+                    'feeder_symbols = { SOL = "SOL-USD" }\n',
+                    encoding="utf-8",
+                )
+                sol_rows = {(v, s): opt for v, s, _, _, opt in monitor.configured_markets(sol_cfg)}
+                self.assertIs(sol_rows[("Lighter", "SOL")], False)
+                self.assertIs(sol_rows[("Binance", "SOL")], False)
+                self.assertIs(sol_rows[("Lighter", "NVDA")], True)
+                self.assertIs(sol_rows[("Arcus", "SOL")], True)
             finally:
                 os.close(fd)
 

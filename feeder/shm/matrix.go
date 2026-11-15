@@ -7,9 +7,9 @@
 //
 // Memory layout (single mmap, cache-line friendly):
 //   - SymbolVersions[2048]: AtomicU64 per symbol (16 KB, fits in L1d)
-//   - BboMatrix[2048][5]: ShmBboMessage payload (64B × 5 × 2048 = 640 KB)
+//   - BboMatrix[2048][12]: ShmBboMessage payload (64B × 12 × 2048 = 1,536 KB)
 //
-// Total: ~656 KB
+// Total: ~1,552 KB
 package shm
 
 import (
@@ -23,9 +23,12 @@ import (
 
 const (
 	NumSymbols   = 2048
-	NumExchanges = 7
+	NumExchanges = 12
 	SlotSize     = 64 // sizeof(ShmBboMessage)
 )
+
+// MagicV12 stamps BboMatrix[0][0]._Reserved so readers reject mismatched slot strides.
+var MagicV12 = [16]byte{'A', 'L', 'E', 'P', 'H', 'T', 'X', '_', 'S', 'H', 'M', '_', 'V', '1', '2', 0}
 
 // ShmBboMessage is the 64-byte cache-line-aligned BBO message.
 // Layout must match Rust #[repr(C, align(64))] exactly.
@@ -91,6 +94,7 @@ func NewMatrix(name string) (*Matrix, error) {
 	}
 
 	shm := (*ShmMarketState)(unsafe.Pointer(&data[0]))
+	shm.BboMatrix[0][0]._Reserved = MagicV12
 
 	return &Matrix{data: data, shm: shm}, nil
 }
@@ -114,9 +118,9 @@ func (m *Matrix) WriteBBO(exchangeID uint8, symbolID uint16, tsNs uint64,
 	}
 	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 
-	// Phase 1: mark slot as being written (odd seqlock)
-	seq := atomic.LoadUint32(seqAddr)
-	atomic.StoreUint32(seqAddr, seq+1) // now odd → write in progress
+	// Phase 1: mark slot as being written (odd seqlock; AddUint32 provides
+	// acquire-release ordering on ARM64 so payload stores never hoist above it).
+	seq := atomic.AddUint32(seqAddr, 1) // now odd → write in progress
 
 	// Phase 2: write payload
 	slot.MsgType = 1 // BBO
@@ -129,7 +133,7 @@ func (m *Matrix) WriteBBO(exchangeID uint8, symbolID uint16, tsNs uint64,
 	slot.AskSize = askSize
 
 	// Phase 3: mark write complete (even seqlock)
-	atomic.StoreUint32(seqAddr, seq+2) // now even → write complete
+	atomic.StoreUint32(seqAddr, seq+1) // now even → write complete
 
 	// Phase 4: increment symbol version to notify Rust reader
 	atomic.AddUint64(&m.shm.SymbolVersions[symbolID], 1)
@@ -190,10 +194,9 @@ func (m *Matrix) InvalidateBBO(exchangeID uint8, symbolID uint16) {
 		return
 	}
 	slot := &m.shm.BboMatrix[symbolID][exchangeID]
-	seq := atomic.LoadUint32(&slot.Seqlock)
-	atomic.StoreUint32(&slot.Seqlock, seq+1)
+	seq := atomic.AddUint32(&slot.Seqlock, 1)
 	slot.TimestampNs = 0
 	slot.BidPrice, slot.BidSize, slot.AskPrice, slot.AskSize = 0, 0, 0, 0
-	atomic.StoreUint32(&slot.Seqlock, seq+2)
+	atomic.StoreUint32(&slot.Seqlock, seq+1)
 	atomic.AddUint64(&m.shm.SymbolVersions[symbolID], 1)
 }

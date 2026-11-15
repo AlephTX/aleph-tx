@@ -15,6 +15,13 @@ Related documents:
 [Research data-source registry](RESEARCH_DATA_SOURCES.md) ·
 [Relative-value replay](PERP_RELATIVE_VALUE.md)
 
+> [!WARNING]
+> **2026-11-15 Post-Audit Methodological Notice (Statistical & Simulator Calibration)**
+> 1. **Holdout Consumption (`0` Untouched OOS Cash-PnL Windows Remain for `V2`)**: Although V2 grid tuning ran on `W1`, the switch from `Uniform16` to `V9_Q_FastRed_Primary` (`ETH: 20 bps`) was motivated after observing V1's `ETH` cascade loss on `W2` (`core-rh-prospective-10h-20261114T044946Z`), and `W3` (`binance_6.45h`) incurred trade-stream gaps (`net_pnl = None`). Accordingly, `W2` is **consumed post-hoc**, leaving **`0` untouched 10-hour out-of-sample cash-PnL windows** for `V2` prior to the pre-registered Tokyo `K >= 10` holdout vault (`tokyo_holdout_vault`).
+> 2. **Non-Activation of `V9` Fast-Reducing in `BTC $500`**: `V9_Q_FastRed_Primary` on `BTC $500/$50` (`W1: +$0.2684 / +$0.1797`) matches V1 `Q6` (`§5.2`) identically on `W1` and within `$0.0004` on `W2` (`66/61` fills, `1,172` cancels), showing fast-reducing branches did not materially activate in that cell.
+> 3. **Passive Queue & Cancel-Boundary Optimism**: Public-tape passive queue advancement ignores ahead-of-us order cancellations (optimistic on deep books) and hidden liquidity, while `maker_first` `strict` mode classifies fills non-overlapping down to `-100 ms` before cancel dispatch (`conservative_cancel_guard` is the required pessimistic bound).
+> 4. **Unmeasured Live Action Delay & Silver Funding Fix**: The `250 ms + 300 ms = 550 ms` effective cancel/taker action latency is an unmeasured model assumption pending gated live minimal-clip telemetry (`TODO-EXEC-01`). Separately, a `100x` Lighter `update/market_stats` `current_funding_rate` (`%` -> `bps`) scaling bug in [quant_lakehouse.py](../scripts/quant_lakehouse.py) was fixed on `2026-11-15`; rebuild any pre-`2026-11-15` Silver funding tables before multi-day funding attribution.
+
 ---
 
 ## 1. Governance & Non-Subsidy Contract
@@ -439,18 +446,19 @@ each directly in the Rust execution/replay engines before sealing
 
 ---
 
-## 9. Scenario 1 (`Quant Profit`) — V2 Multi-Window Validation (`8/8` Raw Profitable, `7/8` Net025 Profitable)
+## 9. Scenario 1 (`Quant Profit`) — V2 Post-Hoc Multi-Window Diagnostics (Holdout Consumed — `0` Untouched OOS Windows Remaining)
 
 `V9_Q_FastRed_Primary` (`core_only = true`, `BTC: 16 bps`, `ETH: 20 bps`,
 `order_ttl_secs = 30`, `requote_threshold_bps = 3.0`,
 `reducing_order_ttl_secs = 4`, `reducing_requote_threshold_bps = 1.0`,
 `max_local_momentum_bps = 12.0`, `cancel_min_profit_bps = 5.0`,
 `flatten_min_profit_bps = 1.0`, `flatten_age_start_fraction = 0.10`,
-`per_side_bound_cancel = true`). All V2 parameter tuning (`selection_quant_v2..v8`,
-`selection_final_v7`) ran strictly on `W1`; `W2` (`core-rh-prospective-10h-20261114T044946Z`)
-was never used in V2 grid searches and was re-evaluated once under sealed
-`frozen_v2_policy.json` (`w2_lighter_quant_and_s3/summary.json`, SHA-256:
-`3777c2b4764e8647853c5664308564b737401ce94212032f05735d58fa70ffca`).
+`per_side_bound_cancel = true`). Although V2 numeric sweeps (`selection_quant_v2..v8`,
+`selection_final_v7`) ran on `W1`, `W2` (`core-rh-prospective-10h-20261114T044946Z`)
+had already been inspected during V1 failure diagnosis before locking `frozen_v2_policy.json`
+(`w2_lighter_quant_and_s3/summary.json`, SHA-256:
+`3777c2b4764e8647853c5664308564b737401ce94212032f05735d58fa70ffca`); treat `W2`
+results below as **post-hoc diagnostic validation**, not untouched prospective holdout.
 
 | Symbol & Budget | Arm | `W1` Raw / Net025 (`$`) | `W2` Raw / Net025 (`$`) | `W2` Net (`bps`) | `W2` Gross Turnover (`$`) | `W2` Fills (`M / T`) | `W2` Cancels (`10h`) | vs. V1 `Q6` on `W2` (`$`) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -782,10 +790,10 @@ reconnect (`trade_feed_gaps = 1`), `maker_replay` strictly sets
 
 ---
 
-### 14.5 Consolidated Final Verdict Across All Three Independent Scenarios (`50 ms` Network Tier)
+### 14.5 Consolidated Final Verdict Across All Three Independent Scenarios (`50 ms` Network Tier — Post-Audit Calibrated)
 
-| Independent Scenario | Qualified Primary Candidate & Venue | Certified `10 h` Out-of-Sample Evidence | Operational Gate & Verdict |
+| Independent Scenario | Qualified Primary Candidate & Venue | Diagnostic `10 h` Evidence (`W1` + Consumed `W2`) | Operational Gate & Verdict |
 | --- | --- | --- | --- |
-| **Scenario 1: Quant Profit** | `V9_Q_FastRed_Primary` (`BTC 16 bps`, `ETH 20 bps`, `30s` open / `4s` fast-reduce TTL, `12 bps` local shock gate + optional `500 ms` Binance staleness breaker) on **Lighter Core Standard (`0/0 bps`)** | `W1` (`4/4` net025 positive) + `W2` (`4/4` raw positive, `3/4` net025 positive: `BTC $1k +$0.376`, `ETH $1k +$0.229`); `6.45h` Binance capture negative (`-$0.43` to `-$3.53` unverified across `1` WS gap); HIP-3 `0ms` `ALO` `83/84` negative | **Selective `BTC`-led `0 bps` Standard Pilot Only** (`HOLD` on Premium fee accounts & standalone HIP-3 `ALO`; never enable `1.0 bps` micro-shock filter on `20 bps` quotes) |
-| **Scenario 2: Hedge Arbitrage** | **(a)** `S2_V2_TailHedge_primary` (`p6_4`) on `Lighter Core` + `Robinhood`; **(b)** Multi-day (`>= 48h–14d`) HIP-3 Growth-Mode Maker-Entry Funding Carry (`Long xyz / Short io` `NVDA` & `SNDK`) | **(a)** `BTC+ETH` portfolio profitable on both `W1` (`+$0.0155`–`+$0.0208` net025) & `W2` (`+$0.0476` net025) with **`0` cancel-overlap fills on `W2`**; **(b)** `14d` settled funding `+10.05%` APR (`NVDA`, `15.7h` breakeven) & `+6.39%` APR (`SNDK`, `24.7h` breakeven) | **GO for Small-Capital `TailHedge` Pilot** (confirm USDG/USDC parity); **Gate Multi-Day RWA Carry** on corporate-action & witnessed settlement audit; capture Arcus `trades` WS next |
-| **Scenario 3: Incentive Turnover (`"0"` Points Cash Value)** | **Mode A (`<= 0 bps`)**: `S3_ModeA_L1k_200s_FR_16bps` (`BTC` & `ETH`) + `S3_ModeA_RH_FlowPatient` (`rh200ms`); **Mode B (`<= $100 / $50M`)**: `S3_ModeB_L50k_5000s_FR_16bps__BTC` (`$5k` clip on `BTC`, `$200–$1k` clip on `ETH`) | **Mode A**: Negative cost (net cash profit!) on both `W1` (`-$64.22 / $1M`) & `W2` (`-$8.76 / $1M`, `$50.2k / 10h`); RH `ETH` at official `200ms` costs **`0.478 bps` (`W1`) / `0.567 bps` (`W2`)** (`1.080 bps` after `52.48%` Standard-Taker dilution). **Mode B `BTC`**: **`-$32.73` (`W1`) & `-$35.13 / $1M` (`W2`)** (`+$1,636` to `+$1,757` net cash profit per `$50M` volume at `~$783k/day`!) | **STRONGEST IMMEDIATE PRODUCTION FIT** — achieves **zero/negative cost** on Mode A and **net cash profit (`-$35 / $1M` vs. `+$2 / $1M` budget)** on Mode B `BTC` without assuming any point value |
+| **Scenario 1: Quant Profit** | `V9_Q_FastRed_Primary` (`BTC 16 bps`, `ETH 20 bps`, `30s` open / `4s` fast-reduce TTL, `12 bps` local shock gate + external-reference breaker) on **Lighter Core Standard (`0/0 bps`)** | `W1` (`4/4` net025 positive) + post-hoc `W2` (`4/4` raw positive, `3/4` net025 positive; note `BTC $500` equals V1 `Q6`); `6.45h` Binance capture incomplete/negative across `1` WS gap; HIP-3 `0ms` `ALO` `83/84` negative | **HOLD — Diagnostic Candidate Only (`0` Untouched OOS Windows Remain)**; freeze parameters before pre-registered Tokyo `K >= 10` `10h` holdout (`tokyo_holdout_vault`) + block-bootstrap CI & gated live cancel-latency calibration |
+| **Scenario 2: Hedge Arbitrage** | **(a)** `S2_V2_TailHedge_primary` (`p6_4`) on `Lighter Core` + `Robinhood`; **(b)** Multi-day (`>= 48h–14d`) HIP-3 Growth-Mode Maker-Entry Funding Carry (`Long xyz / Short io` `NVDA` & `SNDK`) | **(a)** `BTC+ETH` portfolio positive on `W1` (`+$0.0155`–`+$0.0208` net025) & `W2` (`+$0.0476` net025) under `strict` mode; **(b)** `14d` settled funding `+10.05%` APR (`NVDA`, `15.7h` breakeven) & `+6.39%` APR (`SNDK`, `24.7h` breakeven) | **HOLD — Gate on Pre-Registered Tokyo Holdout & `conservative_cancel_guard` Survival**; require USDG/USDC parity, corporate-action/holiday schedule audit, and live `10h` `arcus_trades` holdout before any pilot |
+| **Scenario 3: Incentive Turnover (`"0"` Points Cash Value)** | **Mode A (`<= 0 bps` target)**: `S3_ModeA_L1k_200s_FR_16bps` (`BTC` & `ETH`) + `S3_ModeA_RH_FlowPatient` (`rh200ms`); **Mode B (`<= $100 / $50M` budget)**: `S3_ModeB_L50k_5000s_FR_16bps__BTC` | **Mode A**: Modeled `-0.64 bps` (`W1`) & `-0.09 bps` (`W2`) on Core (`$50.2k / 10h`), `+0.478` / `+0.567 bps` on RH `ETH` (`1.080 bps` after `52.48%` Standard-Taker dilution); **Mode B `BTC`**: modeled `-$32.73` (`W1`) & `-$35.13 / $1M` (`W2`) | **HOLD on Standalone Cash-Profit Claim — Evaluate Strictly by Breakeven Point Value (`$ / $1M` Volume)** across `K >= 10` Tokyo holdout windows under `conservative_cancel_guard` and three-band queue sensitivity with hard loss-budget caps |

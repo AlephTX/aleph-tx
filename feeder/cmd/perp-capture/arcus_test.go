@@ -21,8 +21,8 @@ func TestArcusTradeSubscriptionsRequireMarketsAndDeduplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(subs) != 3 || subs[0].market != "NVDA-USD" || subs[1].market != "SNDK-USD" || subs[2].market != "BTC-USD" {
-		t.Fatalf("unexpected deduplicated subscriptions: %+v", subs)
+	if len(subs) != 1 || subs[0].market != "" || strings.Join(subs[0].coins, ",") != "NVDA-USD,SNDK-USD,BTC-USD" || len(subs[0].requests) != 3 {
+		t.Fatalf("unexpected deduplicated multiplexed subscription: %+v", subs)
 	}
 }
 

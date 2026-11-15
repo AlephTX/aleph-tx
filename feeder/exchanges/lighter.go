@@ -14,8 +14,10 @@ import (
 	"nhooyr.io/websocket"
 )
 
-// Lighter connects to the Lighter (zkLighter) orderbook WebSocket.
+// Lighter connects to a Lighter (Core or Robinhood Chain) orderbook WebSocket.
 type Lighter struct {
+	exchangeID  uint8
+	loopName    string
 	cfg         config.ExchangeConfig
 	matrix      *shm.Matrix
 	depthWriter *shm.DepthWriter
@@ -24,24 +26,30 @@ type Lighter struct {
 }
 
 func NewLighter(cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer, depthWriter *shm.DepthWriter) *Lighter {
+	return NewLighterWithID(ExchangeLighter, "lighter-public", cfg, matrix, eventBuffer, depthWriter)
+}
+
+func NewLighterWithID(exchangeID uint8, loopName string, cfg config.ExchangeConfig, matrix *shm.Matrix, eventBuffer *shm.EventRingBuffer, depthWriter *shm.DepthWriter) *Lighter {
 	mktMap := make(map[int]uint16)
-	for localSym, exchIdxStr := range cfg.Symbols {
-		log.Printf("lighter: mapping symbol %s (exchIdx=%s)", localSym, exchIdxStr)
+	for localSym, exchIdxStr := range cfg.AllPublicSymbols() {
+		log.Printf("%s: mapping symbol %s (exchIdx=%s)", loopName, localSym, exchIdxStr)
 		if id, ok := SymbolNameToID[localSym]; ok {
 			idx, err := strconv.Atoi(exchIdxStr)
 			if err != nil || idx < 0 {
-				log.Printf("lighter: invalid market mapping for %s: %q", localSym, exchIdxStr)
+				log.Printf("%s: invalid market mapping for %s: %q", loopName, localSym, exchIdxStr)
 				continue
 			}
 			mktMap[idx] = id
-			log.Printf("lighter: mapped market %d -> symbol %d (%s)", idx, id, localSym)
+			log.Printf("%s: mapped market %d -> symbol %d (%s)", loopName, idx, id, localSym)
 		} else {
-			log.Printf("lighter: WARNING: symbol %s not found in SymbolNameToID", localSym)
+			log.Printf("%s: WARNING: symbol %s not found in SymbolNameToID", loopName, localSym)
 		}
 	}
-	log.Printf("lighter: initialized with %d markets: %v", len(mktMap), mktMap)
+	log.Printf("%s: initialized with %d markets: %v", loopName, len(mktMap), mktMap)
 
 	return &Lighter{
+		exchangeID:  exchangeID,
+		loopName:    loopName,
 		cfg:         cfg,
 		matrix:      matrix,
 		depthWriter: depthWriter,
@@ -54,15 +62,15 @@ func (l *Lighter) Run(ctx context.Context) error {
 	l.invalidateAll()
 	// Only run public orderbook stream
 	// Private events are handled by LighterPrivate in lighter_private.go
-	return RunConnectionLoop(ctx, "lighter-public", l.connectPublic)
+	return RunConnectionLoop(ctx, l.loopName, l.connectPublic)
 }
 
 func (l *Lighter) invalidateBook(symbolID uint16) {
 	if l.matrix != nil {
-		l.matrix.InvalidateBBO(ExchangeLighter, symbolID)
+		l.matrix.InvalidateBBO(l.exchangeID, symbolID)
 	}
 	if l.depthWriter != nil {
-		l.depthWriter.InvalidateDepth(symbolID, ExchangeLighter)
+		l.depthWriter.InvalidateDepth(symbolID, l.exchangeID)
 	}
 }
 
@@ -154,10 +162,10 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			return fmt.Errorf("market %d: future book timestamp", mktIdx)
 		}
 		tsNs := uint64(tsMs) * 1_000_000
-		l.matrix.WriteBBO(ExchangeLighter, symID, tsNs,
+		l.matrix.WriteBBO(l.exchangeID, symID, tsNs,
 			bids[0].Price, bids[0].Size, asks[0].Price, asks[0].Size)
 		if l.depthWriter != nil {
-			l.depthWriter.WriteDepth(symID, ExchangeLighter, tsNs, bids, asks)
+			l.depthWriter.WriteDepth(symID, l.exchangeID, tsNs, bids, asks)
 		}
 	}
 }

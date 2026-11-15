@@ -106,9 +106,9 @@ def ingest(source, root):
                 raise ValueError('invalid capture order or footer')
             venue, domain, channel = route(row)
             event = row['event']
-            if event not in ('message', 'connected', 'subscribed', 'disconnect', 'clock_refresh', 'end'):
+            if event not in ('message', 'connected', 'subscribed', 'disconnect', 'clock_refresh', 'segment_start', 'segment_end', 'end'):
                 raise ValueError('unsupported public event')
-            if (venue == 'collector') != (event == 'end'):
+            if (venue == 'collector') != (event in ('segment_start', 'segment_end', 'end')):
                 raise ValueError('invalid collector footer')
             ended = event == 'end'
             previous = at

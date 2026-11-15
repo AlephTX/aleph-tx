@@ -27,12 +27,15 @@ for user in aleph-tx aleph-tx-trader; do
 done
 sudo -n install -d -m 0755 "$root/releases" /etc/aleph-tx
 sudo -n mkdir -m 0755 "$dest"
-sudo -n install -d -m 0755 "$dest/bin" "$dest/lib" "$dest/dashboard" "$dest/examples"
+sudo -n install -d -m 0755 "$dest/bin" "$dest/lib" "$dest/dashboard" "$dest/examples" "$dest/scripts"
 sudo -n install -m 0755 feeder/feeder-app feeder/perp-capture \
   target/release/{cross_venue,lighter_inventory_mm} "$dest/bin/"
 sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
 sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts}.py "$dest/"
+sudo -n install -m 0755 \
+  scripts/{capture_timing,archive_public_capture,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner}.py \
+  "$dest/scripts/"
 sudo -n cp -R --no-preserve=ownership dashboard/dist/. "$dest/dashboard/"
 sudo -n chmod -R u=rwX,go=rX "$dest/dashboard"
 printf '{"id":"%s","source_sha256":"%s","base_commit":"%s"}\n' "$release" "$source_sha" "$commit" |
@@ -43,8 +46,12 @@ LD_LIBRARY_PATH="$dest/lib" "$dest/bin/cross_venue" perp-replay "$dest/examples/
 if [[ ! -e /etc/aleph-tx/feeder.toml ]]; then
   sudo -n install -m 0644 deploy/oasis/feeder.toml /etc/aleph-tx/feeder.toml
 fi
-for unit in feeder monitor live; do
+for unit in feeder monitor live flywheel; do
   sudo -n install -m 0644 "deploy/oasis/aleph-tx-$unit.service" /etc/systemd/system/
+done
+sudo -n install -m 0644 deploy/oasis/aleph-tx-flywheel.timer /etc/systemd/system/
+for stream in crypto rwa bulk; do
+  sudo -n install -m 0644 "deploy/oasis/aleph-perp-capture-$stream.service" /etc/systemd/system/
 done
 sudo -n install -m 0644 deploy/oasis/aleph-tx-telemetry.conf /etc/tmpfiles.d/aleph-tx-telemetry.conf
 sudo -n systemd-tmpfiles --create /etc/tmpfiles.d/aleph-tx-telemetry.conf

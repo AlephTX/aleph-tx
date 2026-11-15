@@ -297,13 +297,26 @@ fn attach_funding_proofs(
     Ok(())
 }
 
+fn open_capture_stream(input: &str) -> Result<Box<dyn BufRead>> {
+    if input == "-" {
+        return Ok(Box::new(BufReader::new(std::io::stdin())));
+    }
+    let parts: Vec<&str> = input.split(',').filter(|s| !s.is_empty()).collect();
+    ensure!(!parts.is_empty(), "capture input path is empty");
+    let mut reader: Box<dyn Read> = Box::new(File::open(parts[0])?);
+    for part in &parts[1..] {
+        reader = Box::new(reader.chain(File::open(part)?));
+    }
+    Ok(Box::new(BufReader::new(reader)))
+}
+
 fn capture_to_replay(
     config: &CaptureConfig,
     input: &str,
     output: &str,
     registry: &VenueRegistry,
 ) -> Result<()> {
-    let input = BufReader::new(File::open(input)?);
+    let input = open_capture_stream(input)?;
     let output = Path::new(output);
     ensure!(
         output.extension().is_some_and(|suffix| suffix == "ndjson"),

@@ -14,6 +14,7 @@ from quant_lakehouse import (
     evict_local_capture,
     normalize_capture,
     seal_bronze_capture,
+    seal_bronze_segment_chain,
     unpack_bundle_tar,
 )
 
@@ -257,9 +258,27 @@ class QuantLakehouseTests(unittest.TestCase):
                     },
                 },
             ),
-            # 6. Lighter Robinhood trades: subscription snapshot ignored, zero-price bankruptcy flagged, fees preserved
             self._timed_row(
                 12,
+                "lighter_robinhood",
+                "message",
+                59,
+                payload={
+                    "type": "update/market_stats",
+                    "channel": "market_stats:0",
+                    "timestamp": self.t0 + 58,
+                    "market_stats": {
+                        "symbol": "ETH",
+                        "index_price": "2500.10",
+                        "mark_price": "2500.15",
+                        "current_funding_rate": "0.0012",
+                        "funding_timestamp": self.t0,
+                    },
+                },
+            ),
+            # 6. Lighter Robinhood trades: subscription snapshot ignored, zero-price bankruptcy flagged, fees preserved
+            self._timed_row(
+                13,
                 "lighter_robinhood_trades",
                 "message",
                 60,
@@ -280,7 +299,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 },
             ),
             self._timed_row(
-                13,
+                14,
                 "lighter_robinhood_trades",
                 "message",
                 65,
@@ -314,7 +333,7 @@ class QuantLakehouseTests(unittest.TestCase):
             ),
             # 7. BULK REST snapshot with nanosecond wire timestamp + late source clock (still ordered by available_at_ms)
             self._timed_row(
-                14,
+                15,
                 "bulk_snapshot",
                 "message",
                 70,
@@ -328,7 +347,7 @@ class QuantLakehouseTests(unittest.TestCase):
                     },
                 },
             ),
-            self._timed_row(15, "collector", "end", 80),
+            self._timed_row(16, "collector", "end", 80),
         ]
 
         capture_path = self._write_gz_capture("2026-11-15-tokyo-priority.ndjson.gz", rows)
@@ -340,8 +359,8 @@ class QuantLakehouseTests(unittest.TestCase):
             split_role="selection_dev",
             manifest_out=manifest_path,
         )
-        self.assertEqual(bronze["records"], 15)
-        self.assertEqual(bronze["precise_timing_records"], 15)
+        self.assertEqual(bronze["records"], 16)
+        self.assertEqual(bronze["precise_timing_records"], 16)
         self.assertFalse(bronze["meets_ten_hour_validation_unit"])
         self.assertEqual(bronze["coverage_class"], "diagnostic_short_window")
         self.assertIn("arcus:mainnet:NVDA-USD", bronze["markets_observed"])
@@ -359,7 +378,7 @@ class QuantLakehouseTests(unittest.TestCase):
         )
         self.assertEqual(silver["tables"]["bbo_quotes"]["rows"], 6)
         self.assertEqual(silver["tables"]["public_trades"]["rows"], 4)
-        self.assertEqual(silver["tables"]["funding_and_ctx"]["rows"], 1)
+        self.assertEqual(silver["tables"]["funding_and_ctx"]["rows"], 2)
 
         bbos = _read_gz_ndjson(silver_dir / "bbo_quotes.ndjson.gz")
         # Ceil of available_wall_ns (+250_000 ns) adds +1 ms over truncated available_at_ms
@@ -382,6 +401,9 @@ class QuantLakehouseTests(unittest.TestCase):
         self.assertIsNone(ctxs[0]["source_time_ms"])
         self.assertEqual(ctxs[0]["venue"], "entropy")
         self.assertEqual(ctxs[0]["funding_rate_bps"], "0.125")
+        self.assertEqual(ctxs[1]["venue"], "lighter_robinhood")
+        self.assertEqual(ctxs[1]["funding_rate_raw"], "0.0012")
+        self.assertEqual(ctxs[1]["funding_rate_bps"], "0.12")
 
         trades = _read_gz_ndjson(silver_dir / "public_trades.ndjson.gz")
         self.assertEqual([t["trade_id"] for t in trades], ["901", "12", "501", "502"])
@@ -526,6 +548,156 @@ class QuantLakehouseTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "traversal"):
             unpack_bundle_tar(evil_tar, evil_man, self.root / "safe_target")
+
+    def test_rolling_segments_seal_chain_and_stateful_book_continuity(self) -> None:
+        # Segment 0: opens Lighter Robinhood L2 snapshot (nonce=100) and rotates at +5h.
+        seg0_rows = [
+            self._timed_row(
+                1,
+                "collector",
+                "segment_start",
+                0,
+                payload={"segment_index": 0},
+            ),
+            self._timed_row(
+                2,
+                "lighter_robinhood",
+                "message",
+                10,
+                request_sent_at_ms=self.t0 + 5,
+                payload={
+                    "type": "subscribed/order_book",
+                    "channel": "order_book:0",
+                    "timestamp": self.t0 + 9,
+                    "order_book": {
+                        "nonce": 100,
+                        "begin_nonce": 99,
+                        "last_updated_at": (self.t0 + 9) * 1_000,
+                        "bids": [{"price": "140.00", "size": "10.0"}],
+                        "asks": [{"price": "140.20", "size": "12.0"}],
+                    },
+                },
+            ),
+            self._timed_row(
+                3,
+                "collector",
+                "segment_end",
+                18_000_000,
+                payload={"segment_index": 0, "continued": True},
+            ),
+        ]
+        # Segment 1: continues same run_id at sequence=4, applies delta update (100 -> 101)
+        # without re-snapshot, and seals at +10h05m!
+        seg1_rows = [
+            self._timed_row(
+                4,
+                "collector",
+                "segment_start",
+                18_000_001,
+                payload={
+                    "segment_index": 1,
+                    "prev_segment": "2026-11-16-flywheel.seg0000.ndjson.gz",
+                },
+            ),
+            self._timed_row(
+                5,
+                "lighter_robinhood",
+                "message",
+                18_000_010,
+                payload={
+                    "type": "update/order_book",
+                    "channel": "order_book:0",
+                    "timestamp": self.t0 + 18_000_009,
+                    "order_book": {
+                        "nonce": 101,
+                        "begin_nonce": 100,
+                        "last_updated_at": (self.t0 + 18_000_009) * 1_000,
+                        "bids": [{"price": "140.10", "size": "8.0"}],
+                        "asks": [],
+                    },
+                },
+            ),
+            self._timed_row(
+                6,
+                "collector",
+                "segment_end",
+                36_300_000,
+                payload={"segment_index": 1, "continued": False},
+            ),
+            self._timed_row(7, "collector", "end", 36_300_001),
+        ]
+
+        seg0 = self._write_gz_capture("2026-11-16-flywheel.seg0000.ndjson.gz", seg0_rows)
+        seg1 = self._write_gz_capture("2026-11-16-flywheel.seg0001.ndjson.gz", seg1_rows)
+
+        # Individual segments must NEVER certify a 10h validation unit on their own.
+        m0 = seal_bronze_capture(
+            seg0,
+            campaign_id="2026-11-16-flywheel",
+            collector_region="tokyo",
+            split_role="selection_dev",
+        )
+        m1 = seal_bronze_capture(
+            seg1,
+            campaign_id="2026-11-16-flywheel",
+            collector_region="tokyo",
+            split_role="selection_dev",
+        )
+        self.assertEqual(m0["artifact_kind"], "bronze_public_segment")
+        self.assertEqual(m0["coverage_class"], "rolling_segment")
+        self.assertFalse(m0["meets_ten_hour_validation_unit"])
+        self.assertFalse(m1["meets_ten_hour_validation_unit"])
+
+        # Mid-chain non-terminal segment cannot be normalized standalone.
+        with self.assertRaisesRegex(ValueError, "terminal collector/end"):
+            normalize_capture(
+                seg0,
+                self.root / "bad_single_seg_silver",
+                campaign_id="2026-11-16-flywheel",
+                collector_region="tokyo",
+                precise_times=True,
+            )
+
+        # Contiguous unbroken chain certifies 10h validation unit and preserves delta book state.
+        chain_manifest_path = self.root / "2026-11-16-flywheel.chain_manifest.json"
+        chain = seal_bronze_segment_chain(
+            [seg0, seg1],
+            campaign_id="2026-11-16-flywheel",
+            collector_region="tokyo",
+            split_role="selection_dev",
+            manifest_out=chain_manifest_path,
+        )
+        self.assertTrue(chain["meets_ten_hour_validation_unit"])
+        self.assertEqual(chain["coverage_class"], "ten_hour_candidate")
+        self.assertEqual(chain["first_sequence"], 1)
+        self.assertEqual(chain["last_sequence"], 7)
+
+        chain_silver = self.root / "chain_silver"
+        norm = normalize_capture(
+            chain_manifest_path,
+            chain_silver,
+            campaign_id="2026-11-16-flywheel",
+            collector_region="tokyo",
+            precise_times=True,
+        )
+        self.assertEqual(norm["tables"]["bbo_quotes"]["rows"], 2)
+        bbos = _read_gz_ndjson(chain_silver / "bbo_quotes.ndjson.gz")
+        # Segment 1's delta (nonce 100->101) retained Segment 0's ask=140.2 while updating bid=140.1!
+        self.assertEqual(bbos[1]["bid_px"], "140.1")
+        self.assertEqual(bbos[1]["ask_px"], "140.2")
+
+        # Tampered sequence gap or run_id reset across segments must be rejected!
+        gap_rows = [json.loads(json.dumps(r)) for r in seg1_rows]
+        for idx, r in enumerate(gap_rows):
+            r["capture_timing"]["sequence"] = 5 + idx  # skips sequence 4
+        seg1_gap = self._write_gz_capture("2026-11-16-gap.seg0001.ndjson.gz", gap_rows)
+        with self.assertRaisesRegex(ValueError, "sequence gap"):
+            seal_bronze_segment_chain(
+                [seg0, seg1_gap],
+                campaign_id="2026-11-16-flywheel",
+                collector_region="tokyo",
+                split_role="selection_dev",
+            )
 
 
 if __name__ == "__main__":

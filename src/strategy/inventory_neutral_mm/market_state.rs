@@ -18,12 +18,36 @@ pub(super) fn select_exchange_bbo(
         .filter(valid_quoteable_book)
 }
 
+/// Bounded NTP clock skew tolerated between exchange source timestamps and
+/// local wall clock on live low-latency links (e.g. 3–4 ms Tokyo WS). Causal
+/// replay (`ReplayClock`) always uses `0` skew to forbid lookahead.
+pub(super) const MAX_FUTURE_CLOCK_SKEW_NS: u64 = 500_000_000;
+
+fn live_future_skew_ns() -> u64 {
+    #[cfg(feature = "research-replay")]
+    if super::replay::recorded::wall_time_ns().is_some() {
+        return 0;
+    }
+    MAX_FUTURE_CLOCK_SKEW_NS
+}
+
 pub(super) fn data_age_ms(timestamp_ns: u64, now_ns: u64) -> u64 {
     now_ns.saturating_sub(timestamp_ns) / 1_000_000
 }
 
 pub(super) fn is_stale_bbo(timestamp_ns: u64, now_ns: u64, threshold_ms: u64) -> bool {
     timestamp_ns == 0 || timestamp_ns > now_ns || data_age_ms(timestamp_ns, now_ns) > threshold_ms
+}
+
+fn is_stale_bbo_with_skew(
+    timestamp_ns: u64,
+    now_ns: u64,
+    threshold_ms: u64,
+    max_future_skew_ns: u64,
+) -> bool {
+    timestamp_ns == 0
+        || timestamp_ns > now_ns.saturating_add(max_future_skew_ns)
+        || data_age_ms(timestamp_ns, now_ns) > threshold_ms
 }
 
 /// Depth-normalized imbalance of successive external best quotes.
@@ -54,7 +78,7 @@ impl OrderFlow {
         };
         if let Some(last) = self.previous {
             if book.timestamp_ns == last.timestamp_ns {
-                return self.decay(now_ns - book.timestamp_ns, half_life_ms);
+                return self.decay(now_ns.saturating_sub(book.timestamp_ns), half_life_ms);
             }
             if book.timestamp_ns < last.timestamp_ns
                 || data_age_ms(last.timestamp_ns, book.timestamp_ns) > stale_ms
@@ -97,7 +121,7 @@ impl OrderFlow {
             }
         }
         self.previous = Some(book);
-        self.decay(now_ns - book.timestamp_ns, half_life_ms)
+        self.decay(now_ns.saturating_sub(book.timestamp_ns), half_life_ms)
     }
 
     fn decay(&self, age_ns: u64, half_life_ms: u64) -> f64 {
@@ -170,7 +194,7 @@ impl CrossMarketPressure {
         }
         // Both legs contribute to the estimate. Discount through the age of
         // the older book plus the time until the new quote can be executed.
-        let age_ns = now_ns - times[0].min(times[1]);
+        let age_ns = now_ns.saturating_sub(times[0].min(times[1]));
         let horizon_ns = age_ns as f64 + config.execution_delay_ms as f64 * 1_000_000.0;
         (self.pressure_bps * 2.0_f64.powf(-horizon_ns / half_life_ns))
             .clamp(-config.max_widen_bps, config.max_widen_bps)
@@ -268,7 +292,10 @@ pub(super) fn classify_stale_bbo(
 ) -> StaleBboAction {
     // A static book is not proof of a live feed. Age the source timestamp,
     // rather than starting another timeout only after a stale read is observed.
-    if bbo.timestamp_ns == 0 || bbo.timestamp_ns > now_ns || !valid_quoteable_book(bbo) {
+    if bbo.timestamp_ns == 0
+        || bbo.timestamp_ns > now_ns.saturating_add(live_future_skew_ns())
+        || !valid_quoteable_book(bbo)
+    {
         return StaleBboAction::Cancel;
     }
     let age_ms = data_age_ms(bbo.timestamp_ns, now_ns);
@@ -298,24 +325,38 @@ pub(super) fn build_market_state(
 /// median and the oldest feed timestamp (ns) among the books it used.
 ///
 /// v6.0.1: Added DEBUG logging to track staleness and fallback behavior.
+#[cfg(test)]
 pub(super) fn external_fair_value_mid(
     exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES],
     local_exchange_id: u8,
     now_ns: u64,
     staleness_ms: u64,
 ) -> Option<(f64, u64)> {
+    external_fair_value_mid_filtered(exchanges, local_exchange_id, now_ns, staleness_ms, u16::MAX)
+}
+
+pub(super) fn external_fair_value_mid_filtered(
+    exchanges: &[(u8, ShmBboMessage); NUM_EXCHANGES],
+    local_exchange_id: u8,
+    now_ns: u64,
+    staleness_ms: u64,
+    allowed_mask: u16,
+) -> Option<(f64, u64)> {
     // Exchange count is fixed by the SHM ABI: keep the fair-value hot path
-    // on the stack, including median sorting.
+    // on the stack, including median sorting and slot allowlist filtering.
     let mut valid_mids = [0.0_f64; NUM_EXCHANGES];
     let mut count = 0;
     let mut oldest_ns = u64::MAX;
+    let skew_ns = live_future_skew_ns();
     for (exchange_id, bbo) in exchanges {
         if *exchange_id == local_exchange_id
             || *exchange_id == 0
+            || (*exchange_id as usize) >= NUM_EXCHANGES
+            || (allowed_mask & (1u16 << *exchange_id)) == 0
             || !valid_quoteable_book(bbo)
             || bbo.bid_price == 0.0
             || bbo.ask_price == 0.0
-            || is_stale_bbo(bbo.timestamp_ns, now_ns, staleness_ms)
+            || is_stale_bbo_with_skew(bbo.timestamp_ns, now_ns, staleness_ms, skew_ns)
         {
             continue;
         }
@@ -540,15 +581,8 @@ mod tests {
 
     #[test]
     fn build_market_state_selects_local_bbo_when_one_side_exists() {
-        let exchanges = [
-            default_exchange(),
-            (1, msg(2100.0, 0.0, 1)),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-        ];
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[1] = (1, msg(2100.0, 0.0, 1));
 
         let state = build_market_state(exchanges, 1).expect("local bbo should exist");
 
@@ -593,7 +627,7 @@ mod tests {
             msg(2100.0, f64::INFINITY, now),
             msg(2101.0, 2100.0, now),
             msg(2100.0, 2101.0, 0),
-            msg(2100.0, 2101.0, now + 1),
+            msg(2100.0, 2101.0, now + MAX_FUTURE_CLOCK_SKEW_NS + 1),
         ] {
             let mut exchanges = [default_exchange(); NUM_EXCHANGES];
             exchanges[1] = (1, book);
@@ -606,17 +640,29 @@ mod tests {
     }
 
     #[test]
+    fn minor_exchange_clock_skew_is_accepted_within_bound() {
+        let now = 10_000_000_000;
+        let skewed = msg(2100.0, 2101.0, now + 5_000_000); // +5 ms Tokyo NTP skew
+        assert!(is_stale_bbo(skewed.timestamp_ns, now, 1_000));
+        assert_eq!(
+            classify_stale_bbo(&skewed, now, 1_000, 2_500),
+            StaleBboAction::Fresh
+        );
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[1] = (1, skewed);
+        let mid = external_fair_value_mid(&exchanges, 2, now, 1_000).expect("skewed external mid");
+        assert!((mid.0 - 2100.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn external_fair_value_mid_uses_only_fresh_non_local_two_sided_books() {
         let now_ns = 10_000_000_000;
-        let exchanges = [
-            default_exchange(),
-            (1, msg(2100.0, 2101.0, 9_999_000_000)),
-            (2, msg(2000.0, 2001.0, 9_999_000_000)),
-            (3, msg(2200.0, 2201.0, 9_999_000_000)),
-            (4, msg(2300.0, 0.0, 9_999_000_000)), // one-sided, filtered out
-            (5, msg(2400.0, 2401.0, 9_000_000_000)), // stale at 500ms threshold
-            default_exchange(),
-        ];
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[1] = (1, msg(2100.0, 2101.0, 9_999_000_000));
+        exchanges[2] = (2, msg(2000.0, 2001.0, 9_999_000_000));
+        exchanges[3] = (3, msg(2200.0, 2201.0, 9_999_000_000));
+        exchanges[4] = (4, msg(2300.0, 0.0, 9_999_000_000)); // one-sided, filtered out
+        exchanges[5] = (5, msg(2400.0, 2401.0, 9_000_000_000)); // stale at 500ms threshold
 
         // local=2 excluded; exch 4 one-sided excluded; exch 5 stale excluded
         // remaining: exch 1 (2100.5), exch 3 (2200.5) → median = (2100.5+2200.5)/2 = 2150.5
@@ -631,15 +677,10 @@ mod tests {
     #[test]
     fn external_fair_value_mid_uses_median_not_mean() {
         let now_ns = 10_000_000_000;
-        let exchanges = [
-            default_exchange(),
-            (1, msg(2100.0, 2101.0, 9_999_000_000)),
-            (2, msg(2100.0, 2101.0, 9_999_000_000)),
-            (3, msg(2500.0, 2501.0, 9_999_000_000)),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-        ];
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[1] = (1, msg(2100.0, 2101.0, 9_999_000_000));
+        exchanges[2] = (2, msg(2100.0, 2101.0, 9_999_000_000));
+        exchanges[3] = (3, msg(2500.0, 2501.0, 9_999_000_000));
 
         // local=0 excluded; 3 valid mids: 2100.5, 2100.5, 2500.5 → median = 2100.5
         let external_mid =
@@ -651,19 +692,45 @@ mod tests {
     #[test]
     fn external_fair_value_mid_returns_none_when_all_stale() {
         let now_ns = 10_000_000_000;
-        let exchanges = [
-            default_exchange(),
-            (1, msg(2100.0, 2101.0, 7_000_000_000)), // 3000ms old, stale at 2000ms
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-            default_exchange(),
-        ];
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[1] = (1, msg(2100.0, 2101.0, 7_000_000_000)); // 3000ms old, stale at 2000ms
 
         let external_mid = external_fair_value_mid(&exchanges, 0, now_ns, 2000);
 
         assert!(external_mid.is_none());
+    }
+
+    #[test]
+    fn external_fair_value_mid_filtered_honors_multi_venue_allowlist() {
+        use crate::config::{
+            EXCH_ARCUS, EXCH_BINANCE, EXCH_ENTROPY, EXCH_HYPERLIQUID, EXCH_LIGHTER,
+            EXCH_LIGHTER_ROBINHOOD, EXCH_TRADEXYZ,
+        };
+        let now_ns = 10_000_000_000;
+        let mut exchanges = [default_exchange(); NUM_EXCHANGES];
+        exchanges[EXCH_HYPERLIQUID as usize] =
+            (EXCH_HYPERLIQUID, msg(2450.0, 2451.0, 9_999_000_000));
+        exchanges[EXCH_BINANCE as usize] = (EXCH_BINANCE, msg(2452.0, 2453.0, 9_999_000_000));
+        exchanges[EXCH_ARCUS as usize] = (EXCH_ARCUS, msg(2454.0, 2455.0, 9_999_000_000));
+        exchanges[EXCH_LIGHTER_ROBINHOOD as usize] =
+            (EXCH_LIGHTER_ROBINHOOD, msg(2490.0, 2491.0, 9_999_000_000));
+        exchanges[EXCH_ENTROPY as usize] = (EXCH_ENTROPY, msg(145.0, 145.2, 9_999_000_000));
+        exchanges[EXCH_TRADEXYZ as usize] = (EXCH_TRADEXYZ, msg(145.1, 145.3, 9_999_000_000));
+
+        // Pin crypto fair-value anchor to HL + Binance + Arcus only (excluding USDG/RWA slots).
+        let crypto_mask =
+            (1u16 << EXCH_HYPERLIQUID) | (1u16 << EXCH_BINANCE) | (1u16 << EXCH_ARCUS);
+        let crypto_mid =
+            external_fair_value_mid_filtered(&exchanges, EXCH_LIGHTER, now_ns, 2000, crypto_mask)
+                .expect("crypto mid");
+        assert!((crypto_mid.0 - 2452.5).abs() < 1e-9);
+
+        // Pin RWA fair-value anchor to Entropy + TradeXYZ only.
+        let rwa_mask = (1u16 << EXCH_ENTROPY) | (1u16 << EXCH_TRADEXYZ);
+        let rwa_mid =
+            external_fair_value_mid_filtered(&exchanges, EXCH_ARCUS, now_ns, 2000, rwa_mask)
+                .expect("rwa mid");
+        assert!((rwa_mid.0 - 145.15).abs() < 1e-9);
     }
     #[test]
     #[ignore = "manual release-mode performance benchmark"]

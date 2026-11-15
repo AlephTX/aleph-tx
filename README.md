@@ -1,193 +1,202 @@
 <h1 align="center">
-  <img src="docs/assets/aleph-tx-hero.svg" alt="AlephTX · Perpetual futures execution and relative-value research" width="1120">
+  <img src="docs/assets/aleph-tx-hero.svg" alt="AlephTX · Institutional Perpetual Execution &amp; Quantitative Lakehouse Engine" width="1120">
 </h1>
 
 <p align="center">
-  <a href="docs/QUICKSTART.md">Quickstart</a> ·
-  <a href="docs/LIVE_TRADING.md">Trading and recovery</a> ·
-  <a href="docs/CROSS_VENUE.md">Venue coverage</a> ·
-  <a href="docs/PERP_RECORDING.md">Market data</a> ·
-  <a href="docs/QUANT_DATA_LAKEHOUSE.md">Lakehouse</a> ·
-  <a href="docs/PERP_RELATIVE_VALUE.md">Paper execution</a> ·
-  <a href="docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md">Tokyo roadmap</a>
+  <a href="docs/QUICKSTART.md"><b>Quickstart</b></a> ·
+  <a href="docs/LIVE_TRADING.md"><b>Trading &amp; Recovery</b></a> ·
+  <a href="docs/DUAL_TRACK_IPC.md"><b>Shared-Memory ABI</b></a> ·
+  <a href="docs/CROSS_VENUE.md"><b>Venue Matrix</b></a> ·
+  <a href="docs/PERP_RECORDING.md"><b>24×7 Capture</b></a> ·
+  <a href="docs/QUANT_DATA_LAKEHOUSE.md"><b>Medallion Lakehouse</b></a> ·
+  <a href="docs/PERP_RELATIVE_VALUE.md"><b>Causal Replay</b></a> ·
+  <a href="docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md"><b>Tokyo Roadmap</b></a>
 </p>
 
-AlephTX runs inventory-aware market making on Lighter, with an optional
-inventory hedge on native Hyperliquid. Its separate research path compiles
-recorded depth, funding and independent reference prices into reproducible
-two-leg simulations for crypto and equity perpetuals.
+<p align="center">
+  <code>Rust 1.95.0</code> ·
+  <code>Go 1.25.0</code> ·
+  <code>12-Slot Seqlock SHM (64B / 256B)</code> ·
+  <code>128B V2 Private Event Ring</code> ·
+  <code>Tokyo &lt;10ms Edge</code> ·
+  <code>DuckDB 2.0 + CUDA 12.6</code>
+</p>
 
-## Validate locally
+---
 
-Run the profile check from the repository root. It resolves the network,
-market and strategy mode without loading credentials or starting a feeder.
+**AlephTX** is an institutional-grade perpetual futures execution and causal relative-value research engine engineered around three strictly separated operational planes:
+
+1. **Sub-10ms Supervised Execution (`oasis-tokyo` · `Go 1.25` + `Rust 1.95`)** — A multi-venue Go feed daemon reconstructs full orderbooks and publishes lock-free BBO (`aleph-matrix`, `64B`) and Top-5 depth (`aleph-depth`, `256B`, `64B`-aligned) across **12 exchange slots**, paired with a `128`-byte V2 private execution ring (`aleph-events`). The Rust execution core (`lighter_inventory_mm`) runs zero-allocation multi-venue fair-value pricing, asymmetric adverse-selection cancel shields (`per_side_bound_cancel`), multi-lane API-key signing isolation (`Maker` / `Cancel` / `Taker`), dual-state (`pending`/`confirmed`) nonce state machines, and write-ahead recovery journals with optional protected IOC hedging on native Hyperliquid.
+2. **24×7 Rolling Public Capture & Live-as-Data Flywheel** — Three physically isolated systemd capture streams (`crypto`, `rwa`, `bulk`) record orderbooks, public trade prints (with Lighter fee-signature integers and edge-redacted Arcus prints), funding histories, and dual CEX anchors (`Binance USD-M` + `Coinbase Spot`) under a `<25 µs` paired VDSO monotonic/wall-clock guard. Completed `10h15m` (`36,900s`) windows and zero-gap in-process segments (`-segment-duration`) are cryptographically sealed (`.bronze_manifest.json`) and shipped under Linux `SCHED_IDLE` / `ionice -c 3` to a **20 TB Medallion Lakehouse** with zero impact on hot-path latency.
+3. **Causal 10-Hour Backtesting & Post-Trade Attribution (`aleph` Workstation)** — A 3-tier NVMe workstation (`ext4` Hot Compute + `E:` Cold Bronze Vault + `C:` Bundle/Evidence Cache, `DuckDB 2.0` + `RTX 4070 Ti`) compiles arrival-ordered raw archives into causal replay frames (`cross_venue`) and runs millisecond `ASOF JOIN` fill markout attribution (`scripts/live_attribution.py`) across **three strictly non-subsidized strategy programs**: **Quant Profit (`01`)**, **Hedge Arbitrage (`02`)**, and **Incentive Turnover (`03`)**.
+
+---
+
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph PLANE1["01 · Supervised Low-Latency Execution Plane (oasis-tokyo · asia-northeast1)"]
+        direction LR
+        VENUES["Lighter Core & RH · Arcus<br/>Hyperliquid · Entropy · TradeXYZ<br/>Binance USD-M"] --> FEEDER["Go Feed Daemon<br/>(Book Continuity & V2 Auth)"]
+        FEEDER -->|"Seqlock BBO (64B) & Top-5 Depth (256B)<br/>+ 128B V2 Private Events"| SHM["POSIX Shared Memory<br/>(12-Slot Matrix & Rings)"]
+        SHM --> EXEC["Rust Strategy & Order Tracker<br/>(3-Lane Signer · Per-Side Shield)"]
+        EXEC -->|"Maker Quotes & Protected IOC"| VENUES
+        EXEC --> JOURNAL["Write-Ahead Recovery Journal<br/>(Two-Venue Barrier)"]
+        EXEC --> TELEM["Async Session Telemetry<br/>(JSONL -> SQLite)"]
+        JOURNAL --> AUDIT["Offline Recovery & Fee Audit"]
+        TELEM --> CONSOLE["Loopback Monitor & React 19 Console"]
+    end
+
+    subgraph PLANE2["02 · 24×7 Isolated Rolling Capture & Live-as-Data Flywheel"]
+        direction LR
+        PUB["8 Liquidity Domains + Dual CEX<br/>(Crypto · 73 RWA Legs · BULK)"] --> CAPTURE["perp-capture + Rolling Runner<br/>(VDSO <25µs · 10h15m w01..wNN)"]
+        CAPTURE -->|"SHA-256 Sealed Bronze<br/>(SCHED_IDLE / ionice -c 3)"| LAKE["20 TB Medallion Lakehouse<br/>(00_catalog .. 40_gold)"]
+        TELEM -.->|"0600 Online SQLite Backup<br/>(Public-Path Hard-Blocked)"| PRIV["Isolated Private Vault"]
+    end
+
+    subgraph PLANE3["03 · Causal Replay & Attribution Plane (aleph Workstation · 3-Tier NVMe + CUDA)"]
+        direction LR
+        LAKE --> SILVER["Silver Zstd Parquet & DuckDB<br/>(Tier 1 E: Vault -> Tier 0 ext4)"]
+        SILVER --> COMPILER["Causal Replay Compiler<br/>(cross_venue perp-compile)"]
+        EXT["Equity Calendars, Sessions<br/>& Witnessed Funding"] --> COMPILER
+        COMPILER --> LEDGERS["3 Independent 10h Ledgers<br/>(01 Quant · 02 Arb · 03 Turnover)"]
+        SILVER --> ATTRIB["Millisecond ASOF Attribution<br/>(scripts/live_attribution.py)"]
+        PRIV -.-> ATTRIB
+    end
+```
+
+The supervised Lighter order tracker consumes the `128`-byte V2 private event stream. The `[symbols]` table binds Go and Rust shared-memory slots to canonical tickers, keeping `symbol_id`, exchange slot ID (`1..12`), and venue `market_id` strictly distinct.
+[Shared-memory ABI specification](docs/DUAL_TRACK_IPC.md) · [Example profile](config.example.toml)
+
+---
+
+## Multi-Venue Shared-Memory & Capture Matrix (`NUM_EXCHANGES = 12`)
+
+Both `aleph-matrix` (`2,048` symbols × `12` exchanges × `64B` + `16 KiB` header) and `aleph-depth` (`2,048` symbols × `12` exchanges × `256B` + `16 KiB` header) share one canonical slot table across Go, Rust, and Python:
+
+| Slot | Venue / Liquidity Domain | Config Section | Live SHM Feeds | 24×7 Public Capture Channels & Economics |
+| :---: | --- | --- | --- | --- |
+| **`1`** | **Hyperliquid Core** | `[hyperliquid]` | BBO (`l2Book`) | Native perp `l2Book`, `activeAssetCtx`, `trades`, 5m polled `fundingHistory`; IOC hedge venue for `[inventory_hedge]` |
+| **`2`** | **Lighter Core** (`chain_id=304`) | `[lighter]` | BBO + Top-5 Depth + V2 Private Events | Stateful delta `order_book`, `market_stats`, fee-retaining `trade/*` (`fee_fields_version: 1`), 4m clock refresh (`USDC`) |
+| **`6`** | **Binance USD-M** | `[binance]` | BBO (`@bookTicker`) | Real-time `@bookTicker` lead-lag reference & adverse-selection cancel shield anchor |
+| **`7`** | **Arcus** | `[arcus]` | BBO + Top-5 Depth (`l2Orderbook`) | 20-level WS `l2Orderbook` + edge-sanitized microsecond `arcus_trades`; `0.00 bps` Maker fee on RWA equity perps |
+| **`8`** | **Lighter Robinhood** (`chain_id=466324`) | `[lighter_robinhood]` | BBO + Top-5 Depth | Independent Robinhood Chain domain (`wss://api.rh.lighter.xyz/stream`), `order_book`, `market_stats`, `trade/*` (`USDG`) |
+| **`9`** | **Entropy** (`io:*` HIP-3) | `[entropy]` | BBO (`l2Book`) | HIP-3 RWA perps (`io:NVDA`, `io:SNDK`, `io:AAPL`, `io:CRCL`, `io:DRAM`, `io:NBIS`), `activeAssetCtx`, `trades`, `fundingHistory` |
+| **`10`** | **TradeXYZ** (`xyz:*` HIP-3) | `[tradexyz]` | BBO (`l2Book`) | 18 HIP-3 RWA equity/index perps (`xyz:NVDA`, `xyz:SNDK`, `xyz:TSLA`, `xyz:SP500`, etc.), `activeAssetCtx`, `trades`, `fundingHistory` |
+| **`11`** | **Extended** | — | Reserved SHM slot | Sequenced Starknet CLOB `orderbooks/*`, `publicTrades/*`, and `extended_index` (`prices/index/*`) |
+| — | **BULK** & **Coinbase Spot** |Capture-only | — | Physically isolated `-bulk-ws` 20-level snapshots (14 markets) + `-coinbase` USD spot `ticker` anchor (`BTC-USD`, `ETH-USD`, `SOL-USD`) |
+
+*(Slots `3..5` remain reserved in the binary header to preserve backward compatibility with archived v3/v4 fixtures under [`legacy/v3_archive/`](legacy/v3_archive/).)*
+
+---
+
+## Operating Modes & Three-Track Research Contract
+
+| Plane | Mode / Program | Execution & Accounting Mechanics |
+| --- | --- | --- |
+| **Supervised** | `quant` | Lighter (`Core` or `RobinhoodMainnet`) inventory-neutral market making with multi-venue median fair-value (`external_reference_exchanges`), asymmetric `-4.2 bps` counterparty marginal-cost cancel shields (`per_side_bound_cancel`), 3-lane API key isolation, and persisted UTC daily drawdown guards. |
+| **Supervised** | `inventory_hedge` | Lighter Core Maker quoting paired with confirmed-inventory protected IOC hedging on native Hyperliquid (`strategy_mode = "inventory_hedge"`). Blocked on `RobinhoodMainnet` so `USDG` and `USDC` collateral domains are never implicitly cross-settled. |
+| **Paper (`01`)** | **Quant Profit** (`01_quant_profit`) | Single-venue passive quoting evaluated on complete-cycle net cash PnL after fees/rebates, drawdown, and fill-conditioned `1s / 5s / 30s` markouts (including cancel-pending cohorts). |
+| **Paper (`02`)** | **Hedge Arbitrage** (`02_hedge_arbitrage`) | Matched two-leg basis reversion or funding carry (`pair_hedge` & [`maker-first`](docs/PERP_RELATIVE_VALUE.md#maker-first-replay) where public trade prints advance passive queue position and drive protected IOC hedges). RWA pairs enforce `America/New_York` session calendars and corporate-action gates. |
+| **Paper (`03`)** | **Incentive Turnover** (`03_incentive_turnover`) | Separate capital, fee, and loss budgets across `neutral`, `long_first`, and `short_first` opening postures while maintaining full hedging. Reports target turnover separately from rule-window candidate turnover and confirmed eligible volume; unredeemed points carry zero assumed cash value. |
+
+### Non-Subsidy & 10-Hour Validation Invariants
+
+- **Strict Program Isolation**: Quant profit, hedge arbitrage, and incentive turnover maintain separate configurations, execution states, capital and loss budgets, cash ledgers, and Gold reports. Shared market recordings are counted once as empirical evidence and never permit cross-program PnL subsidy.
+- **Continuous 10-Hour Validation Units**: Every accepted evaluation requires an unbroken **10-hour decision interval** (`36,900s` raw window reserving `15m` for pre-window warm-up and terminal drain), with inventory and cash carried across storage shards and funding boundaries. Short flat-restarted runs are preserved strictly as diagnostics.
+- **Frozen Holdout Discipline**: Parameter selection and Binance A/B/C/D factor ablations occur exclusively on `tokyo_selection_dev`; strategy parameters and split boundaries are cryptographically frozen before evaluating `tokyo_holdout_vault`.
+
+[Trading & recovery runbook](docs/LIVE_TRADING.md) ·
+[Venue capabilities](docs/CROSS_VENUE.md) ·
+[Independent research contract](docs/INDEPENDENT_STRATEGY_RESEARCH.md) ·
+[Ten-hour validation protocol](docs/TEN_HOUR_RESEARCH.md)
+
+---
+
+## Three-Tier Infrastructure & Live-as-Data Flywheel
+
+| Tier | Node / Storage | Hardware & Network Profile | Operational Role |
+| --- | --- | --- | --- |
+| **Tier 1 · Cloud Edge** | **`oasis-tokyo`** (`asia-northeast1-b`) | GCP `t2d-standard-2` (AMD Milan, `gVNIC`, `BBR + FQ`, `tcp_slow_start_after_idle=0`, `16 MB` socket buffers, `<10 ms` to Lighter/Binance Tokyo edge) | Runs `aleph-tx-feeder`, `aleph-tx-monitor`, three isolated 24/7 rolling `10h15m` capture services (`aleph-perp-capture-{crypto,rwa,bulk}.service`), and idle-priority flywheel shipping (`aleph-tx-flywheel.timer`). |
+| **Tier 2 · Lakehouse Hub** | **`AlephTX-Quant-Lakehouse`** | 20 TB Google Drive Medallion Layout (`00_catalog`, `10_bronze_raw`, `20_silver_normalized`, `30_external_evidence`, `40_gold_experiments`) | `$0/GiB` GCP egress lakehouse storing SHA-256-sealed Bronze archives (`.bronze_manifest.json`), Silver Zstd Parquet bundles, external fee/session audits, and frozen Gold experiment manifests. |
+| **Tier 3 · Local Compute** | **`aleph` Workstation** | `i7-13700` (24 threads), `23 GiB` RAM, `RTX 4070 Ti` (12 GB CUDA 12.6), `4 TB` PCIe 4.0 NVMe (`Tier 0 ext4` `2.4 GB/s` + `Tier 1 E:` `1.7 TiB` Vault + `Tier 2 C:` Cache) | Executes streaming Bronze-to-Silver normalization, multi-threaded `DuckDB 2.0` `ASOF JOIN` microstructure scans, `XGBoost` CUDA toxicity modeling, `cross_venue` 10-hour causal replays, and post-trade attribution. |
+
+- **24×7 Rolling Capture (`scripts/perp_rolling_runner.py`)**: Automatically rolls `w01 -> w02 -> w03 ...` continuous `10h15m` windows without downtime, quarantines interrupted partials to `quarantine_partials/`, seals `.bronze_manifest.json`, uploads under `SCHED_IDLE`, and evicts SHA-256-verified older windows when local free disk drops below `16 GiB`.
+- **In-Process Zero-Gap Segmenting (`perp-capture -segment-duration 1h`)**: Rotates `.segNNNN.ndjson.gz` slices inside the same collector process without dropping WebSockets or resetting L2 books, `run_id`, or `sequence` (`quant_lakehouse.py seal-segment-chain`).
+- **Post-Trade Causal Attribution (`scripts/live_attribution.py`)**: Joins private SQLite fill records (`0600`, backed up via `scripts/flywheel_sync.py backup-private` with hard blocks against public folders) against multi-venue Silver Parquet BBOs at `-500ms, -100ms, 0ms, +100ms, +500ms, +1s, +5s, +30s` horizons.
+
+[Medallion Lakehouse & WSL2 guide](docs/QUANT_DATA_LAKEHOUSE.md) ·
+[Data-source registry](docs/RESEARCH_DATA_SOURCES.md) ·
+[Tokyo research & execution backlog](docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md) ·
+[50ms empirical baseline](docs/FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md) ·
+[Priority venue design](docs/PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md) ·
+[Binance A/B protocol](docs/BINANCE_REFERENCE_AB.md) ·
+[Progress checkpoint](docs/RESEARCH_PROGRESS_2026_11_14.md) ·
+[Execution & clock audit](docs/archive/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
+
+---
+
+<a id="validate-locally"></a>
+## Local Validation & Verification
+
+Run the profile check from the repository root. It validates network, market, shared-memory slot bindings, and strategy guards without loading credentials or starting a feeder:
 
 ```sh
 make trade MODE=check \
   CONFIG=config.example.toml
 ```
 
-Use Rust 1.95.0 with rustfmt and Clippy and the pinned Go 1.25.0
-toolchain. Offline CI covers Linux and macOS. The bundled
-Lighter signer and supervised sessions require Linux x86-64.
-[CI workflow](.github/workflows/ci.yml) · [Go module](feeder/go.mod)
+Use **Rust 1.95.0** (`rustfmt`, `clippy`) and **Go 1.25.0**. Offline CI covers Linux and macOS; the native Lighter CGo/FFI signer and supervised live sessions target `x86_64` Linux.
+[CI workflow](.github/workflows/ci.yml) · [Go module](feeder/go.mod) · [Configuration reference](docs/CONFIGURATION.md)
 
 ```sh
+# 1. Full Rust, Go, Python monitor, research pipeline, and React 19 console checks
 make fmt-check
 make check
 make test
+make test-python
+make dashboard-build
 make build
 
+# 2. Deterministic synthetic causal replay checks (lost acks, funding carry, equity basis)
 target/release/cross_venue hedge-replay examples/hedge_replay.json
 target/release/cross_venue perp-replay examples/crypto_funding_paper.json
 target/release/cross_venue perp-replay examples/equity_basis_paper.json
 ```
 
-The synthetic cases cover lost acknowledgments, funding carry and equity
-basis reversion. The monitor tests use Python 3 with SQLite via
-`make test-python`. The console build uses Node 22.12+ on the Node 22
-line or Node 24 via `make dashboard-build`.
-[Configuration reference](docs/CONFIGURATION.md)
+---
 
-## Operating modes
+## Operational Contracts & Release Gates
 
-| Path | Mode | Strategy and configuration |
+| Boundary | Safety Invariant | Reference |
 | --- | --- | --- |
-| Supervised | `quant` | Lighter market making with fair-value, inventory and loss controls. Set `strategy_mode = "quant"`. |
-| Supervised | `inventory_hedge` | Lighter market making with native Hyperliquid IOC hedges sized from confirmed inventory. Set `strategy_mode = "inventory_hedge"` and `[inventory_hedge]`. |
-| Paper | `pair_hedge` | Funding carry or basis reversion on one matched pair per run. This is the default `pair.mode` for `perp-replay`. |
-| Paper | Maker-first | Public prints advance a passive order's queue. Confirmed partials drive protected IOC hedges. See [maker-first replay](docs/PERP_RELATIVE_VALUE.md#maker-first-replay). |
-| Paper | `turnover` | Separate turnover, fee and loss budgets. `neutral`, `long_first` and `short_first` select opening direction while retaining full hedging. Incentive eligibility is reviewed per venue and program. |
+| **Session Lifecycle** | Start only from verified flat positions and zero open orders in the configured scope. Stop via the supervisor (`SIGTERM`) and verify terminal flat cleanup before restart. | [Launch and shutdown](docs/LIVE_TRADING.md#start-and-stop) |
+| **Exposure & Recovery** | Reserve worst-case exposure prior to dispatch and retain it across pending cancels, ambiguous acks, and stream gaps. Reconcile both venues before clearing an active write-ahead journal. | [Execution and recovery](docs/LIVE_TRADING.md#execution-and-recovery) |
+| **Audit & Observability** | Keep source, receipt, availability, and journal timestamps distinct. Attribute fees by asset only with exact reconciled fill coverage; preserve unknown fee/telemetry states as `unknown`. | [Fee evidence](docs/LIVE_TRADING.md#bind-and-measure-fee-evidence) · [Oasis runbook](deploy/oasis/README.md) |
+| **Research Admission** | Enforce causal arrival ordering (`available_at_ms >= received_at_ms`), `<25 µs` VDSO pairing (`±1 ms` drift gate), pre-holdout parameter freezing, and complete two-leg cash accounting. | [Recording](docs/PERP_RECORDING.md) · [Lakehouse](docs/QUANT_DATA_LAKEHOUSE.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) |
 
-The supervised launcher supports mainnet and testnet. Both network modes
-can submit and cancel orders. The paper matrix covers the six pairings
-among Entropy, Arcus, TradeXYZ and BULK. Entropy and TradeXYZ have distinct
-books on shared Hyperliquid infrastructure, so that pair requires an
-explicit shared-risk opt-in. [Trading runbook](docs/LIVE_TRADING.md) ·
-[Venue capabilities](docs/CROSS_VENUE.md)
+### Release Gates for New Execution Routes
 
-Quant profit, arbitrage and incentive turnover use independent experiments
-and ledgers. User or external decisions can select a turnover posture through
-a versioned, expiring replay control; they cannot change risk limits.
-Lighter Core (`chain_id = 304`) and Robinhood Chain (`chain_id = 466324`) are
-separate settlement and data domains: supervised `quant` execution supports
-both domains with multi-lane API-key pools, dual-state (`pending`/`confirmed`)
-nonce recovery, exact isolated/cross liquidation distance (`lighter_risk`),
-and full-book SHM offset integrity checks, while `inventory_hedge` remains
-Core-only so USDG and USDC settlement legs are never mixed implicitly.
-[Independent research and controls](docs/INDEPENDENT_STRATEGY_RESEARCH.md)
+1. **Contract & Microstructure Equivalence** — Verify underlying payoff, settlement currency (`USDC` vs. `USDG`), funding cadence and multipliers, fee tier, tick/lot sizes, and session/halt calendars across both legs.
+2. **Net Execution Economics on Unbroken 10-Hour Holdouts** — Demonstrate positive net cash expectancy or bounded incentive unit cost on untouched 10-hour holdout tapes after both legs' fees, adverse selection, funding settlements, and terminal drain. Retain all rejected and incomplete runs.
+3. **Deterministic Fault & Recovery Verification** — Exercise partial fills, lost acknowledgments, nonce rejections (`21104`/`23000`), WebSocket sequence gaps, and restart barriers under deterministic fault injection before live promotion.
 
-Validation uses continuous **10-hour units**, with warm-up and final exits
-accounted separately. Quant, arbitrage and turnover retain independent
-state and cash ledgers; shared tape is counted once as market evidence.
-Public capture on `oasis-tokyo` (`asia-northeast1`, `<10 ms` to Lighter
-CloudFront/ap-northeast-1) records Lighter Core, Lighter Robinhood, Native
-Hyperliquid, Entropy, TradeXYZ, Arcus (`-arcus-trades` + books), BULK and
-Binance Futures `bookTicker` with VDSO-consistent monotonic/wall clock guards,
-seals immutable Bronze archives into the 3-tier Medallion Lakehouse, and syncs
-directly to `aleph` for continuous 10-hour selection and holdout evaluation.
-[Ten-hour validation and current limits](docs/TEN_HOUR_RESEARCH.md) ·
-[Data-source registry](docs/RESEARCH_DATA_SOURCES.md) ·
-[Lakehouse pipeline](docs/QUANT_DATA_LAKEHOUSE.md)
+*(Historical 20-hour and 10-hour empirical studies: [20-hour Oasis holdout](docs/PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12) · [Adaptive quoting & turnover replay](docs/PERP_RELATIVE_VALUE.md#adaptive-quoting-and-turnover-replay-2026-11-13).)*
 
-Research programs can run independently on the shared tapes. Maker trade
-timing is checked before a turnover matrix, and signal reports expose fresh
-reference availability alongside complete-ledger PnL.
-Offline probes separate Core-only fair value from the local entry filter
-and report fill-conditioned 1/5/30-second markouts, including fills during
-pending cancellation. Paired controls must reproduce the source campaign.
-RH/Core turnover research freezes cost-budget curves and reconciles each
-cycle's execution costs, price drift, fees and modeled overhead. Feed gaps,
-small samples and unverified collateral assumptions remain explicit.
-Cancellation-overlap and account-tier sensitivities use separate frozen
-ledgers. Target turnover is reported separately from unknown reward
-eligibility; points have no assumed cash value.
-[Current results and source gaps](docs/RESEARCH_PROGRESS_2026_11_14.md)
+---
 
-The active research queue prioritizes Tokyo `<10 ms` 10-hour re-calibration
-across Arcus, Entropy, TradeXYZ, BULK and Lighter Core/Robinhood, starting
-with measured per-venue latency quantiles, local pricing versus Binance risk
-filtering, and counterparty defense guardrails. Execution-clock diagnostics
-distinguish delayed trade receipt from modeled cancellation timing; exact cash
-proofs govern turnover cost reporting.
-[Tokyo research and execution queue](docs/TOKYO_RESEARCH_AND_EXECUTION_TODO.md) ·
-[Priority venue design](docs/PRIORITY_VENUE_RESEARCH_DESIGN_2026_11_14.md) ·
-[Binance capture and frozen A/B](docs/BINANCE_REFERENCE_AB.md) ·
-[Execution and cash audit](docs/archive/EXECUTION_CLOCK_REVIEW_2026_11_14.md)
+## Repository Map
 
-## Architecture
-
-```mermaid
-flowchart TB
-    subgraph LIVE["01 · Supervised execution"]
-        direction LR
-        VENUE["Lighter and native Hyperliquid"] --> FEEDS["Go feeder"]
-        FEEDS -->|BBO, depth and private events| SHM["Shared memory"]
-        SHM --> EXEC["Rust strategy and order tracker"]
-        EXEC -->|Orders and reconciliation| VENUE
-        EXEC --> JOURNAL["Recovery journal"]
-        EXEC --> TELEMETRY["Session telemetry"]
-        JOURNAL --> AUDIT["Offline recovery and fee audit"]
-        TELEMETRY --> AUDIT
-        TELEMETRY --> OASIS["Oasis monitor and console"]
-    end
-    subgraph PAPER["02 · Public-data research"]
-        direction LR
-        PUBLIC["Public venue data"] --> RAW["Recorder and raw archive"]
-        RAW --> COMPILER["Causal replay compiler"]
-        INPUT["Reference prices, sessions and funding"] --> COMPILER
-        COMPILER --> REPLAY["Two-leg paper execution"]
-    end
-```
-
-The supervised Lighter order tracker consumes the 128-byte V2 private
-event stream. The `[symbols]` table binds Go and Rust shared-memory
-slots to tickers. Venue market IDs, tick sizes and lot sizes are separate
-configuration values. [Shared-memory ABI](docs/DUAL_TRACK_IPC.md) ·
-[Example profile](config.example.toml)
-
-## Operations and evidence
-
-| Boundary | Contract | Reference |
+| Area | Path | Description |
 | --- | --- | --- |
-| Session lifecycle | Start from verified flat positions and no open orders in the configured scope. Stop through the supervisor and verify cleanup before restarting. | [Launch and shutdown](docs/LIVE_TRADING.md#start-and-stop) |
-| Exposure and recovery | Persist the UTC daily loss baseline and hedge intents. Retain reservations through ambiguous outcomes. An active journal blocks restart pending reconciliation. | [Execution and recovery](docs/LIVE_TRADING.md#execution-and-recovery) |
-| Audit and observability | Bind fee evidence to exact order identity. Track venue-reported fees, modeled costs, trade PnL and account equity separately. | [Fee evidence](docs/LIVE_TRADING.md#bind-and-measure-fee-evidence) · [Oasis runbook](deploy/oasis/README.md) |
-| Research acceptance | Preserve source and availability times, freeze parameters before the holdout, and report entry rejections, costs, residual exposure and final inventory. | [Recording](docs/PERP_RECORDING.md) · [Lakehouse](docs/QUANT_DATA_LAKEHOUSE.md) · [Paper execution](docs/PERP_RELATIVE_VALUE.md) · [10h validation](docs/FIFTY_MS_STRATEGY_RESEARCH_2026_11_14.md) |
+| **Supervised & Research CLIs** | [`src/bin/`](src/bin/) | `lighter_inventory_mm` (supervised Lighter MM & session supervisor) and `cross_venue` (`perp-compile`, `perp-replay`, `hedge-replay`) |
+| **Strategy, Pricing & Venues** | [`src/strategy/`](src/strategy/) · [`src/exchanges/`](src/exchanges/) | Inventory-neutral quoting, `-4.2 bps` per-side cancel shield, causal relative-value engine, Lighter multi-lane FFI signer & `lighter_risk` math |
+| **Go Multi-Venue Feeds & Recorder** | [`feeder/`](feeder/) | 12-slot `feeder-app` (`aleph-matrix`, `aleph-depth`, 128B V2 `aleph-events`) and `perp-capture` (VDSO-guarded public recorder with `-segment-duration`) |
+| **Durable Recovery & Audit** | [`src/live_hedge/`](src/live_hedge/) | Write-ahead hedge intent journal, two-venue restart barrier, and read-only recovery/fee audit |
+| **Lakehouse, Flywheel & Attribution** | [`scripts/`](scripts/) | `quant_lakehouse.py`, `perp_rolling_runner.py`, `flywheel_sync.py`, `live_attribution.py`, and 10-hour readiness/fee audit suite |
+| **Cloud Deployment & Console** | [`deploy/oasis/`](deploy/oasis/) · [`dashboard/`](dashboard/) | `oasis-tokyo` systemd units (feeder, monitor, 3-stream rolling capture, flywheel timer), SQLite telemetry monitor, and React 19 / TypeScript console |
+| **Profiles, Fixtures & Archives** | [`examples/`](examples/) · [`profiles/`](profiles/) · [`docs/archive/`](docs/archive/) · [`legacy/v3_archive/`](legacy/v3_archive/) | Synthetic replay scenarios, offline validation profiles, archived audit checkpoints, and preserved v3/v4 legacy venue modules |
 
-The 20-hour Oasis campaign measures cross-venue basis and funding alongside
-a production-quote replay on public books and trades. Its holdout reports
-include fee scenarios, entry rejections, fill costs and residual inventory.
-Prospective venue rewards have zero value in the model.
-[20-hour holdout](docs/PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12) ·
-[Adaptive quoting and turnover](docs/PERP_RELATIVE_VALUE.md#adaptive-quoting-and-turnover-replay-2026-11-13)
-
-## Release gates for new execution routes
-
-1. **Contract and market data.** Verify payoff, settlement, funding cadence,
-   fee tier, tick and lot on both legs. Measure synchronization, depth and
-   reference coverage in ordinary and stressed sessions.
-2. **Net execution economics.** Use a chronological holdout to compare
-   execution costs, funding coverage, residual exposure and liquidation
-   marks with modeled edge. Retain rejected and incomplete runs.
-3. **Failure recovery.** Exercise partial fills, lost acknowledgments, feed
-   gaps, restart barriers and cleanup with deterministic fault injection.
-   Schema 3 promotion also requires journal compatibility checks and
-   commit tail latency measurements on the target host.
-
-## Repository map
-
-| Area | Source |
-| --- | --- |
-| Launch and CLI | [src/bin/](src/bin/) |
-| Strategy and venue execution | [src/strategy/](src/strategy/) · [src/exchanges/](src/exchanges/) |
-| Go feeds and shared memory | [feeder/](feeder/) |
-| Durable recovery and evidence | [src/live_hedge/](src/live_hedge/) |
-| Monitoring and console | [deploy/oasis/](deploy/oasis/) · [dashboard/](dashboard/) |
-| Synthetic scenarios and capture profiles | [examples/](examples/) · [profiles/](profiles/) |
-| Historical docs and v3/v4 code archives | [docs/archive/](docs/archive/) · [legacy/v3_archive/](legacy/v3_archive/) |
-
-Keep credentials and private operational records outside Git. Review
-the staged blobs and every outgoing commit before publishing.
-[Engineering rules](AGENTS.md#sensitive-data-and-git) ·
-[Benchmark context](docs/archive/AUDIT_2026_11.md) · [MIT license](LICENSE)
+Keep credentials, private profiles, and raw account records strictly outside Git. Review staged blobs and outgoing commits before publishing.
+[Engineering rules](AGENTS.md#sensitive-data-and-git) · [Benchmark context](docs/archive/AUDIT_2026_11.md) · [MIT License](LICENSE)

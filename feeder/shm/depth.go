@@ -14,6 +14,9 @@ const (
 	DepthSlotSize = 256 // sizeof(ShmDepthSnapshot)
 )
 
+// DepthMagicV12 stamps DepthMatrix[0][0]._Reserved[:16] so readers verify the 12-slot ABI.
+var DepthMagicV12 = [16]byte{'A', 'L', 'E', 'P', 'H', 'T', 'X', '_', 'D', 'E', 'P', '_', 'V', '1', '2', 0}
+
 // PriceLevel represents a single order book level (16 bytes)
 type PriceLevel struct {
 	Price float64 // 0..8
@@ -65,7 +68,7 @@ func NewDepthWriter(shmPath string, numSymbols int) (*DepthWriter, error) {
 	}
 	expectedSize := int(unsafe.Sizeof(ShmDepthState{}))
 
-	file, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE, 0600)
+	file, err := os.OpenFile(shmPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("open shm: %w", err)
 	}
@@ -88,6 +91,7 @@ func NewDepthWriter(shmPath string, numSymbols int) (*DepthWriter, error) {
 	}
 
 	data := (*ShmDepthState)(unsafe.Pointer(&mmap[0]))
+	copy(data.DepthMatrix[0][0]._Reserved[:16], DepthMagicV12[:])
 
 	return &DepthWriter{
 		file: file,
@@ -113,9 +117,8 @@ func (w *DepthWriter) WriteDepth(
 	}
 	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 
-	// Seqlock write protocol: odd -> write -> even
-	seq := atomic.LoadUint32(seqAddr)
-	atomic.StoreUint32(seqAddr, seq+1) // now odd → write in progress
+	// Seqlock write protocol: odd -> write -> even (AddUint32 orders ARM64 payload stores)
+	seq := atomic.AddUint32(seqAddr, 1) // now odd → write in progress
 
 	slot.ExchangeID = exchangeID
 	slot.SymbolID = symbolID
@@ -123,7 +126,7 @@ func (w *DepthWriter) WriteDepth(
 	slot.Bids = bids
 	slot.Asks = asks
 
-	atomic.StoreUint32(seqAddr, seq+2) // now even → write complete
+	atomic.StoreUint32(seqAddr, seq+1) // now even → write complete
 
 	// Increment version counter for cache invalidation
 	atomic.AddUint64(&w.data.SymbolVersions[symbolID], 1)
@@ -137,12 +140,11 @@ func (w *DepthWriter) InvalidateDepth(symbolID uint16, exchangeID uint8) {
 	}
 	slot := &w.data.DepthMatrix[symbolID][exchangeID]
 	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
-	seq := atomic.LoadUint32(seqAddr)
-	atomic.StoreUint32(seqAddr, seq+1)
+	seq := atomic.AddUint32(seqAddr, 1)
 	slot.TimestampNs = 0
 	slot.Bids = [DepthLevels]PriceLevel{}
 	slot.Asks = [DepthLevels]PriceLevel{}
-	atomic.StoreUint32(seqAddr, seq+2)
+	atomic.StoreUint32(seqAddr, seq+1)
 	atomic.AddUint64(&w.data.SymbolVersions[symbolID], 1)
 }
 

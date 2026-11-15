@@ -2,10 +2,11 @@
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 const NUM_SYMBOLS: usize = 2048;
-const NUM_EXCHANGES: usize = 7;
+const NUM_EXCHANGES: usize = 12;
 const DEPTH_LEVELS: usize = 5;
 const HEADER_SIZE: usize = NUM_SYMBOLS * std::mem::size_of::<u64>();
 const SLOT_SIZE: usize = 256; // 256 bytes per snapshot
+const DEPTH_MAGIC_V12: [u8; 16] = *b"ALEPHTX_DEP_V12\0";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -77,6 +78,14 @@ impl ShmDepthReader {
                 format!("SHM too small: {} < {}", mmap.len(), expected_size),
             ));
         }
+        let magic_offset = HEADER_SIZE + std::mem::offset_of!(ShmDepthSnapshot, _reserved);
+        let magic = &mmap[magic_offset..magic_offset + 16];
+        if magic != [0u8; 16] && magic != DEPTH_MAGIC_V12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Depth shared memory ABI magic mismatch",
+            ));
+        }
 
         Ok(Self {
             data: mmap.as_ptr(),
@@ -112,7 +121,13 @@ impl ShmDepthReader {
             // SAFETY: Same valid seqlock pointer as above.
             let seq_after = unsafe { (*seq_ptr).load(Ordering::Acquire) };
             if seq_before == seq_after {
-                return (data.timestamp_ns > 0).then_some(data);
+                if data.timestamp_ns == 0
+                    || data.exchange_id != exchange_id
+                    || data.symbol_id != symbol_id
+                {
+                    return None;
+                }
+                return Some(data);
             }
         }
         None
@@ -158,7 +173,10 @@ mod tests {
     fn test_slot_offset_calculation() {
         assert_eq!(ShmDepthReader::slot_offset(0, 0), 16_384);
         assert_eq!(ShmDepthReader::slot_offset(0, 1), 16_384 + 256);
-        assert_eq!(ShmDepthReader::slot_offset(1, 0), 16_384 + 7 * 256);
+        assert_eq!(
+            ShmDepthReader::slot_offset(1, 0),
+            16_384 + NUM_EXCHANGES * 256
+        );
     }
 
     #[test]

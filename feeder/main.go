@@ -22,18 +22,19 @@ func main() {
 	if p := os.Getenv("ALEPH_FEEDER_CONFIG"); p != "" {
 		cfgPath = p
 	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		log.Fatalf("failed to load config %s: %v", cfgPath, err)
-	}
-	exchanges.SetSymbolRegistry(cfg.SymbolTable())
 	publicOnly := false
 	if value := os.Getenv("ALEPH_FEEDER_PUBLIC_ONLY"); value != "" {
+		var err error
 		publicOnly, err = strconv.ParseBool(value)
 		if err != nil {
 			log.Fatal("ALEPH_FEEDER_PUBLIC_ONLY must be a boolean")
 		}
 	}
+	cfg, err := config.LoadWithMode(cfgPath, publicOnly)
+	if err != nil {
+		log.Fatalf("failed to load config %s: %v", cfgPath, err)
+	}
+	exchanges.SetSymbolRegistry(cfg.SymbolTable())
 
 	shmName := "aleph-matrix"
 	if s := os.Getenv("ALEPH_SHM"); s != "" {
@@ -43,13 +44,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Create shared memory matrix (~656 KB)
+	// Create shared memory matrix (~1.55 MB for 12 venue slots)
 	matrix, err := shm.NewMatrix(shmName)
 	if err != nil {
 		log.Fatalf("shm: %v", err)
 	}
 	defer matrix.Close()
-	log.Printf("📡 Shared matrix: %s (~656 KB)", shm.Path(shmName))
+	log.Printf("📡 Shared matrix: %s (~1.55 MB)", shm.Path(shmName))
 
 	// Create V1 event ring buffer for backward compatibility (~64 KB)
 	eventBuffer, err := shm.NewEventRingBuffer()
@@ -93,14 +94,32 @@ func main() {
 		log.Printf("  - %s: enabled=%v", name, exCfg.Enabled)
 	}
 
-	if hlCfg, ok := exchangeConfigs["hyperliquid"]; ok && hlCfg.Enabled {
+	hlByURL := make(map[string][]config.ExchangeConfig)
+	for _, key := range []string{"hyperliquid", "entropy", "tradexyz"} {
+		if sec, ok := exchangeConfigs[key]; ok && sec.Enabled {
+			hlByURL[sec.WSURL] = append(hlByURL[sec.WSURL], sec)
+		}
+	}
+	for wsURL, group := range hlByURL {
+		wg.Add(1)
+		go func(url string, secs []config.ExchangeConfig) {
+			defer wg.Done()
+			hl := exchanges.NewHyperliquidGroup(url, secs, matrix)
+			log.Printf("🔌 Hyperliquid/HIP-3 (%s): starting %d section(s)...", url, len(secs))
+			if err := hl.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Hyperliquid (%s): %v", url, err)
+			}
+		}(wsURL, group)
+	}
+
+	if arcusCfg, ok := exchangeConfigs["arcus"]; ok && arcusCfg.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			hl := exchanges.NewHyperliquid(hlCfg, matrix)
-			log.Println("🔌 Hyperliquid: starting...")
-			if err := hl.Run(ctx); err != nil && err != context.Canceled {
-				log.Printf("Hyperliquid: %v", err)
+			arc := exchanges.NewArcus(arcusCfg, matrix, depthWriter)
+			log.Println("🔌 Arcus: starting...")
+			if err := arc.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Arcus: %v", err)
 			}
 		}()
 	}
@@ -113,6 +132,18 @@ func main() {
 			log.Println("🔌 Binance: starting...")
 			if err := bn.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("Binance: %v", err)
+			}
+		}()
+	}
+
+	if rhCfg, ok := exchangeConfigs["lighter_robinhood"]; ok && rhCfg.Enabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rh := exchanges.NewLighterWithID(exchanges.ExchangeLighterRobinhood, "lighter-robinhood-public", rhCfg, matrix, nil, depthWriter)
+			log.Println("🔌 Lighter Robinhood (public): starting...")
+			if err := rh.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("Lighter Robinhood (public): %v", err)
 			}
 		}()
 	}
