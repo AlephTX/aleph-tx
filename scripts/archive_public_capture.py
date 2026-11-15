@@ -22,6 +22,7 @@ SOURCES = {
     'extended': ('extended', 'mainnet'), 'extended_trades': ('extended', 'mainnet'),
     'extended_index': ('extended', 'mainnet'),
     'arcus': ('arcus', 'mainnet'), 'arcus_snapshot': ('arcus', 'mainnet'),
+    'arcus_trades': ('arcus', 'mainnet'),
     'bulk': ('bulk', 'mainnet'), 'bulk_snapshot': ('bulk', 'mainnet'),
     'coinbase': ('coinbase', 'spot'), 'collector': ('collector', 'session'),
     **{source: ('hyperliquid', 'core') for source in

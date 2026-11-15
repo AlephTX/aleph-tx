@@ -9,7 +9,8 @@ def trade_events(archive, venue, market, leg, *, precise_times=False,
                  excluded_zero_price_transfers=None):
     """Yield maker replay events from acknowledged public trade subscriptions."""
     sources = {'lighter': 'lighter_trades', 'lighter_robinhood': 'lighter_robinhood_trades',
-               'extended': 'extended_trades', 'hyperliquid': 'hyperliquid_trades',
+               'extended': 'extended_trades', 'arcus': 'arcus_trades',
+               'hyperliquid': 'hyperliquid_trades',
                'entropy': 'hyperliquid_trades', 'trade_xyz': 'hyperliquid_trades'}
     source = sources[venue]
     lighter_domain = source in ('lighter_trades', 'lighter_robinhood_trades')
@@ -38,6 +39,13 @@ def trade_events(archive, venue, market, leg, *, precise_times=False,
             subscribed = data['seq'] == 1
             trades = [(t['i'], t['T'], t['p'], t['q'], t['S'].lower()) for t in data['data']
                       if t['m'] == market and t['tT'] == 'TRADE']
+        elif source == 'arcus_trades':
+            subscribed = event == 'subscribed' and data == {'channel': 'trades', 'id': market}
+            trades = [(str(t['tradeId']), t['timestamp'] // 1_000, t['price'], t['size'],
+                       {'BUY': 'buy', 'SELL': 'sell'}[t['side']])
+                      for t in (data.get('contents') or [] if event == 'message' else [])
+                      if t.get('marketDisplayName') == market
+                      and type(t.get('timestamp')) is int and t['timestamp'] > 0]
         else:
             if data['channel'].replace('/', ':') != f'trade:{market}':
                 continue

@@ -80,13 +80,13 @@ Related contracts and tools:
 
 `scripts/quant_lakehouse.py normalize` and `build-duckdb` materialize four
 canonical tables sorted strictly by **`(venue, domain, market, available_at_ms, sequence)`**
-and Hive-partitioned by **`(collector_region, venue, utc_date)`** with
+and Hive-partitioned by **`(collector_region, venue, utc_date, campaign_id)`** with
 `COMPRESSION ZSTD` and `ROW_GROUP_SIZE 250000`:
 
 | Table | Primary Contents | Critical Causal & Precision Invariants |
 | --- | --- | --- |
 | `bbo_quotes` | Top-of-book & depth counts across `arcus`, `entropy` (`io:*`), `trade_xyz` (`xyz:*`), `lighter_robinhood`, `lighter`, `binance`, `bulk`, `extended`, `hyperliquid`, `coinbase` | Reconstructs stateful L2 deltas (`lighter`, `lighter_robinhood`, `extended`), converts wire µs/ns clocks (`arcus`, `lighter`, `bulk`) to `source_time_ms` while preserving `raw_source_time`, and stores both `DECIMAL(38, 12)` (`bid_px`, `ask_px`, `bid_sz`, `ask_sz`) and `DOUBLE` (`mid_px_f64`, `spread_bps_f64`). |
-| `public_trades` | Post-subscription acknowledged public trades | Drops pre-subscription cached snapshots (`subscribed/trade`, Extended `seq=1`, Hyperliquid `time < online_since`), deduplicates reconnect prints, preserves Lighter integer `maker_fee_raw`, `taker_fee_raw`, `transaction_time_us`, and flags `price == 0` bankruptcy transfers via `is_zero_price_transfer = true`. |
+| `public_trades` | Post-subscription acknowledged public trades (`arcus_trades`, `hyperliquid_trades`, `lighter_trades`, `lighter_robinhood_trades`, `extended_trades`) | Requires explicit subscription ack before accepting prints, drops pre-subscription cached snapshots (`subscribed/trade`, Extended `seq=1`, Hyperliquid `time < online_since`), deduplicates reconnect prints, preserves Arcus and Lighter `transaction_time_us` plus Lighter integer `maker_fee_raw`/`taker_fee_raw`, and flags `price == 0` bankruptcy transfers via `is_zero_price_transfer = true`. |
 | `funding_and_ctx` | `market_stats`, `active_asset_ctx`, `hourly_funding_history`, `index_price` | Preserves `source_time_ms = NULL` when a venue publishes no exchange clock (`Hyperliquid activeAssetCtx`) instead of fabricating receipt time; binds settled hourly funding rates to their true receipt `available_at_ms`. |
 | `feed_lifecycle` | `connected`, `subscribed`, `disconnect`, `clock_refresh`, `sequence_gap`, `end` | Captures Lighter subscription RTT brackets (`request_sent_at_ms`..`received_at_ms`) and records sequence/nonce discontinuities explicitly so downstream queries never bridge across unrecorded gaps. |
 

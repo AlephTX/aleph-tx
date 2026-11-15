@@ -499,6 +499,7 @@ impl<'a> Compiler<'a> {
                     | "hyperliquid_funding"
                     | "arcus"
                     | "arcus_snapshot"
+                    | "arcus_trades"
                     | "bulk"
                     | "bulk_snapshot"
                     | "extended"
@@ -514,10 +515,13 @@ impl<'a> Compiler<'a> {
             ("connected", None)
                 if matches!(
                     row.source.as_str(),
-                    "hyperliquid" | "hyperliquid_trades" | "binance"
+                    "hyperliquid" | "hyperliquid_trades" | "binance" | "arcus_trades"
                 ) => {}
             ("subscribed", Some(_))
-                if matches!(row.source.as_str(), "hyperliquid" | "hyperliquid_trades") => {}
+                if matches!(
+                    row.source.as_str(),
+                    "hyperliquid" | "hyperliquid_trades" | "arcus_trades"
+                ) => {}
             ("disconnect" | "clock_refresh", None) => {
                 if row.event == "clock_refresh" {
                     ensure!(

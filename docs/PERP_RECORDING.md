@@ -159,8 +159,8 @@ pair is evaluated against the same arrival clock.
 
 ```sh
 mkdir -p recordings
-feeder/perp-capture -hyperliquid io:NVDA,xyz:NVDA -hl-snapshot-interval 1s \
-  -arcus-ws NVDA-USD -bulk-ws NVDA-USD -duration 2m \
+feeder/perp-capture -hyperliquid io:NVDA,xyz:NVDA -hl-trades -hl-snapshot-interval 1s \
+  -arcus-ws NVDA-USD -arcus-trades -bulk-ws NVDA-USD -duration 2m \
   -output recordings/nvda-four-venues-raw.ndjson
 target/release/cross_venue perp-compile examples/arcus_bulk_nvda_capture.json \
   recordings/nvda-four-venues-raw.ndjson recordings/nvda-arcus-bulk.ndjson
@@ -168,7 +168,10 @@ target/release/cross_venue perp-replay recordings/nvda-arcus-bulk.ndjson
 ```
 
 The WebSocket flags subscribe to Arcus `l2Orderbook` and BULK `l2Snapshot`,
-each with up to 20 unaggregated levels per side. The existing `-arcus` and
+each with up to 20 unaggregated levels per side. Adding `-arcus-trades` records
+acknowledged public `trades` batches (`arcus_trades`) on `wss://api.arcus.xyz/v1/ws`,
+preserving microsecond timestamps and matching-engine sequence numbers while
+stripping participant addresses and order IDs at the collector boundary. The existing `-arcus` and
 `-bulk` flags still record one-second REST snapshots for up to four markets
 per venue. Use both flags for a venue to compare transports on one arrival
 clock. Each record preserves the original publication and its receipt and

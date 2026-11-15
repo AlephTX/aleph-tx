@@ -315,7 +315,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
-	if source.isHyperliquidWS() || source.source == "binance" {
+	if source.isHyperliquidWS() || source.source == "binance" || source.source == "arcus_trades" {
 		now := time.Now()
 		if err := emit(record{Source: source.source, Market: source.market, Event: "connected", ReceivedAt: now.UnixMilli(), received: now}); err != nil {
 			return err
@@ -342,7 +342,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	acknowledged := make(map[string]bool)
 	for {
 		readCtx, cancelRead := ctx, func() {}
-		if source.source != "extended_trades" && source.source != "hyperliquid_trades" {
+		if source.source != "extended_trades" && source.source != "hyperliquid_trades" && source.source != "arcus_trades" {
 			readCtx, cancelRead = context.WithTimeout(ctx, 30*time.Second)
 		}
 		// An inactive market can have no trades while the transport is healthy.
@@ -406,6 +406,19 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			if err != nil {
 				return err
 			}
+		case "arcus_trades":
+			publication, err := arcusTradePublication(source, raw, acknowledged)
+			if err != nil {
+				return err
+			}
+			if publication.Event != "" {
+				publication.ReceivedAt = received.UnixMilli()
+				publication.received = received
+				if err := emit(publication); err != nil {
+					return err
+				}
+			}
+			continue
 		case "arcus":
 			if header.Channel != "l2Orderbook" || !slices.Contains(source.coins, gjson.GetBytes(raw, "id").String()) ||
 				(header.Type != "subscribed" && header.Type != "channel_data") {
@@ -567,7 +580,7 @@ func captureWithTiming(ctx context.Context, sources []subscription, out syncWrit
 			cancel(err)
 			return err
 		}
-		if row.Event == "message" || row.Source == "hyperliquid_trades" && row.Event == "subscribed" {
+		if row.Event == "message" || (row.Source == "hyperliquid_trades" || row.Source == "arcus_trades") && row.Event == "subscribed" {
 			counts[row.Source+"\x00"+row.Market]++
 		}
 	}
@@ -619,6 +632,7 @@ func run() error {
 	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
 	bulk := flag.String("bulk", "", "comma-separated BULK perpetuals for 1s REST snapshots")
 	arcusWS := flag.String("arcus-ws", "", "comma-separated Arcus perpetuals for WebSocket L2 books")
+	arcusTrades := flag.Bool("arcus-trades", false, "record Arcus public trades and subscription acknowledgments")
 	bulkWS := flag.String("bulk-ws", "", "comma-separated BULK perpetuals for WebSocket L2 snapshots")
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")
 	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
@@ -648,6 +662,11 @@ func run() error {
 		return err
 	}
 	sources = append(sources, hlSources...)
+	arcusExtra, err := arcusTradeSubscriptions(*arcusWS, *arcus, *arcusTrades)
+	if err != nil {
+		return err
+	}
+	sources = append(sources, arcusExtra...)
 	rhSources, err := robinhoodSubscriptions(*rh, *rhTrades, *clockRefresh)
 	if err != nil {
 		return err

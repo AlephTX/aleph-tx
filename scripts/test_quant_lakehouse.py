@@ -100,7 +100,7 @@ class QuantLakehouseTests(unittest.TestCase):
                     "A": "8.25",
                 },
             ),
-            # 2. Arcus WS L2 book on NVDA-USD (microsecond wire timestamp)
+            # 2. Arcus WS L2 book + public trades on NVDA-USD (microsecond wire timestamps)
             self._timed_row(
                 2,
                 "arcus",
@@ -117,9 +117,40 @@ class QuantLakehouseTests(unittest.TestCase):
                     },
                 },
             ),
-            # 3. Entropy (io:NVDA) L2 book + activeAssetCtx (missing source clock stays None)
             self._timed_row(
                 3,
+                "arcus_trades",
+                "subscribed",
+                22,
+                market="NVDA-USD",
+                payload={"channel": "trades", "id": "NVDA-USD"},
+            ),
+            self._timed_row(
+                4,
+                "arcus_trades",
+                "message",
+                25,
+                market="NVDA-USD",
+                payload={
+                    "channel": "trades",
+                    "id": "NVDA-USD",
+                    "contents": [
+                        {
+                            "marketDisplayName": "NVDA-USD",
+                            "marketId": 28,
+                            "side": "BUY",
+                            "price": "140.02",
+                            "size": "0.5",
+                            "tradeId": "901",
+                            "timestamp": (self.t0 + 24) * 1_000 + 321,
+                            "sequenceNumber": 11976995605,
+                        }
+                    ],
+                },
+            ),
+            # 3. Entropy (io:NVDA) L2 book + activeAssetCtx (missing source clock stays None)
+            self._timed_row(
+                5,
                 "hyperliquid",
                 "message",
                 30,
@@ -134,7 +165,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 },
             ),
             self._timed_row(
-                4,
+                6,
                 "hyperliquid",
                 "message",
                 35,
@@ -149,7 +180,7 @@ class QuantLakehouseTests(unittest.TestCase):
             ),
             # 4. TradeXYZ (xyz:NVDA) trade subscription + cached print (filtered) + live print (kept)
             self._timed_row(
-                5,
+                7,
                 "hyperliquid_trades",
                 "subscribed",
                 40,
@@ -157,7 +188,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 payload={"type": "trades", "coin": "xyz:NVDA"},
             ),
             self._timed_row(
-                6,
+                8,
                 "hyperliquid_trades",
                 "message",
                 45,
@@ -172,7 +203,7 @@ class QuantLakehouseTests(unittest.TestCase):
             ),
             # 5. Lighter Robinhood book snapshot -> delta update -> nonce gap
             self._timed_row(
-                7,
+                9,
                 "lighter_robinhood",
                 "message",
                 50,
@@ -191,7 +222,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 },
             ),
             self._timed_row(
-                8,
+                10,
                 "lighter_robinhood",
                 "message",
                 55,
@@ -209,7 +240,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 },
             ),
             self._timed_row(
-                9,
+                11,
                 "lighter_robinhood",
                 "message",
                 58,
@@ -228,7 +259,7 @@ class QuantLakehouseTests(unittest.TestCase):
             ),
             # 6. Lighter Robinhood trades: subscription snapshot ignored, zero-price bankruptcy flagged, fees preserved
             self._timed_row(
-                10,
+                12,
                 "lighter_robinhood_trades",
                 "message",
                 60,
@@ -249,7 +280,7 @@ class QuantLakehouseTests(unittest.TestCase):
                 },
             ),
             self._timed_row(
-                11,
+                13,
                 "lighter_robinhood_trades",
                 "message",
                 65,
@@ -283,7 +314,7 @@ class QuantLakehouseTests(unittest.TestCase):
             ),
             # 7. BULK REST snapshot with nanosecond wire timestamp + late source clock (still ordered by available_at_ms)
             self._timed_row(
-                12,
+                14,
                 "bulk_snapshot",
                 "message",
                 70,
@@ -297,7 +328,7 @@ class QuantLakehouseTests(unittest.TestCase):
                     },
                 },
             ),
-            self._timed_row(13, "collector", "end", 80),
+            self._timed_row(15, "collector", "end", 80),
         ]
 
         capture_path = self._write_gz_capture("2026-11-15-tokyo-priority.ndjson.gz", rows)
@@ -309,8 +340,8 @@ class QuantLakehouseTests(unittest.TestCase):
             split_role="selection_dev",
             manifest_out=manifest_path,
         )
-        self.assertEqual(bronze["records"], 13)
-        self.assertEqual(bronze["precise_timing_records"], 13)
+        self.assertEqual(bronze["records"], 15)
+        self.assertEqual(bronze["precise_timing_records"], 15)
         self.assertFalse(bronze["meets_ten_hour_validation_unit"])
         self.assertEqual(bronze["coverage_class"], "diagnostic_short_window")
         self.assertIn("arcus:mainnet:NVDA-USD", bronze["markets_observed"])
@@ -327,7 +358,7 @@ class QuantLakehouseTests(unittest.TestCase):
             precise_times=True,
         )
         self.assertEqual(silver["tables"]["bbo_quotes"]["rows"], 6)
-        self.assertEqual(silver["tables"]["public_trades"]["rows"], 3)
+        self.assertEqual(silver["tables"]["public_trades"]["rows"], 4)
         self.assertEqual(silver["tables"]["funding_and_ctx"]["rows"], 1)
 
         bbos = _read_gz_ndjson(silver_dir / "bbo_quotes.ndjson.gz")
@@ -353,12 +384,16 @@ class QuantLakehouseTests(unittest.TestCase):
         self.assertEqual(ctxs[0]["funding_rate_bps"], "0.125")
 
         trades = _read_gz_ndjson(silver_dir / "public_trades.ndjson.gz")
-        self.assertEqual([t["trade_id"] for t in trades], ["12", "501", "502"])
-        self.assertTrue(trades[1]["is_zero_price_transfer"])
-        self.assertFalse(trades[2]["is_zero_price_transfer"])
-        self.assertEqual(trades[2]["maker_fee_raw"], 0)
-        self.assertEqual(trades[2]["taker_fee_raw"], 20)
-        self.assertEqual(trades[2]["transaction_time_us"], (self.t0 + 64) * 1_000 + 777)
+        self.assertEqual([t["trade_id"] for t in trades], ["901", "12", "501", "502"])
+        self.assertEqual(trades[0]["venue"], "arcus")
+        self.assertEqual(trades[0]["aggressor_side"], "buy")
+        self.assertEqual(trades[0]["source_time_ms"], self.t0 + 24)
+        self.assertEqual(trades[0]["transaction_time_us"], (self.t0 + 24) * 1_000 + 321)
+        self.assertTrue(trades[2]["is_zero_price_transfer"])
+        self.assertFalse(trades[3]["is_zero_price_transfer"])
+        self.assertEqual(trades[3]["maker_fee_raw"], 0)
+        self.assertEqual(trades[3]["taker_fee_raw"], 20)
+        self.assertEqual(trades[3]["transaction_time_us"], (self.t0 + 64) * 1_000 + 777)
 
         lifecycle = _read_gz_ndjson(silver_dir / "feed_lifecycle.ndjson.gz")
         gaps = [row for row in lifecycle if row["event"] == "sequence_gap"]

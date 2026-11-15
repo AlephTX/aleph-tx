@@ -724,12 +724,23 @@ fn hyperliquid_public_evidence_compiles_without_becoming_a_funding_payment() {
         json!({"source":"hyperliquid_funding","event":"message","market":"ETH","received_at_ms":T+200,
             "available_at_ms":T+200,"request_sent_at_ms":T+180,"payload":{"data":[{"coin":"ETH","time":T,"fundingRate":"0.0001"}]}}),
         json!({"source":"hyperliquid_trades","event":"disconnect","market":"ETH","received_at_ms":T+300,"available_at_ms":T+300}),
+        json!({"source":"arcus_trades","event":"connected","market":"NVDA-USD","received_at_ms":T+310,"available_at_ms":T+310}),
+        json!({"source":"arcus_trades","event":"subscribed","market":"NVDA-USD","received_at_ms":T+320,"available_at_ms":T+320,
+            "payload":{"channel":"trades","id":"NVDA-USD"}}),
+        row(
+            "arcus_trades",
+            T + 330,
+            json!({"channel":"trades","id":"NVDA-USD","contents":[{"marketDisplayName":"NVDA-USD","marketId":28,"side":"BUY","price":"160.26","size":"0.05","tradeId":"1","timestamp":T*1000}]}),
+        ),
+        json!({"source":"arcus_trades","event":"disconnect","market":"NVDA-USD","received_at_ms":T+350,"available_at_ms":T+350}),
         footer(T + 400),
     ];
     let (coverage, frames) = replay(&config(), &rows);
     assert_eq!(coverage.source_messages["hyperliquid_funding"], 1);
     assert_eq!(coverage.source_messages["hyperliquid_trades"], 1);
     assert_eq!(coverage.disconnects["hyperliquid_trades"], 1);
+    assert_eq!(coverage.source_messages["arcus_trades"], 1);
+    assert_eq!(coverage.disconnects["arcus_trades"], 1);
     assert_eq!(coverage.settlement_records_written, [0, 0]);
     assert!(
         frames.last().unwrap()["legs"][1]["book"]["tradable"]

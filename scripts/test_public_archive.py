@@ -157,3 +157,30 @@ class PublicArchiveTests(unittest.TestCase):
         self.assertEqual(len(excluded), 1)
         self.assertEqual(excluded[0]['trade_id'], 2)
         self.assertEqual(excluded[0]['size'], '0.0102')
+
+    def test_arcus_public_trades_convert_microseconds_and_track_online_state(self):
+        rows = [
+            self.row('arcus_trades', 'connected', 1, 'NVDA-USD'),
+            self.row('arcus_trades', 'subscribed', 2, 'NVDA-USD', {'channel': 'trades', 'id': 'NVDA-USD'}),
+            self.row('arcus_trades', 'message', 5, 'NVDA-USD', {
+                'channel': 'trades',
+                'id': 'NVDA-USD',
+                'contents': [
+                    {'marketDisplayName': 'NVDA-USD', 'marketId': 28, 'side': 'BUY',
+                     'price': '160.26', 'size': '0.05', 'tradeId': '88', 'timestamp': (self.t + 4) * 1000 + 900},
+                ],
+            }),
+            self.row('arcus_trades', 'disconnect', 8, 'NVDA-USD'),
+            self.row('collector', 'end', 10),
+        ]
+        _, archive = self.capture(rows)
+        events = list(trade_events(archive, 'arcus', 'NVDA-USD', 1))
+        self.assertEqual(
+            events,
+            [
+                {'kind': 'trade_feed', 'at_ms': self.t + 3, 'leg': 1, 'online': True},
+                {'kind': 'trade', 'at_ms': self.t + 6, 'leg': 1, 'source_ms': self.t + 4,
+                 'aggressor': 'buy', 'price': '160.26', 'contracts': '0.05'},
+                {'kind': 'trade_feed', 'at_ms': self.t + 9, 'leg': 1, 'online': False},
+            ],
+        )

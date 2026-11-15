@@ -66,6 +66,7 @@ RAW_SOURCE_MAP = {
     "extended_index": ("extended", "mainnet"),
     "arcus": ("arcus", "mainnet"),
     "arcus_snapshot": ("arcus", "mainnet"),
+    "arcus_trades": ("arcus", "mainnet"),
     "bulk": ("bulk", "mainnet"),
     "bulk_snapshot": ("bulk", "mainnet"),
     "coinbase": ("coinbase", "spot"),
@@ -327,7 +328,7 @@ def seal_bronze_capture(
                 payload = row["payload"]
                 if raw_source in ("hyperliquid", "hyperliquid_snapshot") and isinstance(payload.get("data"), dict):
                     market = payload["data"].get("coin")
-                elif raw_source == "arcus":
+                elif raw_source in ("arcus", "arcus_trades"):
                     market = payload.get("id")
                 elif raw_source in ("arcus_snapshot", "bulk_snapshot"):
                     market = payload.get("market")
@@ -602,7 +603,7 @@ def normalize_capture(
             if event in ("connected", "disconnect", "clock_refresh", "subscribed"):
                 sub_market = market
                 if event == "subscribed" and isinstance(payload, dict):
-                    sub_market = sub_market or payload.get("coin")
+                    sub_market = sub_market or payload.get("coin") or payload.get("id")
                 venue, domain = classify_venue_domain(raw_source, sub_market)
                 if event in ("disconnect", "clock_refresh"):
                     for key in [k for k in books if k[0] == raw_source and (sub_market is None or k[1] == sub_market)]:
@@ -611,6 +612,9 @@ def normalize_capture(
                         trade_online_since[key] = None
                 if raw_source == "hyperliquid_trades" and event == "subscribed" and isinstance(payload, dict):
                     if payload.get("type") == "trades" and sub_market:
+                        trade_online_since[(raw_source, sub_market)] = received_ms
+                if raw_source == "arcus_trades" and event == "subscribed" and isinstance(payload, dict):
+                    if payload.get("channel") == "trades" and sub_market:
                         trade_online_since[(raw_source, sub_market)] = received_ms
                 emit(
                     "feed_lifecycle",
@@ -1093,9 +1097,71 @@ def normalize_capture(
                     },
                 )
 
-            # 7. Public Trade Tapes (Hyperliquid/Entropy/TradeXYZ, Lighter Core & Robinhood, Extended)
-            elif raw_source in ("hyperliquid_trades", "lighter_trades", "lighter_robinhood_trades", "extended_trades"):
-                if raw_source == "hyperliquid_trades":
+            # 7. Public Trade Tapes (Arcus, Hyperliquid/Entropy/TradeXYZ, Lighter Core & Robinhood, Extended)
+            elif raw_source in (
+                "arcus_trades",
+                "hyperliquid_trades",
+                "lighter_trades",
+                "lighter_robinhood_trades",
+                "extended_trades",
+            ):
+                if raw_source == "arcus_trades":
+                    mkt = market or payload.get("id") or ""
+                    venue, domain = classify_venue_domain(raw_source, mkt)
+                    online_since = trade_online_since.get((raw_source, mkt))
+                    if online_since is None:
+                        raise ValueError(f"Arcus trade batch received before subscription ack on {mkt}")
+                    if payload.get("channel") != "trades" or payload.get("id") != mkt:
+                        raise ValueError(f"invalid Arcus trade channel or market envelope on {mkt}")
+                    seen = trade_seen.setdefault((raw_source, mkt), {})
+                    for trd in payload.get("contents") or []:
+                        if trd.get("marketDisplayName") != mkt:
+                            continue
+                        tid = str(trd["tradeId"])
+                        raw_us = int(trd["timestamp"])
+                        if raw_us <= 0:
+                            raise ValueError("non-positive Arcus trade timestamp")
+                        stamp = raw_us // 1_000
+                        side = {"BUY": "buy", "SELL": "sell"}[trd["side"]]
+                        px_dec = parse_positive_dec(trd["price"])
+                        sz_dec = parse_positive_dec(trd["size"])
+                        dedup_val = (raw_us, format_dec(px_dec), format_dec(sz_dec), side)
+                        if tid in seen:
+                            if seen[tid] != dedup_val:
+                                raise ValueError("conflicting duplicate Arcus trade")
+                            continue
+                        seen[tid] = dedup_val
+                        emit(
+                            "public_trades",
+                            {
+                                "campaign_id": campaign_id,
+                                "collector_region": collector_region,
+                                "utc_date": utc_date_str(avail_ms),
+                                "venue": venue,
+                                "domain": domain,
+                                "raw_source": raw_source,
+                                "market": mkt,
+                                "sequence": seq,
+                                "available_at_ms": avail_ms,
+                                "received_at_ms": received_ms,
+                                "source_time_ms": stamp,
+                                "trade_id": tid,
+                                "aggressor_side": side,
+                                "price": format_dec(px_dec),
+                                "size": format_dec(sz_dec),
+                                "price_f64": float(px_dec),
+                                "size_f64": float(sz_dec),
+                                "notional_f64": float(px_dec * sz_dec),
+                                "is_zero_price_transfer": False,
+                                "fee_fields_version": None,
+                                "maker_fee_raw": None,
+                                "taker_fee_raw": None,
+                                "transaction_time_us": raw_us,
+                                "block_height": None,
+                            },
+                        )
+
+                elif raw_source == "hyperliquid_trades":
                     mkt = market or ""
                     venue, domain = classify_venue_domain(raw_source, mkt)
                     online_since = trade_online_since.get((raw_source, mkt))
