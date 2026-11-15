@@ -114,6 +114,30 @@ with gzip.open(out_path, "wt", encoding="utf-8") as fh:
         self.assertTrue((out_dir / w3_name).exists())
         self.assertTrue((out_dir / f"{w3_name}.bronze_manifest.json").exists())
 
+    def test_oasis_installed_script_subset_is_self_contained(self):
+        import re
+        import shutil
+        import subprocess
+        import sys
+
+        repo_root = Path(__file__).resolve().parents[1]
+        install_sh = (repo_root / "deploy" / "oasis" / "install.sh").read_text(encoding="utf-8")
+        match = re.search(r"scripts/\{([^}]+)\}\.py", install_sh)
+        self.assertIsNotNone(match)
+        installed = [name.strip() for name in match.group(1).split(",")]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            isolated = Path(tmpdir) / "isolated_scripts"
+            isolated.mkdir()
+            for name in installed:
+                shutil.copy2(repo_root / "scripts" / f"{name}.py", isolated / f"{name}.py")
+            proc = subprocess.run(
+                [sys.executable, str(isolated / "perp_rolling_runner.py"), "--help"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
