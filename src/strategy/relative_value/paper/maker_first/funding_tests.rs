@@ -35,6 +35,8 @@ fn cycle(at: u64) -> Cycle {
         paired_mids: [None, None],
         closing_maker_filled: false,
         forced_ioc_filled: false,
+        sub_min_top_up_attempts: 0,
+        sub_min_recovery_pending_base: Decimal::ZERO,
     }
 }
 
@@ -137,6 +139,7 @@ fn an_unresolved_ioc_cannot_cross_the_funding_guard() {
         expires_ms: HOUR + 2_000,
         unwind: true,
         closing_hedge: false,
+        sub_min_top_up: false,
     });
     r.funding_timers(HOUR).unwrap();
     assert_eq!(
