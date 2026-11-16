@@ -849,3 +849,67 @@ fn rolling_segment_markers_preserve_stateful_lighter_delta_books() {
         .is_err()
     );
 }
+
+#[test]
+fn precise_times_ceiling_rounds_availability_and_rejects_clock_tampering() {
+    let run_id = "0123456789abcdef0123456789abcdef";
+    let mut r1 = lighter(T, T - 1, 10, 0, true);
+    r1["capture_timing"] = json!({
+        "run_id": run_id,
+        "sequence": 1,
+        "connection_epoch": 1,
+        "receipt_wall_ns": T * 1_000_000 + 200_000,
+        "receipt_monotonic_ns": 10_000_000,
+        "available_wall_ns": T * 1_000_000 + 250_000,
+        "available_monotonic_ns": 10_050_000,
+    });
+    let mut r2 = hl("hyperliquid", T);
+    r2["capture_timing"] = json!({
+        "run_id": run_id,
+        "sequence": 2,
+        "connection_epoch": 1,
+        "receipt_wall_ns": T * 1_000_000 + 300_000,
+        "receipt_monotonic_ns": 10_150_000,
+        "available_wall_ns": T * 1_000_000 + 350_000,
+        "available_monotonic_ns": 10_200_000,
+    });
+    let mut end = footer(T + 200);
+    end["capture_timing"] = json!({
+        "run_id": run_id,
+        "sequence": 3,
+        "connection_epoch": 0,
+        "receipt_wall_ns": (T + 200) * 1_000_000,
+        "receipt_monotonic_ns": 209_800_000,
+        "available_wall_ns": (T + 200) * 1_000_000,
+        "available_monotonic_ns": 209_850_000,
+    });
+    let mut out = Vec::new();
+    let cov = compile_with_options(
+        &config(),
+        true,
+        text(&[r1.clone(), r2.clone(), end.clone()]).as_bytes(),
+        &mut out,
+        &VenueRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(cov.availability_rule, Some("ceil_available_wall_ns_to_ms"));
+    assert_eq!(cov.capture_run_id.as_deref(), Some(run_id));
+    assert_eq!(cov.precise_records, Some(3));
+    // T*1e6 + 250_000 ns ceiling-rounds to T + 1 ms!
+    assert_eq!(cov.first_frame_ms, Some(T + 1));
+
+    // Sequence skip must fail closed.
+    let mut bad_seq = r2;
+    bad_seq["capture_timing"]["sequence"] = json!(4);
+    let mut bad_out = Vec::new();
+    assert!(
+        compile_with_options(
+            &config(),
+            true,
+            text(&[r1, bad_seq, end]).as_bytes(),
+            &mut bad_out,
+            &VenueRegistry::default(),
+        )
+        .is_err()
+    );
+}

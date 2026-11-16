@@ -1,4 +1,6 @@
-use serde::Serialize;
+use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const UPPER_MS: [u64; 19] = [
     0,
@@ -63,5 +65,92 @@ impl TimingHistogram {
             p99_upper_ms: upper(99),
             max_ms: Some(self.max_ms),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureTiming {
+    pub run_id: String,
+    pub sequence: u64,
+    pub connection_epoch: u64,
+    pub receipt_wall_ns: u64,
+    pub receipt_monotonic_ns: u64,
+    pub available_wall_ns: u64,
+    pub available_monotonic_ns: u64,
+}
+
+#[derive(Default)]
+pub(super) struct PreciseClockAudit {
+    run_id: Option<String>,
+    sequence: u64,
+    last_wall_ns: u64,
+    last_mono_ns: u64,
+    origin_ns: i128,
+    epochs: HashMap<(String, Option<String>), u64>,
+}
+
+impl PreciseClockAudit {
+    pub fn observe(
+        &mut self,
+        stamp: Option<CaptureTiming>,
+        source: &str,
+        market: Option<&str>,
+        received_at_ms: u64,
+        available_at_ms: u64,
+    ) -> Result<u64> {
+        let Some(t) = stamp else {
+            bail!("invalid precise capture clock fields");
+        };
+        let valid_hex = t.run_id.len() == 32
+            && t.run_id
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let rw = t.receipt_wall_ns;
+        let aw = t.available_wall_ns;
+        let rm = t.receipt_monotonic_ns;
+        let am = t.available_monotonic_ns;
+        if !valid_hex
+            || t.sequence == 0
+            || rw == 0
+            || aw < rw
+            || am < rm
+            || rw / 1_000_000 != received_at_ms
+            || aw / 1_000_000 != available_at_ms
+            || (aw - rw).abs_diff(am - rm) > 1_000_000
+            || (source == "collector") != (t.connection_epoch == 0)
+        {
+            bail!("inconsistent precise capture clocks");
+        }
+
+        if self.run_id.is_none() {
+            self.run_id = Some(t.run_id.clone());
+            self.origin_ns = i128::from(aw) - i128::from(am);
+        }
+        let key = (source.to_owned(), market.map(str::to_owned));
+        let prior_epoch = self.epochs.get(&key).copied().unwrap_or(0);
+        ensure!(
+            self.run_id.as_deref() == Some(t.run_id.as_str())
+                && t.sequence == self.sequence + 1
+                && aw >= self.last_wall_ns
+                && am >= self.last_mono_ns
+                && (i128::from(aw) - i128::from(am) - self.origin_ns).abs() <= 1_000_000
+                && t.connection_epoch >= prior_epoch,
+            "capture identity, sequence, epoch or clock continuity failed"
+        );
+        self.sequence = t.sequence;
+        self.last_wall_ns = aw;
+        self.last_mono_ns = am;
+        self.epochs.insert(key, t.connection_epoch);
+        // Ceiling division ensures availability never precedes receipt.
+        Ok(aw.div_ceil(1_000_000))
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+
+    pub fn records(&self) -> u64 {
+        self.sequence
     }
 }

@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from archive_public_capture import ingest, records
+from archive_public_capture import ingest, prepare_verified_stream, records, verify_stream_cache
 from compact_replay_inputs import compact, digest, restore
 from public_replay_sources import funding_samples, trade_events
 
@@ -184,3 +184,20 @@ class PublicArchiveTests(unittest.TestCase):
                 {'kind': 'trade_feed', 'at_ms': self.t + 9, 'leg': 1, 'online': False},
             ],
         )
+
+    def test_verified_stream_cache_matches_manifest_and_detects_tampering(self):
+        rows = [
+            self.row('arcus', 'message', 0, 'NVDA-USD', {
+                'channel': 'l2Orderbook', 'type': 'subscribed', 'id': 'NVDA-USD',
+                'contents': {'timestamp': self.t * 1000, 'bids': [['160.0', '1.0']], 'asks': [['160.1', '1.0']]},
+            }),
+            self.row('collector', 'end', 100),
+        ]
+        source, archive = self.capture(rows)
+        meta = prepare_verified_stream(archive, raw_capture=source)
+        self.assertEqual(meta['records'], 2)
+        self.assertEqual(verify_stream_cache(archive), meta)
+        zst = archive / 'verified_stream.ndjson.zst'
+        zst.write_bytes(zst.read_bytes() + b'tampered')
+        with self.assertRaisesRegex(ValueError, 'verified stream cache hash mismatch'):
+            verify_stream_cache(archive)

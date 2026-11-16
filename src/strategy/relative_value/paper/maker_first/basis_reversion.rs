@@ -86,6 +86,11 @@ impl BasisReversionState {
         self.reset();
     }
 
+    pub(super) fn exceeds_gap(&self, policy: MakerBasisReversion, now: u64) -> bool {
+        self.last_observed_ms
+            .is_some_and(|at| now.saturating_sub(at) > policy.max_gap_ms)
+    }
+
     pub(super) fn observe(
         &mut self,
         policy: MakerBasisReversion,
@@ -303,5 +308,7 @@ mod tests {
             s.favorable_dislocation_bps(p, HedgeSide::Buy, 7_200),
             Err("basis_reversion_warmup_or_gap")
         );
+        assert!(!s.exceeds_gap(p, 7_100));
+        assert!(s.exceeds_gap(p, 7_101));
     }
 }

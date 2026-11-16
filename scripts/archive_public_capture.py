@@ -3,6 +3,7 @@
 import argparse
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
+import fcntl
 import gzip
 from hashlib import file_digest, sha256
 from heapq import merge
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 
@@ -194,7 +196,109 @@ def records(root, *, source=None):
         raise ValueError('capture stream hash mismatch')
 
 
-def compile_archive(archive, engine, config, output, *, precise_times=False):
+def verify_stream_cache(archive):
+    archive = archive.resolve(strict=True)
+    stream_zst = archive / 'verified_stream.ndjson.zst'
+    meta_path = archive / 'verified_stream.json'
+    if not stream_zst.is_file() or not meta_path.is_file():
+        return None
+    manifest = json.loads((archive / 'manifest.json').read_text())
+    meta = json.loads(meta_path.read_text())
+    if (meta.get('schema') != 1
+            or meta.get('archive_manifest_sha256') != digest(archive / 'manifest.json')
+            or meta.get('stream_sha256') != manifest['stream_sha256']
+            or meta.get('records') != manifest['records']
+            or meta.get('compressed_sha256') != digest(stream_zst)):
+        raise ValueError('verified stream cache hash mismatch')
+    return meta
+
+
+def prepare_verified_stream(archive, *, raw_capture=None):
+    """Materialize a single cryptographically verified Zstd stream for fast multi-pair compilation."""
+    archive = archive.resolve(strict=True)
+    lock_fd = os.open(archive / '.verified_stream.lock', os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        cached = verify_stream_cache(archive)
+        if cached is not None:
+            return cached
+        manifest_path = archive / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get('schema') != 1:
+            raise ValueError('unknown capture archive version')
+        manifest_id = digest(manifest_path)
+        stream_zst = archive / 'verified_stream.ndjson.zst'
+        meta_path = archive / 'verified_stream.json'
+        with TemporaryDirectory(dir=archive) as directory:
+            tmp_dir = Path(directory)
+            tmp_zst = tmp_dir / 'verified_stream.ndjson.zst'
+            tmp_meta = tmp_dir / 'verified_stream.json'
+            with subprocess.Popen(
+                    ['zstd', '-q', '-T0', '-3', '-o', str(tmp_zst)],
+                    stdin=subprocess.PIPE) as zstd_proc:
+                try:
+                    assert zstd_proc.stdin is not None
+                    with zstd_proc.stdin:
+                        if raw_capture is not None:
+                            raw_capture = Path(raw_capture).resolve(strict=True)
+                            if digest(raw_capture) != manifest['capture_sha256']:
+                                raise ValueError('raw capture sha256 does not match archive manifest')
+                            count, payload_hash = 0, sha256()
+                            if raw_capture.suffix == '.gz' and shutil.which('gzip'):
+                                with subprocess.Popen(['gzip', '-qdc', '--', str(raw_capture)],
+                                                      stdout=subprocess.PIPE) as gz_proc:
+                                    try:
+                                        assert gz_proc.stdout is not None
+                                        for raw in rows(gz_proc.stdout):
+                                            count += 1
+                                            payload_hash.update(raw)
+                                            zstd_proc.stdin.write(raw)
+                                    except BaseException:
+                                        gz_proc.terminate()
+                                        raise
+                                    finally:
+                                        if gz_proc.stdout is not None:
+                                            gz_proc.stdout.close()
+                                    if gz_proc.wait() != 0:
+                                        raise ValueError('gzip decompression failed on raw capture')
+                            else:
+                                with open_capture(raw_capture) as src:
+                                    for raw in rows(src):
+                                        count += 1
+                                        payload_hash.update(raw)
+                                        zstd_proc.stdin.write(raw)
+                            if count != manifest['records'] or payload_hash.hexdigest() != manifest['stream_sha256']:
+                                raise ValueError('raw capture stream hash mismatch')
+                        else:
+                            for raw in records(archive):
+                                zstd_proc.stdin.write(raw)
+                    if zstd_proc.wait() != 0:
+                        raise RuntimeError('zstd compression failed while building verified stream')
+                except BaseException:
+                    zstd_proc.terminate()
+                    raise
+            if digest(manifest_path) != manifest_id:
+                raise ValueError('archive manifest changed during stream preparation')
+            meta = {
+                'schema': 1,
+                'archive_manifest_sha256': manifest_id,
+                'stream_sha256': manifest['stream_sha256'],
+                'compressed_sha256': digest(tmp_zst),
+                'records': manifest['records'],
+            }
+            tmp_meta.write_text(json.dumps(meta, indent=2) + '\n')
+            os.link(tmp_zst, stream_zst)
+            try:
+                os.link(tmp_meta, meta_path)
+            except BaseException:
+                stream_zst.unlink()
+                raise
+            return meta
+    finally:
+        os.close(lock_fd)
+
+
+def compile_archive(archive, engine, config, output, *, precise_times=False, raw_capture=None):
     """Build a reusable market tape. Publish only after the source verifies."""
     output = output.absolute()
     if not output.name.endswith('.ndjson.zst'):
@@ -202,39 +306,65 @@ def compile_archive(archive, engine, config, output, *, precise_times=False):
     evidence = output.with_suffix('.provenance.json')
     if output.exists() or evidence.exists():
         raise FileExistsError('compiled output already exists')
-    from capture_timing import ClockAudit
-    clock = ClockAudit() if precise_times else None
+    if raw_capture is not None:
+        prepare_verified_stream(archive, raw_capture=raw_capture)
+    cached_stream = verify_stream_cache(archive)
     archive_id = digest(archive / 'manifest.json')
     engine_id, config_id = digest(engine), digest(config)
+    output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output.parent) as directory:
         path = Path(directory)
         tape, compressed, provenance = (path / name for name in ('tape.ndjson', 'tape.ndjson.zst', 'provenance.json'))
         coverage_path = path / 'coverage.json'
-        with coverage_path.open('xb') as coverage_output, subprocess.Popen(
-                [str(engine.resolve()), 'perp-compile', str(config.resolve()), '/dev/stdin', str(tape)],
-                stdin=subprocess.PIPE, stdout=coverage_output) as process:
-            try:
-                with process.stdin:
-                    for raw in records(archive):
-                        if clock is not None:
-                            row = json.loads(raw)
-                            row["available_at_ms"] = clock.observe(row)
-                            raw = (json.dumps(row, separators=(",", ":")) + "\n").encode()
-                        process.stdin.write(raw)
-                if process.wait() != 0:
-                    raise RuntimeError('public capture compiler rejected archive')
-            except BaseException:
-                process.terminate()
-                raise
+        cmd = [str(engine.resolve()), 'perp-compile']
+        if precise_times:
+            cmd.append('--precise-times')
+        cmd.extend([str(config.resolve()), '-', str(tape)])
+        if cached_stream is not None:
+            stream_zst = (archive / 'verified_stream.ndjson.zst').resolve(strict=True)
+            with coverage_path.open('xb') as coverage_output, subprocess.Popen(
+                    ['zstd', '-qdc', '--', str(stream_zst)],
+                    stdout=subprocess.PIPE) as zstd_proc:
+                assert zstd_proc.stdout is not None
+                with subprocess.Popen(
+                        cmd, stdin=zstd_proc.stdout, stdout=coverage_output) as process:
+                    zstd_proc.stdout.close()
+                    try:
+                        rc_compile = process.wait()
+                        rc_zstd = zstd_proc.wait()
+                        if rc_compile != 0 or rc_zstd != 0:
+                            raise RuntimeError('public capture compiler rejected archive')
+                    except BaseException:
+                        process.terminate()
+                        zstd_proc.terminate()
+                        raise
+        else:
+            with coverage_path.open('xb') as coverage_output, subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=coverage_output) as process:
+                try:
+                    assert process.stdin is not None
+                    with process.stdin:
+                        for raw in records(archive):
+                            process.stdin.write(raw)
+                    if process.wait() != 0:
+                        raise RuntimeError('public capture compiler rejected archive')
+                except BaseException:
+                    process.terminate()
+                    raise
         if (archive_id, engine_id, config_id) != (digest(archive / 'manifest.json'), digest(engine), digest(config)):
             raise ValueError('a compilation input changed')
         subprocess.run(['zstd', '-q', '-T1', '-3', str(tape), '-o', str(compressed)], check=True)
+        coverage_obj = json.loads(coverage_path.read_text())
+        availability_rule = coverage_obj.pop('availability_rule', None)
+        capture_run_id = coverage_obj.pop('capture_run_id', None)
+        precise_records = coverage_obj.pop('precise_records', None)
         report = {'archive_manifest_sha256': archive_id, 'engine_sha256': engine_id, 'config_sha256': config_id,
                   'decoded_sha256': digest(tape), 'compressed_sha256': digest(compressed),
-                  'coverage': json.loads(coverage_path.read_text())}
-        if clock is not None:
-            report.update(availability_rule='ceil_available_wall_ns_to_ms', capture_run_id=clock.run_id,
-                          precise_records=clock.sequence)
+                  'coverage': coverage_obj}
+        if precise_times:
+            report.update(availability_rule=availability_rule or 'ceil_available_wall_ns_to_ms',
+                          capture_run_id=capture_run_id,
+                          precise_records=precise_records)
         provenance.write_text(json.dumps(report, indent=2) + '\n')
         os.link(compressed, output)
         try:
@@ -251,19 +381,28 @@ def main():
     store = commands.add_parser('ingest')
     store.add_argument('sealed_capture', type=Path)
     store.add_argument('archive', type=Path)
+    prep = commands.add_parser('prepare-stream')
+    prep.add_argument('archive', type=Path)
+    prep.add_argument('--raw-capture', type=Path, default=None)
     restore = commands.add_parser('export')
     restore.add_argument('archive', type=Path)
     restore.add_argument('output', type=Path)
     compiler = commands.add_parser('compile')
     for name in ('archive', 'engine', 'config', 'output'):
         compiler.add_argument(name, type=Path)
+    compiler.add_argument('--precise-times', action='store_true')
+    compiler.add_argument('--raw-capture', type=Path, default=None)
     args = parser.parse_args()
     os.umask(0o077)
     if args.command == 'ingest':
         result = ingest(args.sealed_capture, args.archive)
         print(json.dumps({'records': result['records'], 'shards': len(result['shards']), 'stream_sha256': result['stream_sha256']}))
+    elif args.command == 'prepare-stream':
+        result = prepare_verified_stream(args.archive, raw_capture=args.raw_capture)
+        print(json.dumps(result))
     elif args.command == 'compile':
-        result = compile_archive(args.archive, args.engine, args.config, args.output)
+        result = compile_archive(args.archive, args.engine, args.config, args.output,
+                                 precise_times=args.precise_times, raw_capture=args.raw_capture)
         print(json.dumps({'decoded_sha256': result['decoded_sha256'], 'coverage': result['coverage']}))
     else:
         with args.output.open('xb') as file:

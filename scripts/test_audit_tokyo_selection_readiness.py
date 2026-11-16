@@ -204,7 +204,22 @@ class TokyoSelectionReadinessTests(unittest.TestCase):
             )
         )
 
-        # 4) Single mid-window disconnect MUST fail continuity even when message cadence is dense.
+        # 4) Scheduled Lighter clock_refresh probes preserve continuity, whereas a real disconnect fails.
+        clock_refresh_rows = list(dense_rows)
+        clock_refresh_rows.insert(
+            1800,
+            self._row("lighter", self.t0 + 18_000_005, {}, event="clock_refresh"),
+        )
+        refresh_path = self.root / "clock_refresh_10h.ndjson"
+        refresh_path.write_text(
+            "".join(json.dumps(r) + "\n" for r in clock_refresh_rows), encoding="utf-8"
+        )
+        refresh_report = audit_readiness(refresh_path)
+        self.assertTrue(refresh_report["window"]["continuous_ten_hour_unit_satisfied"])
+        self.assertEqual(refresh_report["sources"]["lighter"]["clock_refreshes"], 1)
+        self.assertEqual(refresh_report["sources"]["lighter"]["disconnects"], 0)
+
+        # 5) Single mid-window disconnect MUST fail continuity even when message cadence is dense.
         disconnect_rows = list(dense_rows)
         disconnect_rows.insert(
             1800,
@@ -219,6 +234,79 @@ class TokyoSelectionReadinessTests(unittest.TestCase):
         self.assertIn(
             "source_disconnects:lighter:1",
             disconnect_report["window"]["continuity_blockers"],
+        )
+
+    def test_strategy_scoped_readiness_separates_confirm_vs_usable_book_and_unrelated_feeds(self):
+        rows = []
+        for step_ms in range(0, 36_360_001, 10_000):
+            ts = self.t0 + step_ms
+            rows.append(
+                self._row(
+                    "arcus",
+                    ts,
+                    {
+                        "channel": "l2Orderbook",
+                        "type": "channel_data",
+                        "id": "NVDA-USD",
+                        "contents": {"timestamp": (ts - 80) * 1000, "bids": [["160", "1"]], "asks": [["161", "1"]]},
+                    },
+                )
+            )
+            rows.append(
+                self._row(
+                    "arcus_trades",
+                    ts + 1,
+                    {"channel": "trades", "id": "NVDA-USD"},
+                    event="subscribed" if step_ms == 0 else "message",
+                )
+            )
+            rows.append(
+                self._row(
+                    "hyperliquid",
+                    ts + 2,
+                    {"channel": "l2Book", "data": {"coin": "xyz:NVDA", "time": ts - 300}},
+                )
+            )
+            rows.append(
+                self._row(
+                    "hyperliquid_trades",
+                    ts + 3,
+                    {"type": "trades", "coin": "xyz:NVDA"},
+                    event="subscribed" if step_ms == 0 else "message",
+                )
+            )
+        # Inject one Hyperliquid 3-hour session expiry: confirm after 1050ms, usable l2Book after 1450ms
+        dc_at = self.t0 + 10_805_000
+        rows.append(self._row("hyperliquid", dc_at, {}, event="disconnect"))
+        rows.append(
+            self._row(
+                "hyperliquid",
+                dc_at + 1050,
+                {"channel": "subscriptionResponse"},
+                event="subscribed",
+            )
+        )
+        rows.append(
+            self._row(
+                "hyperliquid",
+                dc_at + 1450,
+                {"channel": "l2Book", "data": {"coin": "xyz:NVDA", "time": dc_at + 1150}},
+            )
+        )
+        rows.sort(key=lambda r: r["received_at_ms"])
+        path = self.root / "scoped_10h.ndjson"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        rep = audit_readiness(path)
+        self.assertFalse(rep["window"]["continuous_ten_hour_unit_satisfied"])
+        self.assertEqual(rep["sources"]["hyperliquid"]["reconnect_confirm_p50_ms"], 1050.0)
+        self.assertEqual(rep["sources"]["hyperliquid"]["reconnect_usable_p50_ms"], 1450.0)
+        self.assertEqual(
+            rep["strategy_readiness"]["arcus_single_venue"]["status"],
+            "ready_strict_zero_disconnect",
+        )
+        self.assertEqual(
+            rep["strategy_readiness"]["arcus_hip3_pair"]["status"],
+            "ready_with_causal_reconnect_barriers",
         )
 
 

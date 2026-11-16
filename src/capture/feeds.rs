@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 const LEVELS: usize = 20;
 const MAX_LIGHTER_LEVELS: usize = 50_000;
@@ -127,6 +127,69 @@ impl<'a> LegFeed<'a> {
 
     pub fn clock_audit(&self) -> Option<LighterClockAudit> {
         self.config.lighter_clock.map(|_| self.lighter_clock)
+    }
+
+    /// Fast zero-DOM market pre-filter over a validated `RawValue` JSON slice.
+    /// Returns `false` only when the payload positively identifies an unrelated market;
+    /// any matching or structurally ambiguous payload returns `true` so `apply()` runs
+    /// full validation and error reporting unchanged.
+    pub fn matches_payload_raw(&self, source: &str, raw_payload: &str) -> bool {
+        #[derive(Deserialize)]
+        struct ChannelPeek<'a> {
+            #[serde(borrow)]
+            channel: Option<Cow<'a, str>>,
+        }
+        #[derive(Deserialize)]
+        struct HlCoinPeek<'a> {
+            #[serde(borrow)]
+            coin: Option<Cow<'a, str>>,
+        }
+        #[derive(Deserialize)]
+        struct HlPeek<'a> {
+            #[serde(borrow)]
+            data: Option<HlCoinPeek<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct ArcusPeek<'a> {
+            #[serde(borrow)]
+            channel: Option<Cow<'a, str>>,
+            #[serde(borrow)]
+            id: Option<Cow<'a, str>>,
+        }
+
+        match source {
+            "lighter" | "lighter_robinhood" => {
+                let Some(market_id) = self.config.lighter_market_id else {
+                    return true;
+                };
+                match serde_json::from_str::<ChannelPeek<'_>>(raw_payload) {
+                    Ok(peek) => {
+                        let ch = peek.channel.as_deref().unwrap_or_default();
+                        ch.split_once(':')
+                            .or_else(|| ch.split_once('/'))
+                            .and_then(|(_, id)| id.parse::<u16>().ok())
+                            == Some(market_id)
+                    }
+                    Err(_) => true,
+                }
+            }
+            "hyperliquid" | "hyperliquid_snapshot" => {
+                match serde_json::from_str::<HlPeek<'_>>(raw_payload) {
+                    Ok(peek) => {
+                        peek.data.and_then(|d| d.coin).as_deref() == Some(self.market.as_str())
+                    }
+                    Err(_) => true,
+                }
+            }
+            "arcus" => match serde_json::from_str::<ArcusPeek<'_>>(raw_payload) {
+                Ok(peek) => {
+                    peek.channel.as_deref() == Some("l2Orderbook")
+                        && peek.id.as_deref() == Some(self.market.as_str())
+                }
+                Err(_) => true,
+            },
+            _ => true,
+        }
     }
 
     pub fn apply(

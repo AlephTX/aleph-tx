@@ -1018,22 +1018,33 @@ impl Replay<'_> {
                 .observe(policy, self.config.latency_reserve_bps, now, observation);
         }
         if let Some(policy) = self.config.basis_reversion {
-            let observation = self.pair_books(now).filter(|_| self.feed_online).map(|b| {
+            if !self.feed_online || !self.usable[0] || !self.usable[1] {
+                self.basis_reversion.observe(policy, now, None);
+            } else if let Some(b) = self.pair_books(now) {
                 let maker = b[self.maker()].mid();
                 let hedge = b[1 - self.maker()].mid();
-                (
-                    (maker - hedge) / hedge * BPS,
-                    [b[0].timestamp_ms, b[1].timestamp_ms],
-                )
-            });
-            self.basis_reversion.observe(policy, now, observation);
+                self.basis_reversion.observe(
+                    policy,
+                    now,
+                    Some((
+                        (maker - hedge) / hedge * BPS,
+                        [b[0].timestamp_ms, b[1].timestamp_ms],
+                    )),
+                );
+            } else if self.basis_reversion.exceeds_gap(policy, now) {
+                self.basis_reversion.observe(policy, now, None);
+            }
         }
         if let Some(policy) = self.config.entry_flow_filter {
-            let observation = self
-                .fresh(1 - self.maker(), now)
-                .filter(|_| self.feed_online)
-                .map(|b| (b.mid(), b.timestamp_ms));
-            self.entry_flow.observe(policy, now, observation);
+            let hedge_leg = 1 - self.maker();
+            if !self.feed_online || !self.usable[hedge_leg] {
+                self.entry_flow.observe(policy, now, None);
+            } else if let Some(b) = self.fresh(hedge_leg, now) {
+                self.entry_flow
+                    .observe(policy, now, Some((b.mid(), b.timestamp_ms)));
+            } else if self.entry_flow.exceeds_gap(policy, now) {
+                self.entry_flow.observe(policy, now, None);
+            }
         }
         let mark = self
             .fresh(self.maker(), now)

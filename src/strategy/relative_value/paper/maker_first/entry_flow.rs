@@ -79,6 +79,11 @@ impl EntryFlowState {
         self.reset();
     }
 
+    pub(super) fn exceeds_gap(&self, policy: EntryFlowFilter, now: u64) -> bool {
+        self.last_observed_ms
+            .is_some_and(|at| now.saturating_sub(at) > policy.max_gap_ms)
+    }
+
     pub(super) fn observe(
         &mut self,
         policy: EntryFlowFilter,

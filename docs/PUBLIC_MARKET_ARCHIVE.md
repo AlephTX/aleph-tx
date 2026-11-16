@@ -38,7 +38,9 @@ then rename the partial file and ingest it into a new archive directory.
 ```sh
 python3 scripts/archive_public_capture.py ingest \
   /path/to/sealed.ndjson.gz /path/to/public-archive
-python3 scripts/archive_public_capture.py compile \
+python3 scripts/archive_public_capture.py prepare-stream \
+  /path/to/public-archive --raw-capture /path/to/sealed.ndjson.gz
+python3 scripts/archive_public_capture.py compile --precise-times \
   /path/to/public-archive target/release/cross_venue \
   /path/to/compiled/BTC-capture.json /path/to/compiled/BTC-freshest.ndjson.zst
 ```
@@ -50,8 +52,13 @@ several markets are stored under the shared domain. An hour boundary rotates
 storage while retaining original timestamps and event order. Each shard has a
 SHA-256 and event count. The capture manifest also binds the complete original
 stream, so an export can reproduce the exact input, including equal timestamps
-and connection events. Validate time coverage and gaps separately before
-admitting a continuous ten-hour research window.
+and connection events. `prepare-stream` materializes a single SHA-256-verified
+`verified_stream.ndjson.zst` (bound to `manifest.json` via `verified_stream.json`)
+so multi-pair `--precise-times` compilations stream directly through native Rust
+`cross_venue perp-compile --precise-times` without re-decoding shards per pair.
+Validate both station-wide continuity and strategy-scoped feed dependencies with
+`scripts/audit_tokyo_selection_readiness.py` before admitting a continuous
+ten-hour research window.
 
 The quant and turnover runner accepts `--public-archive` and `--compiled-dir`.
 Use `--program quant` or `--program turnover` to schedule each objective

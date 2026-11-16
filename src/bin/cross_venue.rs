@@ -2,7 +2,7 @@
 #[path = "cross_venue/arcus_cli.rs"]
 mod arcus_cli;
 use aleph_tx::{
-    capture::{CaptureConfig, compile as compile_capture},
+    capture::{CaptureConfig, compile_with_options as compile_capture},
     exchanges::{arcus, bulk, hyperliquid, variational},
     funding_evidence,
     hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
@@ -298,8 +298,11 @@ fn attach_funding_proofs(
 }
 
 fn open_capture_stream(input: &str) -> Result<Box<dyn BufRead>> {
-    if input == "-" {
-        return Ok(Box::new(BufReader::new(std::io::stdin())));
+    if input == "-" || input == "/dev/stdin" {
+        return Ok(Box::new(BufReader::with_capacity(
+            1024 * 1024,
+            std::io::stdin(),
+        )));
     }
     let parts: Vec<&str> = input.split(',').filter(|s| !s.is_empty()).collect();
     ensure!(!parts.is_empty(), "capture input path is empty");
@@ -307,11 +310,12 @@ fn open_capture_stream(input: &str) -> Result<Box<dyn BufRead>> {
     for part in &parts[1..] {
         reader = Box::new(reader.chain(File::open(part)?));
     }
-    Ok(Box::new(BufReader::new(reader)))
+    Ok(Box::new(BufReader::with_capacity(1024 * 1024, reader)))
 }
 
 fn capture_to_replay(
     config: &CaptureConfig,
+    precise_times: bool,
     input: &str,
     output: &str,
     registry: &VenueRegistry,
@@ -325,7 +329,13 @@ fn capture_to_replay(
     let temporary = output.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
     let result: Result<_> = (|| {
         let file = File::create_new(&temporary)?;
-        let coverage = compile_capture(config, input, BufWriter::new(&file), registry)?;
+        let coverage = compile_capture(
+            config,
+            config.precise_times || precise_times,
+            input,
+            BufWriter::with_capacity(1024 * 1024, &file),
+            registry,
+        )?;
         file.sync_all()?;
         // Publish a complete replay and never overwrite an earlier dataset.
         fs::hard_link(&temporary, output).context("publish replay without overwriting")?;
@@ -431,12 +441,24 @@ async fn main() -> Result<()> {
             print(&config.preflight(&registry)?)
         }
         [command, config, input, output] if command == "perp-compile" => {
-            capture_to_replay(&read_replay(config)?, input, output, &registry)
+            capture_to_replay(&read_replay(config)?, false, input, output, &registry)
+        }
+        [command, flag, config, input, output]
+            if command == "perp-compile" && flag == "--precise-times" =>
+        {
+            capture_to_replay(&read_replay(config)?, true, input, output, &registry)
         }
         [command, config, input, output, lighter, hyperliquid] if command == "perp-compile" => {
             let mut config = read_replay(config)?;
             attach_funding_proofs(&mut config, lighter, hyperliquid)?;
-            capture_to_replay(&config, input, output, &registry)
+            capture_to_replay(&config, false, input, output, &registry)
+        }
+        [command, flag, config, input, output, lighter, hyperliquid]
+            if command == "perp-compile" && flag == "--precise-times" =>
+        {
+            let mut config = read_replay(config)?;
+            attach_funding_proofs(&mut config, lighter, hyperliquid)?;
+            capture_to_replay(&config, true, input, output, &registry)
         }
         [command, venue, policy, first, last] if command == "perp-funding-proof" => {
             let (first, last) = (first.parse()?, last.parse()?);

@@ -16,12 +16,13 @@ use anyhow::{Context, Result, ensure};
 pub use clock::{LighterClockAudit, LighterClockPolicy};
 use feeds::{ContextTick, LegFeed};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::{
     collections::BTreeMap,
     io::{BufRead, Read, Write},
 };
-use timing::{TimingHistogram, TimingSummary};
+use timing::{CaptureTiming, PreciseClockAudit, TimingHistogram, TimingSummary};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +30,9 @@ pub struct CaptureConfig {
     /// Compile independent local books without asserting settlement parity.
     #[serde(default)]
     pub independent_books: bool,
+    /// Validate nanosecond `capture_timing` clocks and ceiling-round `available_wall_ns` to ms.
+    #[serde(default)]
+    pub precise_times: bool,
     pub pair: PairConfig,
     pub one_way_latency_ms: u64,
     pub trade_from_ms: Option<u64>,
@@ -173,16 +177,17 @@ pub struct ReferenceObservation {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Record {
-    #[serde(rename = "capture_timing")]
-    _capture_timing: Option<serde_json::Value>,
+pub struct Record<'a> {
+    #[serde(borrow)]
+    capture_timing: Option<&'a RawValue>,
     source: String,
     event: String,
     received_at_ms: u64,
     available_at_ms: u64,
     market: Option<String>,
     request_sent_at_ms: Option<u64>,
-    payload: Option<serde_json::Value>,
+    #[serde(borrow)]
+    payload: Option<&'a RawValue>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -216,6 +221,12 @@ pub struct Coverage {
     pub settlement_records_written: [usize; 2],
     pub witnessed_settlement_records_written: [usize; 2],
     pub paper_entries: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability_rule: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precise_records: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -231,16 +242,13 @@ struct Header<'a> {
 const MAX_LINE: u64 = 2 * 1024 * 1024;
 const MAX_FRAMES: usize = 1_000_000;
 
-fn read_record<T: DeserializeOwned>(
-    reader: &mut impl BufRead,
-    bytes: &mut Vec<u8>,
-) -> Result<Option<T>> {
+fn read_line_bytes(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> Result<bool> {
     bytes.clear();
     if reader.take(MAX_LINE + 1).read_until(b'\n', bytes)? == 0 {
-        return Ok(None);
+        return Ok(false);
     }
     ensure!(bytes.len() as u64 <= MAX_LINE, "capture line too large");
-    Ok(Some(serde_json::from_slice(bytes)?))
+    Ok(true)
 }
 
 fn line(output: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -486,7 +494,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn apply(&mut self, row: Record) -> Result<()> {
+    fn apply(&mut self, row: Record<'_>) -> Result<()> {
         ensure!(
             matches!(
                 row.source.as_str(),
@@ -543,8 +551,9 @@ impl<'a> Compiler<'a> {
                     self.coinbase = None;
                 }
             }
-            ("message", Some(payload)) => {
+            ("message", Some(raw_payload)) => {
                 if row.source == "extended_index" {
+                    let payload: serde_json::Value = serde_json::from_str(raw_payload.get())?;
                     ensure!(
                         row.market.as_deref().is_some_and(|market| {
                             payload["data"]["m"].as_str() == Some(market)
@@ -558,16 +567,26 @@ impl<'a> Compiler<'a> {
                     .entry(row.source.clone())
                     .or_default() += 1;
                 if row.source == "coinbase" {
-                    if let ReferenceFeed::Coinbase { product } = &self.config.reference
-                        && let Ok(Some(quote)) =
+                    if let ReferenceFeed::Coinbase { product } = &self.config.reference {
+                        let payload: serde_json::Value = serde_json::from_str(raw_payload.get())?;
+                        if let Ok(Some(quote)) =
                             feeds::coinbase(&payload, product, row.received_at_ms)
-                        && self
-                            .coinbase
-                            .is_none_or(|prior| quote.timestamp_ms >= prior.timestamp_ms)
-                    {
-                        self.coinbase = Some(quote);
+                            && self
+                                .coinbase
+                                .is_none_or(|prior| quote.timestamp_ms >= prior.timestamp_ms)
+                        {
+                            self.coinbase = Some(quote);
+                        }
                     }
                 } else {
+                    let raw_str = raw_payload.get();
+                    let any_leg_matches = self.legs.iter().any(|leg| {
+                        leg.accepts(&row.source) && leg.matches_payload_raw(&row.source, raw_str)
+                    });
+                    if !any_leg_matches {
+                        return Ok(());
+                    }
+                    let payload: serde_json::Value = serde_json::from_str(raw_str)?;
                     for (i, leg) in self.legs.iter_mut().enumerate() {
                         if !leg.accepts(&row.source) {
                             continue;
@@ -823,12 +842,23 @@ impl<'a> Compiler<'a> {
 
 pub fn compile(
     config: &CaptureConfig,
+    input: impl BufRead,
+    output: impl Write,
+    registry: &VenueRegistry,
+) -> Result<Coverage> {
+    compile_with_options(config, config.precise_times, input, output, registry)
+}
+
+pub fn compile_with_options(
+    config: &CaptureConfig,
+    precise_times: bool,
     mut input: impl BufRead,
     mut output: impl Write,
     registry: &VenueRegistry,
 ) -> Result<Coverage> {
     config.validate(registry)?;
     let mut compiler = Compiler::new(config);
+    let mut precise_clock = precise_times.then(PreciseClockAudit::default);
     line(
         &mut output,
         &Header {
@@ -843,10 +873,32 @@ pub fn compile(
     let mut group = 0;
     let mut last_available_ms = 0;
     let mut ended = false;
-    while let Some(row) = read_record::<Record>(&mut input, &mut bytes)
+    while read_line_bytes(&mut input, &mut bytes)
         .with_context(|| format!("capture line {}", compiler.coverage.records + 1))?
     {
+        let mut row: Record<'_> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("capture line {}", compiler.coverage.records + 1))?;
         ensure!(!ended, "data after capture footer");
+        if let Some(audit) = &mut precise_clock {
+            let stamp = row
+                .capture_timing
+                .map(|raw| serde_json::from_str::<CaptureTiming>(raw.get()))
+                .transpose()
+                .with_context(|| {
+                    format!("capture timing line {}", compiler.coverage.records + 1)
+                })?;
+            row.available_at_ms = audit
+                .observe(
+                    stamp,
+                    &row.source,
+                    row.market.as_deref(),
+                    row.received_at_ms,
+                    row.available_at_ms,
+                )
+                .with_context(|| {
+                    format!("capture timing line {}", compiler.coverage.records + 1)
+                })?;
+        }
         let now = row.available_at_ms;
         ensure!(
             row.received_at_ms > 0
@@ -894,6 +946,11 @@ pub fn compile(
         compiler.book_availability.map(TimingHistogram::summarize);
     compiler.coverage.fresh_book_skew_ms = compiler.fresh_book_skew.summarize();
     compiler.coverage.lighter_clock = compiler.legs.each_ref().map(LegFeed::clock_audit);
+    if let Some(audit) = precise_clock {
+        compiler.coverage.availability_rule = Some("ceil_available_wall_ns_to_ms");
+        compiler.coverage.capture_run_id = audit.run_id().map(str::to_owned);
+        compiler.coverage.precise_records = Some(audit.records());
+    }
     Ok(compiler.coverage)
 }
 
