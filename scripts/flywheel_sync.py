@@ -195,16 +195,28 @@ def ship_public_bronze(
     evicted = []
     eviction_candidates: list[tuple[float, Path, Path, Path]] = []
 
+    min_free_bytes = (
+        int(evict_below_free_gib * (1 << 30))
+        if (not evict_after_verify and evict_below_free_gib is not None and evict_below_free_gib > 0)
+        else None
+    )
+    eager_evict = bool(remote_base) and evict_after_verify
+
     for cap_path in _discover_closed_public_captures(resolved_root):
         cid = campaign_id or _infer_campaign_id(cap_path.name)
         manifest_path = cap_path.with_name(f"{cap_path.name}.bronze_manifest.json")
         receipt_path = cap_path.with_name(f"{cap_path.name}.upload_receipt.json")
+        will_upload = bool(remote_base) and not receipt_path.exists()
 
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            cur_sha, cur_bytes = digest_unchanged(cap_path)
-            if cur_sha != manifest.get("capture_sha256") or cur_bytes != manifest.get("capture_bytes"):
+            stat_size = cap_path.stat().st_size
+            if stat_size != manifest.get("capture_bytes"):
                 raise ValueError(f"sealed capture mutated on disk: {cap_path}")
+            if will_upload:
+                cur_sha, cur_bytes = digest_unchanged(cap_path)
+                if cur_sha != manifest.get("capture_sha256") or cur_bytes != manifest.get("capture_bytes"):
+                    raise ValueError(f"sealed capture mutated on disk: {cap_path}")
         else:
             try:
                 manifest = seal_bronze_capture(
@@ -218,62 +230,62 @@ def ship_public_bronze(
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         sealed.append(cap_path.name)
-        if not remote_base:
-            continue
-
-        rel_subdir = (
-            cap_path.parent.relative_to(resolved_root).as_posix()
-            if cap_path.parent != resolved_root
-            else ""
-        )
-        remote_folder = f"{remote_base}/{rel_subdir}" if rel_subdir else remote_base
-        remote_cap = f"{remote_folder}/{cap_path.name}"
-        remote_manifest = f"{remote_folder}/{manifest_path.name}"
-
-        if not receipt_path.exists():
-            for local_src, remote_dst in ((cap_path, remote_cap), (manifest_path, remote_manifest)):
-                copy_cmd = build_idle_command(
-                    [
-                        "rclone",
-                        "copyto",
-                        "--bwlimit",
-                        bwlimit,
-                        "--drive-chunk-size",
-                        drive_chunk_size,
-                        "--",
-                        str(local_src),
-                        remote_dst,
-                    ],
-                    which=which,
-                )
-                runner(copy_cmd, capture_output=True, text=True, check=True)
-
-            receipt = _verify_remote_rclone_object(
-                remote_cap,
-                expected_sha256=manifest["capture_sha256"],
-                expected_bytes=manifest["capture_bytes"],
-                which=which,
-                runner=runner,
+        if remote_base:
+            rel_subdir = (
+                cap_path.parent.relative_to(resolved_root).as_posix()
+                if cap_path.parent != resolved_root
+                else ""
             )
-            try:
-                write_immutable_json(receipt_path, receipt)
-            except FileExistsError:
-                pass
+            remote_folder = f"{remote_base}/{rel_subdir}" if rel_subdir else remote_base
+            remote_cap = f"{remote_folder}/{cap_path.name}"
+            remote_manifest = f"{remote_folder}/{manifest_path.name}"
 
-        shipped.append(
-            {
-                "capture": cap_path.name,
-                "campaign_id": manifest["campaign_id"],
-                "sha256": manifest["capture_sha256"],
-                "bytes": manifest["capture_bytes"],
-                "remote_uri": f"rclone://{remote_cap}",
-            }
-        )
+            if will_upload and not receipt_path.exists():
+                for local_src, remote_dst in ((cap_path, remote_cap), (manifest_path, remote_manifest)):
+                    copy_cmd = build_idle_command(
+                        [
+                            "rclone",
+                            "copyto",
+                            "--bwlimit",
+                            bwlimit,
+                            "--drive-chunk-size",
+                            drive_chunk_size,
+                            "--",
+                            str(local_src),
+                            remote_dst,
+                        ],
+                        which=which,
+                    )
+                    runner(copy_cmd, capture_output=True, text=True, check=True)
 
+                receipt = _verify_remote_rclone_object(
+                    remote_cap,
+                    expected_sha256=manifest["capture_sha256"],
+                    expected_bytes=manifest["capture_bytes"],
+                    which=which,
+                    runner=runner,
+                )
+                try:
+                    write_immutable_json(receipt_path, receipt)
+                except FileExistsError:
+                    pass
+
+            shipped.append(
+                {
+                    "capture": cap_path.name,
+                    "campaign_id": manifest["campaign_id"],
+                    "sha256": manifest["capture_sha256"],
+                    "bytes": manifest["capture_bytes"],
+                    "remote_uri": f"rclone://{remote_cap}",
+                }
+            )
+
+        if not (eager_evict or min_free_bytes is not None) or not receipt_path.exists():
+            continue
         mtime = cap_path.stat().st_mtime
         age_secs = max(0.0, now_ts - mtime)
-        if age_secs >= min_evict_age_secs and receipt_path.exists():
-            if evict_after_verify:
+        if age_secs >= min_evict_age_secs:
+            if eager_evict:
                 tombstone = evict_local_capture(
                     cap_path,
                     manifest_path=manifest_path,
@@ -283,13 +295,7 @@ def ship_public_bronze(
             else:
                 eviction_candidates.append((mtime, cap_path, manifest_path, receipt_path))
 
-    if (
-        not evict_after_verify
-        and evict_below_free_gib is not None
-        and evict_below_free_gib > 0
-        and eviction_candidates
-    ):
-        min_free_bytes = int(evict_below_free_gib * (1 << 30))
+    if min_free_bytes is not None and eviction_candidates:
         eviction_candidates.sort(key=lambda item: (item[0], item[1].name))
         for _mtime, cap_path, manifest_path, receipt_path in eviction_candidates:
             if disk_free_bytes_fn(resolved_root) >= min_free_bytes:

@@ -8,10 +8,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploy" / "oasis"))
 
+import flywheel_sync
+import quant_lakehouse
 from flywheel_sync import (
     backup_private_telemetry,
     build_idle_command,
@@ -315,6 +318,106 @@ class FlywheelSyncTests(unittest.TestCase):
         self.assertEqual(res["shipped_count"], 2)
         self.assertEqual(res["evicted"], ["tokyo-crypto-20261116T000000Z-w01.ndjson.gz"])
         self.assertFalse(w1.exists())
+        self.assertTrue(w2.exists())
+
+    def test_evict_below_free_gib_honors_gdrive_receipt_when_remote_dir_empty(self) -> None:
+        cap_dir = self.root / "gdrive_receipt_guard"
+        rwa_sub = cap_dir / "rwa"
+        rwa_sub.mkdir(parents=True)
+        w1 = self._write_closed_segment(rwa_sub, "tokyo-rwa-20261115T134910Z-w01.ndjson.gz")
+        w2 = self._write_closed_segment(rwa_sub, "tokyo-rwa-20261116T000410Z-w02.ndjson.gz")
+        os.utime(w1, (1_700_000_100, 1_700_000_100))
+        os.utime(w2, (1_700_037_000, 1_700_037_000))
+
+        # Initial pass seals both manifests while disk has 19 GiB free (>= 16 GiB).
+        res_seal = ship_public_bronze(
+            cap_dir,
+            remote_dir="",
+            collector_region="tokyo",
+            split_role="selection_dev",
+            evict_below_free_gib=16.0,
+            min_evict_age_secs=0.0,
+            now_epoch=1_700_100_000.0,
+            disk_free_bytes_fn=lambda _p: 19 << 30,
+        )
+        self.assertEqual(res_seal["sealed_count"], 2)
+        self.assertEqual(res_seal["evicted"], [])
+
+        # Write a verified Google Drive upload receipt ONLY for w01 (w02 not backed up yet).
+        w1_manifest = json.loads(
+            w1.with_name(f"{w1.name}.bronze_manifest.json").read_text(encoding="utf-8")
+        )
+        w1_receipt = w1.with_name(f"{w1.name}.upload_receipt.json")
+        w1_receipt.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "remote_uri": "gdrive://test-fixture",
+                    "sha256": w1_manifest["capture_sha256"],
+                    "bytes": w1_manifest["capture_bytes"],
+                    "verified_at_utc": "2026-11-16T16:30:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Steady-state idle pass (19 GiB >= 16 GiB) must NOT re-hash multi-GB blobs or evict.
+        with mock.patch.object(
+            flywheel_sync, "digest_unchanged", wraps=flywheel_sync.digest_unchanged
+        ) as spy_digest:
+            res_idle = ship_public_bronze(
+                cap_dir,
+                remote_dir="",
+                collector_region="tokyo",
+                split_role="selection_dev",
+                evict_below_free_gib=16.0,
+                min_evict_age_secs=0.0,
+                now_epoch=1_700_100_000.0,
+                disk_free_bytes_fn=lambda _p: 19 << 30,
+            )
+            self.assertEqual(spy_digest.call_count, 0)
+            self.assertEqual(res_idle["evicted"], [])
+            self.assertTrue(w1.exists())
+
+        # Size mutation on disk is still caught immediately even on an idle pass.
+        orig_w2_bytes = w2.read_bytes()
+        w2.write_bytes(orig_w2_bytes + b"x")
+        with self.assertRaisesRegex(ValueError, "sealed capture mutated on disk"):
+            ship_public_bronze(
+                cap_dir,
+                remote_dir="",
+                collector_region="tokyo",
+                split_role="selection_dev",
+                evict_below_free_gib=16.0,
+                min_evict_age_secs=0.0,
+                now_epoch=1_700_100_000.0,
+                disk_free_bytes_fn=lambda _p: 19 << 30,
+            )
+        w2.write_bytes(orig_w2_bytes)
+        os.utime(w2, (1_700_037_000, 1_700_037_000))
+
+        # When free disk stays < 16 GiB (e.g. 12 GiB -> 15 GiB), w01 (Drive-verified) is evicted
+        # with full SHA-256 verification, while unbacked w02 is strictly preserved!
+        with mock.patch.object(
+            quant_lakehouse, "digest_unchanged", wraps=quant_lakehouse.digest_unchanged
+        ) as spy_evict_digest, mock.patch.object(
+            flywheel_sync, "digest_unchanged", wraps=flywheel_sync.digest_unchanged
+        ) as spy_preflight_digest:
+            res_low_disk = ship_public_bronze(
+                cap_dir,
+                remote_dir="",
+                collector_region="tokyo",
+                split_role="selection_dev",
+                evict_below_free_gib=16.0,
+                min_evict_age_secs=0.0,
+                now_epoch=1_700_100_000.0,
+                disk_free_bytes_fn=lambda _p: (12 << 30) if w1.exists() else (15 << 30),
+            )
+            spy_preflight_digest.assert_not_called()
+            spy_evict_digest.assert_called_once_with(w1)
+        self.assertEqual(res_low_disk["evicted"], [w1.name])
+        self.assertFalse(w1.exists())
+        self.assertTrue(w1.with_name(f"{w1.name}.evicted.json").exists())
         self.assertTrue(w2.exists())
 
 

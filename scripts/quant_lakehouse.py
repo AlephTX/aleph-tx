@@ -579,8 +579,20 @@ def evict_local_capture(
         "remote_uri": remote_uri,
         "evicted_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    write_immutable_json(tombstone_path, tombstone)
-    resolved_capture.unlink()
+    try:
+        write_immutable_json(tombstone_path, tombstone)
+    except FileExistsError:
+        # A previous eviction may have recorded the tombstone before unlinking.
+        existing = json.loads(reject_unsafe_path(tombstone_path).read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            raise ValueError("invalid eviction tombstone; refusing eviction")
+        recorded_at = existing.get("evicted_at_utc")
+        if not isinstance(recorded_at, str) or not recorded_at:
+            raise ValueError("invalid eviction tombstone timestamp; refusing eviction")
+        if existing != {**tombstone, "evicted_at_utc": recorded_at}:
+            raise ValueError("conflicting eviction tombstone; refusing eviction")
+        tombstone = existing
+    resolved_capture.unlink(missing_ok=True)
     return tombstone
 
 

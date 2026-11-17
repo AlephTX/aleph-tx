@@ -1,10 +1,12 @@
 import gzip
+from hashlib import sha256
 import json
 from pathlib import Path
 import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -430,6 +432,50 @@ class QuantLakehouseTests(unittest.TestCase):
         self.assertIn("PARTITION_BY (collector_region, venue, utc_date, campaign_id)", sql_text)
         self.assertIn("COMPRESSION ZSTD", sql_text)
         self.assertIn("DECIMAL(38, 12)", sql_text)
+
+    def test_eviction_retries_after_tombstone_write_with_matching_evidence(self) -> None:
+        capture = self.root / "test-capture.ndjson.gz"
+        payload = b"synthetic closed capture"
+        capture.write_bytes(payload)
+        digest = sha256(payload).hexdigest()
+        manifest_path = self.root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({
+                "campaign_id": "test-archive",
+                "capture_sha256": digest,
+                "capture_bytes": len(payload),
+            }),
+            encoding="utf-8",
+        )
+        receipt_path = self.root / "receipt.json"
+        receipt = {"remote_uri": "gdrive://test-fixture", "sha256": digest, "bytes": len(payload)}
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        def evict():
+            return evict_local_capture(capture, manifest_path=manifest_path, remote_receipt_path=receipt_path)
+
+        unlink = Path.unlink
+
+        def interrupt_capture_unlink(path, *args, **kwargs):
+            if path == capture:
+                raise OSError("simulated interruption")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", interrupt_capture_unlink):
+            with self.assertRaisesRegex(OSError, "simulated interruption"):
+                evict()
+        self.assertTrue(capture.exists())
+        tombstone_path = capture.with_name(f"{capture.name}.evicted.json")
+        original_tombstone = tombstone_path.read_bytes()
+
+        receipt_path.write_text(json.dumps({**receipt, "remote_uri": "gdrive://other-fixture"}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "conflicting eviction tombstone"):
+            evict()
+        self.assertTrue(capture.exists())
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        self.assertEqual(evict(), json.loads(original_tombstone))
+        self.assertEqual(tombstone_path.read_bytes(), original_tombstone)
+        self.assertFalse(capture.exists())
 
     def test_rejects_partial_and_private_paths_and_verifies_eviction_and_bundles(self) -> None:
         partial = self.root / "capture.ndjson.gz.partial"
