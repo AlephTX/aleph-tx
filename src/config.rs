@@ -181,6 +181,9 @@ fn default_markout_halflife_fills() -> f64 {
 fn default_markout_threshold_bps() -> f64 {
     -1.0
 }
+fn default_self_fill_half_life_ms() -> u64 {
+    2000
+}
 fn default_min_cycle_interval_ms() -> u64 {
     50
 }
@@ -440,6 +443,13 @@ pub struct InventoryNeutralMMConfig {
     /// from new-quote placement edge for 50ms+ latency regimes.
     #[serde(default)]
     pub quote_hysteresis: Option<QuoteHysteresisConfig>,
+    /// Decoupled adverse-selection fair-value offset per passive fill (bps, 0 disables).
+    /// Passive buy fills shift `pricing_mid` down; passive sell fills shift `pricing_mid` up.
+    #[serde(default)]
+    pub self_fill_alpha_bps: f64,
+    /// Exponential decay half-life (ms) for `self_fill_alpha_bps` (`>= 50` when enabled).
+    #[serde(default = "default_self_fill_half_life_ms")]
+    pub self_fill_half_life_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -634,6 +644,17 @@ impl InventoryNeutralMMConfig {
             self.markout_threshold_bps.is_finite(),
             "{name}: markout_threshold_bps must be finite"
         );
+        anyhow::ensure!(
+            self.self_fill_alpha_bps.is_finite()
+                && (0.0..=50.0).contains(&self.self_fill_alpha_bps),
+            "{name}: self_fill_alpha_bps must be finite and in [0.0, 50.0]"
+        );
+        if self.self_fill_alpha_bps > 0.0 {
+            anyhow::ensure!(
+                self.self_fill_half_life_ms >= 50,
+                "{name}: self_fill_half_life_ms must be >= 50 when self_fill_alpha_bps > 0.0"
+            );
+        }
         if let Some(reserve) = self.markout_reserve {
             anyhow::ensure!(
                 reserve.max_widen_bps > 0.0
@@ -899,6 +920,8 @@ impl InventoryNeutralMMConfig {
             cross_market_reserve: self.cross_market_reserve,
             volatility_regime: self.volatility_regime,
             quote_hysteresis: self.quote_hysteresis,
+            self_fill_alpha_bps: self.self_fill_alpha_bps,
+            self_fill_half_life_ms: self.self_fill_half_life_ms,
         }
     }
 
@@ -991,6 +1014,8 @@ impl Default for InventoryNeutralMMConfig {
             cross_market_reserve: None,
             volatility_regime: None,
             quote_hysteresis: None,
+            self_fill_alpha_bps: 0.0,
+            self_fill_half_life_ms: default_self_fill_half_life_ms(),
         }
     }
 }
@@ -1517,5 +1542,43 @@ mod tests {
             AppConfig::validate_fleet_isolation([("eth_quant", &eth_quant), ("dup_idx", &dup_idx)])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn self_fill_alpha_config_defaults_runtime_copy_and_validation() {
+        let default_cfg = InventoryNeutralMMConfig::default();
+        assert_eq!(default_cfg.self_fill_alpha_bps, 0.0);
+        assert_eq!(default_cfg.self_fill_half_life_ms, 2000);
+
+        let disabled_zero_hl = InventoryNeutralMMConfig {
+            self_fill_alpha_bps: 0.0,
+            self_fill_half_life_ms: 0,
+            ..Default::default()
+        };
+        assert!(disabled_zero_hl.validate().is_ok());
+
+        let valid_cfg = InventoryNeutralMMConfig {
+            self_fill_alpha_bps: 3.5,
+            self_fill_half_life_ms: 750,
+            ..Default::default()
+        };
+        assert!(valid_cfg.validate().is_ok());
+        let copy = valid_cfg.runtime_copy();
+        assert_eq!(copy.self_fill_alpha_bps, 3.5);
+        assert_eq!(copy.self_fill_half_life_ms, 750);
+
+        for bad_alpha in [-0.01, 50.01, f64::NAN, f64::INFINITY] {
+            let cfg = InventoryNeutralMMConfig {
+                self_fill_alpha_bps: bad_alpha,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "bad_alpha={bad_alpha}");
+        }
+        let too_short_half_life = InventoryNeutralMMConfig {
+            self_fill_alpha_bps: 1.0,
+            self_fill_half_life_ms: 49,
+            ..Default::default()
+        };
+        assert!(too_short_half_life.validate().is_err());
     }
 }

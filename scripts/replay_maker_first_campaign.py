@@ -28,15 +28,27 @@ def digest(path):
         return file_digest(file, "sha256").hexdigest()
 
 
+def frame_to_maker_book_event(frame, *, available_notional="150"):
+    books = [leg["book"] | {"available_notional": available_notional} for leg in frame["legs"]]
+    event = {"kind": "book", "at_ms": frame["now_ms"], "books": books}
+    if frame.get("reference") is not None:
+        event["reference"] = frame["reference"]
+    if frame.get("equity_session") is not None:
+        event["equity_session"] = frame["equity_session"]
+    if frame["legs"] and all(leg.get("oracle") is not None for leg in frame["legs"]):
+        event["leg_oracles"] = [leg["oracle"] for leg in frame["legs"]]
+    return event
+
+
 def book_rows(stream, start, end):
     for line in stream:
         frame = json.loads(line)
         when = frame["now_ms"]
         if start <= when < end:
             # Simulation uses a fixed per-leg allowance. Coverage-only
-            # compiler output carries no trading capacity.
-            books = [leg["book"] | {"available_notional": "150"} for leg in frame["legs"]]
-            yield {"kind": "book", "at_ms": when, "books": books}
+            # compiler output carries no trading capacity, while RWA session,
+            # common reference, and per-leg oracle state survive intact.
+            yield frame_to_maker_book_event(frame, available_notional="150")
 
 
 def trade_rows(files, market, leg, end):

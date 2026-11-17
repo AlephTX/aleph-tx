@@ -82,6 +82,10 @@ with gzip.open(out_path, "wt", encoding="utf-8") as fh:
         out_dir = self.root / "crypto"
         quar_dir = self.root / "quarantine"
         out_dir.mkdir()
+        quar_dir.mkdir()
+        # Simulate a prior SIGKILL during quarantine hashing: .partial in quarantine_dir with no manifest yet!
+        unmanifested = quar_dir / "tokyo-crypto-20261114T120000Z-w00.ndjson.gz.partial"
+        unmanifested.write_bytes(b"sigkill-interrupted-quarantine-bytes")
         # Leftover orphan from prior crash at w01 -> swept to quarantine, next window starts at w02!
         orphan = out_dir / "tokyo-crypto-20261115T000000Z-w01.ndjson.gz.partial"
         orphan.write_bytes(b"leftover-crash-bytes")
@@ -104,7 +108,14 @@ with gzip.open(out_path, "wt", encoding="utf-8") as fh:
             max_windows=2,
             failure_backoff_secs=0.05,
         )
-        # 1 orphan swept (w01), 1 failed attempt quarantined (w02), then w03 completed cleanly!
+        # 1 unmanifested quarantine backfilled (w00), 1 orphan swept (w01), 1 failed attempt quarantined (w02), then w03 completed cleanly!
+        self.assertEqual(
+            summary["quarantine_manifests_backfilled"],
+            ["tokyo-crypto-20261114T120000Z-w00.quarantine_manifest.json"],
+        )
+        self.assertTrue(
+            (quar_dir / "tokyo-crypto-20261114T120000Z-w00.quarantine_manifest.json").exists()
+        )
         self.assertEqual(len(summary["orphaned_swept"]), 1)
         self.assertEqual(len(summary["quarantined_windows"]), 1)
         self.assertTrue(summary["quarantined_windows"][0].endswith("-w02.ndjson.gz.partial"))
@@ -137,6 +148,17 @@ with gzip.open(out_path, "wt", encoding="utf-8") as fh:
                 check=False,
             )
             self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+    def test_oasis_capture_units_guard_against_needrestart_and_short_stop_timeouts(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        nr_conf = (repo_root / "deploy" / "oasis" / "50-aleph-tx-needrestart.conf").read_text(encoding="utf-8")
+        self.assertIn("perp-capture-", nr_conf)
+        self.assertIn("$nrconf{override_rc}", nr_conf)
+        for stream in ("bulk", "crypto", "rwa"):
+            unit_txt = (
+                repo_root / "deploy" / "oasis" / f"aleph-perp-capture-{stream}.service"
+            ).read_text(encoding="utf-8")
+            self.assertIn("TimeoutStopSec=120", unit_txt)
 
 
 if __name__ == "__main__":

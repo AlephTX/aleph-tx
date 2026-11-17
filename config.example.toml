@@ -89,6 +89,11 @@ min_profit_bps = 1.0
 # Quoting
 penny_ticks = 1.0
 inventory_skew_bps = 3.0
+# Optional decoupled self-fill adverse fair-value offset (disabled when 0.0; 0.0..=50.0 bps).
+# Shifts pricing_mid down on passive buy fills and up on passive sell fills (clamped at 3x),
+# decaying exponentially with half-life self_fill_half_life_ms (>= 50 ms when enabled).
+# self_fill_alpha_bps = 0.0
+# self_fill_half_life_ms = 2000
 
 # Position management
 base_order_size = 0.02

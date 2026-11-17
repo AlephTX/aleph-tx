@@ -262,3 +262,240 @@ func TestShmReopenInvalidatesWithoutTruncatingAndRecoversOddSeqlocks(t *testing.
 		t.Fatalf("account reopen corrupted position or retained stale freshness: %+v", a1.stats)
 	}
 }
+
+func TestMatrixConcurrentWriterAndAtomicReadersNoTornSnapshots(t *testing.T) {
+	t.Setenv("ALEPH_SHM_DIR", t.TempDir())
+	m, err := NewMatrix("aleph-matrix-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	const (
+		exch       uint8  = 2
+		sym        uint16 = 1002
+		iterations        = 25_000
+		numReaders        = 4
+	)
+
+	start := make(chan struct{})
+	var done atomic.Bool
+	var wg sync.WaitGroup
+
+	// Readers: half use Matrix.ReadBBO, half perform raw Rust-equivalent per-word atomic loads.
+	for r := range numReaders {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			<-start
+			slot := &m.shm.BboMatrix[sym][exch]
+			checkSnap := func(snap ShmBboMessage) {
+				if snap.TimestampNs == 0 {
+					return
+				}
+				step := snap.TimestampNs / 10
+				wantBid := float64(1000 + (step % 500))
+				if snap.MsgType != 1 || snap.ExchangeID != exch || snap.SymbolID != sym {
+					t.Errorf("torn BBO header: %+v", snap)
+					return
+				}
+				if snap.BidPrice != wantBid ||
+					snap.BidSize != wantBid*2.0 ||
+					snap.AskPrice != wantBid+1.0 ||
+					snap.AskSize != wantBid*3.0 {
+					t.Errorf("torn BBO payload: %+v (wantBid=%v)", snap, wantBid)
+				}
+			}
+
+			for !done.Load() {
+				if readerID%2 == 0 {
+					if snap, ok := m.ReadBBO(exch, sym); ok {
+						checkSnap(snap)
+					}
+					continue
+				}
+				seq1 := atomic.LoadUint32(&slot.Seqlock)
+				if seq1&1 != 0 {
+					continue
+				}
+				hdr := atomic.LoadUint32((*uint32)(unsafe.Pointer(&slot.MsgType)))
+				snap := ShmBboMessage{
+					Seqlock:     seq1,
+					MsgType:     uint8(hdr),
+					ExchangeID:  uint8(hdr >> 8),
+					SymbolID:    uint16(hdr >> 16),
+					TimestampNs: atomic.LoadUint64(&slot.TimestampNs),
+					BidPrice:    math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.BidPrice)))),
+					BidSize:     math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.BidSize)))),
+					AskPrice:    math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.AskPrice)))),
+					AskSize:     math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.AskSize)))),
+				}
+				seq2 := atomic.LoadUint32(&slot.Seqlock)
+				if seq1 == seq2 && snap.TimestampNs != 0 {
+					checkSnap(snap)
+				}
+			}
+		}(r)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := uint64(1); i <= iterations; i++ {
+			if i%2500 == 0 {
+				m.InvalidateBBO(exch, sym)
+				continue
+			}
+			bid := float64(1000 + (i % 500))
+			m.WriteBBO(exch, sym, i*10, bid, bid*2.0, bid+1.0, bid*3.0)
+		}
+		// Ensure final state is valid and published
+		finalBid := float64(1000 + ((iterations + 1) % 500))
+		m.WriteBBO(exch, sym, (iterations+1)*10, finalBid, finalBid*2.0, finalBid+1.0, finalBid*3.0)
+		done.Store(true)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	snap, ok := m.ReadBBO(exch, sym)
+	if !ok || snap.TimestampNs != (iterations+1)*10 {
+		t.Fatalf("unexpected final BBO snapshot: ok=%v snap=%+v", ok, snap)
+	}
+}
+
+func TestDepthConcurrentWriterAndAtomicReadersNoTornSnapshots(t *testing.T) {
+	depthPath := filepath.Join(t.TempDir(), "aleph-depth-race")
+	w, err := NewDepthWriter(depthPath, NumSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const (
+		exch       uint8  = 2
+		sym        uint16 = 513
+		iterations        = 20_000
+		numReaders        = 4
+	)
+
+	start := make(chan struct{})
+	var done atomic.Bool
+	var wg sync.WaitGroup
+
+	for r := range numReaders {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			<-start
+			slot := &w.data.DepthMatrix[sym][exch]
+			verify := func(snap ShmDepthSnapshot) {
+				if snap.TimestampNs == 0 {
+					return
+				}
+				step := snap.TimestampNs / 10
+				active := int(step%DepthLevels) + 1
+				base := float64(2000 + (step % 500))
+				if snap.ExchangeID != exch || snap.SymbolID != sym {
+					t.Errorf("torn depth header: %+v", snap)
+					return
+				}
+				for lvl := range DepthLevels {
+					var wantBid, wantAsk PriceLevel
+					if lvl < active {
+						wantBid = PriceLevel{
+							Price: base - float64(lvl),
+							Size:  base*2.0 + float64(lvl+1),
+						}
+						wantAsk = PriceLevel{
+							Price: base + 1.0 + float64(lvl),
+							Size:  base*3.0 + float64(lvl+1),
+						}
+					}
+					if snap.Bids[lvl] != wantBid || snap.Asks[lvl] != wantAsk {
+						t.Errorf("torn depth level %d at step %d: got bid=%+v ask=%+v want bid=%+v ask=%+v",
+							lvl, step, snap.Bids[lvl], snap.Asks[lvl], wantBid, wantAsk)
+						return
+					}
+				}
+			}
+
+			for !done.Load() {
+				if readerID%2 == 0 {
+					if snap, ok := w.ReadDepth(sym, exch); ok {
+						verify(snap)
+					}
+					continue
+				}
+				seq1 := atomic.LoadUint32(&slot.Seqlock)
+				if seq1&1 != 0 {
+					continue
+				}
+				hdr := atomic.LoadUint32((*uint32)(unsafe.Pointer(&slot.ExchangeID)))
+				snap := ShmDepthSnapshot{
+					Seqlock:     seq1,
+					ExchangeID:  uint8(hdr),
+					SymbolID:    uint16(hdr >> 16),
+					TimestampNs: atomic.LoadUint64(&slot.TimestampNs),
+				}
+				for i := range DepthLevels {
+					snap.Bids[i] = PriceLevel{
+						Price: math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.Bids[i].Price)))),
+						Size:  math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.Bids[i].Size)))),
+					}
+					snap.Asks[i] = PriceLevel{
+						Price: math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.Asks[i].Price)))),
+						Size:  math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.Asks[i].Size)))),
+					}
+				}
+				seq2 := atomic.LoadUint32(&slot.Seqlock)
+				if seq1 == seq2 && snap.TimestampNs != 0 {
+					verify(snap)
+				}
+			}
+		}(r)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		buildSides := func(step uint64) ([DepthLevels]PriceLevel, [DepthLevels]PriceLevel) {
+			var bids, asks [DepthLevels]PriceLevel
+			active := int(step%DepthLevels) + 1
+			base := float64(2000 + (step % 500))
+			for lvl := 0; lvl < active; lvl++ {
+				bids[lvl] = PriceLevel{
+					Price: base - float64(lvl),
+					Size:  base*2.0 + float64(lvl+1),
+				}
+				asks[lvl] = PriceLevel{
+					Price: base + 1.0 + float64(lvl),
+					Size:  base*3.0 + float64(lvl+1),
+				}
+			}
+			return bids, asks
+		}
+
+		for i := uint64(1); i <= iterations; i++ {
+			if i%2000 == 0 {
+				w.InvalidateDepth(sym, exch)
+				continue
+			}
+			bids, asks := buildSides(i)
+			w.WriteDepth(sym, exch, i*10, bids, asks)
+		}
+		bids, asks := buildSides(iterations + 1)
+		w.WriteDepth(sym, exch, (iterations+1)*10, bids, asks)
+		done.Store(true)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	snap, ok := w.ReadDepth(sym, exch)
+	if !ok || snap.TimestampNs != (iterations+1)*10 {
+		t.Fatalf("unexpected final depth snapshot: ok=%v snap=%+v", ok, snap)
+	}
+}

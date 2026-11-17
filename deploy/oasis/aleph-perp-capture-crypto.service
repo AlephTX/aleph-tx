@@ -38,7 +38,7 @@ ExecStart=/usr/bin/python3 /opt/aleph-tx/current/scripts/perp_rolling_runner.py 
   -extended-index
 Restart=always
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=120
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

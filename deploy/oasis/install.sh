@@ -57,6 +57,9 @@ sudo -n install -m 0644 deploy/oasis/aleph-tx-telemetry.conf /etc/tmpfiles.d/ale
 sudo -n systemd-tmpfiles --create /etc/tmpfiles.d/aleph-tx-telemetry.conf
 # JavaScript rules need polkit >= 0.106 (Ubuntu 23.10+, Debian 13+).
 sudo -n install -m 0644 deploy/oasis/50-aleph-tx-monitor.rules /etc/polkit-1/rules.d/
+if [[ -d /etc/needrestart/conf.d ]]; then
+  sudo -n install -m 0644 deploy/oasis/50-aleph-tx-needrestart.conf /etc/needrestart/conf.d/50-aleph-tx.conf
+fi
 # Emergency-stop token: generated once, root-only, read by systemd via EnvironmentFile.
 if ! sudo -n grep -q '^ALEPH_MONITOR_CONTROL_TOKEN=' /etc/aleph-tx/monitor.env 2>/dev/null; then
   token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')

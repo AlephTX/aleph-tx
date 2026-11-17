@@ -14,6 +14,7 @@ from replay_ten_hour_scenarios import TEN_HOURS, execute, turnover_policies
 from replay_trade_preflight import audit
 
 COST_CAPS = ("0", "0.5", "1", "2", "4", "8")
+TIGHT_002_COST_CAPS = ("0", "0.02", "0.1", "0.5", "1", "2", "4", "8")
 BASIS_RISK_POLICY = {"lookback_ms": 15_000, "sample_ms": 100, "max_gap_ms": 1000,
                      "min_reserve_bps": "0.5", "range_multiplier": "0.5", "max_reserve_bps": "2"}
 
@@ -94,21 +95,36 @@ def exact_cash_components(cycles, before, after):
     return totals
 
 
-def point(row):
+def point(row, *, external_overhead_bps=None):
     feedback = row.get("turnover_feedback") or {}
-    target = decimal(feedback.get("modeled_target_turnover_quote", 0))
-    complete = (row.get("engine_exit_code") == 0 and row.get("incomplete") is None
-                and row.get("net_pnl") is not None and feedback.get("net_after_overhead") is not None
-                and all(decimal(p) == 0 for p in row.get("open_positions_base", [None])))
+    has_feedback = bool(feedback)
+    tb = row.get("turnover_breakdown")
+    has_tb = isinstance(tb, dict)
+    target = (
+        decimal(tb["target_venue_turnover_quote"])
+        if has_tb and tb.get("target_venue_turnover_quote") is not None
+        else decimal(feedback.get("modeled_target_turnover_quote", 0))
+    )
     diagnostics = row.get("execution_costs") or {}
-    cycles = diagnostics.get("cycles", [])
     # A partial exact schema must not silently downgrade to the legacy path.
     exact_proof = any(key in diagnostics for key in (
         "whole_ledger_cash_reconciled", "whole_ledger_net_before_overhead",
         "whole_ledger_net_after_overhead"))
+    has_after_total = (
+        feedback.get("net_after_overhead") is not None
+        if has_feedback
+        else (diagnostics.get("whole_ledger_net_after_overhead") is not None or external_overhead_bps is not None)
+    )
+    complete = (row.get("engine_exit_code") == 0 and row.get("incomplete") is None
+                and row.get("net_pnl") is not None and has_after_total
+                and all(decimal(p) == 0 for p in row.get("open_positions_base", [None])))
+    cycles = diagnostics.get("cycles", [])
     full_net = diagnostics.get("whole_ledger_net_before_overhead") if exact_proof else row.get("net_pnl")
-    full_after = (diagnostics.get("whole_ledger_net_after_overhead") if exact_proof
-                  else feedback.get("net_after_overhead"))
+    full_after = (
+        diagnostics.get("whole_ledger_net_after_overhead")
+        if exact_proof
+        else (feedback.get("net_after_overhead") if has_feedback else row.get("net_pnl"))
+    )
     cash_complete = (complete and len(cycles) == row.get("closed_cycles")
                      and all(c["completed"] and c["cash_reconciled"] for c in cycles)
                      and (not exact_proof or diagnostics.get("whole_ledger_cash_reconciled") is True)
@@ -123,36 +139,64 @@ def point(row):
                 and all(isinstance(c.get("net_before_overhead"), str)
                         and isinstance(c.get("net_after_overhead"), str) for c in cycles)
                 and serialized_sum_matches((c["net_after_overhead"] for c in cycles), full_after))
-        else:
+        elif has_feedback:
             cash_complete = (feedback.get("overhead_quote") is not None
                              and serialized_sum_matches(
                                  [full_after, feedback["overhead_quote"]], full_net))
+        else:
+            cash_complete = external_overhead_bps is not None
     components = None
     if cash_complete:
         if exact_proof:
             components = exact_cash_components(cycles, full_net, full_after)
         elif (row.get("fees") is not None and row.get("pnl_before_fees") is not None
               and serialized_sum_matches([full_net, row["fees"]], row["pnl_before_fees"])):
+            ovh_val = decimal(feedback["overhead_quote"]) if has_feedback else Decimal(0)
             components = {"fees_quote": decimal(row["fees"]),
                           "price_loss_quote": -decimal(row["pnl_before_fees"]),
-                          "overhead_quote": decimal(feedback["overhead_quote"])}
+                          "overhead_quote": ovh_val}
     components_complete = components is not None
     # Legacy headers remain visible as a consistency signal, never as the source
     # of a certified exact breakdown. A rounded legacy before-total must not
     # invalidate the independent exact proof that was added to replace it.
     legacy_consistent = None
     if components_complete:
-        legacy_consistent = all(value is not None and serialized_sum_matches([value], str(expected))
-                                for value, expected in (
-                                    (row.get("net_pnl"), full_net),
-                                    (feedback.get("net_after_overhead"), full_after),
-                                    (row.get("pnl_before_fees"), -components["price_loss_quote"]),
-                                    (row.get("fees"), components["fees_quote"]),
-                                    (feedback.get("overhead_quote"), components["overhead_quote"])))
+        checks = [
+            (row.get("net_pnl"), full_net),
+            (row.get("pnl_before_fees"), -components["price_loss_quote"]),
+            (row.get("fees"), components["fees_quote"]),
+        ]
+        if has_feedback:
+            checks.extend([
+                (feedback.get("net_after_overhead"), full_after),
+                (feedback.get("overhead_quote"), components["overhead_quote"]),
+            ])
+        legacy_consistent = all(
+            value is not None and serialized_sum_matches([value], str(expected))
+            for value, expected in checks
+        )
     price_complete = components_complete and all(c["price_decomposition_reconciled"] for c in cycles)
-    net = decimal(full_after) if cash_complete else None
+    if cash_complete and external_overhead_bps is not None:
+        if components_complete and components["overhead_quote"] != Decimal(0):
+            raise ValueError("cannot apply external_overhead_bps when engine overhead_quote is non-zero")
+        gross_for_ext = (
+            decimal(tb["dual_venue_gross_turnover_quote"])
+            if has_tb and tb.get("dual_venue_gross_turnover_quote") is not None
+            else decimal(row.get("maker_turnover", 0)) + decimal(row.get("taker_turnover", 0))
+        )
+        ext_ovh = gross_for_ext * decimal(external_overhead_bps) / Decimal(10_000)
+        net = decimal(full_net) - ext_ovh
+        modeled_overhead = (components["overhead_quote"] + ext_ovh) if components_complete else None
+    else:
+        net = decimal(full_after) if cash_complete else None
+        modeled_overhead = components["overhead_quote"] if components_complete else None
     costs = None if net is None or not target else -net / target * 10_000
-    candidate = feedback.get("modeled_eligible_turnover_quote") if cash_complete else None
+    raw_candidate = (
+        tb["rule_window_candidate_turnover_quote"]
+        if has_tb and tb.get("rule_window_candidate_turnover_quote") is not None
+        else (feedback.get("modeled_eligible_turnover_quote") if has_feedback else None)
+    )
+    candidate = raw_candidate if cash_complete else None
     eligibility = reward_eligibility(target, decimal(candidate) if candidate is not None else None, net)
     stages = {}
     if price_complete:
@@ -170,6 +214,26 @@ def point(row):
         marks[str(horizon)] |= {"marked_turnover": str(volume),
             "mid_move_cost_bps": (str(sum((decimal(m["mid_move_cost_quote"]) for m in rows), Decimal(0))
                                        / volume * 10_000) if volume else None)}
+    v2_fields = {}
+    if has_tb:
+        dual_gross = tb.get("dual_venue_gross_turnover_quote")
+        target_q = tb.get("target_venue_turnover_quote")
+        partner_q = (
+            max(Decimal(0), decimal(dual_gross) - decimal(target_q))
+            if dual_gross is not None and target_q is not None
+            else None
+        )
+        v2_fields = {
+            "capability_snapshot_version": tb.get("capability_snapshot_version"),
+            "dual_venue_gross_turnover": str(dual_gross) if dual_gross is not None else None,
+            "partner_venue_turnover": str(partner_q) if partner_q is not None else None,
+            "maker_turnover": str(row["maker_turnover"]) if row.get("maker_turnover") is not None else None,
+            "excluded_recovery_turnover": (
+                str(tb["excluded_recovery_turnover_quote"])
+                if tb.get("excluded_recovery_turnover_quote") is not None
+                else None
+            ),
+        }
     return {
         "engine_exit_code": row.get("engine_exit_code"), "incomplete": row.get("incomplete"),
         "conservative_cancel_guard": row.get("conservative_cancel_guard", False),
@@ -189,7 +253,7 @@ def point(row):
         "cost_quote_per_million_target_turnover": str(costs * 100) if costs is not None else None,
         "price_loss_quote": str(components["price_loss_quote"]) if components_complete else None,
         "explicit_fees_quote": str(components["fees_quote"]) if components_complete else None,
-        "modeled_overhead_quote": str(components["overhead_quote"]) if components_complete else None,
+        "modeled_overhead_quote": str(modeled_overhead) if modeled_overhead is not None else None,
         "execution_cost_by_stage": stages if price_complete else None,
         "reward_eligibility": eligibility,
         "forced_close_fills": sum(s["fills"] for s in forced_stages) if cash_complete else None,
@@ -209,6 +273,7 @@ def point(row):
         "funding_flat": row.get("funding_flat"),
         "sample_scope": "single_selected_window_not_a_population_cost_estimate",
         "sparse_cycles": row.get("closed_cycles", 0) < 30,
+        **v2_fields,
     }
 
 
@@ -220,6 +285,8 @@ def main():
     parser.add_argument("--workers", type=int, choices=(1, 2), default=2)
     parser.add_argument("--basis-risk-ablation", action="store_true",
                         help="48 historical selection arms at the existing 2 bps cost budget")
+    parser.add_argument("--tight-002-caps", action="store_true",
+                        help="Include 0.02 and 0.1 bps caps matching the $100/$50M target")
     args = parser.parse_args()
     os.umask(0o077)
     engine, prepared, out = (p.resolve() for p in (args.engine, args.prepared, args.output))
@@ -234,7 +301,7 @@ def main():
     for name in ("configs", "runs"):
         (out / name).mkdir()
     frozen, inputs, admissions = {}, {}, {}
-    cost_caps = ("2",) if args.basis_risk_ablation else COST_CAPS
+    cost_caps = ("2",) if args.basis_risk_ablation else (TIGHT_002_COST_CAPS if args.tight_002_caps else COST_CAPS)
     for symbol in ("BTC", "ETH"):
         spec = source["markets"][symbol]
         window = spec["window"]

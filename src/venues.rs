@@ -1,8 +1,303 @@
 //! Venue discovery and validation outside the fixed-size SHM matrix.
 use crate::strategy::cross_venue::{QuoteKind, VenueSnapshot};
-use anyhow::{Context, Result, ensure};
-use serde::Serialize;
-use std::collections::BTreeMap;
+use anyhow::{Context, Result, bail, ensure};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, str::FromStr};
+
+/// Versioned snapshot identifier for audited venue latency, fee, and quota semantics.
+pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-17.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAssetScope {
+    All,
+    Crypto,
+    Equity,
+}
+
+impl CapabilityAssetScope {
+    pub fn matches(self, asset_class: &str) -> bool {
+        match self {
+            Self::All => matches!(asset_class, "crypto" | "equity"),
+            Self::Crypto => asset_class == "crypto",
+            Self::Equity => asset_class == "equity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchQuotaSemantics {
+    /// Each transaction inside a batch consumes action quota independently (`SendTxBatch` != 1 unit).
+    PerTransaction,
+    /// Standard venue API rate-limit bucket without per-volume tx-unit replenishment.
+    RateLimitedApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupedOrdersSemantics {
+    /// `CreateGroupedOrders` is restricted to conditional OTO/OCO/OTOCO structures, NOT independent two-sided quotes.
+    ConditionalAttachedOnly,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledCancelSupport {
+    /// Documented in upstream SDK, requires per-network/FFI probe before production reliance.
+    SdkDocumentedProbeRequired,
+    Supported,
+    Unsupported,
+}
+
+/// Versioned venue execution capability and fee profile (`OPT-01`).
+/// Captures deterministic venue-enforced speed-bumps separately from network RTT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VenueExecutionCapability {
+    pub snapshot_version: &'static str,
+    pub venue_id: &'static str,
+    pub liquidity_domain: &'static str,
+    pub settlement_currency: &'static str,
+    pub tier: &'static str,
+    pub asset_scope: CapabilityAssetScope,
+    pub maker_post_only_delay_ms: u64,
+    pub non_post_only_limit_delay_ms: u64,
+    pub cancel_delay_ms: u64,
+    pub modify_delay_ms: u64,
+    pub taker_delay_ms: u64,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub maker_fee_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub taker_fee_bps: Decimal,
+    pub batch_quota_semantics: BatchQuotaSemantics,
+    pub grouped_orders_semantics: GroupedOrdersSemantics,
+    pub scheduled_cancel_support: ScheduledCancelSupport,
+    pub primary_source: &'static str,
+}
+
+fn dec(s: &'static str) -> Decimal {
+    Decimal::from_str(s).expect("valid static capability decimal")
+}
+
+pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
+    use BatchQuotaSemantics::{PerTransaction, RateLimitedApi};
+    use CapabilityAssetScope::{All, Crypto, Equity};
+    use GroupedOrdersSemantics::ConditionalAttachedOnly;
+    use ScheduledCancelSupport::{SdkDocumentedProbeRequired, Supported};
+    vec![
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter",
+            liquidity_domain: "lighter",
+            settlement_currency: "USDC",
+            tier: "standard",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 300,
+            cancel_delay_ms: 300,
+            modify_delay_ms: 300,
+            taker_delay_ms: 300,
+            maker_fee_bps: dec("0"),
+            taker_fee_bps: dec("0"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/reference/account-types",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter",
+            liquidity_domain: "lighter",
+            settlement_currency: "USDC",
+            tier: "premium",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 140,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 140,
+            maker_fee_bps: dec("0.4"),
+            taker_fee_bps: dec("2.8"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/reference/account-types",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter_robinhood",
+            liquidity_domain: "lighter:robinhood",
+            settlement_currency: "USDG",
+            tier: "standard",
+            asset_scope: All,
+            maker_post_only_delay_ms: 200,
+            non_post_only_limit_delay_ms: 300,
+            cancel_delay_ms: 200,
+            modify_delay_ms: 200,
+            taker_delay_ms: 300,
+            maker_fee_bps: dec("0"),
+            taker_fee_bps: dec("0"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/robinhood-chain/overview",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter_robinhood",
+            liquidity_domain: "lighter:robinhood",
+            settlement_currency: "USDG",
+            tier: "premium",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 200,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 200, // Conservative upper bound of RH Premium 200ms->150ms tier schedule
+            maker_fee_bps: dec("0.4"),
+            taker_fee_bps: dec("2.8"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/robinhood-chain/overview",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "arcus",
+            liquidity_domain: "arcus",
+            settlement_currency: "USDC",
+            tier: "level_0",
+            asset_scope: Crypto,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("1.50"),
+            taker_fee_bps: dec("4.50"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: GroupedOrdersSemantics::Unsupported,
+            scheduled_cancel_support: ScheduledCancelSupport::Unsupported,
+            primary_source: "arcus_v1_feetiers_20261117.json#sha256=0d608aa1",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "arcus",
+            liquidity_domain: "arcus",
+            settlement_currency: "USDC",
+            tier: "level_0",
+            asset_scope: Equity,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("0.00"),
+            taker_fee_bps: dec("2.25"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: GroupedOrdersSemantics::Unsupported,
+            scheduled_cancel_support: ScheduledCancelSupport::Unsupported,
+            primary_source: "arcus_v1_feetiers_20261117.json#sha256=0d608aa1",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "arcus",
+            liquidity_domain: "arcus",
+            settlement_currency: "USDC",
+            tier: "level_4",
+            asset_scope: Crypto,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("0.00"),
+            taker_fee_bps: dec("2.30"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: GroupedOrdersSemantics::Unsupported,
+            scheduled_cancel_support: ScheduledCancelSupport::Unsupported,
+            primary_source: "arcus_v1_feetiers_20261117.json#sha256=0d608aa1",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "arcus",
+            liquidity_domain: "arcus",
+            settlement_currency: "USDC",
+            tier: "level_4",
+            asset_scope: Equity,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("0.00"),
+            taker_fee_bps: dec("1.15"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: GroupedOrdersSemantics::Unsupported,
+            scheduled_cancel_support: ScheduledCancelSupport::Unsupported,
+            primary_source: "arcus_v1_feetiers_20261117.json#sha256=0d608aa1",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "hyperliquid",
+            liquidity_domain: "hyperliquid:core",
+            settlement_currency: "USDC",
+            tier: "base",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("1.50"),
+            taker_fee_bps: dec("4.50"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: Supported,
+            primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "entropy",
+            liquidity_domain: "hyperliquid:io",
+            settlement_currency: "USDC",
+            tier: "base",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("1.50"),
+            taker_fee_bps: dec("4.50"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: Supported,
+            primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "trade_xyz",
+            liquidity_domain: "hyperliquid:xyz",
+            settlement_currency: "USDC",
+            tier: "base",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 0,
+            cancel_delay_ms: 0,
+            modify_delay_ms: 0,
+            taker_delay_ms: 0,
+            maker_fee_bps: dec("1.50"),
+            taker_fee_bps: dec("4.50"),
+            batch_quota_semantics: RateLimitedApi,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: Supported,
+            primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals",
+        },
+    ]
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +473,30 @@ impl VenueRegistry {
         }
         Ok(venue)
     }
+
+    /// Resolve the versioned execution capability (`OPT-01`) for `(venue_id, tier, asset_class)`.
+    /// Rejects unregistered or unverified venues/tiers rather than defaulting unknown delays or fees to zero.
+    pub fn resolve_execution_capability(
+        &self,
+        venue_id: &str,
+        tier: &str,
+        asset_class: &str,
+    ) -> Result<VenueExecutionCapability> {
+        let venue = self.get(venue_id)?;
+        ensure!(
+            matches!(asset_class, "crypto" | "equity"),
+            "Unsupported capability asset_class {asset_class:?} for venue {venue_id}"
+        );
+        for cap in audited_execution_capabilities() {
+            if cap.venue_id == venue.id && cap.tier == tier && cap.asset_scope.matches(asset_class)
+            {
+                return Ok(cap);
+            }
+        }
+        bail!(
+            "Unverified execution capability for venue={venue_id} tier={tier} asset_class={asset_class} (snapshot={VENUE_CAPABILITY_SNAPSHOT_VERSION})"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +527,80 @@ mod tests {
         assert!(registry.validate_snapshot(&snapshot).is_ok());
         snapshot.liquidity_domain = "independent".into();
         assert!(registry.validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn execution_capability_separates_lighter_core_and_robinhood_and_rejects_unverified() {
+        let registry = VenueRegistry::default();
+        let core_std = registry
+            .resolve_execution_capability("lighter", "standard", "crypto")
+            .unwrap();
+        let rh_std = registry
+            .resolve_execution_capability("lighter_robinhood", "standard", "equity")
+            .unwrap();
+        assert_eq!(core_std.settlement_currency, "USDC");
+        assert_eq!(rh_std.settlement_currency, "USDG");
+        assert_eq!(core_std.maker_post_only_delay_ms, 0);
+        assert_eq!(rh_std.maker_post_only_delay_ms, 200);
+        assert_eq!(core_std.cancel_delay_ms, 300);
+        assert_eq!(rh_std.cancel_delay_ms, 200);
+
+        let core_prem = registry
+            .resolve_execution_capability("lighter", "premium", "crypto")
+            .unwrap();
+        let rh_prem = registry
+            .resolve_execution_capability("lighter_robinhood", "premium", "equity")
+            .unwrap();
+        assert_eq!(core_prem.taker_delay_ms, 140);
+        assert_eq!(rh_prem.taker_delay_ms, 200);
+        assert_eq!(
+            core_prem.batch_quota_semantics,
+            BatchQuotaSemantics::PerTransaction
+        );
+        assert_eq!(
+            core_prem.grouped_orders_semantics,
+            GroupedOrdersSemantics::ConditionalAttachedOnly
+        );
+
+        let arcus_crypto = registry
+            .resolve_execution_capability("arcus", "level_0", "crypto")
+            .unwrap();
+        let arcus_rwa = registry
+            .resolve_execution_capability("arcus", "level_0", "equity")
+            .unwrap();
+        assert_eq!(arcus_crypto.maker_fee_bps, dec("1.50"));
+        assert_eq!(arcus_crypto.taker_fee_bps, dec("4.50"));
+        assert_eq!(arcus_rwa.maker_fee_bps, dec("0.00"));
+        assert_eq!(arcus_rwa.taker_fee_bps, dec("2.25"));
+
+        // Level 4 (Platinum) per the public /v1/feetiers (230 ppm) and per-market
+        // /v1/markets (RWA custom schedule 115 ppm) snapshots, sha256=0d608aa1.
+        let arcus_crypto_l4 = registry
+            .resolve_execution_capability("arcus", "level_4", "crypto")
+            .unwrap();
+        let arcus_rwa_l4 = registry
+            .resolve_execution_capability("arcus", "level_4", "equity")
+            .unwrap();
+        assert_eq!(arcus_crypto_l4.maker_fee_bps, dec("0.00"));
+        assert_eq!(arcus_crypto_l4.taker_fee_bps, dec("2.30"));
+        assert_eq!(arcus_rwa_l4.maker_fee_bps, dec("0.00"));
+        assert_eq!(arcus_rwa_l4.taker_fee_bps, dec("1.15"));
+
+        // Unverified or read-only venues fail closed rather than defaulting to zero delay/fee.
+        assert!(
+            registry
+                .resolve_execution_capability("edgex", "standard", "crypto")
+                .is_err()
+        );
+        assert!(
+            registry
+                .resolve_execution_capability("bulk", "base", "crypto")
+                .is_err()
+        );
+        assert!(
+            registry
+                .resolve_execution_capability("lighter", "unknown_tier", "crypto")
+                .is_err()
+        );
     }
 }

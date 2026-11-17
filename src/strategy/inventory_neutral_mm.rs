@@ -360,6 +360,60 @@ impl InventoryAge {
     }
 }
 
+/// Decaying fair-value offset from realized passive fills (Vertox §5 / VMM-06).
+///
+/// Decouples immediate adverse-selection information ("someone just hit our bid
+/// or lifted our ask") from inventory skew (`q`), which remains non-zero on old
+/// inventory and drops to zero when a passive fill flattens inventory to flat.
+#[derive(Clone, Copy, Debug, Default)]
+struct SelfFillAlpha {
+    offset_bps: f64,
+    updated_at: Option<Instant>,
+    last_fill_seq: u64,
+}
+
+impl SelfFillAlpha {
+    fn decay_to(&mut self, at: Instant, half_life_ms: f64) {
+        if let Some(prev) = self.updated_at
+            && let Some(elapsed) = at.checked_duration_since(prev)
+        {
+            let dt_ms = elapsed.as_secs_f64() * 1000.0;
+            if dt_ms > 0.0 && self.offset_bps != 0.0 {
+                self.offset_bps *= 0.5_f64.powf(dt_ms / half_life_ms);
+            }
+            self.updated_at = Some(at);
+        }
+    }
+
+    fn observe(
+        &mut self,
+        tracker: &OrderTracker,
+        now: Instant,
+        alpha_bps: f64,
+        half_life_ms: u64,
+    ) -> f64 {
+        let half_life_ms = (half_life_ms.max(1)) as f64;
+        let clamp_bps = 3.0 * alpha_bps;
+        let latest = tracker.total_fill_stats().0;
+        let oldest_retained = latest.saturating_sub(crate::order_tracker::RECENT_FILLS as u64 - 1);
+        let next = self.last_fill_seq.saturating_add(1);
+        for sequence in next.max(oldest_retained)..=latest {
+            if let Some(fill) = tracker.fill_at(sequence) {
+                self.decay_to(fill.at, half_life_ms);
+                let impulse = match fill.side {
+                    OrderSide::Sell => alpha_bps,
+                    OrderSide::Buy => -alpha_bps,
+                };
+                self.offset_bps = (self.offset_bps + impulse).clamp(-clamp_bps, clamp_bps);
+                self.updated_at = Some(self.updated_at.map_or(fill.at, |prev| prev.max(fill.at)));
+            }
+        }
+        self.last_fill_seq = self.last_fill_seq.max(latest);
+        self.decay_to(now, half_life_ms);
+        self.offset_bps
+    }
+}
+
 // ─── Active Order ────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 struct ActiveOrder {
@@ -472,6 +526,7 @@ pub struct InventoryNeutralMM {
     last_micro_sample: Option<Instant>,
     price_evidence: Option<PriceEvidence>,
     markout: markout::MarkoutTracker,
+    self_fill_alpha: SelfFillAlpha,
     /// Fill count captured before this cycle read any inventory state. The
     /// wait compares against it, so a fill landing mid-cycle still wakes the
     /// next cycle instead of being folded into the wait's own baseline.
@@ -585,6 +640,7 @@ impl InventoryNeutralMM {
                     .markout_reserve
                     .map(|policy| Duration::from_millis(policy.max_sample_age_ms)),
             ),
+            self_fill_alpha: SelfFillAlpha::default(),
             config,
             trading,
             order_tracker,
@@ -1574,8 +1630,9 @@ impl InventoryNeutralMM {
             0.0
         };
 
+        let markout = self.markout.stats();
         info!(
-            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Quote/TrkConf/Pend/Eff): {:.4}/{:.4}/{:.4}/{:+.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4}",
+            "📊 PnL: ${:.2} ({:+.3}%) | Equity: ${:.2} | Avail (Safe/Raw/Usable): ${:.2}/${:.2}/${:.2} | Margin: {:.1}% | Pos (Exch/Quote/TrkConf/Pend/Eff): {:.4}/{:.4}/{:.4}/{:+.4}/{:.4} base | Worst (L/S): {:.4}/{:.4} | Orders: {} | Fills: {} ({:.1}/min) | Fees: ${:.4} | Markout (eq/notional/marked$): {:?}/{:?}/${:.0}",
             pnl,
             pnl_pct,
             equity,
@@ -1594,6 +1651,9 @@ impl InventoryNeutralMM {
             self.telemetry.fill_count,
             self.telemetry.fill_rate(),
             self.telemetry.total_fees_paid,
+            markout.ewma_bps,
+            markout.notional_ewma_bps,
+            markout.marked_notional_usd,
         );
     }
 
@@ -1974,6 +2034,20 @@ impl InventoryNeutralMM {
             f64::NAN
         };
         self.markout.update(&self.order_tracker, markout_fair, now);
+        let pricing_mid = if self.config.self_fill_alpha_bps > 0.0
+            && pricing_mid.is_finite()
+            && pricing_mid > 0.0
+        {
+            let decayed_offset_bps = self.self_fill_alpha.observe(
+                &self.order_tracker,
+                now,
+                self.config.self_fill_alpha_bps,
+                self.config.self_fill_half_life_ms,
+            );
+            pricing_mid * (1.0 + decayed_offset_bps / 10_000.0).max(0.1)
+        } else {
+            pricing_mid
+        };
         let primary_ref = self.config.primary_reference_exchange_id();
         let order_flow_bps = self.config.order_flow_reserve.map_or(0.0, |reserve| {
             let book = if using_external {
@@ -2956,3 +3030,291 @@ fn shutdown_requested(shutdown: Option<&tokio::sync::watch::Receiver<bool>>) -> 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod self_fill_alpha_tests {
+    use super::*;
+
+    fn make_test_strategy(
+        self_fill_alpha_bps: f64,
+        self_fill_half_life_ms: u64,
+    ) -> (InventoryNeutralMM, Arc<OrderTracker>, std::path::PathBuf) {
+        use crate::exchange::{
+            BatchOrderParams, BatchOrderResult, BatchResult, OrderInfo, OrderResult,
+        };
+
+        struct OfflineExchange;
+
+        #[async_trait::async_trait]
+        impl Exchange for OfflineExchange {
+            async fn buy(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+                anyhow::bail!("offline")
+            }
+            async fn sell(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+                anyhow::bail!("offline")
+            }
+            async fn place_batch(&self, _: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
+                anyhow::bail!("offline")
+            }
+            async fn cancel_order(&self, _: i64) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            async fn cancel_all(&self) -> anyhow::Result<u32> {
+                anyhow::bail!("offline")
+            }
+            async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+                anyhow::bail!("offline")
+            }
+            async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+                anyhow::bail!("offline")
+            }
+            async fn execute_batch(&self, _: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+                anyhow::bail!("offline")
+            }
+            async fn get_account_stats(&self) -> anyhow::Result<AccountStats> {
+                anyhow::bail!("offline")
+            }
+            fn limit_order_type(&self) -> OrderType {
+                OrderType::PostOnly
+            }
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("aleph-self-fill-alpha-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let matrix_path = directory.join("matrix");
+        let account_path = directory.join("account");
+        let mut matrix_init = vec![0u8; 2048 * 8 + NUM_EXCHANGES * 64];
+        matrix_init[2048 * 8 + 48..2048 * 8 + 64]
+            .copy_from_slice(&crate::shm_reader::SHM_MAGIC_V12);
+        std::fs::write(&matrix_path, matrix_init).unwrap();
+        std::fs::write(&account_path, [0u8; 128]).unwrap();
+        let shm = ShmReader::open(matrix_path.to_str().unwrap(), 1).unwrap();
+        let account = AccountStatsReader::open(account_path.to_str().unwrap()).unwrap();
+        let tracker = Arc::new(OrderTracker::new());
+        let config = InventoryNeutralMMConfig {
+            symbol_id: 0,
+            max_basis_bps: 0.0,
+            self_fill_alpha_bps,
+            self_fill_half_life_ms,
+            ..InventoryNeutralMMConfig::default()
+        };
+        let mut strategy = InventoryNeutralMM::with_data_sources(
+            config,
+            Arc::new(OfflineExchange),
+            Arc::clone(&tracker),
+            shm,
+            account,
+            None,
+        );
+        strategy.account_stats = AccountStats {
+            available_balance: 950.0,
+            portfolio_value: 1_000.0,
+            position: 0.0,
+            leverage: 1.0,
+            margin_usage: 0.05,
+            last_update: Instant::now(),
+        };
+        (strategy, tracker, directory)
+    }
+
+    fn fresh_books(mid: f64) -> ([(u8, ShmBboMessage); NUM_EXCHANGES], ShmBboMessage) {
+        let ts_ns = wall_time_ns();
+        let mk_bbo = |exchange_id: u8| ShmBboMessage {
+            seqlock: 2,
+            msg_type: 1,
+            exchange_id,
+            symbol_id: 0,
+            timestamp_ns: ts_ns,
+            bid_price: mid - 5.0,
+            bid_size: 5.0,
+            ask_price: mid + 5.0,
+            ask_size: 5.0,
+            _reserved: [0u8; 16],
+        };
+        let mut exchanges = [(0u8, ShmBboMessage::default()); NUM_EXCHANGES];
+        exchanges[1] = (1, mk_bbo(1));
+        let local = mk_bbo(2);
+        exchanges[2] = (2, local);
+        (exchanges, local)
+    }
+
+    fn apply_passive_fill(
+        tracker: &OrderTracker,
+        coid: i64,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+        sequence: u64,
+    ) {
+        use crate::types::ShmPrivateEventV2;
+        let is_ask = side == OrderSide::Sell;
+        let exchange_id = 20_000 + coid as u64;
+        tracker.start_tracking(coid, side, price, size);
+        let created = ShmPrivateEventV2::order_created(
+            sequence,
+            2,
+            0,
+            exchange_id,
+            coid,
+            coid,
+            price,
+            size,
+            is_ask,
+            0,
+        );
+        tracker.apply_event(&created).unwrap();
+        let fill = ShmPrivateEventV2::order_filled(
+            sequence + 1,
+            2,
+            0,
+            exchange_id,
+            coid,
+            coid,
+            price,
+            size,
+            0.0,
+            0.0,
+            is_ask,
+            0,
+            90_000 + coid as u64,
+        );
+        tracker.apply_event(&fill).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_self_fill_alpha_keeps_pricing_bit_identical_to_baseline() {
+        tokio::time::pause();
+        let (mut baseline, _baseline_tracker, dir_a) = make_test_strategy(0.0, 2_000);
+        let (mut filled, fill_tracker, dir_b) = make_test_strategy(0.0, 2_000);
+
+        apply_passive_fill(&fill_tracker, 1, OrderSide::Buy, 2_000.0, 0.01, 1);
+        apply_passive_fill(&fill_tracker, 2, OrderSide::Sell, 2_000.0, 0.01, 3);
+
+        let (exchanges, local) = fresh_books(2_000.0);
+        let inputs_a = baseline.calculate_pricing_inputs(&exchanges, &local);
+        let inputs_b = filled.calculate_pricing_inputs(&exchanges, &local);
+        assert_eq!(
+            inputs_b.pricing_mid.to_bits(),
+            inputs_a.pricing_mid.to_bits()
+        );
+
+        let (bid_a, ask_a, bounds_a) = baseline.calculate_optimal_quotes(&inputs_a, 0.0).unwrap();
+        let (bid_b, ask_b, bounds_b) = filled.calculate_optimal_quotes(&inputs_b, 0.0).unwrap();
+        assert_eq!(bid_b.to_bits(), bid_a.to_bits());
+        assert_eq!(ask_b.to_bits(), ask_a.to_bits());
+        assert_eq!(bounds_b.max_bid.to_bits(), bounds_a.max_bid.to_bits());
+        assert_eq!(bounds_b.min_ask.to_bits(), bounds_a.min_ask.to_bits());
+
+        std::fs::remove_dir_all(dir_a).unwrap();
+        std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn passive_buy_fill_shifts_pricing_mid_even_at_flat_inventory_and_decays_by_half_life() {
+        tokio::time::pause();
+        let (mut strategy, tracker, dir) = make_test_strategy(4.0, 2_000);
+        let (mut unshifted, _unshifted_tracker, dir_ref) = make_test_strategy(0.0, 2_000);
+
+        // Acquire short -0.01 inventory 60 s ago so its own self-fill alpha decays to ~0.
+        apply_passive_fill(&tracker, 1, OrderSide::Sell, 2_000.0, 0.01, 1);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let (exchanges_pre, local_pre) = fresh_books(2_000.0);
+        let pre = strategy.calculate_pricing_inputs(&exchanges_pre, &local_pre);
+        let _ = unshifted.calculate_pricing_inputs(&exchanges_pre, &local_pre);
+        assert!((pre.pricing_mid - 2_000.0).abs() < 1e-6);
+        assert!((tracker.confirmed_position() + 0.01).abs() < 1e-12);
+
+        // Passive Buy fill flattens inventory (-0.01 -> 0.0 flat), yet still shifts
+        // fair value down by -4.0 bps (-$0.80 at $2000).
+        tokio::time::advance(Duration::from_millis(500)).await;
+        apply_passive_fill(&tracker, 2, OrderSide::Buy, 2_000.0, 0.01, 3);
+        assert!(tracker.confirmed_position().abs() < 1e-12);
+        strategy.account_stats.position = 0.0;
+        strategy.account_stats.last_update = Instant::now();
+        unshifted.account_stats.last_update = Instant::now();
+
+        let (exchanges_0, local_0) = fresh_books(2_000.0);
+        let inputs_0 = strategy.calculate_pricing_inputs(&exchanges_0, &local_0);
+        let ref_0 = unshifted.calculate_pricing_inputs(&exchanges_0, &local_0);
+        assert!(
+            (inputs_0.pricing_mid - 1_999.20).abs() < 1e-6,
+            "expected -4 bps shift to 1999.20, got {}",
+            inputs_0.pricing_mid
+        );
+        let (bid_0, ask_0, _) = strategy.calculate_optimal_quotes(&inputs_0, 0.0).unwrap();
+        let (ref_bid, ref_ask, _) = unshifted.calculate_optimal_quotes(&ref_0, 0.0).unwrap();
+        assert!(bid_0 < ref_bid && ask_0 < ref_ask);
+
+        // After 1 half-life (2000 ms), offset decays by exact 50% to -2.0 bps (1999.60).
+        tokio::time::advance(Duration::from_millis(2_000)).await;
+        let (exchanges_half, local_half) = fresh_books(2_000.0);
+        let inputs_half = strategy.calculate_pricing_inputs(&exchanges_half, &local_half);
+        assert!(
+            (inputs_half.pricing_mid - 1_999.60).abs() < 1e-6,
+            "expected 50% decayed shift at 1999.60, got {}",
+            inputs_half.pricing_mid
+        );
+
+        // After 10 half-lives total (another 18,000 ms), offset decays to 0.5^10 (< 0.004 bps, ~0).
+        tokio::time::advance(Duration::from_millis(18_000)).await;
+        let (exchanges_ten, local_ten) = fresh_books(2_000.0);
+        let inputs_ten = strategy.calculate_pricing_inputs(&exchanges_ten, &local_ten);
+        assert!(
+            (inputs_ten.pricing_mid - 2_000.0).abs() < 1e-3,
+            "expected ~0 offset after 10 half-lives, got {}",
+            inputs_ten.pricing_mid
+        );
+        let residual_bps = (inputs_ten.pricing_mid / 2_000.0 - 1.0) * 10_000.0;
+        assert!((residual_bps - (-4.0 / 1024.0)).abs() < 1e-6);
+
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir_ref).unwrap();
+    }
+
+    #[tokio::test]
+    async fn burst_of_ten_same_side_fills_is_clamped_at_three_times_alpha() {
+        tokio::time::pause();
+        let (mut buy_strategy, buy_tracker, dir_buy) = make_test_strategy(4.0, 2_000);
+        for i in 1..=10_i64 {
+            apply_passive_fill(
+                &buy_tracker,
+                i,
+                OrderSide::Buy,
+                2_000.0,
+                0.01,
+                (i as u64) * 2,
+            );
+        }
+        let (exchanges, local) = fresh_books(2_000.0);
+        let buy_inputs = buy_strategy.calculate_pricing_inputs(&exchanges, &local);
+        // Clamped at -3 * 4.0 = -12.0 bps -> 2000 * (1 - 0.0012) = 1997.60.
+        assert!(
+            (buy_inputs.pricing_mid - 1_997.60).abs() < 1e-9,
+            "expected -12 bps clamp at 1997.60, got {}",
+            buy_inputs.pricing_mid
+        );
+
+        let (mut sell_strategy, sell_tracker, dir_sell) = make_test_strategy(4.0, 2_000);
+        for i in 1..=10_i64 {
+            apply_passive_fill(
+                &sell_tracker,
+                i,
+                OrderSide::Sell,
+                2_000.0,
+                0.01,
+                (i as u64) * 2,
+            );
+        }
+        let sell_inputs = sell_strategy.calculate_pricing_inputs(&exchanges, &local);
+        // Clamped at +3 * 4.0 = +12.0 bps -> 2000 * (1 + 0.0012) = 2002.40.
+        assert!(
+            (sell_inputs.pricing_mid - 2_002.40).abs() < 1e-9,
+            "expected +12 bps clamp at 2002.40, got {}",
+            sell_inputs.pricing_mid
+        );
+
+        std::fs::remove_dir_all(dir_buy).unwrap();
+        std::fs::remove_dir_all(dir_sell).unwrap();
+    }
+}

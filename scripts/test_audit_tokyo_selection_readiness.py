@@ -309,6 +309,36 @@ class TokyoSelectionReadinessTests(unittest.TestCase):
             "ready_with_causal_reconnect_barriers",
         )
 
+    def test_binds_sidecar_bronze_manifest_sha256_and_rejects_size_mismatch(self):
+        from archive_public_capture import digest
+
+        capture = self.root / "tokyo-bulk-w03.ndjson"
+        capture.write_text(
+            json.dumps(
+                self._row(
+                    "bulk",
+                    self.t0 + 10,
+                    {"type": "book", "symbol": "BTC-USD", "timestamp": self.t0},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sidecar = self.root / "tokyo-bulk-w03.ndjson.bronze_manifest.json"
+        sidecar.write_text(
+            json.dumps({"capture_bytes": capture.stat().st_size, "capture_sha256": "abc"}),
+            encoding="utf-8",
+        )
+        rep = audit_readiness(capture)
+        self.assertEqual(rep["manifest_sha256"], digest(sidecar))
+
+        sidecar.write_text(
+            json.dumps({"capture_bytes": capture.stat().st_size + 1, "capture_sha256": "abc"}),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "capture_bytes"):
+            audit_readiness(capture)
+
 
 if __name__ == "__main__":
     unittest.main()

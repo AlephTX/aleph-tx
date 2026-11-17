@@ -24,6 +24,7 @@ fn cycle(at: u64) -> Cycle {
         started_ms: at,
         initial_cash: Decimal::ZERO,
         initial_turnover: Decimal::ZERO,
+        initial_fees: Decimal::ZERO,
         draining: false,
         externalizing: false,
         maker_turnover: Decimal::ZERO,
@@ -37,6 +38,7 @@ fn cycle(at: u64) -> Cycle {
         forced_ioc_filled: false,
         sub_min_top_up_attempts: 0,
         sub_min_recovery_pending_base: Decimal::ZERO,
+        used_partner_step_deadband: false,
     }
 }
 

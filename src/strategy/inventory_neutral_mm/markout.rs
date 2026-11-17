@@ -9,8 +9,10 @@
 //! the exchange's trade time. A fill is marked against the first fresh fair
 //! value observed in `[horizon, horizon + tolerance]` after that; samples
 //! first seen later are dropped and counted as expired, so a stall cannot pass
-//! a 60 s move off as a 5 s markout. Each fill has equal weight regardless of
-//! size: this measures how often fills are picked off, not notional loss.
+//! a 60 s move off as a 5 s markout (or a 600 ms move off as a 100 ms markout).
+//! Equal-weighted (`ewma_bps`) and notional-weighted (`notional_ewma_bps`)
+//! markouts are tracked side by side without heap allocation, and spread
+//! widening takes the more conservative of the two once warm.
 
 use crate::order_tracker::{FillPrint, OrderSide, OrderTracker, RECENT_FILLS};
 use std::time::Duration;
@@ -22,10 +24,26 @@ const PENDING: usize = 64;
 const MIN_SAMPLES: u32 = 8;
 /// Upper bound on the spread multiplier from markouts.
 pub(super) const MAX_MARKOUT_SPREAD_MULT: f64 = 1.5;
-/// Lateness tolerated beyond the horizon, as a fraction of the horizon.
+/// Lateness tolerated beyond horizons >= 1 s, as a fraction of the horizon.
 const LATE_TOLERANCE_FRACTION: f64 = 0.2;
-/// Minimum absolute lateness tolerance, covering the poll cadence.
+/// Minimum absolute lateness tolerance for horizons >= 1 s, covering the poll cadence.
 const MIN_LATE_TOLERANCE: Duration = Duration::from_millis(500);
+/// Lateness tolerated beyond sub-second horizons (< 1 s), as a fraction of the horizon.
+const SUBSECOND_LATE_TOLERANCE_FRACTION: f64 = 0.5;
+/// Minimum absolute lateness tolerance for sub-second horizons (< 1 s).
+const MIN_SUBSECOND_LATE_TOLERANCE: Duration = Duration::from_millis(25);
+
+fn horizon_tolerance(horizon: Duration) -> Duration {
+    if horizon >= Duration::from_secs(1) {
+        horizon
+            .mul_f64(LATE_TOLERANCE_FRACTION)
+            .max(MIN_LATE_TOLERANCE)
+    } else {
+        horizon
+            .mul_f64(SUBSECOND_LATE_TOLERANCE_FRACTION)
+            .max(MIN_SUBSECOND_LATE_TOLERANCE)
+    }
+}
 
 /// Sample accounting for observability; monotonic over the session.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -40,8 +58,12 @@ pub(crate) struct MarkoutStats {
     pub missed: u64,
     /// Lateness of the most recent marked sample beyond the horizon (ms).
     pub last_delay_ms: f64,
-    /// Bias-corrected EWMA markout in bps, once warm.
+    /// Bias-corrected equal-weighted EWMA markout in bps, once warm.
     pub ewma_bps: Option<f64>,
+    /// Notional-weighted EWMA markout in bps, once warm.
+    pub notional_ewma_bps: Option<f64>,
+    /// Cumulative USD notional (`size * price`) of marked fills.
+    pub marked_notional_usd: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +90,30 @@ impl FillMean {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct NotionalFillMean {
+    weighted_notional_bps: f64,
+    weighted_notional: f64,
+    samples: u32,
+}
+
+impl NotionalFillMean {
+    fn record(&mut self, notional: f64, bps: f64, alpha: f64) {
+        if !(notional.is_finite() && notional > 0.0 && bps.is_finite()) {
+            return;
+        }
+        self.weighted_notional_bps =
+            (1.0 - alpha) * self.weighted_notional_bps + alpha * notional * bps;
+        self.weighted_notional = (1.0 - alpha) * self.weighted_notional + alpha * notional;
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    fn average(self) -> Option<f64> {
+        (self.samples >= MIN_SAMPLES && self.weighted_notional > 0.0)
+            .then(|| self.weighted_notional_bps / self.weighted_notional)
+    }
+}
+
 struct SideSamples {
     means: [FillMean; 2],
     updated_at: [Option<Instant>; 2],
@@ -82,6 +128,7 @@ pub(super) struct MarkoutTracker {
     pending: [Option<Pending>; PENDING],
     last_sequence: u64,
     mean: FillMean,
+    notional_mean: NotionalFillMean,
     sides: Option<SideSamples>,
     stats: MarkoutStats,
 }
@@ -93,14 +140,13 @@ impl MarkoutTracker {
         let horizon = Duration::from_secs_f64(horizon_secs.max(0.1));
         Self {
             horizon,
-            tolerance: horizon
-                .mul_f64(LATE_TOLERANCE_FRACTION)
-                .max(MIN_LATE_TOLERANCE),
+            tolerance: horizon_tolerance(horizon),
             alpha: 1.0 - 0.5_f64.powf(1.0 / halflife_fills.max(1.0)),
             threshold_bps,
             pending: [None; PENDING],
             last_sequence: 0,
             mean: FillMean::default(),
+            notional_mean: NotionalFillMean::default(),
             sides: None,
             stats: MarkoutStats::default(),
         }
@@ -155,6 +201,13 @@ impl MarkoutTracker {
             match markout_bps(entry.print, fair) {
                 Some(bps) => {
                     self.record(bps);
+                    if entry.print.size.is_finite() && entry.print.size > 0.0 {
+                        let notional = entry.print.size * entry.print.price;
+                        if notional.is_finite() && notional > 0.0 {
+                            self.notional_mean.record(notional, bps, self.alpha);
+                            self.stats.marked_notional_usd += notional;
+                        }
+                    }
                     if let Some(sides) = &mut self.sides {
                         let i = usize::from(entry.print.side == OrderSide::Sell);
                         if sides.updated_at[i]
@@ -172,6 +225,7 @@ impl MarkoutTracker {
             }
         }
         self.stats.ewma_bps = self.ewma_bps();
+        self.stats.notional_ewma_bps = self.notional_ewma_bps();
     }
 
     pub(crate) fn stats(&self) -> MarkoutStats {
@@ -213,6 +267,11 @@ impl MarkoutTracker {
         self.mean.average()
     }
 
+    /// Notional-weighted average markout once enough fills have been marked.
+    pub(super) fn notional_ewma_bps(&self) -> Option<f64> {
+        self.notional_mean.average()
+    }
+
     pub(super) fn side_reserve_bps(
         &self,
         now: Instant,
@@ -233,9 +292,16 @@ impl MarkoutTracker {
     }
 
     /// Spread multiplier in [1, MAX_MARKOUT_SPREAD_MULT]: +10% per bp of
-    /// average markout below the threshold.
+    /// average markout below the threshold, using the more conservative of
+    /// equal-weighted and notional-weighted markouts when both are warm.
     pub(super) fn spread_multiplier(&self) -> f64 {
-        match self.ewma_bps() {
+        let conservative_bps = match (self.ewma_bps(), self.notional_ewma_bps()) {
+            (Some(eq), Some(notional)) => Some(eq.min(notional)),
+            (Some(eq), None) => Some(eq),
+            (None, Some(notional)) => Some(notional),
+            (None, None) => None,
+        };
+        match conservative_bps {
             Some(bps) if bps < self.threshold_bps => {
                 (1.0 + 0.1 * (self.threshold_bps - bps)).min(MAX_MARKOUT_SPREAD_MULT)
             }
@@ -499,5 +565,89 @@ mod tests {
         // Fill 1 is 25.5 s late and dropped; fill 2 is 0.5 s late and marked.
         assert_eq!((stats.marked, stats.expired), (1, 1));
         assert!((stats.last_delay_ms - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn notional_weighted_markout_reverses_sign_and_widens_after_large_adverse_sweep() {
+        // Vertox §3.1: 9 small 1-unit fills at +1.0 bps followed by 1 large
+        // 100-unit sweep at -3.0 bps leave equal-weighted EWMA positive while
+        // notional-weighted EWMA is strongly negative and triggers widening.
+        let orders = OrderTracker::new();
+        let mut markout = MarkoutTracker::new(5.0, 20.0, -1.0);
+        let t0 = Instant::now();
+        for seq in 1..=9 {
+            markout.enqueue(FillPrint {
+                sequence: seq,
+                side: OrderSide::Buy,
+                price: 2000.0,
+                size: 1.0,
+                at: t0,
+            });
+        }
+        // Bought at 2000.0, fair 2000.2 -> +1.0 bps on each 1-unit fill.
+        markout.update(&orders, 2000.2, t0 + Duration::from_secs(5));
+        assert_eq!(markout.spread_multiplier(), 1.0);
+
+        let t1 = t0 + Duration::from_secs(6);
+        markout.enqueue(FillPrint {
+            sequence: 10,
+            side: OrderSide::Buy,
+            price: 2000.0,
+            size: 100.0,
+            at: t1,
+        });
+        // Bought 100 units at 2000.0, fair 1999.4 -> -3.0 bps on $200k notional.
+        markout.update(&orders, 1999.4, t1 + Duration::from_secs(5));
+
+        let stats = markout.stats();
+        assert_eq!((stats.marked, stats.expired), (10, 0));
+        assert!((stats.marked_notional_usd - 218_000.0).abs() < 1e-6);
+        let eq_bps = stats.ewma_bps.expect("equal-weighted EWMA warm");
+        let notional_bps = stats.notional_ewma_bps.expect("notional EWMA warm");
+        assert!(
+            eq_bps > 0.0,
+            "equal-weighted EWMA must remain positive, got {eq_bps}"
+        );
+        assert!(
+            notional_bps < -2.0,
+            "notional-weighted EWMA must be < -2.0 bps, got {notional_bps}"
+        );
+        assert_eq!(markout.notional_ewma_bps(), Some(notional_bps));
+        assert!(
+            markout.spread_multiplier() > 1.0,
+            "spread multiplier must widen on large notional pick-off"
+        );
+    }
+
+    #[test]
+    fn subsecond_horizon_caps_late_tolerance_proportionally() {
+        let orders = OrderTracker::new();
+        let mut markout = MarkoutTracker::new(0.1, 20.0, -1.0);
+        assert_eq!(markout.tolerance, Duration::from_millis(50));
+
+        let t0 = Instant::now();
+        markout.enqueue(print(1, OrderSide::Buy, 2000.0, t0));
+        // At +140 ms (40 ms late <= 50 ms tolerance), sample is accepted.
+        markout.update(&orders, 2000.2, t0 + Duration::from_millis(140));
+        let stats = markout.stats();
+        assert_eq!((stats.marked, stats.expired), (1, 0));
+        assert!((stats.last_delay_ms - 40.0).abs() < 1e-6);
+
+        let t1 = t0 + Duration::from_secs(1);
+        markout.enqueue(print(2, OrderSide::Buy, 2000.0, t1));
+        // At +250 ms (150 ms late > 50 ms tolerance), stale sample expires.
+        markout.update(&orders, 2000.2, t1 + Duration::from_millis(250));
+        let stats = markout.stats();
+        assert_eq!((stats.marked, stats.expired), (1, 1));
+
+        // 250 ms horizon scales tolerance to 125 ms; >= 1 s retains 500 ms floor.
+        assert_eq!(
+            MarkoutTracker::new(0.25, 20.0, -1.0).tolerance,
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            MarkoutTracker::new(1.0, 20.0, -1.0).tolerance,
+            Duration::from_millis(500)
+        );
     }
 }

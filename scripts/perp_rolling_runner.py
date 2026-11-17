@@ -43,10 +43,58 @@ def _sha256_and_size(path: Path) -> tuple[str, int]:
     h = sha256()
     total = 0
     with path.open("rb") as fh:
-        while chunk := fh.read(256 * 1024):
+        while chunk := fh.read(4 * 1024 * 1024):
             h.update(chunk)
             total += len(chunk)
     return h.hexdigest(), total
+
+
+def backfill_missing_quarantine_manifests(
+    quarantine_dir: Path, *, collector_region: str
+) -> list[str]:
+    """Backfill `.quarantine_manifest.json` for any `.partial` in `quarantine_dir` interrupted by SIGKILL."""
+    backfilled: list[str] = []
+    if not quarantine_dir.is_dir():
+        return backfilled
+    for entry in sorted(quarantine_dir.iterdir(), key=lambda p: p.name):
+        if not (entry.is_file() and ".partial" in entry.name and not entry.name.endswith(".json")):
+            continue
+        stem = entry.name
+        for suf in (".ndjson.gz.partial", ".ndjson.partial", ".partial"):
+            idx = stem.find(suf)
+            if idx != -1:
+                stem = stem[:idx]
+                break
+        manifest_path = quarantine_dir / f"{stem}.quarantine_manifest.json"
+        orphan_manifest = quarantine_dir / f"{stem}-orphan.quarantine_manifest.json"
+        if manifest_path.exists() or orphan_manifest.exists():
+            continue
+        digest, size_bytes = _sha256_and_size(entry)
+        mtime = entry.stat().st_mtime
+        manifest = {
+            "schema_version": 1,
+            "manifest_kind": "quarantine_partial",
+            "campaign_id": stem,
+            "created_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "collector_region": collector_region,
+            "split_role": "quarantine_diagnostic",
+            "observed_window_utc": {
+                "start": datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "duration_seconds": 0,
+            },
+            "raw_file": {
+                "name": entry.name,
+                "size_bytes": size_bytes,
+                "sha256": digest,
+            },
+            "sealed_cleanly": False,
+            "abort_reason": "backfilled_after_stop_timeout_sigkill",
+            "notes": "Manifest backfilled on runner startup after prior stop timeout interrupted hashing.",
+        }
+        write_immutable_json(manifest_path, manifest)
+        backfilled.append(manifest_path.name)
+    return backfilled
 
 
 def next_window_index(output_dir: Path, quarantine_dir: Path, stream_name: str) -> int:
@@ -171,6 +219,9 @@ def run_rolling_loop(
 
     orphaned = sweep_orphaned_partials(
         output_dir, quarantine_dir, collector_region=collector_region
+    )
+    backfilled = backfill_missing_quarantine_manifests(
+        quarantine_dir, collector_region=collector_region
     )
 
     stop_requested = False
@@ -298,6 +349,7 @@ def run_rolling_loop(
     return {
         "stream_name": stream_name,
         "orphaned_swept": orphaned,
+        "quarantine_manifests_backfilled": backfilled,
         "completed_windows": completed_windows,
         "quarantined_windows": quarantined_windows,
     }

@@ -144,4 +144,10 @@ impl FundingState {
             .iter()
             .find_map(|(start, _)| (*start > now).then_some(*start))
     }
+
+    pub fn next_flat_deadline(&self, now: u64) -> Option<u64> {
+        self.timers.iter().find_map(|(at, kind)| {
+            (*at > now && matches!(kind, TimerKind::Check | TimerKind::Slot(_))).then_some(*at)
+        })
+    }
 }

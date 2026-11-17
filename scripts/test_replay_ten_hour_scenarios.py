@@ -166,6 +166,43 @@ class ContinuousSourceTests(unittest.TestCase):
             self.assertFalse(any(row['kind'] == 'end' for row in rows))
             self.assertTrue(any(row['kind'] == 'book' for row in rows))
 
+    def test_book_rows_preserve_equity_session_reference_and_leg_oracles(self):
+        from replay_maker_first_campaign import book_rows
+        frame = {
+            'now_ms': 150,
+            'reference': {'price': '682.50', 'timestamp_ms': 149, 'mode': 'live_external'},
+            'equity_session': {
+                'observed_at_ms': 145,
+                'opens_at_ms': 100,
+                'closes_at_ms': 500,
+                'clear_until_ms': 1000,
+                'halted': False,
+            },
+            'legs': [
+                {
+                    'book': {'market': 'SPY-USD', 'timestamp_ms': 148, 'tradable': True,
+                             'bids': [{'price': '682.40', 'contracts': '1'}],
+                             'asks': [{'price': '682.60', 'contracts': '1'}],
+                             'bounds': None, 'available_notional': '0'},
+                    'oracle': {'price': '682.50', 'timestamp_ms': 148, 'mode': 'live_external'},
+                },
+                {
+                    'book': {'market': 'SPY', 'timestamp_ms': 149, 'tradable': True,
+                             'bids': [{'price': '682.45', 'contracts': '1'}],
+                             'asks': [{'price': '682.55', 'contracts': '1'}],
+                             'bounds': None, 'available_notional': '0'},
+                    'oracle': {'price': '682.50', 'timestamp_ms': 149, 'mode': 'live_external'},
+                },
+            ],
+        }
+        stream = io.StringIO(json.dumps(frame) + '\n')
+        emitted = list(book_rows(stream, 100, 200))
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]['reference'], frame['reference'])
+        self.assertEqual(emitted[0]['equity_session'], frame['equity_session'])
+        self.assertEqual(len(emitted[0]['leg_oracles']), 2)
+        self.assertEqual(emitted[0]['books'][0]['available_notional'], '150')
+
 
 if __name__ == '__main__':
     unittest.main()

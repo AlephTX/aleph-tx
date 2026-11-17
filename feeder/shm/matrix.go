@@ -13,6 +13,7 @@
 package shm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
@@ -62,6 +63,20 @@ func init() {
 	if unsafe.Sizeof(ShmBboMessage{}) != SlotSize {
 		panic(fmt.Sprintf("ShmBboMessage size is %d, expected %d", unsafe.Sizeof(ShmBboMessage{}), SlotSize))
 	}
+	var msg ShmBboMessage
+	if unsafe.Offsetof(msg.Seqlock) != 0 ||
+		unsafe.Offsetof(msg.MsgType) != 4 ||
+		unsafe.Offsetof(msg.MsgType)%4 != 0 ||
+		unsafe.Offsetof(msg.ExchangeID) != 5 ||
+		unsafe.Offsetof(msg.SymbolID) != 6 ||
+		unsafe.Offsetof(msg.TimestampNs) != 8 ||
+		unsafe.Offsetof(msg.BidPrice) != 16 ||
+		unsafe.Offsetof(msg.BidSize) != 24 ||
+		unsafe.Offsetof(msg.AskPrice) != 32 ||
+		unsafe.Offsetof(msg.AskSize) != 40 ||
+		unsafe.Offsetof(msg._Reserved) != 48 {
+		panic("ShmBboMessage ABI field offset or alignment mismatch")
+	}
 	shmSize := unsafe.Sizeof(ShmMarketState{})
 	fmt.Printf("shm: ShmMarketState size = %d bytes (%.2f KB)\n", shmSize, float64(shmSize)/1024)
 }
@@ -94,33 +109,39 @@ func NewMatrix(name string) (*Matrix, error) {
 	}
 
 	shm := (*ShmMarketState)(unsafe.Pointer(&data[0]))
+	magicLo := binary.LittleEndian.Uint64(MagicV12[0:8])
+	magicHi := binary.LittleEndian.Uint64(MagicV12[8:16])
+
 	// Clear any pre-existing slots via seqlock instead of O_TRUNC so live
 	// mmap readers never observe a zero-length file (SIGBUS) or stale quotes.
 	for sym := range NumSymbols {
 		for ex := range NumExchanges {
 			slot := &shm.BboMatrix[sym][ex]
-			seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
-			cur := atomic.LoadUint32(seqAddr)
-			if (sym == 0 && ex == 0) || cur != 0 || slot.TimestampNs != 0 {
+			cur := atomic.LoadUint32(&slot.Seqlock)
+			if (sym == 0 && ex == 0) || cur != 0 || atomic.LoadUint64(&slot.TimestampNs) != 0 {
 				step := uint32(1)
 				if cur&1 == 1 {
 					step = 2 // Recover crashed odd writer to next odd epoch
 				}
-				odd := atomic.AddUint32(seqAddr, step)
-				slot.MsgType = 0
-				slot.ExchangeID = 0
-				slot.SymbolID = 0
-				slot.TimestampNs = 0
-				slot.BidPrice = 0
-				slot.BidSize = 0
-				slot.AskPrice = 0
-				slot.AskSize = 0
+				odd := atomic.AddUint32(&slot.Seqlock, step)
+				atomic.StoreUint32((*uint32)(unsafe.Pointer(&slot.MsgType)), 0)
+				atomic.StoreUint64(&slot.TimestampNs, 0)
+				atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidPrice)), 0)
+				atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidSize)), 0)
+				atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskPrice)), 0)
+				atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskSize)), 0)
+				r0 := (*uint64)(unsafe.Pointer(&slot._Reserved[0]))
+				r1 := (*uint64)(unsafe.Pointer(&slot._Reserved[8]))
 				if sym == 0 && ex == 0 {
-					slot._Reserved = MagicV12
+					if atomic.LoadUint64(r0) != magicLo || atomic.LoadUint64(r1) != magicHi {
+						atomic.StoreUint64(r0, magicLo)
+						atomic.StoreUint64(r1, magicHi)
+					}
 				} else {
-					slot._Reserved = [16]byte{}
+					atomic.StoreUint64(r0, 0)
+					atomic.StoreUint64(r1, 0)
 				}
-				atomic.StoreUint32(seqAddr, odd+1)
+				atomic.StoreUint32(&slot.Seqlock, odd+1)
 			}
 		}
 		if atomic.LoadUint64(&shm.SymbolVersions[sym]) != 0 {
@@ -145,27 +166,25 @@ func (m *Matrix) WriteBBO(exchangeID uint8, symbolID uint16, tsNs uint64,
 
 	// Get pointers
 	slot := &m.shm.BboMatrix[symbolID][exchangeID]
-	if tsNs < slot.TimestampNs {
+	if tsNs < atomic.LoadUint64(&slot.TimestampNs) {
 		return // Delayed/replayed updates cannot make an older quote current.
 	}
-	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 
 	// Phase 1: mark slot as being written (odd seqlock; AddUint32 provides
 	// acquire-release ordering on ARM64 so payload stores never hoist above it).
-	seq := atomic.AddUint32(seqAddr, 1) // now odd → write in progress
+	seq := atomic.AddUint32(&slot.Seqlock, 1) // now odd → write in progress
 
-	// Phase 2: write payload
-	slot.MsgType = 1 // BBO
-	slot.ExchangeID = exchangeID
-	slot.SymbolID = symbolID
-	slot.TimestampNs = tsNs
-	slot.BidPrice = bidPrice
-	slot.BidSize = bidSize
-	slot.AskPrice = askPrice
-	slot.AskSize = askSize
+	// Phase 2: write payload atomically per aligned word (msgType=1 | exch<<8 | sym<<16)
+	headerWord := uint32(1) | (uint32(exchangeID) << 8) | (uint32(symbolID) << 16)
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&slot.MsgType)), headerWord)
+	atomic.StoreUint64(&slot.TimestampNs, tsNs)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidPrice)), math.Float64bits(bidPrice))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidSize)), math.Float64bits(bidSize))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskPrice)), math.Float64bits(askPrice))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskSize)), math.Float64bits(askSize))
 
 	// Phase 3: mark write complete (even seqlock)
-	atomic.StoreUint32(seqAddr, seq+1) // now even → write complete
+	atomic.StoreUint32(&slot.Seqlock, seq+1) // now even → write complete
 
 	// Phase 4: increment symbol version to notify Rust reader
 	atomic.AddUint64(&m.shm.SymbolVersions[symbolID], 1)
@@ -185,24 +204,24 @@ func (m *Matrix) ReadBBO(exchangeID uint8, symbolID uint16) (ShmBboMessage, bool
 		return ShmBboMessage{}, false
 	}
 	slot := &m.shm.BboMatrix[symbolID][exchangeID]
-	seqAddr := (*uint32)(unsafe.Pointer(&slot.Seqlock))
 	for range 8 {
-		before := atomic.LoadUint32(seqAddr)
+		before := atomic.LoadUint32(&slot.Seqlock)
 		if before&1 != 0 {
 			continue
 		}
+		headerWord := atomic.LoadUint32((*uint32)(unsafe.Pointer(&slot.MsgType)))
 		snap := ShmBboMessage{
 			Seqlock:     before,
-			MsgType:     slot.MsgType,
-			ExchangeID:  slot.ExchangeID,
-			SymbolID:    slot.SymbolID,
-			TimestampNs: slot.TimestampNs,
-			BidPrice:    slot.BidPrice,
-			BidSize:     slot.BidSize,
-			AskPrice:    slot.AskPrice,
-			AskSize:     slot.AskSize,
+			MsgType:     uint8(headerWord),
+			ExchangeID:  uint8(headerWord >> 8),
+			SymbolID:    uint16(headerWord >> 16),
+			TimestampNs: atomic.LoadUint64(&slot.TimestampNs),
+			BidPrice:    math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.BidPrice)))),
+			BidSize:     math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.BidSize)))),
+			AskPrice:    math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.AskPrice)))),
+			AskSize:     math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&slot.AskSize)))),
 		}
-		after := atomic.LoadUint32(seqAddr)
+		after := atomic.LoadUint32(&slot.Seqlock)
 		if before == after {
 			return snap, snap.TimestampNs != 0
 		}
@@ -227,8 +246,12 @@ func (m *Matrix) InvalidateBBO(exchangeID uint8, symbolID uint16) {
 	}
 	slot := &m.shm.BboMatrix[symbolID][exchangeID]
 	seq := atomic.AddUint32(&slot.Seqlock, 1)
-	slot.TimestampNs = 0
-	slot.BidPrice, slot.BidSize, slot.AskPrice, slot.AskSize = 0, 0, 0, 0
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&slot.MsgType)), 0)
+	atomic.StoreUint64(&slot.TimestampNs, 0)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidPrice)), 0)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.BidSize)), 0)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskPrice)), 0)
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&slot.AskSize)), 0)
 	atomic.StoreUint32(&slot.Seqlock, seq+1)
 	atomic.AddUint64(&m.shm.SymbolVersions[symbolID], 1)
 }

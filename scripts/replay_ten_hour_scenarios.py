@@ -17,7 +17,7 @@ import tomllib
 
 from archive_public_capture import verify_compiled
 from replay_maker_campaign import books, load, save, strategy_config, unseal
-from replay_maker_first_campaign import digest
+from replay_maker_first_campaign import digest, frame_to_maker_book_event
 from public_replay_sources import trade_events
 from replay_trade_preflight import audit as audit_trade_timing, timing_policy
 
@@ -186,9 +186,9 @@ def turnover_input(campaign, symbol, window, output, *, compiled=None, public_ar
                     book_span[0] = at
                 book_span[1] = at
                 # This is an explicit paper capital allowance, not displayed
-                # depth. Every bid/ask level, time and tradability flag survives.
-                books = [leg["book"] | {"available_notional": "150"} for leg in frame["legs"]]
-                yield {"kind": "book", "at_ms": at, "books": books}
+                # depth. Every bid/ask level, time, tradability flag, reference,
+                # and equity session state survives.
+                yield frame_to_maker_book_event(frame, available_notional="150")
         def prints(leg):
             terms = pair["legs"][leg]
             venue = terms["venue"]

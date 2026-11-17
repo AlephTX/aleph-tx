@@ -233,6 +233,7 @@ def audit_readiness(
     max_overall_gap_ms: int = 15_000,
     max_source_gap_ms: int = 60_000,
     session_gated_sources: tuple[str, ...] = (),
+    manifest_path: Path | None = None,
 ) -> dict:
     if lighter_leverage <= 0 or hedge_leverage <= 0:
         raise ValueError("leverages must be positive")
@@ -240,11 +241,25 @@ def audit_readiness(
         raise ValueError("gap limits must be positive")
     session_gated_set = {s.strip() for s in session_gated_sources if s and s.strip()}
     target = target.resolve(strict=True)
-    manifest_sha256 = (
-        digest(target / "manifest.json")
-        if target.is_dir() and (target / "manifest.json").is_file()
-        else None
-    )
+    resolved_manifest: Path | None = None
+    if manifest_path is not None:
+        resolved_manifest = manifest_path.resolve(strict=True)
+    elif target.is_dir() and (target / "manifest.json").is_file():
+        resolved_manifest = target / "manifest.json"
+    elif target.is_file():
+        sidecar = target.with_name(f"{target.name}.bronze_manifest.json")
+        if sidecar.is_file():
+            resolved_manifest = sidecar
+    manifest_sha256: str | None = None
+    if resolved_manifest is not None:
+        if resolved_manifest.name.endswith(".bronze_manifest.json") and target.is_file():
+            meta = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+            expected_bytes = meta.get("capture_bytes")
+            if isinstance(expected_bytes, int) and target.stat().st_size != expected_bytes:
+                raise ValueError(
+                    f"capture size {target.stat().st_size} does not match bronze manifest capture_bytes {expected_bytes}"
+                )
+        manifest_sha256 = digest(resolved_manifest)
 
     latencies: dict[str, list[float]] = {}
     source_counts: dict[str, dict[str, int]] = {}
@@ -704,6 +719,12 @@ def main() -> None:
         default=(),
         help="Optional sources with scheduled market-hours halts (recorded in window.session_gated_sources)",
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional parent .bronze_manifest.json or archive manifest.json path to bind manifest_sha256",
+    )
     args = parser.parse_args()
 
     report = audit_readiness(
@@ -713,6 +734,7 @@ def main() -> None:
         max_overall_gap_ms=args.max_overall_gap_ms,
         max_source_gap_ms=args.max_source_gap_ms,
         session_gated_sources=tuple(args.session_gated_sources),
+        manifest_path=args.manifest,
     )
     if args.output:
         write_report(report, args.output)

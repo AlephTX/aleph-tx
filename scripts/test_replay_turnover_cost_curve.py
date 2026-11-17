@@ -1,6 +1,6 @@
 import unittest
 from decimal import Decimal
-from replay_turnover_cost_curve import (COST_CAPS, point, serialized_sum_matches,
+from replay_turnover_cost_curve import (COST_CAPS, TIGHT_002_COST_CAPS, point, serialized_sum_matches,
                                        reward_eligibility, basis_risk_variants)
 from replay_ten_hour_scenarios import summarize_quant, turnover_policies
 
@@ -242,6 +242,118 @@ class CostCurveTests(unittest.TestCase):
         self.assertEqual(s["fixed_ledger_overhead_sensitivity"]["0"], -0.03)
         self.assertAlmostEqual(s["fixed_ledger_overhead_sensitivity"]["0.25"], -0.28)
         self.assertIn("not_exchange_fee", s["modeled_overhead_source"])
+
+    def test_v2_reverse_arm_and_tight_002_caps_reconcile_without_feedback(self):
+        self.assertEqual(COST_CAPS, ("0", "0.5", "1", "2", "4", "8"))
+        self.assertIn("0.02", TIGHT_002_COST_CAPS)
+        self.assertIn("0.1", TIGHT_002_COST_CAPS)
+        row = {
+            "engine_exit_code": 0,
+            "incomplete": None,
+            "net_pnl": "-0.3",
+            "pnl_before_fees": "-0.1",
+            "fees": "0.2",
+            "maker_turnover": "1000",
+            "taker_turnover": "1000",
+            "closed_cycles": 1,
+            "open_positions_base": ["0", "0"],
+            "turnover_feedback": None,
+            "turnover_breakdown": {
+                "capability_snapshot_version": "2026-11-17.v1",
+                "target_venue_turnover_quote": "1000",
+                "dual_venue_gross_turnover_quote": "2000",
+                "rule_window_candidate_turnover_quote": "1000",
+                "confirmed_eligible_turnover_quote": None,
+                "excluded_recovery_turnover_quote": "25.5",
+            },
+            "execution_costs": {
+                "whole_ledger_cash_reconciled": True,
+                "whole_ledger_net_before_overhead": "-0.3",
+                "whole_ledger_net_after_overhead": "-0.3",
+                "cycles": [{
+                    "completed": True,
+                    "cash_reconciled": True,
+                    "price_decomposition_reconciled": True,
+                    "net_before_overhead": "-0.3",
+                    "net_after_overhead": "-0.3",
+                    "opening_hedge_slippage_vs_submit_touch": "0",
+                    "fees_quote": "0.2",
+                    "price_loss_quote": "0.1",
+                    "overhead_quote": "0",
+                    "stages": [],
+                    "price_drift_cost_quote": "0.1",
+                    "entry_markouts": [],
+                }],
+            },
+        }
+        p0 = point(row)
+        self.assertTrue(p0["cash_attribution_reconciled"])
+        self.assertTrue(p0["cash_components_reconciled"])
+        self.assertTrue(p0["legacy_headline_consistent"])
+        self.assertEqual(p0["observed_target_turnover"], "1000")
+        self.assertEqual(p0["dual_venue_gross_turnover"], "2000")
+        self.assertEqual(p0["partner_venue_turnover"], "1000")
+        self.assertEqual(p0["excluded_recovery_turnover"], "25.5")
+        self.assertEqual(p0["capability_snapshot_version"], "2026-11-17.v1")
+        self.assertEqual(p0["net_after_overhead"], "-0.3")
+        self.assertEqual(p0["modeled_overhead_quote"], "0")
+        self.assertEqual(Decimal(p0["realized_cost_bps_per_target_turnover"]), Decimal("3"))
+
+        p25 = point(row, external_overhead_bps="0.25")
+        self.assertTrue(p25["cash_attribution_reconciled"])
+        self.assertEqual(Decimal(p25["modeled_overhead_quote"]), Decimal("0.05"))
+        self.assertEqual(Decimal(p25["net_after_overhead"]), Decimal("-0.35"))
+        self.assertEqual(Decimal(p25["realized_cost_bps_per_target_turnover"]), Decimal("3.5"))
+        self.assertIsNone(p25["reward_eligibility"]["confirmed_eligible_turnover"])
+
+    def test_exact_breakdown_candidate_overrides_float_feedback_rounding(self):
+        exact_target = "4044.5988939600000000000000000"
+        row = {
+            "engine_exit_code": 0,
+            "incomplete": None,
+            "net_pnl": "-2.46901388088145",
+            "pnl_before_fees": "-2.00000000000000",
+            "fees": "0.46901388088145",
+            "closed_cycles": 1,
+            "open_positions_base": ["0", "0"],
+            "turnover_feedback": {
+                "modeled_target_turnover_quote": 4044.5988939600006,
+                "modeled_eligible_turnover_quote": 4044.5988939600006,
+                "net_after_overhead": "-2.46901388088145",
+                "overhead_quote": "0",
+            },
+            "turnover_breakdown": {
+                "capability_snapshot_version": "2026-11-17.v1",
+                "target_venue_turnover_quote": exact_target,
+                "dual_venue_gross_turnover_quote": "7913.9588249600000000000000000",
+                "rule_window_candidate_turnover_quote": exact_target,
+                "confirmed_eligible_turnover_quote": None,
+                "excluded_recovery_turnover_quote": "9.999600477000000000000000000",
+            },
+            "execution_costs": {
+                "whole_ledger_cash_reconciled": True,
+                "whole_ledger_net_before_overhead": "-2.46901388088145",
+                "whole_ledger_net_after_overhead": "-2.46901388088145",
+                "cycles": [{
+                    "completed": True,
+                    "cash_reconciled": True,
+                    "price_decomposition_reconciled": True,
+                    "net_before_overhead": "-2.46901388088145",
+                    "net_after_overhead": "-2.46901388088145",
+                    "opening_hedge_slippage_vs_submit_touch": "0",
+                    "fees_quote": "0.46901388088145",
+                    "price_loss_quote": "2.00000000000000",
+                    "overhead_quote": "0",
+                    "stages": [],
+                    "price_drift_cost_quote": "0",
+                    "entry_markouts": [],
+                }],
+            },
+        }
+        p0 = point(row, external_overhead_bps="0")
+        self.assertTrue(p0["cash_attribution_reconciled"])
+        self.assertEqual(p0["observed_target_turnover"], exact_target)
+        self.assertEqual(p0["reward_eligibility"]["rule_window_candidate_turnover"], exact_target)
 
 
 if __name__ == "__main__":
