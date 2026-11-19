@@ -13,7 +13,8 @@ fn risk_config() -> MakerFirstConfig {
     };
     c.turnover_feedback = Some(TurnoverFeedback { alpha: Decimal::ZERO,
         min_reserve_bps: d("0.25"), max_reserve_bps: d("0.25"),
-        overhead_bps: Decimal::ZERO, max_quote_distance_bps: Decimal::ZERO });
+        overhead_bps: Decimal::ZERO, max_quote_distance_bps: Decimal::ZERO,
+        fixed_overhead_usd_per_day: None });
     c.basis_risk_reserve = Some(BasisRiskReserve { lookback_ms: 1000, sample_ms: 100,
         max_gap_ms: 250, min_reserve_bps: d("0.5"), range_multiplier: d("0.5"), max_reserve_bps: d("10") });
     c

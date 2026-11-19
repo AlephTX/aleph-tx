@@ -2,6 +2,7 @@ package shm
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -106,15 +107,17 @@ const (
 // Memory layout:
 //
 //	[0-7]:     write_idx (atomic u64)
-//	[8-15]:    generation (atomic u64)
-//	[16-63]:   padding (header)
+//	[8-15]:    generation (atomic u64, odd while a slot is being overwritten)
+//	[16-23]:   producer_epoch (atomic u64, incremented each producer startup)
+//	[24-63]:   padding (header)
 //	[64-...]:  1024 event slots (128 bytes each)
 type EventRingBufferV2 struct {
-	mmap       []byte
-	writeIdx   *uint64
-	generation *uint64 // header[8:16]: odd while any slot is being overwritten
-	slots      []ShmPrivateEventV2
-	localSeq   uint64
+	mmap          []byte
+	writeIdx      *uint64
+	generation    *uint64 // header[8:16]: odd while any slot is being overwritten
+	producerEpoch *uint64 // header[16:24]: incremented on every NewEventRingBufferV2
+	slots         []ShmPrivateEventV2
+	localSeq      uint64
 }
 
 // NewEventRingBufferV2 creates or opens the V2 event ring buffer
@@ -138,21 +141,32 @@ func NewEventRingBufferV2() (*EventRingBufferV2, error) {
 
 	writeIdx := (*uint64)(unsafe.Pointer(&data[0]))
 	generation := (*uint64)(unsafe.Pointer(&data[8]))
+	producerEpoch := (*uint64)(unsafe.Pointer(&data[16]))
 	// Recover a writer interrupted before publishing. Existing consumers must
-	// reconnect after feeder failure; never leave the ring permanently odd.
-	atomic.StoreUint64(generation, (atomic.LoadUint64(generation)+1)&^1)
+	// reconnect or reconcile after feeder restart; never leave the ring odd.
+	if g := atomic.LoadUint64(generation); g&1 == 1 {
+		atomic.AddUint64(generation, 1)
+	}
+	atomic.AddUint64(producerEpoch, 1)
 	slots := (*[V2RingBufferSlots]ShmPrivateEventV2)(unsafe.Pointer(&data[V2HeaderSize]))
 
 	// Resume from current write_idx to avoid index regression
 	currentIdx := atomic.LoadUint64(writeIdx)
 
-	return &EventRingBufferV2{
-		mmap:       data,
-		writeIdx:   writeIdx,
-		generation: generation,
-		slots:      slots[:],
-		localSeq:   currentIdx,
-	}, nil
+	rb := &EventRingBufferV2{
+		mmap:          data,
+		writeIdx:      writeIdx,
+		generation:    generation,
+		producerEpoch: producerEpoch,
+		slots:         slots[:],
+		localSeq:      currentIdx,
+	}
+	// If reopening an existing non-empty ring, immediately signal PrivateStreamLost
+	// so consumers reconcile fills/cancels potentially missed during feeder downtime.
+	if currentIdx > 0 {
+		rb.PushPrivateStreamLost()
+	}
+	return rb, nil
 }
 
 // Close unmaps the shared memory
@@ -165,17 +179,38 @@ func (rb *EventRingBufferV2) Close() error {
 
 // Push writes a new V2 event to the ring buffer (lock-free, single writer)
 func (rb *EventRingBufferV2) Push(event ShmPrivateEventV2) {
-	generation := atomic.LoadUint64(rb.generation)
-	atomic.StoreUint64(rb.generation, generation+1)
+	// AddUint64 provides acquire-release ordering on ARM64 so slot stores
+	// cannot hoist above the odd transition.
+	odd := atomic.AddUint64(rb.generation, 1)
+	if odd&1 == 0 {
+		odd = atomic.AddUint64(rb.generation, 1)
+	}
 	event.Sequence = rb.localSeq
 	rb.localSeq++
 
 	idx := event.Sequence % V2RingBufferSlots
-	rb.slots[idx] = event
+	words := (*[16]uint64)(unsafe.Pointer(&rb.slots[idx]))
+	headerWord := uint64(event.ExchangeID) | (uint64(event.EventType) << 8) | (uint64(event.SymbolID) << 16)
+	atomic.StoreUint64(&words[0], event.Sequence)
+	atomic.StoreUint64(&words[1], headerWord)
+	atomic.StoreUint64(&words[2], event.ExchangeOrderID)
+	atomic.StoreUint64(&words[3], math.Float64bits(event.FillPrice))
+	atomic.StoreUint64(&words[4], math.Float64bits(event.FillSize))
+	atomic.StoreUint64(&words[5], math.Float64bits(event.RemainingSize))
+	atomic.StoreUint64(&words[6], math.Float64bits(event.FeePaid))
+	atomic.StoreUint64(&words[7], uint64(event.IsAsk))
+	atomic.StoreUint64(&words[8], uint64(event.ClientOrderID))
+	atomic.StoreUint64(&words[9], uint64(event.OrderIndex))
+	atomic.StoreUint64(&words[10], math.Float64bits(event.OriginalSize))
+	atomic.StoreUint64(&words[11], math.Float64bits(event.OrderPrice))
+	atomic.StoreUint64(&words[12], event.TimestampNs)
+	atomic.StoreUint64(&words[13], event.TradeID)
+	atomic.StoreUint64(&words[14], uint64(event.FeeSource))
+	atomic.StoreUint64(&words[15], 0)
 
 	// Release barrier: ensure event data is written before updating write_idx
 	atomic.StoreUint64(rb.writeIdx, event.Sequence+1)
-	atomic.StoreUint64(rb.generation, generation+2)
+	atomic.StoreUint64(rb.generation, odd+1)
 }
 
 // ─── V2 Convenience Methods ──────────────────────────────────────────────────
@@ -335,7 +370,9 @@ func NewEventRingBuffer() (*EventRingBuffer, error) {
 	generation := (*uint64)(unsafe.Pointer(&data[8]))
 	// Recover a writer interrupted before publishing. Existing consumers must
 	// reconnect after feeder failure; never leave the ring permanently odd.
-	atomic.StoreUint64(generation, (atomic.LoadUint64(generation)+1)&^1)
+	if g := atomic.LoadUint64(generation); g&1 == 1 {
+		atomic.AddUint64(generation, 1)
+	}
 	slots := (*[RingBufferSlots]ShmPrivateEvent)(unsafe.Pointer(&data[HeaderSize]))
 
 	// Resume from current write_idx to avoid index regression
@@ -358,14 +395,25 @@ func (rb *EventRingBuffer) Close() error {
 }
 
 func (rb *EventRingBuffer) Push(event ShmPrivateEvent) {
-	generation := atomic.LoadUint64(rb.generation)
-	atomic.StoreUint64(rb.generation, generation+1)
+	odd := atomic.AddUint64(rb.generation, 1)
+	if odd&1 == 0 {
+		odd = atomic.AddUint64(rb.generation, 1)
+	}
 	event.Sequence = rb.localSeq
 	rb.localSeq++
 	idx := event.Sequence % RingBufferSlots
-	rb.slots[idx] = event
+	words := (*[8]uint64)(unsafe.Pointer(&rb.slots[idx]))
+	headerWord := uint64(event.ExchangeID) | (uint64(event.EventType) << 8) | (uint64(event.SymbolID) << 16)
+	atomic.StoreUint64(&words[0], event.Sequence)
+	atomic.StoreUint64(&words[1], headerWord)
+	atomic.StoreUint64(&words[2], event.OrderID)
+	atomic.StoreUint64(&words[3], math.Float64bits(event.FillPrice))
+	atomic.StoreUint64(&words[4], math.Float64bits(event.FillSize))
+	atomic.StoreUint64(&words[5], math.Float64bits(event.RemainingSize))
+	atomic.StoreUint64(&words[6], math.Float64bits(event.FeePaid))
+	atomic.StoreUint64(&words[7], uint64(event.IsAsk))
 	atomic.StoreUint64(rb.writeIdx, event.Sequence+1)
-	atomic.StoreUint64(rb.generation, generation+2)
+	atomic.StoreUint64(rb.generation, odd+1)
 }
 
 func (rb *EventRingBuffer) PushOrderCreated(exchangeID uint8, symbolID uint16, orderID uint64, size float64, isAsk bool) {

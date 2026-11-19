@@ -47,6 +47,14 @@ fn generation(mmap: &Mmap) -> u64 {
     unsafe { (*mmap.as_ptr().add(8).cast::<AtomicU64>()).load(Ordering::Acquire) }
 }
 
+// Header bytes 16..24 track V2 producer restarts/reopens so a restarted writer
+// always triggers reconciliation even when write_idx stays monotonic.
+#[inline]
+fn producer_epoch(mmap: &Mmap) -> u64 {
+    // SAFETY: V2 constructor validates the complete 64-byte aligned header.
+    unsafe { (*mmap.as_ptr().add(16).cast::<AtomicU64>()).load(Ordering::Acquire) }
+}
+
 // ─── V1 Reader (backward compatible) ────────────────────────────────────────
 
 /// Lock-free event ring buffer reader (V1: 64-byte events)
@@ -124,15 +132,16 @@ impl ShmEventReader {
         val
     }
 
-    /// Read an event from a specific slot using atomic-safe copy
+    /// Read an event from a specific slot using aligned atomic word loads.
     #[inline]
     fn read_slot(&self, slot: usize) -> ShmPrivateEvent {
+        const _: () = assert!(V1_HEADER_SIZE.is_multiple_of(8) && V1_EVENT_SIZE == 64);
         let offset = V1_HEADER_SIZE + (slot * V1_EVENT_SIZE);
-        let ptr = unsafe { self.mmap.as_ptr().add(offset) as *const ShmPrivateEvent };
-        // SAFETY: The Acquire load on write_idx guarantees this data is fully written.
-        // We use read_volatile as an additional safety measure to prevent the compiler
-        // from caching or eliding this read.
-        unsafe { std::ptr::read_volatile(ptr) }
+        // SAFETY: mmap is page-aligned and new() validates V1_TOTAL_SIZE; slot is < V1_RING_BUFFER_SLOTS.
+        let words_ptr = unsafe { self.mmap.as_ptr().add(offset).cast::<AtomicU64>() };
+        let words: [u64; 8] =
+            std::array::from_fn(|i| unsafe { (*words_ptr.add(i)).load(Ordering::Relaxed) });
+        ShmPrivateEvent::from_words(words)
     }
 
     /// Try to read the next event (non-blocking)
@@ -212,6 +221,7 @@ impl ShmEventReader {
 pub struct ShmEventReaderV2 {
     mmap: Mmap,
     local_read_idx: u64,
+    local_epoch: u64,
     integrity_lost: bool,
 }
 
@@ -240,9 +250,11 @@ impl ShmEventReaderV2 {
             )));
         }
 
+        let local_epoch = producer_epoch(&mmap);
         Ok(Self {
             mmap,
             local_read_idx: 0,
+            local_epoch,
             integrity_lost: false,
         })
     }
@@ -254,6 +266,7 @@ impl ShmEventReaderV2 {
 
     /// Skip all existing events, only consume events written after this call
     pub fn skip_to_end(&mut self) {
+        self.local_epoch = producer_epoch(&self.mmap);
         self.local_read_idx = self.read_write_idx();
     }
 
@@ -266,53 +279,73 @@ impl ShmEventReaderV2 {
         val
     }
 
-    /// Read a V2 event from a specific slot
+    /// Read a V2 event from a specific slot using aligned atomic word loads.
     #[inline]
     fn read_slot(&self, slot: usize) -> ShmPrivateEventV2 {
+        const _: () = assert!(V2_HEADER_SIZE.is_multiple_of(8) && V2_EVENT_SIZE == 128);
         let offset = V2_HEADER_SIZE + (slot * V2_EVENT_SIZE);
-        let ptr = unsafe { self.mmap.as_ptr().add(offset) as *const ShmPrivateEventV2 };
-        unsafe { std::ptr::read_volatile(ptr) }
+        // SAFETY: mmap is page-aligned and new() validates V2_TOTAL_SIZE; slot is < V2_RING_BUFFER_SLOTS.
+        let words_ptr = unsafe { self.mmap.as_ptr().add(offset).cast::<AtomicU64>() };
+        let words: [u64; 16] =
+            std::array::from_fn(|i| unsafe { (*words_ptr.add(i)).load(Ordering::Relaxed) });
+        ShmPrivateEventV2::from_words(words)
     }
 
     /// Try to read the next V2 event (non-blocking)
     ///
     /// Returns `None` if no new events are available.
     pub fn try_read(&mut self) -> Option<ShmPrivateEventV2> {
-        let before = generation(&self.mmap);
-        if before & 1 != 0 {
-            return None;
-        }
-        let write_idx = self.read_write_idx();
-        if write_idx < self.local_read_idx {
+        let current_epoch = producer_epoch(&self.mmap);
+        if current_epoch != self.local_epoch {
             self.integrity_lost = true;
-            return None;
+            self.local_epoch = current_epoch;
         }
-        if self.local_read_idx == write_idx {
-            return None;
+
+        for _ in 0..64 {
+            let before = generation(&self.mmap);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let write_idx = self.read_write_idx();
+            if write_idx < self.local_read_idx {
+                self.integrity_lost = true;
+                return None;
+            }
+            if self.local_read_idx == write_idx {
+                return None;
+            }
+            let read_idx = self
+                .local_read_idx
+                .max(write_idx.saturating_sub(V2_RING_BUFFER_SLOTS));
+            let slot = (read_idx % V2_RING_BUFFER_SLOTS) as usize;
+            let event = self.read_slot(slot);
+            fence(Ordering::Acquire);
+            // If the writer touched the ring or restarted during our copy, retry without consuming.
+            let after_epoch = producer_epoch(&self.mmap);
+            if generation(&self.mmap) != before || after_epoch != self.local_epoch {
+                if after_epoch != self.local_epoch {
+                    self.integrity_lost = true;
+                    self.local_epoch = after_epoch;
+                }
+                std::hint::spin_loop();
+                continue;
+            }
+            if event.sequence != read_idx {
+                self.integrity_lost = true;
+                return None;
+            }
+            if read_idx > self.local_read_idx {
+                self.integrity_lost = true;
+                tracing::error!(
+                    "V2 event ring overflow: {} events lost",
+                    read_idx - self.local_read_idx
+                );
+            }
+            self.local_read_idx = read_idx + 1;
+            return Some(event);
         }
-        let read_idx = self
-            .local_read_idx
-            .max(write_idx.saturating_sub(V2_RING_BUFFER_SLOTS));
-        let slot = (read_idx % V2_RING_BUFFER_SLOTS) as usize;
-        let event = self.read_slot(slot);
-        fence(Ordering::Acquire);
-        // If the writer touched the ring during our copy, retry without consuming.
-        if generation(&self.mmap) != before {
-            return None;
-        }
-        if event.sequence != read_idx {
-            self.integrity_lost = true;
-            return None;
-        }
-        if read_idx > self.local_read_idx {
-            self.integrity_lost = true;
-            tracing::error!(
-                "V2 event ring overflow: {} events lost",
-                read_idx - self.local_read_idx
-            );
-        }
-        self.local_read_idx = read_idx + 1;
-        Some(event)
+        None
     }
 
     /// Consume an integrity alarm (overflow, corrupt slot, or producer index reset).
@@ -359,6 +392,7 @@ mod tests {
         ShmEventReaderV2 {
             mmap: map.make_read_only().unwrap(),
             local_read_idx: 0,
+            local_epoch: 0,
             integrity_lost: false,
         }
     }
@@ -434,5 +468,98 @@ mod tests {
         };
         assert_eq!(reader.try_read().unwrap().order_id, 5);
         assert!(reader.try_read().is_none());
+    }
+
+    #[test]
+    fn v2_producer_epoch_change_reports_integrity_loss() {
+        let mut map = memmap2::MmapMut::map_anon(V2_TOTAL_SIZE).unwrap();
+        map[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        map[8..16].copy_from_slice(&2u64.to_ne_bytes());
+        map[16..24].copy_from_slice(&1u64.to_ne_bytes());
+        let event = ShmPrivateEventV2::order_created(0, 2, 1, 5, 7, 5, 100.0, 0.1, false, 0);
+        // SAFETY: anonymous mmap is page aligned; slot 0 is within allocated extent.
+        unsafe {
+            std::ptr::write(map.as_mut_ptr().add(V2_HEADER_SIZE).cast(), event);
+        }
+        let mut reader = ShmEventReaderV2 {
+            mmap: map.make_read_only().unwrap(),
+            local_read_idx: 0,
+            local_epoch: 0,
+            integrity_lost: false,
+        };
+        assert_eq!(reader.try_read().unwrap().client_order_id, 7);
+        assert!(reader.take_integrity_loss());
+        assert!(!reader.take_integrity_loss());
+    }
+
+    #[test]
+    fn v2_and_v1_atomic_slot_loads_preserve_all_fields() {
+        let v1_orig = ShmPrivateEvent::order_filled(9, 2, 1, 42, 123.45, 0.25, 0.75, 0.003, true);
+        let mut v1_map = memmap2::MmapMut::map_anon(V1_TOTAL_SIZE).unwrap();
+        v1_map[0..8].copy_from_slice(&10u64.to_ne_bytes());
+        v1_map[8..16].copy_from_slice(&2u64.to_ne_bytes());
+        let v1_slot = 9usize;
+        unsafe {
+            std::ptr::write(
+                v1_map
+                    .as_mut_ptr()
+                    .add(V1_HEADER_SIZE + v1_slot * V1_EVENT_SIZE)
+                    .cast(),
+                v1_orig,
+            );
+        }
+        let mut v1_reader = ShmEventReader {
+            mmap: v1_map.make_read_only().unwrap(),
+            local_read_idx: 9,
+            integrity_lost: false,
+        };
+        let v1_read = v1_reader.try_read().unwrap();
+        assert_eq!(v1_read.sequence, v1_orig.sequence);
+        assert_eq!(v1_read.exchange_id, v1_orig.exchange_id);
+        assert_eq!(v1_read.event_type, v1_orig.event_type);
+        assert_eq!(v1_read.symbol_id, v1_orig.symbol_id);
+        assert_eq!(v1_read.order_id, v1_orig.order_id);
+        assert_eq!(v1_read.fill_price, v1_orig.fill_price);
+        assert_eq!(v1_read.fill_size, v1_orig.fill_size);
+        assert_eq!(v1_read.remaining_size, v1_orig.remaining_size);
+        assert_eq!(v1_read.fee_paid, v1_orig.fee_paid);
+        assert_eq!(v1_read.is_ask, v1_orig.is_ask);
+
+        let v2_orig = ShmPrivateEventV2::order_filled(
+            4,
+            2,
+            1,
+            88,
+            99,
+            555,
+            2500.5,
+            0.75,
+            0.25,
+            -0.012,
+            false,
+            1_700_000_000_123,
+            9876,
+        )
+        .with_fee_source(crate::types::events::FeeSource::RateDerived);
+        let mut v2_reader = ring_v2(5, 2, v2_orig);
+        v2_reader.local_read_idx = 4;
+        let v2_read = v2_reader.try_read().unwrap();
+        assert_eq!(v2_read.sequence, v2_orig.sequence);
+        assert_eq!(v2_read.exchange_id, v2_orig.exchange_id);
+        assert_eq!(v2_read.event_type, v2_orig.event_type);
+        assert_eq!(v2_read.symbol_id, v2_orig.symbol_id);
+        assert_eq!(v2_read.exchange_order_id, v2_orig.exchange_order_id);
+        assert_eq!(v2_read.fill_price, v2_orig.fill_price);
+        assert_eq!(v2_read.fill_size, v2_orig.fill_size);
+        assert_eq!(v2_read.remaining_size, v2_orig.remaining_size);
+        assert_eq!(v2_read.fee_paid, v2_orig.fee_paid);
+        assert_eq!(v2_read.is_ask, v2_orig.is_ask);
+        assert_eq!(v2_read.client_order_id, v2_orig.client_order_id);
+        assert_eq!(v2_read.order_index, v2_orig.order_index);
+        assert_eq!(v2_read.original_size, v2_orig.original_size);
+        assert_eq!(v2_read.order_price, v2_orig.order_price);
+        assert_eq!(v2_read.timestamp_ns, v2_orig.timestamp_ns);
+        assert_eq!(v2_read.trade_id, v2_orig.trade_id);
+        assert_eq!(v2_read.fee_source, v2_orig.fee_source);
     }
 }

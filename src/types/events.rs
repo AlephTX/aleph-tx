@@ -153,6 +153,26 @@ impl ShmPrivateEvent {
     pub fn event_type(&self) -> Option<EventType> {
         EventType::from_u8(self.event_type)
     }
+
+    /// Reconstruct a V1 event from 8 aligned little-endian atomic words.
+    #[inline(always)]
+    pub fn from_words(words: [u64; 8]) -> Self {
+        let w1 = words[1].to_le();
+        Self {
+            sequence: words[0],
+            exchange_id: (w1 & 0xff) as u8,
+            event_type: ((w1 >> 8) & 0xff) as u8,
+            symbol_id: ((w1 >> 16) & 0xffff) as u16,
+            _pad1: 0,
+            order_id: words[2],
+            fill_price: f64::from_bits(words[3]),
+            fill_size: f64::from_bits(words[4]),
+            remaining_size: f64::from_bits(words[5]),
+            fee_paid: f64::from_bits(words[6]),
+            is_ask: (words[7].to_le() & 0xff) as u8,
+            _padding: [0; 7],
+        }
+    }
 }
 
 impl fmt::Debug for ShmPrivateEvent {
@@ -468,6 +488,34 @@ impl ShmPrivateEventV2 {
         self.fee_source = source as u8;
         self
     }
+
+    /// Reconstruct a V2 event from 16 aligned little-endian atomic words.
+    #[inline(always)]
+    pub fn from_words(words: [u64; 16]) -> Self {
+        let w1 = words[1].to_le();
+        Self {
+            sequence: words[0],
+            exchange_id: (w1 & 0xff) as u8,
+            event_type: ((w1 >> 8) & 0xff) as u8,
+            symbol_id: ((w1 >> 16) & 0xffff) as u16,
+            _pad1: 0,
+            exchange_order_id: words[2],
+            fill_price: f64::from_bits(words[3]),
+            fill_size: f64::from_bits(words[4]),
+            remaining_size: f64::from_bits(words[5]),
+            fee_paid: f64::from_bits(words[6]),
+            is_ask: (words[7].to_le() & 0xff) as u8,
+            _padding1: [0; 7],
+            client_order_id: words[8] as i64,
+            order_index: words[9] as i64,
+            original_size: f64::from_bits(words[10]),
+            order_price: f64::from_bits(words[11]),
+            timestamp_ns: words[12],
+            trade_id: words[13],
+            fee_source: (words[14].to_le() & 0xff) as u8,
+            _reserved: [0; 15],
+        }
+    }
 }
 
 impl fmt::Debug for ShmPrivateEventV2 {
@@ -529,9 +577,20 @@ const _: () = {
     use std::mem::offset_of;
     assert!(std::mem::size_of::<ShmPrivateEventV2>() == 128);
     assert!(std::mem::align_of::<ShmPrivateEventV2>() == 64);
+    assert!(offset_of!(ShmPrivateEventV2, sequence) == 0);
+    assert!(offset_of!(ShmPrivateEventV2, exchange_id) == 8);
+    assert!(offset_of!(ShmPrivateEventV2, event_type) == 9);
+    assert!(offset_of!(ShmPrivateEventV2, symbol_id) == 10);
+    assert!(offset_of!(ShmPrivateEventV2, exchange_order_id) == 16);
+    assert!(offset_of!(ShmPrivateEventV2, fill_price) == 24);
+    assert!(offset_of!(ShmPrivateEventV2, fill_size) == 32);
+    assert!(offset_of!(ShmPrivateEventV2, remaining_size) == 40);
     assert!(offset_of!(ShmPrivateEventV2, fee_paid) == 48);
     assert!(offset_of!(ShmPrivateEventV2, is_ask) == 56);
     assert!(offset_of!(ShmPrivateEventV2, client_order_id) == 64);
+    assert!(offset_of!(ShmPrivateEventV2, order_index) == 72);
+    assert!(offset_of!(ShmPrivateEventV2, original_size) == 80);
+    assert!(offset_of!(ShmPrivateEventV2, order_price) == 88);
     assert!(offset_of!(ShmPrivateEventV2, timestamp_ns) == 96);
     assert!(offset_of!(ShmPrivateEventV2, trade_id) == 104);
     assert!(offset_of!(ShmPrivateEventV2, fee_source) == 112);

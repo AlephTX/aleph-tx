@@ -72,3 +72,15 @@ fn invalid_inputs_are_rejected() {
     let mut guard = DailyLossGuard::open(None, 0.05, 1000.0, 10).unwrap();
     assert_eq!(guard.check(f64::NAN, 10).unwrap(), 0.0);
 }
+
+#[test]
+fn zero_or_negative_equity_trips_and_persists_breach() {
+    for equity in [0.0, -5.0] {
+        let path = temp_path();
+        let mut guard = DailyLossGuard::open(Some(path.clone()), 0.05, 1000.0, 10).unwrap();
+        let err = guard.check(equity, 10).unwrap_err();
+        assert!(err.to_string().contains("non-positive equity"), "{err}");
+        assert!(DailyLossGuard::open(Some(path.clone()), 0.05, 100.0, 10).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}

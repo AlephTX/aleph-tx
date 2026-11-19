@@ -82,6 +82,76 @@ class QuantLakehouseTests(unittest.TestCase):
                 handle.write(json.dumps(item, separators=(",", ":")) + "\n")
         return out
 
+    def test_duckdb_checks_digest_of_zero_row_table_before_writing(self) -> None:
+        capture = self._write_gz_capture("public-empty.ndjson.gz", [self._timed_row(1, "collector", "end", 10)])
+        stage = self.root / "silver"
+        manifest = normalize_capture(capture, stage, campaign_id="example-integrity", collector_region="tokyo")
+        table = manifest["tables"]["public_trades"]
+        self.assertEqual(table["rows"], 0)
+        path = stage / table["file"]
+        # Alter the gzip timestamp. The uncompressed data and byte length still match.
+        contents = bytearray(path.read_bytes())
+        contents[4] ^= 1
+        path.write_bytes(contents)
+
+        destination = self.root / "catalog"
+        with self.assertRaisesRegex(ValueError, "public_trades failed hash check"):
+            build_duckdb_lakehouse(stage, destination / "parquet", destination / "lake.duckdb")
+        self.assertFalse(destination.exists())
+
+    def test_arcus_projection_keeps_unaffected_market_sequence_and_strict_default(self) -> None:
+        def event(seq, market, trade_timestamp=None):
+            payload = {"id": market, "channel": "trades"}
+            if trade_timestamp is not None:
+                payload["contents"] = [{"marketDisplayName": market, "tradeId": "1",
+                                        "timestamp": trade_timestamp, "price": "10", "size": "2", "side": "BUY"}]
+            return self._timed_row(seq + 1, "arcus_trades", "subscribed" if trade_timestamp is None else "message",
+                                   seq + 10, market=market, payload=payload)
+
+        source_us = self.t0 * 1000
+        rows = [event(0, "SPY-USD"), event(1, "QQQ-USD"), event(2, "SPY-USD", source_us),
+                event(3, "SPY-USD", source_us + 13), event(4, "QQQ-USD", source_us + 5),
+                self._timed_row(6, "arcus", "subscribed", 17, market="SPY-USD"),
+                self._timed_row(7, "collector", "end", 20)]
+        capture = self._write_gz_capture("public-projection.ndjson.gz", rows)
+        args = dict(campaign_id="example-projection", collector_region="tokyo", precise_times=True)
+        with self.assertRaisesRegex(ValueError, "conflicting duplicate Arcus trade"):
+            normalize_capture(capture, self.root / "strict", **args)
+        with self.assertRaisesRegex(ValueError, "conflicting duplicate Arcus trade"):
+            normalize_capture(capture, self.root / "other-market",
+                              withheld_arcus_trade_markets=frozenset({"QQQ-USD"}), **args)
+        dest = self.root / "partial"
+        result = normalize_capture(capture, dest, withheld_arcus_trade_markets=frozenset({"SPY-USD"}), **args)
+        self.assertEqual(result["artifact_kind"], "silver_partial_market_projection")
+        self.assertEqual(result["withheld_arcus_trade_messages"], {"SPY-USD": 3})
+        trades = _read_gz_ndjson(dest / "public_trades.ndjson.gz")
+        self.assertEqual([(t["market"], t["sequence"], t["transaction_time_us"]) for t in trades],
+                         [("QQQ-USD", 4, source_us + 5)])
+        lifecycle = _read_gz_ndjson(dest / "feed_lifecycle.ndjson.gz")
+        self.assertFalse(any(r["market"] == "SPY-USD" and r["raw_source"] == "arcus_trades"
+                             and r["event"] == "subscribed" for r in lifecycle))
+        db = self.root / "isolated" / "lake.duckdb"
+        parquet = db.parent / "parquet"
+        with self.assertRaisesRegex(ValueError, "--allow-partial-projection"):
+            build_duckdb_lakehouse(dest, parquet, db)
+        self.assertFalse(db.parent.exists())
+        receipt = build_duckdb_lakehouse(dest, parquet, db, allow_partial_projection=True)
+        self.assertEqual(receipt["withheld_arcus_trade_messages"], {"SPY-USD": 3})
+        self.assertEqual(receipt["artifact_kind"], "silver_partial_market_projection")
+        if receipt["engine"] == "python_duckdb":
+            import duckdb
+
+            with duckdb.connect(str(db), read_only=True) as conn:
+                subscriptions = dict(conn.execute(
+                    "SELECT market, arcus_trade_subscriptions FROM v_stream_health WHERE venue = 'arcus'"
+                ).fetchall())
+                self.assertEqual(subscriptions, {"QQQ-USD": 1, "SPY-USD": 0})
+        rows[0]["market"] = "QQQ-USD"
+        ambiguous = self._write_gz_capture("ambiguous-projection.ndjson.gz", rows)
+        with self.assertRaisesRegex(ValueError, "ambiguous Arcus market"):
+            normalize_capture(ambiguous, self.root / "ambiguous",
+                              withheld_arcus_trade_markets=frozenset({"SPY-USD"}), **args)
+
     def test_seal_and_normalize_priority_venues_preserve_causality_and_fees(self) -> None:
         rows = [
             # 1. Binance USD-M BBO with sub-ms precise timing (avail_sub_ns=250_000 -> ceil +1 ms)

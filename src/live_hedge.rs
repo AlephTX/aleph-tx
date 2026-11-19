@@ -126,6 +126,8 @@ struct Observation {
     /// The full Lighter read behind `primary`, journaled with any intent.
     primary_evidence: PositionEvidence,
     hedge: Decimal,
+    /// Hyperliquid clearinghouse `state.time` attached to this snapshot.
+    hedge_account_time_ms: u64,
     book: BestBidAsk,
 }
 
@@ -161,6 +163,7 @@ struct PendingIoc {
     order: PerpOrder,
     sent_at_ms: u64,
     expires_after_ms: u64,
+    pre_dispatch_account_time_ms: u64,
     /// Set once an authenticated Hyperliquid account snapshot reports
     /// `state.time > expires_after_ms`, proving in causal time that the
     /// venue clock has passed the signed `expiresAfter` deadline.
@@ -183,6 +186,18 @@ impl PendingIoc {
         let Some(terminal) = &self.terminal else {
             return Ok(None);
         };
+        if timestamp_ms < self.pre_dispatch_account_time_ms {
+            return Ok(None);
+        }
+        // If local wall clock lags Hyperliquid `state.time`, a synchronous IOC
+        // reply stamped with `sent_at_ms` must still wait for a strictly newer
+        // venue account snapshot before releasing exposure (`EXEC-H5`).
+        if terminal.source == "response"
+            && self.sent_at_ms < self.pre_dispatch_account_time_ms
+            && timestamp_ms <= self.pre_dispatch_account_time_ms
+        {
+            return Ok(None);
+        }
         account_confirmed_fill(
             self.order.is_buy,
             self.before,
@@ -328,6 +343,33 @@ pub struct LiveInventoryHedge {
     max_primary_age: Duration,
 }
 
+/// Require live hedge preflight `deadband_base` and `max_unhedged_base` to each cover
+/// Hyperliquid's $10 / 1-lot IOC minimum (`EXEC-H6`) so non-reduce-only residual exposure
+/// cannot deadlock against the exchange minimum notional floor.
+pub(crate) fn validate_preflight_deadband(
+    limits: &HedgeLimits,
+    sz_decimals: u32,
+    bid: Decimal,
+) -> Result<()> {
+    let lot = Decimal::new(1, sz_decimals);
+    ensure!(
+        bid > Decimal::ZERO
+            && limits.deadband_base >= lot
+            && bid
+                .checked_mul(limits.deadband_base)
+                .is_some_and(|value| value >= Decimal::TEN)
+            && limits
+                .deadband_base
+                .checked_add(lot)
+                .is_some_and(|min| min <= limits.max_unhedged_base)
+            && bid
+                .checked_mul(limits.max_unhedged_base)
+                .is_some_and(|value| value >= Decimal::TEN),
+        "Deadband and net-exposure limit must each cover Hyperliquid's $10 / 1-lot minimum"
+    );
+    Ok(())
+}
+
 impl LiveInventoryHedge {
     /// Export reconciled hedge fills alongside the primary-venue telemetry.
     pub(crate) fn set_telemetry(&mut self, sink: Option<crate::telemetry_sink::TelemetrySink>) {
@@ -381,24 +423,7 @@ impl LiveInventoryHedge {
                 && fresh(now, book.timestamp_ms, MAX_QUOTE_AGE_MS),
             "Stale Hyperliquid preflight data"
         );
-        let lot = Decimal::new(1, market.asset.sz_decimals);
-        ensure!(
-            (limits.deadband_base.is_zero()
-                || (limits.deadband_base >= lot
-                    && book
-                        .bid
-                        .checked_mul(limits.deadband_base)
-                        .is_some_and(|value| value >= Decimal::TEN)))
-                && limits
-                    .deadband_base
-                    .checked_add(lot)
-                    .is_some_and(|min| min <= limits.max_unhedged_base)
-                && book
-                    .bid
-                    .checked_mul(limits.max_unhedged_base)
-                    .is_some_and(|value| value >= Decimal::TEN),
-            "Deadband (when non-zero) and net-exposure limit must each cover Hyperliquid's $10 / 1-lot minimum"
-        );
+        validate_preflight_deadband(&limits, market.asset.sz_decimals, book.bid)?;
         let trading = HyperliquidTrading::new(info.clone(), signer, None)?;
         Ok(Self {
             limits,
@@ -682,6 +707,7 @@ impl LiveInventoryHedge {
             primary_requested_at: primary_evidence.requested_at,
             primary_evidence,
             hedge,
+            hedge_account_time_ms: state.time,
             book,
         }))
     }
@@ -751,6 +777,7 @@ impl LiveInventoryHedge {
             order,
             sent_at_ms,
             expires_after_ms,
+            pre_dispatch_account_time_ms: observed.hedge_account_time_ms,
             venue_past_expiry: false,
             terminal: None,
             cancel_sent: false,

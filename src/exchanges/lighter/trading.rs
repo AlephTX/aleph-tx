@@ -433,6 +433,75 @@ impl Drop for SubmissionGuard<'_> {
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
+const UNSET_QUOTA_REMAINING: i64 = i64::MIN;
+
+fn deserialize_optional_quota<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+    let parsed = match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64().or_else(|| {
+            n.as_f64()
+                .filter(|v| v.is_finite())
+                .map(|v| v.floor() as i64)
+        }),
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            trimmed.parse::<i64>().ok().or_else(|| {
+                trimmed
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.floor() as i64)
+            })
+        }
+        _ => None,
+    };
+    Ok(parsed.filter(|&q| q >= 0))
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaEnvelope {
+    #[serde(default, deserialize_with = "deserialize_optional_quota")]
+    volume_quota_remaining: Option<i64>,
+}
+
+struct QuotaTracker {
+    remaining: AtomicI64,
+    observed_at_ns: AtomicU64,
+}
+
+impl QuotaTracker {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicI64::new(UNSET_QUOTA_REMAINING),
+            observed_at_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_from_body(&self, body: &str) {
+        if let Ok(env) = serde_json::from_str::<QuotaEnvelope>(body)
+            && let Some(q) = env.volume_quota_remaining
+        {
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            self.observed_at_ns.store(now_ns, Ordering::Release);
+            self.remaining.store(q, Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> Option<crate::exchange::VolumeQuotaSnapshot> {
+        let observed_at_ns = self.observed_at_ns.load(Ordering::Acquire);
+        let rem = self.remaining.load(Ordering::Acquire);
+        Some(crate::exchange::VolumeQuotaSnapshot {
+            remaining: (rem != UNSET_QUOTA_REMAINING).then_some(rem),
+            observed_at_ns,
+        })
+    }
+}
+
 /// Per-API-key signing and submission lane.
 ///
 /// Isolates `api_key_index`, monotonic `nonce`, and HTTP submission lock so
@@ -445,16 +514,22 @@ struct SigningLane {
     submission_lock: TokioMutex<()>,
     nonce: AtomicI64,
     nonce_init: TokioMutex<bool>,
+    quota: Arc<QuotaTracker>,
 }
 
 impl SigningLane {
-    fn new(signer: Arc<super::ffi::LighterSigner>, api_key_index: i64) -> Self {
+    fn new(
+        signer: Arc<super::ffi::LighterSigner>,
+        api_key_index: i64,
+        quota: Arc<QuotaTracker>,
+    ) -> Self {
         Self {
             signer,
             api_key_index,
             submission_lock: TokioMutex::new(()),
             nonce: AtomicI64::new(0),
             nonce_init: TokioMutex::new(false),
+            quota,
         }
     }
 
@@ -543,6 +618,7 @@ impl SigningLane {
                 TradingError::SubmissionUncertain("Missing transaction hash".into()).into(),
             );
         }
+        self.quota.record_from_body(&body);
         self.increment_nonce();
         *self.nonce_init.lock().await = true;
 
@@ -593,6 +669,7 @@ impl SigningLane {
             )
             .into());
         }
+        self.quota.record_from_body(&body);
         self.nonce.fetch_add(txs.len() as i64, Ordering::SeqCst);
         *self.nonce_init.lock().await = true;
 
@@ -622,6 +699,11 @@ pub struct LighterTrading {
     order_tracker: Option<Arc<OrderTracker>>,
     /// Lock-free execution-boundary ceiling on worst-case single-leg position (base units).
     max_worst_case_position_bits: AtomicU64,
+    /// Lock-free execution-boundary reference mid price & deviation band (bps) for pre-nonce fat-finger checks.
+    ref_mid_bits: AtomicU64,
+    max_price_band_bps_bits: AtomicU64,
+    /// Shared venue volume quota tracker updated from tx/batch responses (`OPT-05`).
+    quota: Arc<QuotaTracker>,
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
     quote_expiry: Option<Duration>,
@@ -633,6 +715,10 @@ pub struct LighterTrading {
 
 #[async_trait]
 impl Exchange for LighterTrading {
+    fn venue_name(&self) -> &'static str {
+        "lighter"
+    }
+
     async fn buy(&self, size: f64, price: f64) -> Result<OrderResult> {
         self.buy_internal(size, price).await
     }
@@ -674,6 +760,7 @@ impl Exchange for LighterTrading {
                 Ok(OrderInfo {
                     order_id: o.order_index.to_string(),
                     client_order_index: o.client_order_index,
+                    order_index: Some(o.order_index),
                     side: if o.is_ask { Side::Sell } else { Side::Buy },
                     price,
                     size,
@@ -691,6 +778,10 @@ impl Exchange for LighterTrading {
         self.recover_flat().await
     }
 
+    async fn reconcile_non_flat_without_feed(&self) -> Result<f64> {
+        self.reconcile_non_flat().await
+    }
+
     async fn execute_batch(&self, actions: Vec<BatchAction>) -> Result<BatchResult> {
         self.execute_batch(actions).await
     }
@@ -701,6 +792,14 @@ impl Exchange for LighterTrading {
 
     fn set_max_worst_case_position(&self, max_position: f64) {
         LighterTrading::set_max_worst_case_position(self, max_position);
+    }
+
+    fn volume_quota_snapshot(&self) -> Option<crate::exchange::VolumeQuotaSnapshot> {
+        self.quota.snapshot()
+    }
+
+    fn set_reference_price_band(&self, reference_mid: f64, max_deviation_bps: f64) {
+        LighterTrading::set_reference_price_band(self, reference_mid, max_deviation_bps);
     }
 
     async fn get_account_stats(
@@ -735,10 +834,12 @@ impl LighterTrading {
 
     #[cfg(test)]
     pub(crate) fn offline_test_client(base_url: &str) -> Self {
+        let quota = Arc::new(QuotaTracker::new());
         Self {
             maker_lane: SigningLane::new(
                 Arc::new(super::ffi::LighterSigner::offline_for_test()),
                 0,
+                Arc::clone(&quota),
             ),
             cancel_lane: None,
             taker_lane: None,
@@ -758,6 +859,9 @@ impl LighterTrading {
             client_order_counter: AtomicI64::new(43),
             order_tracker: None,
             max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            ref_mid_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            max_price_band_bps_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            quota,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -772,6 +876,7 @@ impl LighterTrading {
         cancel_key_index: Option<i64>,
         taker_key_index: Option<i64>,
     ) -> Self {
+        let quota = Arc::new(QuotaTracker::new());
         let make_lane = |key_idx| {
             SigningLane::new(
                 Arc::new(super::ffi::LighterSigner::mock_for_test(
@@ -779,6 +884,7 @@ impl LighterTrading {
                     account_index,
                 )),
                 key_idx,
+                Arc::clone(&quota),
             )
         };
         Self {
@@ -801,6 +907,9 @@ impl LighterTrading {
             client_order_counter: AtomicI64::new(1000),
             order_tracker: None,
             max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            ref_mid_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            max_price_band_bps_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            quota,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
             test_auth_token: None,
@@ -837,6 +946,7 @@ impl LighterTrading {
             taker_key,
         } = credentials;
 
+        let quota = Arc::new(QuotaTracker::new());
         let init_lane = |key: ApiKeyCredentials, role: &str| -> Result<SigningLane> {
             let signer = Arc::new(
                 super::ffi::LighterSigner::new(
@@ -848,7 +958,11 @@ impl LighterTrading {
                 )
                 .map_err(|e| anyhow::anyhow!("{role} signer init failed: {e}"))?,
             );
-            Ok(SigningLane::new(signer, key.api_key_index))
+            Ok(SigningLane::new(
+                signer,
+                key.api_key_index,
+                Arc::clone(&quota),
+            ))
         };
 
         let maker_lane = init_lane(maker_key, "Maker")?;
@@ -910,6 +1024,9 @@ impl LighterTrading {
             client_order_counter: AtomicI64::new(counter_start),
             order_tracker: None,
             max_worst_case_position_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            ref_mid_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            max_price_band_bps_bits: AtomicU64::new(UNSET_POSITION_CAP_BITS),
+            quota,
             limit_order_type: OrderType::Limit,
             quote_expiry: None,
             #[cfg(test)]
@@ -1163,6 +1280,26 @@ impl LighterTrading {
         (bits != UNSET_POSITION_CAP_BITS).then(|| f64::from_bits(bits))
     }
 
+    pub fn set_reference_price_band(&self, reference_mid: f64, max_deviation_bps: f64) {
+        if reference_mid.is_finite()
+            && reference_mid > 0.0
+            && max_deviation_bps.is_finite()
+            && max_deviation_bps > 0.0
+        {
+            self.ref_mid_bits
+                .store(reference_mid.to_bits(), Ordering::Release);
+            self.max_price_band_bps_bits
+                .store(max_deviation_bps.to_bits(), Ordering::Release);
+        }
+    }
+
+    fn reference_price_band(&self) -> Option<(f64, f64)> {
+        let mid_bits = self.ref_mid_bits.load(Ordering::Acquire);
+        let bps_bits = self.max_price_band_bps_bits.load(Ordering::Acquire);
+        (mid_bits != UNSET_POSITION_CAP_BITS && bps_bits != UNSET_POSITION_CAP_BITS)
+            .then(|| (f64::from_bits(mid_bits), f64::from_bits(bps_bits)))
+    }
+
     fn ensure_side_exposure_within_cap(&self, side: Side) -> Result<()> {
         if let (Some(tracker), Some(cap)) = (&self.order_tracker, self.max_worst_case_position()) {
             let tol = 0.5 / self.size_multiplier.max(1.0) + 1e-9;
@@ -1200,11 +1337,119 @@ impl LighterTrading {
         normalize_order(params, self.price_multiplier, self.size_multiplier)
     }
 
-    fn ensure_can_place(&self, params: &OrderParams) -> Result<()> {
+    fn ensure_reduce_only_valid(
+        &self,
+        side: Side,
+        size: f64,
+        verified_position: Option<f64>,
+        is_passive: bool,
+    ) -> Result<()> {
+        self.ensure_reduce_only_valid_with_pending(side, size, verified_position, true, is_passive)
+    }
+
+    fn ensure_reduce_only_valid_with_pending(
+        &self,
+        side: Side,
+        size: f64,
+        verified_position: Option<f64>,
+        include_pending_exposure: bool,
+        is_passive: bool,
+    ) -> Result<()> {
+        let (pos, pending_same_side) = if let Some(pos) = verified_position {
+            (pos, 0.0)
+        } else {
+            let tracker = self.order_tracker.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Reduce-only order requires OrderTracker or verified REST position proof"
+                )
+            })?;
+            anyhow::ensure!(
+                !tracker.needs_reconciliation(),
+                "Order state requires reconciliation before unverified reduce-only order"
+            );
+            if is_passive {
+                let (confirmed, short, long) = tracker.exposure_bounds();
+                let pending = match side {
+                    Side::Buy => (long - confirmed).max(0.0),
+                    Side::Sell => (confirmed - short).max(0.0),
+                };
+                (confirmed, pending)
+            } else {
+                let tracker_side = match side {
+                    Side::Buy => TrackerSide::Buy,
+                    Side::Sell => TrackerSide::Sell,
+                };
+                (
+                    tracker.confirmed_position(),
+                    tracker.reduce_only_pending_exposure(tracker_side),
+                )
+            }
+        };
+        let valid_direction = pos.is_finite()
+            && match side {
+                Side::Sell => pos > 1e-9,
+                Side::Buy => pos < -1e-9,
+            };
+        let worst_case_reduce = if include_pending_exposure {
+            pending_same_side + size
+        } else {
+            pending_same_side.max(size)
+        };
+        anyhow::ensure!(
+            valid_direction
+                && size.is_finite()
+                && size > 0.0
+                && worst_case_reduce <= pos.abs() * 1.000_001 + 1e-6,
+            "Reduce-only {:?} size {:.6} (pending={:.6}) incompatible with confirmed position {:.6}",
+            side,
+            size,
+            pending_same_side,
+            pos
+        );
+        Ok(())
+    }
+
+    fn ensure_can_place_with_pending(
+        &self,
+        params: &OrderParams,
+        verified_position: Option<f64>,
+        include_pending_exposure: bool,
+    ) -> Result<()> {
         if params.reduce_only {
-            return Ok(());
+            return self.ensure_reduce_only_valid_with_pending(
+                params.side,
+                params.size,
+                verified_position,
+                include_pending_exposure,
+                params.order_type != OrderType::Ioc,
+            );
         }
-        self.ensure_open_risk_allowed()
+        self.ensure_can_place(params, verified_position)
+    }
+
+    fn ensure_can_place(&self, params: &OrderParams, verified_position: Option<f64>) -> Result<()> {
+        if params.reduce_only {
+            return self.ensure_reduce_only_valid(
+                params.side,
+                params.size,
+                verified_position,
+                params.order_type != OrderType::Ioc,
+            );
+        }
+        self.ensure_open_risk_allowed()?;
+        if let Some((ref_mid, max_bps)) = self.reference_price_band() {
+            let dev_bps = ((params.price - ref_mid).abs() / ref_mid) * 10_000.0;
+            anyhow::ensure!(
+                dev_bps.is_finite() && dev_bps <= max_bps + 1e-6,
+                "Execution-boundary price-band guard rejected {:?} @ {:.6} (ref_mid={:.6}, deviation={:.2} bps > max={:.2} bps)",
+                params.side,
+                params.price,
+                ref_mid,
+                dev_bps,
+                max_bps
+            );
+        }
+        Ok(())
     }
 
     fn ensure_open_risk_allowed(&self) -> Result<()> {
@@ -1220,13 +1465,21 @@ impl LighterTrading {
 
     /// 通用下单 (v5.0.0: per-order tracking + multi-key lane isolation)
     pub async fn place_order(&self, params: OrderParams) -> Result<OrderResult> {
+        self.place_order_with_proof(params, None).await
+    }
+
+    async fn place_order_with_proof(
+        &self,
+        params: OrderParams,
+        verified_position: Option<f64>,
+    ) -> Result<OrderResult> {
         let params = self.normalize_order(params)?;
         let lane = self.lane_for_order(params.order_type);
         let _submission = lane.submission_lock.lock().await;
-        self.ensure_can_place(&params)?;
+        self.ensure_can_place(&params, verified_position)?;
         let (tx_type, tx_info, tx_hash, client_order_index) =
             self.sign_order_on_lane(lane, &params).await?;
-        self.ensure_can_place(&params)?;
+        self.ensure_can_place(&params, verified_position)?;
 
         // Optimistic accounting: register per-order BEFORE API call
         let tracker_side = match params.side {
@@ -1235,19 +1488,28 @@ impl LighterTrading {
         };
         if let Some(ref tracker) = self.order_tracker {
             anyhow::ensure!(
-                tracker.start_tracking(client_order_index, tracker_side, params.price, params.size),
+                tracker.start_tracking_order(
+                    client_order_index,
+                    tracker_side,
+                    params.price,
+                    params.size,
+                    params.reduce_only,
+                ),
                 "Tracker refused order reservation"
             );
             // Re-verify reconciliation state and execution-boundary exposure cap
             // after reserving so concurrent lane failures or strategy bugs cannot
             // slip excess exposure across the wire boundary.
-            if let Err(err) = self.ensure_can_place(&params).and_then(|()| {
-                if params.reduce_only {
-                    Ok(())
-                } else {
-                    self.ensure_side_exposure_within_cap(params.side)
-                }
-            }) {
+            if let Err(err) = self
+                .ensure_can_place_with_pending(&params, verified_position, false)
+                .and_then(|()| {
+                    if params.reduce_only {
+                        Ok(())
+                    } else {
+                        self.ensure_side_exposure_within_cap(params.side)
+                    }
+                })
+            {
                 tracker.mark_failed(client_order_index);
                 return Err(err);
             }
@@ -1343,6 +1605,8 @@ impl LighterTrading {
             ask_price: ask.price,
             ask_size: ask.size,
         };
+        self.ensure_can_place(&bid, None)?;
+        self.ensure_can_place(&ask, None)?;
         // Get base nonce for batch
         let base_nonce = lane
             .get_nonce(&self.client, &self.base_url, self.account_index)
@@ -1455,22 +1719,58 @@ impl LighterTrading {
             .iter()
             .any(|action| matches!(action, BatchAction::Place(order) if !order.reduce_only));
 
+        let mut prepared_actions = Vec::with_capacity(actions.len());
+        let (mut ro_buy_total, mut ro_sell_total) = (0.0_f64, 0.0_f64);
+        let (mut ro_buy_passive, mut ro_sell_passive) = (false, false);
+        for action in actions {
+            match action {
+                BatchAction::Place(params) => {
+                    let params = self.normalize_order(params)?;
+                    self.ensure_can_place(&params, None)?;
+                    if params.reduce_only {
+                        let is_passive = params.order_type != OrderType::Ioc;
+                        match params.side {
+                            Side::Buy => {
+                                ro_buy_total += params.size;
+                                ro_buy_passive |= is_passive;
+                            }
+                            Side::Sell => {
+                                ro_sell_total += params.size;
+                                ro_sell_passive |= is_passive;
+                            }
+                        }
+                    }
+                    prepared_actions.push(BatchAction::Place(params));
+                }
+                BatchAction::Cancel(order_index) => {
+                    prepared_actions.push(BatchAction::Cancel(order_index));
+                }
+            }
+        }
+        if ro_buy_total > 0.0 {
+            self.ensure_reduce_only_valid(Side::Buy, ro_buy_total, None, ro_buy_passive)?;
+        }
+        if ro_sell_total > 0.0 {
+            self.ensure_reduce_only_valid(Side::Sell, ro_sell_total, None, ro_sell_passive)?;
+        }
+
         // 获取起始 Nonce
         let base_nonce = lane
             .get_nonce(&self.client, &self.base_url, self.account_index)
             .await?;
 
-        for (i, action) in actions.into_iter().enumerate() {
+        let mut reduce_only_flags = Vec::with_capacity(prepared_actions.len());
+        for (i, action) in prepared_actions.into_iter().enumerate() {
             let nonce = base_nonce + (i as i64);
             match action {
                 BatchAction::Place(params) => {
-                    let params = self.normalize_order(params)?;
-                    self.ensure_can_place(&params)?;
                     let (tx_type, tx_info, _hash, coi) = self
                         .sign_order_with_nonce_on_lane(lane, &params, nonce)
                         .await?;
 
                     txs.push((tx_type, tx_info));
+                    reduce_only_flags
+                        .push((params.reduce_only, params.order_type != OrderType::Ioc));
                     place_results.push(PlaceResult {
                         client_order_index: coi,
                         side: params.side,
@@ -1489,9 +1789,10 @@ impl LighterTrading {
         }
 
         let cancels = txs.len() - place_results.len();
-        self.submit_prepared(
+        self.submit_prepared_with_flags(
             txs,
             place_results,
+            &reduce_only_flags,
             cancels,
             opens_risk,
             |_, _| std::future::ready(Ok(())),
@@ -1503,16 +1804,47 @@ impl LighterTrading {
         .await
     }
 
+    #[cfg(test)]
+    async fn submit_prepared<R, RFut, S, SFut>(
+        &self,
+        txs: Vec<(u8, String)>,
+        place_results: Vec<PlaceResult>,
+        cancels: usize,
+        opens_risk: bool,
+        record: R,
+        send: S,
+    ) -> Result<BatchResult>
+    where
+        R: FnOnce(&[PlaceResult], usize) -> RFut,
+        RFut: std::future::Future<Output = Result<()>>,
+        S: FnOnce(Vec<(u8, String)>) -> SFut,
+        SFut: std::future::Future<Output = Result<SendTxBatchResponse>>,
+    {
+        let flags = vec![(false, false); place_results.len()];
+        self.submit_prepared_with_flags(
+            txs,
+            place_results,
+            &flags,
+            cancels,
+            opens_risk,
+            record,
+            send,
+        )
+        .await
+    }
+
     /// The part of `execute_batch` after every action has signed: reserve
     /// risk, then `record` the creates, then `send`. `record` runs only for
     /// batches with creates; until it completes nothing is sent. A record
     /// error releases the reservations because nothing left this process.
     /// Once `record` starts, a dropped future or an uncertain send keeps every
     /// create reserved and requires reconciliation, as for a lost send.
-    async fn submit_prepared<R, RFut, S, SFut>(
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_prepared_with_flags<R, RFut, S, SFut>(
         &self,
         txs: Vec<(u8, String)>,
         place_results: Vec<PlaceResult>,
+        reduce_only_flags: &[(bool, bool)],
         cancels: usize,
         opens_risk: bool,
         record: R,
@@ -1530,14 +1862,37 @@ impl LighterTrading {
         // Register only after ALL actions have signed successfully. A local signing
         // failure must not leave phantom reservations for an unsent partial batch.
         if let Some(tracker) = &self.order_tracker {
-            for order in &place_results {
+            let (mut ro_buy_reserved, mut ro_sell_reserved) = (0.0_f64, 0.0_f64);
+            let (mut ro_buy_passive, mut ro_sell_passive) = (false, false);
+            for (idx, order) in place_results.iter().enumerate() {
+                let (reduce_only, is_passive) = reduce_only_flags
+                    .get(idx)
+                    .copied()
+                    .unwrap_or((false, false));
+                if reduce_only {
+                    match order.side {
+                        Side::Buy => {
+                            ro_buy_reserved += order.size;
+                            ro_buy_passive |= is_passive;
+                        }
+                        Side::Sell => {
+                            ro_sell_reserved += order.size;
+                            ro_sell_passive |= is_passive;
+                        }
+                    }
+                }
                 let side = if order.side == Side::Buy {
                     TrackerSide::Buy
                 } else {
                     TrackerSide::Sell
                 };
-                if !tracker.start_tracking(order.client_order_index, side, order.price, order.size)
-                {
+                if !tracker.start_tracking_order(
+                    order.client_order_index,
+                    side,
+                    order.price,
+                    order.size,
+                    reduce_only,
+                ) {
                     for reserved in place_results
                         .iter()
                         .take_while(|r| r.client_order_index != order.client_order_index)
@@ -1548,19 +1903,38 @@ impl LighterTrading {
                 }
                 tracker.mark_submission_uncertain(order.client_order_index);
             }
-            if opens_risk {
-                let cap_check = self.ensure_open_risk_allowed().and_then(|()| {
+            let cap_check = (|| -> Result<()> {
+                if ro_buy_reserved > 0.0 {
+                    self.ensure_reduce_only_valid_with_pending(
+                        Side::Buy,
+                        ro_buy_reserved,
+                        None,
+                        false,
+                        ro_buy_passive,
+                    )?;
+                }
+                if ro_sell_reserved > 0.0 {
+                    self.ensure_reduce_only_valid_with_pending(
+                        Side::Sell,
+                        ro_sell_reserved,
+                        None,
+                        false,
+                        ro_sell_passive,
+                    )?;
+                }
+                if opens_risk {
+                    self.ensure_open_risk_allowed()?;
                     for order in &place_results {
                         self.ensure_side_exposure_within_cap(order.side)?;
                     }
-                    Ok(())
-                });
-                if let Err(err) = cap_check {
-                    for order in &place_results {
-                        tracker.mark_failed(order.client_order_index);
-                    }
-                    return Err(err);
                 }
+                Ok(())
+            })();
+            if let Err(err) = cap_check {
+                for order in &place_results {
+                    tracker.mark_failed(order.client_order_index);
+                }
+                return Err(err);
             }
         }
 
@@ -1835,7 +2209,7 @@ impl LighterTrading {
             return Ok(());
         }
 
-        self.place_order(self.close_order(position, current_price)?)
+        self.place_order_with_proof(self.close_order(position, current_price)?, Some(position))
             .await?;
         tracing::info!("Close position order submitted");
         Ok(())
@@ -1930,7 +2304,7 @@ fn encode_order(price: f64, size: f64, price_scale: f64, size_scale: f64) -> Res
     let price_units = (price * price_scale).round();
     let size_units = (size * size_scale).round();
     anyhow::ensure!(
-        price_units >= 1.0 && price_units <= u32::MAX as f64,
+        price_units >= 1.0 && price_units <= i32::MAX as f64,
         "Order price out of range"
     );
     anyhow::ensure!(
@@ -2116,6 +2490,7 @@ pub(crate) fn account_response_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// Serve each `(status, body)` once per request on a loopback port.
     async fn account_server(
@@ -2658,13 +3033,12 @@ mod tests {
             }
         });
 
-        let trading = Arc::new(LighterTrading::mock_multi_lane_test_client(
-            &url,
-            10,
-            7,
-            Some(8),
-            Some(9),
-        ));
+        let mut trading_inner =
+            LighterTrading::mock_multi_lane_test_client(&url, 10, 7, Some(8), Some(9));
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), -0.05));
+        trading_inner.set_order_tracker(tracker);
+        let trading = Arc::new(trading_inner);
 
         let start = Instant::now();
         let t_taker = {
@@ -2769,6 +3143,25 @@ mod tests {
         assert!(encode_order(100.0, 1e-12, 100.0, 1e6).is_err());
         assert!(encode_order(100.005, 1.0, 100.0, 1e6).is_err());
         assert!(encode_order(100.0, 0.0015, 100.0, 1000.0).is_err());
+        assert!(encode_order(i32::MAX as f64 + 1.0, 1.0, 1.0, 1e6).is_err());
+        let signer = crate::lighter_ffi::LighterSigner::mock_for_test(0, 1);
+        assert!(
+            signer
+                .sign_create_order(
+                    0i64,
+                    1,
+                    100,
+                    i32::MAX as u32 + 1,
+                    false,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    1
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2865,6 +3258,11 @@ mod tests {
         let as_exchange: Arc<dyn Exchange> = Arc::clone(&shared) as Arc<dyn Exchange>;
         as_exchange.set_max_worst_case_position(0.10);
         // Confirming +0.10 flat and trying to buy +0.02 now breaches the tightened 0.10 cap.
+        tracker
+            .apply_event(&crate::types::ShmPrivateEventV2::order_canceled(
+                0, 2, 1, 10, 502, 10, 0.05, 0,
+            ))
+            .unwrap();
         assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.10));
         let tightened_err = shared
             .submit_prepared(
@@ -2887,6 +3285,186 @@ mod tests {
                 .to_string()
                 .contains("Execution-boundary long cap breached")
         );
+
+        // Execution-boundary reduce-only checks reject wrong side, flat state, and oversizing.
+        assert!(
+            shared
+                .ensure_can_place(
+                    &OrderParams {
+                        side: Side::Buy,
+                        price: 2000.0,
+                        size: 0.05,
+                        order_type: OrderType::Ioc,
+                        reduce_only: true,
+                    },
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            shared
+                .ensure_can_place(
+                    &OrderParams {
+                        side: Side::Sell,
+                        price: 2000.0,
+                        size: 0.25,
+                        order_type: OrderType::Ioc,
+                        reduce_only: true,
+                    },
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            shared
+                .ensure_can_place(
+                    &OrderParams {
+                        side: Side::Sell,
+                        price: 2000.0,
+                        size: 0.10,
+                        order_type: OrderType::Ioc,
+                        reduce_only: true,
+                    },
+                    None
+                )
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_reduce_only_rejects_pre_nonce_and_pre_sign_without_http_requests() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&http_requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    seen.fetch_add(1, Ordering::AcqRel);
+                    let mut buf = [0u8; 4096];
+                    let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                        .await
+                        .unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.contains("sendTxBatch") {
+                        serde_json::json!({"code": 200, "tx_hash": ["ok-proof"]}).to_string()
+                    } else {
+                        serde_json::json!({"code": 200, "nonce": 77, "tx_hash": "ok-proof"})
+                            .to_string()
+                    };
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let sell_close = OrderParams {
+            side: Side::Sell,
+            price: 2000.0,
+            size: 0.05,
+            order_type: OrderType::Ioc,
+            reduce_only: true,
+        };
+
+        // 1. Missing OrderTracker fails closed pre-nonce/pre-sign on both single and batch paths.
+        let mut trading = LighterTrading::mock_multi_lane_test_client(&url, 10, 7, None, None);
+        assert!(trading.place_order(sell_close.clone()).await.is_err());
+        assert!(
+            trading
+                .execute_batch(vec![BatchAction::Place(sell_close.clone())])
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), 0);
+
+        // 2. Stale / reconciling OrderTracker also fails closed pre-nonce for unverified callers.
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.10));
+        tracker.require_reconciliation();
+        trading.set_order_tracker(Arc::clone(&tracker));
+        assert!(trading.place_order(sell_close.clone()).await.is_err());
+        assert!(
+            trading
+                .execute_batch(vec![BatchAction::Place(sell_close.clone())])
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), 0);
+
+        // 3. Cumulative reduce-only orders in a single batch exceeding confirmed position reject pre-nonce.
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.08));
+        assert!(
+            trading
+                .execute_batch(vec![
+                    BatchAction::Place(sell_close.clone()),
+                    BatchAction::Place(sell_close.clone()),
+                ])
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), 0);
+
+        // 4. Verified REST proof rejects wrong size pre-sign, and permits emergency recovery close.
+        assert!(
+            trading
+                .place_order_with_proof(
+                    OrderParams {
+                        size: 0.20,
+                        ..sell_close.clone()
+                    },
+                    Some(0.05)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), 0);
+
+        tracker.require_reconciliation();
+        trading
+            .place_order_with_proof(sell_close.clone(), Some(0.05))
+            .await
+            .unwrap();
+        assert!(http_requests.load(Ordering::Acquire) >= 1);
+
+        // 5. Existing open/pending-cancel exposure on the same side counts toward the reduce-only ceiling.
+        let pending_tracker = Arc::new(OrderTracker::new());
+        assert!(pending_tracker.confirm_cleanup(pending_tracker.reconciliation_epoch(), 0.10));
+        assert!(pending_tracker.start_tracking_order(701, TrackerSide::Sell, 2001.0, 0.06, true));
+        pending_tracker.mark_pending_cancel(701);
+        trading.set_order_tracker(Arc::clone(&pending_tracker));
+        let reqs_before_pending = http_requests.load(Ordering::Acquire);
+        assert!(
+            trading
+                .execute_batch(vec![BatchAction::Place(OrderParams {
+                    size: 0.06,
+                    ..sell_close.clone()
+                })])
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), reqs_before_pending);
+        trading
+            .execute_batch(vec![BatchAction::Place(OrderParams {
+                size: 0.04,
+                ..sell_close
+            })])
+            .await
+            .unwrap();
+        assert!(http_requests.load(Ordering::Acquire) > reqs_before_pending);
+
+        server.abort();
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -2930,5 +3508,116 @@ mod tests {
             }
             assert!(signer.sign_cancel_order(255, (1i64 << 48) + 7, 20).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn volume_quota_and_batch_price_band_guard_enforce_pre_nonce_safety() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&http_requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let count = seen.fetch_add(1, Ordering::AcqRel) + 1;
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.contains("/api/v1/nextNonce") {
+                        serde_json::json!({"code": 200, "nonce": 77 + count}).to_string()
+                    } else if count <= 2 {
+                        serde_json::json!({
+                            "code": 200,
+                            "tx_hash": ["0x1", "0x2"],
+                            "volume_quota_remaining": 42
+                        })
+                        .to_string()
+                    } else {
+                        // Response without `volume_quota_remaining` must retain last known `Some(42)`.
+                        serde_json::json!({"code": 200, "tx_hash": "0x3"}).to_string()
+                    };
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let mut trading = LighterTrading::mock_multi_lane_test_client(&url, 1, 10, None, None);
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.05));
+        trading.set_order_tracker(Arc::clone(&tracker));
+
+        assert_eq!(trading.volume_quota_snapshot().unwrap().remaining, None);
+        trading.set_reference_price_band(2000.0, 50.0); // +/- 50 bps = [1990.0, 2010.0]
+
+        // Pre-nonce rejection on both `execute_batch` and `place_batch` with zero HTTP traffic.
+        let bad_ask = OrderParams {
+            side: Side::Sell,
+            price: 2050.0, // +250 bps > 50 bps
+            size: 0.02,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        };
+        assert!(
+            trading
+                .execute_batch(vec![BatchAction::Place(bad_ask)])
+                .await
+                .is_err()
+        );
+        assert!(
+            trading
+                .place_batch(BatchOrderParams {
+                    bid_price: 1998.0,
+                    ask_price: 2050.0,
+                    bid_size: 0.02,
+                    ask_size: 0.02,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(http_requests.load(Ordering::Acquire), 0);
+
+        // Valid batch within band hits mock server, parses `volume_quota_remaining = 42`.
+        trading
+            .place_batch(BatchOrderParams {
+                bid_price: 1998.0,
+                ask_price: 2002.0,
+                bid_size: 0.02,
+                ask_size: 0.02,
+            })
+            .await
+            .unwrap();
+        let snap1 = trading.volume_quota_snapshot().unwrap();
+        assert_eq!(snap1.remaining, Some(42));
+        assert!(snap1.observed_at_ns > 0);
+
+        // Emergency `reduce_only` flatten bypasses opening price band and preserves quota `42`
+        // when subsequent response omits quota.
+        trading
+            .place_order(OrderParams {
+                side: Side::Sell,
+                price: 1970.0, // -150 bps from ref_mid, emergency close of confirmed +0.05
+                size: 0.05,
+                order_type: OrderType::Ioc,
+                reduce_only: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(trading.volume_quota_snapshot().unwrap().remaining, Some(42));
+
+        server.abort();
     }
 }

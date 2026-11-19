@@ -20,6 +20,10 @@ use tokio::time::Instant;
 
 /// Pending fills awaiting their horizon. Fixed so the hot path never allocates.
 const PENDING: usize = 64;
+/// Multi-horizon markout curve horizons (seconds) for S9-2 quantile quote floors.
+pub(crate) const CURVE_HORIZONS_SECS: [f64; 4] = [1.0, 5.0, 30.0, 60.0];
+/// Fixed circular buffer length per (side, horizon) for zero-allocation empirical quantiles.
+const CURVE_RING: usize = 32;
 /// Fills marked before the estimate influences quotes.
 const MIN_SAMPLES: u32 = 8;
 /// Upper bound on the spread multiplier from markouts.
@@ -64,6 +68,102 @@ pub(crate) struct MarkoutStats {
     pub notional_ewma_bps: Option<f64>,
     /// Cumulative USD notional (`size * price`) of marked fills.
     pub marked_notional_usd: f64,
+}
+
+/// Multi-horizon markout diagnostics snapshot across `[1s, 5s, 30s, 60s]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct MultiHorizonMarkoutSnapshot {
+    pub horizons_secs: [f64; 4],
+    pub ewma_bps: [Option<f64>; 4],
+    pub median_bps: [Option<f64>; 4],
+    pub samples: [u32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct CurvePending {
+    print: FillPrint,
+    marked_mask: u8,
+}
+
+#[derive(Clone, Copy)]
+struct HorizonRing {
+    samples: [f64; CURVE_RING],
+    head: usize,
+    len: usize,
+    mean: FillMean,
+    updated_at: Option<Instant>,
+}
+
+impl Default for HorizonRing {
+    fn default() -> Self {
+        Self {
+            samples: [0.0; CURVE_RING],
+            head: 0,
+            len: 0,
+            mean: FillMean::default(),
+            updated_at: None,
+        }
+    }
+}
+
+impl HorizonRing {
+    fn reset(&mut self) {
+        self.head = 0;
+        self.len = 0;
+        self.mean = FillMean::default();
+        self.updated_at = None;
+    }
+
+    fn record(&mut self, bps: f64, alpha: f64, now: Instant, max_age: Option<Duration>) {
+        if !bps.is_finite() {
+            return;
+        }
+        if let Some(limit) = max_age
+            && self
+                .updated_at
+                .is_some_and(|at| now.saturating_duration_since(at) > limit)
+        {
+            self.reset();
+        }
+        self.samples[self.head] = bps;
+        self.head = (self.head + 1) % CURVE_RING;
+        if self.len < CURVE_RING {
+            self.len += 1;
+        }
+        self.mean.record(bps, alpha);
+        self.updated_at = Some(now);
+    }
+
+    fn quantile(&self, now: Instant, p: f64, max_age: Option<Duration>) -> Option<f64> {
+        if self.len < MIN_SAMPLES as usize || !p.is_finite() {
+            return None;
+        }
+        if let Some(limit) = max_age {
+            let at = self.updated_at?;
+            if now.saturating_duration_since(at) > limit {
+                return None;
+            }
+        }
+        let mut scratch = [0.0_f64; CURVE_RING];
+        scratch[..self.len].copy_from_slice(&self.samples[..self.len]);
+        scratch[..self.len].sort_by(f64::total_cmp);
+        let pos = p.clamp(0.0, 1.0) * ((self.len - 1) as f64);
+        let lo = pos.floor() as usize;
+        let hi = pos.ceil() as usize;
+        let frac = pos - (lo as f64);
+        Some(scratch[lo] + frac * (scratch[hi] - scratch[lo]))
+    }
+
+    fn median_unexpired(&self) -> Option<f64> {
+        if self.len < MIN_SAMPLES as usize {
+            return None;
+        }
+        let mut scratch = [0.0_f64; CURVE_RING];
+        scratch[..self.len].copy_from_slice(&self.samples[..self.len]);
+        scratch[..self.len].sort_by(f64::total_cmp);
+        let mid = self.len - 1;
+        Some(0.5 * (scratch[mid / 2] + scratch[mid.div_ceil(2)]))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -131,6 +231,11 @@ pub(super) struct MarkoutTracker {
     notional_mean: NotionalFillMean,
     sides: Option<SideSamples>,
     stats: MarkoutStats,
+    curve_horizons: [Duration; 4],
+    curve_tolerances: [Duration; 4],
+    curve_pending: [Option<CurvePending>; PENDING],
+    side_curves: [[HorizonRing; 4]; 2],
+    overall_curves: [HorizonRing; 4],
 }
 
 impl MarkoutTracker {
@@ -138,6 +243,8 @@ impl MarkoutTracker {
     /// tolerated average markout (e.g. -1.0) before widening starts.
     pub(super) fn new(horizon_secs: f64, halflife_fills: f64, threshold_bps: f64) -> Self {
         let horizon = Duration::from_secs_f64(horizon_secs.max(0.1));
+        let curve_horizons = CURVE_HORIZONS_SECS.map(Duration::from_secs_f64);
+        let curve_tolerances = curve_horizons.map(horizon_tolerance);
         Self {
             horizon,
             tolerance: horizon_tolerance(horizon),
@@ -149,6 +256,11 @@ impl MarkoutTracker {
             notional_mean: NotionalFillMean::default(),
             sides: None,
             stats: MarkoutStats::default(),
+            curve_horizons,
+            curve_tolerances,
+            curve_pending: [None; PENDING],
+            side_curves: [[HorizonRing::default(); 4]; 2],
+            overall_curves: [HorizonRing::default(); 4],
         }
     }
 
@@ -224,6 +336,38 @@ impl MarkoutTracker {
                 None => self.stats.expired += 1,
             }
         }
+        let side_max_age = self.sides.as_ref().map(|s| s.max_age);
+        for slot in &mut self.curve_pending {
+            let Some(mut entry) = *slot else {
+                continue;
+            };
+            let age = now.saturating_duration_since(entry.print.at);
+            for h in 0..4 {
+                let bit = 1u8 << h;
+                if entry.marked_mask & bit != 0 || age < self.curve_horizons[h] {
+                    continue;
+                }
+                let late = age - self.curve_horizons[h];
+                if late > self.curve_tolerances[h] {
+                    entry.marked_mask |= bit;
+                    continue;
+                }
+                if !fair_valid {
+                    continue;
+                }
+                if let Some(bps) = markout_bps(entry.print, fair) {
+                    let side_idx = usize::from(entry.print.side == OrderSide::Sell);
+                    self.side_curves[side_idx][h].record(bps, self.alpha, now, side_max_age);
+                    self.overall_curves[h].record(bps, self.alpha, now, None);
+                }
+                entry.marked_mask |= bit;
+            }
+            *slot = if entry.marked_mask == 0b1111 {
+                None
+            } else {
+                Some(entry)
+            };
+        }
         self.stats.ewma_bps = self.ewma_bps();
         self.stats.notional_ewma_bps = self.notional_ewma_bps();
     }
@@ -256,6 +400,26 @@ impl MarkoutTracker {
             self.stats.overwritten += 1;
         }
         self.pending[target] = Some(Pending { print });
+
+        let mut curve_target = 0;
+        let mut curve_oldest = u64::MAX;
+        for (index, slot) in self.curve_pending.iter().enumerate() {
+            match slot {
+                None => {
+                    curve_target = index;
+                    break;
+                }
+                Some(entry) if entry.print.sequence < curve_oldest => {
+                    curve_oldest = entry.print.sequence;
+                    curve_target = index;
+                }
+                Some(_) => {}
+            }
+        }
+        self.curve_pending[curve_target] = Some(CurvePending {
+            print,
+            marked_mask: 0,
+        });
     }
 
     fn record(&mut self, bps: f64) {
@@ -289,6 +453,43 @@ impl MarkoutTracker {
                     (gross_target_bps - bps).clamp(0.0, max_widen_bps)
                 })
         })
+    }
+
+    /// Maximum empirical adverse quantile loss (positive bps) across `[1s, 5s, 30s, 60s]`
+    /// for `[Buy, Sell]` entry sides at quantile `p` (e.g. `0.25` or `0.50`).
+    pub(super) fn adverse_quantile_loss_bps(
+        &self,
+        now: Instant,
+        quantile_p: f64,
+        max_age: Option<Duration>,
+    ) -> [f64; 2] {
+        let max_age = max_age.or_else(|| self.sides.as_ref().map(|s| s.max_age));
+        [0, 1].map(|side_idx| {
+            self.side_curves[side_idx]
+                .iter()
+                .filter_map(|ring| ring.quantile(now, quantile_p, max_age))
+                .map(|q_bps| (-q_bps).max(0.0))
+                .fold(0.0_f64, f64::max)
+        })
+    }
+
+    /// Per-horizon EWMA and median markouts across `[1s, 5s, 30s, 60s]`.
+    #[allow(dead_code)]
+    pub(crate) fn curve_snapshot(&self) -> MultiHorizonMarkoutSnapshot {
+        let mut ewma_bps = [None; 4];
+        let mut median_bps = [None; 4];
+        let mut samples = [0; 4];
+        for h in 0..4 {
+            ewma_bps[h] = self.overall_curves[h].mean.average();
+            median_bps[h] = self.overall_curves[h].median_unexpired();
+            samples[h] = self.overall_curves[h].mean.samples;
+        }
+        MultiHorizonMarkoutSnapshot {
+            horizons_secs: CURVE_HORIZONS_SECS,
+            ewma_bps,
+            median_bps,
+            samples,
+        }
     }
 
     /// Spread multiplier in [1, MAX_MARKOUT_SPREAD_MULT]: +10% per bp of
@@ -648,6 +849,43 @@ mod tests {
         assert_eq!(
             MarkoutTracker::new(1.0, 20.0, -1.0).tolerance,
             Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn multi_horizon_curve_and_adverse_quantile_drive_side_loss_without_allocating() {
+        let start = Instant::now();
+        let mut markout =
+            MarkoutTracker::new(5.0, 20.0, -1.0).with_side_samples(Some(Duration::from_secs(120)));
+        let orders = OrderTracker::new();
+        for seq in 1..=u64::from(MIN_SAMPLES) {
+            markout.enqueue(print(seq, OrderSide::Buy, 1000.0, start));
+            markout.enqueue(print(seq + 100, OrderSide::Sell, 1000.0, start));
+        }
+        // At +1s: buys dropped -1.0 bps (999.9), sells earned +1.0 bps.
+        markout.update(&orders, 999.9, start + Duration::from_secs(1));
+        let losses_1s =
+            markout.adverse_quantile_loss_bps(start + Duration::from_secs(1), 0.5, None);
+        assert!((losses_1s[0] - 1.0).abs() < 1e-9, "got {:?}", losses_1s);
+        assert_eq!(losses_1s[1], 0.0);
+        // At +30s: buys deteriorated to -4.5 bps (999.55), dominating the 1s curve!
+        markout.update(&orders, 999.55, start + Duration::from_secs(30));
+        let curve = markout.curve_snapshot();
+        assert_eq!(curve.horizons_secs, CURVE_HORIZONS_SECS);
+        assert!(curve.median_bps[0].is_some() && curve.median_bps[2].is_some());
+        let losses = markout.adverse_quantile_loss_bps(start + Duration::from_secs(30), 0.5, None);
+        assert!(
+            (losses[0] - 4.5).abs() < 1e-6,
+            "expected 4.5 bps buy adverse loss, got {losses:?}"
+        );
+        assert_eq!(
+            losses[1], 0.0,
+            "sell fills earned positive markout, loss must stay 0"
+        );
+        // Expiration past 120s max_age returns zero stale quantile loss.
+        assert_eq!(
+            markout.adverse_quantile_loss_bps(start + Duration::from_secs(200), 0.5, None),
+            [0.0, 0.0]
         );
     }
 }

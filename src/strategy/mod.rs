@@ -1,7 +1,10 @@
+pub mod cross_sectional;
 pub mod cross_venue;
 pub mod inventory_neutral_mm;
 pub mod matched_settlement;
+pub mod multiday_carry;
 pub mod relative_value;
+mod replay_queue_depth;
 
 use crate::shm_reader::ShmBboMessage;
 use std::future::Future;

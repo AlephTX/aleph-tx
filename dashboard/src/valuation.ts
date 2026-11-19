@@ -96,6 +96,10 @@ const SOURCES: Record<string, string> = {
   external_median: '外部中位价',
   lighter_book: 'Lighter 盘口',
   lighter_depth: 'Lighter 深度',
+  lighter_touch_micro: 'Lighter 微价',
+  local_book: '本所盘口',
+  local_depth: '本所深度',
+  local_touch_micro: '本所微价',
 }
 
 /** Ages compare evidence from the feeder and strategy clocks with the

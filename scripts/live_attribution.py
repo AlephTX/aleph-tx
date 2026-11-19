@@ -473,6 +473,45 @@ def _mean_or_none(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def summarize_fill_metric(fills: list[dict], values: list[float | None]) -> dict:
+    """Summarize one session's diagnostic labels, with explicit cohort coverage.
+
+    Weights use the recorded fill size/notional, never a reference venue's price.
+    These floating-point diagnostics are not a cash ledger or eligible turnover.
+    Unknown labels/weights must not become zero or imply complete coverage.
+    """
+    if len(fills) != len(values):
+        raise ValueError("one metric value per fill is required")
+    valid = [v is not None and math.isfinite(v) for v in values]
+    out = {
+        "fill_count": len(fills),
+        "valid_label_count": sum(valid),
+        "label_coverage": sum(valid) / len(fills) if fills else None,
+        "equal_weight_bps": _mean_or_none([v for v, ok in zip(values, valid) if ok]),
+    }
+    for name, field in (("quantity", "size"), ("notional", "notional")):
+        weights = [f.get(field) for f in fills]
+        known = [
+            isinstance(w, (int, float)) and not isinstance(w, bool)
+            and math.isfinite(w) and w > 0
+            for w in weights
+        ]
+        matched = [i for i in range(len(fills)) if valid[i] and known[i]]
+        denominator = math.fsum(weights[i] for i in matched)
+        total = math.fsum(weights) if all(known) else None
+        out[f"{name}_weighted_bps"] = (
+            math.fsum(values[i] * (weights[i] / denominator) for i in matched)
+            if denominator > 0 else None
+        )
+        out[f"valid_label_{name}"] = denominator
+        out[f"total_{name}"] = total
+        out[f"{name}_coverage"] = (
+            denominator / total if total is not None and total > 0 else None
+        )
+        out[f"unknown_{name}_count"] = len(fills) - sum(known)
+    return out
+
+
 def attribute_session(
     telemetry: dict,
     *,
@@ -755,13 +794,19 @@ def attribute_session(
             "mean_vs_fill_bps": _mean_or_none(vs_fill_vals),
             "mean_lead_vs_local_bps": _mean_or_none(lead_vals),
             "mean_markouts_bps": horizon_means,
+            "markout_statistics": {
+                f"{h}ms": summarize_fill_metric(fill_reports, [
+                    r["references"][ref_key]["markouts_bps"][f"{h}ms"]
+                    for r in fill_reports
+                ]) for h in horizons_ms
+            },
         }
 
     hedge_reported = sum(1 for hf in hedge_fills if hf.get("price_source") == "fill")
     hedge_limit = sum(1 for hf in hedge_fills if hf.get("price_source") == "limit")
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "engine": "duckdb_asof" if use_duck else "python_causal_bisect",
         "collector_region": collector_region,
         "campaign_id": campaign_id,
@@ -785,6 +830,20 @@ def attribute_session(
             "limit_bound_fills": hedge_limit,
         },
         "reference_summary": ref_summaries,
+        "local_markout_statistics": {
+            f"{h}ms": summarize_fill_metric(fill_reports, [
+                r["local_book"]["markouts_bps"][f"{h}ms"] for r in fill_reports
+            ]) for h in horizons_ms
+        },
+        "primary_reference_market_key": primary_ref_key,
+        "net_primary_markout_statistics": {
+            f"{h}ms": summarize_fill_metric(fill_reports, [
+                r["net_primary_markouts_after_fee_bps"][f"{h}ms"] for r in fill_reports
+            ]) for h in horizons_ms
+        },
+        "rated_fee_statistics": summarize_fill_metric(fill_reports, [
+            r["rated_fee_bps"] for r in fill_reports
+        ]),
         "fills": fill_reports,
     }
 
@@ -798,7 +857,7 @@ def render_markdown_summary(report: dict) -> str:
         f"- **Symbol / Venue**: `{report.get('symbol')}` on `{report.get('exchange')}`",
         f"- **Total Fills**: `{report['fill_count']}` (fast `<250ms` sniped: `{report['fast_sniped_fills_lt_250ms']}`, `500ms < -2bps` toxic: `{report['toxic_fills_500ms_lt_minus_2bps']}`)",
         "",
-        "## Cross-Venue Lead/Lag & Realized Markouts",
+        "## Cross-Venue Lead/Lag & Realized Markouts (equal weight)",
         "",
         "| Reference Market | Matched | At-Fill Edge (bps) | Lead vs Local (bps) | +100ms (bps) | +500ms (bps) | +5s (bps) |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -809,6 +868,25 @@ def render_markdown_summary(report: dict) -> str:
         lines.append(
             f"| `{key}` | {s['matched_fills']} | {fmt(s['mean_vs_fill_bps'])} | {fmt(s['mean_lead_vs_local_bps'])} | {fmt(m.get('100ms'))} | {fmt(m.get('500ms'))} | {fmt(m.get('5000ms'))} |"
         )
+    lines.extend([
+        "", "## Markout Weighting & Coverage", "",
+        "Diagnostic markouts are not realized cash PnL or confirmed eligible turnover. "
+        "Net labels subtract the rated fill fee once; unknown fees remain unrated.",
+        "",
+        "| Market / Cohort | Horizon | Equal (bps) | Quantity (bps) | Notional (bps) | Labels | Notional Coverage |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    cohorts = [(key, s.get("markout_statistics", {})) for key, s in report["reference_summary"].items()]
+    cohorts.append(("primary after rated fee", report.get("net_primary_markout_statistics", {})))
+    for key, stats in cohorts:
+        for horizon, s in stats.items():
+            coverage = s["notional_coverage"]
+            coverage_text = "n/a" if coverage is None else f"{coverage:.1%}"
+            lines.append(
+                f"| `{key}` | {horizon} | {fmt(s['equal_weight_bps'])} | "
+                f"{fmt(s['quantity_weighted_bps'])} | {fmt(s['notional_weighted_bps'])} | "
+                f"{s['valid_label_count']}/{s['fill_count']} | {coverage_text} |"
+            )
     return "\n".join(lines) + "\n"
 
 

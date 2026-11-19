@@ -50,6 +50,7 @@ fn active_order(
         side,
         price,
         size,
+        reduce_only: false,
         placed_at: Instant::now() - Duration::from_secs(age_secs),
     }
 }
@@ -617,6 +618,7 @@ fn pending_create_without_order_index_is_not_scheduled_for_cancel() {
         side: OrderSide::Sell,
         price: desired[0].price + 1.0,
         size: desired[0].size,
+        reduce_only: false,
         placed_at: Instant::now() - Duration::from_secs(30),
     }];
 
@@ -648,7 +650,7 @@ fn risk_limits_respect_existing_worst_case_exposure() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 70.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -673,7 +675,7 @@ fn risk_limits_scale_down_when_margin_budget_is_tight() {
         min_available_balance: config.min_available_balance,
         available_balance: 20.0,
         usable_balance: 5.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 4.0,
     };
 
@@ -698,7 +700,7 @@ fn pre_urgency_long_inventory_under_margin_pressure_keeps_both_sides_meaningful(
         min_available_balance: config.min_available_balance,
         available_balance: 21.0,
         usable_balance: 15.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 4.0,
     };
 
@@ -724,7 +726,7 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_long() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -749,7 +751,7 @@ fn risk_limits_disable_same_side_when_inventory_urgency_triggers_short() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -774,7 +776,7 @@ fn risk_limits_cap_flatten_side_when_pending_sell_would_flip_past_flat() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 4.0,
     };
 
@@ -799,7 +801,7 @@ fn risk_limits_cap_flatten_side_when_pending_buy_would_flip_past_flat() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 4.0,
     };
 
@@ -825,7 +827,7 @@ fn tiny_inventory_inside_deadband_keeps_both_sides_but_applies_soft_skew() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -854,7 +856,7 @@ fn inventory_outside_deadband_starts_directional_skew() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -879,7 +881,7 @@ fn inventory_just_outside_deadband_keeps_both_sides_meaningful() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -905,7 +907,7 @@ fn inventory_beyond_urgency_threshold_disables_same_side() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -930,7 +932,7 @@ fn moderate_inventory_below_urgency_threshold_keeps_same_side_non_zero() {
         min_available_balance: config.min_available_balance,
         available_balance: 100.0,
         usable_balance: 100.0,
-        margin_per_eth: 210.0,
+        margin_per_unit: 210.0,
         grid_multiplier: 2.0,
     };
 
@@ -1385,14 +1387,14 @@ fn risk_budgets_hold_across_inventory_and_margin_scenarios() {
                 min_available_balance: config.min_available_balance,
                 available_balance: balance,
                 usable_balance: balance,
-                margin_per_eth: 210.0,
+                margin_per_unit: 210.0,
                 grid_multiplier: 4.0,
             };
             let (bid, ask) =
                 InventoryNeutralMM::calculate_asymmetric_sizes_for_config(&config, &risk, 2100.0);
             assert!(bid.is_finite() && ask.is_finite() && bid >= 0.0 && ask >= 0.0);
             assert!(
-                (bid + ask) * risk.grid_multiplier * risk.margin_per_eth <= balance + 1e-9,
+                (bid + ask) * risk.grid_multiplier * risk.margin_per_unit <= balance + 1e-9,
                 "margin exceeded: position={position} balance={balance}, bid={bid} ask={ask}"
             );
             assert!(
@@ -2111,11 +2113,13 @@ fn quote_hysteresis_validates_bounds_and_cancels_only_breaching_side_immediately
         per_side_bound_cancel: true,
         reducing_order_ttl_secs: None,
         reducing_requote_threshold_bps: None,
+        entry_requote_threshold_bps: None,
         zero_deadband_flatten: false,
         breakeven_exit_bps: None,
         breakeven_hold_fraction: 0.0,
         max_local_momentum_bps: None,
         conservative_dual_anchor: false,
+        ..Default::default()
     });
     assert!(
         cfg.validate().is_err(),
@@ -2129,11 +2133,13 @@ fn quote_hysteresis_validates_bounds_and_cancels_only_breaching_side_immediately
         per_side_bound_cancel: true,
         reducing_order_ttl_secs: Some(2),
         reducing_requote_threshold_bps: Some(0.5),
+        entry_requote_threshold_bps: Some(3.0),
         zero_deadband_flatten: true,
         breakeven_exit_bps: Some(1.0),
         breakeven_hold_fraction: 0.4,
         max_local_momentum_bps: Some(4.0),
         conservative_dual_anchor: true,
+        ..Default::default()
     });
     cfg.validate().unwrap();
 
@@ -2203,11 +2209,13 @@ fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing
         per_side_bound_cancel: true,
         reducing_order_ttl_secs: Some(2),
         reducing_requote_threshold_bps: Some(0.5),
+        entry_requote_threshold_bps: None,
         zero_deadband_flatten: true,
         breakeven_exit_bps: Some(1.0),
         breakeven_hold_fraction: 0.5,
         max_local_momentum_bps: Some(2.0),
         conservative_dual_anchor: true,
+        ..Default::default()
     });
 
     // Record flat cash baseline, then apply a buy fill at 2000.0 (0.01 units -> -$20 cash).
@@ -2237,6 +2245,8 @@ fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing
         as_score: 0.0,
         using_external_fair_value: true,
         order_flow_bps: 0.0,
+        local_ofi_bps: 0.0,
+        cancel_bump_bps: 0.0,
         cross_market_bps: 0.0,
         volatility_pressure: 0.0,
         #[cfg(feature = "research-replay")]
@@ -2307,6 +2317,7 @@ fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing
         None,
         Some(Duration::from_secs(2)),
         true,
+        None,
     );
     let opening_plan = execution::build_side_execution_plan_with_options(
         &strategy.config,
@@ -2321,6 +2332,7 @@ fn quote_hysteresis_preserves_flattened_quote_target_breakeven_and_fast_reducing
         None,
         None,
         false,
+        None,
     );
     assert_eq!(reducing_plan.to_cancel, vec![501]);
     assert_eq!(reducing_plan.to_place.len(), 1);
@@ -2363,6 +2375,8 @@ fn lighter_fair_mark_margin_guard_clamps_spoofed_book_and_triggers_pre_liquidati
         as_score: 0.2,
         using_external_fair_value: true,
         order_flow_bps: 0.0,
+        local_ofi_bps: 0.0,
+        cancel_bump_bps: 0.0,
         cross_market_bps: 0.0,
         volatility_pressure: 0.0,
         #[cfg(feature = "research-replay")]
@@ -2393,6 +2407,1126 @@ fn lighter_fair_mark_margin_guard_clamps_spoofed_book_and_triggers_pre_liquidati
     assert_eq!(health1.regime, MarginRegime::PreLiquidationDeleverage);
     assert!(health1.partial_liquidation_mark.is_some());
     assert!(health1.zero_price_trigger_mark.is_some());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn local_touch_micro_and_toxicity_protect_adding_side_while_entry_hysteresis_holds_queue() {
+    use crate::config::{
+        LocalFairValueConfig, LocalFairValueMode, LocalToxicityConfig, QuoteHysteresisConfig,
+    };
+
+    let (mut strategy, _tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.grid_levels = 1;
+    strategy.config.min_profit_bps = 6.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.max_spread_bps = 40.0;
+    strategy.config.require_external_fair_value = false;
+    strategy.config.local_fair_value_config = Some(LocalFairValueConfig {
+        mode: LocalFairValueMode::TouchMicro,
+        max_shift_bps: 2.0,
+    });
+    strategy.config.local_toxicity = Some(LocalToxicityConfig {
+        ofi_half_life_ms: 100,
+        ofi_max_widen_bps: 4.0,
+        cancel_speed_bump_ms: 310,
+        cancel_option_mult: 0.4,
+        cancel_option_max_bps: 10.0,
+        enable_local_markout: true,
+        ..Default::default()
+    });
+    let mut cfg_check = strategy.config.clone();
+    cfg_check.symbol_id = crate::config::SYM_ETH;
+    cfg_check.validate().unwrap();
+    strategy.use_local_fair_value();
+
+    let t0 = wall_time_ns().saturating_sub(100_000_000);
+    let exchanges = [(0u8, ShmBboMessage::default()); crate::shm_reader::NUM_EXCHANGES];
+
+    // 1. Heavily skewed L1 bid size (9.0 vs 1.0 across a 4bps spread) shifts `pricing_mid`
+    //    toward ask within ±2.0 bps while leaving `inputs.mid` strictly at native midpoint.
+    let bbo0 = ShmBboMessage {
+        exchange_id: strategy.config.exchange_id,
+        symbol_id: strategy.config.symbol_id,
+        timestamp_ns: t0,
+        bid_price: 1999.60,
+        bid_size: 9.0,
+        ask_price: 2000.40,
+        ask_size: 1.0,
+        ..Default::default()
+    };
+    let inputs0 = strategy.calculate_pricing_inputs(&exchanges, &bbo0);
+    assert!((inputs0.mid - 2000.0).abs() < 1e-9);
+    assert!(!inputs0.using_external_fair_value);
+    assert!(
+        inputs0.pricing_mid > 2000.30 && inputs0.pricing_mid <= 2000.40,
+        "TouchMicro shifted pricing_mid={}",
+        inputs0.pricing_mid
+    );
+    assert_eq!(
+        strategy.price_evidence.map(|e| e.source),
+        Some("lighter_touch_micro")
+    );
+
+    // 2. Subsequent bid replenishment (+8 size) & ask depletion produces positive local OFI,
+    //    widening inventory-adding ask while keeping inventory-reducing ask tight when q > 0.
+    let bbo1 = ShmBboMessage {
+        timestamp_ns: t0 + 50_000_000,
+        bid_price: 1999.70,
+        bid_size: 12.0,
+        ask_price: 2000.40,
+        ask_size: 0.5,
+        ..bbo0
+    };
+    let mut inputs1 = strategy.calculate_pricing_inputs(&exchanges, &bbo1);
+    assert!(
+        inputs1.local_ofi_bps > 0.5,
+        "positive local OFI={}",
+        inputs1.local_ofi_bps
+    );
+    assert!(inputs1.cancel_bump_bps > 0.0);
+
+    inputs1.vol_bps = 2.0;
+    let mut clean = inputs1.clone();
+    clean.local_ofi_bps = 0.0;
+    clean.cancel_bump_bps = 0.0;
+    inputs1.mid = 2000.05;
+    inputs1.pricing_mid = 2000.05;
+    inputs1.bid_touch = 1999.70;
+    inputs1.ask_touch = 2000.40;
+    clean.mid = 2000.05;
+    clean.pricing_mid = 2000.05;
+    clean.bid_touch = 1999.70;
+    clean.ask_touch = 2000.40;
+
+    let (base_bid, base_ask, _) = strategy.calculate_optimal_quotes(&clean, 0.0).unwrap();
+    let (tox_bid, tox_ask, _) = strategy.calculate_optimal_quotes(&inputs1, 0.0).unwrap();
+    assert!(
+        tox_ask > base_ask,
+        "local OFI + cancel bump must widen ask: base={base_ask}, tox={tox_ask}"
+    );
+    assert!(
+        tox_bid < base_bid,
+        "cancel speed-bump reserve must also widen adding bid when flat: base={base_bid}, tox={tox_bid}"
+    );
+
+    // When holding short inventory (q = -0.05), ask adds risk (widened) while bid reduces (kept tight).
+    let (short_base_bid, short_base_ask, _) =
+        strategy.calculate_optimal_quotes(&clean, -0.05).unwrap();
+    let (short_tox_bid, short_tox_ask, _) =
+        strategy.calculate_optimal_quotes(&inputs1, -0.05).unwrap();
+    assert_eq!(short_tox_bid, short_base_bid);
+    assert!(short_tox_ask > short_base_ask);
+
+    // 3. `entry_requote_threshold_bps` suppresses churn for non-breaching entry orders inside
+    //    `cancel_bounds`, while still cancelling orders that breach `cancel_bounds` at age=0.
+    strategy.config.requote_threshold_bps = 0.5;
+    strategy.config.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 3.0,
+        flatten_min_profit_bps: 1.0,
+        flatten_age_start_fraction: 0.5,
+        per_side_bound_cancel: true,
+        reducing_order_ttl_secs: Some(2),
+        reducing_requote_threshold_bps: Some(0.5),
+        entry_requote_threshold_bps: Some(5.0),
+        zero_deadband_flatten: false,
+        breakeven_exit_bps: None,
+        breakeven_hold_fraction: 0.0,
+        max_local_momentum_bps: None,
+        conservative_dual_anchor: false,
+        ..Default::default()
+    });
+    let mut hyst_check = strategy.config.clone();
+    hyst_check.symbol_id = crate::config::SYM_ETH;
+    hyst_check.validate().unwrap();
+
+    let cancel_bounds = MakerPriceBounds::new_asymmetric(2000.0, 2000.0, 0.0, 3.0, 3.0, 0.01)
+        .expect("valid cancel bounds");
+    let healthy_entry_buy = active_order(11, 211, OrderSide::Buy, 1999.50, 0.02, 2);
+    let held_plan = execution::build_side_execution_plan_with_bounds(
+        &strategy.config,
+        &[healthy_entry_buy],
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.10, // diff = 0.40 (< 5 bps = $1.00), safe inside cancel_bounds (<= 1999.70)
+        0.02,
+        2000.0 * 5.0 / 10_000.0,
+        0.25,
+        1,
+        Some(cancel_bounds),
+    );
+    assert!(held_plan.to_cancel.is_empty());
+    assert!(held_plan.to_place.is_empty());
+
+    let breaching_entry_buy = active_order(12, 212, OrderSide::Buy, 1999.80, 0.02, 0);
+    let breach_plan = execution::build_side_execution_plan_with_bounds(
+        &strategy.config,
+        &[breaching_entry_buy],
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.10,
+        0.02,
+        2000.0 * 5.0 / 10_000.0,
+        0.25,
+        1,
+        Some(cancel_bounds),
+    );
+    assert_eq!(breach_plan.to_cancel, vec![212]);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sprint3_ratchet_hysteresis_ofi_withdrawal_and_nearest_notional_behave_asymmetrically() {
+    use crate::config::{LocalToxicityConfig, QuoteHysteresisConfig};
+    use components::EntryRatchetPolicy;
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.symbol_id = crate::config::SYM_ETH;
+    strategy.config.tick_size = 0.01;
+    strategy.config.step_size = 0.0001;
+    strategy.config.grid_levels = 1;
+    strategy.config.min_profit_bps = 8.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.order_ttl_secs = 2;
+    strategy.config.base_order_notional_usd = 500.0;
+    strategy.config.max_position_notional_usd = 1000.0;
+    strategy.config.inventory_urgency_notional_usd = 500.0;
+    strategy.config.round_base_notional_nearest = true;
+
+    // 1. `round_base_notional_nearest = true`: $500 / $90,000 = 0.005555... -> 0.0056 BTC ($504).
+    let snap = strategy.build_risk_snapshot(90_000.0);
+    assert!((snap.base_order_size - 0.0056).abs() < 1e-9);
+    // Respects max_position ceiling even when nearest step would exceed it.
+    strategy.config.max_position_notional_usd = 500.0;
+    let capped_snap = strategy.build_risk_snapshot(90_000.0);
+    assert!(capped_snap.base_order_size <= 0.005556 + 1e-9);
+    strategy.config.max_position_notional_usd = 1000.0;
+
+    // 2. `asymmetric_entry_ratchet`: holds FIFO queue on tightening favorable drift (<= 4 bps),
+    //    rejects `calm_mode` 2x inflation (+6 bps > 4 bps requotes after lifetime),
+    //    and IMMEDIATELY cancels at age=0 on adverse retreat (> 1 bps).
+    let favorable_hold = 2000.0 * 4.0 / 10_000.0; // $0.80
+    let adverse_retreat = 2000.0 * 1.0 / 10_000.0; // $0.20
+    let ratchet = Some(EntryRatchetPolicy {
+        favorable_hold_threshold: favorable_hold,
+        adverse_retreat_threshold: adverse_retreat,
+    });
+    let cancel_bounds = MakerPriceBounds::new_asymmetric(2000.0, 2000.0, 0.0, 2.0, 2.0, 0.01)
+        .expect("valid bounds");
+
+    let resting_bid = active_order(1, 301, OrderSide::Buy, 1999.20, 0.02, 0);
+    let fav_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &[resting_bid],
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.70, // +0.50 (+2.5 bps) favorable within $0.80 hold
+        0.02,
+        favorable_hold,
+        0.25,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        ratchet,
+    );
+    assert!(fav_plan.to_cancel.is_empty());
+    assert!(fav_plan.to_place.is_empty());
+
+    // Without calm_mode 2x inflation, +6 bps ($1.20 > $0.80) IS treated as stale once calm cooldown elapses.
+    let aged_bid = active_order(2, 302, OrderSide::Buy, 1998.50, 0.02, 10);
+    let no_inflation_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &[aged_bid],
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.70, // +1.20 (+6 bps) > $0.80 (would falsely match 2.0x = $1.60!)
+        0.02,
+        favorable_hold,
+        0.25,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        ratchet,
+    );
+    assert_eq!(no_inflation_plan.to_cancel, vec![302]);
+
+    // Adverse retreat (-$0.40 = -2 bps > $0.20 retreat threshold) cancels IMMEDIATELY at age=0s
+    // AND re-quotes at the safer lower price in the same batch!
+    let exposed_bid = active_order(3, 303, OrderSide::Buy, 1999.20, 0.02, 0);
+    let retreat_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &[exposed_bid],
+        OrderType::PostOnly,
+        Side::Buy,
+        1998.80,
+        0.02,
+        favorable_hold,
+        0.25,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        ratchet,
+    );
+    assert_eq!(retreat_plan.to_cancel, vec![303]);
+    assert_eq!(retreat_plan.to_place.len(), 1);
+    assert!((retreat_plan.to_place[0].price - 1998.80).abs() < 1e-9);
+
+    // 3. `LocalToxicityConfig::{ofi_withdraw_threshold, vol_pause_bps}` pause only entry sides.
+    strategy.config.local_toxicity = Some(LocalToxicityConfig {
+        ofi_half_life_ms: 100,
+        ofi_max_widen_bps: 0.0,
+        ofi_withdraw_threshold: Some(0.5),
+        vol_pause_bps: Some(15.0),
+        ..Default::default()
+    });
+    strategy.config.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 2.0,
+        flatten_min_profit_bps: 1.0,
+        entry_requote_threshold_bps: Some(4.0),
+        asymmetric_entry_ratchet: true,
+        adverse_retreat_threshold_bps: Some(1.0),
+        ..Default::default()
+    });
+    let mut cfg_check = strategy.config.clone();
+    cfg_check.symbol_id = crate::config::SYM_ETH;
+    cfg_check.validate().unwrap();
+
+    // Positive normalized OFI >= 0.5 withdraws ask entry when flat (q = 0), keeping bid entry alive.
+    strategy.last_local_ofi_norm = 0.75;
+    strategy.account_stats.portfolio_value = 1000.0;
+    strategy.account_stats.available_balance = 900.0;
+    let flat_risk = strategy.build_risk_snapshot(2000.0);
+    let flat_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &flat_risk, 0.0)
+        .unwrap();
+    assert!(flat_target.bid_size > 0.0);
+    assert_eq!(flat_target.ask_size, 0.0);
+
+    // When holding LONG inventory (q > 0), positive OFI must NOT withdraw the reducing ask!
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.01;
+    let long_risk = strategy.build_risk_snapshot(2000.0);
+    let long_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &long_risk, 0.0)
+        .unwrap();
+    assert!(long_target.ask_size > 0.0);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn defense_state_machine_quota_guard_and_non_lighter_venue_decoupling() {
+    use crate::config::{
+        DefensePolicyConfig, EXCH_ARCUS, LocalFairValueConfig, LocalFairValueMode,
+    };
+    use crate::exchange::{
+        BatchAction, BatchOrderParams, BatchOrderResult, BatchResult, OrderInfo, OrderResult,
+        VolumeQuotaSnapshot,
+    };
+    use std::sync::atomic::AtomicI64;
+
+    struct QuotaMockVenue {
+        quota_rem: Arc<AtomicI64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Exchange for QuotaMockVenue {
+        fn venue_name(&self) -> &'static str {
+            "arcus"
+        }
+        async fn buy(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn sell(&self, _: f64, _: f64) -> anyhow::Result<OrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn place_batch(&self, _: BatchOrderParams) -> anyhow::Result<BatchOrderResult> {
+            anyhow::bail!("offline")
+        }
+        async fn cancel_order(&self, _: i64) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
+        async fn cancel_all(&self) -> anyhow::Result<u32> {
+            anyhow::bail!("offline")
+        }
+        async fn get_active_orders(&self) -> anyhow::Result<Vec<OrderInfo>> {
+            anyhow::bail!("offline")
+        }
+        async fn close_all_positions(&self, _: f64) -> anyhow::Result<()> {
+            anyhow::bail!("offline")
+        }
+        async fn execute_batch(&self, _: Vec<BatchAction>) -> anyhow::Result<BatchResult> {
+            anyhow::bail!("offline")
+        }
+        async fn get_account_stats(&self) -> anyhow::Result<AccountStats> {
+            anyhow::bail!("offline")
+        }
+        fn limit_order_type(&self) -> OrderType {
+            OrderType::PostOnly
+        }
+        fn volume_quota_snapshot(&self) -> Option<VolumeQuotaSnapshot> {
+            Some(VolumeQuotaSnapshot {
+                remaining: Some(self.quota_rem.load(std::sync::atomic::Ordering::Acquire)),
+                observed_at_ns: 1,
+            })
+        }
+    }
+
+    let quota_rem = Arc::new(AtomicI64::new(100));
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.trading = Arc::new(QuotaMockVenue {
+        quota_rem: Arc::clone(&quota_rem),
+    });
+    strategy.config.symbol_id = crate::config::SYM_ETH;
+    strategy.config.exchange_id = EXCH_ARCUS;
+    strategy.config.grid_levels = 1;
+    strategy.config.require_external_fair_value = false;
+    strategy.config.local_fair_value_config = Some(LocalFairValueConfig {
+        mode: LocalFairValueMode::TouchMicro,
+        max_shift_bps: 2.0,
+    });
+    strategy.config.min_volume_quota_for_quoting = Some(10);
+    strategy.config.max_order_price_band_bps = Some(50.0);
+    strategy.config.defense_policy = Some(DefensePolicyConfig {
+        caution_spread_bps: 8.0,
+        caution_widen_bps: 2.0,
+        caution_size_scale: 0.5,
+        side_defense_momentum_bps: 10.0,
+        reduce_only_spread_bps: 20.0,
+        halt_spread_bps: 50.0,
+        cooldown_ms: 3_000,
+    });
+    strategy.config.validate().unwrap();
+    strategy.use_local_fair_value();
+
+    // 1. Non-Lighter venue uses `local_*` mark provenance rather than `lighter_*`.
+    let t0 = wall_time_ns().saturating_sub(100_000_000);
+    let exchanges = [(0u8, ShmBboMessage::default()); crate::shm_reader::NUM_EXCHANGES];
+    let arcus_bbo = ShmBboMessage {
+        exchange_id: EXCH_ARCUS,
+        symbol_id: strategy.config.symbol_id,
+        timestamp_ns: t0,
+        bid_price: 1999.60,
+        bid_size: 4.0,
+        ask_price: 2000.40,
+        ask_size: 1.0,
+        ..Default::default()
+    };
+    strategy.calculate_pricing_inputs(&exchanges, &arcus_bbo);
+    assert_eq!(
+        strategy.price_evidence.map(|e| e.source),
+        Some("local_touch_micro")
+    );
+
+    // 2. Low remaining volume quota (`5 < 10`) halts new flat entries, yet preserves reducing asks.
+    strategy.account_stats.portfolio_value = 1000.0;
+    strategy.account_stats.available_balance = 900.0;
+    let baseline_risk = strategy.build_risk_snapshot(2000.0);
+    let healthy_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &baseline_risk, 0.0)
+        .unwrap();
+    assert!(healthy_target.bid_size > 0.0 && healthy_target.ask_size > 0.0);
+
+    quota_rem.store(5, std::sync::atomic::Ordering::Release);
+    let starved_flat = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &baseline_risk, 0.0)
+        .unwrap();
+    assert_eq!(starved_flat.bid_size, 0.0);
+    assert_eq!(starved_flat.ask_size, 0.0);
+
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.01;
+    let long_risk = strategy.build_risk_snapshot(2000.0);
+    let starved_long = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &long_risk, 0.0)
+        .unwrap();
+    assert_eq!(starved_long.bid_size, 0.0);
+    assert!(starved_long.ask_size > 0.0);
+
+    // 3. DefenseStateMachine Caution -> ReduceOnly preserves exit while blocking flat entries.
+    quota_rem.store(100, std::sync::atomic::Ordering::Release);
+    strategy.account_stats.position = 0.0;
+    let now_ms = 10_000;
+    assert_eq!(
+        strategy.defense.evaluate(
+            strategy.config.defense_policy,
+            now_ms,
+            10.0, // >= 8.0 Caution
+            0.0,
+            true,
+        ),
+        defense::DefenseRegime::Caution
+    );
+    assert_eq!(strategy.defense_caution_widen_bps(), 2.0);
+    let caution_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &baseline_risk, 0.0)
+        .unwrap();
+    assert!(caution_target.bid_size < healthy_target.bid_size);
+    assert!(caution_target.ask_size < healthy_target.ask_size);
+
+    assert_eq!(
+        strategy.defense.evaluate(
+            strategy.config.defense_policy,
+            now_ms + 100,
+            25.0, // >= 20.0 ReduceOnly
+            0.0,
+            true,
+        ),
+        defense::DefenseRegime::ReduceOnly
+    );
+    let ro_long = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &long_risk, 0.0)
+        .unwrap();
+    assert_eq!(ro_long.bid_size, 0.0);
+    assert!(ro_long.ask_size > 0.0);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn vmm07_notional_normalized_as_inventory_and_vol_gap_reset_behave_deterministically() {
+    let mut vol_legacy = TimeScaledVolatility::new();
+    let mut vol_reset = TimeScaledVolatility::new();
+    let t0 = Instant::now();
+    let mut px = 100.0;
+    for i in 0..=40 {
+        let t = t0 + Duration::from_millis(i * 500);
+        px *= if i % 2 == 0 { 1.001 } else { 0.999 };
+        vol_legacy.update_with_gap_reset(px, t, None);
+        vol_reset.update_with_gap_reset(px, t, Some(Duration::from_secs(60)));
+    }
+    assert!(vol_legacy.sigma().is_some());
+    assert!(vol_reset.sigma().is_some());
+
+    // After a 120s feed gap, legacy preserves prior variance while gap-reset clears to re-warm.
+    // Backward / duplicate timestamps never corrupt state.
+    let gap_at = t0 + Duration::from_secs(140);
+    vol_legacy.update_with_gap_reset(px, t0 + Duration::from_secs(10), None);
+    vol_legacy.update_with_gap_reset(px * 1.002, gap_at, None);
+    vol_reset.update_with_gap_reset(px * 1.002, gap_at, Some(Duration::from_secs(60)));
+    assert!(vol_legacy.sigma().is_some());
+    assert!(vol_reset.sigma().is_none());
+
+    // Cold-start `normalize_cold_start_sigma_by_poll` scales sigma by 1 / sqrt(poll_secs).
+    let (mut s_fast, _, dir_fast) = wake_test_strategy(250, 50);
+    let (mut s_slow, _, dir_slow) = wake_test_strategy(250, 50);
+    for (s, poll_ms) in [(&mut s_fast, 100u64), (&mut s_slow, 400u64)] {
+        s.config.poll_interval_ms = poll_ms;
+        s.config.require_external_fair_value = false;
+        s.config.normalize_cold_start_sigma_by_poll = true;
+        s.use_local_fair_value();
+        s.micro.update(2000.0);
+        s.micro.update(2002.0);
+        s.micro.update(2000.0);
+        s.last_micro_sample = Some(Instant::now());
+    }
+    let t_bbo = wall_time_ns().saturating_sub(50_000_000);
+    let empty = [(0u8, ShmBboMessage::default()); crate::shm_reader::NUM_EXCHANGES];
+    let bbo = ShmBboMessage {
+        exchange_id: 2,
+        symbol_id: s_fast.config.symbol_id,
+        timestamp_ns: t_bbo,
+        bid_price: 1999.9,
+        bid_size: 2.0,
+        ask_price: 2000.1,
+        ask_size: 2.0,
+        ..Default::default()
+    };
+    let in_fast = s_fast.calculate_pricing_inputs(&empty, &bbo);
+    let in_slow = s_slow.calculate_pricing_inputs(&empty, &bbo);
+    assert!(((in_fast.sigma_per_sqrt_sec / in_slow.sigma_per_sqrt_sec) - 2.0).abs() < 1e-9);
+
+    // Cross-asset USD-notional A-S normalization produces invariant relative bps reservation skew.
+    for s in [&mut s_fast, &mut s_slow] {
+        s.config.as_gamma = 500.0;
+        s.config.as_time_horizon_sec = 1.0;
+        s.config.as_kappa = 500.0;
+        s.config.inventory_skew_bps = 0.0;
+        s.config.penny_ticks = 0.0;
+        s.config.min_profit_bps = 2.0;
+        s.config.maker_fee_bps = 0.0;
+        s.config.max_spread_bps = 120.0;
+        s.config.as_inventory_notional_usd = Some(500.0);
+    }
+    s_fast.config.tick_size = 0.1; // BTC ($100,000, q=0.005 -> $500)
+    s_slow.config.tick_size = 0.000001; // XRP ($0.50, q=1000.0 -> $500)
+    let (btc_bid, btc_ask, _) = s_fast
+        .calculate_optimal_quotes(
+            &PricingInputs {
+                mid: 100_000.0,
+                pricing_mid: 100_000.0,
+                bid_touch: 99_990.0,
+                ask_touch: 100_010.0,
+                vol_bps: 10.0,
+                sigma_per_sqrt_sec: 0.002,
+                as_score: 0.0,
+                using_external_fair_value: false,
+                order_flow_bps: 0.0,
+                local_ofi_bps: 0.0,
+                cancel_bump_bps: 0.0,
+                cross_market_bps: 0.0,
+                volatility_pressure: 0.0,
+                #[cfg(feature = "research-replay")]
+                participation_bbo: None,
+            },
+            0.005,
+        )
+        .unwrap();
+    let (xrp_bid, xrp_ask, _) = s_slow
+        .calculate_optimal_quotes(
+            &PricingInputs {
+                mid: 0.50,
+                pricing_mid: 0.50,
+                bid_touch: 0.49995,
+                ask_touch: 0.50005,
+                vol_bps: 10.0,
+                sigma_per_sqrt_sec: 0.002,
+                as_score: 0.0,
+                using_external_fair_value: false,
+                order_flow_bps: 0.0,
+                local_ofi_bps: 0.0,
+                cancel_bump_bps: 0.0,
+                cross_market_bps: 0.0,
+                volatility_pressure: 0.0,
+                #[cfg(feature = "research-replay")]
+                participation_bbo: None,
+            },
+            1000.0,
+        )
+        .unwrap();
+    let btc_skew_bps = ((0.5 * (btc_bid + btc_ask) - 100_000.0) / 100_000.0) * 10_000.0;
+    let xrp_skew_bps = ((0.5 * (xrp_bid + xrp_ask) - 0.50) / 0.50) * 10_000.0;
+    assert!((btc_skew_bps - xrp_skew_bps).abs() < 0.05);
+
+    // Fee-floor dominates near-zero gamma without breaking spread invariant.
+    s_slow.config.as_gamma = 1e-6;
+    s_slow.config.maker_fee_bps = 10.0;
+    let (fee_bid, fee_ask, _) = s_slow
+        .calculate_optimal_quotes(
+            &PricingInputs {
+                mid: 100.0,
+                pricing_mid: 100.0,
+                bid_touch: 99.9,
+                ask_touch: 100.1,
+                vol_bps: 1.0,
+                sigma_per_sqrt_sec: 1e-5,
+                as_score: 0.0,
+                using_external_fair_value: false,
+                order_flow_bps: 0.0,
+                local_ofi_bps: 0.0,
+                cancel_bump_bps: 0.0,
+                cross_market_bps: 0.0,
+                volatility_pressure: 0.0,
+                #[cfg(feature = "research-replay")]
+                participation_bbo: None,
+            },
+            0.0,
+        )
+        .unwrap();
+    assert!(((fee_ask - fee_bid) / 100.0) * 10_000.0 >= 22.0 - 1e-6);
+
+    std::fs::remove_dir_all(dir_fast).unwrap();
+    std::fs::remove_dir_all(dir_slow).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn sprint5_passive_touch_flatten_schmitt_toxicity_cooldown_and_retreat_cooldown() {
+    use crate::config::{LocalToxicityConfig, QuoteHysteresisConfig};
+    use components::EntryRatchetPolicy;
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.symbol_id = crate::config::SYM_ETH;
+    strategy.config.tick_size = 0.01;
+    strategy.config.step_size = 0.001;
+    strategy.config.grid_levels = 1;
+    strategy.config.min_profit_bps = 8.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.position_timeout_secs = 60;
+    strategy.config.base_order_notional_usd = 50.0;
+    strategy.config.max_position_notional_usd = 500.0;
+    strategy.config.local_toxicity = Some(LocalToxicityConfig {
+        ofi_half_life_ms: 100,
+        ofi_withdraw_threshold: Some(0.6),
+        withdraw_cooldown_ms: 2_000,
+        withdraw_clear_ratio: Some(0.5),
+        ..Default::default()
+    });
+    strategy.config.quote_hysteresis = Some(QuoteHysteresisConfig {
+        cancel_min_profit_bps: 2.0,
+        flatten_min_profit_bps: 0.0,
+        entry_requote_threshold_bps: Some(4.0),
+        asymmetric_entry_ratchet: true,
+        adverse_retreat_threshold_bps: Some(1.0),
+        passive_touch_flatten_age_fraction: Some(0.5),
+        adverse_retreat_reentry_cooldown_ms: 1_500,
+        ..Default::default()
+    });
+    strategy.config.validate().unwrap();
+    strategy.account_stats.portfolio_value = 1000.0;
+    strategy.account_stats.available_balance = 900.0;
+
+    // 1. Schmitt trigger + cooldown keeps bid withdrawn at -0.40 after tripping at -0.65.
+    strategy.last_local_ofi_norm = -0.65;
+    let flat_risk = strategy.build_risk_snapshot(2000.0);
+    let tripped = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &flat_risk, 0.0)
+        .unwrap();
+    assert_eq!(tripped.bid_size, 0.0);
+    assert!(tripped.ask_size > 0.0);
+
+    tokio::time::advance(Duration::from_millis(2_500)).await;
+    strategy.last_local_ofi_norm = -0.40; // Still latched (> -0.30 clear ratio)
+    let latched = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &flat_risk, 0.0)
+        .unwrap();
+    assert_eq!(latched.bid_size, 0.0);
+
+    strategy.last_local_ofi_norm = -0.20; // Below hysteresis band -> unlatches
+    let cleared = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &flat_risk, 0.0)
+        .unwrap();
+    assert!(cleared.bid_size > 0.0);
+
+    // 2. Passive pre-timeout touch flatten pulls aged reducing ask to touch without crossing.
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.01;
+    let deadband = strategy.config.step_size * 0.5;
+    strategy
+        .inventory_age
+        .observe(0.01, deadband, Instant::now());
+    let inputs = PricingInputs {
+        mid: 2000.0,
+        pricing_mid: 2000.0,
+        bid_touch: 1999.90,
+        ask_touch: 2000.00,
+        vol_bps: 10.0,
+        sigma_per_sqrt_sec: 0.001,
+        as_score: 0.0,
+        using_external_fair_value: false,
+        order_flow_bps: 0.0,
+        local_ofi_bps: 0.0,
+        cancel_bump_bps: 0.0,
+        cross_market_bps: 0.0,
+        volatility_pressure: 0.0,
+        #[cfg(feature = "research-replay")]
+        participation_bbo: None,
+    };
+    let (bid_0, ask_0, _) = strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+    assert!(bid_0 < ask_0 && ask_0 > 2000.80);
+    tokio::time::advance(Duration::from_secs(55)).await;
+    let (bid_55, ask_55, _) = strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+    assert!(bid_55 < ask_55 && ask_55 < 2000.00 + 0.25 * (ask_0 - 2000.00));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let (bid_60, ask_60, _) = strategy.calculate_optimal_quotes(&inputs, 0.01).unwrap();
+    assert!(bid_60 < ask_60 && (ask_60 - 2000.00).abs() < 1e-9);
+    let long_risk = strategy.build_risk_snapshot(2000.0);
+    // Even if touch blend narrows spread below `min_profit_bps` (8 bps), exit quote stays accepted!
+    let target = strategy
+        .build_quote_target(1999.70, 2000.00, 2000.0, &long_risk, 0.0)
+        .unwrap();
+    assert!(target.ask_size > 0.0);
+
+    // 3. `SideExecutionPlan.had_adverse_retreat` triggers cleanly on adverse drift.
+    let cancel_bounds =
+        MakerPriceBounds::new_asymmetric(2000.0, 2000.0, 0.0, 2.0, 2.0, 0.01).unwrap();
+    let retreat_plan = execution::build_side_execution_plan_with_options(
+        &strategy.config,
+        &[active_order(9, 901, OrderSide::Buy, 1999.20, 0.02, 0)],
+        OrderType::PostOnly,
+        Side::Buy,
+        1998.80,
+        0.02,
+        0.80,
+        0.25,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        Some(EntryRatchetPolicy {
+            favorable_hold_threshold: 0.80,
+            adverse_retreat_threshold: 0.20,
+        }),
+    );
+    assert!(retreat_plan.had_adverse_retreat);
+    assert_eq!(retreat_plan.to_cancel, vec![901]);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn utilization_floor_cap_causal_l1_depth_cap_and_cancel_reasons_work() {
+    use components::{CancelReason, round_down_to_step};
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config = InventoryNeutralMMConfig {
+        base_order_notional_usd: 50.0,
+        max_position_notional_usd: 500.0,
+        inventory_urgency_notional_usd: 250.0,
+        reference_portfolio_value: 50_000.0,
+        min_portfolio_scale: 1.0,
+        max_portfolio_scale: 1.0,
+        target_resting_margin_utilization: 0.05,
+        max_leverage: 2.0,
+        grid_levels: 2,
+        grid_size_decay: 0.7,
+        ..test_config()
+    };
+    strategy.config.validate().unwrap();
+    strategy.account_stats.portfolio_value = 50_000.0;
+    strategy.account_stats.available_balance = 50_000.0;
+    let un_capped = strategy.build_risk_snapshot(2000.0);
+    assert!(
+        un_capped.base_order_size > 0.03,
+        "legacy utilization floor inflates base_order_size: {}",
+        un_capped.base_order_size
+    );
+
+    strategy.config.cap_utilization_floor_to_base_notional = true;
+    let capped_risk = strategy.build_risk_snapshot(2000.0);
+    assert!(
+        (capped_risk.base_order_size - 0.025).abs() < 1e-9,
+        "cap_utilization_floor_to_base_notional must hold $50 / $2000 = 0.025, got {}",
+        capped_risk.base_order_size
+    );
+
+    // Causal L1 touch depth cap constrains only inventory-adding side when fresh local BBO is available.
+    strategy.config.max_top_book_depth_fraction = Some(0.10);
+    strategy.config.validate().unwrap();
+    strategy.last_local_l1_notional = Some([100.0, 400.0]);
+    let flat_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &capped_risk, 0.0)
+        .unwrap();
+    assert_eq!(
+        flat_target.bid_size, 0.0,
+        "10% of $100 bid L1 < $11 min notional"
+    );
+    assert!(
+        (flat_target.ask_size - round_down_to_step(40.0 / 2001.0, strategy.config.step_size)).abs()
+            < 1e-9
+    );
+
+    // Long inventory: Bid (entry) stays capped to 0, while Ask (reducing) ignores small Ask L1 cap!
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.025;
+    strategy.last_local_l1_notional = Some([100.0, 100.0]);
+    let long_risk = strategy.build_risk_snapshot(2000.0);
+    let long_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &long_risk, 0.0)
+        .unwrap();
+    assert_eq!(long_target.bid_size, 0.0);
+    assert!(
+        long_target.ask_size > 0.02,
+        "reducing Ask must never be suppressed by entry L1 depth cap: {}",
+        long_target.ask_size
+    );
+
+    // Verify CancelReason tagging for non-RO reducing cancellation, S6-1 exposure retention
+    // while the cancel is still in flight, next-cycle RO replenishment, and pure grid fill-in.
+    let cancel_bounds =
+        MakerPriceBounds::new_asymmetric(2000.0, 2000.0, 0.0, 1.0, 1.0, 0.01).unwrap();
+    let non_ro_existing = active_order(11, 1101, OrderSide::Sell, 2001.0, 0.05, 0);
+    let ro_plan = execution::build_side_execution_plan_full(
+        &strategy.config,
+        &[non_ro_existing],
+        OrderType::PostOnly,
+        Side::Sell,
+        2001.0,
+        0.025,
+        0.5,
+        0.2,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        None,
+        Some(0.025),
+        false,
+        None,
+    );
+    assert_eq!(
+        ro_plan.cancel_reasons,
+        vec![(1101, CancelReason::ReducingCapOrNonRo)]
+    );
+    assert!(
+        ro_plan.to_place.is_empty(),
+        "S6-1 must wait for 0.05 non-RO cancel to settle before placing 0.025 RO"
+    );
+    let ro_next_plan = execution::build_side_execution_plan_full(
+        &strategy.config,
+        &[],
+        OrderType::PostOnly,
+        Side::Sell,
+        2001.0,
+        0.025,
+        0.5,
+        0.2,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        None,
+        Some(0.025),
+        false,
+        None,
+    );
+    assert!(!ro_next_plan.to_place.is_empty());
+    assert!(ro_next_plan.to_place.iter().all(|o| o.reduce_only));
+
+    let ramp_plan = execution::build_side_execution_plan_full(
+        &strategy.config,
+        &[active_order(12, 1201, OrderSide::Buy, 1999.0, 0.025, 0)],
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.0,
+        0.025,
+        0.5,
+        0.2,
+        1,
+        Some(cancel_bounds),
+        None,
+        false,
+        None,
+        None,
+        false,
+        None,
+    );
+    assert!(ramp_plan.is_pure_grid_fill_in);
+    assert!(ramp_plan.to_cancel.is_empty());
+    assert_eq!(ramp_plan.to_place.len(), 1);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cross_sectional_one_sided_veto_blocks_adverse_entry_but_preserves_exit_and_expires() {
+    use crate::strategy::cross_sectional::{
+        CrossSectionalConfig, CrossSectionalDirection, CrossSectionalEngine,
+    };
+
+    let cs_cfg = CrossSectionalConfig {
+        symbols: vec![1001, 1002, 1003, 1004],
+        direction: CrossSectionalDirection::FundingCarry,
+        lookback_ms: 86_400_000,
+        max_quote_staleness_ms: 5_000,
+        max_funding_staleness_ms: 7_200_000,
+        rebalance_interval_ms: 28_800_000,
+        legs_per_side: 1,
+        min_active_symbols: None,
+        leg_notional_usd: 50.0,
+        vol_target_pnl_usd: None,
+        min_leg_notional_usd: None,
+        min_spread_return_bps: 1.0,
+        rank_hysteresis_bps: 0.0,
+        max_adverse_funding_bps: None,
+        maker_chase_window_ms: 30_000,
+        ioc_fallback_max_slippage_bps: None,
+    };
+    cs_cfg.validate().unwrap();
+    let mut cs = CrossSectionalEngine::new(cs_cfg).unwrap();
+    let now = 1_700_086_400_000_u64;
+    for &(sym, rate_bps) in &[(1001, -4.0), (1002, -0.5), (1003, 0.5), (1004, 4.5)] {
+        assert!(cs.observe_book(sym, now, now, 100.0, 100.1));
+        assert!(cs.observe_funding(sym, now - 60_000, now - 60_000, rate_bps));
+    }
+    let [veto_bid, veto_ask] = cs.mm_blocked_entry_sides(1004, now, 1);
+    assert!(veto_bid && !veto_ask);
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.symbol_id = 1004;
+    strategy.config.tick_size = 0.01;
+    strategy.config.step_size = 0.001;
+    strategy.config.min_profit_bps = 4.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.base_order_notional_usd = 50.0;
+    strategy.config.max_position_notional_usd = 500.0;
+    strategy.config.cap_utilization_floor_to_base_notional = true;
+    strategy.account_stats.portfolio_value = 1_000.0;
+    strategy.account_stats.available_balance = 900.0;
+    strategy.set_external_entry_side_veto(veto_bid, veto_ask, Duration::from_secs(5));
+
+    // When flat, adverse bottom-tail BID entry is blocked while ASK stays active.
+    let flat_risk = strategy.build_risk_snapshot(100.05);
+    let flat_target = strategy
+        .build_quote_target(100.0, 100.1, 100.05, &flat_risk, 0.0)
+        .unwrap();
+    assert_eq!(flat_target.bid_size, 0.0);
+    assert!(flat_target.ask_size > 0.0);
+
+    // When long (+0.01) on top-carry sym 1001 (`veto_ask = true`), ASK reduces inventory so it MUST remain unblocked!
+    let [bid_v1, ask_v1] = cs.mm_blocked_entry_sides(1001, now, 1);
+    assert!(!bid_v1 && ask_v1);
+    strategy.set_external_entry_side_veto(bid_v1, ask_v1, Duration::from_secs(5));
+    let flat_ask_vetoed = strategy
+        .build_quote_target(100.0, 100.1, 100.05, &flat_risk, 0.0)
+        .unwrap();
+    assert!(flat_ask_vetoed.bid_size > 0.0);
+    assert_eq!(flat_ask_vetoed.ask_size, 0.0);
+
+    apply_test_fill(&tracker, 1, 1);
+    strategy.account_stats.position = 0.01;
+    let long_risk = strategy.build_risk_snapshot(100.05);
+    let long_target = strategy
+        .build_quote_target(100.0, 100.1, 100.05, &long_risk, 0.01)
+        .unwrap();
+    assert!(
+        long_target.ask_size > 0.0,
+        "reducing ask must never be vetoed while long"
+    );
+
+    // After TTL expires, two-sided entry quoting resumes cleanly.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let post_ttl_target = strategy
+        .build_quote_target(100.0, 100.1, 100.05, &flat_risk, 0.0)
+        .unwrap();
+    assert!(post_ttl_target.bid_size > 0.0);
+    assert!(post_ttl_target.ask_size > 0.0);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn risk_budgeted_gamma_and_markout_quantile_floor_scale_quotes_by_actual_risk() {
+    use crate::config::{LocalToxicityConfig, MarkoutReserveConfig};
+
+    let (mut strategy, tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.tick_size = 0.001;
+    strategy.config.step_size = 0.001;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.min_profit_bps = 1.0;
+    strategy.config.max_spread_bps = 60.0;
+    strategy.config.as_gamma = 5000.0;
+    strategy.config.as_kappa = 2000.0;
+    strategy.config.as_time_horizon_sec = 1.0;
+    strategy.config.max_position = 0.01;
+    strategy.config.max_position_notional_usd = 0.0;
+    strategy.config.inventory_skew_bps = 0.0;
+    strategy.config.quote_hysteresis = None;
+    strategy.config.min_portfolio_scale = 1.0;
+    strategy.config.max_portfolio_scale = 1.0;
+    strategy.config.local_toxicity = Some(LocalToxicityConfig {
+        enable_local_markout: true,
+        ..Default::default()
+    });
+    strategy.config.markout_reserve = Some(MarkoutReserveConfig {
+        max_widen_bps: 15.0,
+        close_cost_bps: 0.0,
+        max_sample_age_ms: 120_000,
+        quantile_floor_p: Some(0.5),
+    });
+
+    // Build PricingInputs with sigma = 1e-4 (1 bp/sqrt(s)) at max_pos q = 0.01.
+    // Use wide touch bounds first so touch anchoring does not mask the -8.0 bps reservation shift.
+    // Without as_risk_budget_bps_at_max_pos, 5000 * (1e-4)^2 * 0.01 = 5e-7 = 0.005 bps!
+    let wide_inputs = PricingInputs {
+        bid_touch: 998.00,
+        ask_touch: 1002.00,
+        mid: 1000.0,
+        pricing_mid: 1000.0,
+        using_external_fair_value: false,
+        as_score: 0.0,
+        vol_bps: 1.0,
+        sigma_per_sqrt_sec: 1e-4,
+        order_flow_bps: 0.0,
+        local_ofi_bps: 0.0,
+        cancel_bump_bps: 0.0,
+        cross_market_bps: 0.0,
+        volatility_pressure: 0.0,
+        #[cfg(feature = "research-replay")]
+        participation_bbo: None,
+    };
+    let (legacy_bid, legacy_ask, _) = strategy
+        .calculate_optimal_quotes(&wide_inputs, 0.01)
+        .unwrap();
+    let legacy_mid = 0.5 * (legacy_bid + legacy_ask);
+    let legacy_shift = (1000.0 - legacy_mid) / 1000.0 * 10_000.0;
+    assert!(
+        legacy_shift < 0.05,
+        "confirm default uncalibrated as_gamma barely moves reservation price (~0.005 bps), got {legacy_shift:.4} bps"
+    );
+
+    // With 2.0 bps risk budget at max_pos, both sides stay outside placement_bounds (min_ask = 1000.05),
+    // so mid shifts by 2.0 bps while spread keeps kappa. With 8.0 bps budget, bid shifts by 8.0 bps
+    // while ask respects placement_bounds.min_ask safety instead of selling below fair value.
+    strategy.config.as_risk_budget_bps_at_max_pos = Some(2.0);
+    let (cal2_bid, cal2_ask, _) = strategy
+        .calculate_optimal_quotes(&wide_inputs, 0.01)
+        .unwrap();
+    let cal2_mid = 0.5 * (cal2_bid + cal2_ask);
+    let shift2_bps = (1000.0 - cal2_mid) / 1000.0 * 10_000.0;
+    assert!(
+        (shift2_bps - 2.0).abs() < 0.15,
+        "expected ~2.0 bps unclamped reservation shift, got {shift2_bps:.3} bps"
+    );
+    strategy.config.as_risk_budget_bps_at_max_pos = Some(8.0);
+    let (cal8_bid, cal8_ask, _) = strategy
+        .calculate_optimal_quotes(&wide_inputs, 0.01)
+        .unwrap();
+    let bid_shift8_bps = (legacy_bid - cal8_bid) / 1000.0 * 10_000.0;
+    assert!(
+        (bid_shift8_bps - 8.0).abs() < 0.15,
+        "expected ~8.0 bps bid shift, got {bid_shift8_bps:.3} bps"
+    );
+    assert!(
+        cal8_ask >= 1000.05,
+        "ask must still honor placement_bounds.min_ask"
+    );
+
+    // Record 8 toxic BUY fills @ 1000.0 whose 1s markout moves to 999.50 (-5.0 bps).
+    // Fee(0) + loss(5.0) + half_profit(0.5) = 5.5 bps floor -> entry bid <= 999.45!
+    strategy.config.as_risk_budget_bps_at_max_pos = None;
+    for seq in 1..=8_u64 {
+        let oid = seq as i64;
+        tracker.start_tracking(oid, crate::order_tracker::OrderSide::Buy, 1000.0, 0.01);
+        let fill = crate::types::ShmPrivateEventV2::order_filled(
+            seq * 2,
+            2,
+            0,
+            50_000 + seq,
+            oid,
+            oid,
+            1000.0,
+            0.01,
+            0.0,
+            0.0,
+            false,
+            0,
+            seq,
+        );
+        tracker.apply_event(&fill).unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    strategy
+        .markout
+        .update(&tracker, 999.50, tokio::time::Instant::now());
+
+    // Flat entry BID must be clamped at <= 999.45 (5.5 bps below fair), even with tight touch!
+    let tight_inputs = PricingInputs {
+        bid_touch: 999.95,
+        ask_touch: 1000.05,
+        ..wide_inputs
+    };
+    let (entry_bid, entry_ask, _) = strategy
+        .calculate_optimal_quotes(&tight_inputs, 0.0)
+        .unwrap();
+    assert!(
+        entry_bid <= 999.46,
+        "expected toxic buy entry bid <= 999.46 (5.5bp floor), got {entry_bid}"
+    );
+    assert!(entry_ask > 1000.0);
+
+    // Reducing BID while short (-0.01) must NOT be pushed down by the buy-entry markout floor!
+    let (exit_bid, _, _) = strategy
+        .calculate_optimal_quotes(&tight_inputs, -0.01)
+        .unwrap();
+    assert!(
+        exit_bid > entry_bid,
+        "reducing bid ({exit_bid}) must remain closer to touch than toxic entry bid ({entry_bid})"
+    );
 
     std::fs::remove_dir_all(directory).unwrap();
 }

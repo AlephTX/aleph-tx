@@ -3,7 +3,7 @@
 use super::*;
 use anyhow::{Context, ensure};
 use rust_decimal::Decimal;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Deserialize)]
 struct OrderHistory {
@@ -89,54 +89,144 @@ pub(crate) fn order_history(response: &serde_json::Value) -> Result<Vec<Historic
     Ok(response.orders)
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryMode {
+    Flatten,
+    ReconcileInPlace,
+}
+
 impl LighterTrading {
     pub(super) async fn recover_flat(&self) -> Result<()> {
-        let tracker = self
-            .order_tracker
-            .as_ref()
-            .context("Shutdown recovery requires the order tracker")?;
+        self.recover_with_mode(RecoveryMode::Flatten)
+            .await
+            .map(|_| ())
+    }
+
+    pub(super) async fn reconcile_non_flat(&self) -> Result<f64> {
+        self.recover_with_mode(RecoveryMode::ReconcileInPlace).await
+    }
+
+    async fn recover_with_mode(&self, mode: RecoveryMode) -> Result<f64> {
+        let tracker = self.order_tracker.as_ref().context(match mode {
+            RecoveryMode::Flatten => "Shutdown recovery requires the order tracker",
+            RecoveryMode::ReconcileInPlace => {
+                "In-session reconciliation requires the order tracker"
+            }
+        })?;
         tracker.require_reconciliation();
         let mut orders = BTreeSet::new();
-        let mut canceled = BTreeSet::new();
-        let mut closes = 0;
-        for _ in 0..10 {
+        let mut last_cancel_round: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut unindexed_cancel_observed = false;
+        let mut closes = 0usize;
+        for round in 0usize..10 {
             let epoch = tracker.reconciliation_epoch();
             orders.extend(tracker.recovery_cois());
             let open = self.get_active_orders().await?;
             if !open.is_empty() {
-                orders.extend(open.iter().map(|order| order.client_order_index));
-                let actions: Vec<_> = open
+                for order in &open {
+                    if order.client_order_index > 0 {
+                        orders.insert(order.client_order_index);
+                    } else {
+                        unindexed_cancel_observed = true;
+                    }
+                }
+                let cancel_targets: Vec<i64> = open
                     .iter()
-                    .filter(|order| canceled.insert(order.order_index))
-                    .map(|order| BatchAction::Cancel(order.order_index))
+                    .filter(|order| {
+                        last_cancel_round
+                            .get(&order.order_index)
+                            .is_none_or(|&prev| round.saturating_sub(prev) >= 2)
+                    })
+                    .map(|order| order.order_index)
                     .collect();
-                for chunk in actions.chunks(50) {
-                    self.execute_batch(chunk.to_vec()).await?;
+                let mut cancel_failed = false;
+                for chunk in cancel_targets.chunks(50) {
+                    let batch: Vec<_> = chunk.iter().copied().map(BatchAction::Cancel).collect();
+                    match self.execute_batch(batch).await {
+                        Ok(_) => {
+                            for &oid in chunk {
+                                last_cancel_round.insert(oid, round);
+                            }
+                        }
+                        Err(err) => {
+                            if round + 1 >= 10 {
+                                return Err(err);
+                            }
+                            tracing::warn!(
+                                round,
+                                error = %err,
+                                "Lighter recovery cancel batch failed; retrying on next round"
+                            );
+                            cancel_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if cancel_failed {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
                 }
             } else if let Some(fill_time) = self.terminal_fill_time(&orders).await? {
                 let account = self.position_evidence().await?;
                 let position = account.position;
-                if account.covers(fill_time) && tracker.reconciliation_epoch() == epoch {
-                    if position.is_zero() {
-                        if tracker.confirm_recovered_flat(epoch, &orders) {
-                            tracing::info!(
-                                "Lighter REST recovery confirmed zero position and terminal orders"
-                            );
-                            return Ok(());
+                let watermark_ok = account.covers(fill_time)
+                    && (!unindexed_cancel_observed
+                        || account.transaction_time.is_some()
+                        || !last_cancel_round.is_empty());
+                if watermark_ok && tracker.reconciliation_epoch() == epoch {
+                    match mode {
+                        RecoveryMode::Flatten => {
+                            if position.is_zero() {
+                                if tracker.confirm_recovered_flat(epoch, &orders) {
+                                    tracing::info!(
+                                        "Lighter REST recovery confirmed zero position and terminal orders"
+                                    );
+                                    return Ok(0.0);
+                                }
+                            } else {
+                                ensure!(
+                                    closes < 3,
+                                    "Lighter REST recovery left residual inventory"
+                                );
+                                let pos_f64: f64 = position.try_into()?;
+                                let touch = self.recovery_touch(pos_f64 > 0.0).await?;
+                                let close = self
+                                    .place_order_with_proof(
+                                        self.close_order(pos_f64, touch)?,
+                                        Some(pos_f64),
+                                    )
+                                    .await?;
+                                orders.insert(close.client_order_index);
+                                closes += 1;
+                            }
                         }
-                    } else {
-                        ensure!(closes < 3, "Lighter REST recovery left residual inventory");
-                        let position: f64 = position.try_into()?;
-                        let touch = self.recovery_touch(position > 0.0).await?;
-                        let close = self.place_order(self.close_order(position, touch)?).await?;
-                        orders.insert(close.client_order_index);
-                        closes += 1;
+                        RecoveryMode::ReconcileInPlace => {
+                            let pos_f64: f64 = position.try_into()?;
+                            if tracker.confirm_recovered_position(epoch, pos_f64, &orders) {
+                                tracing::info!(
+                                    position = pos_f64,
+                                    "Lighter REST recovery confirmed authoritative position and terminal orders"
+                                );
+                                return Ok(pos_f64);
+                            }
+                        }
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!("Lighter REST recovery could not prove zero position and terminal orders")
+        match mode {
+            RecoveryMode::Flatten => {
+                anyhow::bail!(
+                    "Lighter REST recovery could not prove zero position and terminal orders"
+                )
+            }
+            RecoveryMode::ReconcileInPlace => {
+                anyhow::bail!(
+                    "Lighter REST recovery could not prove terminal orders and authoritative position"
+                )
+            }
+        }
     }
 
     // The absence of an order from either REST endpoint is insufficient. For
@@ -409,7 +499,9 @@ mod tests {
         trading.test_auth_token = Some("fixture-read-auth");
         let tracker = Arc::new(OrderTracker::new());
         assert!(tracker.start_tracking(123, TrackerSide::Buy, 2000.0, 0.02));
-        assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.0));
+        assert!(
+            tracker.confirm_recovered_flat(tracker.reconciliation_epoch(), &BTreeSet::from([123]))
+        );
         tracker
             .apply_event(&crate::types::ShmPrivateEventV2::order_filled(
                 0, 2, 1002, 1, 123, 1, 2000.0, 0.02, 0.0, 0.0, false, 0, 1,
@@ -458,6 +550,25 @@ mod tests {
         assert!(format!("{:#}", result.unwrap_err()).contains("more than once"));
         assert_eq!(requests, 1);
         assert!(unreconciled);
+    }
+
+    #[tokio::test]
+    async fn reconcile_non_flat_confirms_nonzero_position_without_flattening() {
+        let (url, served, server) =
+            recovery_venue(vec![account(Some(20), "0.25"), account(Some(30), "0.25")]).await;
+        let mut trading = LighterTrading::offline_test_client(&url);
+        trading.test_auth_token = Some("fixture-read-auth");
+        let tracker = Arc::new(OrderTracker::new());
+        assert!(tracker.start_tracking(123, TrackerSide::Buy, 2000.0, 0.25));
+        tracker.require_reconciliation();
+        trading.set_order_tracker(Arc::clone(&tracker));
+
+        let pos = trading.reconcile_non_flat().await.unwrap();
+        server.abort();
+        assert!((pos - 0.25).abs() < 1e-9);
+        assert!(!tracker.needs_reconciliation());
+        assert!((tracker.confirmed_position() - 0.25).abs() < 1e-9);
+        assert_eq!(served.load(std::sync::atomic::Ordering::Acquire), 2);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

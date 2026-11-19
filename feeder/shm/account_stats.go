@@ -67,14 +67,16 @@ func NewAccountStatsWriter(name string) (*AccountStatsWriter, error) {
 	// Avoid O_TRUNC (which causes SIGBUS on live mmaps); invalidate freshness
 	// timestamps under seqlock while preserving last Position across restarts.
 	cur := atomic.LoadUint64(&stats.Version)
-	if cur != 0 || stats.UpdatedAt != 0 || stats.PositionUpdatedAt != 0 {
+	updatedAt := atomic.LoadUint64(&stats.UpdatedAt)
+	posUpdatedAt := atomic.LoadUint64(&stats.PositionUpdatedAt)
+	if cur != 0 || cur&1 != 0 || updatedAt != 0 || posUpdatedAt != 0 {
 		step := uint64(1)
 		if cur&1 == 1 {
 			step = 2
 		}
 		odd := atomic.AddUint64(&stats.Version, step)
-		stats.UpdatedAt = 0
-		stats.PositionUpdatedAt = 0
+		atomic.StoreUint64(&stats.UpdatedAt, 0)
+		atomic.StoreUint64(&stats.PositionUpdatedAt, 0)
 		atomic.StoreUint64(&stats.Version, odd+1)
 	}
 
@@ -88,7 +90,9 @@ func (w *AccountStatsWriter) WriteStats(
 ) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.writeStatsLocked(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, w.stats.Position, w.stats.PositionUpdatedAt, timestampNs)
+	pos := math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&w.stats.Position))))
+	posUpdatedAt := atomic.LoadUint64(&w.stats.PositionUpdatedAt)
+	w.writeStatsLocked(collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower, pos, posUpdatedAt, timestampNs)
 }
 
 // WriteStatsWithPosition writes account statistics including position to shared memory.
@@ -110,22 +114,22 @@ func (w *AccountStatsWriter) writeStatsLocked(
 			return
 		}
 	}
-	if timestampNs == 0 || timestampNs < w.stats.UpdatedAt {
+	if timestampNs == 0 || timestampNs < atomic.LoadUint64(&w.stats.UpdatedAt) {
 		return
 	}
 	// Increment version first (AddUint64 provides acquire-release ordering on ARM64)
 	odd := atomic.AddUint64(&w.stats.Version, 1) // Odd = writing
 
-	// Write all fields
-	w.stats.Collateral = collateral
-	w.stats.PortfolioValue = portfolioValue
-	w.stats.Leverage = leverage
-	w.stats.AvailableBalance = availableBalance
-	w.stats.MarginUsage = marginUsage
-	w.stats.BuyingPower = buyingPower
-	w.stats.Position = position
-	w.stats.PositionUpdatedAt = positionTimestampNs
-	w.stats.UpdatedAt = timestampNs
+	// Write all fields atomically so Go -race and C11/Rust consumers avoid non-atomic data races.
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.Collateral)), math.Float64bits(collateral))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.PortfolioValue)), math.Float64bits(portfolioValue))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.Leverage)), math.Float64bits(leverage))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.AvailableBalance)), math.Float64bits(availableBalance))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.MarginUsage)), math.Float64bits(marginUsage))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.BuyingPower)), math.Float64bits(buyingPower))
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.Position)), math.Float64bits(position))
+	atomic.StoreUint64(&w.stats.PositionUpdatedAt, positionTimestampNs)
+	atomic.StoreUint64(&w.stats.UpdatedAt, timestampNs)
 
 	// Increment version again to signal write complete
 	atomic.StoreUint64(&w.stats.Version, odd+1) // Even = complete
@@ -140,13 +144,13 @@ func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if timestampNs < w.stats.PositionUpdatedAt {
+	if timestampNs < atomic.LoadUint64(&w.stats.PositionUpdatedAt) {
 		return
 	}
 	odd := atomic.AddUint64(&w.stats.Version, 1) // Odd = writing
 
-	w.stats.Position = position
-	w.stats.PositionUpdatedAt = timestampNs
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&w.stats.Position)), math.Float64bits(position))
+	atomic.StoreUint64(&w.stats.PositionUpdatedAt, timestampNs)
 
 	atomic.StoreUint64(&w.stats.Version, odd+1) // Even = complete
 }
@@ -154,14 +158,14 @@ func (w *AccountStatsWriter) WritePosition(position float64, timestampNs uint64)
 func (w *AccountStatsWriter) PositionNeedsRefresh(now, maxAge uint64) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	at := w.stats.PositionUpdatedAt
+	at := atomic.LoadUint64(&w.stats.PositionUpdatedAt)
 	return at == 0 || at > now || now-at >= maxAge
 }
 
 func (w *AccountStatsWriter) EquityNeedsRefresh(now, maxAge uint64) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	at := w.stats.UpdatedAt
+	at := atomic.LoadUint64(&w.stats.UpdatedAt)
 	return at == 0 || at > now || now-at >= maxAge
 }
 
@@ -181,6 +185,16 @@ func (w *AccountStatsWriter) InvalidatePosition() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	odd := atomic.AddUint64(&w.stats.Version, 1)
-	w.stats.PositionUpdatedAt = 0
+	atomic.StoreUint64(&w.stats.PositionUpdatedAt, 0)
+	atomic.StoreUint64(&w.stats.Version, odd+1)
+}
+
+// InvalidateEquity marks account equity stats unavailable without clearing Position
+// or PositionUpdatedAt when the user_stats stream closes or reconnects.
+func (w *AccountStatsWriter) InvalidateEquity() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	odd := atomic.AddUint64(&w.stats.Version, 1)
+	atomic.StoreUint64(&w.stats.UpdatedAt, 0)
 	atomic.StoreUint64(&w.stats.Version, odd+1)
 }

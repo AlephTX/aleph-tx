@@ -354,6 +354,23 @@ class CostCurveTests(unittest.TestCase):
         self.assertTrue(p0["cash_attribution_reconciled"])
         self.assertEqual(p0["observed_target_turnover"], exact_target)
         self.assertEqual(p0["reward_eligibility"]["rule_window_candidate_turnover"], exact_target)
+        self.assertNotIn("decomposed_overhead", p0)
+
+    def test_decomposed_overhead_strips_engine_tax_and_prorates_fixed_infra(self):
+        row = self.exact_cash_row()
+        legacy = point(row)
+        self.assertNotIn("decomposed_overhead", legacy)
+        self.assertEqual(Decimal(legacy["net_after_overhead"]), Decimal("-0.4"))
+
+        decomposed = point(row, fixed_overhead_usd_per_day="2.4", window_hours="10", strip_engine_overhead=True)
+        d = decomposed["decomposed_overhead"]
+        self.assertEqual(Decimal(d["variable_net_quote"]), Decimal("-0.3"))
+        self.assertEqual(Decimal(d["variable_cost_per_million_target"]), Decimal("300"))
+        self.assertEqual(Decimal(d["fixed_window_overhead_quote"]), Decimal("1"))
+        self.assertEqual(Decimal(d["net_after_fixed_window_overhead_quote"]), Decimal("-1.3"))
+        self.assertEqual(Decimal(d["all_in_cost_per_million_target_observed_pace"]), Decimal("1300"))
+        # $2.4/day * 30d / $50M = $1.44/M fixed at $50M/30d target pace
+        self.assertEqual(Decimal(d["all_in_cost_per_million_target_50m_30d_pace"]), Decimal("301.44"))
 
 
 if __name__ == "__main__":

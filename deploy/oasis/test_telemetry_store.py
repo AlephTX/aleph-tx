@@ -486,6 +486,12 @@ class StoreTest(unittest.TestCase):
         mark = self.store.summary(now_ms=5_000)["session"]["valuation"]["mark"]
         self.assertEqual((mark["source"], mark["freshness"], mark["feed_age_ms"]),
                          ("lighter_book", "observed", 3_700))
+        self.write({"type": "snapshot", "ts_ms": 1500, "mid": 2005.0,
+                    "mark_source": "local_touch_micro", "mark_sampled_ms": 1450, "mark_feed_ms": 1400})
+        self.store.ingest()
+        mark = self.store.summary(now_ms=5_000)["session"]["valuation"]["mark"]
+        self.assertEqual((mark["source"], mark["freshness"], mark["feed_age_ms"]),
+                         ("local_touch_micro", "observed", 3_600))
 
     def test_every_contradicting_clock_order_is_a_mismatch_without_ages(self):
         now = 5_000
@@ -547,6 +553,23 @@ class StoreTest(unittest.TestCase):
             self.assertIn("mark_time", session["valuation"]["missing"])
         finally:
             store.db.close()
+
+    def test_snapshot_ingests_quota_and_defense_regime_and_keeps_unknown_as_null(self):
+        self.write(
+            {"type": "session", "ts_ms": 1000, "exchange": "lighter", "symbol": "ETH"},
+            {"type": "snapshot", "ts_ms": 1100, "mid": 2000.0,
+             "volume_quota_remaining": 180, "defense_regime": "reduce_only"},
+            {"type": "snapshot", "ts_ms": 1200, "mid": 2001.0,
+             "volume_quota_remaining": True, "defense_regime": "bogus_regime"},
+        )
+        self.store.ingest()
+        rows = self.store.db.execute(
+            "SELECT ts_ms, volume_quota_remaining, defense_regime FROM snapshots ORDER BY ts_ms"
+        ).fetchall()
+        self.assertEqual(
+            [(r["ts_ms"], r["volume_quota_remaining"], r["defense_regime"]) for r in rows],
+            [(1100, 180, "reduce_only"), (1200, None, None)],
+        )
 
 DASHBOARD_FIXTURES = Path(__file__).resolve().parents[2] / "dashboard" / "src" / "fixtures"
 
@@ -654,6 +677,16 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
                     store.summary(now_ms=140_000, session_id="missing_session")
                 with self.assertRaises(ValueError):
                     store.pnl_series("1m", session_id="missing_session")
+
+                # /api/sessions returns full per-session valuation, open_orders, and equity_change
+                # matching /api/summary?session=<id> (`MON-H1`) without coercing missing marks to 0.
+                rows = {row["session_id"]: row for row in store.sessions(now_ms=140_000)}
+                self.assertEqual(set(rows), {"s_quant", "s_hedge"})
+                self.assertEqual(rows["s_quant"], quant["session"])
+                self.assertEqual(rows["s_hedge"], latest["session"])
+                self.assertAlmostEqual(rows["s_quant"]["total_pnl"], 2.0)
+                self.assertAlmostEqual(rows["s_quant"]["equity_change"], 2.0)
+                self.assertEqual(rows["s_quant"]["valuation"]["lighter"]["unrealized"], "flat")
             finally:
                 store.db.close()
 

@@ -53,6 +53,7 @@ fn observation(primary: &str, hedge: &str) -> Observation {
             received_at: Instant::now(),
         },
         hedge: d(hedge),
+        hedge_account_time_ms: 0,
         book: BestBidAsk {
             coin: "ETH".into(),
             timestamp_ms: 100,
@@ -143,6 +144,7 @@ fn ack_and_timeout_reserve_exposure_until_terminal_and_account_agree() {
         order,
         sent_at_ms: 100,
         expires_after_ms: 5_100,
+        pre_dispatch_account_time_ms: 0,
         venue_past_expiry: false,
         terminal: None,
         cancel_sent: false,
@@ -1203,4 +1205,95 @@ async fn expired_unknown_ioc_requires_causal_venue_clock_and_unchanged_position(
     let _ = Ordering::Acquire;
     server.abort();
     let _ = std::fs::remove_file(journal_path);
+}
+
+#[test]
+fn lagging_local_clock_rejects_stale_predispatch_account_snapshot_on_rejected_ioc() {
+    let pre_dispatch_venue_time = 2_000_000_005_000_u64;
+    let lagging_local_sent_ms = 2_000_000_004_800_u64; // local clock 200ms behind Hyperliquid!
+    let pending = PendingIoc {
+        id: "0xstale001".into(),
+        before: Decimal::ZERO,
+        order: PerpOrder {
+            is_buy: false,
+            limit_price: d("1998"),
+            size: d("0.03"),
+            reduce_only: false,
+            time_in_force: TimeInForce::Ioc,
+            client_order_id: None,
+        },
+        sent_at_ms: lagging_local_sent_ms,
+        expires_after_ms: lagging_local_sent_ms + 5_000,
+        pre_dispatch_account_time_ms: pre_dispatch_venue_time,
+        venue_past_expiry: false,
+        terminal: Some(Terminal {
+            at_ms: lagging_local_sent_ms,
+            filled: Decimal::ZERO,
+            price: None,
+            source: "response",
+        }),
+        cancel_sent: false,
+    };
+
+    // Stale pre-dispatch snapshot (`state.time <= pre_dispatch_venue_time`) must NOT release!
+    assert_eq!(
+        pending
+            .confirmed_fill(Decimal::ZERO, pre_dispatch_venue_time - 10)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        pending
+            .confirmed_fill(Decimal::ZERO, pre_dispatch_venue_time)
+            .unwrap(),
+        None
+    );
+
+    // Strictly post-dispatch venue snapshot releases exposure with confirmed zero fill.
+    assert_eq!(
+        pending
+            .confirmed_fill(Decimal::ZERO, pre_dispatch_venue_time + 1)
+            .unwrap(),
+        Some(Decimal::ZERO)
+    );
+}
+
+#[test]
+fn preflight_rejects_zero_or_sub_ten_dollar_deadband_to_prevent_unhedgeable_stall() {
+    let base = limits();
+    // ETH bid = $2000, sz_decimals = 4 (lot = 0.0001). $10 minimum requires deadband >= 0.005 ETH.
+    assert!(
+        validate_preflight_deadband(
+            &HedgeLimits {
+                deadband_base: Decimal::ZERO,
+                ..base.clone()
+            },
+            4,
+            d("2000")
+        )
+        .is_err()
+    );
+    assert!(
+        validate_preflight_deadband(
+            &HedgeLimits {
+                deadband_base: d("0.0049"),
+                ..base.clone()
+            },
+            4,
+            d("2000")
+        )
+        .is_err()
+    );
+    assert!(
+        validate_preflight_deadband(
+            &HedgeLimits {
+                deadband_base: d("0.005"),
+                max_unhedged_base: d("0.05"),
+                ..base
+            },
+            4,
+            d("2000")
+        )
+        .is_ok()
+    );
 }

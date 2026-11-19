@@ -17,17 +17,21 @@ import (
 	"nhooyr.io/websocket"
 )
 
+const orderDetailCapacity = 4096
+
 // LighterPrivate connects to Lighter private WebSocket for order/trade events
 type LighterPrivate struct {
-	cfg          config.ExchangeConfig
-	eventBuffer  privateEventSink
-	auth         *LighterAuth
-	mktMap       map[int]uint16          // market_index -> symbol_id
-	accountStats *LighterAccountStats    // For updating position
-	statsWriter  *shm.AccountStatsWriter // Direct SHM write for instant position updates
-	orderSizes   map[uint64]float64      // order_id -> remaining_base_amount
-	orderDetails map[uint64]orderDetail  // order_id -> full order details
-	seenTradeIDs *tradeIDSet             // bounded trade_id dedupe for duplicate WS payloads
+	cfg               config.ExchangeConfig
+	eventBuffer       privateEventSink
+	auth              *LighterAuth
+	mktMap            map[int]uint16          // market_index -> symbol_id
+	accountStats      *LighterAccountStats    // For updating position
+	statsWriter       *shm.AccountStatsWriter // Direct SHM write for instant position updates
+	orderSizes        map[uint64]float64      // order_id -> remaining_base_amount
+	orderDetails      map[uint64]orderDetail  // order_id -> full order details
+	trackedDetailIDs  *tradeIDSet             // bounded FIFO eviction for orderDetails
+	completedOrderIDs *tradeIDSet             // prevents terminal filled updates resurrecting orderSizes
+	seenTradeIDs      *tradeIDSet             // bounded trade_id dedupe for duplicate WS payloads
 }
 
 // privateEventSink permits deterministic replay without mmap or credentials.
@@ -72,15 +76,17 @@ func NewLighterPrivate(
 	}
 
 	return &LighterPrivate{
-		cfg:          cfg,
-		eventBuffer:  eventBuffer,
-		auth:         auth,
-		mktMap:       mktMap,
-		accountStats: accountStats,
-		statsWriter:  statsWriter,
-		orderSizes:   make(map[uint64]float64),
-		orderDetails: make(map[uint64]orderDetail),
-		seenTradeIDs: newTradeIDSet(tradeIDCapacity),
+		cfg:               cfg,
+		eventBuffer:       eventBuffer,
+		auth:              auth,
+		mktMap:            mktMap,
+		accountStats:      accountStats,
+		statsWriter:       statsWriter,
+		orderSizes:        make(map[uint64]float64),
+		orderDetails:      make(map[uint64]orderDetail),
+		trackedDetailIDs:  newTradeIDSet(orderDetailCapacity),
+		completedOrderIDs: newTradeIDSet(tradeIDCapacity),
+		seenTradeIDs:      newTradeIDSet(tradeIDCapacity),
 	}, nil
 }
 
@@ -221,7 +227,7 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 		if refreshDone != nil {
 			<-refreshDone
 		}
-		if guard.pending == 0 && ctx.Err() == nil {
+		if guard.pending == 0 {
 			lp.eventBuffer.PushPrivateStreamLost()
 		}
 	}()
@@ -270,12 +276,13 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 				}
 			}
 
+			isSnapshot := result.Get("type").String() == "subscribed/account_market"
 			// Process orders array
 			ordersArray := result.Get("orders")
 			if ordersArray.Exists() && ordersArray.IsArray() {
 				log.Printf("lighter-private: received %d order event(s)", len(ordersArray.Array()))
 				ordersArray.ForEach(func(key, value gjson.Result) bool {
-					lp.processOrderFast(value)
+					lp.processOrderWithMode(value, isSnapshot)
 					return true // continue iteration
 				})
 			}
@@ -285,6 +292,12 @@ func (lp *LighterPrivate) connect(ctx context.Context) error {
 			if tradesArray.Exists() && tradesArray.IsArray() {
 				log.Printf("lighter-private: received %d trade event(s)", len(tradesArray.Array()))
 				tradesArray.ForEach(func(key, value gjson.Result) bool {
+					if isSnapshot {
+						if id := value.Get("trade_id").Int(); id > 0 {
+							lp.seenTradeIDs.Add(uint64(id))
+						}
+						return true
+					}
 					lp.processTradeFast(value)
 					return true // continue iteration
 				})
@@ -319,7 +332,22 @@ func (lp *LighterPrivate) processPositionFast(positionData gjson.Result) {
 	}
 }
 
+func (lp *LighterPrivate) trackOrderDetail(orderID uint64, detail orderDetail) {
+	if lp.trackedDetailIDs != nil {
+		if _, exists := lp.orderDetails[orderID]; !exists {
+			if evicted, ok := lp.trackedDetailIDs.AddEvicting(orderID); ok && evicted != orderID {
+				delete(lp.orderDetails, evicted)
+			}
+		}
+	}
+	lp.orderDetails[orderID] = detail
+}
+
 func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
+	lp.processOrderWithMode(order, false)
+}
+
+func (lp *LighterPrivate) processOrderWithMode(order gjson.Result, isSnapshot bool) {
 	marketIndex := int(order.Get("market_index").Int())
 	symID, ok := lp.mktMap[marketIndex]
 	if !ok {
@@ -370,13 +398,13 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 		} else {
 			lp.orderSizes[orderID] = initialSize
 		}
-		lp.orderDetails[orderID] = orderDetail{
+		lp.trackOrderDetail(orderID, orderDetail{
 			clientOrderIndex: clientOrderIndex,
 			orderIndex:       orderIndex,
 			price:            price,
 			initialSize:      initialSize,
 			isAsk:            isAsk,
-		}
+		})
 		lp.eventBuffer.PushOrderCreatedV2(
 			uint8(ExchangeLighter),
 			symID,
@@ -407,6 +435,9 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 		}
 		delete(lp.orderSizes, orderID)
 		delete(lp.orderDetails, orderID)
+		if lp.completedOrderIDs != nil {
+			lp.completedOrderIDs.Add(orderID)
+		}
 		lp.eventBuffer.PushOrderCanceledV2(
 			uint8(ExchangeLighter),
 			symID,
@@ -420,20 +451,30 @@ func (lp *LighterPrivate) processOrderFast(order gjson.Result) {
 	case "filled":
 		log.Printf("lighter-private: order event: id=%d coi=%d status=%s market=%d",
 			orderID, clientOrderIndex, status, marketIndex)
-		// Some immediate fills arrive without a prior "open" event. Seed local
-		// tracking from the filled order payload so the following trade event can
-		// still bind to the correct client_order_index.
+		if lp.completedOrderIDs != nil && lp.completedOrderIDs.Contains(orderID) {
+			delete(lp.orderSizes, orderID)
+			return
+		}
+		if isSnapshot {
+			if lp.completedOrderIDs != nil {
+				lp.completedOrderIDs.Add(orderID)
+			}
+			return
+		}
+		// Some immediate fills arrive without a prior "open" event. Seed bounded
+		// detail tracking from the filled order payload so a following trade event
+		// can bind client_order_index, without resurrecting remaining size when zero.
 		if _, ok := lp.orderDetails[orderID]; !ok {
-			lp.orderDetails[orderID] = orderDetail{
+			lp.trackOrderDetail(orderID, orderDetail{
 				clientOrderIndex: clientOrderIndex,
 				orderIndex:       orderIndex,
 				price:            price,
 				initialSize:      initialSize,
 				isAsk:            isAsk,
-			}
+			})
 		}
-		if _, ok := lp.orderSizes[orderID]; !ok {
-			lp.orderSizes[orderID] = initialSize
+		if _, ok := lp.orderSizes[orderID]; !ok && remainingSize > 0 {
+			lp.orderSizes[orderID] = remainingSize
 		}
 	}
 }
@@ -527,6 +568,9 @@ func (lp *LighterPrivate) processTradeFast(trade gjson.Result) {
 		}
 		if remainingSize == 0 {
 			delete(lp.orderSizes, orderID)
+			if lp.completedOrderIDs != nil {
+				lp.completedOrderIDs.Add(orderID)
+			}
 		} else {
 			lp.orderSizes[orderID] = remainingSize
 		}

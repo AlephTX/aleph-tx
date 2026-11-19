@@ -221,6 +221,48 @@ fn valid_quoteable_book(bbo: &ShmBboMessage) -> bool {
         && (bbo.bid_price == 0.0 || bbo.ask_price == 0.0 || bbo.bid_price < bbo.ask_price)
 }
 
+/// Stoikov L1 size-weighted microprice, clamped to `±max_shift_bps` around midpoint.
+pub(super) fn local_touch_micro_price(bbo: &ShmBboMessage, max_shift_bps: f64) -> Option<f64> {
+    if !valid_quoteable_book(bbo)
+        || bbo.bid_price <= 0.0
+        || bbo.ask_price <= bbo.bid_price
+        || bbo.bid_size <= 0.0
+        || bbo.ask_size <= 0.0
+        || !max_shift_bps.is_finite()
+        || max_shift_bps <= 0.0
+    {
+        return None;
+    }
+    let mid = 0.5 * bbo.bid_price + 0.5 * bbo.ask_price;
+    let scale = bbo.bid_size.max(bbo.ask_size);
+    let bid = bbo.bid_size / scale;
+    let ask = bbo.ask_size / scale;
+    let imbalance = (bid - ask) / (bid + ask);
+    let shift_bps = (5_000.0 * (bbo.ask_price - bbo.bid_price) / mid * imbalance)
+        .clamp(-max_shift_bps, max_shift_bps);
+    let price = mid * (1.0 + shift_bps / 10_000.0);
+    (price.is_finite() && price > 0.0).then_some(price)
+}
+
+/// Option-value reserve (bps) compensating inventory-adding quotes for Lighter's
+/// asymmetric cancel speed bump (`cancel_speed_bump_ms`).
+pub(super) fn cancel_speed_bump_reserve_bps(
+    sigma_per_sqrt_sec: f64,
+    config: crate::config::LocalToxicityConfig,
+) -> f64 {
+    if config.cancel_speed_bump_ms == 0
+        || config.cancel_option_mult <= 0.0
+        || config.cancel_option_max_bps <= 0.0
+        || !sigma_per_sqrt_sec.is_finite()
+        || sigma_per_sqrt_sec <= 0.0
+    {
+        return 0.0;
+    }
+    let horizon_secs = config.cancel_speed_bump_ms as f64 / 1_000.0;
+    (config.cancel_option_mult * sigma_per_sqrt_sec * horizon_secs.sqrt() * 10_000.0)
+        .clamp(0.0, config.cancel_option_max_bps)
+}
+
 /// Slow EWMA of the venue basis `local_mid / external_mid - 1`.
 ///
 /// Lighter persistently trades at a premium or discount to the Binance/HL

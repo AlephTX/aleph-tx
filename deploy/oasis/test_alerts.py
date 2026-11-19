@@ -66,6 +66,14 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual([(a["key"], a["severity"]) for a in crit], [("drawdown", CRITICAL)])
         self.assertEqual(evaluate(status(), summary(equity=990.0), NOW), [])
 
+    def test_zero_or_negative_equity_alerts_critical_while_missing_does_not(self):
+        for eq in (0.0, -25.0):
+            alerts = evaluate(status(), summary(equity=eq), NOW)
+            self.assertEqual([(a["key"], a["severity"]) for a in alerts], [("drawdown", CRITICAL)])
+        missing = summary()
+        missing["snapshot"]["equity"] = None
+        self.assertEqual(evaluate(status(), missing, NOW), [])
+
     def test_legacy_snapshot_cannot_supply_the_daily_baseline(self):
         legacy = summary(equity=930.0)
         for key in ("daily_loss_day_start_ms", "daily_loss_start_equity", "daily_loss_limit_pct"):
@@ -79,6 +87,32 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(keys(evaluate(status(), naked, NOW)), ["hedge_imbalance", "stream_lost"])
         hedge_only = summary(hedge_account="0xabc", hedge_position=-0.1)
         self.assertEqual(keys(evaluate(status(), hedge_only, NOW)), ["hedge_imbalance"])
+
+    def test_volume_quota_and_defense_regime_alerts(self):
+        warn_q = summary()
+        warn_q["snapshot"]["volume_quota_remaining"] = 200
+        self.assertEqual(
+            [(a["key"], a["severity"]) for a in evaluate(status(), warn_q, NOW)],
+            [("volume_quota_low", WARNING)],
+        )
+        crit_q = summary()
+        crit_q["snapshot"]["volume_quota_remaining"] = 25
+        crit_q["snapshot"]["defense_regime"] = "halt"
+        self.assertEqual(
+            [(a["key"], a["severity"]) for a in evaluate(status(), crit_q, NOW)],
+            [("defense_regime", CRITICAL), ("volume_quota_low", CRITICAL)],
+        )
+        ro = summary()
+        ro["snapshot"]["defense_regime"] = "reduce_only"
+        self.assertEqual(
+            [(a["key"], a["severity"]) for a in evaluate(status(), ro, NOW)],
+            [("defense_regime", WARNING)],
+        )
+        # Missing/unknown defense or stopped session produces no alert.
+        stopped = summary(stopped_ms=NOW - 1)
+        stopped["snapshot"]["volume_quota_remaining"] = 0
+        stopped["snapshot"]["defense_regime"] = "halt"
+        self.assertEqual(evaluate(status(), stopped, NOW), [])
 
 
 class AlerterTest(unittest.TestCase):

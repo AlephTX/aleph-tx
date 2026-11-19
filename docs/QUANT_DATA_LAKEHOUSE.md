@@ -222,6 +222,27 @@ rclone copy --transfers 4 --drive-chunk-size 128M \
   --campaign-id 2026-11-16-tokyo-priority
 ```
 
+Before writing Parquet or DuckDB output, `build-duckdb` checks each staged
+gzip file against the compressed length and SHA-256 in its Silver manifest.
+Zero-row tables have an empty gzip stream with its own recorded digest.
+
+A sealed capture with conflicting Arcus trade identities can still support research
+on unaffected streams. First retain the strict normalization error and identify the
+affected markets from the Bronze archive. For a separate derived campaign, repeat
+`--withhold-arcus-trade-market MARKET` on the `normalize` command for each affected
+market. Use a distinct campaign ID, staging directory, Parquet root and DuckDB file
+for the projection, then pass `--allow-partial-projection` to `build-duckdb`.
+The build rejects partial staging by default before writing any output. The projection
+manifest and build result record `silver_partial_market_projection` and the
+number of omitted subscription and trade messages by market. The receipt clock sees
+every original row, and unaffected records retain their original sequence numbers.
+Books for an excluded trade market remain available for book-only work. Strategies
+that need those prints must record missing trade coverage. Check the market keys in
+`withheld_arcus_trade_messages` first, including keys with zero observed messages.
+For other markets, `v_stream_health.arcus_trade_subscriptions` counts observed
+Arcus trade subscriptions. Check the relevant connection epochs and gaps as well
+when a strategy needs continuous trade coverage.
+
 ### 3. Example Causal DuckDB Queries (Zero Look-Ahead)
 
 ```sql
@@ -323,3 +344,17 @@ feed post-trade attribution on `aleph` with zero impact on order/cancel latency:
      at-fill cross-venue lead/lag (`available_at_ms <= fill_alignment_ms`),
      `+100ms / +500ms / +1s / +5s / +30s` realized markouts, `<250ms` sniped-fill
      ratios, and rated-only fee attribution (`role_unknown`/`missing` stay `null`).
+   - Attribution schema 2 preserves the existing equal-weight means and adds
+     `markout_statistics` per reference/horizon, `local_markout_statistics`,
+     `net_primary_markout_statistics`, and `rated_fee_statistics`. Each reports
+     equal-, fill-quantity-, and recorded-notional-weighted bps, valid-label
+     counts, matched quantity/notional, and coverage against the entire session.
+     Missing labels are excluded from means but remain in coverage denominators;
+     unknown weights make total weight and coverage unknown. Empty cohorts have
+     null means and coverage. Quantity weights are within one session/market,
+     never pooled across different assets.
+   - Net primary labels deduct the rated fill fee once and show their own coverage;
+     missing fees cannot imply zero cost. These floating-point markout diagnostics
+     do not replace exact cash/fee ledgers, add hedge slippage to realized PnL,
+     or establish target-venue, paired, or reward-eligible turnover. Preserve those
+     separate denominators in the replay `turnover_breakdown` and reward evidence.

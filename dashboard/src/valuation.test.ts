@@ -99,6 +99,9 @@ describe('valuation', () => {
       '标记 外部中位价 · 时钟不一致，新鲜度未知',
     )
     expect(markLine({ ...m, freshness: 'observed', feed_age_ms: null })).toBe('标记 外部中位价 · 行情 未知')
+    expect(markLine({ ...m, source: 'local_touch_micro', freshness: 'observed', feed_age_ms: 2000 })).toBe(
+      '标记 本所微价 · 行情 2秒前',
+    )
   })
 
   it('tells a missing fee rate apart from an explicit zero in the fill table', () => {

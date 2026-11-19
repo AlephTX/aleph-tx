@@ -121,6 +121,21 @@ func TestHyperliquidGroupRoutesCoreEntropyAndTradeXYZWithoutSlotCollision(t *tes
 	if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); ok {
 		t.Fatal("TradeXYZ slot not invalidated")
 	}
+
+	validETH := []byte(`{"channel":"l2Book","data":{"coin":"ETH","time":1794712726550,"levels":[[{"px":"2450.2","sz":"5.0"}],[{"px":"2450.5","sz":"4.0"}]]}}`)
+	if err := hl.handleMessage(validETH, now, lastPub); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeHyperliquid, 1002); !ok {
+		t.Fatal("expected ETH BBO live before crossed check")
+	}
+	crossed := []byte(`{"channel":"l2Book","data":{"coin":"ETH","time":1794712726600,"levels":[[{"px":"2451.0","sz":"5.0"}],[{"px":"2450.5","sz":"4.0"}]]}}`)
+	if err := hl.handleMessage(crossed, now, lastPub); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeHyperliquid, 1002); ok {
+		t.Fatal("crossed Hyperliquid book remained readable in SHM")
+	}
 }
 
 func TestLighterRobinhoodUsesDedicatedExchangeSlot(t *testing.T) {

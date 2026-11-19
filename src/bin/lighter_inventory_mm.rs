@@ -5,6 +5,7 @@ mod session;
 
 use aleph_tx::account_stats_reader::AccountStatsReader;
 use aleph_tx::config::InventoryNeutralMMConfig;
+use aleph_tx::exchange::{Exchange, ShadowExchange};
 use aleph_tx::exchanges::hyperliquid::Network;
 use aleph_tx::lighter_trading::{LighterCredentials, LighterDomain, LighterTrading};
 use aleph_tx::order_tracker::OrderTracker;
@@ -186,6 +187,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [flag, path] if flag == "--shadow" => run_shadow_feeder(Path::new(path)).await,
         [flag, path, dotenv, feeder] if matches!(flag.as_str(), "--live" | "--testnet") => {
             let profile = session::Profile::load(Path::new(path))?;
             let network = if flag == "--testnet" {
@@ -197,9 +199,179 @@ async fn main() -> Result<()> {
         }
         [] => run_existing_feeder().await,
         _ => bail!(
-            "Usage: lighter_inventory_mm --check CONFIG [CONFIG2 ...] | (--live | --testnet) CONFIG DOTENV FEEDER"
+            "Usage: lighter_inventory_mm --check CONFIG [CONFIG2 ...] | --shadow CONFIG | (--live | --testnet) CONFIG DOTENV FEEDER"
         ),
     }
+}
+
+struct TempShadowStatsFile(Option<PathBuf>);
+
+impl Drop for TempShadowStatsFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn write_synthetic_account_stats_at(
+    path: &Path,
+    equity_usd: f64,
+    now_ns: u64,
+    seq: u64,
+) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("Open synthetic shadow account stats {}", path.display()))?;
+    if file.metadata()?.len() != 128 {
+        file.set_len(128)?;
+        let zero = [0u8; 128];
+        file.write_all_at(&zero, 0)?;
+    }
+    let odd = seq * 2 + 1;
+    let even = odd + 1;
+    file.write_all_at(&odd.to_le_bytes(), 0)?;
+    for (offset, val) in [
+        (8u64, equity_usd),
+        (16, equity_usd),
+        (24, 0.0),
+        (32, equity_usd),
+        (40, 0.0),
+        (48, equity_usd),
+        (64, 0.0),
+    ] {
+        file.write_all_at(&val.to_le_bytes(), offset)?;
+    }
+    file.write_all_at(&now_ns.to_le_bytes(), 56)?;
+    file.write_all_at(&now_ns.to_le_bytes(), 72)?;
+    file.write_all_at(&even.to_le_bytes(), 0)?;
+    Ok(())
+}
+
+/// Zero-credential read-only shadow runner (`--shadow CONFIG`): connects to live SHM
+/// BBO/depth streams and drives the full strategy + defense FSM + telemetry sink
+/// against [`ShadowExchange`], with zero network dispatch or signing keys.
+async fn run_shadow_feeder(config_path: &Path) -> Result<()> {
+    let profile = session::Profile::load(config_path)?;
+    anyhow::ensure!(
+        !profile.has_hedge(),
+        "--shadow currently observes a single-venue profile; omit [inventory_hedge]"
+    );
+    let domain = profile.domain;
+    let network = domain.network();
+    let symbol = profile.symbol.clone();
+    let config = profile.strategy;
+    let initial_equity = config.reference_portfolio_value.max(50_000.0);
+    let ipc = shm_dir();
+    let market_path = ipc.join("aleph-matrix");
+    let depth_path = ipc.join("aleph-depth");
+    let live_stats_path = ipc.join("aleph-account-stats");
+
+    let mut _temp_stats_guard = TempShadowStatsFile(None);
+    let mut heartbeat_handle = None;
+    let stats_path = if live_stats_path.exists() {
+        live_stats_path
+    } else {
+        let synthetic =
+            std::env::temp_dir().join(format!("aleph-shadow-stats-{}.shm", std::process::id()));
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        write_synthetic_account_stats_at(&synthetic, initial_equity, now_ns, 1)?;
+        _temp_stats_guard = TempShadowStatsFile(Some(synthetic.clone()));
+        let hb_path = synthetic.clone();
+        heartbeat_handle = Some(tokio::spawn(async move {
+            let mut seq = 2u64;
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let ts_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                if write_synthetic_account_stats_at(&hb_path, initial_equity, ts_ns, seq).is_err() {
+                    break;
+                }
+                seq = seq.saturating_add(1);
+            }
+        }));
+        synthetic
+    };
+
+    let (shm_reader, account_reader, depth_reader) = tokio::try_join!(
+        wait_for_resource(&market_path, |p| ShmReader::open(p, 2048)),
+        wait_for_resource(&stats_path, |p| Ok(AccountStatsReader::open(p)?)),
+        async {
+            if config.use_depth_pricing && depth_path.exists() {
+                Ok(Some(
+                    wait_for_resource(&depth_path, |p| Ok(ShmDepthReader::open(p, 2048)?)).await?,
+                ))
+            } else {
+                Ok(None)
+            }
+        },
+    )?;
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let (stop, shutdown) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
+        let _ = stop.send(true);
+    });
+
+    let tracker = Arc::new(OrderTracker::new());
+    let shadow = Arc::new(ShadowExchange::new(
+        domain.telemetry_exchange(),
+        Arc::clone(&tracker),
+        config.exchange_id,
+        config.symbol_id,
+        config.use_post_only,
+        initial_equity,
+    ));
+    let telemetry = TelemetrySink::from_env(&SessionInfo {
+        session_id: uuid::Uuid::new_v4().to_string(),
+        network: format!("{network:?}"),
+        exchange: format!("{}_shadow", domain.telemetry_exchange()),
+        symbol,
+        market_id: config.market_id as u64,
+        account: 0,
+        hedge_account: None,
+    });
+    let exchange_arc: Arc<dyn Exchange> = Arc::clone(&shadow) as Arc<dyn Exchange>;
+    let mut strategy = InventoryNeutralMM::with_data_sources(
+        config,
+        exchange_arc,
+        tracker,
+        shm_reader,
+        account_reader,
+        depth_reader,
+    );
+    if let Some(sink) = telemetry {
+        strategy = strategy.with_telemetry_sink(sink);
+    }
+    if network == Network::Testnet {
+        strategy.use_local_fair_value();
+    }
+    tracing::info!(
+        venue = domain.telemetry_exchange(),
+        equity = initial_equity,
+        "Starting zero-credential read-only shadow runner"
+    );
+    let res = strategy.run(Some(shutdown)).await;
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    let stats = shadow.stats();
+    tracing::info!(?stats, "Shadow runner finished cleanly");
+    res
 }
 
 // Keep the established standalone entry for an externally managed feeder.

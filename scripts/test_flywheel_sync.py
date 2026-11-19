@@ -420,6 +420,79 @@ class FlywheelSyncTests(unittest.TestCase):
         self.assertTrue(w1.with_name(f"{w1.name}.evicted.json").exists())
         self.assertTrue(w2.exists())
 
+    def test_ship_public_bronze_creates_lock_and_vacuum_into_backups_live_wal(self) -> None:
+        cap_dir = self.root / "cap_lock"
+        cap_dir.mkdir()
+        self._write_closed_segment(cap_dir, "tokyo-flywheel-20261116.seg0000.ndjson.gz")
+        ship_public_bronze(
+            cap_dir,
+            remote_dir="",
+            collector_region="tokyo",
+            split_role="selection_dev",
+        )
+        self.assertTrue((cap_dir / ".flywheel_public.lock").exists())
+
+        db_path = self.root / "wal_live.sqlite3"
+        writer = sqlite3.connect(db_path)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        writer.execute("INSERT INTO events (note) VALUES ('row1'), ('row2')")
+        writer.commit()
+
+        staging = self.root / "private_vacuum"
+        meta = flywheel_sync.atomic_sqlite_backup(db_path, staging, snapshot_tag="wal_check")
+        gz_path = Path(meta["path"])
+        raw_db = self.root / "restored.sqlite3"
+        with gzip.open(gz_path, "rb") as src, raw_db.open("wb") as dst:
+            dst.write(src.read())
+        with sqlite3.connect(raw_db) as restored:
+            count = restored.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_ship_public_bronze_propagates_missing_uploader_binary(self) -> None:
+        cap_dir = self.root / "missing_rclone"
+        cap_dir.mkdir()
+        cap = self._write_closed_segment(cap_dir, "tokyo-flywheel-20261118.seg0000.ndjson.gz")
+
+        def missing_rclone_runner(cmd, **_kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "rclone")
+
+        with self.assertRaises(FileNotFoundError):
+            ship_public_bronze(
+                cap_dir,
+                remote_dir="gdrive:bronze",
+                collector_region="tokyo",
+                split_role="selection_dev",
+                runner=missing_rclone_runner,
+                which=lambda _name: None,
+            )
+        self.assertTrue(cap.exists())
+        self.assertFalse(cap.with_name(f"{cap.name}.upload_receipt.json").exists())
+
+    def test_ship_public_bronze_skips_only_concurrently_vanished_local_capture(self) -> None:
+        cap_dir = self.root / "vanished_local"
+        cap_dir.mkdir()
+        c1 = self._write_closed_segment(cap_dir, "tokyo-vanish-20261118.seg0000.ndjson.gz")
+        c2 = self._write_closed_segment(cap_dir, "tokyo-vanish-20261118.seg0001.ndjson.gz")
+        orig_seal = flywheel_sync.seal_bronze_capture
+
+        def flaky_seal(cap_path: Path, **kwargs):
+            if cap_path == c1:
+                c1.unlink()
+                raise FileNotFoundError(cap_path)
+            return orig_seal(cap_path, **kwargs)
+
+        with mock.patch.object(flywheel_sync, "seal_bronze_capture", side_effect=flaky_seal):
+            res = ship_public_bronze(
+                cap_dir,
+                remote_dir="",
+                collector_region="tokyo",
+                split_role="selection_dev",
+            )
+        self.assertEqual(res["sealed_count"], 1)
+        self.assertTrue(c2.with_name(f"{c2.name}.bronze_manifest.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

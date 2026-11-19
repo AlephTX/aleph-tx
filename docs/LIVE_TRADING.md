@@ -61,8 +61,11 @@ cargo run --bin lighter_inventory_mm -- --check \
 | Launcher mode | Default profile | Default credential file | Effect |
 | --- | --- | --- | --- |
 | `MODE=check` | `config.toml` | None | Validate and print the resolved mode offline |
+| `MODE=shadow` | `config.toml` | None | Run zero-credential read-only SHM shadow observer against `ShadowExchange` (no HTTP/WS/signing keys) |
 | `MODE=testnet` | `config.testnet.toml` | `.env.testnet` | Run the supervised session against testnet |
 | `MODE=live` | `config.toml` | `.env.lighter` | Run the supervised session against mainnet |
+
+`MODE=shadow` never loads credentials, signing keys, or outbound HTTP/WebSocket clients: it reads local shared memory against `ShadowExchange` to observe decisions, `DefenseStateMachine` transitions, and `ALEPH_TELEMETRY_DIR` logs with zero order dispatch (`make trade MODE=shadow CONFIG=config.example.toml`).
 
 Both network modes submit and cancel orders. Run them only with
 authorization for the selected network and accounts. Override the
@@ -165,6 +168,15 @@ separate entry points.
   telemetry is enabled. REST recovery checks the exact order's terminal
   history and the account transaction watermark before resuming or
   completing cleanup.
+- Ordinary cleanup cannot discard any active tracker reservation, even when
+  REST lists no open orders and a newer position snapshot is flat. Pending
+  creates/cancels and late fills first enter REST recovery, which requires
+  terminal history for every known order and a covering account fill watermark.
+  A missing terminal record keeps cleanup blocked. A new order, late fill or
+  reconciliation epoch change during the final position check also prevents
+  the rebase.
+  Legacy helpers that bulk-clear reservations or acknowledge a gap without
+  terminal evidence are available only inside unit tests.
 - If the feeder fails during shutdown, recovery queries Lighter open
   orders and confirms known orders by client ID. It checks the account
   transaction watermark after fills before issuing or confirming a

@@ -7,6 +7,32 @@ func isLighterBookSource(source string) bool {
 	return source == "lighter" || source == "lighter_robinhood"
 }
 
+func staggerLighterClockRefresh(sources []subscription, start time.Time) {
+	for i := range sources {
+		s := &sources[i]
+		switch s.source {
+		case "lighter":
+			s.firstClockRefresh = start.Add(s.clockRefresh)
+		case "lighter_robinhood":
+			s.firstClockRefresh = start.Add(s.clockRefresh / 2)
+		}
+	}
+}
+
+// Retain the original phase after a disconnect, even if retries missed a refresh.
+func (s subscription) nextClockRefresh(now time.Time) time.Time {
+	if s.clockRefresh <= 0 {
+		return time.Time{}
+	}
+	if s.firstClockRefresh.IsZero() {
+		return now.Add(s.clockRefresh)
+	}
+	if now.Before(s.firstClockRefresh) {
+		return s.firstClockRefresh
+	}
+	return now.Add(s.clockRefresh - now.Sub(s.firstClockRefresh)%s.clockRefresh)
+}
+
 func robinhoodSubscriptions(markets string, trades bool, clock time.Duration) ([]subscription, error) {
 	if markets == "" {
 		return nil, nil

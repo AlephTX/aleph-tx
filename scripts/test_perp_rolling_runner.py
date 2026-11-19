@@ -160,6 +160,34 @@ with gzip.open(out_path, "wt", encoding="utf-8") as fh:
             ).read_text(encoding="utf-8")
             self.assertIn("TimeoutStopSec=120", unit_txt)
 
+    def test_backfill_quarantine_is_stream_scoped_and_ignores_concurrent_manifest(self) -> None:
+        from perp_rolling_runner import WINDOW_RE, backfill_missing_quarantine_manifests
+
+        self.assertEqual(
+            WINDOW_RE.search("tokyo-rwa-20261116T000000Z-w07.01.jsonl.zst").group(1),
+            "07",
+        )
+        quar_dir = self.root / "shared_quarantine"
+        quar_dir.mkdir()
+        crypto_partial = quar_dir / "tokyo-crypto-20261116T000000Z-w01.ndjson.gz.partial"
+        rwa_partial = quar_dir / "tokyo-rwa-20261116T000000Z-w01.ndjson.gz.partial"
+        crypto_partial.write_bytes(b"crypto-bytes")
+        rwa_partial.write_bytes(b"rwa-bytes")
+
+        created = backfill_missing_quarantine_manifests(
+            quar_dir, collector_region="tokyo", stream_name="crypto"
+        )
+        self.assertEqual(created, ["tokyo-crypto-20261116T000000Z-w01.quarantine_manifest.json"])
+        self.assertFalse((quar_dir / "tokyo-rwa-20261116T000000Z-w01.quarantine_manifest.json").exists())
+
+        # Re-running (or racing with another process after exists() check) stays idempotent.
+        self.assertEqual(
+            backfill_missing_quarantine_manifests(
+                quar_dir, collector_region="tokyo", stream_name="crypto"
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

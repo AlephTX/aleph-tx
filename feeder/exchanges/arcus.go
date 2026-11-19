@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strconv"
 	"time"
@@ -173,7 +174,8 @@ func parseArcusDepth(raw [][2]string, descending bool) ([shm.DepthLevels]shm.Pri
 		}
 		px, errPx := strconv.ParseFloat(pair[0], 64)
 		sz, errSz := strconv.ParseFloat(pair[1], 64)
-		if errPx != nil || errSz != nil || px <= 0 || sz < 0 {
+		if errPx != nil || errSz != nil || math.IsNaN(px) || math.IsInf(px, 0) ||
+			math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz < 0 {
 			return out, 0, false
 		}
 		if sz == 0 {

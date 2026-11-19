@@ -344,7 +344,7 @@ mod tests {
 
             writer_barrier.wait();
             for step in 1..=ITERATIONS {
-                let active = if step % 4 == 0 {
+                let active = if step.is_multiple_of(4) {
                     ((step as usize / 4) % DEPTH_LEVELS) + 1
                 } else {
                     DEPTH_LEVELS
@@ -403,7 +403,7 @@ mod tests {
             assert_ne!(snap.timestamp_ns, 0);
             assert_eq!(snap.timestamp_ns % 10, 0);
             let step = snap.timestamp_ns / 10;
-            let active = if step % 4 == 0 {
+            let active = if step.is_multiple_of(4) {
                 ((step as usize / 4) % DEPTH_LEVELS) + 1
             } else {
                 DEPTH_LEVELS

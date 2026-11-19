@@ -10,8 +10,11 @@ User=aleph-tx-trader
 Group=aleph-tx-trader
 StateDirectory=aleph-tx-live
 StateDirectoryMode=0700
+RuntimeDirectory=aleph-tx-live
+RuntimeDirectoryMode=0700
 WorkingDirectory=/var/lib/aleph-tx-live
 Environment=LD_LIBRARY_PATH=/opt/aleph-tx/current/lib
+Environment=ALEPH_IPC_ROOT=/run/aleph-tx-live
 Environment=ALEPH_TELEMETRY_DIR=/var/lib/aleph-tx-telemetry
 ReadWritePaths=/var/lib/aleph-tx-telemetry
 ExecStartPre=/opt/aleph-tx/current/bin/lighter_inventory_mm --check /etc/aleph-tx/live.toml

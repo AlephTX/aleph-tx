@@ -42,4 +42,13 @@ func TestRESTEquityUsesAssetValueAndRequiresAvailableBalance(t *testing.T) {
 	if _, err := snapshot.equityStats(); err == nil {
 		t.Fatal("accepted missing available balance")
 	}
+
+	wiped, err := decodeLighterAccount(strings.NewReader(`{"code":200,"accounts":[{"index":42,"collateral":"0","total_asset_value":"0","available_balance":"0","positions":[]}]}`), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wipedStats, err := wiped.equityStats()
+	if err != nil || wipedStats.equity != 0 || wipedStats.leverage != 0 || wipedStats.marginUsage != 1 {
+		t.Fatalf("expected fail-closed zero-equity stats {leverage:0 marginUsage:1}, got %+v err=%v", wipedStats, err)
+	}
 }

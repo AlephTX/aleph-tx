@@ -36,8 +36,10 @@ cost and profit floor. The launcher validates this relationship when
 hedging is enabled. [Trading runbook](LIVE_TRADING.md#configure-and-validate).
 
 The optional `[inventory_neutral_mm.markout_reserve]` table widens the
-inventory-adding side using its own recent fill markouts against fresh
-external fair value. `max_widen_bps` caps the reserve on each side and
+inventory-adding side using its own recent fill markouts. An active external
+fair value supplies the mark. With local pricing, explicitly enable
+`local_toxicity.enable_local_markout` to use the fresh local touch microprice.
+`max_widen_bps` caps the reserve on each side and
 `max_spread_bps` caps the model's combined spread. Set `close_cost_bps` to
 the modeled exit fee and impact. The gross markout target includes this
 cost, the maker fee and half the round-trip profit floor. The estimate

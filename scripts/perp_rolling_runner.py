@@ -36,7 +36,9 @@ from flywheel_sync import build_idle_command
 from quant_lakehouse import VALID_REGIONS, VALID_ROLES, write_immutable_json
 
 
-WINDOW_RE = re.compile(r"-w([0-9]{2,})(?:\.ndjson\.gz|\.ndjson)")
+WINDOW_RE = re.compile(
+    r"-w([0-9]{2,})(?:\.\d+)?(?:\.ndjson\.gz|\.ndjson|\.jsonl\.zst)(?:\.\d+)?"
+)
 
 
 def _sha256_and_size(path: Path) -> tuple[str, int]:
@@ -50,17 +52,23 @@ def _sha256_and_size(path: Path) -> tuple[str, int]:
 
 
 def backfill_missing_quarantine_manifests(
-    quarantine_dir: Path, *, collector_region: str
+    quarantine_dir: Path,
+    *,
+    collector_region: str,
+    stream_name: str | None = None,
 ) -> list[str]:
     """Backfill `.quarantine_manifest.json` for any `.partial` in `quarantine_dir` interrupted by SIGKILL."""
     backfilled: list[str] = []
     if not quarantine_dir.is_dir():
         return backfilled
+    stream_marker = f"-{stream_name}-" if stream_name else None
     for entry in sorted(quarantine_dir.iterdir(), key=lambda p: p.name):
         if not (entry.is_file() and ".partial" in entry.name and not entry.name.endswith(".json")):
             continue
+        if stream_marker is not None and stream_marker not in entry.name:
+            continue
         stem = entry.name
-        for suf in (".ndjson.gz.partial", ".ndjson.partial", ".partial"):
+        for suf in (".ndjson.gz.partial", ".ndjson.partial", ".jsonl.zst.partial", ".partial"):
             idx = stem.find(suf)
             if idx != -1:
                 stem = stem[:idx]
@@ -92,7 +100,10 @@ def backfill_missing_quarantine_manifests(
             "abort_reason": "backfilled_after_stop_timeout_sigkill",
             "notes": "Manifest backfilled on runner startup after prior stop timeout interrupted hashing.",
         }
-        write_immutable_json(manifest_path, manifest)
+        try:
+            write_immutable_json(manifest_path, manifest)
+        except FileExistsError:
+            continue
         backfilled.append(manifest_path.name)
     return backfilled
 
@@ -221,7 +232,9 @@ def run_rolling_loop(
         output_dir, quarantine_dir, collector_region=collector_region
     )
     backfilled = backfill_missing_quarantine_manifests(
-        quarantine_dir, collector_region=collector_region
+        quarantine_dir,
+        collector_region=collector_region,
+        stream_name=stream_name,
     )
 
     stop_requested = False

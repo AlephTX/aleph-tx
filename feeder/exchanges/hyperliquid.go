@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -179,23 +180,29 @@ func (h *Hyperliquid) handleMessage(raw []byte, now time.Time, lastPublication m
 	}
 
 	bidPx, err := strconv.ParseFloat(bids[0].Px, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(bidPx) || math.IsInf(bidPx, 0) || bidPx <= 0 {
 		log.Printf("hyperliquid: failed to parse bid price: %v", err)
 		return nil
 	}
 	bidSz, err := strconv.ParseFloat(bids[0].Sz, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(bidSz) || math.IsInf(bidSz, 0) || bidSz <= 0 {
 		log.Printf("hyperliquid: failed to parse bid size: %v", err)
 		return nil
 	}
 	askPx, err := strconv.ParseFloat(asks[0].Px, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(askPx) || math.IsInf(askPx, 0) || askPx <= 0 {
 		log.Printf("hyperliquid: failed to parse ask price: %v", err)
 		return nil
 	}
 	askSz, err := strconv.ParseFloat(asks[0].Sz, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(askSz) || math.IsInf(askSz, 0) || askSz <= 0 {
 		log.Printf("hyperliquid: failed to parse ask size: %v", err)
+		return nil
+	}
+	if bidPx >= askPx {
+		if h.matrix != nil {
+			h.matrix.InvalidateBBO(target.exchangeID, target.symbolID)
+		}
 		return nil
 	}
 

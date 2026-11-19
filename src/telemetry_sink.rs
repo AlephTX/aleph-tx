@@ -75,6 +75,12 @@ pub struct StrategySnapshot {
     pub markout_last_delay_ms: f64,
     /// Bias-corrected EWMA markout in bps; null until warm.
     pub markout_ewma_bps: Option<f64>,
+    /// Remaining venue volume quota reported by execution responses (`OPT-05`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_quota_remaining: Option<i64>,
+    /// Active deterministic defense state machine regime (`OPT-07`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defense_regime: Option<&'static str>,
 }
 
 /// One private order or fill event, copied from the V2 ring.

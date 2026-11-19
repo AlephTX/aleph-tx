@@ -29,17 +29,27 @@ func (s *tradeIDSet) Contains(id uint64) bool {
 
 // Add records id, evicting the oldest entry once the set is full.
 func (s *tradeIDSet) Add(id uint64) {
+	_, _ = s.AddEvicting(id)
+}
+
+// AddEvicting records id and returns (evicted, true) if an oldest entry was evicted.
+func (s *tradeIDSet) AddEvicting(id uint64) (uint64, bool) {
 	if s.Contains(id) {
-		return
+		return 0, false
 	}
+	var evicted uint64
+	var didEvict bool
 	if len(s.order) < cap(s.order) {
 		s.order = append(s.order, id)
 	} else {
-		delete(s.seen, s.order[s.next])
+		evicted = s.order[s.next]
+		didEvict = true
+		delete(s.seen, evicted)
 		s.order[s.next] = id
 		s.next = (s.next + 1) % len(s.order)
 	}
 	s.seen[id] = struct{}{}
+	return evicted, didEvict
 }
 
 func (s *tradeIDSet) Len() int {

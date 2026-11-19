@@ -56,6 +56,11 @@ func (las *LighterAccountStats) Run(ctx context.Context) error {
 }
 
 func (las *LighterAccountStats) connect(ctx context.Context) error {
+	if las.statsWriter != nil {
+		las.statsWriter.InvalidateEquity()
+		defer las.statsWriter.InvalidateEquity()
+	}
+
 	c, _, err := websocket.Dial(ctx, las.cfg.WSURL, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -188,9 +193,6 @@ func (snapshot lighterAccountSnapshot) equityStats() (lighterEquityStats, error)
 		values[i] = parsed
 	}
 	collateral, equity, available := values[0], values[1], values[2]
-	if equity <= 0 {
-		return lighterEquityStats{}, fmt.Errorf("non-positive Lighter account equity")
-	}
 	var grossNotional float64
 	for _, position := range snapshot.Positions {
 		value, parseErr := strconv.ParseFloat(position.Value, 64)
@@ -199,12 +201,18 @@ func (snapshot lighterAccountSnapshot) equityStats() (lighterEquityStats, error)
 		}
 		grossNotional += math.Abs(value)
 	}
+	leverage := 0.0
+	marginUsage := 1.0
+	if equity > 0 {
+		leverage = grossNotional / equity
+		marginUsage = 1 - math.Min(1, math.Max(0, available/equity))
+	}
 	return lighterEquityStats{
 		collateral:  collateral,
 		equity:      equity,
 		available:   available,
-		leverage:    grossNotional / equity,
-		marginUsage: 1 - math.Min(1, math.Max(0, available/equity)),
+		leverage:    leverage,
+		marginUsage: marginUsage,
 	}, nil
 }
 
@@ -239,9 +247,14 @@ func (las *LighterAccountStats) processStats(stats *lighterUserStats) {
 		log.Printf("lighter-account-stats: failed to parse buying_power: %v", err)
 		return
 	}
+	for _, v := range [...]float64{collateral, portfolioValue, leverage, availableBalance, marginUsage, buyingPower} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			log.Printf("lighter-account-stats: ignoring non-finite account stats")
+			return
+		}
+	}
 
-	log.Printf("lighter-account-stats: collateral=$%.2f portfolio=$%.2f leverage=%.2fx available=$%.2f margin=%.1f%% buying_power=$%.2f",
-		collateral, portfolioValue, leverage, availableBalance, marginUsage*100, buyingPower)
+	log.Printf("lighter-account-stats: updated account stats")
 
 	// Write to shared memory for Rust to read (including position)
 	timestampNs := uint64(time.Now().UnixNano())

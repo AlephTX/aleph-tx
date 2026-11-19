@@ -27,6 +27,20 @@ pub struct ShmAccountStats {
 
 const ACCOUNT_STATS_SIZE: usize = 128;
 
+const _: () = {
+    assert!(std::mem::size_of::<ShmAccountStats>() == ACCOUNT_STATS_SIZE);
+    assert!(std::mem::offset_of!(ShmAccountStats, version) == 0);
+    assert!(std::mem::offset_of!(ShmAccountStats, collateral) == 8);
+    assert!(std::mem::offset_of!(ShmAccountStats, portfolio_value) == 16);
+    assert!(std::mem::offset_of!(ShmAccountStats, leverage) == 24);
+    assert!(std::mem::offset_of!(ShmAccountStats, available_balance) == 32);
+    assert!(std::mem::offset_of!(ShmAccountStats, margin_usage) == 40);
+    assert!(std::mem::offset_of!(ShmAccountStats, buying_power) == 48);
+    assert!(std::mem::offset_of!(ShmAccountStats, updated_at) == 56);
+    assert!(std::mem::offset_of!(ShmAccountStats, position) == 64);
+    assert!(std::mem::offset_of!(ShmAccountStats, position_updated_at) == 72);
+};
+
 pub struct AccountStatsReader {
     mmap: Mmap,
     local_version: u64,
@@ -57,21 +71,25 @@ impl AccountStatsReader {
     }
 
     fn snapshot(&self) -> AccountStatsSnapshot {
-        let ptr = self.mmap.as_ptr().cast::<ShmAccountStats>();
-        // SAFETY: Each field is inside the validated mapping. Raw volatile reads
-        // avoid creating a shared Rust reference to externally mutated payload.
-        unsafe {
-            AccountStatsSnapshot {
-                collateral: std::ptr::addr_of!((*ptr).collateral).read_volatile(),
-                portfolio_value: std::ptr::addr_of!((*ptr).portfolio_value).read_volatile(),
-                leverage: std::ptr::addr_of!((*ptr).leverage).read_volatile(),
-                available_balance: std::ptr::addr_of!((*ptr).available_balance).read_volatile(),
-                margin_usage: std::ptr::addr_of!((*ptr).margin_usage).read_volatile(),
-                buying_power: std::ptr::addr_of!((*ptr).buying_power).read_volatile(),
-                position: std::ptr::addr_of!((*ptr).position).read_volatile(),
-                updated_at: std::ptr::addr_of!((*ptr).updated_at).read_volatile(),
-                position_updated_at: std::ptr::addr_of!((*ptr).position_updated_at).read_volatile(),
-            }
+        let base = self.mmap.as_ptr();
+        // SAFETY: open() validates mmap.len() == ACCOUNT_STATS_SIZE (128), mmap is page-aligned,
+        // and compile-time offset_of! assertions confirm every field is 8-byte aligned.
+        // Relaxed atomic loads avoid C11/Rust data-race UB when racing against a live writer
+        // before fence(Ordering::Acquire) + version seqlock verification.
+        let load_u64 = |offset: usize| -> u64 {
+            debug_assert!(offset + 8 <= ACCOUNT_STATS_SIZE && offset.is_multiple_of(8));
+            unsafe { (*base.byte_add(offset).cast::<AtomicU64>()).load(Ordering::Relaxed) }
+        };
+        AccountStatsSnapshot {
+            collateral: f64::from_bits(load_u64(8)),
+            portfolio_value: f64::from_bits(load_u64(16)),
+            leverage: f64::from_bits(load_u64(24)),
+            available_balance: f64::from_bits(load_u64(32)),
+            margin_usage: f64::from_bits(load_u64(40)),
+            buying_power: f64::from_bits(load_u64(48)),
+            updated_at: load_u64(56),
+            position: f64::from_bits(load_u64(64)),
+            position_updated_at: load_u64(72),
         }
     }
 

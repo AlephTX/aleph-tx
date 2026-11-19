@@ -249,6 +249,10 @@ impl LighterSigner {
         if !super::super::valid_market_id(market_index) {
             return Err("Invalid Lighter market ID".into());
         }
+        let price_c = c_int::try_from(price)
+            .map_err(|_| "Lighter order price exceeds C int range (i32::MAX)".to_string())?;
+        let trigger_price_c = c_int::try_from(trigger_price)
+            .map_err(|_| "Lighter trigger price exceeds C int range (i32::MAX)".to_string())?;
         #[cfg(test)]
         if self.mock_only {
             let tx_info = serde_json::json!({
@@ -281,12 +285,12 @@ impl LighterSigner {
                 market_index,
                 client_order_index,
                 base_amount,
-                price as c_int,
+                price_c,
                 is_ask as c_int,
                 order_type as c_int,
                 time_in_force as c_int,
                 reduce_only as c_int,
-                trigger_price as c_int,
+                trigger_price_c,
                 order_expiry,
                 0, // No integrator account or fees.
                 0,

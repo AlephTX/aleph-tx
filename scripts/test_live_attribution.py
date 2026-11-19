@@ -15,11 +15,56 @@ from live_attribution import (
     attribute_session,
     load_session_telemetry,
     render_markdown_summary,
+    summarize_fill_metric,
 )
 from telemetry_store import TelemetryStore
 
 
 class LiveAttributionTests(unittest.TestCase):
+    def test_weighting_reverses_small_fill_bias_and_reports_missing_labels(self) -> None:
+        fills = [
+            {"size": 1.0, "notional": 100.0},
+            {"size": 9.0, "notional": 1800.0},
+            {"size": 10.0, "notional": 2000.0},
+        ]
+        stats = summarize_fill_metric(fills, [10.0, -2.0, None])
+        self.assertEqual(stats["equal_weight_bps"], 4.0)
+        self.assertAlmostEqual(stats["quantity_weighted_bps"], -0.8)
+        self.assertAlmostEqual(stats["notional_weighted_bps"], -2600.0 / 1900.0)
+        self.assertEqual(stats["valid_label_count"], 2)
+        self.assertAlmostEqual(stats["label_coverage"], 2 / 3)
+        self.assertEqual(stats["quantity_coverage"], 0.5)
+        self.assertAlmostEqual(stats["notional_coverage"], 1900 / 3900)
+
+    def test_partial_fill_split_preserves_weighted_markout(self) -> None:
+        whole = summarize_fill_metric(
+            [{"size": 10.0, "notional": 1000.0}, {"size": 1.0, "notional": 200.0}],
+            [-3.0, 2.0],
+        )
+        split = summarize_fill_metric(
+            [{"size": 5.0, "notional": 500.0}, {"size": 5.0, "notional": 500.0},
+             {"size": 1.0, "notional": 200.0}], [-3.0, -3.0, 2.0],
+        )
+        for key in ("quantity_weighted_bps", "notional_weighted_bps", "valid_label_notional"):
+            self.assertAlmostEqual(whole[key], split[key])
+        self.assertNotEqual(whole["equal_weight_bps"], split["equal_weight_bps"])
+
+    def test_unknown_weights_and_empty_labels_do_not_imply_full_coverage(self) -> None:
+        fills = [{"size": 1.0, "notional": 100.0}, {"size": 1.0, "notional": None}]
+        stats = summarize_fill_metric(fills, [1.0, 2.0])
+        self.assertIsNone(stats["total_notional"])
+        self.assertIsNone(stats["notional_coverage"])
+        self.assertEqual(stats["unknown_notional_count"], 1)
+        self.assertEqual(stats["notional_weighted_bps"], 1.0)
+        for values in ([None, None], [float("nan"), float("inf")]):
+            missing = summarize_fill_metric(fills[:1] * 2, values)
+            self.assertEqual(missing["notional_coverage"], 0.0)
+            self.assertIsNone(missing["equal_weight_bps"])
+            self.assertIsNone(missing["notional_weighted_bps"])
+        empty = summarize_fill_metric([], [])
+        self.assertIsNone(empty["notional_weighted_bps"])
+        self.assertIsNone(empty["notional_coverage"])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -207,6 +252,12 @@ class LiveAttributionTests(unittest.TestCase):
         # Because Fill 2 has `role_unknown` fee_source, session-level `all_fees_rated` MUST be False!
         self.assertFalse(py_report["all_fees_rated"])
         self.assertIsNone(py_report["mean_rated_fee_bps"])
+        self.assertEqual(py_report["schema_version"], 2)
+        net500 = py_report["net_primary_markout_statistics"]["500ms"]
+        self.assertEqual(net500["valid_label_count"], 1)
+        self.assertEqual(net500["label_coverage"], 0.5)
+        self.assertLess(net500["notional_coverage"], 1.0)
+        self.assertAlmostEqual(net500["notional_weighted_bps"], -30.0)
 
         f1, f2 = py_report["fills"]
         self.assertEqual(f1["alignment_clock"], "exchange_ts_ns")

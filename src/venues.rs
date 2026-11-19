@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, str::FromStr};
 
 /// Versioned snapshot identifier for audited venue latency, fee, and quota semantics.
-pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-17.v1";
+pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-18.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +81,10 @@ fn dec(s: &'static str) -> Decimal {
     Decimal::from_str(s).expect("valid static capability decimal")
 }
 
+// HIP-3 domains deliberately have no generic audited fee row. Per-asset
+// deployerFeeScale/growthMode, collateral and account terms are required; the
+// native Hyperliquid base fee is not a verified all-in Entropy/TradeXYZ fee.
+// See official fee formula and docs/RESEARCH_DATA_SOURCES.md.
 pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
     use BatchQuotaSemantics::{PerTransaction, RateLimitedApi};
     use CapabilityAssetScope::{All, Crypto, Equity};
@@ -257,44 +261,6 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
             grouped_orders_semantics: ConditionalAttachedOnly,
             scheduled_cancel_support: Supported,
             primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees",
-        },
-        VenueExecutionCapability {
-            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
-            venue_id: "entropy",
-            liquidity_domain: "hyperliquid:io",
-            settlement_currency: "USDC",
-            tier: "base",
-            asset_scope: All,
-            maker_post_only_delay_ms: 0,
-            non_post_only_limit_delay_ms: 0,
-            cancel_delay_ms: 0,
-            modify_delay_ms: 0,
-            taker_delay_ms: 0,
-            maker_fee_bps: dec("1.50"),
-            taker_fee_bps: dec("4.50"),
-            batch_quota_semantics: RateLimitedApi,
-            grouped_orders_semantics: ConditionalAttachedOnly,
-            scheduled_cancel_support: Supported,
-            primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals",
-        },
-        VenueExecutionCapability {
-            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
-            venue_id: "trade_xyz",
-            liquidity_domain: "hyperliquid:xyz",
-            settlement_currency: "USDC",
-            tier: "base",
-            asset_scope: All,
-            maker_post_only_delay_ms: 0,
-            non_post_only_limit_delay_ms: 0,
-            cancel_delay_ms: 0,
-            modify_delay_ms: 0,
-            taker_delay_ms: 0,
-            maker_fee_bps: dec("1.50"),
-            taker_fee_bps: dec("4.50"),
-            batch_quota_semantics: RateLimitedApi,
-            grouped_orders_semantics: ConditionalAttachedOnly,
-            scheduled_cancel_support: Supported,
-            primary_source: "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals",
         },
     ]
 }
@@ -499,6 +465,58 @@ impl VenueRegistry {
     }
 }
 
+/// Effective per-asset HIP-3 fee and volume credit terms (`OPT-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Hip3AssetFeeSchedule {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub effective_maker_fee_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub effective_taker_fee_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub tier_volume_credit_weight: Decimal,
+    pub growth_mode_enabled: bool,
+}
+
+/// Compute effective HIP-3 fee schedule from native Hyperliquid base fees,
+/// deployer fee scale, growth-mode status, and asset disjointness.
+///
+/// Fails closed if `growth_mode_enabled` is requested for a verified core
+/// crypto asset or if `deployer_fee_scale` falls outside `[0, 5]`.
+pub fn compute_hip3_execution_fees(
+    base_maker_bps: Decimal,
+    base_taker_bps: Decimal,
+    deployer_fee_scale: Decimal,
+    growth_mode_enabled: bool,
+    is_verified_core_crypto_asset: bool,
+) -> Result<Hip3AssetFeeSchedule> {
+    ensure!(
+        base_maker_bps >= Decimal::ZERO && base_taker_bps >= Decimal::ZERO,
+        "HIP-3 base fees must be nonnegative"
+    );
+    ensure!(
+        deployer_fee_scale >= Decimal::ZERO && deployer_fee_scale <= Decimal::from(5),
+        "HIP-3 deployer_fee_scale must lie in [0, 5]"
+    );
+    ensure!(
+        !(growth_mode_enabled && is_verified_core_crypto_asset),
+        "HIP-3 growth mode excludes verified core crypto assets"
+    );
+    // Standard HIP-3 fee is 2x Hyperliquid base scaled by deployerFeeScale;
+    // Growth Mode reduces both fees and 14d tier volume credit by 90% (0.10x).
+    let scale_factor = Decimal::ONE + deployer_fee_scale;
+    let growth_factor = if growth_mode_enabled {
+        dec("0.10")
+    } else {
+        Decimal::ONE
+    };
+    Ok(Hip3AssetFeeSchedule {
+        effective_maker_fee_bps: (base_maker_bps * scale_factor * growth_factor).normalize(),
+        effective_taker_fee_bps: (base_taker_bps * scale_factor * growth_factor).normalize(),
+        tier_volume_credit_weight: growth_factor.normalize(),
+        growth_mode_enabled,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +604,19 @@ mod tests {
         assert_eq!(arcus_rwa_l4.maker_fee_bps, dec("0.00"));
         assert_eq!(arcus_rwa_l4.taker_fee_bps, dec("1.15"));
 
+        // Data discovery remains supported, but HIP-3 execution economics need
+        // asset-specific evidence instead of inheriting native perp base fees.
+        for venue in ["entropy", "trade_xyz"] {
+            assert!(registry.get(venue).is_ok());
+            for asset_class in ["crypto", "equity"] {
+                assert!(
+                    registry
+                        .resolve_execution_capability(venue, "base", asset_class)
+                        .is_err()
+                );
+            }
+        }
+
         // Unverified or read-only venues fail closed rather than defaulting to zero delay/fee.
         assert!(
             registry
@@ -601,6 +632,32 @@ mod tests {
             registry
                 .resolve_execution_capability("lighter", "unknown_tier", "crypto")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn hip3_execution_fees_enforce_growth_mode_cuts_and_core_crypto_disjointness() {
+        let base_maker = dec("1.50");
+        let base_taker = dec("4.50");
+        let regular =
+            compute_hip3_execution_fees(base_maker, base_taker, Decimal::ONE, false, false)
+                .unwrap();
+        assert_eq!(regular.effective_maker_fee_bps, dec("3"));
+        assert_eq!(regular.effective_taker_fee_bps, dec("9"));
+        assert_eq!(regular.tier_volume_credit_weight, Decimal::ONE);
+
+        let growth =
+            compute_hip3_execution_fees(base_maker, base_taker, Decimal::ONE, true, false).unwrap();
+        assert_eq!(growth.effective_maker_fee_bps, dec("0.3"));
+        assert_eq!(growth.effective_taker_fee_bps, dec("0.9"));
+        assert_eq!(growth.tier_volume_credit_weight, dec("0.1"));
+
+        // Core crypto asset disjointness fails closed under HIP-3 growth mode.
+        assert!(
+            compute_hip3_execution_fees(base_maker, base_taker, Decimal::ONE, true, true).is_err()
+        );
+        assert!(
+            compute_hip3_execution_fees(base_maker, base_taker, dec("-0.1"), false, false).is_err()
         );
     }
 }

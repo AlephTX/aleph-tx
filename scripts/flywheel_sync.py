@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import gzip
 from hashlib import sha256
 import json
@@ -202,110 +203,126 @@ def ship_public_bronze(
     )
     eager_evict = bool(remote_base) and evict_after_verify
 
-    for cap_path in _discover_closed_public_captures(resolved_root):
-        cid = campaign_id or _infer_campaign_id(cap_path.name)
-        manifest_path = cap_path.with_name(f"{cap_path.name}.bronze_manifest.json")
-        receipt_path = cap_path.with_name(f"{cap_path.name}.upload_receipt.json")
-        will_upload = bool(remote_base) and not receipt_path.exists()
+    with (resolved_root / ".flywheel_public.lock").open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        for cap_path in _discover_closed_public_captures(resolved_root):
+            cid = campaign_id or _infer_campaign_id(cap_path.name)
+            manifest_path = cap_path.with_name(f"{cap_path.name}.bronze_manifest.json")
+            receipt_path = cap_path.with_name(f"{cap_path.name}.upload_receipt.json")
+            will_upload = bool(remote_base) and not receipt_path.exists()
 
-        if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            stat_size = cap_path.stat().st_size
-            if stat_size != manifest.get("capture_bytes"):
-                raise ValueError(f"sealed capture mutated on disk: {cap_path}")
-            if will_upload:
-                cur_sha, cur_bytes = digest_unchanged(cap_path)
-                if cur_sha != manifest.get("capture_sha256") or cur_bytes != manifest.get("capture_bytes"):
-                    raise ValueError(f"sealed capture mutated on disk: {cap_path}")
-        else:
             try:
-                manifest = seal_bronze_capture(
-                    cap_path,
-                    campaign_id=cid,
-                    collector_region=collector_region,
-                    split_role=split_role,
-                    manifest_out=manifest_path,
+                if manifest_path.exists():
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    stat_size = cap_path.stat().st_size
+                    if stat_size != manifest.get("capture_bytes"):
+                        raise ValueError(f"sealed capture mutated on disk: {cap_path}")
+                    if will_upload:
+                        cur_sha, cur_bytes = digest_unchanged(cap_path)
+                        if cur_sha != manifest.get("capture_sha256") or cur_bytes != manifest.get("capture_bytes"):
+                            raise ValueError(f"sealed capture mutated on disk: {cap_path}")
+                else:
+                    try:
+                        manifest = seal_bronze_capture(
+                            cap_path,
+                            campaign_id=cid,
+                            collector_region=collector_region,
+                            split_role=split_role,
+                            manifest_out=manifest_path,
+                        )
+                    except FileExistsError:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                if not cap_path.exists():
+                    continue
+                raise
+
+            sealed.append(cap_path.name)
+            if remote_base:
+                rel_subdir = (
+                    cap_path.parent.relative_to(resolved_root).as_posix()
+                    if cap_path.parent != resolved_root
+                    else ""
                 )
-            except FileExistsError:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                remote_folder = f"{remote_base}/{rel_subdir}" if rel_subdir else remote_base
+                remote_cap = f"{remote_folder}/{cap_path.name}"
+                remote_manifest = f"{remote_folder}/{manifest_path.name}"
 
-        sealed.append(cap_path.name)
-        if remote_base:
-            rel_subdir = (
-                cap_path.parent.relative_to(resolved_root).as_posix()
-                if cap_path.parent != resolved_root
-                else ""
-            )
-            remote_folder = f"{remote_base}/{rel_subdir}" if rel_subdir else remote_base
-            remote_cap = f"{remote_folder}/{cap_path.name}"
-            remote_manifest = f"{remote_folder}/{manifest_path.name}"
+                if will_upload and not receipt_path.exists():
+                    # Do not swallow uploader binary FileNotFoundError (e.g. missing rclone).
+                    for local_src, remote_dst in ((cap_path, remote_cap), (manifest_path, remote_manifest)):
+                        copy_cmd = build_idle_command(
+                            [
+                                "rclone",
+                                "copyto",
+                                "--bwlimit",
+                                bwlimit,
+                                "--drive-chunk-size",
+                                drive_chunk_size,
+                                "--",
+                                str(local_src),
+                                remote_dst,
+                            ],
+                            which=which,
+                        )
+                        runner(copy_cmd, capture_output=True, text=True, check=True)
 
-            if will_upload and not receipt_path.exists():
-                for local_src, remote_dst in ((cap_path, remote_cap), (manifest_path, remote_manifest)):
-                    copy_cmd = build_idle_command(
-                        [
-                            "rclone",
-                            "copyto",
-                            "--bwlimit",
-                            bwlimit,
-                            "--drive-chunk-size",
-                            drive_chunk_size,
-                            "--",
-                            str(local_src),
-                            remote_dst,
-                        ],
+                    receipt = _verify_remote_rclone_object(
+                        remote_cap,
+                        expected_sha256=manifest["capture_sha256"],
+                        expected_bytes=manifest["capture_bytes"],
                         which=which,
+                        runner=runner,
                     )
-                    runner(copy_cmd, capture_output=True, text=True, check=True)
+                    try:
+                        write_immutable_json(receipt_path, receipt)
+                    except FileExistsError:
+                        pass
 
-                receipt = _verify_remote_rclone_object(
-                    remote_cap,
-                    expected_sha256=manifest["capture_sha256"],
-                    expected_bytes=manifest["capture_bytes"],
-                    which=which,
-                    runner=runner,
+                shipped.append(
+                    {
+                        "capture": cap_path.name,
+                        "campaign_id": manifest["campaign_id"],
+                        "sha256": manifest["capture_sha256"],
+                        "bytes": manifest["capture_bytes"],
+                        "remote_uri": f"rclone://{remote_cap}",
+                    }
                 )
+
+            if not (eager_evict or min_free_bytes is not None) or not receipt_path.exists():
+                continue
+            try:
+                mtime = cap_path.stat().st_mtime
+                age_secs = max(0.0, now_ts - mtime)
+                if age_secs >= min_evict_age_secs:
+                    if eager_evict:
+                        tombstone = evict_local_capture(
+                            cap_path,
+                            manifest_path=manifest_path,
+                            remote_receipt_path=receipt_path,
+                        )
+                        evicted.append(tombstone["evicted_filename"])
+                    else:
+                        eviction_candidates.append((mtime, cap_path, manifest_path, receipt_path))
+            except FileNotFoundError:
+                if not cap_path.exists():
+                    continue
+                raise
+
+        if min_free_bytes is not None and eviction_candidates:
+            eviction_candidates.sort(key=lambda item: (item[0], item[1].name))
+            for _mtime, cap_path, manifest_path, receipt_path in eviction_candidates:
+                if disk_free_bytes_fn(resolved_root) >= min_free_bytes:
+                    break
                 try:
-                    write_immutable_json(receipt_path, receipt)
-                except FileExistsError:
-                    pass
-
-            shipped.append(
-                {
-                    "capture": cap_path.name,
-                    "campaign_id": manifest["campaign_id"],
-                    "sha256": manifest["capture_sha256"],
-                    "bytes": manifest["capture_bytes"],
-                    "remote_uri": f"rclone://{remote_cap}",
-                }
-            )
-
-        if not (eager_evict or min_free_bytes is not None) or not receipt_path.exists():
-            continue
-        mtime = cap_path.stat().st_mtime
-        age_secs = max(0.0, now_ts - mtime)
-        if age_secs >= min_evict_age_secs:
-            if eager_evict:
-                tombstone = evict_local_capture(
-                    cap_path,
-                    manifest_path=manifest_path,
-                    remote_receipt_path=receipt_path,
-                )
-                evicted.append(tombstone["evicted_filename"])
-            else:
-                eviction_candidates.append((mtime, cap_path, manifest_path, receipt_path))
-
-    if min_free_bytes is not None and eviction_candidates:
-        eviction_candidates.sort(key=lambda item: (item[0], item[1].name))
-        for _mtime, cap_path, manifest_path, receipt_path in eviction_candidates:
-            if disk_free_bytes_fn(resolved_root) >= min_free_bytes:
-                break
-            tombstone = evict_local_capture(
-                cap_path,
-                manifest_path=manifest_path,
-                remote_receipt_path=receipt_path,
-            )
-            evicted.append(tombstone["evicted_filename"])
+                    tombstone = evict_local_capture(
+                        cap_path,
+                        manifest_path=manifest_path,
+                        remote_receipt_path=receipt_path,
+                    )
+                    evicted.append(tombstone["evicted_filename"])
+                except FileNotFoundError:
+                    continue
 
     return {
         "schema_version": 1,
@@ -378,13 +395,15 @@ def atomic_sqlite_backup(db_path: Path, staging_dir: Path, *, snapshot_tag: str)
     raw_backup = staging_dir / f".telemetry-{snapshot_tag}.sqlite3.tmp.{os.getpid()}"
     final_gz = staging_dir / f"telemetry-{snapshot_tag}.sqlite3.gz"
     try:
+        if raw_backup.exists():
+            raw_backup.unlink()
         src_uri = f"file:{db_path.resolve()}?mode=ro"
         with sqlite3.connect(src_uri, uri=True, timeout=10.0) as src_conn:
-            with sqlite3.connect(raw_backup) as dst_conn:
-                src_conn.backup(dst_conn, pages=256, sleep=0.005)
-                integrity = dst_conn.execute("PRAGMA integrity_check").fetchone()
-                if not integrity or integrity[0] != "ok":
-                    raise ValueError(f"SQLite backup integrity_check failed: {integrity}")
+            src_conn.execute("VACUUM INTO ?", (str(raw_backup),))
+        with sqlite3.connect(f"file:{raw_backup}?mode=ro", uri=True, timeout=10.0) as check_conn:
+            integrity = check_conn.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise ValueError(f"SQLite backup integrity_check failed: {integrity}")
         gz_sha, gz_bytes = _write_gzip_0600(raw_backup, final_gz)
     finally:
         if raw_backup.exists():

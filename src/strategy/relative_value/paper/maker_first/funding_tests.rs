@@ -236,6 +236,7 @@ fn a_late_precancel_fill_is_booked_and_cannot_disappear_at_the_boundary() {
         price: d("1000"),
         left: d("0.1"),
         ahead: Decimal::ZERO,
+        queue_depth: None,
         arrival_ms: HOUR - 5_500,
         activated_ms: Some(HOUR - 5_500),
         expires_ms: HOUR - 4_700,

@@ -589,7 +589,11 @@ pub(super) async fn launch(
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    let mut session = Session::new(Path::new("pids"), Path::new("/dev/shm"))?;
+    let ipc_root = std::env::var_os("ALEPH_IPC_ROOT")
+        .filter(|val| !val.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/dev/shm"));
+    let mut session = Session::new(Path::new("pids"), &ipc_root)?;
     let feeder_config = session.ipc.join("config.toml");
     if let Err(error) = fs::write(&feeder_config, profile.feeder_config) {
         session.discard_unstarted()?;

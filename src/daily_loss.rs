@@ -8,8 +8,10 @@
 use anyhow::{Context, Result};
 use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -113,8 +115,21 @@ impl DailyLossGuard {
             today > self.state.utc_day || !self.state.breached,
             "daily loss limit already breached today"
         );
-        if !equity.is_finite() || equity <= 0.0 {
-            return Ok(0.0); // Unusable snapshots are rejected upstream.
+        if !equity.is_finite() {
+            return Ok(0.0); // Non-finite snapshots are rejected upstream.
+        }
+        if equity <= 0.0 {
+            if today > self.state.utc_day {
+                self.state.utc_day = today;
+            }
+            self.state.breached = true;
+            // Persist before failing so a wipeout cannot re-arm on restart.
+            self.persist()?;
+            anyhow::bail!(
+                "daily loss limit breached: non-positive equity (${:.2} -> ${:.2})",
+                self.state.start_equity,
+                equity
+            );
         }
         if today > self.state.utc_day {
             self.state = DailyLossState {
@@ -150,7 +165,11 @@ impl DailyLossGuard {
         }
         let tmp = path.with_extension("tmp");
         {
-            let mut file = File::create(&tmp)?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut file = opts.open(&tmp)?;
             file.write_all(&serde_json::to_vec(&self.state)?)?;
             file.sync_all()?;
         }

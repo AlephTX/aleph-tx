@@ -30,6 +30,11 @@ use tokio::time::Instant;
 use crate::types::ShmPrivateEventV2;
 
 const POS_SCALE: f64 = 1e8;
+
+#[inline]
+fn scale_pos(v: f64) -> i64 {
+    (v * POS_SCALE).round() as i64
+}
 const PENDING_CREATE_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 const PENDING_CANCEL_RECONCILE_GRACE: Duration = Duration::from_secs(3);
 const FILL_COMPLETION_EPS: f64 = 1e-9;
@@ -127,6 +132,8 @@ pub struct TrackedOrder {
     pub total_fee: f64,
     /// Fill records: (trade_id, fill_size, fill_price)
     pub fills: Vec<(u64, f64, f64)>,
+    /// Whether the order was submitted with `reduce_only = true`.
+    pub reduce_only: bool,
     /// Submission outcome is unknown; absence from open orders cannot release risk.
     pub submission_uncertain: bool,
     position_generation: u64,
@@ -262,15 +269,21 @@ impl OrderTracker {
         self.reconciliation_epoch.load(Ordering::Acquire)
     }
 
+    /// Evidence token from the last successful recovery, not a new gap that
+    /// may have arrived since its asynchronous terminal/account checks finished.
+    pub(crate) fn last_reconciled_epoch(&self) -> u64 {
+        self.reconciled_epoch.load(Ordering::Acquire)
+    }
+
     pub fn needs_reconciliation(&self) -> bool {
         let reconciled = self.reconciled_epoch.load(Ordering::Acquire);
         self.reconciliation_epoch() != reconciled
     }
 
-    /// A cleanup may acknowledge only the epoch it observed before starting.
-    /// A new gap during the cleanup always remains visible, even if it races
-    /// between the comparison and the acknowledgment store.
-    pub fn clear_reconciliation_if_epoch(&self, epoch: u64) -> bool {
+    /// Test fixture helper. Production recovery must supply terminal-order and
+    /// position evidence through `confirm_cleanup` or `confirm_recovered_flat`.
+    #[cfg(test)]
+    fn clear_reconciliation_if_epoch(&self, epoch: u64) -> bool {
         let state = self.state.read();
         let _gate = self.reconciliation_gate.lock();
         if self.reconciliation_epoch() != epoch || !state.late_fill_orders.is_empty() {
@@ -280,9 +293,10 @@ impl OrderTracker {
         self.reconciliation_epoch() == epoch
     }
 
-    /// Atomically acknowledge an authoritative cleanup: the caller has confirmed
-    /// no exchange open orders and obtained a fresh independent position snapshot.
-    /// State mutations and gap detection cannot interleave with this commit.
+    /// Rebase from a fresh independent position only after all locally reserved
+    /// orders have terminal evidence. Empty REST open orders alone cannot prove
+    /// that a pending create/cancel never filled. REST terminal history recovery
+    /// uses `confirm_recovered_flat` with its covered order identities instead.
     pub fn confirm_cleanup(&self, epoch: u64, authoritative_position: f64) -> bool {
         self.commit_cleanup(epoch, authoritative_position, None)
     }
@@ -291,6 +305,17 @@ impl OrderTracker {
     /// orders and the account transaction watermark that covers their fills.
     pub(crate) fn confirm_recovered_flat(&self, epoch: u64, orders: &BTreeSet<i64>) -> bool {
         self.commit_cleanup(epoch, 0.0, Some(orders))
+    }
+
+    /// REST recovery has checked terminal history of quarantined orders and an
+    /// authoritative account watermark, rebasing onto the confirmed non-flat position.
+    pub(crate) fn confirm_recovered_position(
+        &self,
+        epoch: u64,
+        authoritative_position: f64,
+        orders: &BTreeSet<i64>,
+    ) -> bool {
+        self.commit_cleanup(epoch, authoritative_position, Some(orders))
     }
 
     pub(crate) fn has_late_fills(&self) -> bool {
@@ -327,7 +352,7 @@ impl OrderTracker {
                 .keys()
                 .chain(state.late_fill_orders.iter())
                 .all(|id| orders.contains(id)),
-            None => state.late_fill_orders.is_empty(),
+            None => state.active_orders.is_empty() && state.late_fill_orders.is_empty(),
         };
         if self.reconciliation_epoch() != epoch || !covered {
             return false;
@@ -350,8 +375,9 @@ impl OrderTracker {
         true
     }
 
-    /// For synchronous initialization only; asynchronous cleanup must use an epoch.
-    pub fn clear_reconciliation_required(&self) {
+    /// Test fixture helper; unavailable to production initialization/recovery.
+    #[cfg(test)]
+    fn clear_reconciliation_required(&self) {
         self.clear_reconciliation_if_epoch(self.reconciliation_epoch());
     }
 
@@ -461,6 +487,18 @@ impl OrderTracker {
         (confirmed, short, long)
     }
 
+    /// Total remaining exposure on `side` across active `reduce_only` orders
+    /// (`PendingCreate | Open | PartiallyFilled | PendingCancel`).
+    pub fn reduce_only_pending_exposure(&self, side: OrderSide) -> f64 {
+        let state = self.state.read();
+        state
+            .active_orders
+            .values()
+            .filter(|o| o.side == side && o.reduce_only && o.lifecycle.has_pending_exposure())
+            .map(|o| o.remaining_size().max(0.0))
+            .sum()
+    }
+
     /// Debug: Verify atomic exposure matches locked traversal.
     /// NOTE: Not linearizable — TOCTOU window between locked and atomic reads.
     /// False positives possible under concurrent mutation. Use only for diagnostics.
@@ -555,6 +593,18 @@ impl OrderTracker {
         price: f64,
         size: f64,
     ) -> bool {
+        self.start_tracking_order(client_order_id, side, price, size, false)
+    }
+
+    /// Register a new order before sending to exchange, preserving `reduce_only`.
+    pub fn start_tracking_order(
+        &self,
+        client_order_id: i64,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+        reduce_only: bool,
+    ) -> bool {
         if client_order_id == 0
             || !price.is_finite()
             || price <= 0.0
@@ -579,6 +629,7 @@ impl OrderTracker {
             last_update: Instant::now(),
             total_fee: 0.0,
             fills: Vec::new(),
+            reduce_only,
             submission_uncertain: false,
             position_generation: state.position_generation,
         };
@@ -592,7 +643,7 @@ impl OrderTracker {
         state.active_orders.insert(client_order_id, order);
 
         // Phase 2: Increment atomic exposure
-        let size_scaled = (size * POS_SCALE) as i64;
+        let size_scaled = scale_pos(size);
         match side {
             OrderSide::Buy => {
                 self.pending_buy_exposure
@@ -628,7 +679,7 @@ impl OrderTracker {
         }
         if let Some(mut order) = state.active_orders.remove(&client_order_id) {
             // Phase 2: Decrement atomic exposure
-            let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+            let remaining_scaled = scale_pos(order.remaining_size());
             match order.side {
                 OrderSide::Buy => {
                     self.pending_buy_exposure
@@ -700,7 +751,7 @@ impl OrderTracker {
                 exchange_position,
                 delta
             );
-            let scaled = (exchange_position * POS_SCALE) as i64;
+            let scaled = scale_pos(exchange_position);
             self.confirmed_position.store(scaled, Ordering::Release);
         }
 
@@ -725,9 +776,10 @@ impl OrderTracker {
             .retain(|_, cid| active_orders.contains_key(cid) || completed_orders.contains_key(cid));
     }
 
-    /// Cancel all active orders in tracker (when exchange cancel_all is called)
-    /// Moves all active orders to completed with Canceled lifecycle
-    pub fn cancel_all_active(&self) -> usize {
+    /// Test fixture helper. Sending cancel-all is not terminal evidence and
+    /// must never release production reservations through this shortcut.
+    #[cfg(test)]
+    fn cancel_all_active(&self) -> usize {
         let mut state = self.state.write();
         let drained: Vec<_> = state.active_orders.drain().collect();
         let count = drained.len();
@@ -735,7 +787,7 @@ impl OrderTracker {
         for (coi, mut order) in drained {
             // Phase 2: Decrement atomic exposure
             if order.lifecycle.has_pending_exposure() {
-                let remaining_scaled = (order.remaining_size() * POS_SCALE) as i64;
+                let remaining_scaled = scale_pos(order.remaining_size());
                 match order.side {
                     OrderSide::Buy => {
                         self.pending_buy_exposure
@@ -823,6 +875,20 @@ impl OrderTracker {
                     unresolved_count += 1;
                 }
                 _ => {}
+            }
+            if let Some(oo) = matched_open {
+                if order.order_index.is_none()
+                    && let Some(idx) = oo
+                        .order_index
+                        .or_else(|| oo.order_id.parse::<i64>().ok())
+                        .filter(|&idx| idx > 0)
+                {
+                    order.order_index = Some(idx);
+                }
+                if oo.filled > order.filled_size + 1e-9 {
+                    order.submission_uncertain = true;
+                    unresolved_count += 1;
+                }
             }
         }
 
@@ -919,132 +985,174 @@ impl OrderTracker {
 
     fn handle_order_created(&self, event: &ShmPrivateEventV2) -> anyhow::Result<()> {
         let client_id = event.client_order_id;
-        let mut state = self.state.write();
+        let mut late_accepted_after_fail = false;
+        {
+            let mut state = self.state.write();
 
-        if let Some(order) = state.active_orders.get_mut(&client_id) {
-            if order.exchange_order_id == Some(event.exchange_order_id)
-                && order.order_index == Some(event.order_index)
-                && order.lifecycle != OrderLifecycle::PendingCreate
-            {
+            if let Some(order) = state.active_orders.get_mut(&client_id) {
+                if order.exchange_order_id == Some(event.exchange_order_id)
+                    && order.order_index == Some(event.order_index)
+                    && order.lifecycle != OrderLifecycle::PendingCreate
+                {
+                    order.last_update = Instant::now();
+                    tracing::debug!(
+                        "Ignoring duplicate order confirmation: coi={} exch_id={} order_idx={}",
+                        client_id,
+                        event.exchange_order_id,
+                        event.order_index
+                    );
+                    return Ok(());
+                }
+
+                // Delayed binding: attach exchange IDs to locally registered order
+                order.exchange_order_id = Some(event.exchange_order_id);
+                order.order_index = Some(event.order_index);
+                if order.lifecycle == OrderLifecycle::PendingCreate {
+                    order.lifecycle = OrderLifecycle::Open;
+                }
+                order.submission_uncertain = false;
                 order.last_update = Instant::now();
+
+                // Build reverse mapping
+                state
+                    .exchange_to_client
+                    .insert(event.exchange_order_id, client_id);
+
                 tracing::debug!(
-                    "Ignoring duplicate order confirmation: coi={} exch_id={} order_idx={}",
+                    "✅ Order confirmed: coi={} exch_id={} order_idx={}",
                     client_id,
                     event.exchange_order_id,
                     event.order_index
                 );
-                return Ok(());
-            }
+            } else if let Some(existing_cid) = state
+                .exchange_to_client
+                .get(&event.exchange_order_id)
+                .copied()
+            {
+                if let Some(order) = state.active_orders.get_mut(&existing_cid) {
+                    order.last_update = Instant::now();
+                    tracing::debug!(
+                        "Ignoring duplicate order-created event by exchange binding: exch_id={} coi={} event_coi={}",
+                        event.exchange_order_id,
+                        existing_cid,
+                        client_id
+                    );
+                    return Ok(());
+                }
 
-            // Delayed binding: attach exchange IDs to locally registered order
-            order.exchange_order_id = Some(event.exchange_order_id);
-            order.order_index = Some(event.order_index);
-            if order.lifecycle == OrderLifecycle::PendingCreate {
+                if state.completed_orders.contains_key(&existing_cid) {
+                    tracing::debug!(
+                        "Ignoring duplicate order-created event for completed order: exch_id={} coi={}",
+                        event.exchange_order_id,
+                        existing_cid
+                    );
+                    return Ok(());
+                }
+            } else if state
+                .completed_orders
+                .get(&client_id)
+                .is_some_and(|o| o.lifecycle == OrderLifecycle::Rejected)
+            {
+                let mut order = state
+                    .completed_orders
+                    .remove(&client_id)
+                    .expect("checked rejected order exists");
+                order.exchange_order_id = Some(event.exchange_order_id);
+                order.order_index = (event.order_index != 0).then_some(event.order_index);
                 order.lifecycle = OrderLifecycle::Open;
-            }
-            order.submission_uncertain = false;
-            order.last_update = Instant::now();
-
-            // Build reverse mapping
-            state
-                .exchange_to_client
-                .insert(event.exchange_order_id, client_id);
-
-            tracing::debug!(
-                "✅ Order confirmed: coi={} exch_id={} order_idx={}",
-                client_id,
-                event.exchange_order_id,
-                event.order_index
-            );
-        } else if let Some(existing_cid) = state
-            .exchange_to_client
-            .get(&event.exchange_order_id)
-            .copied()
-        {
-            if let Some(order) = state.active_orders.get_mut(&existing_cid) {
+                order.submission_uncertain = true;
                 order.last_update = Instant::now();
-                tracing::debug!(
-                    "Ignoring duplicate order-created event by exchange binding: exch_id={} coi={} event_coi={}",
-                    event.exchange_order_id,
-                    existing_cid,
-                    client_id
-                );
-                return Ok(());
-            }
-
-            if state.completed_orders.contains_key(&existing_cid) {
-                tracing::debug!(
-                    "Ignoring duplicate order-created event for completed order: exch_id={} coi={}",
-                    event.exchange_order_id,
-                    existing_cid
-                );
-                return Ok(());
-            }
-        } else {
-            if let Some(order) = state.completed_orders.get_mut(&client_id) {
-                order.last_update = Instant::now();
-                tracing::debug!(
-                    "Ignoring duplicate order-created event for completed order: coi={} exch_id={}",
+                let remaining_scaled = scale_pos(order.remaining_size());
+                match order.side {
+                    OrderSide::Buy => {
+                        self.pending_buy_exposure
+                            .fetch_add(remaining_scaled, Ordering::AcqRel);
+                    }
+                    OrderSide::Sell => {
+                        self.pending_sell_exposure
+                            .fetch_add(remaining_scaled, Ordering::AcqRel);
+                    }
+                }
+                state
+                    .exchange_to_client
+                    .insert(event.exchange_order_id, client_id);
+                state.active_orders.insert(client_id, order);
+                late_accepted_after_fail = true;
+                tracing::error!(
+                    "⚠️  Late OrderCreated arrived after mark_failed: coi={} exch_id={}; re-reserving exposure and requiring reconciliation",
                     client_id,
                     event.exchange_order_id
                 );
-                return Ok(());
-            }
-
-            // Auto-register untracked order (e.g. from restart, or manual order)
-            if self.started_at.elapsed() < STARTUP_AUTO_REGISTER_GRACE {
-                tracing::debug!(
-                    "Ignoring untracked order during startup grace: coi={} exch_id={}",
-                    client_id,
-                    event.exchange_order_id
-                );
-                return Ok(());
-            }
-
-            let side = if event.is_ask != 0 {
-                OrderSide::Sell
             } else {
-                OrderSide::Buy
-            };
-            let order = TrackedOrder {
-                client_order_id: client_id,
-                exchange_order_id: Some(event.exchange_order_id),
-                order_index: Some(event.order_index),
-                side,
-                price: event.order_price,
-                original_size: event.original_size,
-                filled_size: 0.0,
-                lifecycle: OrderLifecycle::Open,
-                created_at: Instant::now(),
-                last_update: Instant::now(),
-                total_fee: 0.0,
-                fills: Vec::new(),
-                submission_uncertain: false,
-                position_generation: 0,
-            };
-            state
-                .exchange_to_client
-                .insert(event.exchange_order_id, client_id);
-            state.active_orders.insert(client_id, order);
+                if let Some(order) = state.completed_orders.get_mut(&client_id) {
+                    order.last_update = Instant::now();
+                    tracing::debug!(
+                        "Ignoring duplicate order-created event for completed order: coi={} exch_id={}",
+                        client_id,
+                        event.exchange_order_id
+                    );
+                    return Ok(());
+                }
 
-            // Phase 2: Auto-registered order needs atomic exposure
-            let size_scaled = (event.original_size * POS_SCALE) as i64;
-            match side {
-                OrderSide::Buy => {
-                    self.pending_buy_exposure
-                        .fetch_add(size_scaled, Ordering::AcqRel);
+                // Auto-register untracked order (e.g. from restart, or manual order)
+                if self.started_at.elapsed() < STARTUP_AUTO_REGISTER_GRACE {
+                    tracing::debug!(
+                        "Ignoring untracked order during startup grace: coi={} exch_id={}",
+                        client_id,
+                        event.exchange_order_id
+                    );
+                    return Ok(());
                 }
-                OrderSide::Sell => {
-                    self.pending_sell_exposure
-                        .fetch_add(size_scaled, Ordering::AcqRel);
+
+                let side = if event.is_ask != 0 {
+                    OrderSide::Sell
+                } else {
+                    OrderSide::Buy
+                };
+                let order = TrackedOrder {
+                    client_order_id: client_id,
+                    exchange_order_id: Some(event.exchange_order_id),
+                    order_index: Some(event.order_index),
+                    side,
+                    price: event.order_price,
+                    original_size: event.original_size,
+                    filled_size: 0.0,
+                    lifecycle: OrderLifecycle::Open,
+                    created_at: Instant::now(),
+                    last_update: Instant::now(),
+                    total_fee: 0.0,
+                    fills: Vec::new(),
+                    reduce_only: false,
+                    submission_uncertain: false,
+                    position_generation: 0,
+                };
+                state
+                    .exchange_to_client
+                    .insert(event.exchange_order_id, client_id);
+                state.active_orders.insert(client_id, order);
+
+                // Phase 2: Auto-registered order needs atomic exposure
+                let size_scaled = scale_pos(event.original_size);
+                match side {
+                    OrderSide::Buy => {
+                        self.pending_buy_exposure
+                            .fetch_add(size_scaled, Ordering::AcqRel);
+                    }
+                    OrderSide::Sell => {
+                        self.pending_sell_exposure
+                            .fetch_add(size_scaled, Ordering::AcqRel);
+                    }
                 }
+
+                tracing::warn!(
+                    "⚠️  Auto-registered untracked order: coi={} exch_id={}",
+                    client_id,
+                    event.exchange_order_id
+                );
             }
-
-            tracing::warn!(
-                "⚠️  Auto-registered untracked order: coi={} exch_id={}",
-                client_id,
-                event.exchange_order_id
-            );
+        }
+        if late_accepted_after_fail {
+            self.require_reconciliation();
         }
 
         Ok(())
@@ -1131,7 +1239,7 @@ impl OrderTracker {
             .ok_or_else(|| anyhow::anyhow!("cash flow overflow"))?;
         let now = Instant::now();
         if let Some(order) = state.active_orders.get_mut(&cid) {
-            let before = (order.remaining_size() * POS_SCALE) as i64;
+            let before = scale_pos(order.remaining_size());
             order.filled_size += event.fill_size;
             order.total_fee += event.fee_paid;
             order.last_update = now;
@@ -1142,7 +1250,7 @@ impl OrderTracker {
             let after = if complete {
                 0
             } else {
-                (order.remaining_size() * POS_SCALE) as i64
+                scale_pos(order.remaining_size())
             };
             // Difference of rounded totals, rather than rounding each individual
             // fill, prevents residual/negative atomic exposure after many fills.
@@ -1189,12 +1297,13 @@ impl OrderTracker {
                 last_update: now,
                 total_fee: event.fee_paid,
                 fills: vec![(event.trade_id, event.fill_size, event.fill_price)],
+                reduce_only: false,
                 submission_uncertain: false,
                 position_generation: 0,
             };
             if event.remaining_size > FILL_COMPLETION_EPS {
                 order.lifecycle = OrderLifecycle::PartiallyFilled;
-                let remaining = (order.remaining_size() * POS_SCALE) as i64;
+                let remaining = scale_pos(order.remaining_size());
                 match side {
                     OrderSide::Buy => {
                         self.pending_buy_exposure

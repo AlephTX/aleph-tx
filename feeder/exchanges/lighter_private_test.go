@@ -33,7 +33,16 @@ func (r *eventRecorder) PushOrderFilledV2(ex uint8, sym uint16, order uint64, cl
 }
 func privateForTest() (*LighterPrivate, *eventRecorder) {
 	r := &eventRecorder{}
-	return &LighterPrivate{eventBuffer: r, auth: &LighterAuth{accountIndex: 42}, mktMap: map[int]uint16{0: 1002}, orderSizes: map[uint64]float64{}, orderDetails: map[uint64]orderDetail{}, seenTradeIDs: newTradeIDSet(tradeIDCapacity)}, r
+	return &LighterPrivate{
+		eventBuffer:       r,
+		auth:              &LighterAuth{accountIndex: 42},
+		mktMap:            map[int]uint16{0: 1002},
+		orderSizes:        map[uint64]float64{},
+		orderDetails:      map[uint64]orderDetail{},
+		trackedDetailIDs:  newTradeIDSet(orderDetailCapacity),
+		completedOrderIDs: newTradeIDSet(tradeIDCapacity),
+		seenTradeIDs:      newTradeIDSet(tradeIDCapacity),
+	}, r
 }
 func TestPrivateTradeIdentifiesTakerAndFees(t *testing.T) {
 	lp, r := privateForTest()
@@ -173,5 +182,36 @@ func TestPrivateTradeFeeSourceRingFixture(t *testing.T) {
 	}
 	if !bytes.Equal(events, want) {
 		t.Fatal("V2 bytes differ from the fixture the Rust reader replays")
+	}
+}
+
+func TestPrivateFilledOrderDoesNotResurrectSizesAndBoundsDetails(t *testing.T) {
+	lp, r := privateForTest()
+	lp.processOrderFast(gjson.Parse(`{"market_index":0,"order_index":21,"client_order_index":201,"status":"open","price":"100","initial_base_amount":"5","remaining_base_amount":"5"}`))
+	lp.processTradeFast(gjson.Parse(`{"trade_id":901,"market_id":0,"price":"100","size":"5","bid_id":21,"ask_id":99}`))
+	if _, ok := lp.orderSizes[21]; ok {
+		t.Fatal("orderSizes not cleared on full fill")
+	}
+	lp.processOrderFast(gjson.Parse(`{"market_index":0,"order_index":21,"client_order_index":201,"status":"filled","price":"100","initial_base_amount":"5","remaining_base_amount":"0"}`))
+	if _, ok := lp.orderSizes[21]; ok {
+		t.Fatal("terminal filled order resurrected orderSizes")
+	}
+	if len(r.fills) != 1 {
+		t.Fatalf("expected 1 fill, got %d", len(r.fills))
+	}
+
+	// Immediate fill with no prior open order and remaining_base_amount=0 must not leak orderSizes.
+	lp.processOrderFast(gjson.Parse(`{"market_index":0,"order_index":22,"client_order_index":202,"status":"filled","price":"100","initial_base_amount":"3","remaining_base_amount":"0"}`))
+	if _, ok := lp.orderSizes[22]; ok {
+		t.Fatal("filled update with zero remaining populated orderSizes")
+	}
+
+	// Bounding orderDetails to orderDetailCapacity prevents unbounded map growth across long sessions.
+	for i := 0; i < orderDetailCapacity+256; i++ {
+		id := 1000 + i
+		lp.processOrderFast(gjson.Parse(fmt.Sprintf(`{"market_index":0,"order_index":%d,"client_order_index":%d,"status":"filled","price":"100","initial_base_amount":"1","remaining_base_amount":"0"}`, id, id)))
+	}
+	if got := len(lp.orderDetails); got > orderDetailCapacity {
+		t.Fatalf("orderDetails exceeded capacity %d: got %d", orderDetailCapacity, got)
 	}
 }

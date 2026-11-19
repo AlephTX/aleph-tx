@@ -7,6 +7,7 @@ or resolved alerts when ALEPH_MONITOR_ALERT_WEBHOOK is set.
 """
 
 import json
+import math
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -15,6 +16,8 @@ CRITICAL, WARNING = "critical", "warning"
 QUOTE_STALE_MS = 15_000
 SNAPSHOT_STALE_MS = 60_000
 LOSS_WARN_FRACTION = 0.6  # warn at 60% of the configured daily loss budget
+QUOTA_WARN_THRESHOLD = 250
+QUOTA_CRIT_THRESHOLD = 50
 
 
 def _alert(key, severity, message):
@@ -60,13 +63,19 @@ def evaluate(status, summary, now_ms):
 
     start = snapshot.get("daily_loss_start_equity") or 0
     limit = snapshot.get("daily_loss_limit_pct") or 0
-    equity = snapshot.get("equity") or 0
+    raw_equity = snapshot.get("equity")
+    equity_valid = (
+        isinstance(raw_equity, (int, float))
+        and not isinstance(raw_equity, bool)
+        and math.isfinite(raw_equity)
+    )
     utc_day_start = now_ms - now_ms % 86_400_000
     if (running and snapshot.get("daily_loss_day_start_ms") == utc_day_start
-            and start > 0 and equity > 0 and 0 < limit < 1):
+            and start > 0 and equity_valid and 0 < limit < 1):
+        equity = float(raw_equity)
         budget = start * limit
         if equity <= start - budget * LOSS_WARN_FRACTION:
-            severity = CRITICAL if equity <= start - budget * 0.9 else WARNING
+            severity = CRITICAL if (equity <= 0 or equity <= start - budget * 0.9) else WARNING
             drawdown = (start - equity) / start
             alerts.append(_alert("drawdown", severity,
                                  f"当日回撤 {drawdown * 100:.2f}%（UTC 日亏熔断 {limit * 100:g}%）"))
@@ -78,6 +87,21 @@ def evaluate(status, summary, now_ms):
         if abs(net) > max(abs(primary) * 0.5, 1e-12):
             alerts.append(_alert("hedge_imbalance", WARNING,
                                  f"两腿净敞口 {net:+.4f}（Lighter {primary:+.4f}）"))
+
+    if running and snapshot:
+        quota = snapshot.get("volume_quota_remaining")
+        if isinstance(quota, int) and not isinstance(quota, bool):
+            if quota <= QUOTA_CRIT_THRESHOLD:
+                alerts.append(_alert("volume_quota_low", CRITICAL,
+                                     f"Lighter 剩余成交额度过低 ({quota})"))
+            elif quota <= QUOTA_WARN_THRESHOLD:
+                alerts.append(_alert("volume_quota_low", WARNING,
+                                     f"Lighter 剩余成交额度偏低 ({quota})"))
+        defense = snapshot.get("defense_regime")
+        if defense == "halt":
+            alerts.append(_alert("defense_regime", CRITICAL, "防御状态机已进入 Halt 停机保护"))
+        elif defense == "reduce_only":
+            alerts.append(_alert("defense_regime", WARNING, "防御状态机已进入 ReduceOnly 仅平仓模式"))
 
     order = {CRITICAL: 0, WARNING: 1}
     return sorted(alerts, key=lambda a: (order[a["severity"]], a["key"]))

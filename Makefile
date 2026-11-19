@@ -39,6 +39,7 @@ help:
 	@echo "  make build          - Compile Rust binaries and Go feeder"
 	@echo "  make build-feeder   - Compile Go feeder only"
 	@echo "  make trade          - Check the trading profile offline"
+	@echo "  make trade MODE=shadow - Run zero-credential read-only SHM shadow observer"
 	@echo "  make trade MODE=live - Run Lighter with optional Hyperliquid inventory hedge"
 	@echo "  make trade MODE=testnet - Run the isolated Lighter/Hyperliquid testnet profile"
 	@echo ""
@@ -104,9 +105,12 @@ trade: build-feeder
 else ifeq ($(MODE),check)
 trade:
 	cargo run --locked --quiet --bin lighter_inventory_mm -- --check "$(CONFIG)"
+else ifeq ($(MODE),shadow)
+trade:
+	cargo run --locked --release --bin lighter_inventory_mm -- --shadow "$(CONFIG)"
 else
 trade:
-	@echo "MODE must be check, live, or testnet" >&2; exit 2
+	@echo "MODE must be check, shadow, live, or testnet" >&2; exit 2
 endif
 
 # Core Build

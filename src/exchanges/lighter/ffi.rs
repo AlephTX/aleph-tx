@@ -59,6 +59,10 @@ mod unavailable {
             order_expiry: i64,
             nonce: i64,
         ) -> Result<SignedTransaction, String> {
+            std::ffi::c_int::try_from(price)
+                .map_err(|_| "Lighter order price exceeds C int range (i32::MAX)".to_string())?;
+            std::ffi::c_int::try_from(_trigger_price)
+                .map_err(|_| "Lighter trigger price exceeds C int range (i32::MAX)".to_string())?;
             #[cfg(test)]
             if let Some((api_key_index, account_index)) = self.mock_identity {
                 let market_index = market_index.into();

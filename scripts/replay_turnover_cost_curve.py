@@ -95,7 +95,14 @@ def exact_cash_components(cycles, before, after):
     return totals
 
 
-def point(row, *, external_overhead_bps=None):
+def point(
+    row,
+    *,
+    external_overhead_bps=None,
+    fixed_overhead_usd_per_day=None,
+    window_hours=Decimal("10"),
+    strip_engine_overhead=False,
+):
     feedback = row.get("turnover_feedback") or {}
     has_feedback = bool(feedback)
     tb = row.get("turnover_breakdown")
@@ -176,7 +183,49 @@ def point(row, *, external_overhead_bps=None):
             for value, expected in checks
         )
     price_complete = components_complete and all(c["price_decomposition_reconciled"] for c in cycles)
-    if cash_complete and external_overhead_bps is not None:
+    decomposed = None
+    if strip_engine_overhead or fixed_overhead_usd_per_day is not None:
+        per_day = decimal(fixed_overhead_usd_per_day) if fixed_overhead_usd_per_day is not None else Decimal(0)
+        hours = decimal(window_hours)
+        if not per_day.is_finite() or per_day < 0:
+            raise ValueError("fixed_overhead_usd_per_day must be finite and nonnegative")
+        if not hours.is_finite() or hours <= 0:
+            raise ValueError("window_hours must be finite and positive")
+        fixed_window = per_day * hours / Decimal(24)
+        var_net = None
+        if cash_complete:
+            gross_val = (
+                decimal(tb["dual_venue_gross_turnover_quote"])
+                if has_tb and tb.get("dual_venue_gross_turnover_quote") is not None
+                else decimal(row.get("maker_turnover", 0)) + decimal(row.get("taker_turnover", 0))
+            )
+            if external_overhead_bps is not None:
+                var_net = decimal(full_net) - gross_val * decimal(external_overhead_bps) / Decimal(10_000)
+            elif strip_engine_overhead:
+                var_net = decimal(full_net)
+            elif components_complete:
+                var_net = decimal(full_net) - components["overhead_quote"]
+            else:
+                var_net = decimal(full_net)
+        var_cost_m = (-var_net * Decimal(1_000_000) / target) if (var_net is not None and target > 0) else None
+        net_after_fixed = (var_net - fixed_window) if var_net is not None else None
+        obs_all_in_m = (-net_after_fixed * Decimal(1_000_000) / target) if (net_after_fixed is not None and target > 0) else None
+        pace_50m_all_in_m = (
+            var_cost_m + per_day * Decimal(30) / Decimal(50)
+            if var_cost_m is not None
+            else None
+        )
+        decomposed = {
+            "net_before_modeled_overhead_quote": str(decimal(full_net)) if cash_complete else None,
+            "variable_net_quote": str(var_net) if var_net is not None else None,
+            "variable_cost_per_million_target": str(var_cost_m) if var_cost_m is not None else None,
+            "fixed_overhead_usd_per_day": str(per_day),
+            "fixed_window_overhead_quote": str(fixed_window),
+            "net_after_fixed_window_overhead_quote": str(net_after_fixed) if net_after_fixed is not None else None,
+            "all_in_cost_per_million_target_observed_pace": str(obs_all_in_m) if obs_all_in_m is not None else None,
+            "all_in_cost_per_million_target_50m_30d_pace": str(pace_50m_all_in_m) if pace_50m_all_in_m is not None else None,
+        }
+    if cash_complete and external_overhead_bps is not None and not strip_engine_overhead:
         if components_complete and components["overhead_quote"] != Decimal(0):
             raise ValueError("cannot apply external_overhead_bps when engine overhead_quote is non-zero")
         gross_for_ext = (
@@ -273,6 +322,7 @@ def point(row, *, external_overhead_bps=None):
         "funding_flat": row.get("funding_flat"),
         "sample_scope": "single_selected_window_not_a_population_cost_estimate",
         "sparse_cycles": row.get("closed_cycles", 0) < 30,
+        **({"decomposed_overhead": decomposed} if decomposed is not None else {}),
         **v2_fields,
     }
 

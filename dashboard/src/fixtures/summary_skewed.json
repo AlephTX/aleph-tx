@@ -95,6 +95,7 @@
   "daily_loss_day_start_ms": null,
   "daily_loss_limit_pct": null,
   "daily_loss_start_equity": null,
+  "defense_regime": null,
   "dropped": 0,
   "equity": 1000.0,
   "exchange_position": 0.0,
@@ -120,6 +121,7 @@
   "total_fees": 0.0,
   "trade_cash_flow": 0.0,
   "ts_ms": 6100,
+  "volume_quota_remaining": null,
   "worst_case_long": 0.0,
   "worst_case_short": 0.0
  },

@@ -499,3 +499,164 @@ func TestDepthConcurrentWriterAndAtomicReadersNoTornSnapshots(t *testing.T) {
 		t.Fatalf("unexpected final depth snapshot: ok=%v snap=%+v", ok, snap)
 	}
 }
+
+func TestEventRingBufferV2ConcurrentAndRestart(t *testing.T) {
+	t.Setenv("ALEPH_SHM_DIR", t.TempDir())
+	rb, err := NewEventRingBufferV2()
+	if err != nil {
+		t.Fatalf("NewEventRingBufferV2() error = %v", err)
+	}
+
+	const total = 2000
+	var done atomic.Bool
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		var localIdx uint64
+		genPtr := (*uint64)(unsafe.Pointer(&rb.mmap[8]))
+		writeIdxPtr := (*uint64)(unsafe.Pointer(&rb.mmap[0]))
+		for !done.Load() {
+			gen1 := atomic.LoadUint64(genPtr)
+			if gen1&1 != 0 {
+				continue
+			}
+			wIdx := atomic.LoadUint64(writeIdxPtr)
+			if localIdx == wIdx {
+				continue
+			}
+			readIdx := localIdx
+			if wIdx > V2RingBufferSlots && readIdx < wIdx-V2RingBufferSlots {
+				readIdx = wIdx - V2RingBufferSlots
+			}
+			slotOff := V2HeaderSize + int(readIdx%V2RingBufferSlots)*V2EventSize
+			var words [16]uint64
+			for i := range words {
+				words[i] = atomic.LoadUint64((*uint64)(unsafe.Pointer(&rb.mmap[slotOff+i*8])))
+			}
+			if atomic.LoadUint64(genPtr) != gen1 {
+				continue
+			}
+			ev := *(*ShmPrivateEventV2)(unsafe.Pointer(&words[0]))
+			if ev.Sequence != readIdx {
+				continue
+			}
+			if ev.ExchangeOrderID != 1000+readIdx || ev.ClientOrderID != int64(5000+readIdx) || ev.OrderPrice != 2000.0+float64(readIdx) {
+				t.Errorf("torn V2 slot at seq=%d: %+v", readIdx, ev)
+				return
+			}
+			localIdx = readIdx + 1
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := uint64(0); i < total; i++ {
+			rb.PushOrderCreatedV2(2, 1, 1000+i, int64(5000+i), 9, 2000.0+float64(i), 0.25, false, 1)
+		}
+		done.Store(true)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Simulate crash leaving odd generation on a non-empty ring and verify reopen recovery.
+	epochBefore := atomic.LoadUint64(rb.producerEpoch)
+	if epochBefore != 1 {
+		t.Fatalf("expected initial producerEpoch=1, got %d", epochBefore)
+	}
+	atomic.StoreUint64(rb.generation, 4001)
+	if err := rb.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reopened, err := NewEventRingBufferV2()
+	if err != nil {
+		t.Fatalf("reopen NewEventRingBufferV2() error = %v", err)
+	}
+	defer reopened.Close()
+
+	if gen := atomic.LoadUint64(reopened.generation); gen&1 != 0 {
+		t.Fatalf("expected even generation after reopen recovery, got %d", gen)
+	}
+	if epoch := atomic.LoadUint64(reopened.producerEpoch); epoch != epochBefore+1 {
+		t.Fatalf("expected producerEpoch=%d on reopen, got %d", epochBefore+1, epoch)
+	}
+	if got := reopened.GetWriteIdxV2(); got != total+1 {
+		t.Fatalf("expected writeIdx=%d (including PrivateStreamLost), got %d", total+1, got)
+	}
+	lastSlotOff := V2HeaderSize + int(total%V2RingBufferSlots)*V2EventSize
+	lastEv := *(*ShmPrivateEventV2)(unsafe.Pointer(&reopened.mmap[lastSlotOff]))
+	if lastEv.EventType != EventTypePrivateLost || lastEv.Sequence != total {
+		t.Fatalf("expected PrivateStreamLost at seq=%d, got %+v", total, lastEv)
+	}
+}
+
+func TestAccountStatsWriterConcurrentAndInvalidateEquity(t *testing.T) {
+	t.Setenv("ALEPH_SHM_DIR", t.TempDir())
+	w, err := NewAccountStatsWriter("account-stats")
+	if err != nil {
+		t.Fatalf("NewAccountStatsWriter() error = %v", err)
+	}
+	defer w.Close()
+
+	var done atomic.Bool
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		verPtr := (*uint64)(unsafe.Pointer(&w.data[0]))
+		for !done.Load() {
+			v1 := atomic.LoadUint64(verPtr)
+			if v1&1 != 0 {
+				continue
+			}
+			col := math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&w.data[8]))))
+			pv := math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&w.data[16]))))
+			if atomic.LoadUint64(verPtr) != v1 {
+				continue
+			}
+			if pv != 0 && pv != col*2 {
+				t.Errorf("torn account stats snapshot: col=%v pv=%v", col, pv)
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := uint64(1); i <= 2000; i++ {
+			col := float64(1000 + i)
+			w.WriteStats(col, col*2, 2.0, col, 0.2, col*5, i*100)
+			if i%10 == 0 {
+				w.WritePosition(float64(i)*0.1, i*100+1)
+			}
+		}
+		done.Store(true)
+	}()
+
+	close(start)
+	wg.Wait()
+
+	w.WritePosition(1.5, 9_999_999)
+	w.InvalidateEquity()
+	if got := atomic.LoadUint64(&w.stats.UpdatedAt); got != 0 {
+		t.Fatalf("expected UpdatedAt=0 after InvalidateEquity, got %d", got)
+	}
+	if got := atomic.LoadUint64(&w.stats.PositionUpdatedAt); got != 9_999_999 {
+		t.Fatalf("expected PositionUpdatedAt preserved after InvalidateEquity, got %d", got)
+	}
+	if got := math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(&w.stats.Position)))); got != 1.5 {
+		t.Fatalf("expected Position=1.5 preserved after InvalidateEquity, got %v", got)
+	}
+}

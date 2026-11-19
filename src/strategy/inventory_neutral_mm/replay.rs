@@ -55,6 +55,7 @@ pub(super) struct Resting {
     pub is_ask: bool,
     pub price: f64,
     pub remaining: f64,
+    pub reduce_only: bool,
 }
 
 /// Taker fee for offline IOC fills (timeout flatten). Assumption, not a quote.
@@ -213,8 +214,15 @@ impl SimVenue {
 
     /// Register an order the strategy placed, as LighterTrading would before
     /// submission, then acknowledge it as the private stream would.
-    fn place(&self, side: Side, price: f64, size: f64, ioc: bool) -> PlaceResult {
-        let order = self.reserve(side, price, size, ioc);
+    fn place(
+        &self,
+        side: Side,
+        price: f64,
+        size: f64,
+        ioc: bool,
+        reduce_only: bool,
+    ) -> PlaceResult {
+        let order = self.reserve(side, price, size, ioc, reduce_only);
         self.activate(order);
         PlaceResult {
             client_order_index: order.client_order_id,
@@ -224,7 +232,7 @@ impl SimVenue {
         }
     }
 
-    fn reserve(&self, side: Side, price: f64, size: f64, _ioc: bool) -> Resting {
+    fn reserve(&self, side: Side, price: f64, size: f64, _ioc: bool, reduce_only: bool) -> Resting {
         let coid = self
             .next_coid
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -235,7 +243,10 @@ impl SimVenue {
             Side::Buy => OrderSide::Buy,
             Side::Sell => OrderSide::Sell,
         };
-        assert!(self.tracker.start_tracking(coid, tracker_side, price, size));
+        assert!(
+            self.tracker
+                .start_tracking_order(coid, tracker_side, price, size, reduce_only)
+        );
         let is_ask = side == Side::Sell;
         #[cfg(test)]
         self.record(Action::Place {
@@ -251,6 +262,7 @@ impl SimVenue {
             is_ask,
             price,
             remaining: size,
+            reduce_only,
         }
     }
 
@@ -288,7 +300,14 @@ impl SimVenue {
         {
             let racing = self.book.lock().get(&order_index).copied();
             if let Some(order) = racing {
-                self.fill(order, order.price, order.remaining, false);
+                let fill_size = if order.reduce_only {
+                    order.remaining.min(self.reducible_size(order.is_ask))
+                } else {
+                    order.remaining
+                };
+                if fill_size > 0.5e-8 {
+                    self.fill(order, order.price, fill_size, false);
+                }
             }
         }
         let removed = self.book.lock().remove(&order_index);
@@ -347,16 +366,29 @@ impl SimVenue {
             .copied()
             .collect();
         for order in crossing {
-            let size = if fraction >= 1.0 {
+            let mut size = if fraction >= 1.0 {
                 order.remaining
             } else {
                 // Keep fills on a 1e-8 grid like the tracker's scaled units.
                 ((order.remaining * fraction) * 1e8).floor() / 1e8
             };
+            let reducible = self.reducible_size(order.is_ask);
+            if order.reduce_only {
+                size = size.min(reducible);
+            }
             if size <= 0.0 {
+                if order.reduce_only {
+                    self.cancel(order.exchange_order_id as i64);
+                }
                 continue;
             }
             self.fill(order, order.price, size, false);
+            if order.reduce_only
+                && size < order.remaining - 0.5e-8
+                && self.reducible_size(order.is_ask) <= 0.5e-8
+            {
+                self.cancel(order.exchange_order_id as i64);
+            }
         }
     }
 
@@ -440,7 +472,7 @@ impl SimVenue {
             };
             size = size.min(reducible);
         }
-        let result = self.place(order.side, order.price, size, true);
+        let result = self.place(order.side, order.price, size, true, order.reduce_only);
         let booked = self
             .book
             .lock()
@@ -499,6 +531,15 @@ impl SimVenue {
         self.ledger.lock().position_e8 as f64 / 1e8
     }
 
+    pub(super) fn reducible_size(&self, is_ask: bool) -> f64 {
+        let pos = self.net_position();
+        if is_ask {
+            pos.max(0.0)
+        } else {
+            (-pos).max(0.0)
+        }
+    }
+
     /// Signed trade cash flow less fees, as OrderTracker accounts it.
     pub fn cash_flow(&self) -> f64 {
         self.ledger.lock().cash
@@ -552,6 +593,7 @@ impl Exchange for SimVenue {
             .map(|o| OrderInfo {
                 order_id: o.exchange_order_id.to_string(),
                 client_order_index: o.client_order_id,
+                order_index: i64::try_from(o.exchange_order_id).ok(),
                 side: if o.is_ask { Side::Sell } else { Side::Buy },
                 price: o.price,
                 size: o.remaining,
@@ -581,8 +623,32 @@ impl Exchange for SimVenue {
                     );
                     if order.order_type == OrderType::Ioc {
                         place_results.push(self.place_ioc(&order));
+                    } else if order.reduce_only
+                        && self.reducible_size(order.side == Side::Sell) <= 0.5e-8
+                    {
+                        let rejected =
+                            self.reserve(order.side, order.price, order.size, false, true);
+                        self.apply(ShmPrivateEventV2::order_rejected(
+                            self.next_sequence(),
+                            LIGHTER,
+                            self.symbol,
+                            rejected.client_order_id,
+                            self.event_time(),
+                        ));
+                        place_results.push(PlaceResult {
+                            client_order_index: rejected.client_order_id,
+                            side: order.side,
+                            price: order.price,
+                            size: order.size,
+                        });
                     } else {
-                        place_results.push(self.place(order.side, order.price, order.size, false));
+                        place_results.push(self.place(
+                            order.side,
+                            order.price,
+                            order.size,
+                            false,
+                            order.reduce_only,
+                        ));
                     }
                 }
                 BatchAction::Cancel(order_index) => self.cancel(order_index),
@@ -990,6 +1056,8 @@ mod tests {
             as_score: 0.0,
             using_external_fair_value: true,
             order_flow_bps: 0.0,
+            local_ofi_bps: 0.0,
+            cancel_bump_bps: 0.0,
             cross_market_bps: 0.0,
             volatility_pressure: 0.0,
             #[cfg(feature = "research-replay")]

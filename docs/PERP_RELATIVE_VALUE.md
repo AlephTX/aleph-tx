@@ -775,6 +775,14 @@ keeps the corresponding fee tier and 2 or 12 bps profit floor fixed.
 [Crypto volatility and liquidity cycles](https://arxiv.org/abs/2109.12142) ·
 [Configuration](CONFIGURATION.md)
 
+In recorded `maker_replay` reports, `active_until_ms` is the replay clock
+after the input feed and strategy tasks have finished. A strategy can halt
+while the feed continues through the recording. On a strategy error, newer
+reports include `strategy_halted_at_ms`, the simulated time when the strategy
+task returned the error. In a continuous run this includes the final cleanup
+attempt. Older halted reports leave that time unknown. Use
+`funding_boundaries_verified` to check settlement coverage.
+
 All 64 holdout windows finished flat. The minute-range policy reduced
 time-weighted absolute inventory by 3.2–55.7% across the 16 matched
 comparisons and improved PnL in eight. The figures below use the Standard
@@ -1312,3 +1320,123 @@ of its inputs and is a separate result from strategy performance.
 [HIP-3 market and oracle settings](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals) ·
 [Arcus market metadata](https://docs.arcus.xyz/api-reference/public/get-markets) ·
 [NYSE hours and holidays](https://www.nyse.com/markets/hours-calendars).
+
+For `maker-first-replay`, optional `trade_from_ms` delays opening quotes while the replay consumes warmup books and updates causal indicators. Omission starts entry evaluation at `start_ms`. To configure a ten-hour decision window, set `end_ms - drain_ms - trade_from_ms` to `36_000_000`. Existing funding and holding-time guards can stop new entries earlier.
+
+In offline Core-only maker replay, `local_obi_filter` accepts a
+`threshold` between zero and one and a positive `max_age_ms` bounded by
+the local-book freshness setting. It uses the displayed sizes at the best bid
+and ask. A fresh imbalance can withdraw an inventory-adding quote when the
+account and fill position agree on direction. Reducing quotes retain their
+normal execution rules and pending cancels remain exposed to fills. Stale
+imbalance observations provide no directional veto. The report identifies
+the filter and counts fresh decisions and withdrawn quote targets.
+
+Core-only recorded replay also accepts an optional `local_fair_value`
+configuration. Use `{"kind":"touch_micro"}` for the size-weighted touch
+price. Use `kind = shrunk_imbalance` with a JSON `expected_bps` array
+of shape 5 × 3 × 3 for a fitted one-second quotation adjustment. The three
+axes are best-level size imbalance, top-five size imbalance and trailing
+one-second midprice change in basis points. Their bin boundaries are
+`[-0.6, -0.2, 0.2, 0.6]`, `[-0.35, 0.35]` and `[-0.5, 0.5]`.
+Values equal to a boundary enter the upper bin. Fit the table on an
+earlier training set and record its hash before replaying later windows.
+
+Both models cap the adjustment at two basis points. Replay publishes their
+inputs when a book passes its configured delivery delay. The source used at
+each observation must be at most 250 ms old. Missing depth resets the
+history. The fitted model additionally needs a valid observation as of one
+second earlier. The usual midpoint supplies the fallback. Orders keep the
+recorded queue, venue timing, ledger and terminal liquidation rules. The
+report's `fair_value_mode` identifies the selected model.
+
+Core-only replay accepts a directional `strategy.markout_reserve` when
+`strategy.local_toxicity.enable_local_markout` is true. The strategy marks
+passive fills against the fresh local touch microprice and uses recent
+side-specific observations to widen inventory-adding quotes. The usual
+minimum sample count, age limit and maximum widening still apply.
+
+### Cross-sectional research targets
+
+`CrossSectionalEngine::compute_targets` checks the latest book for every
+configured symbol at each decision, including decisions inside the
+rebalance interval. Receipt time must be at or before the decision, and
+source age must fit `max_quote_staleness_ms`. Historical anchor books must
+have arrived within that limit of their source timestamps and both clocks
+must fit the original sampling tolerance around the lookback boundary.
+By default every configured symbol needs both observations. Setting
+`min_active_symbols` allows a smaller eligible universe. Any held leg
+above the strategy's USD 1 position threshold still needs both observations.
+The same quorum applies when reusing a cached target. If a flat leg with
+a nonzero target loses its anchor, the engine ranks the remaining eligible
+symbols again, provided the quorum holds. An insufficient quorum, an
+unavailable held leg, or a backward decision clock yields `None`. The
+caller can distinguish unavailable evidence from an evaluated zero target.
+[Cross-sectional strategy](../src/strategy/cross_sectional.rs)
+
+### Multi-day carry checkpoints and settlement evidence
+
+Run `cross_venue multiday-carry SCENARIO.json` for a paper valuation on
+two distinct venues. Each scenario supplies a separate capital balance,
+loss budget, entry and exit fees, and fixed costs. Both legs must share a
+known UTC funding schedule. The default is hourly on the UTC hour.
+`funding_interval_ms` and `funding_offset_ms` describe a different
+common schedule. Each input rate is per contractual settlement. The
+pre-entry ten-hour forecast uses the count of scheduled settlements in
+the next ten hours and only the prior rates available by the configured
+publication cutoff.
+
+Supply a fresh paired valuation at each ten-hour boundary and at the
+campaign end while exposed. Funding accrues for settlements after entry
+through exit. A missing settlement frame or an absent rate pair leaves
+a funding gap. A later frame cannot supply a price for an earlier
+checkpoint. A terminal exit pays both leg fees before its checkpoint
+equity is recorded. Inspect `status`, `expected_checkpoints`,
+`missing_checkpoints`, and `missing_witness_slots` alongside cash.
+An observed mark and funding transfer can value a position. Evidence of
+executable size, timing and both legs' entry and exit fills is additionally
+needed to score a trading strategy.
+[Scenario implementation](../src/strategy/multiday_carry.rs) ·
+[Offline reporting command](../scripts/run_multiday_carry_subtrack.py)
+
+### Recorded maker calibration clocks
+
+Enable both `calibration_telemetry` and `diagnose_cross_market` when
+running a selection-period replay. Each distance bin measures how long
+an order rested while the last received quote was fresh and the trade
+feed online. Activation, effective cancellation, full fills, feed gaps
+and a change of mid bound each interval. Attributing a delayed fill to a
+distance bin uses the last mid received strictly before the earliest
+possible execution consistent with the clock guard. An ambiguous cancel
+race or a missing historical mid contributes to `unpriced_fills`.
+Distance-bin fills plus unpriced fills should equal `maker_fills`.
+Keep per-market training inputs with their `exposure_model` and
+`fill_distance_model` tags. The extractor rejects a group if either tag
+differs, including when some reports omit a tag. The CLI also rejects
+byte-identical input files and the aggregator checks each distance bin's
+edges before pooling counts. Verify window boundaries independently when
+combining distinct report files. Fit each historical
+version separately. Histograms summarize post-fill price changes at
+their reported horizons. Record label counts and sparse or unpriced
+bins alongside a fit.
+[Telemetry implementation](../src/strategy/inventory_neutral_mm/replay/recorded/calibration.rs) ·
+[Calibration extractor](../scripts/extract_mm_calibration_inputs.py)
+
+### Opening hedge markouts in maker-first paper replay
+
+The optional `entry_markout_gate` measures movement of the hedge venue's
+mid from receipt of the opening fill. The horizon uses the replay receipt
+clock. A label needs a fresh hedge quote whose source time is at or after
+the horizon and which is available within the one-second grace period.
+A maker quote cannot supply a missing hedge price. The report reconciles
+opening fills through `labels_completed`, `missing_hedge_anchor`,
+`unlabelled_expired` and `pending_labels`. The `samples` count covers
+only labels retained in the current quantile. A configured
+`max_sample_age_ms` expires labels and returns the gate to its prior
+when fewer than four remain. [Implementation](../src/strategy/relative_value/paper/maker_first.rs)
+
+The ablation generator's version 2 manifest hashes every byte of each
+saved configuration, including the trailing newline. Version 1 hashed
+the canonical JSON before writing the newline. Preserve the original
+manifest next to an independent file-byte digest when auditing an older
+registration. [Configuration generator](../scripts/build_preregistered_ablation_arms.py)

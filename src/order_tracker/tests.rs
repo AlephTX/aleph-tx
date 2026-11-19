@@ -615,6 +615,7 @@ async fn test_reconcile_absent_open_order_preserves_exposure_and_requests_cleanu
         active_orders: Ok(vec![OrderInfo {
             order_id: "9702".to_string(),
             client_order_index: 7002,
+            order_index: Some(9702),
             side: Side::Sell,
             price: 3010.0,
             size: 0.04,
@@ -711,6 +712,7 @@ async fn test_reconcile_with_exchange_rebinds_pending_create_and_reverts_stuck_p
             OrderInfo {
                 order_id: "9821".to_string(),
                 client_order_index: 8201,
+                order_index: Some(9821),
                 side: Side::Buy,
                 price: 3000.0,
                 size: 0.05,
@@ -719,6 +721,7 @@ async fn test_reconcile_with_exchange_rebinds_pending_create_and_reverts_stuck_p
             OrderInfo {
                 order_id: "9822".to_string(),
                 client_order_index: 8202,
+                order_index: Some(9822),
                 side: Side::Sell,
                 price: 3010.0,
                 size: 0.04,
@@ -1009,20 +1012,36 @@ fn cleanup_commit_is_atomic_and_preserves_risk_when_epoch_changed() {
     assert_eq!(tracker.active_order_count(), 1);
     assert_eq!(tracker.worst_case_long(), 0.5);
     assert!(!tracker.confirm_cleanup(tracker.reconciliation_epoch(), f64::NAN));
+    // Even the current epoch plus a fresh position cannot release a pending
+    // create/cancel without a terminal event (or REST terminal-history proof).
+    assert!(!tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.01));
+    tracker.mark_pending_cancel(1);
+    assert!(!tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.01));
+    assert_eq!(tracker.worst_case_long(), 0.5);
+    tracker
+        .apply_event(&ShmPrivateEventV2::order_canceled(
+            0, 2, 1, 10, 1, 10, 0.5, 0,
+        ))
+        .unwrap();
     assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.01));
     assert_eq!(tracker.active_order_count(), 0);
     assert_eq!(tracker.pending_buy_exposure(), 0.0);
     assert_eq!(tracker.confirmed_position(), 0.01);
     assert!(!tracker.needs_reconciliation());
+    let terminal_epoch = tracker.last_reconciled_epoch();
     tracker.require_reconciliation();
     assert!(tracker.needs_reconciliation());
+    // A gap arriving just after REST recovery must not be acknowledged by
+    // sampling a newer epoch while waiting for the final account snapshot.
+    assert_eq!(tracker.last_reconciled_epoch(), terminal_epoch);
+    assert!(!tracker.confirm_cleanup(terminal_epoch, 0.01));
 }
 
 #[test]
 fn late_fills_cannot_change_the_rebased_position_even_after_order_gc() {
     let tracker = make_tracker();
     assert!(tracker.start_tracking(1, OrderSide::Buy, 100.0, 0.1));
-    assert!(tracker.confirm_cleanup(tracker.reconciliation_epoch(), 0.0));
+    assert!(tracker.confirm_recovered_flat(tracker.reconciliation_epoch(), &BTreeSet::from([1])));
     let mut late =
         ShmPrivateEventV2::order_filled(0, 2, 1, 10, 1, 10, 100.0, 0.1, 0.0, -0.01, false, 0, 99);
     tracker.apply_event(&late).unwrap();
@@ -1079,4 +1098,68 @@ fn recent_fill_ring_exposes_side_price_and_sequence() {
             .fill_at(1 + crate::order_tracker::RECENT_FILLS as u64)
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn reconcile_binds_order_index_and_flags_unrecorded_fills() {
+    let tracker = make_tracker();
+    tracker.start_tracking(8301, OrderSide::Buy, 3000.0, 0.10);
+    {
+        let mut state = tracker.state.write();
+        let order = state.active_orders.get_mut(&8301).unwrap();
+        order.created_at = tokio::time::Instant::now() - Duration::from_secs(5);
+        order.last_update = order.created_at;
+    }
+
+    let exchange = MockExchange {
+        active_orders: Ok(vec![OrderInfo {
+            order_id: "9831".to_string(),
+            client_order_index: 8301,
+            order_index: Some(9831),
+            side: Side::Buy,
+            price: 3000.0,
+            size: 0.10,
+            filled: 0.02, // REST reports a partial fill not yet seen over SHM
+        }]),
+    };
+
+    tracker.reconcile_with_exchange(&exchange).await.unwrap();
+    assert!(tracker.needs_reconciliation());
+    let state = tracker.state.read();
+    let order = state.active_orders.get(&8301).unwrap();
+    assert_eq!(order.order_index, Some(9831));
+    assert!(order.submission_uncertain);
+}
+
+#[test]
+fn late_order_created_after_mark_failed_reserves_exposure_and_requires_reconciliation() {
+    let tracker = make_tracker();
+    tracker.start_tracking(8401, OrderSide::Buy, 3000.0, 0.05);
+    tracker.mark_failed(8401);
+    assert!(!tracker.needs_reconciliation());
+    assert!((tracker.worst_case_long() - 0.0).abs() < 1e-10);
+
+    let late_created =
+        ShmPrivateEventV2::order_created(1, 2, 1, 9841, 8401, 555, 3000.0, 0.05, false, 0);
+    tracker.apply_event(&late_created).unwrap();
+    assert!(tracker.needs_reconciliation());
+    assert_eq!(tracker.active_order_count(), 1);
+    assert!((tracker.worst_case_long() - 0.05).abs() < 1e-10);
+    let state = tracker.state.read();
+    let recovered = state.active_orders.get(&8401).unwrap();
+    assert_eq!(recovered.order_index, Some(555));
+    assert!(recovered.submission_uncertain);
+}
+
+#[test]
+fn pos_scale_rounding_avoids_binary_truncation_drift() {
+    let tracker = make_tracker();
+    // 0.29 * 1e8 in IEEE-754 has exact representation slightly below 29_000_000.0 if scaled naively.
+    assert!(tracker.start_tracking(8501, OrderSide::Buy, 100.0, 0.29));
+    assert_eq!(
+        tracker.pending_buy_exposure.load(Ordering::Acquire),
+        29_000_000
+    );
+    tracker.mark_failed(8501);
+    assert_eq!(tracker.pending_buy_exposure.load(Ordering::Acquire), 0);
 }

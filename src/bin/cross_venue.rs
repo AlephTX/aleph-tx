@@ -10,11 +10,12 @@ use aleph_tx::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
     strategy::matched_settlement::MatchedSettlement,
+    strategy::multiday_carry::MultiDayCarryScenario,
     strategy::relative_value::{
         Frame as PerpFrame, MakerFirstConfig, MakerFirstEvent, PairConfig, PaperReport,
         PaperScenario, PaperWindow, run_maker_first, run_paper, run_paper_frames_with_window,
     },
-    venues::VenueRegistry,
+    venues::{VenueRegistry, audited_execution_capabilities},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -356,6 +357,10 @@ async fn main() -> Result<()> {
             arcus_cli::run(network, command).await
         }
         [command] if command == "venues" => print(&registry.iter().collect::<Vec<_>>()),
+        [command] if command == "capabilities" => print(&audited_execution_capabilities()),
+        [command, venue, tier, asset_class] if command == "capability-check" => {
+            print(&registry.resolve_execution_capability(venue, tier, asset_class)?)
+        }
         [command, journal, evidence @ ..]
             if command == "hedge-journal-audit" && evidence.len() <= 1 =>
         {
@@ -390,6 +395,9 @@ async fn main() -> Result<()> {
         }
         [command, file] if command == "matched-settlement" => {
             print(&read_replay::<MatchedSettlement>(file)?.evaluate()?)
+        }
+        [command, file] if command == "multiday-carry" => {
+            print(&read_replay::<MultiDayCarryScenario>(file)?.evaluate()?)
         }
         [command, config, file] if command == "maker-first-replay" => {
             let config: MakerFirstConfig = read_replay(config)?;
@@ -563,7 +571,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | multiday-carry FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -719,6 +727,22 @@ mod tests {
                 .parse::<Decimal>()
                 .unwrap(),
             Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn capability_check_admits_audited_tiers_and_rejects_unverified_venues() {
+        let registry = VenueRegistry::default();
+        assert!(!audited_execution_capabilities().is_empty());
+        assert!(
+            registry
+                .resolve_execution_capability("lighter", "standard", "crypto")
+                .is_ok()
+        );
+        assert!(
+            registry
+                .resolve_execution_capability("entropy", "base", "equity")
+                .is_err()
         );
     }
 }

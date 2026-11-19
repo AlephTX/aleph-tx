@@ -702,6 +702,7 @@ def normalize_capture(
     campaign_id: str,
     collector_region: str,
     precise_times: bool = False,
+    withheld_arcus_trade_markets: frozenset[str] = frozenset(),
 ) -> dict:
     """Normalize a sealed capture or partitioned archive into 4 receipt-causal Silver tables."""
     if collector_region not in VALID_REGIONS:
@@ -717,6 +718,7 @@ def normalize_capture(
     books: dict[tuple[str, str], StatefulOrderBook] = {}
     trade_online_since: dict[tuple[str, str], int | None] = {}
     trade_seen: dict[tuple[str, str], dict] = {}
+    withheld_messages = {market: 0 for market in sorted(withheld_arcus_trade_markets)}
     ended = False
     previous_at = 0
     clock_audit = ClockAudit() if precise_times else None
@@ -756,6 +758,17 @@ def normalize_capture(
             req_sent_ms = row.get("request_sent_at_ms")
             payload = row.get("payload")
             market = row.get("market")
+
+            # Keep the original sequence and audit every receipt clock. A projected
+            # market has neither an online trades subscription nor usable prints.
+            if withheld_messages and raw_source == "arcus_trades" and event in ("subscribed", "message"):
+                envelope_market = payload.get("id") if isinstance(payload, dict) else None
+                if market in withheld_messages or envelope_market in withheld_messages:
+                    if (not envelope_market or (market and market != envelope_market)
+                            or payload.get("channel") != "trades"):
+                        raise ValueError("ambiguous Arcus market in withheld trade stream")
+                    withheld_messages[envelope_market] += 1
+                    continue
 
             if raw_source == "collector" and event in ("segment_start", "segment_end"):
                 emit(
@@ -1559,6 +1572,9 @@ def normalize_capture(
         "causal_ordering_key": ["venue", "domain", "market", "available_at_ms", "sequence"],
         "tables": tables_meta,
     }
+    if withheld_messages:
+        summary["artifact_kind"] = "silver_partial_market_projection"
+        summary["withheld_arcus_trade_messages"] = withheld_messages
     write_immutable_json(output_dir / "silver_manifest.json", summary)
     return summary
 
@@ -1770,7 +1786,8 @@ SELECT
     COUNT(*) FILTER (WHERE event = 'disconnect') AS disconnects,
     COUNT(*) FILTER (WHERE event = 'sequence_gap') AS sequence_gaps,
     MIN(available_at_ms) AS first_lifecycle_ms,
-    MAX(available_at_ms) AS last_lifecycle_ms
+    MAX(available_at_ms) AS last_lifecycle_ms,
+    COUNT(*) FILTER (WHERE raw_source = 'arcus_trades' AND event = 'subscribed') AS arcus_trade_subscriptions
 FROM v_feed_lifecycle
 GROUP BY campaign_id, collector_region, venue, domain, market;
 """
@@ -1783,18 +1800,20 @@ def build_duckdb_lakehouse(
     *,
     sql_out: Path | None = None,
     require_duckdb: bool = False,
+    allow_partial_projection: bool = False,
 ) -> dict:
     """Compile normalized Silver staging tables into Zstd Parquet + DuckDB catalog."""
     resolved_staging = reject_unsafe_path(staging_dir, must_be_directory=True)
     manifest = json.loads((resolved_staging / "silver_manifest.json").read_text(encoding="utf-8"))
+    partial = manifest.get("artifact_kind") == "silver_partial_market_projection"
+    if partial and not allow_partial_projection:
+        raise ValueError("partial Silver requires --allow-partial-projection and separate Parquet and DuckDB destinations")
+    if partial and not manifest.get("withheld_arcus_trade_messages"):
+        raise ValueError("partial Silver manifest must identify its withheld Arcus markets")
     for name, info in manifest["tables"].items():
-        if info["rows"] == 0:
-            # Ensure empty tables still contain a valid empty gzip stream.
-            reject_unsafe_path(resolved_staging / info["file"])
-        else:
-            sha, size = digest_unchanged(resolved_staging / info["file"])
-            if sha != info["compressed_sha256"] or size != info["compressed_bytes"]:
-                raise ValueError(f"Silver staging table {name} failed hash check")
+        sha, size = digest_unchanged(resolved_staging / info["file"])
+        if sha != info["compressed_sha256"] or size != info["compressed_bytes"]:
+            raise ValueError(f"Silver staging table {name} failed hash check")
 
     parquet_root.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1835,7 +1854,7 @@ def build_duckdb_lakehouse(
         elif require_duckdb:
             raise RuntimeError("DuckDB is not installed (install `pip install duckdb` or `duckdb` CLI on WSL)")
 
-    return {
+    result = {
         "campaign_id": manifest["campaign_id"],
         "sql_path": str(target_sql),
         "parquet_root": str(parquet_root),
@@ -1843,6 +1862,10 @@ def build_duckdb_lakehouse(
         "executed": engine_used is not None,
         "engine": engine_used,
     }
+    if partial:
+        result["artifact_kind"] = manifest["artifact_kind"]
+        result["withheld_arcus_trade_messages"] = manifest["withheld_arcus_trade_messages"]
+    return result
 
 
 def bundle_directory_tar(source_dir: Path, bundle_out: Path, *, campaign_id: str) -> dict:
@@ -1964,6 +1987,10 @@ def main() -> None:
     p_norm.add_argument("--campaign-id", required=True)
     p_norm.add_argument("--collector-region", choices=VALID_REGIONS, required=True)
     p_norm.add_argument("--precise-times", action="store_true")
+    p_norm.add_argument(
+        "--withhold-arcus-trade-market", action="append", default=[],
+        help="Produce a partial Silver projection without trade subscriptions or prints for this market",
+    )
 
     p_duck = sub.add_parser("build-duckdb", help="Compile Silver staging tables into Zstd Parquet + DuckDB views")
     p_duck.add_argument("--staging-dir", type=Path, required=True)
@@ -1971,6 +1998,8 @@ def main() -> None:
     p_duck.add_argument("--db-path", type=Path, required=True)
     p_duck.add_argument("--sql-out", type=Path)
     p_duck.add_argument("--require-duckdb", action="store_true")
+    p_duck.add_argument("--allow-partial-projection", action="store_true",
+                        help="Build a partial market projection using dedicated Parquet and DuckDB destinations")
 
     p_bundle = sub.add_parser("bundle-parquet", help="Bundle Parquet shards into one deterministic .tar for Drive")
     p_bundle.add_argument("--source-dir", type=Path, required=True)
@@ -2019,6 +2048,7 @@ def main() -> None:
             campaign_id=args.campaign_id,
             collector_region=args.collector_region,
             precise_times=args.precise_times,
+            withheld_arcus_trade_markets=frozenset(args.withhold_arcus_trade_market),
         )
     elif args.command == "build-duckdb":
         result = build_duckdb_lakehouse(
@@ -2027,6 +2057,7 @@ def main() -> None:
             args.db_path,
             sql_out=args.sql_out,
             require_duckdb=args.require_duckdb,
+            allow_partial_projection=args.allow_partial_projection,
         )
     elif args.command == "bundle-parquet":
         result = bundle_directory_tar(args.source_dir, args.bundle_out, campaign_id=args.campaign_id)

@@ -1,18 +1,23 @@
 //! Replay public depth and trades through the production maker and OrderTracker.
+use super::components::CancelReason;
 use super::*;
 use crate::config::EXCH_HYPERLIQUID;
+use crate::strategy::replay_queue_depth::ReplayQueueDepth;
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Datelike};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io::BufRead;
 use tokio::sync::watch;
 
 pub(in crate::strategy::inventory_neutral_mm) mod binance_signal;
+mod calibration;
 mod cancel_timing;
 #[cfg(test)]
 mod cancel_timing_tests;
 mod continuous;
+pub(in crate::strategy::inventory_neutral_mm) mod local_fair_value;
 pub(in crate::strategy::inventory_neutral_mm) mod local_signal;
 
 const HOUR_MS: u64 = 3_600_000;
@@ -25,6 +30,54 @@ thread_local! {
     static CLOCK: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static ATTRIBUTION: RefCell<Option<QuoteAttribution>> = const { RefCell::new(None) };
     static CHANGED_QUOTES: Cell<[bool; 2]> = const { Cell::new([false; 2]) };
+    static CANCEL_REASON: Cell<Option<CancelReason>> = const { Cell::new(None) };
+    static BATCH_CANCEL_REASONS: RefCell<Vec<(i64, CancelReason)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(in crate::strategy::inventory_neutral_mm) struct CancelReasonScope(
+    Option<Option<CancelReason>>,
+);
+
+impl CancelReasonScope {
+    pub(in crate::strategy::inventory_neutral_mm) fn open(reason: CancelReason) -> Self {
+        Self(Some(CANCEL_REASON.replace(Some(reason))))
+    }
+
+    pub(in crate::strategy::inventory_neutral_mm) fn open_default(reason: CancelReason) -> Self {
+        if CANCEL_REASON.get().is_none() {
+            Self(Some(CANCEL_REASON.replace(Some(reason))))
+        } else {
+            Self(None)
+        }
+    }
+}
+
+impl Drop for CancelReasonScope {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0 {
+            CANCEL_REASON.set(prior);
+        }
+    }
+}
+
+pub(in crate::strategy::inventory_neutral_mm) struct BatchCancelReasons(
+    Option<Vec<(i64, CancelReason)>>,
+);
+
+impl BatchCancelReasons {
+    pub(in crate::strategy::inventory_neutral_mm) fn open(
+        reasons: Vec<(i64, CancelReason)>,
+    ) -> Self {
+        Self(Some(BATCH_CANCEL_REASONS.replace(reasons)))
+    }
+}
+
+impl Drop for BatchCancelReasons {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0.take() {
+            BATCH_CANCEL_REASONS.replace(prior);
+        }
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -108,6 +161,8 @@ impl ReplayClock {
                 .is_none()
         );
         ATTRIBUTION.replace(diagnose.then(QuoteAttribution::default));
+        CANCEL_REASON.set(None);
+        BATCH_CANCEL_REASONS.replace(Vec::new());
         Self
     }
 }
@@ -116,6 +171,8 @@ impl Drop for ReplayClock {
     fn drop(&mut self) {
         CLOCK.set(None);
         ATTRIBUTION.replace(None);
+        CANCEL_REASON.set(None);
+        BATCH_CANCEL_REASONS.replace(Vec::new());
     }
 }
 
@@ -140,12 +197,12 @@ fn now_ms() -> u64 {
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct HyperliquidObiFilter {
+struct BookImbalanceFilter {
     threshold: f64,
     max_age_ms: u64,
 }
 
-impl HyperliquidObiFilter {
+impl BookImbalanceFilter {
     fn blocked_sides(
         self,
         book: Option<ShmBboMessage>,
@@ -174,9 +231,18 @@ impl HyperliquidObiFilter {
     }
 }
 
+#[derive(Clone, Copy, Serialize)]
+enum ImbalanceBook {
+    #[serde(rename = "hyperliquid_obi_filter")]
+    Reference(BookImbalanceFilter),
+    #[serde(rename = "local_obi_filter")]
+    Local(BookImbalanceFilter),
+}
+
 #[derive(Serialize)]
 pub(in crate::strategy::inventory_neutral_mm) struct QuoteParticipation {
-    hyperliquid_obi_filter: HyperliquidObiFilter,
+    #[serde(flatten)]
+    source: ImbalanceBook,
     decisions: u64,
     fresh_reference_decisions: u64,
     withdrawn_bid_targets: u64,
@@ -184,6 +250,17 @@ pub(in crate::strategy::inventory_neutral_mm) struct QuoteParticipation {
 }
 
 impl QuoteParticipation {
+    pub(in crate::strategy::inventory_neutral_mm) fn exchange_id(
+        &self,
+        local: u8,
+        reference: u8,
+    ) -> u8 {
+        match self.source {
+            ImbalanceBook::Reference(_) => reference,
+            ImbalanceBook::Local(_) => local,
+        }
+    }
+
     pub(in crate::strategy::inventory_neutral_mm) fn apply(
         &mut self,
         target: &mut QuoteTarget,
@@ -193,10 +270,10 @@ impl QuoteParticipation {
     ) {
         self.decisions += 1;
         let at_ns = wall_time_ns().expect("recorded quote participation requires replay clock");
-        let Some([bid, ask]) = self
-            .hyperliquid_obi_filter
-            .blocked_sides(book, at_ns, positions)
-        else {
+        let filter = match self.source {
+            ImbalanceBook::Reference(filter) | ImbalanceBook::Local(filter) => filter,
+        };
+        let Some([bid, ask]) = filter.blocked_sides(book, at_ns, positions) else {
             return;
         };
         self.fresh_reference_decisions += 1;
@@ -210,6 +287,64 @@ impl QuoteParticipation {
             self.withdrawn_ask_targets += 1;
             target.ask_size = 0.0;
         }
+    }
+}
+
+fn default_initial_ahead_fraction() -> f64 {
+    1.0
+}
+
+fn default_cancel_progress_power() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbabilisticQueueConfig {
+    /// Fraction `[0, 1]` of displayed level depth initially placed ahead of newly activated orders.
+    #[serde(default = "default_initial_ahead_fraction")]
+    initial_ahead_fraction: f64,
+    /// Power-law queue depletion exponent `alpha` in `(0, 10]` (`x^a / (x^a + (1-x)^a)`).
+    #[serde(default = "default_cancel_progress_power")]
+    cancel_progress_power: f64,
+}
+
+impl ProbabilisticQueueConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.initial_ahead_fraction.is_finite()
+                && (0.0..=1.0).contains(&self.initial_ahead_fraction)
+                && self.cancel_progress_power.is_finite()
+                && self.cancel_progress_power > 0.0
+                && self.cancel_progress_power <= 10.0,
+            "invalid probabilistic queue model parameters"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct QueueModelReport {
+    initial_ahead_fraction: f64,
+    cancel_progress_power: f64,
+    cancel_depletion_events: u64,
+    cancel_depleted_ahead_base: f64,
+}
+
+fn power_queue_cancel_share_f64(ahead: f64, prev_depth: f64, power: f64) -> f64 {
+    if ahead <= 0.0 || !ahead.is_finite() || !prev_depth.is_finite() || prev_depth <= 0.0 {
+        return 0.0;
+    }
+    if ahead >= prev_depth {
+        return 1.0;
+    }
+    let x = (ahead / prev_depth).clamp(0.0, 1.0);
+    let xa = x.powf(power);
+    let denom = xa + (1.0 - x).powf(power);
+    if denom > 0.0 && denom.is_finite() {
+        (xa / denom).clamp(0.0, 1.0)
+    } else {
+        x
     }
 }
 
@@ -237,7 +372,17 @@ pub struct RecordedMakerConfig {
     #[serde(default)]
     diagnose_cross_market: bool,
     #[serde(default)]
-    hyperliquid_obi_filter: Option<HyperliquidObiFilter>,
+    diagnose_cancel_attribution: bool,
+    /// Opt-in `S10-1` calibration telemetry (distance exposure, markout
+    /// histograms, realized sigma). Requires `diagnose_cross_market` labels.
+    #[serde(default)]
+    calibration_telemetry: bool,
+    #[serde(default)]
+    hyperliquid_obi_filter: Option<BookImbalanceFilter>,
+    #[serde(default)]
+    local_obi_filter: Option<BookImbalanceFilter>,
+    #[serde(default)]
+    local_fair_value: Option<local_fair_value::Policy>,
     #[serde(default)]
     local_reversal_filter: Option<local_signal::LocalReversalFilter>,
     #[serde(default)]
@@ -259,6 +404,9 @@ pub struct RecordedMakerConfig {
     min_contracts: f64,
     min_notional: f64,
     depth_participation: f64,
+    /// Optional opt-in probabilistic queue-position sensitivity model (`S8-3`).
+    #[serde(default)]
+    queue_model: Option<ProbabilisticQueueConfig>,
 }
 
 fn default_trade_delivery_grace_ms() -> u64 {
@@ -382,6 +530,25 @@ impl RecordedMakerConfig {
             }),
             "invalid Hyperliquid OBI filter threshold or reference age"
         );
+        if let Some(policy) = &self.local_fair_value {
+            ensure!(self.core_only, "local fair value requires Core-only replay");
+            policy.validate()?;
+        }
+        if let Some(filter) = self.local_obi_filter {
+            ensure!(
+                self.core_only
+                    && self.hyperliquid_obi_filter.is_none()
+                    && self.binance_risk_filter.is_none()
+                    && self.local_reversal_filter.is_none(),
+                "local book imbalance requires separate Core-only replay"
+            );
+            ensure!(
+                filter.threshold > 0.0
+                    && filter.threshold < 1.0
+                    && (1..=self.strategy.local_staleness_ms).contains(&filter.max_age_ms),
+                "invalid local book imbalance threshold or age"
+            );
+        }
         if let Some(policy) = self.binance_risk_filter {
             policy.validate()?;
             ensure!(
@@ -403,11 +570,25 @@ impl RecordedMakerConfig {
                 self.hyperliquid_obi_filter.is_none()
                     && self.strategy.volatility_regime.is_none()
                     && self.strategy.order_flow_reserve.is_none()
-                    && self.strategy.cross_market_reserve.is_none()
-                    && self.strategy.markout_reserve.is_none(),
+                    && self.strategy.cross_market_reserve.is_none(),
                 "Core-only replay cannot enable external-reference policies"
             );
+            ensure!(
+                self.strategy.markout_reserve.is_none()
+                    || self
+                        .strategy
+                        .local_toxicity
+                        .is_some_and(|policy| policy.enable_local_markout),
+                "Core-only markout reserve requires local_toxicity.enable_local_markout"
+            );
         }
+        if let Some(qm) = self.queue_model {
+            qm.validate()?;
+        }
+        ensure!(
+            !self.calibration_telemetry || self.diagnose_cross_market,
+            "calibration_telemetry requires diagnose_cross_market markout labels"
+        );
         Ok(())
     }
 }
@@ -529,8 +710,12 @@ impl Event {
 struct Queue {
     activated_ms: u64,
     ahead: f64,
+    queue_depth: Option<Box<ReplayQueueDepth<f64>>>,
+    price: f64,
+    is_ask: bool,
     changed_side: bool,
     cancel_requested: bool,
+    cancel_attr_recorded: bool,
     cancel_window: Option<cancel_timing::CancelWindow>,
 }
 
@@ -629,6 +814,139 @@ struct ExecutionAttribution {
     ioc_turnover_with_submit_mid: f64,
 }
 
+#[derive(Default, Clone, Copy, Serialize)]
+struct CancelQueueHistogram {
+    lt_500ms: u64,
+    ms_500_to_1500: u64,
+    ms_1500_to_4000: u64,
+    ms_4000_to_10000: u64,
+    ge_10000ms: u64,
+}
+
+impl CancelQueueHistogram {
+    fn record(&mut self, age_ms: u64) {
+        match age_ms {
+            0..=499 => self.lt_500ms += 1,
+            500..=1_499 => self.ms_500_to_1500 += 1,
+            1_500..=3_999 => self.ms_1500_to_4000 += 1,
+            4_000..=9_999 => self.ms_4000_to_10000 += 1,
+            _ => self.ge_10000ms += 1,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct CancelReasonAccum {
+    requests: u64,
+    total_queue_age_ms: u64,
+    histogram: CancelQueueHistogram,
+}
+
+impl CancelReasonAccum {
+    fn record(&mut self, age_ms: u64) {
+        self.requests += 1;
+        self.total_queue_age_ms += age_ms;
+        self.histogram.record(age_ms);
+    }
+
+    fn report(self) -> CancelReasonReport {
+        CancelReasonReport {
+            requests: self.requests,
+            total_queue_age_ms: self.total_queue_age_ms,
+            mean_queue_age_ms: if self.requests > 0 {
+                self.total_queue_age_ms as f64 / self.requests as f64
+            } else {
+                0.0
+            },
+            histogram: self.histogram,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CancelReasonReport {
+    requests: u64,
+    total_queue_age_ms: u64,
+    mean_queue_age_ms: f64,
+    histogram: CancelQueueHistogram,
+}
+
+#[derive(Default)]
+struct CancelAttributionAccum {
+    maker_cancel_requests: u64,
+    total_preserved_queue_ms: u64,
+    histogram: CancelQueueHistogram,
+    by_reason: BTreeMap<CancelReason, CancelReasonAccum>,
+    reduce_only_auto_cancels: CancelReasonAccum,
+    maker_fills: u64,
+    total_filled_queue_age_ms: u64,
+    cancel_pending_fills: u64,
+}
+
+impl CancelAttributionAccum {
+    fn record_cancel(&mut self, reason: CancelReason, queue_age_ms: u64) {
+        self.maker_cancel_requests += 1;
+        self.total_preserved_queue_ms += queue_age_ms;
+        self.histogram.record(queue_age_ms);
+        self.by_reason
+            .entry(reason)
+            .or_default()
+            .record(queue_age_ms);
+    }
+
+    fn record_reduce_only_auto_cancel(&mut self, queue_age_ms: u64) {
+        self.reduce_only_auto_cancels.record(queue_age_ms);
+    }
+
+    fn record_fill(&mut self, queue_age_ms: u64, cancel_pending: bool) {
+        self.maker_fills += 1;
+        self.total_filled_queue_age_ms += queue_age_ms;
+        self.cancel_pending_fills += u64::from(cancel_pending);
+    }
+
+    fn finish(self) -> CancelAttribution {
+        let by_reason = self
+            .by_reason
+            .into_iter()
+            .map(|(reason, accum)| (reason.as_str(), accum.report()))
+            .collect();
+        CancelAttribution {
+            maker_cancel_requests: self.maker_cancel_requests,
+            total_preserved_queue_ms: self.total_preserved_queue_ms,
+            mean_preserved_queue_ms: if self.maker_cancel_requests > 0 {
+                self.total_preserved_queue_ms as f64 / self.maker_cancel_requests as f64
+            } else {
+                0.0
+            },
+            histogram: self.histogram,
+            by_reason,
+            reduce_only_auto_cancels: self.reduce_only_auto_cancels.report(),
+            maker_fills: self.maker_fills,
+            total_filled_queue_age_ms: self.total_filled_queue_age_ms,
+            mean_filled_queue_age_ms: if self.maker_fills > 0 {
+                self.total_filled_queue_age_ms as f64 / self.maker_fills as f64
+            } else {
+                0.0
+            },
+            cancel_pending_fills: self.cancel_pending_fills,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CancelAttribution {
+    maker_cancel_requests: u64,
+    total_preserved_queue_ms: u64,
+    mean_preserved_queue_ms: f64,
+    histogram: CancelQueueHistogram,
+    by_reason: BTreeMap<&'static str, CancelReasonReport>,
+    reduce_only_auto_cancels: CancelReasonReport,
+    maker_fills: u64,
+    total_filled_queue_age_ms: u64,
+    mean_filled_queue_age_ms: f64,
+    cancel_pending_fills: u64,
+}
+
 #[derive(Default)]
 struct Market {
     book: Book,
@@ -650,6 +968,33 @@ struct Market {
     stale_rejections: u64,
     accepted_orders: u64,
     attribution: Option<ExecutionAttribution>,
+    cancel_attribution: Option<CancelAttributionAccum>,
+    queue_model_report: Option<QueueModelReport>,
+    calibration: Option<calibration::CalibrationAccum>,
+}
+
+impl Market {
+    fn calibration_book(&mut self, at: u64, next: Option<(f64, u64)>) {
+        if let Some(cal) = self.calibration.as_mut() {
+            cal.on_book(
+                at,
+                next,
+                self.queue
+                    .iter()
+                    .filter(|(id, _)| !self.cancelled.contains_key(id))
+                    .map(|(_, q)| (q.activated_ms, q.price, q.is_ask)),
+            );
+        }
+    }
+
+    fn end_quote_exposure(&mut self, id: i64, at: u64) {
+        if let Some(cal) = self.calibration.as_mut()
+            && !self.cancelled.contains_key(&id)
+            && let Some(q) = self.queue.get(&id)
+        {
+            cal.accrue_order(at, q.activated_ms, q.price, q.is_ask);
+        }
+    }
 }
 
 pub(super) struct Matching {
@@ -671,6 +1016,7 @@ pub(super) struct Matching {
     min_contracts: f64,
     min_notional: f64,
     participation: f64,
+    queue_model: Option<ProbabilisticQueueConfig>,
 }
 
 impl Matching {
@@ -684,6 +1030,20 @@ impl Matching {
                         ..Default::default()
                     }),
                     cancel_timing: cancel_timing::Diagnostics::new(config.trade_clock_guard_ms),
+                    ..Default::default()
+                }),
+                cancel_attribution: config
+                    .diagnose_cancel_attribution
+                    .then(CancelAttributionAccum::default),
+                calibration: config.calibration_telemetry.then(|| {
+                    calibration::CalibrationAccum::new(
+                        MARKOUT_HORIZONS_MS,
+                        config.trade_delivery_grace_ms + config.trade_clock_guard_ms,
+                    )
+                }),
+                queue_model_report: config.queue_model.map(|qm| QueueModelReport {
+                    initial_ahead_fraction: qm.initial_ahead_fraction,
+                    cancel_progress_power: qm.cancel_progress_power,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -713,15 +1073,36 @@ impl Matching {
             min_contracts: config.min_contracts,
             min_notional: config.min_notional,
             participation: config.depth_participation,
+            queue_model: config.queue_model,
         }
     }
 
     fn on_book(&self, book: Book) {
         let mut state = self.market.lock();
+        if state.calibration.is_some() {
+            let at = now_ms();
+            let next = book
+                .touch()
+                .filter(|_| {
+                    book.fresh(at, self.max_age_ms) && state.trade_feed_online == Some(true)
+                })
+                .map(|(bid, ask)| {
+                    (
+                        (bid[0] + ask[0]) * 0.5,
+                        book.timestamp_ms.saturating_add(self.max_age_ms),
+                    )
+                });
+            state.calibration_book(at, next);
+        }
         if let Some((bid, ask)) = book.touch() {
             let mid = bid[0] * 0.5 + ask[0] * 0.5;
             state.last_mid = Some(mid);
-            if let Some(stats) = &mut state.attribution {
+            let Market {
+                calibration,
+                attribution,
+                ..
+            } = &mut *state;
+            if let Some(stats) = attribution {
                 let now = now_ms();
                 for (index, pending) in stats.pending_marks.iter_mut().enumerate() {
                     while let Some(fill) = pending.front() {
@@ -734,6 +1115,9 @@ impl Matching {
                         }
                         let fill = pending.pop_front().expect("checked markout");
                         if eligible && !expired {
+                            if let Some(cal) = calibration.as_mut() {
+                                cal.on_mark(index, fill.signed_quantity, fill.price, mid);
+                            }
                             stats.maker_markouts[index].mark(&fill, mid);
                             stats.cancel_timing.mark(index, &fill, mid);
                             if index == 0 {
@@ -748,6 +1132,58 @@ impl Matching {
                         }
                     }
                 }
+            }
+        }
+        if let Some(qm) = self.queue_model {
+            let now = now_ms();
+            let market = &mut *state;
+            for (id, q) in &mut market.queue {
+                let Some(history) = q.queue_depth.as_mut() else {
+                    continue;
+                };
+                if market.cancelled.contains_key(id) || market.trade_feed_online == Some(false) {
+                    history.reset(now);
+                    continue;
+                }
+                let side = if q.is_ask { &book.asks } else { &book.bids };
+                let visible = side.last().is_some_and(|worst| {
+                    if q.is_ask {
+                        q.price <= worst[0] + self.tick * 0.1
+                    } else {
+                        q.price >= worst[0] - self.tick * 0.1
+                    }
+                });
+                if !visible {
+                    history.reset(now);
+                    continue;
+                }
+                let depth = side
+                    .iter()
+                    .find(|v| (v[0] - q.price).abs() < self.tick * 0.1)
+                    .map_or(0.0, |v| v[1]);
+                history.book(
+                    book.timestamp_ms,
+                    depth,
+                    now,
+                    (
+                        self.clock_guard_ms,
+                        self.trade_delivery_grace_ms,
+                        self.max_age_ms,
+                    ),
+                    |before, after| {
+                        let drop = before - after;
+                        let share =
+                            power_queue_cancel_share_f64(q.ahead, before, qm.cancel_progress_power);
+                        let depleted = (share * drop).max(q.ahead - after).min(drop).min(q.ahead);
+                        q.ahead -= depleted;
+                        if depleted > 0.0
+                            && let Some(rep) = market.queue_model_report.as_mut()
+                        {
+                            rep.cancel_depletion_events += 1;
+                            rep.cancel_depleted_ahead_base += depleted;
+                        }
+                    },
+                );
             }
         }
         // Never replenish IOC depth from a repeated publication.
@@ -767,26 +1203,52 @@ impl Matching {
     fn record_cancel_with_delay(&self, order_index: Option<i64>, delay: Duration) {
         let requested_ms = now_ms();
         let effective_ms = requested_ms.saturating_add(delay.as_millis() as u64);
+        let fallback_reason = CANCEL_REASON.get().unwrap_or(if order_index.is_none() {
+            CancelReason::RiskOrSpreadCancelAll
+        } else {
+            CancelReason::Other
+        });
         let mut state = self.market.lock();
         let Market {
-            queue, attribution, ..
+            queue,
+            attribution,
+            cancel_attribution,
+            ..
         } = &mut *state;
-        if let Some(stats) = attribution {
+        if attribution.is_some() || cancel_attribution.is_some() {
             for (&id, order) in queue.iter_mut() {
                 if order_index.is_none_or(|index| id == index) {
-                    if !order.cancel_requested {
-                        order.cancel_requested = true;
-                        stats.maker_cancel_requests += 1;
+                    if let Some(stats) = attribution.as_mut() {
+                        if !order.cancel_requested {
+                            order.cancel_requested = true;
+                            stats.maker_cancel_requests += 1;
+                        }
+                        // Diagnostics only. A repeated request preserves the first
+                        // request and the earliest modeled cancellation deadline.
+                        if let Some(prior) = &mut order.cancel_window {
+                            prior.effective_ms = prior.effective_ms.min(effective_ms);
+                        } else {
+                            order.cancel_window = Some(cancel_timing::CancelWindow {
+                                requested_ms,
+                                effective_ms,
+                            });
+                        }
                     }
-                    // Diagnostics only. A repeated request preserves the first
-                    // request and the earliest modeled cancellation deadline.
-                    if let Some(prior) = &mut order.cancel_window {
-                        prior.effective_ms = prior.effective_ms.min(effective_ms);
-                    } else {
-                        order.cancel_window = Some(cancel_timing::CancelWindow {
-                            requested_ms,
-                            effective_ms,
-                        });
+                    if let Some(cancel_stats) = cancel_attribution.as_mut()
+                        && !order.cancel_attr_recorded
+                    {
+                        order.cancel_attr_recorded = true;
+                        let reason = BATCH_CANCEL_REASONS
+                            .with_borrow(|reasons| {
+                                reasons
+                                    .iter()
+                                    .rev()
+                                    .find(|(oid, _)| *oid == id)
+                                    .map(|(_, reason)| *reason)
+                            })
+                            .unwrap_or(fallback_reason);
+                        cancel_stats
+                            .record_cancel(reason, requested_ms.saturating_sub(order.activated_ms));
                     }
                 }
             }
@@ -811,6 +1273,9 @@ impl Matching {
 
     pub(super) fn forget(&self, order_index: i64) {
         let mut state = self.market.lock();
+        if state.calibration.is_some() {
+            state.end_quote_exposure(order_index, now_ms());
+        }
         state.queue.remove(&order_index);
         state.cancelled.remove(&order_index);
     }
@@ -823,6 +1288,7 @@ impl Matching {
             return;
         }
         let cancelled_ms = now_ms();
+        state.end_quote_exposure(id, cancelled_ms);
         state.cancelled.insert(
             id,
             CancelledOrder {
@@ -889,7 +1355,7 @@ impl Matching {
         Ok(())
     }
 
-    fn admit(&self, order: Resting, ioc: bool, changed_side: bool) -> bool {
+    fn admit(&self, venue: &SimVenue, order: Resting, ioc: bool, changed_side: bool) -> bool {
         let now = now_ms();
         let mut state = self.market.lock();
         let size = order.remaining;
@@ -914,12 +1380,19 @@ impl Matching {
                 state.post_only_rejections += 1;
                 return false;
             }
+            if order.reduce_only {
+                let reducible =
+                    components::round_down_to_step(venue.reducible_size(order.is_ask), self.step);
+                if reducible + self.step * 1e-6 < self.step {
+                    return false;
+                }
+            }
             let side = if order.is_ask {
                 &state.book.asks
             } else {
                 &state.book.bids
             };
-            let ahead = side
+            let level_depth = side
                 .iter()
                 .find(|level| (level[0] - price).abs() < self.tick * 0.1)
                 .map_or_else(
@@ -934,13 +1407,27 @@ impl Matching {
                     },
                     |level| level[1],
                 );
+            let ahead = self.queue_model.map_or(level_depth, |qm| {
+                if level_depth.is_finite() {
+                    level_depth * qm.initial_ahead_fraction
+                } else {
+                    f64::INFINITY
+                }
+            });
             state.queue.insert(
                 order.exchange_order_id as i64,
                 Queue {
                     activated_ms: now,
                     ahead,
+                    queue_depth: self
+                        .queue_model
+                        .filter(|_| level_depth.is_finite())
+                        .map(|_| Box::new(ReplayQueueDepth::new(now))),
+                    price,
+                    is_ask: order.is_ask,
                     changed_side,
                     cancel_requested: false,
+                    cancel_attr_recorded: false,
                     cancel_window: None,
                 },
             );
@@ -988,6 +1475,22 @@ impl Matching {
         if source > at.saturating_add(self.clock_guard_ms) {
             anyhow::bail!("trade source time exceeds clock guard");
         }
+        if self.queue_model.is_some() {
+            // Count public touches and sweep-through prints even while activation clock is uncertain.
+            for q in self.market.lock().queue.values_mut() {
+                let touched_or_swept = if taker_buy {
+                    price >= q.price - self.tick * 0.1
+                } else {
+                    price <= q.price + self.tick * 0.1
+                };
+                if q.is_ask == taker_buy
+                    && touched_or_swept
+                    && let Some(depth) = q.queue_depth.as_mut()
+                {
+                    depth.trade(source, size, at, self.clock_guard_ms, self.max_age_ms);
+                }
+            }
+        }
         self.prune_cancelled(at);
         let eligible_ms = at.min(source.saturating_sub(self.clock_guard_ms));
         let mut orders: Vec<_> = venue.book.lock().values().copied().collect();
@@ -1019,7 +1522,30 @@ impl Matching {
         let mut remaining = size;
         for order in orders {
             let id = order.exchange_order_id as i64;
-            let (activated_ms, changed_side, cancel_requested, cancel_window) = {
+            let reducible = if order.reduce_only {
+                let cap =
+                    components::round_down_to_step(venue.reducible_size(order.is_ask), self.step);
+                if cap + self.step * 1e-6 < self.step {
+                    {
+                        let mut state = self.market.lock();
+                        if let Some(activated_ms) = state.queue.get(&id).map(|q| q.activated_ms)
+                            && let Some(cancel_stats) = state.cancel_attribution.as_mut()
+                        {
+                            cancel_stats
+                                .record_reduce_only_auto_cancel(at.saturating_sub(activated_ms));
+                        }
+                    }
+                    if venue.book.lock().contains_key(&id) {
+                        venue.cancel(id);
+                    }
+                    self.forget(id);
+                    continue;
+                }
+                Some(cap)
+            } else {
+                None
+            };
+            let (activated_ms, changed_side, cancel_requested, cancel_attr_recorded, cancel_window) = {
                 let mut state = self.market.lock();
                 let observed_effective_ms =
                     state.cancelled.get(&id).map(|order| order.cancelled_ms);
@@ -1042,6 +1568,7 @@ impl Matching {
                     queue.activated_ms,
                     queue.changed_side,
                     queue.cancel_requested,
+                    queue.cancel_attr_recorded,
                     queue.cancel_window.map(|mut window| {
                         // Once a simulated cancellation has executed, use its
                         // observed local effect time instead of the deadline.
@@ -1052,8 +1579,15 @@ impl Matching {
                     }),
                 )
             };
-            let qty = components::round_down_to_step(order.remaining.min(remaining), self.step);
+            let max_order_qty = reducible.map_or(order.remaining, |cap| order.remaining.min(cap));
+            let qty = components::round_down_to_step(max_order_qty.min(remaining), self.step);
             if qty > 0.0 {
+                if let Some(cancel_stats) = &mut self.market.lock().cancel_attribution {
+                    cancel_stats.record_fill(
+                        at.saturating_sub(activated_ms),
+                        cancel_requested || cancel_attr_recorded,
+                    );
+                }
                 if let Some(stats) = &mut self.market.lock().attribution {
                     let age = at - activated_ms;
                     let cancel_source_timing = stats.cancel_timing.fill(
@@ -1093,6 +1627,18 @@ impl Matching {
                         });
                     }
                 }
+                {
+                    let mut state = self.market.lock();
+                    let before_cancel = state.cancelled.get(&id).is_none_or(|cancelled| {
+                        source.saturating_add(self.clock_guard_ms) < cancelled.cancelled_ms
+                    });
+                    if let Some(cal) = state.calibration.as_mut() {
+                        // The cash simulator includes ambiguous cancel races. A
+                        // distance sample needs a print proven to precede removal.
+                        let mid = cal.observable_mid(eligible_ms).filter(|_| before_cancel);
+                        cal.on_fill(order.price, order.is_ask, qty, mid);
+                    }
+                }
                 venue.fill(order, order.price, qty, false);
                 {
                     let mut state = self.market.lock();
@@ -1103,6 +1649,15 @@ impl Matching {
                 }
                 remaining = (remaining - qty).max(0.0);
                 if qty >= order.remaining - self.step * 1e-6 {
+                    self.forget(id);
+                } else if reducible.is_some_and(|cap| cap - qty + self.step * 1e-6 < self.step) {
+                    if venue.book.lock().contains_key(&id) {
+                        venue.cancel(id);
+                    }
+                    if let Some(cancel_stats) = &mut self.market.lock().cancel_attribution {
+                        cancel_stats
+                            .record_reduce_only_auto_cancel(at.saturating_sub(activated_ms));
+                    }
                     self.forget(id);
                 }
             }
@@ -1213,6 +1768,7 @@ impl Matching {
                     params.price,
                     params.size,
                     params.order_type == OrderType::Ioc,
+                    params.reduce_only,
                 )),
                 BatchAction::Cancel(_) => None,
             })
@@ -1226,7 +1782,7 @@ impl Matching {
                     let order = reservation.expect("place reservation");
                     let ioc = params.order_type == OrderType::Ioc;
                     let allowed = self.flat_at_funding.as_ref().is_none_or(|schedule| {
-                        schedule.allows_arrival(now_ms(), ioc && params.reduce_only)
+                        schedule.allows_arrival(now_ms(), params.reduce_only)
                     });
                     if !allowed {
                         self.market.lock().funding_rejections += 1;
@@ -1241,7 +1797,7 @@ impl Matching {
                     if allowed
                         && warmed
                         && online
-                        && self.admit(order, ioc, changed_sides[usize::from(order.is_ask)])
+                        && self.admit(venue, order, ioc, changed_sides[usize::from(order.is_ask)])
                     {
                         venue.activate(order);
                         if ioc {
@@ -1305,6 +1861,8 @@ pub struct RecordedMakerReport {
     start_ms: u64,
     end_ms: u64,
     active_until_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy_halted_at_ms: Option<u64>,
     initial_equity: f64,
     strategy_startups: u64,
     daily_loss_start_equity: Option<f64>,
@@ -1343,11 +1901,17 @@ pub struct RecordedMakerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     cross_market_attribution: Option<CrossMarketAttribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_attribution: Option<CancelAttribution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calibration: Option<calibration::CalibrationReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     quote_participation: Option<QuoteParticipation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_participation: Option<local_signal::LocalParticipation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binance_participation: Option<binance_signal::Participation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_model: Option<QueueModelReport>,
 }
 
 #[derive(Serialize)]
@@ -1470,6 +2034,11 @@ async fn drive(
             Arc::clone(binance_signal.as_ref().expect("configured reference")),
         )
     });
+    let local_fair_value = config
+        .local_fair_value
+        .clone()
+        .map(|policy| Arc::new(PlMutex::new(local_fair_value::Signal::new(policy))));
+    strategy.recorded_local_fair_value = local_fair_value.clone();
     if config.core_only {
         strategy.use_local_fair_value();
     }
@@ -1479,16 +2048,17 @@ async fn drive(
             Arc::clone(local_signal.as_ref().expect("configured local signal")),
         )
     });
-    strategy.quote_participation =
-        config
-            .hyperliquid_obi_filter
-            .map(|hyperliquid_obi_filter| QuoteParticipation {
-                hyperliquid_obi_filter,
-                decisions: 0,
-                fresh_reference_decisions: 0,
-                withdrawn_bid_targets: 0,
-                withdrawn_ask_targets: 0,
-            });
+    strategy.quote_participation = config
+        .hyperliquid_obi_filter
+        .map(ImbalanceBook::Reference)
+        .or_else(|| config.local_obi_filter.map(ImbalanceBook::Local))
+        .map(|source| QuoteParticipation {
+            source,
+            decisions: 0,
+            fresh_reference_decisions: 0,
+            withdrawn_bid_targets: 0,
+            withdrawn_ask_targets: 0,
+        });
     let (stop, stop_rx) = watch::channel(false);
     let (done, mut account_done) = watch::channel(false);
     let mut frames = 0;
@@ -1499,6 +2069,9 @@ async fn drive(
             let mut line = String::new();
             let mut delayed_books = VecDeque::<(u64, Book, Book)>::new();
             let publish = |lighter: &Book, hyperliquid: &Book| {
+                if let Some(signal) = &local_fair_value {
+                    signal.lock().book(now_ms(), lighter);
+                }
                 if let Some(signal) = &local_signal {
                     signal.lock().book(now_ms(), lighter);
                 }
@@ -1564,6 +2137,14 @@ async fn drive(
                         let mut state = matching.market.lock();
                         if !online && state.trade_feed_online != Some(false) {
                             state.trade_feed_gaps += 1;
+                            for order in state.queue.values_mut() {
+                                if let Some(depth) = order.queue_depth.as_mut() {
+                                    depth.reset(at);
+                                }
+                            }
+                        }
+                        if !online {
+                            state.calibration_book(at, None);
                         }
                         state.trade_feed_online = Some(online);
                     }
@@ -1650,13 +2231,14 @@ async fn drive(
         }
     };
     let run = async {
-        let result = if config.flat_at_funding.is_some() {
+        let (result, verified) = if config.flat_at_funding.is_some() {
             continuous::run(&mut strategy, &config, &sim, stop_rx).await
         } else {
             (strategy.run(Some(stop_rx)).await, 0)
         };
+        let strategy_halted_at_ms = result.is_err().then(now_ms);
         done.send_replace(true);
-        result
+        (result, verified, strategy_halted_at_ms)
     };
     let end_quotes = async {
         let mut done = done.subscribe();
@@ -1667,7 +2249,7 @@ async fn drive(
             }
         }
     };
-    let (data, (), (result, funding_boundaries_verified), ()) =
+    let (data, (), (result, funding_boundaries_verified, strategy_halted_at_ms), ()) =
         tokio::join!(feed, accounts, run, end_quotes);
     data?;
     account(
@@ -1678,6 +2260,9 @@ async fn drive(
     );
     let ledger = *sim.ledger.lock();
     let mut market = matching.market.lock();
+    if market.calibration.is_some() {
+        market.calibration_book(now_ms().min(config.drain_until_ms), None);
+    }
     let resting_orders = sim.book.lock().len();
     let final_position = sim.net_position();
     ensure!(
@@ -1729,7 +2314,9 @@ async fn drive(
         }
     });
     Ok(RecordedMakerReport {
-        fair_value_mode: if config.core_only {
+        fair_value_mode: if let Some(policy) = &config.local_fair_value {
+            policy.label()
+        } else if config.core_only {
             "core_only"
         } else {
             "external_with_local_fallback"
@@ -1737,6 +2324,7 @@ async fn drive(
         start_ms: config.start_ms,
         end_ms: config.end_ms,
         active_until_ms,
+        strategy_halted_at_ms,
         initial_equity: config.initial_equity,
         strategy_startups: 1,
         daily_loss_start_equity: strategy
@@ -1789,9 +2377,18 @@ async fn drive(
         needs_reconciliation,
         halted,
         cross_market_attribution,
+        cancel_attribution: market
+            .cancel_attribution
+            .take()
+            .map(CancelAttributionAccum::finish),
+        calibration: market
+            .calibration
+            .as_ref()
+            .map(calibration::CalibrationAccum::finish),
         quote_participation: strategy.quote_participation,
         local_participation: strategy.local_participation,
         binance_participation: strategy.binance_participation,
+        queue_model: market.queue_model_report,
     })
 }
 
@@ -1835,7 +2432,11 @@ mod tests {
             cancel_transport_ms: None,
             taker_transport_ms: None,
             diagnose_cross_market: false,
+            diagnose_cancel_attribution: false,
+            calibration_telemetry: false,
             hyperliquid_obi_filter: None,
+            local_obi_filter: None,
+            local_fair_value: None,
             local_reversal_filter: None,
             binance_risk_filter: None,
             core_only: false,
@@ -1848,6 +2449,7 @@ mod tests {
             min_contracts: 0.001,
             min_notional: 1.0,
             depth_participation: 0.25,
+            queue_model: None,
         }
     }
 
@@ -1918,7 +2520,7 @@ mod tests {
 
     #[test]
     fn obi_filter_uses_only_fresh_two_sided_depth_and_preserves_the_exit_side() {
-        let filter = HyperliquidObiFilter {
+        let filter = BookImbalanceFilter {
             threshold: 0.6,
             max_age_ms: 250,
         };
@@ -1969,10 +2571,10 @@ mod tests {
     async fn obi_filter_zero_target_withdraws_resting_order_without_suppressing_exit() {
         let _clock = ReplayClock::open(START, false);
         let mut filter = QuoteParticipation {
-            hyperliquid_obi_filter: HyperliquidObiFilter {
+            source: ImbalanceBook::Reference(BookImbalanceFilter {
                 threshold: 0.6,
                 max_age_ms: 250,
-            },
+            }),
             decisions: 0,
             fresh_reference_decisions: 0,
             withdrawn_bid_targets: 0,
@@ -2008,6 +2610,7 @@ mod tests {
                 side: OrderSide::Buy,
                 price: 1999.0,
                 size: 0.05,
+                reduce_only: false,
                 placed_at: Instant::now(),
             }],
             OrderType::PostOnly,
@@ -2179,6 +2782,37 @@ mod tests {
     }
 
     #[test]
+    fn local_imbalance_uses_execution_book_without_external_depth() {
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.local_obi_filter = Some(BookImbalanceFilter {
+            threshold: 0.6,
+            max_age_ms: 250,
+        });
+        let data = tape(&cfg, true)
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["kind"] == "book" {
+                    row.as_object_mut().unwrap().remove("hyperliquid");
+                    row["lighter"]["bids"][0][1] = serde_json::json!(0.01);
+                    row["lighter"]["asks"][0][1] = serde_json::json!(100.0);
+                }
+                row.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        let counters = &result["quote_participation"];
+        assert_eq!(counters["local_obi_filter"]["threshold"], 0.6);
+        assert!(counters.get("hyperliquid_obi_filter").is_none());
+        assert!(counters["fresh_reference_decisions"].as_u64().unwrap() > 0);
+        assert!(counters["withdrawn_bid_targets"].as_u64().unwrap() > 0);
+        assert_eq!(counters["withdrawn_ask_targets"], 0);
+    }
+
+    #[test]
     fn core_only_quotes_are_invariant_to_external_book_prices() {
         let run = |external_mid: Option<f64>| {
             let mut cfg = continuous_config(125);
@@ -2216,11 +2850,33 @@ mod tests {
         assert_eq!(control, serde_json::to_value(run(None)).unwrap());
         let mut invalid = continuous_config(125);
         invalid.core_only = true;
-        invalid.hyperliquid_obi_filter = Some(HyperliquidObiFilter {
+        invalid.hyperliquid_obi_filter = Some(BookImbalanceFilter {
             threshold: 0.6,
             max_age_ms: 250,
         });
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn core_only_markout_reserve_requires_local_marks() {
+        use crate::config::{LocalToxicityConfig, MarkoutReserveConfig};
+
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.strategy.markout_reserve = Some(MarkoutReserveConfig {
+            max_widen_bps: 1.0,
+            close_cost_bps: 0.25,
+            max_sample_age_ms: 60_000,
+            quantile_floor_p: None,
+        });
+        assert!(cfg.validate().is_err());
+        cfg.strategy.local_toxicity = Some(LocalToxicityConfig::default());
+        assert!(cfg.validate().is_err());
+        cfg.strategy.local_toxicity = Some(LocalToxicityConfig {
+            enable_local_markout: true,
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -2235,6 +2891,12 @@ mod tests {
         assert_eq!(report.net_liquidation_pnl, Some(0.0));
         assert_eq!(report.final_position, 0.0);
         assert_eq!(report.active_until_ms, START + 140_000);
+        assert!(
+            serde_json::to_value(&report)
+                .unwrap()
+                .get("strategy_halted_at_ms")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2419,6 +3081,12 @@ mod tests {
             .join("\n");
         let report = run_recorded_maker(config, data.as_bytes()).unwrap();
         assert!(report.halted.as_ref().unwrap().contains("fresh book"));
+        let halted_at = report.strategy_halted_at_ms.unwrap();
+        assert!((START + 55_000..report.active_until_ms).contains(&halted_at));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["strategy_halted_at_ms"],
+            halted_at
+        );
         assert_eq!(report.net_liquidation_pnl, None);
     }
 
@@ -2688,5 +3356,757 @@ mod tests {
         assert_eq!(marked.marked_fills_1s, 1);
         assert_eq!(marked.markout_quote_1s, -0.025);
         assert_eq!(stats.ioc_cost_quote_vs_submit_mid, 0.025);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn passive_reduce_only_clamps_fills_at_zero_cancels_remainder_and_rejects_flat() {
+        let _clock = ReplayClock::open(START, false);
+        let config = config();
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(Book {
+            timestamp_ms: START,
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+
+        // Flat account rejects passive reduce-only sell via OrderRejected, preserving zero inventory.
+        let ro_sell = |price, size| {
+            BatchAction::Place(OrderParams {
+                side: Side::Sell,
+                price,
+                size,
+                order_type: OrderType::PostOnly,
+                reduce_only: true,
+            })
+        };
+        venue
+            .execute_batch(vec![ro_sell(100.5, 0.50)])
+            .await
+            .unwrap();
+        assert_eq!(matching.market.lock().accepted_orders, 0);
+        assert!(venue.book.lock().is_empty());
+        assert_eq!(tracker.active_order_count(), 0);
+
+        // Open +0.50 long via PostOnly buy.
+        venue
+            .execute_batch(vec![BatchAction::Place(OrderParams {
+                side: Side::Buy,
+                price: 100.0,
+                size: 0.50,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            })])
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(150)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        matching
+            .on_trade(&venue, now_ms(), now_ms(), 99.8, 0.50, false)
+            .unwrap();
+        assert!((venue.net_position() - 0.50).abs() < 1e-9);
+        assert!((tracker.confirmed_position() - 0.50).abs() < 1e-9);
+
+        // Place TWO resting reduce-only sells (0.30 @ 100.40 and 0.40 @ 100.50) — total 0.70 > 0.50 held —
+        // plus one oversized tombstone. An oversized 2.0 buy print must clamp at 0.50 -> 0.00 and cancel
+        // the unfilled 0.20 remainder without ever crossing zero into short!
+        venue
+            .execute_batch(vec![ro_sell(100.4, 0.30), ro_sell(100.5, 0.40)])
+            .await
+            .unwrap();
+        assert_eq!(venue.book.lock().len(), 2);
+        tokio::time::advance(Duration::from_millis(150)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        matching
+            .on_trade(&venue, now_ms(), now_ms(), 100.6, 2.00, true)
+            .unwrap();
+        assert!((venue.net_position() - 0.0).abs() < 1e-9);
+        assert!((tracker.confirmed_position() - 0.0).abs() < 1e-9);
+        assert!(venue.book.lock().is_empty());
+        assert_eq!(tracker.active_order_count(), 0);
+        assert_eq!(venue.ledger.lock().maker_fills, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_cancel_tombstone_with_reduce_only_cannot_cross_zero_inventory() {
+        let _clock = ReplayClock::open(START, false);
+        let config = config();
+        let tracker = Arc::new(OrderTracker::new());
+        let mut venue = SimVenue::new(Arc::clone(&tracker), 0.0);
+        venue.recorded = Some(Matching::new(&config));
+        let matching = venue.recorded.as_ref().unwrap();
+        matching.on_book(Book {
+            timestamp_ms: START,
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+
+        // Open -0.25 short.
+        venue
+            .execute_batch(vec![BatchAction::Place(OrderParams {
+                side: Side::Sell,
+                price: 100.0,
+                size: 0.25,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            })])
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(150)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        matching
+            .on_trade(&venue, now_ms(), now_ms(), 100.2, 0.25, true)
+            .unwrap();
+        assert!((venue.net_position() + 0.25).abs() < 1e-9);
+
+        // Place reduce-only buy 0.40 @ 99.6 and cancel it (creating tombstone while cancel is in flight).
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        venue
+            .execute_batch(vec![BatchAction::Place(OrderParams {
+                side: Side::Buy,
+                price: 99.6,
+                size: 0.40,
+                order_type: OrderType::PostOnly,
+                reduce_only: true,
+            })])
+            .await
+            .unwrap();
+        assert_eq!(venue.book.lock().len(), 1);
+        let ro_id = *venue.book.lock().keys().next().unwrap();
+        tokio::time::advance(Duration::from_millis(150)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        venue.cancel_order(ro_id).await.unwrap();
+        let source = now_ms() - 20;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        matching
+            .on_trade(&venue, now_ms(), source, 99.5, 1.00, false)
+            .unwrap();
+        assert!((venue.net_position() - 0.0).abs() < 1e-9);
+        assert!((tracker.confirmed_position() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calibration_telemetry_preserves_baseline_json_and_reconciles_fill_counts() {
+        let make_cfg = |calibration_telemetry: bool| {
+            let mut cfg = continuous_config(15);
+            cfg.strategy.grid_levels = 2;
+            cfg.strategy.base_order_size = 0.01;
+            cfg.diagnose_cross_market = true;
+            cfg.calibration_telemetry = calibration_telemetry;
+            cfg
+        };
+        let base_cfg = make_cfg(false);
+        // Wide 99/101 book with periodic sweep-through prints on both sides so
+        // inside-spread quotes are filled and markouts are labelled.
+        let mut input_tape = format!(
+            "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+            base_cfg.start_ms
+        );
+        for at in (base_cfg.start_ms..base_cfg.drain_until_ms).step_by(500) {
+            let book =
+                serde_json::json!({"timestamp_ms":at,"bids":[[99.0,1.0]],"asks":[[101.0,1.0]]});
+            let event =
+                serde_json::json!({"kind":"book","at_ms":at,"lighter":book,"hyperliquid":book});
+            input_tape.push_str(&event.to_string());
+            input_tape.push('\n');
+            let rel = at - base_cfg.start_ms;
+            if rel >= 3_000 && at < base_cfg.end_ms && rel % 2_000 == 0 {
+                let (aggressor, price) = if rel % 4_000 == 0 {
+                    ("sell", 98.0)
+                } else {
+                    ("buy", 102.0)
+                };
+                let trade = serde_json::json!({
+                    "kind":"trade","at_ms":at + 100,"source_ms":at + 100,
+                    "price":price,"size":5.0,"aggressor":aggressor
+                });
+                input_tape.push_str(&trade.to_string());
+                input_tape.push('\n');
+            }
+        }
+        let baseline = run_recorded_maker(base_cfg, input_tape.as_bytes()).unwrap();
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+        assert!(baseline_json.get("calibration").is_none());
+
+        let calibrated = run_recorded_maker(make_cfg(true), input_tape.as_bytes()).unwrap();
+        let mut calibrated_json = serde_json::to_value(&calibrated).unwrap();
+        let cal = calibrated_json
+            .as_object_mut()
+            .unwrap()
+            .remove("calibration")
+            .expect("calibration present when enabled");
+        // Enabling telemetry must leave every existing report field invariant.
+        assert_eq!(calibrated_json, baseline_json);
+
+        let binned: u64 = cal["distance_bins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bin| bin["fill_count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            binned + cal["unpriced_fills"].as_u64().unwrap(),
+            calibrated.maker_fills
+        );
+        let exposure: f64 = cal["distance_bins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bin| bin["exposure_secs"].as_f64().unwrap())
+            .sum();
+        assert!(exposure > 0.0, "resting quotes must accumulate exposure");
+        assert!(
+            calibrated.maker_fills > 0,
+            "fixture must exercise maker fills"
+        );
+        let attribution = calibrated.cross_market_attribution.as_ref().unwrap();
+        assert!(attribution.maker_markouts[0].marked_fills > 0);
+        for (index, hist) in cal["markout_histograms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let total: u64 = hist["counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_u64().unwrap())
+                .sum::<u64>()
+                + hist["underflow"].as_u64().unwrap()
+                + hist["overflow"].as_u64().unwrap();
+            assert_eq!(total, attribution.maker_markouts[index].marked_fills);
+        }
+
+        let mut invalid = make_cfg(true);
+        invalid.diagnose_cross_market = false;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn isolate_cooldown_cancel_churn_cuts_opposite_side_cancels_during_reentry_cooldown() {
+        let make_cfg = |isolate: bool| {
+            let mut cfg = continuous_config(40);
+            cfg.strategy.tick_size = 0.001;
+            cfg.strategy.poll_interval_ms = 250;
+            cfg.strategy.min_cycle_interval_ms = 250;
+            cfg.strategy.grid_levels = 2;
+            cfg.strategy.grid_spacing_bps = 2.0;
+            cfg.strategy.base_order_size = 0.5;
+            cfg.strategy.max_position = 5.0;
+            cfg.strategy.inventory_urgency_threshold = 2.0;
+            cfg.strategy.maker_fee_bps = 0.0;
+            cfg.strategy.min_profit_bps = 16.0;
+            cfg.strategy.max_spread_bps = 16.0;
+            cfg.strategy.order_ttl_secs = 1;
+            cfg.strategy.requote_threshold_bps = 1.0;
+            cfg.strategy.quote_hysteresis = Some(crate::config::QuoteHysteresisConfig {
+                cancel_min_profit_bps: 4.8,
+                flatten_min_profit_bps: 0.5,
+                flatten_age_start_fraction: 0.1,
+                per_side_bound_cancel: true,
+                asymmetric_entry_ratchet: true,
+                entry_requote_threshold_bps: Some(4.0),
+                adverse_retreat_threshold_bps: Some(1.0),
+                adverse_retreat_reentry_cooldown_ms: 1_500,
+                isolate_cooldown_cancel_churn: isolate,
+                ..Default::default()
+            });
+            cfg.diagnose_cross_market = true;
+            cfg.diagnose_cancel_attribution = true;
+            cfg
+        };
+        let cfg_legacy = make_cfg(false);
+        let mut drift_tape = format!(
+            "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+            cfg_legacy.start_ms
+        );
+        let mut ts = cfg_legacy.start_ms;
+        while ts < cfg_legacy.drain_until_ms {
+            let rel = ts - cfg_legacy.start_ms;
+            // Wait 10s (> 8s CALM_REQUOTE_MIN_LIFETIME) at 100.0, then dip -5.0 bps so BOTH Bids
+            // retreat (resting_orders drops 4 -> 2 < 3) into 1.5s cooldown while Ask exceeds
+            // 4.0 bps entry_requote_threshold (within cancel_bounds), then mean-revert to 99.980.
+            let mid = if rel < 10_000 {
+                100.0
+            } else if rel < 12_250 {
+                99.950
+            } else if rel < 22_000 {
+                99.980
+            } else if rel < 24_250 {
+                99.930
+            } else {
+                99.960
+            };
+            let ext = serde_json::json!({
+                "timestamp_ms": ts,
+                "bids": [[mid - 0.05, 1.0]],
+                "asks": [[mid + 0.05, 1.0]]
+            });
+            let loc = serde_json::json!({
+                "timestamp_ms": ts,
+                "bids": [[mid - 0.15, 1.0]],
+                "asks": [[mid + 0.15, 1.0]]
+            });
+            let ev = serde_json::json!({"kind":"book","at_ms":ts,"lighter":loc,"hyperliquid":ext});
+            drift_tape.push_str(&ev.to_string());
+            drift_tape.push('\n');
+            ts += 250;
+        }
+        let legacy = run_recorded_maker(cfg_legacy, drift_tape.as_bytes()).unwrap();
+        let isolated = run_recorded_maker(make_cfg(true), drift_tape.as_bytes()).unwrap();
+        let legacy_cancels = legacy
+            .cancel_attribution
+            .as_ref()
+            .unwrap()
+            .maker_cancel_requests;
+        let isolated_cancels = isolated
+            .cancel_attribution
+            .as_ref()
+            .unwrap()
+            .maker_cancel_requests;
+        let isolated_retreats = isolated
+            .cancel_attribution
+            .as_ref()
+            .unwrap()
+            .by_reason
+            .get("adverse_retreat")
+            .map_or(0, |r| r.requests);
+        assert!(
+            isolated_retreats > 0,
+            "adverse_retreat protection must remain active"
+        );
+        assert!(
+            isolated_cancels < legacy_cancels,
+            "expected isolate_cooldown_cancel_churn to cut opposite-side churn cancels ({isolated_cancels} vs legacy {legacy_cancels}); legacy={:?} isolated={:?}",
+            legacy
+                .cancel_attribution
+                .as_ref()
+                .unwrap()
+                .by_reason
+                .iter()
+                .map(|(k, v)| (*k, v.requests))
+                .collect::<Vec<_>>(),
+            isolated
+                .cancel_attribution
+                .as_ref()
+                .unwrap()
+                .by_reason
+                .iter()
+                .map(|(k, v)| (*k, v.requests))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn cancel_attribution_preserves_baseline_json_and_decomposes_reasons_and_queue_ages() {
+        let make_base_cfg = |diagnose_cancel_attribution: bool| {
+            let mut cfg = continuous_config(15);
+            cfg.strategy.grid_levels = 2;
+            cfg.strategy.base_order_size = 0.01;
+            cfg.strategy.order_ttl_secs = 2;
+            cfg.strategy.quote_hysteresis = Some(crate::config::QuoteHysteresisConfig {
+                cancel_min_profit_bps: 1.0,
+                flatten_min_profit_bps: 0.5,
+                flatten_age_start_fraction: 0.5,
+                asymmetric_entry_ratchet: true,
+                entry_requote_threshold_bps: Some(1.0),
+                adverse_retreat_threshold_bps: Some(1.0),
+                adverse_retreat_reentry_cooldown_ms: 1_500,
+                ..Default::default()
+            });
+            cfg.diagnose_cross_market = true;
+            cfg.diagnose_cancel_attribution = diagnose_cancel_attribution;
+            cfg
+        };
+
+        let base_cfg = make_base_cfg(false);
+        let input_tape = tape(&base_cfg, true);
+        let baseline = run_recorded_maker(base_cfg, input_tape.as_bytes()).unwrap();
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+        assert!(baseline_json.get("cancel_attribution").is_none());
+
+        let attributed = run_recorded_maker(make_base_cfg(true), input_tape.as_bytes()).unwrap();
+        let mut attributed_json = serde_json::to_value(&attributed).unwrap();
+        let cancel_attr = attributed_json
+            .as_object_mut()
+            .unwrap()
+            .remove("cancel_attribution")
+            .expect("cancel_attribution present when enabled");
+
+        // Enabling diagnose_cancel_attribution must leave all existing report fields 100% invariant.
+        assert_eq!(attributed_json, baseline_json);
+        let reqs = cancel_attr["maker_cancel_requests"].as_u64().unwrap();
+        assert_eq!(
+            reqs,
+            attributed
+                .cross_market_attribution
+                .as_ref()
+                .unwrap()
+                .maker_cancel_requests
+        );
+        let by_reason = cancel_attr["by_reason"].as_object().unwrap();
+        let reason_sum: u64 = by_reason
+            .values()
+            .map(|entry| entry["requests"].as_u64().unwrap())
+            .sum();
+        assert_eq!(reason_sum, reqs);
+
+        // Compare naive max_initial_placements_per_cycle=1 vs staged_reentry_only=true across a 2-level grid drift tape.
+        let make_drift_tape = |cfg: &RecordedMakerConfig| {
+            let mut out = format!(
+                "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+                cfg.start_ms
+            );
+            let mut ts = cfg.start_ms;
+            while ts < cfg.drain_until_ms {
+                let rel = ts - cfg.start_ms;
+                let cycle_rel = rel.saturating_sub(2_000) % 12_000;
+                let mid = if !(2_000..38_000).contains(&rel) {
+                    100.0
+                } else if cycle_rel < 2_500 {
+                    // Drop -4 bps to sweep Bids via AdverseRetreat into 1.5s cooldown.
+                    99.96
+                } else if cycle_rel < 6_500 {
+                    // Drift +3.5 bps during naive's 4s L1 starvation -> inverted L1 on naive!
+                    99.995
+                } else {
+                    // Pull back -2 bps -> trips AdverseRetreat (1 bp) on inverted B1 in naive!
+                    99.975
+                };
+                let ext = serde_json::json!({
+                    "timestamp_ms": ts,
+                    "bids": [[mid - 0.05, 1.0]],
+                    "asks": [[mid + 0.05, 1.0]]
+                });
+                let loc = serde_json::json!({
+                    "timestamp_ms": ts,
+                    "bids": [[mid - 0.15, 1.0]],
+                    "asks": [[mid + 0.15, 1.0]]
+                });
+                let event =
+                    serde_json::json!({"kind":"book","at_ms":ts,"lighter":loc,"hyperliquid":ext});
+                out.push_str(&event.to_string());
+                out.push('\n');
+                ts += 250;
+            }
+            out
+        };
+
+        let make_drift_cfg = |staged_reentry_only: bool| {
+            let mut cfg = continuous_config(42);
+            cfg.strategy.poll_interval_ms = 250;
+            cfg.strategy.min_cycle_interval_ms = 250;
+            cfg.strategy.grid_levels = 2;
+            cfg.strategy.grid_spacing_bps = 2.0;
+            cfg.strategy.base_order_size = 0.5;
+            cfg.strategy.max_position = 5.0;
+            cfg.strategy.inventory_urgency_threshold = 2.0;
+            cfg.strategy.min_profit_bps = 16.0;
+            cfg.strategy.order_ttl_secs = 25;
+            cfg.strategy.quote_hysteresis = Some(crate::config::QuoteHysteresisConfig {
+                cancel_min_profit_bps: 4.8,
+                flatten_min_profit_bps: 0.5,
+                flatten_age_start_fraction: 0.1,
+                per_side_bound_cancel: true,
+                asymmetric_entry_ratchet: true,
+                entry_requote_threshold_bps: Some(4.0),
+                adverse_retreat_threshold_bps: Some(1.0),
+                adverse_retreat_reentry_cooldown_ms: 1_500,
+                max_initial_placements_per_cycle: Some(1),
+                staged_reentry_only,
+                ..Default::default()
+            });
+            cfg.diagnose_cancel_attribution = true;
+            cfg
+        };
+
+        let naive_cfg = make_drift_cfg(false);
+        let drift_tape = make_drift_tape(&naive_cfg);
+        let naive_rep = run_recorded_maker(naive_cfg, drift_tape.as_bytes()).unwrap();
+        let fixed_rep = run_recorded_maker(make_drift_cfg(true), drift_tape.as_bytes()).unwrap();
+        let naive_cancels = naive_rep
+            .cancel_attribution
+            .as_ref()
+            .unwrap()
+            .maker_cancel_requests;
+        let fixed_cancels = fixed_rep
+            .cancel_attribution
+            .as_ref()
+            .unwrap()
+            .maker_cancel_requests;
+        assert!(
+            fixed_cancels < naive_cancels,
+            "staged_reentry_only should cut naive limit cancel churn ({fixed_cancels} vs {naive_cancels})"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probabilistic_queue_avoids_trade_double_count_and_recovers_touch_fills() {
+        let setup_matching = |queue_model: Option<ProbabilisticQueueConfig>| {
+            let mut cfg = config();
+            cfg.end_ms = START + 5_000;
+            cfg.drain_until_ms = cfg.end_ms + 2_000;
+            cfg.order_entry_ms = 50;
+            cfg.venue_maker_delay_ms = 0;
+            cfg.venue_cancel_delay_ms = 50;
+            cfg.order_response_ms = 0;
+            cfg.trade_clock_guard_ms = 5;
+            cfg.trade_delivery_grace_ms = 80;
+            cfg.queue_model = queue_model;
+            cfg
+        };
+
+        let run_scenario = |qm: Option<ProbabilisticQueueConfig>, book_first: bool| async move {
+            let _clock = ReplayClock::open(START, false);
+            let cfg = setup_matching(qm);
+            let tracker = Arc::new(OrderTracker::new());
+            let mut sim =
+                SimVenue::for_symbol(Arc::clone(&tracker), crate::config::SYM_BTC, 0.0, 4.0);
+            sim.recorded = Some(Matching::new(&cfg));
+            let sim = Arc::new(sim);
+            let matching = sim.recorded.as_ref().unwrap();
+
+            // 1. Initial book: 1.0 BTC resting at best bid 99.0.
+            matching.on_book(Book {
+                timestamp_ms: START,
+                bids: vec![[99.0, 1.0]],
+                asks: vec![[101.0, 1.0]],
+            });
+            // Admit buy order of 0.1 BTC @ 99.0 (`order_entry_ms = 50` -> activated at START + 50).
+            matching
+                .execute(
+                    &sim,
+                    vec![BatchAction::Place(OrderParams {
+                        side: Side::Buy,
+                        price: 99.0,
+                        size: 0.1,
+                        order_type: OrderType::PostOnly,
+                        reduce_only: false,
+                    })],
+                )
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            matching.on_book(Book {
+                timestamp_ms: now_ms(),
+                bids: vec![[99.0, 1.0]],
+                asks: vec![[101.0, 1.0]],
+            });
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let trade_source = now_ms() - 5;
+            if !book_first {
+                matching
+                    .on_trade(&sim, now_ms(), trade_source, 99.0, 0.30, false)
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            matching.on_book(Book {
+                timestamp_ms: now_ms(),
+                bids: vec![[99.0, 0.70]],
+                asks: vec![[101.0, 1.0]],
+            });
+            if book_first {
+                matching
+                    .on_trade(&sim, now_ms(), trade_source, 99.0, 0.30, false)
+                    .unwrap();
+            }
+            let expected = qm.map_or(1.0, |model| model.initial_ahead_fraction) - 0.30;
+            assert!(
+                (matching.market.lock().queue.values().next().unwrap().ahead - expected).abs()
+                    < 1e-9
+            );
+            let after_trade_drop_events = matching
+                .market
+                .lock()
+                .queue_model_report
+                .map_or(0, |r| r.cancel_depletion_events);
+            assert_eq!(
+                after_trade_drop_events, 0,
+                "trade-driven book drop must not trigger cancel depletion"
+            );
+
+            // 3. New liquidity joins behind us (+0.40 -> 1.10 at +250ms), then 0.65 cancels out (-> 0.45 at +300ms).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            matching.on_book(Book {
+                timestamp_ms: now_ms(),
+                bids: vec![[99.0, 1.10]],
+                asks: vec![[101.0, 1.0]],
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            matching.on_book(Book {
+                timestamp_ms: now_ms(),
+                bids: vec![[99.0, 0.45]],
+                asks: vec![[101.0, 1.0]],
+            });
+            // All possible prints from the 0.65 reduction have now arrived.
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            matching.on_book(Book {
+                timestamp_ms: now_ms(),
+                bids: vec![[99.0, 0.45]],
+                asks: vec![[101.0, 1.0]],
+            });
+            let ahead_before_touch = matching.market.lock().queue.values().next().unwrap().ahead;
+
+            // 4. Touch trade of 0.45 BTC @ 99.0 at +450ms (enough to exhaust probabilistic ahead <= 0.45,
+            //    but NOT enough for Conservative ahead = 0.70!).
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            matching
+                .on_trade(&sim, now_ms(), now_ms() - 5, 99.0, 0.45, false)
+                .unwrap();
+            let pos = sim.net_position();
+            let report = matching.market.lock().queue_model_report;
+            (ahead_before_touch, pos, report)
+        };
+
+        let (cons_ahead, cons_pos, cons_rep) = run_scenario(None, false).await;
+        assert!(cons_rep.is_none());
+        assert!((cons_ahead - 0.70).abs() < 1e-9);
+        assert!((cons_pos - 0.0).abs() < 1e-9);
+
+        let (p1_ahead, p1_pos, p1_rep) = run_scenario(
+            Some(ProbabilisticQueueConfig {
+                initial_ahead_fraction: 1.0,
+                cancel_progress_power: 1.0,
+            }),
+            false,
+        )
+        .await;
+        let p1_rep = p1_rep.expect("probabilistic queue report");
+        assert!(p1_rep.cancel_depletion_events >= 1);
+        assert!(
+            p1_ahead < 0.35,
+            "expected depleted ahead < 0.35, got {p1_ahead}"
+        );
+        assert!(
+            (p1_pos - 0.1).abs() < 1e-9,
+            "touch fill should succeed: {p1_pos}"
+        );
+
+        let (reordered_ahead, reordered_pos, reordered_report) = run_scenario(
+            Some(ProbabilisticQueueConfig {
+                initial_ahead_fraction: 1.0,
+                cancel_progress_power: 1.0,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!((reordered_ahead, reordered_pos), (p1_ahead, p1_pos));
+        assert_eq!(
+            reordered_report.unwrap().cancel_depleted_ahead_base,
+            p1_rep.cancel_depleted_ahead_base
+        );
+
+        // Under power=3.0 (tail-heavy cancellations when x > 0.5: x=0.7/1.1=0.636 -> p(x) > x),
+        // even more tail-front cancellation or ordering differs monotonically from power=1.0!
+        let (p3_ahead, p3_pos, p3_rep) = run_scenario(
+            Some(ProbabilisticQueueConfig {
+                initial_ahead_fraction: 0.5,
+                cancel_progress_power: 3.0,
+            }),
+            false,
+        )
+        .await;
+        assert!(p3_rep.unwrap().cancel_depletion_events >= 1);
+        assert!(p3_ahead < p1_ahead);
+        assert!((p3_pos - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn pre_activation_sweep_through_print_is_not_credited_as_cancellation() {
+        let _clock = ReplayClock::open(START, false);
+        let mut cfg = config();
+        cfg.end_ms = START + 5_000;
+        cfg.drain_until_ms = cfg.end_ms + 2_000;
+        cfg.order_entry_ms = 120;
+        cfg.venue_maker_delay_ms = 0;
+        cfg.venue_cancel_delay_ms = 50;
+        cfg.order_response_ms = 0;
+        cfg.trade_clock_guard_ms = 10;
+        cfg.trade_delivery_grace_ms = 80;
+        cfg.queue_model = Some(ProbabilisticQueueConfig {
+            initial_ahead_fraction: 1.0,
+            cancel_progress_power: 1.0,
+        });
+        let tracker = Arc::new(OrderTracker::new());
+        let mut sim = SimVenue::for_symbol(Arc::clone(&tracker), crate::config::SYM_BTC, 0.0, 4.0);
+        sim.recorded = Some(Matching::new(&cfg));
+        let sim = Arc::new(sim);
+        let matching = sim.recorded.as_ref().unwrap();
+
+        // Book has 1.0 BTC @ 99.0 and 1.0 BTC @ 98.0 below it so level 99.0 stays visible when 0.
+        matching.on_book(Book {
+            timestamp_ms: START,
+            bids: vec![[99.0, 1.0], [98.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        matching
+            .execute(
+                &sim,
+                vec![BatchAction::Place(OrderParams {
+                    side: Side::Buy,
+                    price: 99.0,
+                    size: 0.1,
+                    order_type: OrderType::PostOnly,
+                    reduce_only: false,
+                })],
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[99.0, 1.0], [98.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+
+        // Pre-activation aggressive sweep print at 98.5 clears 99.0 without a separate 99.0 print.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let sweep_src = now_ms() - 2;
+        matching
+            .on_trade(&sim, now_ms(), sweep_src, 98.5, 1.0, false)
+            .unwrap();
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[98.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+
+        // Wait past clock_guard + trade_delivery_grace + 100ms, then restore 99.0 liquidity.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        matching.on_book(Book {
+            timestamp_ms: now_ms(),
+            bids: vec![[98.0, 1.0]],
+            asks: vec![[101.0, 1.0]],
+        });
+        let report = matching.market.lock().queue_model_report.unwrap();
+        assert_eq!(
+            report.cancel_depletion_events, 0,
+            "pre-activation sweep-through print must not credit a cancellation"
+        );
     }
 }

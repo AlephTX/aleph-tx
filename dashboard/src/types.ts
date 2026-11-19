@@ -145,7 +145,7 @@ export type Freshness = 'observed' | 'historical' | 'unknown' | 'clock_mismatch'
  * so an age is a best estimate, not proof the hosts are synchronized. */
 export interface Mark {
   price: number | null
-  /** external_median · lighter_book · lighter_depth · unknown (legacy). */
+  /** external_median · lighter_{book,depth,touch_micro} · local_{book,depth,touch_micro} · unknown (legacy). */
   source: string | null
   /** When the snapshot record was written; not when the price was observed. */
   snapshot_ms: number | null
@@ -204,6 +204,8 @@ export interface Snapshot {
   markout_missed?: number | null
   markout_last_delay_ms?: number | null
   markout_ewma_bps?: number | null
+  volume_quota_remaining?: number | null
+  defense_regime?: string | null
 }
 
 export interface Window {

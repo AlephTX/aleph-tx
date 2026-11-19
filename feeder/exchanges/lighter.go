@@ -90,31 +90,41 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 	defer c.CloseNow()
 	c.SetReadLimit(1 << 20) // 1MB — initial snapshot is large
 
-	log.Printf("lighter: connected to %s", l.cfg.WSURL)
+	log.Printf("%s: connected to %s", l.loopName, l.cfg.WSURL)
+
+	channels := make([]string, 0, len(l.mktMap))
+	for mktIdx := range l.mktMap {
+		channels = append(channels, fmt.Sprintf("order_book/%d", mktIdx))
+	}
+	guard := newSubscriptionGuard(ctx, "order_book", channels, subscriptionTimeout)
+	defer guard.cancel()
 
 	// Subscribe to configured markets
 	for mktIdx := range l.mktMap {
 		sub := fmt.Sprintf(`{"type":"subscribe","channel":"order_book/%d"}`, mktIdx)
-		if err := c.Write(ctx, websocket.MessageText, []byte(sub)); err != nil {
+		if err := c.Write(guard.ctx, websocket.MessageText, []byte(sub)); err != nil {
 			return fmt.Errorf("subscribe market %d: %w", mktIdx, err)
 		}
-		log.Printf("lighter: subscribed to market %d", mktIdx)
+		log.Printf("%s: subscribed to market %d", l.loopName, mktIdx)
 	}
 
 	// Reconnection always starts from a fresh snapshot. Never reuse a book
 	// across a disconnect, during which arbitrary deltas may have been lost.
 	books := make(map[int]*lighterBook, len(l.mktMap))
-	stopKeepalive := wsutil.StartKeepalive(ctx, "lighter-public", c, 15*time.Second, nil)
+	stopKeepalive := wsutil.StartKeepalive(ctx, l.loopName, c, 15*time.Second, nil)
 	defer stopKeepalive()
 
 	for {
-		_, data, err := c.Read(ctx)
+		_, data, err := c.Read(guard.readContext(ctx))
 		if err != nil {
 			return err
 		}
 
 		// Zero-copy JSON parsing with gjson
 		result := gjson.ParseBytes(data)
+		if err := guard.observe(result); err != nil {
+			return err
+		}
 		msgType := result.Get("type").String()
 		channel := result.Get("channel").String()
 
@@ -159,7 +169,8 @@ func (l *Lighter) connectPublic(ctx context.Context) error {
 			tsMs = book.lastUpdatedAt / 1000
 		}
 		if tsMs <= 0 {
-			tsMs = time.Now().UnixMilli()
+			l.invalidateBook(symID)
+			return fmt.Errorf("market %d: missing exchange book timestamp", mktIdx)
 		}
 		if tsMs > time.Now().Add(time.Second).UnixMilli() {
 			return fmt.Errorf("market %d: future book timestamp", mktIdx)

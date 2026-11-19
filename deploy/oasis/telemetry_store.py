@@ -98,7 +98,25 @@ MARK_MIGRATIONS = (("mark_source", "TEXT"), ("mark_sampled_ms", "INTEGER"),
 # Legacy snapshots have no evidence of the persisted daily loss budget.
 DAILY_LOSS_MIGRATIONS = (("daily_loss_day_start_ms", "INTEGER"),
                          ("daily_loss_start_equity", "REAL"), ("daily_loss_limit_pct", "REAL"))
-MARK_SOURCES = ("external_median", "lighter_book", "lighter_depth")
+GUARD_MIGRATIONS = (("volume_quota_remaining", "INTEGER"), ("defense_regime", "TEXT"))
+DEFENSE_REGIMES = (
+    "normal",
+    "caution",
+    "side_defense_buy",
+    "side_defense_sell",
+    "side_defense_both",
+    "reduce_only",
+    "halt",
+)
+MARK_SOURCES = (
+    "external_median",
+    "lighter_book",
+    "lighter_depth",
+    "lighter_touch_micro",
+    "local_book",
+    "local_depth",
+    "local_touch_micro",
+)
 # Columns added after the first release; created on demand for old databases.
 SESSION_MIGRATIONS = (("hedge_position", "REAL NOT NULL DEFAULT 0"),
                       ("hedge_avg_cost", "REAL NOT NULL DEFAULT 0"),
@@ -186,7 +204,8 @@ class TelemetryStore:
         for name, ddl in SESSION_MIGRATIONS:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
-        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS),
+        for table, migrations in (("snapshots", SNAPSHOT_MIGRATIONS + MARK_MIGRATIONS
+                                   + DAILY_LOSS_MIGRATIONS + GUARD_MIGRATIONS),
                                   ("hedge_fills", HEDGE_FILL_MIGRATIONS),
                                   ("fills", FILL_MIGRATIONS)):
             columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
@@ -280,8 +299,12 @@ class TelemetryStore:
             values += [integer(record.get("daily_loss_day_start_ms"), None),
                        finite(record.get("daily_loss_start_equity"), None),
                        finite(record.get("daily_loss_limit_pct"), None)]
+            raw_quota = record.get("volume_quota_remaining")
+            quota = None if isinstance(raw_quota, bool) else integer(raw_quota, None)
+            defense = record.get("defense_regime")
+            values += [quota, defense if defense in DEFENSE_REGIMES else None]
             fields = (*SNAPSHOT_FIELDS, *extra,
-                      *(name for name, _ in MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS))
+                      *(name for name, _ in MARK_MIGRATIONS + DAILY_LOSS_MIGRATIONS + GUARD_MIGRATIONS))
             self.db.execute(f"INSERT OR REPLACE INTO snapshots (session_id, ts_ms, {', '.join(fields)})"
                             f" VALUES (?,?{',?' * len(fields)})", (sid, ts, *values))
         elif kind == "stopped":
@@ -402,13 +425,24 @@ class TelemetryStore:
         row = self.db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         return dict(row) if row else None
 
+    def _enrich_session(self, session, now_ms):
+        snapshot = self.latest_snapshot(session["session_id"])
+        open_orders = self.db.execute(
+            "SELECT count(*) FROM orders WHERE session_id=? AND status IN ('open','partial')",
+            (session["session_id"],),
+        ).fetchone()[0]
+        enriched = {
+            **session,
+            **self._session_pnl(session, snapshot, now_ms),
+            "open_orders": open_orders,
+        }
+        return enriched, snapshot
+
     @locked
-    def sessions(self, limit=50):
+    def sessions(self, limit=50, now_ms=None):
+        now_ms = now_ms or int(time.time() * 1000)
         rows = self._rows("SELECT * FROM sessions ORDER BY started_ms DESC LIMIT ?", (limit,))
-        for row in rows:
-            row["net_pnl"] = row["realized"] - row["fees"]
-            row["hedge_net_pnl"] = row["hedge_realized"] - row["hedge_fees"]
-        return rows
+        return [self._enrich_session(row, now_ms)[0] for row in rows]
 
     @locked
     def latest_snapshot(self, session_id):
@@ -587,13 +621,7 @@ class TelemetryStore:
             session = self.session(session_id)
             if session is None:
                 raise ValueError("unknown session")
-        snapshot = self.latest_snapshot(session["session_id"]) if session else None
-        current = None
-        if session:
-            current = {**session, **self._session_pnl(session, snapshot, now_ms),
-                       "open_orders": self.db.execute(
-                           "SELECT count(*) FROM orders WHERE session_id=? AND status IN ('open','partial')",
-                           (session["session_id"],)).fetchone()[0]}
+        current, snapshot = (None, None) if not session else self._enrich_session(session, now_ms)
         return {"session": current, "snapshot": snapshot,
                 "windows": {"today": self._window(day_start, session_id=session_id),
                             "24h": self._window(now_ms - 86_400_000, session_id=session_id),

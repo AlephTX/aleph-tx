@@ -310,6 +310,10 @@ pub struct InventoryNeutralMMConfig {
     pub inventory_urgency_threshold: f64, // default: 0.08
     #[serde(default)]
     pub base_order_notional_usd: f64, // optional: quote in USD notional instead of base units
+    /// Round USD-derived `base_order_size` to the nearest `step_size` instead of flooring,
+    /// avoiding systematic under-sizing on coarse-step assets (e.g. BTC 0.0001 lots at $500).
+    #[serde(default)]
+    pub round_base_notional_nearest: bool,
     #[serde(default)]
     pub max_position_notional_usd: f64, // optional: max inventory in USD notional
     #[serde(default)]
@@ -450,9 +454,158 @@ pub struct InventoryNeutralMMConfig {
     /// Exponential decay half-life (ms) for `self_fill_alpha_bps` (`>= 50` when enabled).
     #[serde(default = "default_self_fill_half_life_ms")]
     pub self_fill_half_life_ms: u64,
+    /// Production+replay local fair value pricing policy when external references are absent/disabled.
+    #[serde(default)]
+    pub local_fair_value_config: Option<LocalFairValueConfig>,
+    /// Local BBO order-flow imbalance, cancel speed-bump option reserve, and local markout gating.
+    #[serde(default)]
+    pub local_toxicity: Option<LocalToxicityConfig>,
+    /// Minimum reported venue volume quota before halting new inventory-adding quotes (`OPT-05`).
+    #[serde(default)]
+    pub min_volume_quota_for_quoting: Option<i64>,
+    /// Maximum entry deviation (bps) from fair mid enforced pre-nonce at execution boundary (`§7.E`).
+    #[serde(default)]
+    pub max_order_price_band_bps: Option<f64>,
+    /// Deterministic 5-state defense escalation state machine (`OPT-07`).
+    #[serde(default)]
+    pub defense_policy: Option<DefensePolicyConfig>,
+    /// Optional notional USD unit (`q * mid / unit_usd`) normalizing A-S inventory term across assets (`VMM-07`).
+    #[serde(default)]
+    pub as_inventory_notional_usd: Option<f64>,
+    /// Optional gap duration (seconds) after which `TimeScaledVolatility` resets prior variance (`VMM-07`).
+    #[serde(default)]
+    pub vol_gap_reset_secs: Option<u64>,
+    /// Scale cold-start per-sample `vol_bps` by `1 / sqrt(poll_interval_secs)` (`VMM-07`).
+    #[serde(default)]
+    pub normalize_cold_start_sigma_by_poll: bool,
+    /// Do not let `target_resting_margin_utilization` inflate `base_order_size` above the
+    /// configured `base_order_size` / `base_order_notional_usd` budget (`S7-2`).
+    #[serde(default)]
+    pub cap_utilization_floor_to_base_notional: bool,
+    /// Optional causal cap `(0.0, 5.0]` on inventory-adding top-level order size as a
+    /// fraction of fresh local L1 touch notional (`S7-2`).
+    #[serde(default)]
+    pub max_top_book_depth_fraction: Option<f64>,
+    /// Optional target A-S reservation shift (bps) at `max_position` (`S9-2`).
+    /// Derives `gamma_inv = (budget_bps / 1e4) / (sigma^2 * T * max_pos_for_as)` cleanly
+    /// while leaving `as_gamma / as_kappa` decoupled for spread computation.
+    #[serde(default)]
+    pub as_risk_budget_bps_at_max_pos: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+fn default_defense_caution_size_scale() -> f64 {
+    0.5
+}
+
+fn default_defense_cooldown_ms() -> u64 {
+    3_000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefensePolicyConfig {
+    /// Local BBO spread (bps) entering `Caution` regime.
+    pub caution_spread_bps: f64,
+    /// Extra additive reserve (bps) on inventory-adding sides during `Caution`.
+    #[serde(default)]
+    pub caution_widen_bps: f64,
+    /// Multiplier in `(0.05, 1.0]` applied to inventory-adding sizes during `Caution`.
+    #[serde(default = "default_defense_caution_size_scale")]
+    pub caution_size_scale: f64,
+    /// Causal short-horizon EMA momentum magnitude (bps) entering `SideDefense`.
+    pub side_defense_momentum_bps: f64,
+    /// Local BBO spread (bps) entering two-sided `ReduceOnly` (zero new entries).
+    pub reduce_only_spread_bps: f64,
+    /// Extreme local BBO spread (bps) entering `Halt` (immediate `cancel_all_orders`).
+    pub halt_spread_bps: f64,
+    /// Minimum calm hold duration (ms) before stepping down from defensive states.
+    #[serde(default = "default_defense_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalFairValueMode {
+    Mid,
+    TouchMicro,
+    DepthMicro,
+}
+
+fn default_local_fair_value_max_shift_bps() -> f64 {
+    2.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalFairValueConfig {
+    pub mode: LocalFairValueMode,
+    #[serde(default = "default_local_fair_value_max_shift_bps")]
+    pub max_shift_bps: f64,
+}
+
+fn default_cancel_option_mult() -> f64 {
+    0.4
+}
+
+fn default_cancel_option_max_bps() -> f64 {
+    10.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalToxicityConfig {
+    /// Half-life (ms) for Cont-Kukanov-Stoikov BBO order-flow imbalance (`0` disables local OFI).
+    #[serde(default)]
+    pub ofi_half_life_ms: u64,
+    /// Max directional widening (bps) on the inventory-adding side driven by local OFI.
+    #[serde(default)]
+    pub ofi_max_widen_bps: f64,
+    /// Venue + wire cancel latency (ms, e.g. `310` on Lighter Standard) priced as lookback option reserve.
+    #[serde(default)]
+    pub cancel_speed_bump_ms: u64,
+    /// Multiplier on `sigma_per_sqrt_sec * sqrt(cancel_speed_bump_ms / 1000)`.
+    #[serde(default = "default_cancel_option_mult")]
+    pub cancel_option_mult: f64,
+    /// Maximum reserve (bps) added by the cancel-speed-bump option term.
+    #[serde(default = "default_cancel_option_max_bps")]
+    pub cancel_option_max_bps: f64,
+    /// Mark passive fills against local size-weighted microprice when external fair value is inactive.
+    #[serde(default)]
+    pub enable_local_markout: bool,
+    /// Withdraw (`size = 0`) only the vulnerable inventory-adding side when normalized
+    /// local BBO OFI (`[-1, 1]`) reaches or exceeds this magnitude.
+    #[serde(default)]
+    pub ofi_withdraw_threshold: Option<f64>,
+    /// Pause (`size = 0`) inventory-adding sides when short-horizon local volatility
+    /// `vol_bps` reaches or exceeds this cap, while preserving inventory-reducing quotes.
+    #[serde(default)]
+    pub vol_pause_bps: Option<f64>,
+    /// Minimum hold duration (ms) after `LocalToxicityConfig` withdraws an entry side.
+    #[serde(default)]
+    pub withdraw_cooldown_ms: u64,
+    /// Schmitt-trigger unlatch fraction `(0, 1]` relative to withdraw thresholds.
+    #[serde(default)]
+    pub withdraw_clear_ratio: Option<f64>,
+}
+
+impl Default for LocalToxicityConfig {
+    fn default() -> Self {
+        Self {
+            ofi_half_life_ms: 0,
+            ofi_max_widen_bps: 0.0,
+            cancel_speed_bump_ms: 0,
+            cancel_option_mult: default_cancel_option_mult(),
+            cancel_option_max_bps: default_cancel_option_max_bps(),
+            enable_local_markout: false,
+            ofi_withdraw_threshold: None,
+            vol_pause_bps: None,
+            withdraw_cooldown_ms: 0,
+            withdraw_clear_ratio: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuoteHysteresisConfig {
     pub cancel_min_profit_bps: f64,
@@ -468,6 +621,18 @@ pub struct QuoteHysteresisConfig {
     /// Optional tighter price tolerance (bps) for re-anchoring reducing quotes.
     #[serde(default)]
     pub reducing_requote_threshold_bps: Option<f64>,
+    /// Optional wider price tolerance (bps) for non-reducing entry orders inside `cancel_bounds`
+    /// to preserve FIFO queue priority across sub-second BBO updates.
+    #[serde(default)]
+    pub entry_requote_threshold_bps: Option<f64>,
+    /// Hold FIFO queue on benign/tightening drift within `entry_requote_threshold_bps`
+    /// (without `calm_mode` 2x inflation), while retreating immediately at age 0 on
+    /// adverse drift beyond `adverse_retreat_threshold_bps`.
+    #[serde(default)]
+    pub asymmetric_entry_ratchet: bool,
+    /// Optional adverse-move price tolerance (bps) before immediately pulling an entry quote.
+    #[serde(default)]
+    pub adverse_retreat_threshold_bps: Option<f64>,
     /// Activate passive flattening immediately for any confirmed inventory >= step_size.
     #[serde(default)]
     pub zero_deadband_flatten: bool,
@@ -485,6 +650,35 @@ pub struct QuoteHysteresisConfig {
     /// `max(pricing_mid, local_mid)` on asks so entries require edge against both books.
     #[serde(default)]
     pub conservative_dual_anchor: bool,
+    /// Fraction `[0, 1)` of `position_timeout_secs` at which reducing quotes chase passive BBO touch.
+    #[serde(default)]
+    pub passive_touch_flatten_age_fraction: Option<f64>,
+    /// Cooldown (ms) holding an entry side out after `adverse_retreat` triggers a forced cancel.
+    #[serde(default)]
+    pub adverse_retreat_reentry_cooldown_ms: u64,
+    /// When `true`, suppress normal age/threshold cancellations on resting entry levels inside
+    /// `cancel_bounds` & `adverse_retreat` bounds while re-entry cooldown is active (`S6-2`).
+    #[serde(default)]
+    pub cooldown_hold_safe_levels: bool,
+    /// Optional cap on how many entry grid levels may be placed in a single cycle when
+    /// replenishing from cooldown/flat (`1..=5`, `S6-2`).
+    #[serde(default)]
+    pub max_initial_placements_per_cycle: Option<usize>,
+    /// When `true` alongside `max_initial_placements_per_cycle`, stage only initial entry
+    /// from an empty side, exempt pure deeper grid fill-in (`to_cancel.is_empty()`) from
+    /// 4s `MICRO_REFRESH_COOLDOWN` starvation, and prevent deeper fill-in from bypassing
+    /// opposite-side cancel-deferral guards (`S7-2`).
+    #[serde(default)]
+    pub staged_reentry_only: bool,
+    /// When `true`, enforce `reduce_only = true` + closable exposure cap on ANY confirmed
+    /// inventory-reducing grid, preventing baseline non-`exit_touch` zero-crossing fills (`S7-2`).
+    #[serde(default)]
+    pub enforce_reduce_only_on_reducing_side: bool,
+    /// When `true`, prevent one-sided adverse retreats, active re-entry cooldowns, and
+    /// empty-side post-cooldown re-entries from disabling churn-deferral guards on the
+    /// surviving opposite side (never suppresses safety/bound-breach/adverse-retreat cancels, `S12-1`).
+    #[serde(default)]
+    pub isolate_cooldown_cancel_churn: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -493,6 +687,10 @@ pub struct MarkoutReserveConfig {
     pub max_widen_bps: f64,
     pub close_cost_bps: f64,
     pub max_sample_age_ms: u64,
+    /// Optional empirical adverse markout quantile `p in (0.0, 0.5]` across `[1s, 5s, 30s, 60s]`
+    /// enforcing a hard quote-distance floor on non-reducing entries (`S9-2`).
+    #[serde(default)]
+    pub quantile_floor_p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -660,7 +858,10 @@ impl InventoryNeutralMMConfig {
                 reserve.max_widen_bps > 0.0
                     && reserve.max_widen_bps <= self.max_spread_bps
                     && (0.0..=10_000.0).contains(&reserve.close_cost_bps)
-                    && reserve.max_sample_age_ms > 0,
+                    && reserve.max_sample_age_ms > 0
+                    && reserve
+                        .quantile_floor_p
+                        .is_none_or(|p| p.is_finite() && p > 0.0 && p <= 0.5),
                 "{name}: invalid directional markout reserve"
             );
         }
@@ -711,6 +912,19 @@ impl InventoryNeutralMMConfig {
                         .is_none_or(|bps| bps.is_finite()
                             && bps > 0.0
                             && bps <= self.max_spread_bps)
+                    && hysteresis
+                        .entry_requote_threshold_bps
+                        .is_none_or(|bps| bps.is_finite()
+                            && bps > 0.0
+                            && bps <= self.max_spread_bps)
+                    && hysteresis
+                        .adverse_retreat_threshold_bps
+                        .is_none_or(|bps| bps.is_finite()
+                            && bps > 0.0
+                            && bps <= self.max_spread_bps)
+                    && (!hysteresis.asymmetric_entry_ratchet
+                        || hysteresis.entry_requote_threshold_bps.is_some()
+                        || hysteresis.adverse_retreat_threshold_bps.is_some())
                     && hysteresis.breakeven_exit_bps.is_none_or(
                         |bps| bps.is_finite() && (-100.0..=self.max_spread_bps).contains(&bps)
                     )
@@ -719,9 +933,55 @@ impl InventoryNeutralMMConfig {
                     && hysteresis
                         .max_local_momentum_bps
                         .is_none_or(|bps| bps.is_finite() && (0.1..=1_000.0).contains(&bps))
+                    && hysteresis
+                        .passive_touch_flatten_age_fraction
+                        .is_none_or(|f| f.is_finite() && (0.0..1.0).contains(&f))
+                    && hysteresis.adverse_retreat_reentry_cooldown_ms <= 60_000
+                    && hysteresis
+                        .max_initial_placements_per_cycle
+                        .is_none_or(|n| (1..=5).contains(&n))
+                    && (!hysteresis.staged_reentry_only
+                        || hysteresis.max_initial_placements_per_cycle.is_some())
                     && 2.0 * self.maker_fee_bps + hysteresis.cancel_min_profit_bps >= 0.0
                     && 2.0 * self.maker_fee_bps + hysteresis.flatten_min_profit_bps >= 0.0,
                 "{name}: invalid quote hysteresis"
+            );
+        }
+        if let Some(local_fv) = self.local_fair_value_config {
+            anyhow::ensure!(
+                local_fv.max_shift_bps.is_finite()
+                    && local_fv.max_shift_bps > 0.0
+                    && local_fv.max_shift_bps <= self.max_spread_bps,
+                "{name}: invalid local fair value config"
+            );
+        }
+        if let Some(tox) = self.local_toxicity {
+            nonnegative(
+                name,
+                &[
+                    tox.ofi_max_widen_bps,
+                    tox.cancel_option_mult,
+                    tox.cancel_option_max_bps,
+                ],
+            )?;
+            anyhow::ensure!(
+                tox.ofi_max_widen_bps <= self.max_spread_bps
+                    && ((tox.ofi_max_widen_bps == 0.0 && tox.ofi_withdraw_threshold.is_none())
+                        || (10..=60_000).contains(&tox.ofi_half_life_ms))
+                    && tox
+                        .ofi_withdraw_threshold
+                        .is_none_or(|t| t.is_finite() && t > 0.0 && t <= 1.0)
+                    && tox
+                        .vol_pause_bps
+                        .is_none_or(|v| v.is_finite() && (0.1..=1_000.0).contains(&v))
+                    && tox.withdraw_cooldown_ms <= 60_000
+                    && tox
+                        .withdraw_clear_ratio
+                        .is_none_or(|r| r.is_finite() && r > 0.0 && r <= 1.0)
+                    && tox.cancel_speed_bump_ms <= 5_000
+                    && (tox.cancel_speed_bump_ms == 0 || tox.cancel_option_max_bps > 0.0)
+                    && tox.cancel_option_max_bps <= self.max_spread_bps,
+                "{name}: invalid local toxicity config"
             );
         }
         anyhow::ensure!(
@@ -776,13 +1036,70 @@ impl InventoryNeutralMMConfig {
                 "{name}: maintenance_margin_fraction must be in (0.0, 0.5) with mmf * safety_multiple < 1.0"
             );
         }
+        if let Some(min_q) = self.min_volume_quota_for_quoting {
+            anyhow::ensure!(
+                min_q > 0,
+                "{name}: min_volume_quota_for_quoting must be positive"
+            );
+        }
+        if let Some(band_bps) = self.max_order_price_band_bps {
+            anyhow::ensure!(
+                band_bps.is_finite() && (5.0..=2_000.0).contains(&band_bps),
+                "{name}: max_order_price_band_bps must be in [5.0, 2000.0]"
+            );
+        }
+        if let Some(frac) = self.max_top_book_depth_fraction {
+            anyhow::ensure!(
+                frac.is_finite() && frac > 0.0 && frac <= 5.0,
+                "{name}: max_top_book_depth_fraction must be in (0.0, 5.0]"
+            );
+        }
+        if let Some(budget_bps) = self.as_risk_budget_bps_at_max_pos {
+            anyhow::ensure!(
+                budget_bps.is_finite() && budget_bps > 0.0 && budget_bps <= 500.0,
+                "{name}: as_risk_budget_bps_at_max_pos must be in (0.0, 500.0]"
+            );
+        }
+        if let Some(def) = self.defense_policy {
+            anyhow::ensure!(
+                def.caution_spread_bps.is_finite()
+                    && def.reduce_only_spread_bps.is_finite()
+                    && def.halt_spread_bps.is_finite()
+                    && def.caution_widen_bps.is_finite()
+                    && def.caution_size_scale.is_finite()
+                    && def.side_defense_momentum_bps.is_finite()
+                    && def.caution_spread_bps > 0.0
+                    && def.caution_spread_bps <= def.reduce_only_spread_bps
+                    && def.reduce_only_spread_bps <= def.halt_spread_bps
+                    && def.halt_spread_bps <= 5_000.0
+                    && def.caution_widen_bps >= 0.0
+                    && def.caution_widen_bps <= self.max_spread_bps
+                    && (0.05..=1.0).contains(&def.caution_size_scale)
+                    && (0.1..=1_000.0).contains(&def.side_defense_momentum_bps)
+                    && (100..=300_000).contains(&def.cooldown_ms),
+                "{name}: invalid defense_policy"
+            );
+        }
+        if let Some(unit_usd) = self.as_inventory_notional_usd {
+            anyhow::ensure!(
+                unit_usd.is_finite() && (1.0..=10_000_000.0).contains(&unit_usd),
+                "{name}: as_inventory_notional_usd must be in [1.0, 10_000_000.0]"
+            );
+        }
+        if let Some(reset_secs) = self.vol_gap_reset_secs {
+            anyhow::ensure!(
+                (10..=86_400).contains(&reset_secs),
+                "{name}: vol_gap_reset_secs must be in [10, 86400]"
+            );
+        }
+        let max_exch = crate::shm_reader::NUM_EXCHANGES as u8;
         anyhow::ensure!(
-            (self.exchange_id == EXCH_LIGHTER || self.exchange_id == EXCH_LIGHTER_ROBINHOOD)
+            (1..max_exch).contains(&self.exchange_id)
                 && (1..MAX_SYMBOL_ID).contains(&self.symbol_id),
-            "{name}: expected Lighter (2 or 8) and an SHM symbol ID in 1..{}",
+            "{name}: expected SHM exchange_id in 1..{} and SHM symbol ID in 1..{}",
+            max_exch - 1,
             MAX_SYMBOL_ID - 1
         );
-        let max_exch = crate::shm_reader::NUM_EXCHANGES as u8;
         if let Some(primary) = self.primary_reference_exchange {
             anyhow::ensure!(
                 (1..max_exch).contains(&primary) && primary != self.exchange_id,
@@ -810,20 +1127,39 @@ impl InventoryNeutralMMConfig {
                 seen_refs |= bit;
             }
         }
-        anyhow::ensure!(
-            crate::exchanges::lighter::valid_market_id(self.market_id),
-            "{name}: invalid Lighter market ID"
-        );
+        if self.exchange_id == EXCH_LIGHTER || self.exchange_id == EXCH_LIGHTER_ROBINHOOD {
+            anyhow::ensure!(
+                crate::exchanges::lighter::valid_market_id(self.market_id),
+                "{name}: invalid Lighter market ID"
+            );
+        } else {
+            anyhow::ensure!(
+                self.market_id >= 0,
+                "{name}: market_id must be non-negative"
+            );
+        }
         anyhow::ensure!(
             2.0 * self.maker_fee_bps + self.min_profit_bps >= 0.0
                 && self.max_spread_bps >= 2.0 * self.maker_fee_bps + self.min_profit_bps,
             "{name}: maximum spread is below the fee/profit floor"
         );
-        anyhow::ensure!(
-            self.step_size <= self.max_position
-                && self.inventory_urgency_threshold <= self.max_position,
-            "{name}: inventory urgency exceeds the position limit"
-        );
+        if self.max_position_notional_usd == 0.0 {
+            anyhow::ensure!(
+                self.step_size <= self.max_position,
+                "{name}: step_size exceeds max_position"
+            );
+        } else if self.base_order_notional_usd > 0.0 {
+            anyhow::ensure!(
+                self.base_order_notional_usd <= self.max_position_notional_usd,
+                "{name}: base_order_notional_usd exceeds max_position_notional_usd"
+            );
+        }
+        if self.inventory_urgency_notional_usd == 0.0 || self.max_position_notional_usd == 0.0 {
+            anyhow::ensure!(
+                self.inventory_urgency_threshold <= self.max_position,
+                "{name}: inventory urgency exceeds the position limit"
+            );
+        }
         if self.inventory_urgency_notional_usd > 0.0 && self.max_position_notional_usd > 0.0 {
             anyhow::ensure!(
                 self.inventory_urgency_notional_usd <= self.max_position_notional_usd,
@@ -871,6 +1207,7 @@ impl InventoryNeutralMMConfig {
             max_position: self.max_position,
             inventory_urgency_threshold: self.inventory_urgency_threshold,
             base_order_notional_usd: self.base_order_notional_usd,
+            round_base_notional_nearest: self.round_base_notional_nearest,
             max_position_notional_usd: self.max_position_notional_usd,
             inventory_urgency_notional_usd: self.inventory_urgency_notional_usd,
             min_inventory_notional_usd: self.min_inventory_notional_usd,
@@ -922,6 +1259,17 @@ impl InventoryNeutralMMConfig {
             quote_hysteresis: self.quote_hysteresis,
             self_fill_alpha_bps: self.self_fill_alpha_bps,
             self_fill_half_life_ms: self.self_fill_half_life_ms,
+            local_fair_value_config: self.local_fair_value_config,
+            local_toxicity: self.local_toxicity,
+            min_volume_quota_for_quoting: self.min_volume_quota_for_quoting,
+            max_order_price_band_bps: self.max_order_price_band_bps,
+            defense_policy: self.defense_policy,
+            as_inventory_notional_usd: self.as_inventory_notional_usd,
+            vol_gap_reset_secs: self.vol_gap_reset_secs,
+            normalize_cold_start_sigma_by_poll: self.normalize_cold_start_sigma_by_poll,
+            cap_utilization_floor_to_base_notional: self.cap_utilization_floor_to_base_notional,
+            max_top_book_depth_fraction: self.max_top_book_depth_fraction,
+            as_risk_budget_bps_at_max_pos: self.as_risk_budget_bps_at_max_pos,
         }
     }
 
@@ -983,6 +1331,7 @@ impl Default for InventoryNeutralMMConfig {
             max_position: 0.15,
             inventory_urgency_threshold: 0.08,
             base_order_notional_usd: 0.0,
+            round_base_notional_nearest: false,
             max_position_notional_usd: 0.0,
             inventory_urgency_notional_usd: 0.0,
             min_inventory_notional_usd: default_min_inventory_notional_usd(),
@@ -1016,6 +1365,17 @@ impl Default for InventoryNeutralMMConfig {
             quote_hysteresis: None,
             self_fill_alpha_bps: 0.0,
             self_fill_half_life_ms: default_self_fill_half_life_ms(),
+            local_fair_value_config: None,
+            local_toxicity: None,
+            min_volume_quota_for_quoting: None,
+            max_order_price_band_bps: None,
+            defense_policy: None,
+            as_inventory_notional_usd: None,
+            vol_gap_reset_secs: None,
+            normalize_cold_start_sigma_by_poll: false,
+            cap_utilization_floor_to_base_notional: false,
+            max_top_book_depth_fraction: None,
+            as_risk_budget_bps_at_max_pos: None,
         }
     }
 }
@@ -1580,5 +1940,59 @@ mod tests {
             ..Default::default()
         };
         assert!(too_short_half_life.validate().is_err());
+    }
+
+    #[test]
+    fn altcoin_usd_notional_profiles_validate_when_step_size_exceeds_legacy_eth_base_defaults() {
+        let mut xrp = InventoryNeutralMMConfig {
+            step_size: 1.0,
+            tick_size: 0.0001,
+            max_position: 0.2,
+            inventory_urgency_threshold: 0.08,
+            base_order_notional_usd: 100.0,
+            max_position_notional_usd: 150.0,
+            inventory_urgency_notional_usd: 75.0,
+            round_base_notional_nearest: true,
+            ..Default::default()
+        };
+        xrp.validate().unwrap();
+        assert!(xrp.runtime_copy().round_base_notional_nearest);
+
+        xrp.base_order_notional_usd = 200.0;
+        assert!(xrp.validate().is_err());
+
+        let legacy_no_notional = InventoryNeutralMMConfig {
+            step_size: 1.0,
+            tick_size: 0.0001,
+            max_position: 0.2,
+            inventory_urgency_threshold: 0.08,
+            ..Default::default()
+        };
+        assert!(legacy_no_notional.validate().is_err());
+
+        // Decoupled strategy validates cleanly for non-Lighter SHM venues while rejecting 0 / out-of-range.
+        for exch in [EXCH_ARCUS, EXCH_BACKPACK, EXCH_EXTENDED] {
+            let mut other = InventoryNeutralMMConfig {
+                exchange_id: exch,
+                market_id: 999_999,
+                min_volume_quota_for_quoting: Some(10),
+                max_order_price_band_bps: Some(50.0),
+                defense_policy: Some(DefensePolicyConfig {
+                    caution_spread_bps: 8.0,
+                    caution_widen_bps: 2.0,
+                    caution_size_scale: 0.5,
+                    side_defense_momentum_bps: 6.0,
+                    reduce_only_spread_bps: 20.0,
+                    halt_spread_bps: 50.0,
+                    cooldown_ms: 2_000,
+                }),
+                ..Default::default()
+            };
+            other.validate().unwrap();
+            other.exchange_id = 0;
+            assert!(other.validate().is_err());
+            other.exchange_id = crate::shm_reader::NUM_EXCHANGES as u8;
+            assert!(other.validate().is_err());
+        }
     }
 }

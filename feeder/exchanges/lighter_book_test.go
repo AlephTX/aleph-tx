@@ -87,6 +87,14 @@ func TestLighterBookNonceContinuityAndTimestampGuard(t *testing.T) {
 	if changed, err := book.apply(delta1, false); err != nil || !changed {
 		t.Fatalf("contiguous delta failed: changed=%v err=%v", changed, err)
 	}
+	// begin_nonce must match prior nonce even if nonce increments sequentially (+1).
+	var stepCheck lighterBook
+	if _, err := stepCheck.apply(snap, true); err != nil {
+		t.Fatalf("stepCheck snapshot failed: %v", err)
+	}
+	if _, err := stepCheck.apply(gjson.Parse(`{"nonce":101,"begin_nonce":99,"last_updated_at":1700000000001000,"bids":[],"asks":[]}`), false); err == nil {
+		t.Fatal("accepted begin_nonce=99, nonce=101 over prior nonce=100")
+	}
 	// Duplicate / older nonce is ignored without rolling back or erroring.
 	if changed, err := book.apply(delta1, false); err != nil || changed {
 		t.Fatalf("duplicate nonce reapplied: changed=%v err=%v", changed, err)

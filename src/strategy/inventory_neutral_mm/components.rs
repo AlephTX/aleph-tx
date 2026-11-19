@@ -3,9 +3,51 @@ use super::execution::InventoryContext;
 use super::pricing::MakerPriceBounds;
 use crate::config::InventoryNeutralMMConfig;
 use crate::exchange::{OrderParams, OrderType, Side};
-use crate::order_tracker::OrderLifecycle;
+use crate::order_tracker::{OrderLifecycle, OrderSide};
 use std::time::Duration;
 use tracing::{debug, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+#[allow(dead_code)]
+pub(in crate::strategy::inventory_neutral_mm) enum CancelReason {
+    EdgeFloorCancelAll,
+    RiskOrSpreadCancelAll,
+    TimeoutOrShutdownCancelAll,
+    SideWithdrawn,
+    BoundBreach,
+    AdverseRetreat,
+    ReducingCapOrNonRo,
+    NormalPriceRequote,
+    NormalSizeOrGridRequote,
+    ReduceOnlyAutoCancel,
+    Other,
+}
+
+#[cfg(feature = "research-replay")]
+impl CancelReason {
+    pub(in crate::strategy::inventory_neutral_mm) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EdgeFloorCancelAll => "edge_floor_cancel_all",
+            Self::RiskOrSpreadCancelAll => "risk_or_spread_cancel_all",
+            Self::TimeoutOrShutdownCancelAll => "timeout_or_shutdown_cancel_all",
+            Self::SideWithdrawn => "side_withdrawn",
+            Self::BoundBreach => "bound_breach",
+            Self::AdverseRetreat => "adverse_retreat",
+            Self::ReducingCapOrNonRo => "reducing_cap_or_non_ro",
+            Self::NormalPriceRequote => "normal_price_requote",
+            Self::NormalSizeOrGridRequote => "normal_size_or_grid_requote",
+            Self::ReduceOnlyAutoCancel => "reduce_only_auto_cancel",
+            Self::Other => "other",
+        }
+    }
+}
+
+pub(super) struct ReconcileSideResult {
+    pub to_cancel: Vec<i64>,
+    pub cancel_reasons: Vec<(i64, CancelReason)>,
+    pub to_place: Vec<OrderParams>,
+    pub had_adverse_retreat: bool,
+}
 
 pub(super) const FLOAT_EPSILON: f64 = 1e-9;
 const CALM_SIDE_REQUOTE_COOLDOWN: Duration = Duration::from_secs(4);
@@ -22,7 +64,7 @@ pub(super) struct RiskSnapshot {
     pub min_available_balance: f64,
     pub available_balance: f64,
     pub usable_balance: f64,
-    pub margin_per_eth: f64,
+    pub margin_per_unit: f64,
     pub grid_multiplier: f64,
 }
 
@@ -50,6 +92,10 @@ pub(super) enum QuoteCycleDecision {
 
 pub(super) fn round_down_to_step(value: f64, step: f64) -> f64 {
     (((value / step) + FLOAT_EPSILON).floor()) * step
+}
+
+pub(super) fn round_nearest_to_step(value: f64, step: f64) -> f64 {
+    ((value / step).round()) * step
 }
 
 pub(super) fn round_up_to_step(value: f64, step: f64) -> f64 {
@@ -173,7 +219,11 @@ pub(super) fn utilization_floor_base_order_size(
     grid_multiplier: f64,
     mid: f64,
 ) -> f64 {
-    if usable_balance <= 0.0 || mid <= 0.0 || config.max_leverage <= 0.0 {
+    if config.cap_utilization_floor_to_base_notional
+        || usable_balance <= 0.0
+        || mid <= 0.0
+        || config.max_leverage <= 0.0
+    {
         return base_order_size;
     }
 
@@ -249,6 +299,122 @@ pub(super) fn inventory_skew_ratio(config: &InventoryNeutralMMConfig, position: 
     (position / threshold).clamp(-1.0, 1.0)
 }
 
+/// Unambiguous reducing capacity (`[max_bid_close, max_ask_close]`) from
+/// `[account_pos, confirmed_pos]`.
+///
+/// Accounts for 100ms account-snapshot lag safely: a flat (`|account_pos| < half_step`)
+/// snapshot does not block closing an already-confirmed fill, while a genuine opposite-sign
+/// conflict forces `[0.0, 0.0]`, and agrees on `min(|account|, |confirmed|)` when both
+/// snapshots agree on direction.
+pub(super) fn closable_reducing_sizes(positions: [f64; 2], step_size: f64) -> [f64; 2] {
+    if !step_size.is_finite()
+        || step_size <= 0.0
+        || !positions[0].is_finite()
+        || !positions[1].is_finite()
+    {
+        return [0.0, 0.0];
+    }
+    let half_step = (step_size * 0.5).max(FLOAT_EPSILON);
+    let [account_pos, confirmed_pos] = positions;
+    let max_bid_close = if confirmed_pos <= -half_step && account_pos < half_step {
+        let bound = if account_pos <= -half_step {
+            (-account_pos).min(-confirmed_pos)
+        } else {
+            -confirmed_pos
+        };
+        round_down_to_step(bound.max(0.0), step_size)
+    } else {
+        0.0
+    };
+    let max_ask_close = if confirmed_pos >= half_step && account_pos > -half_step {
+        let bound = if account_pos >= half_step {
+            account_pos.min(confirmed_pos)
+        } else {
+            confirmed_pos
+        };
+        round_down_to_step(bound.max(0.0), step_size)
+    } else {
+        0.0
+    };
+    [max_bid_close, max_ask_close]
+}
+
+pub(super) fn build_reducing_grid_plan(
+    config: &InventoryNeutralMMConfig,
+    side: Side,
+    order_type: OrderType,
+    start_px: f64,
+    top_level_sz: f64,
+    closable_abs: f64,
+) -> Vec<OrderParams> {
+    if !start_px.is_finite()
+        || start_px <= 0.0
+        || !top_level_sz.is_finite()
+        || top_level_sz <= 0.0
+        || !closable_abs.is_finite()
+        || closable_abs <= 0.0
+        || !config.tick_size.is_finite()
+        || config.tick_size <= 0.0
+        || !config.step_size.is_finite()
+        || config.step_size <= 0.0
+    {
+        return Vec::new();
+    }
+    let mut remaining_budget = round_down_to_step(closable_abs.max(0.0), config.step_size);
+    let base_top = top_level_sz.min(remaining_budget);
+    if base_top <= 0.0 {
+        return Vec::new();
+    }
+    let mut quotes = Vec::with_capacity(usize::from(config.grid_levels.max(1)));
+    let spacing = (config.grid_spacing_bps / 10000.0 * start_px).max(config.tick_size);
+
+    for level in 0..config.grid_levels.max(1) {
+        let raw_price = if side == Side::Buy {
+            start_px - spacing * f64::from(level)
+        } else {
+            start_px + spacing * f64::from(level)
+        };
+        let price = if side == Side::Buy {
+            (raw_price / config.tick_size).floor() * config.tick_size
+        } else {
+            (raw_price / config.tick_size).ceil() * config.tick_size
+        };
+        if !price.is_finite() || price <= 0.0 {
+            break;
+        }
+        let min_sz = min_quotable_size(config, price);
+        if !remaining_budget.is_finite() || remaining_budget + FLOAT_EPSILON < min_sz {
+            break;
+        }
+        let weight = config.grid_size_decay.powi(level as i32);
+        let mut level_sz =
+            round_down_to_step((base_top * weight).min(remaining_budget), config.step_size);
+        if level_sz + FLOAT_EPSILON < min_sz
+            || (remaining_budget - level_sz > FLOAT_EPSILON
+                && remaining_budget - level_sz + FLOAT_EPSILON < min_sz)
+        {
+            level_sz = remaining_budget;
+        }
+        if !level_sz.is_finite() || level_sz + FLOAT_EPSILON < min_sz {
+            break;
+        }
+        quotes.push(OrderParams {
+            size: level_sz,
+            price,
+            side,
+            order_type,
+            reduce_only: true,
+        });
+        remaining_budget =
+            round_down_to_step((remaining_budget - level_sz).max(0.0), config.step_size);
+        if remaining_budget + FLOAT_EPSILON < config.step_size {
+            break;
+        }
+    }
+
+    quotes
+}
+
 pub(super) fn build_grid_plan(
     config: &InventoryNeutralMMConfig,
     side: Side,
@@ -303,6 +469,12 @@ pub(super) fn build_grid_plan(
     quotes
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EntryRatchetPolicy {
+    pub favorable_hold_threshold: f64,
+    pub adverse_retreat_threshold: f64,
+}
+
 #[cfg(test)]
 pub(super) fn reconcile_side_plan(
     existing_orders: &[ActiveOrder],
@@ -337,7 +509,7 @@ pub(super) fn reconcile_side_plan_with_bounds(
     max_replacements_per_cycle: usize,
     cancel_bounds: Option<MakerPriceBounds>,
 ) -> (Vec<i64>, Vec<OrderParams>) {
-    reconcile_side_plan_with_options(
+    let res = reconcile_side_plan_with_options(
         existing_orders,
         desired_quotes,
         threshold,
@@ -347,7 +519,11 @@ pub(super) fn reconcile_side_plan_with_bounds(
         max_replacements_per_cycle,
         cancel_bounds,
         false,
-    )
+        None,
+        None,
+        false,
+    );
+    (res.to_cancel, res.to_place)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,12 +537,16 @@ pub(super) fn reconcile_side_plan_with_options(
     max_replacements_per_cycle: usize,
     cancel_bounds: Option<MakerPriceBounds>,
     fast_reducing: bool,
-) -> (Vec<i64>, Vec<OrderParams>) {
+    entry_ratchet: Option<EntryRatchetPolicy>,
+    reducing_cap: Option<f64>,
+    suppress_normal_cancels: bool,
+) -> ReconcileSideResult {
     let mut matched_existing = vec![false; existing_orders.len()];
     let mut to_place = Vec::new();
     let calm_mode = !fast_reducing && max_replacements_per_cycle <= 1;
+    let mut remaining_match_cap = reducing_cap.unwrap_or(f64::INFINITY);
 
-    for (level_idx, desired) in desired_quotes.iter().enumerate() {
+    let price_matches_desired = |order: &ActiveOrder, level_idx: usize, desired: &OrderParams| {
         // Top-of-book queue is the most expensive to churn away.
         // Keep calm-market levels stickier so small touch drift does not constantly reset queue priority.
         let level_threshold = if fast_reducing {
@@ -378,6 +558,22 @@ pub(super) fn reconcile_side_plan_with_options(
         } else {
             threshold
         };
+        if let Some(ratchet) = entry_ratchet.filter(|_| !fast_reducing) {
+            let is_adverse_move = match order.side {
+                OrderSide::Buy => desired.price < order.price - FLOAT_EPSILON,
+                OrderSide::Sell => desired.price > order.price + FLOAT_EPSILON,
+            };
+            if is_adverse_move {
+                (order.price - desired.price).abs() <= ratchet.adverse_retreat_threshold
+            } else {
+                (desired.price - order.price).abs() <= ratchet.favorable_hold_threshold
+            }
+        } else {
+            (order.price - desired.price).abs() <= level_threshold
+        }
+    };
+
+    for (level_idx, desired) in desired_quotes.iter().enumerate() {
         if let Some((idx, _)) = existing_orders
             .iter()
             .enumerate()
@@ -386,26 +582,125 @@ pub(super) fn reconcile_side_plan_with_options(
                 let within_bounds =
                     cancel_bounds.is_none_or(|bounds| bounds.allows(order.side, order.price));
                 let size_tolerance = (desired.size * size_tolerance_ratio).max(step_size);
+                let price_ok = price_matches_desired(order, level_idx, desired);
+                let reduce_ok = !desired.reduce_only
+                    || (order.reduce_only && order.lifecycle != OrderLifecycle::PendingCancel);
+                let cap_ok = reducing_cap.is_none_or(|_| {
+                    order.size <= desired.size + FLOAT_EPSILON
+                        && order.size <= remaining_match_cap + FLOAT_EPSILON
+                });
                 within_bounds
-                    && (order.price - desired.price).abs() <= level_threshold
+                    && price_ok
                     && (order.size - desired.size).abs() <= size_tolerance
+                    && reduce_ok
+                    && cap_ok
             })
         {
             matched_existing[idx] = true;
+            if reducing_cap.is_some() {
+                remaining_match_cap = (remaining_match_cap - existing_orders[idx].size).max(0.0);
+            }
         } else {
             to_place.push(desired.clone());
         }
     }
 
-    let forced_cancels: Vec<i64> = existing_orders
-        .iter()
-        .filter(|order| {
-            cancel_bounds.is_some_and(|bounds| !bounds.allows(order.side, order.price))
-                && order.order_index.is_some()
-                && order.lifecycle != OrderLifecycle::PendingCancel
-        })
-        .filter_map(|order| order.order_index)
-        .collect();
+    let top_desired_px = desired_quotes.first().map(|q| q.price);
+    let adverse_retreat_triggered = |idx: usize, order: &ActiveOrder| -> bool {
+        if matched_existing[idx] {
+            return false;
+        }
+        let (Some(ratchet), Some(top_px)) =
+            (entry_ratchet.filter(|_| !fast_reducing), top_desired_px)
+        else {
+            return false;
+        };
+        match order.side {
+            OrderSide::Buy => {
+                order.price - top_px > ratchet.adverse_retreat_threshold + FLOAT_EPSILON
+            }
+            OrderSide::Sell => {
+                top_px - order.price > ratchet.adverse_retreat_threshold + FLOAT_EPSILON
+            }
+        }
+    };
+
+    let had_adverse_retreat = existing_orders.iter().enumerate().any(|(idx, order)| {
+        adverse_retreat_triggered(idx, order)
+            && order.order_index.is_some()
+            && order.lifecycle != OrderLifecycle::PendingCancel
+    });
+
+    let mut forced_cancel_flags = vec![false; existing_orders.len()];
+    for (idx, order) in existing_orders.iter().enumerate() {
+        let non_reducing_during_close = reducing_cap.is_some() && !order.reduce_only;
+        if (cancel_bounds.is_some_and(|bounds| !bounds.allows(order.side, order.price))
+            || adverse_retreat_triggered(idx, order)
+            || non_reducing_during_close)
+            && order.order_index.is_some()
+            && order.lifecycle != OrderLifecycle::PendingCancel
+        {
+            forced_cancel_flags[idx] = true;
+        }
+    }
+    if let Some(cap_abs) = reducing_cap {
+        let mut surviving_exposure: f64 = existing_orders
+            .iter()
+            .enumerate()
+            .filter(|(idx, order)| {
+                !forced_cancel_flags[*idx] && order.lifecycle != OrderLifecycle::PendingCancel
+            })
+            .map(|(_, order)| order.size)
+            .sum();
+        while surviving_exposure > cap_abs + FLOAT_EPSILON {
+            let cancel_idx = existing_orders
+                .iter()
+                .enumerate()
+                .find(|(idx, order)| {
+                    !matched_existing[*idx]
+                        && !forced_cancel_flags[*idx]
+                        && order.order_index.is_some()
+                        && order.lifecycle != OrderLifecycle::PendingCancel
+                })
+                .or_else(|| {
+                    existing_orders
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(idx, order)| {
+                            !forced_cancel_flags[*idx]
+                                && order.order_index.is_some()
+                                && order.lifecycle != OrderLifecycle::PendingCancel
+                        })
+                })
+                .map(|(idx, _)| idx);
+            let Some(cancel_idx) = cancel_idx else {
+                break;
+            };
+            forced_cancel_flags[cancel_idx] = true;
+            surviving_exposure = (surviving_exposure - existing_orders[cancel_idx].size).max(0.0);
+        }
+    }
+    let mut forced_cancels = Vec::new();
+    let mut forced_reasons = Vec::new();
+    for (idx, order) in existing_orders.iter().enumerate() {
+        if !forced_cancel_flags[idx] {
+            continue;
+        }
+        let Some(oid) = order.order_index else {
+            continue;
+        };
+        let reason = if cancel_bounds.is_some_and(|bounds| !bounds.allows(order.side, order.price))
+        {
+            CancelReason::BoundBreach
+        } else if adverse_retreat_triggered(idx, order) {
+            CancelReason::AdverseRetreat
+        } else {
+            CancelReason::ReducingCapOrNonRo
+        };
+        forced_cancels.push(oid);
+        forced_reasons.push((oid, reason));
+    }
 
     let recent_same_side_refresh = !fast_reducing
         && max_replacements_per_cycle <= 1
@@ -419,26 +714,46 @@ pub(super) fn reconcile_side_plan_with_options(
         min_lifetime
     };
 
-    let mut normal_cancels: Vec<i64> = existing_orders
-        .iter()
-        .enumerate()
-        .filter(|(idx, order)| {
-            !matched_existing[*idx]
-                && cancel_bounds.is_none_or(|bounds| bounds.allows(order.side, order.price))
-                && order.placed_at.elapsed() >= replacement_min_lifetime
-        })
-        .filter(|_| !recent_same_side_refresh)
-        .filter(|(_, order)| {
-            order.order_index.is_some() && order.lifecycle != OrderLifecycle::PendingCancel
-        })
-        .filter_map(|(_, order)| order.order_index)
-        .collect();
+    let mut normal_cancels: Vec<(i64, CancelReason)> = if suppress_normal_cancels {
+        Vec::new()
+    } else {
+        existing_orders
+            .iter()
+            .enumerate()
+            .filter(|(idx, order)| {
+                !matched_existing[*idx]
+                    && !forced_cancel_flags[*idx]
+                    && cancel_bounds.is_none_or(|bounds| bounds.allows(order.side, order.price))
+                    && !adverse_retreat_triggered(*idx, order)
+                    && order.placed_at.elapsed() >= replacement_min_lifetime
+            })
+            .filter(|_| !recent_same_side_refresh)
+            .filter(|(_, order)| {
+                order.order_index.is_some() && order.lifecycle != OrderLifecycle::PendingCancel
+            })
+            .map(|(_, order)| {
+                let oid = order.order_index.expect("checked Some");
+                let size_or_grid_only = desired_quotes
+                    .iter()
+                    .enumerate()
+                    .any(|(level_idx, desired)| price_matches_desired(order, level_idx, desired));
+                let reason = if size_or_grid_only {
+                    CancelReason::NormalSizeOrGridRequote
+                } else {
+                    CancelReason::NormalPriceRequote
+                };
+                (oid, reason)
+            })
+            .collect()
+    };
     let remaining_cap = max_replacements_per_cycle.saturating_sub(forced_cancels.len());
     if normal_cancels.len() > remaining_cap {
         normal_cancels.truncate(remaining_cap);
     }
     let mut to_cancel = forced_cancels;
-    to_cancel.extend(normal_cancels);
+    to_cancel.extend(normal_cancels.iter().map(|(oid, _)| *oid));
+    let mut cancel_reasons = forced_reasons;
+    cancel_reasons.extend(normal_cancels);
 
     let remaining_existing = existing_orders.len().saturating_sub(to_cancel.len());
     let placement_capacity = desired_quotes.len().saturating_sub(remaining_existing);
@@ -446,7 +761,12 @@ pub(super) fn reconcile_side_plan_with_options(
         to_place.truncate(placement_capacity);
     }
 
-    (to_cancel, to_place)
+    ReconcileSideResult {
+        to_cancel,
+        cancel_reasons,
+        to_place,
+        had_adverse_retreat,
+    }
 }
 
 pub(super) fn apply_risk_limits(
@@ -461,7 +781,7 @@ pub(super) fn apply_risk_limits(
         config.step_size,
         config.tick_size,
         risk.max_position,
-        risk.margin_per_eth,
+        risk.margin_per_unit,
         risk.grid_multiplier,
     ]
     .iter()
@@ -571,8 +891,8 @@ pub(super) fn apply_risk_limits(
     // preference is allowed to restore exposure removed by the margin check.
     let bid_size = bid_size.min(bid_top_headroom);
     let ask_size = ask_size.min(ask_top_headroom);
-    let bid_margin_required = bid_size * risk.margin_per_eth * grid_multiplier;
-    let ask_margin_required = ask_size * risk.margin_per_eth * grid_multiplier;
+    let bid_margin_required = bid_size * risk.margin_per_unit * grid_multiplier;
+    let ask_margin_required = ask_size * risk.margin_per_unit * grid_multiplier;
     let total_margin_required = bid_margin_required + ask_margin_required;
 
     let (bid_size, ask_size) = if total_margin_required > risk.usable_balance

@@ -71,7 +71,7 @@ mod tests {
             min_available_balance: 10.0,
             available_balance: 70.0,
             usable_balance: 49.0,
-            margin_per_eth: 200.0,
+            margin_per_unit: 200.0,
             grid_multiplier: 2.0,
         };
 

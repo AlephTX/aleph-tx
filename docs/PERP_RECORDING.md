@@ -125,6 +125,14 @@ own `legs[i].lighter_market_id` and `lighter_clock`. A Core message,
 disconnect or clock observation cannot update that leg. The common
 `lighter-clock-refresh` flag applies to both enabled deployments.
 
+With both book feeds enabled, add `-stagger-lighter-clock-refresh` to schedule
+the first Robinhood refresh halfway through the interval and the first Core
+refresh at the full interval. Both feeds connect at startup. Each then keeps its
+phase across reconnects and segment rotations. For a four-minute interval,
+Robinhood refreshes at minutes 2, 6, 10 and Core at minutes 4, 8, 12.
+The default measures each connection's interval from its own start. Each
+refresh still invalidates that venue's book until fresh evidence arrives.
+
 ### Public fee signatures
 
 New Lighter trade envelopes carry collector-owned `fee_fields_version: 1`
