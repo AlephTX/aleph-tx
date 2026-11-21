@@ -417,6 +417,33 @@ evidence, corporate actions, and the market terms used to size and price
 the simulated orders. The [Oasis replay results](PERP_RELATIVE_VALUE.md#oasis-holdout-2026-11-12)
 document the research policies and the archived artifacts they consume.
 
+### Backpack perpetuals
+
+`-backpack` takes uppercase USDC perpetual symbols such as
+`ANT.US_USDC_PERP` or `BTC_USDC_PERP`. Each market has its own connection
+and subscribes to `depth`, `trade` and `markPrice`. After subscribing, the
+recorder archives one REST depth snapshot as `backpack_snapshot`. Deltas
+that arrive meanwhile stay in the socket buffer and follow the snapshot in
+the file. A delta whose `U` is not the previous `u + 1` ends the
+connection, and the reconnect starts a new epoch with a fresh snapshot.
+Trades keep price, quantity, maker side, trade ID and both venue times.
+Maker and taker order IDs are dropped.
+
+To rebuild a book, take the snapshot's `lastUpdateId`, skip deltas with
+`u <= lastUpdateId`, and start at the first delta whose `U..u` covers
+`lastUpdateId + 1`. Key levels by numeric price, because the snapshot and
+the deltas format the same price differently (`85.00` and `85.0`).
+Quantities are absolute and a zero quantity deletes the level. Event times
+`E` and `T` are microseconds. Mark-price messages carry the index price and
+the funding-rate estimate for the next hourly settlement, not a settled
+payment.
+[Backpack streams](https://docs.backpack.exchange/#tag/Streams)
+
+```sh
+feeder/perp-capture -backpack ANT.US_USDC_PERP,SPY.US_USDC_PERP \
+  -precise-times -gzip -duration 15m -output recordings/backpack.ndjson.gz
+```
+
 ### Extended × Lighter synchronized capture
 
 Record both BTC and ETH books and trades on one receipt clock. Extended

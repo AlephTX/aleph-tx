@@ -55,6 +55,7 @@ type subscription struct {
 	clockRefresh      time.Duration
 	firstClockRefresh time.Time
 	readTimeout       time.Duration
+	snapshotURL       string
 }
 
 const maxMarketsPerSource = 32
@@ -344,6 +345,11 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			return fmt.Errorf("subscribe: %w", err)
 		}
 	}
+	if source.source == "backpack" {
+		if err := backpackSnapshot(ctx, source, emit); err != nil {
+			return err
+		}
+	}
 	var heartbeat []byte
 	if source.isHyperliquidWS() {
 		heartbeat = []byte(`{"method":"ping"}`)
@@ -352,7 +358,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 	defer stopKeepalive()
 
 	nonces := make(map[string]uint64)
-	var extendedSequence uint64
+	var extendedSequence, backpackSequence uint64
 	acknowledged := make(map[string]bool)
 	for {
 		readCtx, cancelRead := ctx, func() {}
@@ -420,6 +426,11 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 				return err
 			}
 			extendedSequence = next
+		case "backpack":
+			raw, backpackSequence, err = backpackPublication(raw, source, backpackSequence)
+			if err != nil {
+				return err
+			}
 		case "lighter_trades", "lighter_robinhood_trades":
 			if header.Type != "subscribed/trade" && header.Type != "update/trade" {
 				continue
@@ -730,6 +741,7 @@ func run() error {
 	rhTrades := flag.Bool("lighter-robinhood-trades", false, "record Robinhood Chain Lighter public trades")
 	lighterTrades := flag.Bool("lighter-trades", false, "record Lighter public trades on a separate connection")
 	extended := flag.String("extended", "", "comma-separated active Extended CLOB perpetuals for public depth and trades")
+	backpack := flag.String("backpack", "", "comma-separated Backpack USDC perpetuals for public depth, trades and mark prices")
 	extendedIndex := flag.Bool("extended-index", false, "record Extended public index prices for the selected markets")
 	hl := flag.String("hyperliquid", "", "comma-separated Hyperliquid core or HIP-3 coins")
 	hlTrades := flag.Bool("hl-trades", false, "record Hyperliquid public trades and subscription acknowledgments")
@@ -813,6 +825,11 @@ func run() error {
 		}
 		sources = append(sources, extra...)
 	}
+	extraBackpack, err := backpackSubscriptions(*backpack)
+	if err != nil {
+		return err
+	}
+	sources = append(sources, extraBackpack...)
 	extraBinance, err := binanceSubscriptions(*binance)
 	if err != nil {
 		return err
