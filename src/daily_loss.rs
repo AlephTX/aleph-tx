@@ -20,6 +20,12 @@ struct DailyLossState {
     utc_day: i32,
     start_equity: f64,
     breached: bool,
+    /// Intraday high-water mark equity on `utc_day`.
+    #[serde(default)]
+    peak_equity: f64,
+    /// Progressive drawdown brake tier: `0=1.00x, 1=0.75x, 2=0.50x, 3=0.25x, 4=breached (0.00x)`.
+    #[serde(default)]
+    brake_tier: u8,
 }
 
 #[derive(Debug)]
@@ -27,6 +33,7 @@ pub struct DailyLossGuard {
     path: Option<PathBuf>,
     limit_pct: f64,
     state: DailyLossState,
+    persisted_peak_equity: f64,
 }
 
 /// The baseline and limit used by the strategy's daily loss check.
@@ -40,6 +47,34 @@ pub struct DailyLossSnapshot {
 /// Current UTC day as days since CE. Allocation-free.
 pub fn utc_day_now() -> i32 {
     Utc::now().date_naive().num_days_from_ce()
+}
+
+/// Compute next drawdown brake tier (`0..=3`) with `0.05` recovery hysteresis.
+fn next_brake_tier(current_tier: u8, r_dd: f64) -> u8 {
+    let r = if r_dd.is_finite() { r_dd.max(0.0) } else { 0.0 };
+    let escalated = if r >= 0.75 {
+        3
+    } else if r >= 0.50 {
+        2
+    } else if r >= 0.25 {
+        1
+    } else {
+        0
+    };
+    let mut tier = current_tier.min(3);
+    if escalated >= tier {
+        return escalated;
+    }
+    if tier == 3 && r < 0.70 {
+        tier = 2;
+    }
+    if tier == 2 && r < 0.45 {
+        tier = 1;
+    }
+    if tier == 1 && r < 0.20 {
+        tier = 0;
+    }
+    tier
 }
 
 impl DailyLossGuard {
@@ -65,23 +100,34 @@ impl DailyLossGuard {
             "daily loss state is from a later UTC day; refusing to reset the budget"
         );
         let state = match stored {
-            Some(state) if state.utc_day == today => {
+            Some(mut state) if state.utc_day == today => {
                 anyhow::ensure!(
                     !state.breached,
                     "daily loss limit already breached today (baseline ${:.2}); refusing to start",
                     state.start_equity
                 );
+                state.peak_equity = state.peak_equity.max(equity);
+                let budget_usd = state.start_equity * limit_pct;
+                let r_dd = if budget_usd > 0.0 {
+                    (state.peak_equity - equity).max(0.0) / budget_usd
+                } else {
+                    0.0
+                };
+                state.brake_tier = next_brake_tier(state.brake_tier, r_dd);
                 state
             }
             _ => DailyLossState {
                 utc_day: today,
                 start_equity: equity,
                 breached: false,
+                peak_equity: equity,
+                brake_tier: 0,
             },
         };
         let guard = Self {
             path,
             limit_pct,
+            persisted_peak_equity: state.peak_equity,
             state,
         };
         if stored != Some(state) {
@@ -92,6 +138,44 @@ impl DailyLossGuard {
 
     pub fn start_equity(&self) -> f64 {
         self.state.start_equity
+    }
+
+    pub fn peak_equity(&self) -> f64 {
+        self.state.peak_equity
+    }
+
+    pub fn brake_tier(&self) -> u8 {
+        if self.state.breached {
+            4
+        } else {
+            self.state.brake_tier
+        }
+    }
+
+    /// Real-time progressive sizing scale in `[0.0, 1.0]` (never `> 1.0`).
+    pub fn risk_scale(&self) -> f64 {
+        if self.state.breached {
+            return 0.0;
+        }
+        match self.state.brake_tier {
+            0 => 1.0,
+            1 => 0.75,
+            2 => 0.50,
+            3 => 0.25,
+            _ => 0.0,
+        }
+    }
+
+    /// Intraday drawdown from `peak_equity` as a multiple of today's daily loss budget.
+    pub fn drawdown_budget_ratio(&self, equity: f64) -> f64 {
+        if !equity.is_finite() {
+            return 0.0;
+        }
+        let budget_usd = self.state.start_equity * self.limit_pct;
+        if budget_usd <= 0.0 || !budget_usd.is_finite() {
+            return 0.0;
+        }
+        (self.state.peak_equity - equity).max(0.0) / budget_usd
     }
 
     pub fn snapshot(&self) -> DailyLossSnapshot {
@@ -123,6 +207,7 @@ impl DailyLossGuard {
                 self.state.utc_day = today;
             }
             self.state.breached = true;
+            self.state.brake_tier = 4;
             // Persist before failing so a wipeout cannot re-arm on restart.
             self.persist()?;
             anyhow::bail!(
@@ -136,13 +221,17 @@ impl DailyLossGuard {
                 utc_day: today,
                 start_equity: equity,
                 breached: false,
+                peak_equity: equity,
+                brake_tier: 0,
             };
+            self.persisted_peak_equity = equity;
             self.persist()?;
             return Ok(0.0);
         }
         let pnl_pct = (equity - self.state.start_equity) / self.state.start_equity;
         if pnl_pct < -self.limit_pct {
             self.state.breached = true;
+            self.state.brake_tier = 4;
             // Persist before failing so a restart cannot re-arm the budget.
             self.persist()?;
             anyhow::bail!(
@@ -151,6 +240,16 @@ impl DailyLossGuard {
                 self.state.start_equity,
                 equity
             );
+        }
+        self.state.peak_equity = self.state.peak_equity.max(equity);
+        let r_dd = self.drawdown_budget_ratio(equity);
+        let new_tier = next_brake_tier(self.state.brake_tier, r_dd);
+        let tier_changed = new_tier != self.state.brake_tier;
+        self.state.brake_tier = new_tier;
+        let peak_step = 0.10 * self.state.start_equity * self.limit_pct;
+        if tier_changed || (self.state.peak_equity - self.persisted_peak_equity) >= peak_step {
+            self.persisted_peak_equity = self.state.peak_equity;
+            self.persist()?;
         }
         Ok(pnl_pct)
     }
@@ -182,13 +281,44 @@ impl DailyLossGuard {
 fn load(path: &Path) -> Result<Option<DailyLossState>> {
     match fs::read(path) {
         Ok(bytes) => {
-            let state: DailyLossState = serde_json::from_slice(&bytes)
+            let mut state: DailyLossState = serde_json::from_slice(&bytes)
                 .with_context(|| format!("corrupt daily loss state {}", path.display()))?;
             anyhow::ensure!(
                 state.start_equity.is_finite() && state.start_equity > 0.0,
                 "invalid daily loss baseline in {}",
                 path.display()
             );
+            anyhow::ensure!(
+                state.peak_equity.is_finite() && state.peak_equity >= 0.0,
+                "invalid peak equity in {}",
+                path.display()
+            );
+            if state.peak_equity == 0.0 {
+                // Upgrade legacy 3-field state files seamlessly.
+                state.peak_equity = state.start_equity;
+            } else {
+                anyhow::ensure!(
+                    state.peak_equity >= state.start_equity * (1.0 - 1e-12),
+                    "invalid peak equity below start equity in {}",
+                    path.display()
+                );
+                state.peak_equity = state.peak_equity.max(state.start_equity);
+            }
+            anyhow::ensure!(
+                state.brake_tier <= 4,
+                "invalid brake tier {} in {}",
+                state.brake_tier,
+                path.display()
+            );
+            if state.breached {
+                state.brake_tier = 4;
+            } else {
+                anyhow::ensure!(
+                    state.brake_tier <= 3,
+                    "inconsistent unbreached brake tier 4 in {}",
+                    path.display()
+                );
+            }
             Ok(Some(state))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

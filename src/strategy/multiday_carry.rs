@@ -8,6 +8,7 @@
 
 use anyhow::{Result, ensure};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -66,6 +67,13 @@ pub struct MultiDayCarryConfig {
     pub fixed_overhead_usd_per_day: Decimal,
     #[serde(default)]
     pub exit_on_missing_witness: bool,
+    /// Optional target std of causal pre-window funding differentials in bps per settlement
+    /// for capped inverse-vol scaling (`min(1.0, target / observed_vol)`).
+    #[serde(default)]
+    pub target_prior_rate_vol_bps: Option<Decimal>,
+    /// Optional fraction in `(0, 1)` of `max_loss_budget_usd` triggering early soft exit.
+    #[serde(default)]
+    pub soft_drawdown_brake_fraction: Option<Decimal>,
 }
 
 impl MultiDayCarryConfig {
@@ -118,6 +126,16 @@ impl MultiDayCarryConfig {
             !(self.leg_exit_fee_bps.is_some() && self.maker_exit_fee_bps != Decimal::ZERO),
             "specify either maker_exit_fee_bps or leg_exit_fee_bps, not both"
         );
+        ensure!(
+            self.target_prior_rate_vol_bps
+                .is_none_or(|v| v > Decimal::ZERO),
+            "target_prior_rate_vol_bps must be positive when set"
+        );
+        ensure!(
+            self.soft_drawdown_brake_fraction
+                .is_none_or(|f| f > Decimal::ZERO && f < Decimal::ONE),
+            "soft_drawdown_brake_fraction must be in (0, 1) when set"
+        );
         Ok(())
     }
 }
@@ -163,6 +181,7 @@ pub enum CarryExitReason {
     BlockedEntryDistance,
     TrailingFundingDecay,
     LossBudgetBreached,
+    SoftDrawdownBrake,
     BasisDrawdownBreached,
     MissingFundingWitness,
     CampaignEnd,
@@ -198,6 +217,10 @@ pub struct MultiDayCarryReport {
     pub entered: bool,
     pub exit_reason: CarryExitReason,
     #[serde(with = "rust_decimal::serde::str")]
+    pub vol_scale_applied: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub effective_leg_notional_usd: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     pub base_quantity: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub capital_usd: Decimal,
@@ -225,6 +248,41 @@ pub struct MultiDayCarryReport {
     pub expected_checkpoints: u64,
     pub missing_checkpoints: u64,
     pub ten_hour_checkpoints: Vec<TenHourCarryCheckpoint>,
+}
+
+fn causal_vol_scale(
+    causal_prior: &BTreeMap<u64, Decimal>,
+    target_prior_rate_vol_bps: Option<Decimal>,
+) -> Decimal {
+    let Some(target_bps) = target_prior_rate_vol_bps else {
+        return Decimal::ONE;
+    };
+    let rates_bps: Vec<f64> = causal_prior
+        .values()
+        .filter_map(|r| (*r * BPS).to_f64())
+        .collect();
+    let n = rates_bps.len();
+    if n < 2 {
+        return Decimal::ONE;
+    }
+    let mean_bps = rates_bps.iter().sum::<f64>() / n as f64;
+    let var_bps = rates_bps
+        .iter()
+        .map(|x| {
+            let d = x - mean_bps;
+            d * d
+        })
+        .sum::<f64>()
+        / (n - 1) as f64;
+    let obs_std_bps = var_bps.max(0.0).sqrt();
+    let target = target_bps.to_f64().unwrap_or(0.0);
+    // Strict ceiling of 1.0: never amplify leverage during calm periods.
+    if obs_std_bps > target && target > 0.0 {
+        let clamped = (target / obs_std_bps).clamp(0.10, 1.0);
+        Decimal::new((clamped * 1_000_000.0).round() as i64, 6)
+    } else {
+        Decimal::ONE
+    }
 }
 
 impl MultiDayCarryScenario {
@@ -346,6 +404,8 @@ impl MultiDayCarryScenario {
         let campaign_ms = self.config.end_ms - self.config.decision_start_ms;
         let fixed_infra_usd = self.config.fixed_overhead_usd_per_day * Decimal::from(campaign_ms)
             / Decimal::from(DAY_MS);
+        let vol_scale = causal_vol_scale(&causal_prior, self.config.target_prior_rate_vol_bps);
+        let effective_leg_notional_usd = self.config.target_leg_notional_usd * vol_scale;
 
         let build_flat_report =
             |frozen_sign: i32, reason: CarryExitReason, status: &'static str| MultiDayCarryReport {
@@ -359,6 +419,8 @@ impl MultiDayCarryScenario {
                 required_entry_distance_bps: required_distance_bps,
                 entered: false,
                 exit_reason: reason,
+                vol_scale_applied: vol_scale,
+                effective_leg_notional_usd,
                 base_quantity: Decimal::ZERO,
                 capital_usd: self.config.capital_usd,
                 price_pnl_usd: Decimal::ZERO,
@@ -417,7 +479,7 @@ impl MultiDayCarryScenario {
         }
 
         let avg_px = (entry.leg0_price + entry.leg1_price) / Decimal::from(2);
-        let base_qty = self.config.target_leg_notional_usd / avg_px;
+        let base_qty = effective_leg_notional_usd / avg_px;
         let q0 = base_qty * Decimal::from(frozen_leg0_sign);
         let q1 = -q0;
         let entry_fee_rates = self.config.resolved_entry_fee_bps();
@@ -494,6 +556,13 @@ impl MultiDayCarryScenario {
                 if max_drawdown_usd >= self.config.max_loss_budget_usd {
                     open = false;
                     exit_reason = CarryExitReason::LossBudgetBreached;
+                } else if self
+                    .config
+                    .soft_drawdown_brake_fraction
+                    .is_some_and(|frac| max_drawdown_usd >= self.config.max_loss_budget_usd * frac)
+                {
+                    open = false;
+                    exit_reason = CarryExitReason::SoftDrawdownBrake;
                 } else if adverse_basis >= self.config.max_basis_drawdown_bps {
                     open = false;
                     exit_reason = CarryExitReason::BasisDrawdownBreached;
@@ -557,6 +626,8 @@ impl MultiDayCarryScenario {
             required_entry_distance_bps: required_distance_bps,
             entered: true,
             exit_reason,
+            vol_scale_applied: vol_scale,
+            effective_leg_notional_usd,
             base_quantity: base_qty,
             capital_usd: self.config.capital_usd,
             price_pnl_usd: realized_price_pnl_usd,
@@ -616,6 +687,8 @@ mod tests {
             leg_exit_fee_bps: None,
             fixed_overhead_usd_per_day: d("1.6666666667"),
             exit_on_missing_witness: false,
+            target_prior_rate_vol_bps: None,
+            soft_drawdown_brake_fraction: None,
         };
         let prior_settlements = vec![
             // Strictly before start - 2h -> causal; post-cutoff sample must be ignored!
@@ -867,6 +940,71 @@ mod tests {
             let mut tampered = rep.clone();
             mutate(&mut tampered);
             assert!(!MultiDayCarryScenario::cash_components_reconcile(&tampered));
+        }
+    }
+
+    #[test]
+    fn capped_inverse_vol_scaling_shrinks_high_vol_and_never_amplifies_calm_vol() {
+        let mut noisy = scenario("2.0");
+        let start = noisy.config.decision_start_ms;
+        let hour = hourly_interval_ms();
+        // Causal prior settlements: +0.5 bp/h and +2.5 bp/h -> mean +1.5 bp/h, sample std = sqrt(2) ~= 1.4142 bps.
+        noisy.prior_settlements = vec![
+            PriorSettlement {
+                settled_at_ms: start - 4 * hour,
+                rate_diff: d("0.00005"),
+            },
+            PriorSettlement {
+                settled_at_ms: start - 3 * hour,
+                rate_diff: d("0.00025"),
+            },
+        ];
+        noisy.config.target_prior_rate_vol_bps = Some(d("0.5"));
+        let rep = noisy.evaluate().unwrap();
+        assert!(rep.cash_identity_reconciled);
+        assert!(rep.vol_scale_applied < Decimal::ONE);
+        assert!(rep.vol_scale_applied >= d("0.10"));
+        assert!(rep.effective_leg_notional_usd < noisy.config.target_leg_notional_usd);
+        assert_eq!(rep.base_quantity, rep.effective_leg_notional_usd / d("100"));
+
+        // Calm volatility: target = 5.0 > obs_std (1.4142) -> strictly capped at 1.0 (never > 1.0!).
+        let mut calm = noisy;
+        calm.config.target_prior_rate_vol_bps = Some(d("5.0"));
+        let calm_rep = calm.evaluate().unwrap();
+        assert_eq!(calm_rep.vol_scale_applied, Decimal::ONE);
+        assert_eq!(
+            calm_rep.effective_leg_notional_usd,
+            calm.config.target_leg_notional_usd
+        );
+    }
+
+    #[test]
+    fn soft_drawdown_brake_exits_early_before_full_loss_budget_with_reconciled_cash() {
+        let mut sc = scenario("2.0");
+        sc.config.max_loss_budget_usd = d("20");
+        sc.config.max_basis_drawdown_bps = d("500");
+        sc.config.soft_drawdown_brake_fraction = Some(d("0.5")); // soft brake at $10 DD
+        // Leg0 (short, qty=-1) rises from 100 to 112 at h=3 -> -$12 adverse move (>= $10 soft brake, < $20 hard budget).
+        for f in sc.frames.iter_mut().skip(3) {
+            f.leg0_price = d("112");
+        }
+        let rep = sc.evaluate().unwrap();
+        assert_eq!(rep.exit_reason, CarryExitReason::SoftDrawdownBrake);
+        assert!(rep.cash_identity_reconciled);
+        assert!(rep.max_drawdown_usd < sc.config.max_loss_budget_usd);
+    }
+
+    #[test]
+    fn invalid_crash_knobs_are_rejected_by_validate() {
+        for bad_vol in [d("0"), d("-0.5")] {
+            let mut sc = scenario("2.0");
+            sc.config.target_prior_rate_vol_bps = Some(bad_vol);
+            assert!(sc.evaluate().is_err());
+        }
+        for bad_frac in [d("0"), d("-0.1"), d("1"), d("1.2")] {
+            let mut sc = scenario("2.0");
+            sc.config.soft_drawdown_brake_fraction = Some(bad_frac);
+            assert!(sc.evaluate().is_err());
         }
     }
 }
