@@ -33,6 +33,10 @@ from functools import wraps
 from pathlib import Path
 
 EPS = 1e-12
+UNIT_EXCHANGE_FILTERS = {
+    "aleph-tx-live": "(exchange IS NULL OR exchange != 'arcus_xyz_basis')",
+    "aleph-tx-arcus-xyz": "exchange = 'arcus_xyz_basis'",
+}
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS ingest_offsets (
@@ -423,6 +427,33 @@ class TelemetryStore:
         return dict(row) if row else None
 
     @locked
+    def latest_session_for_unit(self, unit):
+        clause = UNIT_EXCHANGE_FILTERS.get(unit)
+        if not clause:
+            return None
+        row = self.db.execute(
+            f"SELECT * FROM sessions WHERE {clause} ORDER BY started_ms DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    @locked
+    def unit_summaries(self, now_ms=None):
+        now_ms = now_ms or int(time.time() * 1000)
+        out = {}
+        for unit in UNIT_EXCHANGE_FILTERS:
+            session = self.latest_session_for_unit(unit)
+            if session is None:
+                continue
+            enriched, snapshot = self._enrich_session(session, now_ms)
+            out[unit] = {"session": enriched, "snapshot": snapshot}
+        return out
+
+    @locked
+    def ingested_offsets(self):
+        rows = self.db.execute("SELECT file, inode, offset FROM ingest_offsets").fetchall()
+        return {row["file"]: (int(row["inode"]), int(row["offset"])) for row in rows}
+
+    @locked
     def session(self, session_id):
         row = self.db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         return dict(row) if row else None
@@ -624,11 +655,24 @@ class TelemetryStore:
             if session is None:
                 raise ValueError("unknown session")
         current, snapshot = (None, None) if not session else self._enrich_session(session, now_ms)
-        return {"session": current, "snapshot": snapshot,
-                "windows": {"today": self._window(day_start, session_id=session_id),
-                            "24h": self._window(now_ms - 86_400_000, session_id=session_id),
-                            "7d": self._window(now_ms - 7 * 86_400_000, session_id=session_id),
-                            "all": self._window(0, session_id=session_id)}}
+        return {
+            "session": current,
+            "snapshot": snapshot,
+            "windows": {
+                "today": self._window(day_start, session_id=session_id),
+                "24h": self._window(now_ms - 86_400_000, session_id=session_id),
+                "7d": self._window(now_ms - 7 * 86_400_000, session_id=session_id),
+                "all": self._window(0, session_id=session_id),
+            },
+        }
+
+    @locked
+    def alert_summary(self, now_ms=None):
+        """Return latest summary augmented with per-unit sessions for isolated alerting."""
+        now_ms = now_ms or int(time.time() * 1000)
+        payload = self.summary(now_ms=now_ms)
+        payload["unit_sessions"] = self.unit_summaries(now_ms=now_ms)
+        return payload
 
     @locked
     def fills(self, limit=200, before_ms=None, session_id=None):
@@ -737,11 +781,23 @@ def prune_telemetry_dir(
     max_total_bytes=200 * 1024 * 1024,
     active_grace_secs=600,
     now_secs=None,
+    ingested_offsets=None,
+    require_ingested=False,
 ):
-    """Prune closed `*.jsonl` telemetry files by age first, then total size cap."""
+    """Prune closed `*.jsonl` telemetry files by age first, then total size cap.
+
+    When `ingested_offsets` (mapping filename -> (inode, offset)) is supplied or
+    `require_ingested=True`, non-empty JSONL files are deleted only after their
+    committed SQLite ingest offset covers the full on-disk size for the matching inode.
+    """
     root = Path(telemetry_dir)
     if not root.is_dir():
-        return {"deleted": [], "deleted_bytes": 0, "remaining_bytes": 0}
+        return {"deleted": [], "deleted_bytes": 0, "remaining_bytes": 0, "skipped_uningested": []}
+    if require_ingested and ingested_offsets is None:
+        raise ValueError("require_ingested=True requires ingested_offsets")
+    verify_ingest = ingested_offsets is not None
+    offsets = ingested_offsets or {}
+
     now = time.time() if now_secs is None else float(now_secs)
     age_cutoff = None if (max_age_days is None or max_age_days <= 0) else float(max_age_days) * 86_400.0
     byte_cap = None if (max_total_bytes is None or max_total_bytes < 0) else int(max_total_bytes)
@@ -754,30 +810,46 @@ def prune_telemetry_dir(
             st = path.stat()
         except FileNotFoundError:
             continue
-        files.append((st.st_mtime, st.st_size, path))
-    files.sort(key=lambda item: (item[0], item[2].name))
+        files.append((st.st_mtime, st.st_size, st.st_ino, path))
+    files.sort(key=lambda item: (item[0], item[3].name))
 
     total_bytes = sum(item[1] for item in files)
     deleted = []
     deleted_bytes = 0
+    skipped_uningested = []
     survivors = []
 
-    for mtime, size, path in files:
+    def _is_ingested(filename, size, inode):
+        if not verify_ingest or size == 0:
+            return True
+        rec = offsets.get(filename)
+        if rec is None:
+            return False
+        rec_ino, rec_off = rec
+        return rec_ino == inode and rec_off >= size
+
+    for mtime, size, inode, path in files:
         age = max(0.0, now - mtime)
-        eligible = age >= active_grace_secs
+        past_grace = age >= active_grace_secs
+        ingested = _is_ingested(path.name, size, inode)
+        if past_grace and not ingested and age_cutoff is not None and age > age_cutoff:
+            skipped_uningested.append(path.name)
+        eligible = past_grace and ingested
         if eligible and age_cutoff is not None and age > age_cutoff:
             os.unlink(path)
             deleted.append(path.name)
             deleted_bytes += size
             total_bytes -= size
         else:
-            survivors.append((mtime, size, path, eligible))
+            survivors.append((mtime, size, inode, path, eligible, past_grace, ingested))
 
     if byte_cap is not None and total_bytes > byte_cap:
-        for _mtime, size, path, eligible in survivors:
+        for _mtime, size, _inode, path, eligible, past_grace, ingested in survivors:
             if total_bytes <= byte_cap:
                 break
             if not eligible:
+                if past_grace and not ingested and path.name not in skipped_uningested:
+                    skipped_uningested.append(path.name)
                 continue
             os.unlink(path)
             deleted.append(path.name)
@@ -788,6 +860,7 @@ def prune_telemetry_dir(
         "deleted": deleted,
         "deleted_bytes": deleted_bytes,
         "remaining_bytes": max(0, total_bytes),
+        "skipped_uningested": skipped_uningested,
     }
 
 
@@ -799,23 +872,43 @@ def _main():
     p.add_argument("--max-age-days", type=float, default=7.0)
     p.add_argument("--max-mb", type=float, default=200.0)
     p.add_argument("--active-grace-secs", type=float, default=600.0)
-    p.add_argument("--db", type=Path, default=None, help="Optional SQLite path to prune")
+    p.add_argument("--db", type=Path, default=None, help="Optional SQLite path to verify ingestion & prune")
     p.add_argument("--retention-days", type=float, default=14.0)
+    p.add_argument(
+        "--allow-uningested",
+        action="store_true",
+        help="Allow deleting un-verified JSONL files without `--db` offset checks",
+    )
     args = parser.parse_args()
     if args.command == "prune":
-        file_stats = prune_telemetry_dir(
-            args.dir,
-            max_age_days=args.max_age_days,
-            max_total_bytes=int(args.max_mb * 1024 * 1024),
-            active_grace_secs=args.active_grace_secs,
-        )
-        db_stats = None
         if args.db is not None:
             store = TelemetryStore(args.db, args.dir)
             try:
+                # Flush complete records before file deletion so monitor downtime never drops uningested fills.
+                ingested_lines = store.ingest()
+                offsets = store.ingested_offsets()
+                file_stats = prune_telemetry_dir(
+                    args.dir,
+                    max_age_days=args.max_age_days,
+                    max_total_bytes=int(args.max_mb * 1024 * 1024),
+                    active_grace_secs=args.active_grace_secs,
+                    ingested_offsets=offsets,
+                    require_ingested=True,
+                )
+                file_stats["ingested_before_prune"] = ingested_lines
                 db_stats = store.prune_expired(retention_days=args.retention_days)
             finally:
                 store.db.close()
+        elif args.allow_uningested:
+            file_stats = prune_telemetry_dir(
+                args.dir,
+                max_age_days=args.max_age_days,
+                max_total_bytes=int(args.max_mb * 1024 * 1024),
+                active_grace_secs=args.active_grace_secs,
+            )
+            db_stats = None
+        else:
+            raise SystemExit("refusing to prune JSONL without --db ingest verification (pass --allow-uningested to override)")
         print(json.dumps({"files": file_stats, "db": db_stats}, indent=2))
 
 

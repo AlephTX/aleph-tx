@@ -62,12 +62,12 @@ class OnboardExchangeEnvTests(unittest.TestCase):
             for secret_frag in (arc_hex, hl_hex, lgt_hex, "ext-only-one", "not_printed_bp_value"):
                 self.assertNotIn(secret_frag, proc.stdout)
 
-    def test_split_writes_mode_600_isolated_files_and_skips_incomplete(self) -> None:
+    def test_split_preserves_existing_dir_mode_and_supports_0640(self) -> None:
         priv = "PRIVATE_" + "KEY"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             env_path = root / ".env.unified"
-            out_dir = root / "out"
+            out_dir = root / "etc_aleph"
             env_path.write_text(
                 "\n".join([
                     "ARCUS_ACCOUNT_ADDRESS=0x1111111111111111111111111111111111111111",
@@ -83,17 +83,19 @@ class OnboardExchangeEnvTests(unittest.TestCase):
                 encoding="utf-8",
             )
             out_dir.mkdir()
+            os.chmod(out_dir, 0o755)
             (out_dir / "monitor.env").write_text("ALEPH_MONITOR_CONTROL_TOKEN=keep-tok\n", encoding="utf-8")
 
-            res = split_env_file(env_path, out_dir)
-            self.assertEqual(os.stat(out_dir).st_mode & 0o777, 0o700)
+            res = split_env_file(env_path, out_dir, trading_mode=0o640)
+            # Pre-existing directory permissions must NOT be clobbered to 0700.
+            self.assertEqual(os.stat(out_dir).st_mode & 0o777, 0o755)
             self.assertIn("arcus_xyz_basis.env", res["written"])
             self.assertIn("monitor.env", res["written"])
             self.assertIn("live.env", res["skipped"])
 
             arc_file = out_dir / "arcus_xyz_basis.env"
             mon_file = out_dir / "monitor.env"
-            self.assertEqual(os.stat(arc_file).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(arc_file).st_mode & 0o777, 0o640)
             self.assertEqual(os.stat(mon_file).st_mode & 0o777, 0o600)
 
             arc_txt = arc_file.read_text(encoding="utf-8")
@@ -107,6 +109,15 @@ class OnboardExchangeEnvTests(unittest.TestCase):
             self.assertNotIn("PRIVATE", mon_txt)
             self.assertNotIn("aa" * 16, mon_txt)
             self.assertNotIn("bb" * 16, mon_txt)
+
+            # Brand-new directory defaults to 0700 and 0600 files; world-readable mode fails closed.
+            new_dir = root / "fresh_out"
+            res2 = split_env_file(env_path, new_dir)
+            self.assertEqual(os.stat(new_dir).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(new_dir / "arcus_xyz_basis.env").st_mode & 0o777, 0o600)
+            self.assertEqual(res2["written"]["arcus_xyz_basis.env"]["mode"], "0600")
+            with self.assertRaises(ValueError):
+                split_env_file(env_path, new_dir, trading_mode=0o644)
 
 
 if __name__ == "__main__":

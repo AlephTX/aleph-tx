@@ -156,6 +156,61 @@ class EvaluateTest(unittest.TestCase):
         }
         self.assertEqual(keys(evaluate(active, stale, NOW)), ["telemetry_stale"])
 
+    def test_unit_sessions_isolate_stopped_strategy_from_active_strategy_alerts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Active Lighter session (running, stale telemetry + drawdown + halt defense) started earlier.
+            (root / "live_sess.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": NOW - 300_000, "exchange": "lighter", "symbol": "ETH", "account": 1, "hedge_account": "0xhl"},
+                {
+                    "type": "snapshot",
+                    "ts_ms": NOW - 120_000,
+                    "equity": 950.0,
+                    "session_start_equity": 1000.0,
+                    "daily_loss_day_start_ms": DAY_START,
+                    "daily_loss_start_equity": 1000.0,
+                    "daily_loss_limit_pct": 0.05,
+                    "exchange_position": 0.5,
+                    "defense_regime": "halt",
+                    "mid": 2000.0,
+                },
+            )) + "\n")
+            # Newer Arcus session started later and stopped cleanly (`stopped_ms` set).
+            (root / "arcus_sess.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": NOW - 60_000, "exchange": "arcus_xyz_basis", "symbol": "ANT-USD", "account": 0, "hedge_account": "0xxyz"},
+                {
+                    "type": "snapshot",
+                    "ts_ms": NOW - 50_000,
+                    "equity": 500.0,
+                    "session_start_equity": 500.0,
+                    "daily_loss_day_start_ms": DAY_START,
+                    "daily_loss_start_equity": 500.0,
+                    "daily_loss_limit_pct": 0.05,
+                    "defense_regime": "normal",
+                    "mid": 88.5,
+                },
+                {"type": "stopped", "ts_ms": NOW - 40_000},
+            )) + "\n")
+
+            store = TelemetryStore(":memory:", root)
+            try:
+                store.ingest()
+                st = {
+                    "services": {
+                        "aleph-tx-feeder": {"ActiveState": "active"},
+                        "aleph-tx-live": {"ActiveState": "active"},
+                        "aleph-tx-arcus-xyz": {"ActiveState": "inactive", "Result": "success"},
+                    },
+                    "markets": [{"venue": "Lighter", "symbol": "ETH", "state": "live"}],
+                }
+                got = keys(evaluate(st, store.alert_summary(now_ms=NOW), NOW))
+                self.assertIn("telemetry_stale", got)
+                self.assertIn("drawdown", got)
+                self.assertIn("hedge_imbalance", got)
+                self.assertIn("defense_regime", got)
+            finally:
+                store.db.close()
+
 
 class AlerterTest(unittest.TestCase):
     def test_drawdown_escalation_refreshes_message_and_notifies_once(self):

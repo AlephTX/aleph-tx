@@ -26,6 +26,74 @@ def _alert(key, severity, message):
     return {"key": key, "severity": severity, "message": message}
 
 
+def _evaluate_session_alerts(
+    alerts,
+    *,
+    unit_active,
+    session,
+    snapshot,
+    now_ms,
+    key_prefix="",
+    primary_venue="Lighter",
+    include_quota=True,
+):
+    running = bool(unit_active and session and not session.get("stopped_ms"))
+    if running:
+        last = session.get("last_ms") or 0
+        if now_ms - last > SNAPSHOT_STALE_MS:
+            alerts.append(_alert(f"{key_prefix}telemetry_stale", WARNING,
+                                 f"遥测已 {(now_ms - last) // 1000}s 未更新"))
+    if session.get("stream_lost", 0) > 0:
+        alerts.append(_alert(f"{key_prefix}stream_lost", WARNING,
+                             f"私有流中断 {session['stream_lost']} 次"))
+    if snapshot.get("dropped", 0) > 0:
+        alerts.append(_alert(f"{key_prefix}telemetry_dropped", WARNING,
+                             f"遥测丢弃 {int(snapshot['dropped'])} 条"))
+
+    start = snapshot.get("daily_loss_start_equity") or 0
+    limit = snapshot.get("daily_loss_limit_pct") or 0
+    raw_equity = snapshot.get("equity")
+    equity_valid = (
+        isinstance(raw_equity, (int, float))
+        and not isinstance(raw_equity, bool)
+        and math.isfinite(raw_equity)
+    )
+    utc_day_start = now_ms - now_ms % 86_400_000
+    if (running and snapshot.get("daily_loss_day_start_ms") == utc_day_start
+            and start > 0 and equity_valid and 0 < limit < 1):
+        equity = float(raw_equity)
+        budget = start * limit
+        if equity <= start - budget * LOSS_WARN_FRACTION:
+            severity = CRITICAL if (equity <= 0 or equity <= start - budget * 0.9) else WARNING
+            drawdown = (start - equity) / start
+            alerts.append(_alert(f"{key_prefix}drawdown", severity,
+                                 f"当日回撤 {drawdown * 100:.2f}%（UTC 日亏熔断 {limit * 100:g}%）"))
+
+    if running and snapshot and session.get("hedge_account"):
+        primary = snapshot.get("exchange_position") or 0.0
+        hedge = session.get("hedge_position") or 0.0
+        net = primary + hedge
+        if abs(net) > max(abs(primary) * 0.5, 1e-12):
+            alerts.append(_alert(f"{key_prefix}hedge_imbalance", WARNING,
+                                 f"两腿净敞口 {net:+.4f}（{primary_venue} {primary:+.4f}）"))
+
+    if running and snapshot:
+        if include_quota:
+            quota = snapshot.get("volume_quota_remaining")
+            if isinstance(quota, int) and not isinstance(quota, bool):
+                if quota <= QUOTA_CRIT_THRESHOLD:
+                    alerts.append(_alert(f"{key_prefix}volume_quota_low", CRITICAL,
+                                         f"Lighter 剩余成交额度过低 ({quota})"))
+                elif quota <= QUOTA_WARN_THRESHOLD:
+                    alerts.append(_alert(f"{key_prefix}volume_quota_low", WARNING,
+                                         f"Lighter 剩余成交额度偏低 ({quota})"))
+        defense = snapshot.get("defense_regime")
+        if defense == "halt":
+            alerts.append(_alert(f"{key_prefix}defense_regime", CRITICAL, "防御状态机已进入 Halt 停机保护"))
+        elif defense == "reduce_only":
+            alerts.append(_alert(f"{key_prefix}defense_regime", WARNING, "防御状态机已进入 ReduceOnly 仅平仓模式"))
+
+
 def evaluate(status, summary, now_ms):
     """Active alerts, most severe first. Inputs are the /api payload dicts."""
     alerts = []
@@ -53,62 +121,36 @@ def evaluate(status, summary, now_ms):
             alerts.append(_alert(f"quote_{venue}_{symbol}", WARNING,
                                  f"{venue} {symbol} 行情{('过期' if state == 'stale' else '缺失')}"))
 
-    session = (summary or {}).get("session") or {}
-    snapshot = (summary or {}).get("snapshot") or {}
-    running = (live_active or arcus_active) and session and not session.get("stopped_ms")
-    if running:
-        last = session.get("last_ms") or 0
-        if now_ms - last > SNAPSHOT_STALE_MS:
-            alerts.append(_alert("telemetry_stale", WARNING,
-                                 f"遥测已 {(now_ms - last) // 1000}s 未更新"))
-    if session.get("stream_lost", 0) > 0:
-        alerts.append(_alert("stream_lost", WARNING,
-                             f"私有流中断 {session['stream_lost']} 次"))
-    if snapshot.get("dropped", 0) > 0:
-        alerts.append(_alert("telemetry_dropped", WARNING,
-                             f"遥测丢弃 {int(snapshot['dropped'])} 条"))
-
-    start = snapshot.get("daily_loss_start_equity") or 0
-    limit = snapshot.get("daily_loss_limit_pct") or 0
-    raw_equity = snapshot.get("equity")
-    equity_valid = (
-        isinstance(raw_equity, (int, float))
-        and not isinstance(raw_equity, bool)
-        and math.isfinite(raw_equity)
-    )
-    utc_day_start = now_ms - now_ms % 86_400_000
-    if (running and snapshot.get("daily_loss_day_start_ms") == utc_day_start
-            and start > 0 and equity_valid and 0 < limit < 1):
-        equity = float(raw_equity)
-        budget = start * limit
-        if equity <= start - budget * LOSS_WARN_FRACTION:
-            severity = CRITICAL if (equity <= 0 or equity <= start - budget * 0.9) else WARNING
-            drawdown = (start - equity) / start
-            alerts.append(_alert("drawdown", severity,
-                                 f"当日回撤 {drawdown * 100:.2f}%（UTC 日亏熔断 {limit * 100:g}%）"))
-
-    if running and snapshot and session.get("hedge_account"):
-        primary = snapshot.get("exchange_position") or 0.0
-        hedge = session.get("hedge_position") or 0.0
-        net = primary + hedge
-        if abs(net) > max(abs(primary) * 0.5, 1e-12):
-            alerts.append(_alert("hedge_imbalance", WARNING,
-                                 f"两腿净敞口 {net:+.4f}（Lighter {primary:+.4f}）"))
-
-    if running and snapshot:
-        quota = snapshot.get("volume_quota_remaining")
-        if isinstance(quota, int) and not isinstance(quota, bool):
-            if quota <= QUOTA_CRIT_THRESHOLD:
-                alerts.append(_alert("volume_quota_low", CRITICAL,
-                                     f"Lighter 剩余成交额度过低 ({quota})"))
-            elif quota <= QUOTA_WARN_THRESHOLD:
-                alerts.append(_alert("volume_quota_low", WARNING,
-                                     f"Lighter 剩余成交额度偏低 ({quota})"))
-        defense = snapshot.get("defense_regime")
-        if defense == "halt":
-            alerts.append(_alert("defense_regime", CRITICAL, "防御状态机已进入 Halt 停机保护"))
-        elif defense == "reduce_only":
-            alerts.append(_alert("defense_regime", WARNING, "防御状态机已进入 ReduceOnly 仅平仓模式"))
+    unit_sessions = (summary or {}).get("unit_sessions")
+    if isinstance(unit_sessions, dict):
+        unit_specs = (
+            ("aleph-tx-live", live_active, "", "Lighter", True),
+            ("aleph-tx-arcus-xyz", arcus_active, "arcus_", "Arcus", False),
+        )
+        for unit, unit_active, prefix, primary_venue, include_quota in unit_specs:
+            entry = unit_sessions.get(unit)
+            if not entry:
+                continue
+            _evaluate_session_alerts(
+                alerts,
+                unit_active=unit_active,
+                session=entry.get("session") or {},
+                snapshot=entry.get("snapshot") or {},
+                now_ms=now_ms,
+                key_prefix=prefix,
+                primary_venue=primary_venue,
+                include_quota=include_quota,
+            )
+    else:
+        session = (summary or {}).get("session") or {}
+        snapshot = (summary or {}).get("snapshot") or {}
+        _evaluate_session_alerts(
+            alerts,
+            unit_active=(live_active or arcus_active),
+            session=session,
+            snapshot=snapshot,
+            now_ms=now_ms,
+        )
 
     disk = (status or {}).get("disk") or {}
     free_gib = disk.get("free_gib")

@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import grp
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import sys
 from typing import Any
@@ -384,16 +386,83 @@ def audit_env_dict(env: dict[str, str], duplicates: list[str] | None = None, *, 
     }
 
 
-def _write_mode_600(path: Path, lines: list[str]) -> None:
+def _parse_octal_mode(raw: str) -> int:
+    text = raw.strip()
+    if not text or not all(ch in "01234567" for ch in text):
+        raise ValueError(f"invalid octal mode: {raw!r}")
+    mode = int(text, 8)
+    _validate_private_mode(mode)
+    return mode
+
+
+def _validate_private_mode(mode: int) -> None:
+    if mode < 0 or mode > 0o777 or (mode & 0o007) != 0 or (mode & 0o600) != 0o600:
+        raise ValueError(
+            f"unsafe file mode 0{mode:03o}: must allow owner rw and zero world access bits"
+        )
+
+
+def _resolve_owner_uid(owner: str | None) -> int | None:
+    if owner is None:
+        return None
+    text = owner.strip()
+    if not text:
+        raise ValueError("owner must not be empty")
+    if text.isdigit():
+        return int(text)
+    try:
+        return pwd.getpwnam(text).pw_uid
+    except KeyError as exc:
+        raise ValueError(f"unknown owner user: {text!r}") from exc
+
+
+def _resolve_group_gid(group: str | None) -> int | None:
+    if group is None:
+        return None
+    text = group.strip()
+    if not text:
+        raise ValueError("group must not be empty")
+    if text.isdigit():
+        return int(text)
+    try:
+        return grp.getgrnam(text).gr_gid
+    except KeyError as exc:
+        raise ValueError(f"unknown group: {text!r}") from exc
+
+
+def _ensure_out_dir(out_dir: Path, *, dir_mode: int | None) -> None:
+    if dir_mode is not None:
+        if dir_mode < 0 or dir_mode > 0o777 or (dir_mode & 0o700) != 0o700:
+            raise ValueError(f"invalid directory mode: 0{dir_mode:03o}")
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            raise NotADirectoryError(f"out_dir is not a directory: {out_dir}")
+        if dir_mode is not None:
+            os.chmod(out_dir, dir_mode)
+    else:
+        create_mode = dir_mode if dir_mode is not None else 0o700
+        out_dir.mkdir(parents=True, exist_ok=True, mode=create_mode)
+        os.chmod(out_dir, create_mode)
+
+
+def _write_scoped_file(
+    path: Path,
+    lines: list[str],
+    *,
+    mode: int = 0o600,
+    uid: int | None = None,
+    gid: int | None = None,
+) -> None:
+    _validate_private_mode(mode)
     content = "\n".join(lines) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
-        os.chmod(tmp, 0o600)
+        if uid is not None or gid is not None:
+            os.chown(tmp, uid if uid is not None else -1, gid if gid is not None else -1)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         if tmp.exists():
@@ -401,20 +470,47 @@ def _write_mode_600(path: Path, lines: list[str]) -> None:
         raise
 
 
-def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
-    """Emit strictly isolated `0600` runtime files from a unified `.env`."""
+def split_env_file(
+    source: Path,
+    out_dir: Path,
+    *,
+    trading_mode: int | None = None,
+    monitor_mode: int = 0o600,
+    owner: str | None = None,
+    group: str | None = None,
+    dir_mode: int | None = None,
+) -> dict[str, Any]:
+    """Emit least-privilege scoped runtime files without altering pre-existing directory perms."""
+    _validate_private_mode(monitor_mode)
+    uid = _resolve_owner_uid(owner)
+    gid = _resolve_group_gid(group)
+    is_etc_aleph = Path(os.path.normpath(str(out_dir))) == Path("/etc/aleph-tx")
+    if gid is None and is_etc_aleph:
+        try:
+            gid = grp.getgrnam("aleph-tx-trader").gr_gid
+        except KeyError:
+            gid = None
+
+    if trading_mode is not None:
+        effective_trading_mode = trading_mode
+    elif group is not None or is_etc_aleph:
+        effective_trading_mode = 0o640
+    else:
+        effective_trading_mode = 0o600
+    _validate_private_mode(effective_trading_mode)
+    mode_tag = f"{effective_trading_mode:04o}"
+
     env, duplicates = parse_dotenv_with_duplicates(source)
     report = audit_env_dict(env, duplicates, env_path=str(source))
     venues = report["venues"]
     written: dict[str, dict[str, Any]] = {}
     skipped: dict[str, str] = {}
 
-    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(out_dir, 0o700)
+    _ensure_out_dir(out_dir, dir_mode=dir_mode)
 
     # 1. arcus_xyz_basis.env (Arcus + Hyperliquid)
     if venues["arcus"]["status"] == "ready" and venues["hyperliquid"]["status"] == "ready":
-        lines = ["# Scoped runtime env for aleph-tx-arcus-xyz.service (mode 0600)."]
+        lines = [f"# Scoped runtime env for aleph-tx-arcus-xyz.service (mode {mode_tag})."]
         emitted_keys: list[str] = []
         for k in ARCUS_ENV_WHITELIST:
             val = env.get(k, "").strip()
@@ -422,8 +518,8 @@ def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
                 lines.append(f"{k}={val}")
                 emitted_keys.append(k)
         target = out_dir / "arcus_xyz_basis.env"
-        _write_mode_600(target, lines)
-        written["arcus_xyz_basis.env"] = {"path": str(target), "keys": emitted_keys, "mode": "0600"}
+        _write_scoped_file(target, lines, mode=effective_trading_mode, uid=uid, gid=gid)
+        written["arcus_xyz_basis.env"] = {"path": str(target), "keys": emitted_keys, "mode": mode_tag}
     else:
         skipped["arcus_xyz_basis.env"] = (
             f"requires ready arcus ({venues['arcus']['status']}) & hyperliquid ({venues['hyperliquid']['status']})"
@@ -431,7 +527,7 @@ def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
 
     # 2. live.env (Lighter Core + optional Hyperliquid hedge)
     if venues["lighter_core"]["status"] == "ready":
-        lines = ["# Scoped runtime env for aleph-tx-live.service (mode 0600)."]
+        lines = [f"# Scoped runtime env for aleph-tx-live.service (mode {mode_tag})."]
         emitted_keys = []
         allowed = list(LIGHTER_CORE_FEEDER_ENV) + list(LIGHTER_EXTRA_LANE_ENV)
         if venues["hyperliquid"]["status"] == "ready":
@@ -444,8 +540,8 @@ def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
                 lines.append(f"{k}={val}")
                 emitted_keys.append(k)
         target = out_dir / "live.env"
-        _write_mode_600(target, lines)
-        written["live.env"] = {"path": str(target), "keys": emitted_keys, "mode": "0600"}
+        _write_scoped_file(target, lines, mode=effective_trading_mode, uid=uid, gid=gid)
+        written["live.env"] = {"path": str(target), "keys": emitted_keys, "mode": mode_tag}
     else:
         skipped["live.env"] = f"requires ready lighter_core ({venues['lighter_core']['status']})"
 
@@ -455,10 +551,11 @@ def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
     mon_pairs = sync_monitor_env.build_monitor_env(env, existing_mon)
     if mon_pairs:
         sync_monitor_env.sync_monitor_env_file(source, mon_target)
+        os.chmod(mon_target, monitor_mode)
         written["monitor.env"] = {
             "path": str(mon_target),
             "keys": [k for k, _ in mon_pairs],
-            "mode": "0600",
+            "mode": f"{monitor_mode:04o}",
         }
     else:
         skipped["monitor.env"] = "no valid public monitor identifiers present"
@@ -466,6 +563,7 @@ def split_env_file(source: Path, out_dir: Path) -> dict[str, Any]:
     return {
         "source": str(source),
         "out_dir": str(out_dir),
+        "dir_mode": f"{os.stat(out_dir).st_mode & 0o777:04o}",
         "written": written,
         "skipped": skipped,
         "audit_summary": report["summary"],
@@ -479,9 +577,13 @@ def main(argv: list[str] | None = None) -> int:
     p_audit = sub.add_parser("audit", help="Audit all venue credentials without printing any secret values")
     p_audit.add_argument("--env", type=Path, required=True)
 
-    p_split = sub.add_parser("split", help="Emit isolated 0600 env files from unified env")
+    p_split = sub.add_parser("split", help="Emit isolated runtime env files from unified env")
     p_split.add_argument("--env", type=Path, required=True)
     p_split.add_argument("--out-dir", type=Path, required=True)
+    p_split.add_argument("--trading-mode", default=None, help="Octal mode for trading env files (default 0600, or 0640 with --group / /etc/aleph-tx)")
+    p_split.add_argument("--owner", default=None, help="Optional owner user or uid for trading env files")
+    p_split.add_argument("--group", default=None, help="Optional group name or gid for trading env files (e.g. aleph-tx-trader)")
+    p_split.add_argument("--dir-mode", default=None, help="Optional octal mode to apply to --out-dir (default preserves existing dirs)")
 
     args = parser.parse_args(argv)
     if not args.env.is_file():
@@ -493,7 +595,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(audit_env_dict(env, duplicates, env_path=str(args.env)), indent=2))
         return 0
     if args.command == "split":
-        print(json.dumps(split_env_file(args.env, args.out_dir), indent=2))
+        trading_mode = _parse_octal_mode(args.trading_mode) if args.trading_mode is not None else None
+        dir_mode = int(args.dir_mode, 8) if args.dir_mode is not None else None
+        print(json.dumps(
+            split_env_file(
+                args.env,
+                args.out_dir,
+                trading_mode=trading_mode,
+                owner=args.owner,
+                group=args.group,
+                dir_mode=dir_mode,
+            ),
+            indent=2,
+        ))
         return 0
     return 2
 

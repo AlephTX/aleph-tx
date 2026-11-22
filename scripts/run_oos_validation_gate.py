@@ -411,21 +411,48 @@ def evaluate_rth_ant_gate(
     }
 
 
+EXPECTED_RWA_FULL_MARKETS = frozenset({"NVDA", "SPY", "QQQ", "AMZN", "AAPL", "TSLA"})
+EXPECTED_RWA_EX_NVDA_MARKETS = EXPECTED_RWA_FULL_MARKETS - {"NVDA"}
+
+
+def _require_bool(mapping: dict[str, Any], key: str, *, ctx: str) -> bool:
+    if key not in mapping:
+        raise ValueError(f"missing required boolean field {key!r} in {ctx}")
+    val = mapping[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"field {key!r} must be boolean in {ctx}")
+    return val
+
+
 def _summarize_rwa_arm(summary: dict[str, Any], arm_name: str, *, exclude_nvda: bool) -> dict[str, Any]:
+    markets = summary.get("markets")
+    if not isinstance(markets, dict):
+        raise ValueError("missing required 'markets' mapping in W15 RWA summary")
     if not exclude_nvda:
+        actual_full = frozenset(markets.keys())
+        if actual_full != EXPECTED_RWA_FULL_MARKETS:
+            raise ValueError(
+                f"W15 RWA full_6markets set mismatch: expected {sorted(EXPECTED_RWA_FULL_MARKETS)}, got {sorted(actual_full)}"
+            )
         arm = (summary.get("aggregate_6markets") or {}).get(arm_name)
         if not arm:
             raise KeyError(f"missing aggregate_6markets arm {arm_name!r}")
+        ctx = f"aggregate_6markets.{arm_name}"
         return {
             "core_maker_usd": float(arm["core_maker_usd"]),
             "dual_usd": float(arm["dual_usd"]),
             "terminal_liq_cash_usd": float(arm["terminal_liq_cash_usd"]),
             "core_usd_per_m_liq": float(arm["single_venue_core_usd_per_m_liq"]),
-            "terminal_flat_all": bool(arm.get("terminal_flat_all")),
-            "drawdown_58_breached": bool(arm.get("drawdown_58_breached")),
+            "terminal_flat_all": _require_bool(arm, "terminal_flat_all", ctx=ctx),
+            "drawdown_58_breached": _require_bool(arm, "drawdown_58_breached", ctx=ctx),
         }
 
-    markets = summary.get("markets") or {}
+    actual_ex_nvda = frozenset(sym for sym in markets if sym != "NVDA")
+    if actual_ex_nvda != EXPECTED_RWA_EX_NVDA_MARKETS:
+        raise ValueError(
+            f"W15 RWA ex-NVDA market set mismatch: expected {sorted(EXPECTED_RWA_EX_NVDA_MARKETS)}, got {sorted(actual_ex_nvda)}"
+        )
+
     core_vol = 0.0
     dual_vol = 0.0
     liq_cash = 0.0
@@ -434,23 +461,25 @@ def _summarize_rwa_arm(summary: dict[str, Any], arm_name: str, *, exclude_nvda: 
     halt_blocks = 0
     max_mkt_dd = 0.0
     count = 0
-    for sym, sym_data in markets.items():
-        if sym == "NVDA":
-            continue
+    for sym in sorted(EXPECTED_RWA_EX_NVDA_MARKETS):
+        sym_data = markets[sym]
         arm = (sym_data.get("arms") or {}).get(arm_name)
         if not arm:
             raise KeyError(f"missing market {sym!r} arm {arm_name!r}")
+        ctx = f"markets.{sym}.arms.{arm_name}"
         core_vol += float(arm["core_maker_usd"])
         dual_vol += float(arm["dual_usd"])
         liq_cash += float(arm["terminal_liq_cash_usd"])
-        flat_all = flat_all and bool(arm.get("terminal_flat_liq_ok", True))
-        mkt_dd = float(arm.get("max_drawdown_usd", 0.0))
+        flat_all = flat_all and _require_bool(arm, "terminal_flat_liq_ok", ctx=ctx)
+        if "max_drawdown_usd" not in arm or isinstance(arm["max_drawdown_usd"], bool):
+            raise ValueError(f"missing or non-numeric max_drawdown_usd in {ctx}")
+        mkt_dd = float(arm["max_drawdown_usd"])
         max_mkt_dd = max(max_mkt_dd, mkt_dd)
-        any_58_breach = any_58_breach or bool(arm.get("drawdown_58_breached")) or mkt_dd >= 580.0
+        any_58_breach = any_58_breach or bool(arm.get("drawdown_58_breached", False)) or mkt_dd >= 580.0
         halt_blocks += int(arm.get("halt_blocked", 0))
         count += 1
-    if count == 0 or core_vol <= 0.0:
-        raise ValueError(f"empty ex-NVDA volume for {arm_name}")
+    if count != len(EXPECTED_RWA_EX_NVDA_MARKETS) or core_vol <= 0.0:
+        raise ValueError(f"invalid ex-NVDA volume/count ({count}) for {arm_name}")
     return {
         "markets_included": count,
         "core_maker_usd": round(core_vol, 2),
@@ -704,7 +733,7 @@ def main() -> int:
         res["input_json"] = str(args.rwa_summary_json)
         args.output.write_text(json.dumps(res, indent=2) + "\n")
         print(json.dumps({"gate": res["gate"], "verdict": res["verdict"], "arms": res["arms"]}, indent=2))
-        return 0
+        return 0 if res["verdict"] in ("GO_HEDGED", "GO_UNHEDGED_ONLY") else 1
     if args.command == "w17-crash-pause-verify":
         res = verify_w17_crash_pause_prereg(args.prereg, repo_root)
         print(json.dumps(res, indent=2))

@@ -628,6 +628,30 @@ class OosValidationGateTests(unittest.TestCase):
         dd_breach = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0, other_dd=600.0)
         self.assertEqual(evaluate_w15_rwa_gate(dd_breach)["verdict"], "NO_GO")
 
+    def test_w15_rwa_gate_fails_closed_on_missing_fields_incomplete_markets_and_no_go_exit_code(self) -> None:
+        missing_flat = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
+        del missing_flat["markets"]["SPY"]["arms"]["CORE_HEDGE_SELF_PULL05_C310"]["terminal_flat_liq_ok"]
+        with self.assertRaises(ValueError):
+            evaluate_w15_rwa_gate(missing_flat)
+
+        partial_markets = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
+        del partial_markets["markets"]["TSLA"]
+        with self.assertRaises(ValueError):
+            evaluate_w15_rwa_gate(partial_markets)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            go_json = root / "go.json"
+            no_go_json = root / "nogo.json"
+            out_json = root / "out.json"
+            go_json.write_text(json.dumps(_sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)))
+            no_go_json.write_text(json.dumps(_sample_rwa_summary(nvda_cash=-80.0, other_cash=-15.0)))
+
+            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--rwa-summary-json", str(go_json), "--output", str(out_json)]):
+                self.assertEqual(cli_main(), 0)
+            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--rwa-summary-json", str(no_go_json), "--output", str(out_json)]):
+                self.assertEqual(cli_main(), 1)
+
     def test_w17_crash_pause_verify_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

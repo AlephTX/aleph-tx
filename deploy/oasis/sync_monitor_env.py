@@ -28,6 +28,10 @@ PRESERVED_OPERATIONAL_KEYS = (
     "ALEPH_MONITOR_RETENTION_DAYS",
     "ALEPH_MONITOR_PORT",
 )
+SENSITIVE_PRESERVED_KEYS = frozenset({
+    "ALEPH_MONITOR_CONTROL_TOKEN",
+    "ALEPH_MONITOR_ALERT_WEBHOOK",
+})
 PRESERVED_PUBLIC_OVERRIDE_KEYS = (
     "ALEPH_MONITOR_HL_XYZ_ADDRESS",
     "ALEPH_MONITOR_HL_IO_ADDRESS",
@@ -101,16 +105,19 @@ def build_monitor_env(source_env: dict[str, str], existing_env: dict[str, str] |
     return pairs
 
 
-def render_monitor_env(pairs: list[tuple[str, str]]) -> str:
+def render_monitor_env(pairs: list[tuple[str, str]], *, redact_sensitive: bool = False) -> str:
     lines = ["# Managed public-only identifiers & operational monitor settings (mode 0600)."]
-    lines.extend(f"{key}={value}" for key, value in pairs)
+    for key, value in pairs:
+        shown = "<redacted>" if redact_sensitive and key in SENSITIVE_PRESERVED_KEYS else value
+        lines.append(f"{key}={shown}")
     return "\n".join(lines) + "\n"
 
 
 def sync_monitor_env_file(source: Path, output: Path | None = None, *, dry_run: bool = False) -> str:
     source_env = parse_dotenv(source)
     existing_env = parse_dotenv(output) if (output is not None and output.is_file()) else None
-    rendered = render_monitor_env(build_monitor_env(source_env, existing_env))
+    pairs = build_monitor_env(source_env, existing_env)
+    rendered = render_monitor_env(pairs, redact_sensitive=False)
     if output is not None and not dry_run:
         output.parent.mkdir(parents=True, exist_ok=True)
         tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
@@ -124,18 +131,23 @@ def sync_monitor_env_file(source: Path, output: Path | None = None, *, dry_run: 
             if tmp.exists():
                 tmp.unlink()
             raise
-    return rendered
+        return rendered
+    return render_monitor_env(pairs, redact_sensitive=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="Private `.env*` file to extract public IDs from")
     parser.add_argument("--output", type=Path, default=None, help="Destination monitor.env path (writes mode 0600)")
-    parser.add_argument("--dry-run", action="store_true", help="Print rendered public-only env without writing")
+    parser.add_argument("--dry-run", action="store_true", help="Print redacted preview without writing secrets")
     args = parser.parse_args()
-    rendered = sync_monitor_env_file(args.source, args.output, dry_run=args.dry_run)
     if args.dry_run or args.output is None:
-        sys.stdout.write(rendered)
+        source_env = parse_dotenv(args.source)
+        existing_env = parse_dotenv(args.output) if (args.output is not None and args.output.is_file()) else None
+        pairs = build_monitor_env(source_env, existing_env)
+        sys.stdout.write(render_monitor_env(pairs, redact_sensitive=True))
+    else:
+        sync_monitor_env_file(args.source, args.output, dry_run=False)
     return 0
 
 

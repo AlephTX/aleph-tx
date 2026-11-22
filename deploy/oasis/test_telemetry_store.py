@@ -937,6 +937,111 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
             for forbidden in ("ab" * 8, "cd" * 8, "ef" * 8, "12" * 8, "syntheticbase58token", "nevercopy", "PRIVATE", "SECRET"):
                 self.assertNotIn(forbidden, rendered)
 
+    def test_sync_monitor_env_dry_run_redacts_tokens_and_webhooks(self):
+        import subprocess
+        import sys
+        import sync_monitor_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / ".env.private"
+            dst = root / "monitor.env"
+            src.write_text("HYPERLIQUID_ACCOUNT_ADDRESS=0x1111111111111111111111111111111111111111\n", encoding="utf-8")
+            tok = "tok_should_never_leak_to_stdout"
+            hook = "https://hooks.example.com/services/SECRET_WEBHOOK"
+            dst.write_text(
+                f"ALEPH_MONITOR_CONTROL_TOKEN={tok}\n"
+                f"ALEPH_MONITOR_ALERT_WEBHOOK={hook}\n"
+                "ALEPH_MONITOR_PORT=8765\n",
+                encoding="utf-8",
+            )
+            preview = sync_monitor_env.sync_monitor_env_file(src, dst, dry_run=True)
+            self.assertIn("ALEPH_MONITOR_CONTROL_TOKEN=<redacted>", preview)
+            self.assertIn("ALEPH_MONITOR_ALERT_WEBHOOK=<redacted>", preview)
+            self.assertIn("ALEPH_MONITOR_HL_ADDRESS=0x1111111111111111111111111111111111111111", preview)
+            self.assertNotIn(tok, preview)
+            self.assertNotIn(hook, preview)
+
+            script = Path(__file__).resolve().parent / "sync_monitor_env.py"
+            proc = subprocess.run(
+                [sys.executable, str(script), "--source", str(src), "--output", str(dst), "--dry-run"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertNotIn(tok, proc.stdout)
+            self.assertNotIn(hook, proc.stdout)
+            self.assertIn("ALEPH_MONITOR_CONTROL_TOKEN=<redacted>", proc.stdout)
+            # dry-run must leave dst untouched
+            self.assertIn(tok, dst.read_text(encoding="utf-8"))
+
+    def test_prune_telemetry_dir_verifies_ingest_offsets_before_unlink(self):
+        import os
+        import subprocess
+        import sys
+        from telemetry_store import prune_telemetry_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "monitor.sqlite3"
+            now_secs = 2_000_000.0
+            old_ts = now_secs - 10 * 86_400
+
+            pending = root / "pending.jsonl"
+            pending.write_text(
+                json.dumps({"type": "session", "ts_ms": 1_000, "exchange": "lighter", "symbol": "ETH", "account": 1}) + "\n"
+                + json.dumps(fill(2_000, "buy", 2000.0, 0.2, 0.0, 501, fee_source="explicit_zero")) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(pending, (old_ts, old_ts))
+
+            # Direct offset guard refuses to delete an uningested expired file.
+            blocked = prune_telemetry_dir(
+                root, max_age_days=7, now_secs=now_secs, ingested_offsets={}, require_ingested=True
+            )
+            self.assertEqual(blocked["deleted"], [])
+            self.assertEqual(blocked["skipped_uningested"], ["pending.jsonl"])
+            self.assertTrue(pending.is_file())
+
+            # Partial offset also refuses deletion.
+            st = os.stat(pending)
+            partial = prune_telemetry_dir(
+                root,
+                max_age_days=7,
+                now_secs=now_secs,
+                ingested_offsets={"pending.jsonl": (st.st_ino, st.st_size - 5)},
+                require_ingested=True,
+            )
+            self.assertEqual(partial["deleted"], [])
+            self.assertTrue(pending.is_file())
+
+            # CLI `--db` flushes ingest BEFORE deleting so fills survive in SQLite.
+            cli = Path(__file__).resolve().parent / "telemetry_store.py"
+            subprocess.run(
+                [sys.executable, str(cli), "prune", "--dir", str(root), "--db", str(db_path),
+                 "--max-age-days", "7", "--retention-days", "14"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertFalse(pending.exists())
+            store = TelemetryStore(db_path, root)
+            try:
+                self.assertEqual(len(store.fills()), 1)
+                self.assertEqual(store.fills()[0]["trade_id"], 501)
+            finally:
+                store.db.close()
+
+    def test_parse_retention_days_handles_invalid_env_gracefully(self):
+        import monitor
+
+        self.assertEqual(monitor.parse_retention_days("14"), 14.0)
+        self.assertEqual(monitor.parse_retention_days("0"), 0.0)
+        self.assertEqual(monitor.parse_retention_days("not-a-number"), 14.0)
+        self.assertEqual(monitor.parse_retention_days("nan"), 14.0)
+        self.assertEqual(monitor.parse_retention_days("-3"), 14.0)
+        self.assertEqual(monitor.parse_retention_days(""), 14.0)
+
 
 if __name__ == "__main__":
     unittest.main()

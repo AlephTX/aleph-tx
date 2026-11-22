@@ -52,7 +52,7 @@ Audit your unified local `.env` (no secrets printed) and split least-privilege f
 
 ```sh
 python3 scripts/onboard_exchange_env.py audit --env .env.all_exchanges
-python3 scripts/onboard_exchange_env.py split --env .env.all_exchanges --out-dir /etc/aleph-tx
+sudo python3 scripts/onboard_exchange_env.py split --env .env.all_exchanges --out-dir /etc/aleph-tx --owner root --group aleph-tx-trader --trading-mode 0640
 sudo systemctl restart aleph-tx-monitor.service
 
 # Read-only public readiness & fee-tier check across configured venues:

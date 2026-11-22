@@ -10,6 +10,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 try:
@@ -50,7 +51,22 @@ DB_PATH = os.environ.get("ALEPH_MONITOR_DB", "/var/lib/aleph-tx-monitor/telemetr
 CONTROL_TOKEN = os.environ.get("ALEPH_MONITOR_CONTROL_TOKEN", "")
 ALERT_WEBHOOK = os.environ.get("ALEPH_MONITOR_ALERT_WEBHOOK", "").strip()
 ALERT_INTERVAL = 15
-RETENTION_DAYS = float(os.environ.get("ALEPH_MONITOR_RETENTION_DAYS", "14"))
+def parse_retention_days(raw, default=14.0):
+    """Parse ALEPH_MONITOR_RETENTION_DAYS safely without crashing dashboard startup."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"invalid ALEPH_MONITOR_RETENTION_DAYS={raw!r}; defaulting to {default}", file=sys.stderr, flush=True)
+        return default
+    if not math.isfinite(value) or value < 0:
+        print(f"out-of-range ALEPH_MONITOR_RETENTION_DAYS={raw!r}; defaulting to {default}", file=sys.stderr, flush=True)
+        return default
+    return value
+
+
+RETENTION_DAYS = parse_retention_days(os.environ.get("ALEPH_MONITOR_RETENTION_DAYS", "14"))
 PRUNE_INTERVAL = 3600
 LIVE_UNITS = ("aleph-tx-live.service", "aleph-tx-arcus-xyz.service")
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -361,7 +377,7 @@ def alert_loop(store, alerter):
         try:
             status = {"services": services(), "markets": markets(), "disk": disk_status()}
             now_ms = int(time.time() * 1000)
-            alerter.update(evaluate(status, store.summary(now_ms=now_ms), now_ms))
+            alerter.update(evaluate(status, store.alert_summary(now_ms=now_ms), now_ms))
         except Exception as exc:  # keep serving; the next pass retries
             print(f"alert evaluation failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(ALERT_INTERVAL)
