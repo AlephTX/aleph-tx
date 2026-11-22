@@ -104,7 +104,7 @@ func main() {
 		wg.Add(1)
 		go func(url string, secs []config.ExchangeConfig) {
 			defer wg.Done()
-			hl := exchanges.NewHyperliquidGroup(url, secs, matrix)
+			hl := exchanges.NewHyperliquidGroupWithDepth(url, secs, matrix, depthWriter)
 			log.Printf("🔌 Hyperliquid/HIP-3 (%s): starting %d section(s)...", url, len(secs))
 			if err := hl.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("Hyperliquid (%s): %v", url, err)

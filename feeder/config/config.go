@@ -35,6 +35,8 @@ type ExchangeSection struct {
 	FeederRESTURL       string            `toml:"feeder_rest_url"`
 	FeederSymbols       map[string]string `toml:"feeder_symbols"`
 	FeederPublicSymbols map[string]string `toml:"feeder_public_symbols"`
+	FeederFastBook      bool              `toml:"feeder_fast_book"`
+	FeederBBOChannel    bool              `toml:"feeder_bbo_channel"`
 
 	// Strategy settings (ignored by feeder)
 	ExchangeID uint16 `toml:"exchange_id"`
@@ -49,6 +51,8 @@ type ExchangeConfig struct {
 	RESTURL       string            `toml:"rest_url"`
 	Symbols       map[string]string `toml:"symbols"`
 	PublicSymbols map[string]string `toml:"public_symbols"`
+	FastBook      bool              `toml:"fast_book"`
+	BBOChannel    bool              `toml:"bbo_channel"`
 }
 
 // AllPublicSymbols merges primary Symbols with optional PublicSymbols for
@@ -84,22 +88,28 @@ func (c *Config) ToExchangeMap() map[string]ExchangeConfig {
 			PublicSymbols: c.LighterRobinhood.FeederPublicSymbols,
 		},
 		"hyperliquid": {
-			Enabled: c.Hyperliquid.FeederEnabled,
-			WSURL:   c.Hyperliquid.FeederWSURL,
-			RESTURL: c.Hyperliquid.FeederRESTURL,
-			Symbols: c.Hyperliquid.FeederSymbols,
+			Enabled:    c.Hyperliquid.FeederEnabled,
+			WSURL:      c.Hyperliquid.FeederWSURL,
+			RESTURL:    c.Hyperliquid.FeederRESTURL,
+			Symbols:    c.Hyperliquid.FeederSymbols,
+			FastBook:   c.Hyperliquid.FeederFastBook,
+			BBOChannel: c.Hyperliquid.FeederBBOChannel,
 		},
 		"entropy": {
-			Enabled: c.Entropy.FeederEnabled,
-			WSURL:   c.Entropy.FeederWSURL,
-			RESTURL: c.Entropy.FeederRESTURL,
-			Symbols: c.Entropy.FeederSymbols,
+			Enabled:    c.Entropy.FeederEnabled,
+			WSURL:      c.Entropy.FeederWSURL,
+			RESTURL:    c.Entropy.FeederRESTURL,
+			Symbols:    c.Entropy.FeederSymbols,
+			FastBook:   c.Entropy.FeederFastBook,
+			BBOChannel: c.Entropy.FeederBBOChannel,
 		},
 		"tradexyz": {
-			Enabled: c.TradeXYZ.FeederEnabled,
-			WSURL:   c.TradeXYZ.FeederWSURL,
-			RESTURL: c.TradeXYZ.FeederRESTURL,
-			Symbols: c.TradeXYZ.FeederSymbols,
+			Enabled:    c.TradeXYZ.FeederEnabled,
+			WSURL:      c.TradeXYZ.FeederWSURL,
+			RESTURL:    c.TradeXYZ.FeederRESTURL,
+			Symbols:    c.TradeXYZ.FeederSymbols,
+			FastBook:   c.TradeXYZ.FeederFastBook,
+			BBOChannel: c.TradeXYZ.FeederBBOChannel,
 		},
 		"arcus": {
 			Enabled: c.Arcus.FeederEnabled,
