@@ -6,11 +6,14 @@
 //!   - Entry quote distance `>= partner_fee_bps + conditional_markout_bps + min_entry_profit_bps`;
 //!   - Continuous 10h (`36_000_000 ms`) checkpoints with exact witnessed funding reconciliation.
 
+use crate::strategy::portfolio_risk::{
+    CarryBudgetAllocation, CarryBudgetConfig, allocate_carry_budgets,
+};
 use anyhow::{Result, ensure};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const UNIT_MS: u64 = 36_000_000;
@@ -686,6 +689,175 @@ impl MultiDayCarryScenario {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiDayCarryPortfolioRequest {
+    pub scenarios: Vec<MultiDayCarryScenario>,
+    pub leg_vols: Vec<f64>,
+    pub corr: Vec<Vec<f64>>,
+    pub historical_portfolio_returns: Vec<f64>,
+    pub mean_return: f64,
+    pub variance: f64,
+    pub budget: CarryBudgetConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiDayCarryPortfolioLegReport {
+    pub market: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub allocated_notional_usd: Decimal,
+    pub executed: bool,
+    pub report: Option<MultiDayCarryReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiDayCarryPortfolioReport {
+    pub allocation: CarryBudgetAllocation,
+    pub legs: Vec<MultiDayCarryPortfolioLegReport>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_allocated_notional_usd: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_net_variable_pnl_usd: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_net_all_in_pnl_usd: Decimal,
+    pub all_cash_identities_reconciled: bool,
+}
+
+fn finite_notional_to_decimal_6dp(raw_notional: f64, market: &str) -> Result<Decimal> {
+    ensure!(
+        raw_notional.is_finite() && raw_notional >= 0.0,
+        "allocated notional for {market} must be non-negative and finite"
+    );
+    let scaled = (raw_notional * 1_000_000.0).round();
+    ensure!(
+        scaled.is_finite() && scaled >= 0.0 && scaled < (i128::MAX as f64),
+        "scaled allocated notional for {market} overflows i128"
+    );
+    Decimal::try_from_i128_with_scale(scaled as i128, 6)
+        .map_err(|err| anyhow::anyhow!("allocated notional for {market} overflows Decimal: {err}"))
+}
+
+pub fn evaluate_multiday_carry_portfolio(
+    req: &MultiDayCarryPortfolioRequest,
+) -> Result<MultiDayCarryPortfolioReport> {
+    ensure!(
+        !req.scenarios.is_empty(),
+        "multi-day carry portfolio scenarios must be non-empty"
+    );
+    ensure!(
+        req.leg_vols.len() == req.scenarios.len(),
+        "leg_vols length ({}) must match scenarios length ({})",
+        req.leg_vols.len(),
+        req.scenarios.len()
+    );
+
+    let mut seen_pairs = HashSet::with_capacity(req.scenarios.len());
+    for scenario in &req.scenarios {
+        ensure!(
+            !scenario.config.market.is_empty()
+                && !scenario.config.legs[0].is_empty()
+                && !scenario.config.legs[1].is_empty()
+                && scenario.config.legs[0] != scenario.config.legs[1],
+            "multi-day carry portfolio scenario requires distinct leg venues and market symbol"
+        );
+        ensure!(
+            scenario.config.capital_usd > Decimal::ZERO,
+            "capital_usd for {} must be positive",
+            scenario.config.market
+        );
+        ensure!(
+            seen_pairs.insert((scenario.config.market.as_str(), &scenario.config.legs)),
+            "duplicate market/legs pair in multi-day carry portfolio: {} [{}, {}]",
+            scenario.config.market,
+            scenario.config.legs[0],
+            scenario.config.legs[1]
+        );
+    }
+
+    let allocation = allocate_carry_budgets(
+        &req.leg_vols,
+        &req.corr,
+        &req.historical_portfolio_returns,
+        req.mean_return,
+        req.variance,
+        &req.budget,
+    )?;
+    ensure!(
+        allocation.leg_notionals_usd.len() == req.scenarios.len(),
+        "carry budget leg allocation length mismatch"
+    );
+
+    let mut legs = Vec::with_capacity(req.scenarios.len());
+    let mut total_allocated_notional_usd = Decimal::ZERO;
+    let mut total_net_variable_pnl_usd = Decimal::ZERO;
+    let mut total_net_all_in_pnl_usd = Decimal::ZERO;
+    let mut all_cash_identities_reconciled = true;
+
+    for (scenario, &raw_notional) in req
+        .scenarios
+        .iter()
+        .zip(allocation.leg_notionals_usd.iter())
+    {
+        let allocated_dec = finite_notional_to_decimal_6dp(raw_notional, &scenario.config.market)?;
+        if allocated_dec <= Decimal::ZERO {
+            legs.push(MultiDayCarryPortfolioLegReport {
+                market: scenario.config.market.clone(),
+                allocated_notional_usd: Decimal::ZERO,
+                executed: false,
+                report: None,
+            });
+            continue;
+        }
+
+        let max_leg_notional = scenario
+            .config
+            .capital_usd
+            .checked_mul(Decimal::from(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "capital_usd 5x bound overflow for market {}",
+                    scenario.config.market
+                )
+            })?;
+        ensure!(
+            allocated_dec <= max_leg_notional,
+            "risk-budget allocated notional {allocated_dec} for {} exceeds 5x single-leg capital bound {max_leg_notional}",
+            scenario.config.market
+        );
+
+        let mut cloned = scenario.clone();
+        cloned.config.target_leg_notional_usd = allocated_dec;
+        let report = cloned.evaluate()?;
+
+        total_allocated_notional_usd = total_allocated_notional_usd
+            .checked_add(allocated_dec)
+            .ok_or_else(|| anyhow::anyhow!("total_allocated_notional_usd overflow"))?;
+        total_net_variable_pnl_usd = total_net_variable_pnl_usd
+            .checked_add(report.net_variable_pnl_usd)
+            .ok_or_else(|| anyhow::anyhow!("total_net_variable_pnl_usd overflow"))?;
+        total_net_all_in_pnl_usd = total_net_all_in_pnl_usd
+            .checked_add(report.net_all_in_pnl_usd)
+            .ok_or_else(|| anyhow::anyhow!("total_net_all_in_pnl_usd overflow"))?;
+        all_cash_identities_reconciled &= report.cash_identity_reconciled;
+
+        legs.push(MultiDayCarryPortfolioLegReport {
+            market: scenario.config.market.clone(),
+            allocated_notional_usd: allocated_dec,
+            executed: true,
+            report: Some(report),
+        });
+    }
+
+    Ok(MultiDayCarryPortfolioReport {
+        allocation,
+        legs,
+        total_allocated_notional_usd,
+        total_net_variable_pnl_usd,
+        total_net_all_in_pnl_usd,
+        all_cash_identities_reconciled,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,5 +1224,122 @@ mod tests {
         assert_eq!(rep.vol_scale_applied, Decimal::ZERO);
         assert_eq!(rep.exit_reason, CarryExitReason::InsufficientVolPrior);
         assert_eq!(rep.status, "vol_scale_insufficient");
+    }
+
+    #[test]
+    fn portfolio_allocation_reconciles_multileg_cash_and_handles_brake_zero() {
+        let mut eth = scenario("2.0");
+        eth.config.market = "ETH".into();
+        let sol = scenario("2.0");
+        let mut ant = scenario("2.0");
+        ant.config.market = "ANT".into();
+
+        let mut hist = vec![0.001; 39];
+        hist.push(-0.08);
+        // vols [0.015, 0.030, 0.045] with max_single_leg_weight=0.5 -> weights [0.5, 0.3, 0.2]
+        // ES(97.5%) = 0.08, max_gross=3000, max_es_loss=120 -> es_budget_scale = 120 / (3000*0.08) = 0.5
+        // allocated_gross = 1500 -> leg notionals [750, 450, 300]
+        let req = MultiDayCarryPortfolioRequest {
+            scenarios: vec![eth, sol, ant],
+            leg_vols: vec![0.015, 0.030, 0.045],
+            corr: vec![
+                vec![1.0, 0.25, 0.10],
+                vec![0.25, 1.0, 0.20],
+                vec![0.10, 0.20, 1.0],
+            ],
+            historical_portfolio_returns: hist,
+            mean_return: 0.20,
+            variance: 0.01,
+            budget: CarryBudgetConfig {
+                max_gross_notional_usd: 3_000.0,
+                max_single_leg_weight: 0.50,
+                max_es_loss_usd: 120.0,
+                ..CarryBudgetConfig::default()
+            },
+        };
+
+        let rep = evaluate_multiday_carry_portfolio(&req).unwrap();
+        assert!(rep.all_cash_identities_reconciled);
+        assert_eq!(rep.legs.len(), 3);
+        assert_eq!(rep.total_allocated_notional_usd, d("1500"));
+        assert_eq!(rep.legs[0].market, "ETH");
+        assert_eq!(rep.legs[0].allocated_notional_usd, d("750"));
+        assert_eq!(rep.legs[1].market, "SOL");
+        assert_eq!(rep.legs[1].allocated_notional_usd, d("450"));
+        assert_eq!(rep.legs[2].market, "ANT");
+        assert_eq!(rep.legs[2].allocated_notional_usd, d("300"));
+        for leg in &rep.legs {
+            assert!(leg.executed);
+            let inner = leg.report.as_ref().expect("executed leg report");
+            assert!(inner.cash_identity_reconciled);
+            assert_eq!(inner.effective_leg_notional_usd, leg.allocated_notional_usd);
+        }
+        let expected_var: Decimal = rep
+            .legs
+            .iter()
+            .map(|l| l.report.as_ref().unwrap().net_variable_pnl_usd)
+            .sum();
+        let expected_all_in: Decimal = rep
+            .legs
+            .iter()
+            .map(|l| l.report.as_ref().unwrap().net_all_in_pnl_usd)
+            .sum();
+        assert_eq!(rep.total_net_variable_pnl_usd, expected_var);
+        assert_eq!(rep.total_net_all_in_pnl_usd, expected_all_in);
+
+        // Brake scale 0.0 halts all legs cleanly without running leg evaluations.
+        let mut braked = req;
+        braked.budget.brake_scale = 0.0;
+        let braked_rep = evaluate_multiday_carry_portfolio(&braked).unwrap();
+        assert!(braked_rep.all_cash_identities_reconciled);
+        assert_eq!(braked_rep.total_allocated_notional_usd, Decimal::ZERO);
+        assert_eq!(braked_rep.total_net_variable_pnl_usd, Decimal::ZERO);
+        assert_eq!(braked_rep.total_net_all_in_pnl_usd, Decimal::ZERO);
+        for leg in &braked_rep.legs {
+            assert!(!leg.executed);
+            assert_eq!(leg.allocated_notional_usd, Decimal::ZERO);
+            assert!(leg.report.is_none());
+        }
+    }
+
+    #[test]
+    fn portfolio_allocation_rejects_empty_mismatch_duplicates_and_capital_overflow() {
+        let sol = scenario("2.0");
+        let mut eth = scenario("2.0");
+        eth.config.market = "ETH".into();
+
+        let base = MultiDayCarryPortfolioRequest {
+            scenarios: vec![eth.clone(), sol.clone()],
+            leg_vols: vec![0.02, 0.02],
+            corr: vec![vec![1.0, 0.2], vec![0.2, 1.0]],
+            historical_portfolio_returns: vec![0.001, -0.02],
+            mean_return: 0.20,
+            variance: 0.01,
+            budget: CarryBudgetConfig {
+                max_gross_notional_usd: 2_000.0,
+                max_single_leg_weight: 0.50,
+                max_es_loss_usd: 200.0,
+                ..CarryBudgetConfig::default()
+            },
+        };
+
+        let mut empty = base.clone();
+        empty.scenarios.clear();
+        empty.leg_vols.clear();
+        assert!(evaluate_multiday_carry_portfolio(&empty).is_err());
+
+        let mut len_mismatch = base.clone();
+        len_mismatch.leg_vols.pop();
+        assert!(evaluate_multiday_carry_portfolio(&len_mismatch).is_err());
+
+        let mut dup = base.clone();
+        dup.scenarios[1].config.market = "ETH".into();
+        assert!(evaluate_multiday_carry_portfolio(&dup).is_err());
+
+        // Single-leg capital bound is 5x capital_usd: 100 * 5 = 500 < allocated 1000.
+        let mut cap_overflow = base;
+        cap_overflow.scenarios[0].config.capital_usd = d("100");
+        let err = evaluate_multiday_carry_portfolio(&cap_overflow).unwrap_err();
+        assert!(err.to_string().contains("5x single-leg capital bound"));
     }
 }

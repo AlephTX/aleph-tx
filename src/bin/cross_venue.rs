@@ -10,7 +10,10 @@ use aleph_tx::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
     strategy::matched_settlement::MatchedSettlement,
-    strategy::multiday_carry::MultiDayCarryScenario,
+    strategy::multiday_carry::{
+        MultiDayCarryPortfolioRequest, MultiDayCarryScenario, evaluate_multiday_carry_portfolio,
+    },
+    strategy::portfolio_risk::{PortfolioRiskScenario, evaluate_portfolio_risk_scenario},
     strategy::relative_value::{
         Frame as PerpFrame, MakerFirstConfig, MakerFirstEvent, PairConfig, PaperReport,
         PaperScenario, PaperWindow, run_maker_first, run_paper, run_paper_frames_with_window,
@@ -399,6 +402,16 @@ async fn main() -> Result<()> {
         [command, file] if command == "multiday-carry" => {
             print(&read_replay::<MultiDayCarryScenario>(file)?.evaluate()?)
         }
+        [command, file] if command == "multiday-carry-portfolio" => {
+            print(&evaluate_multiday_carry_portfolio(&read_replay::<
+                MultiDayCarryPortfolioRequest,
+            >(file)?)?)
+        }
+        [command, file] if command == "portfolio-risk" => {
+            print(&evaluate_portfolio_risk_scenario(&read_replay::<
+                PortfolioRiskScenario,
+            >(file)?)?)
+        }
         [command, config, file] if command == "maker-first-replay" => {
             let config: MakerFirstConfig = read_replay(config)?;
             let mut reader = BufReader::new(File::open(file)?);
@@ -571,7 +584,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | multiday-carry FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -744,5 +757,29 @@ mod tests {
                 .resolve_execution_capability("entropy", "base", "equity")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn portfolio_risk_example_fixture_evaluates_and_invalid_corr_fails_closed() {
+        let scenario: PortfolioRiskScenario =
+            serde_json::from_str(include_str!("../../examples/portfolio_risk_budget.json"))
+                .expect("parse portfolio_risk_budget.json");
+        let eval = evaluate_portfolio_risk_scenario(&scenario).expect("evaluate portfolio risk");
+        assert_eq!(eval.allocation.weights.len(), 3);
+        assert!(eval.allocation.allocated_gross_notional_usd > 0.0);
+        assert!(
+            eval.allocation.allocated_gross_notional_usd <= scenario.config.max_gross_notional_usd
+        );
+        assert!(eval.allocation.effective_scale <= 1.0);
+        assert!(eval.stress_on_allocated_notional.is_some());
+
+        let mut asymmetric_corr = scenario.clone();
+        asymmetric_corr.corr[0][1] = 0.99;
+        asymmetric_corr.corr[1][0] = 0.0;
+        assert!(evaluate_portfolio_risk_scenario(&asymmetric_corr).is_err());
+
+        let mut non_unit_diag = scenario;
+        non_unit_diag.corr[0][0] = 0.8;
+        assert!(evaluate_portfolio_risk_scenario(&non_unit_diag).is_err());
     }
 }
