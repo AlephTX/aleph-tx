@@ -12,7 +12,8 @@ use crate::exchanges::arcus::{
 };
 use crate::exchanges::hyperliquid::{
     AccountState as HlAccountState, ExecutionStatus as HlExecutionStatus, OpenOrder as HlOpenOrder,
-    OrderLookup as HlOrderLookup, SubmissionError as HlSubmissionError, ValidatedBook,
+    OrderLookup as HlOrderLookup, PerpAsset as HlPerpAsset, SubmissionError as HlSubmissionError,
+    ValidatedBook,
 };
 use crate::live_hedge::{
     IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill, classify_lookup,
@@ -55,8 +56,13 @@ fn default_max_hold_ms() -> u64 {
 fn default_max_arcus_age_ms() -> u64 {
     250
 }
+pub const HL_MIN_ORDER_NOTIONAL_USD: f64 = 10.0;
+
 fn default_max_hl_age_ms() -> u64 {
-    30_000
+    5_000
+}
+fn default_max_venue_clock_skew_ms() -> u64 {
+    2_000
 }
 fn default_slippage_bps() -> f64 {
     8.0
@@ -96,6 +102,8 @@ pub struct ArcusXyzBasisConfig {
     pub max_arcus_book_age_ms: u64,
     #[serde(default = "default_max_hl_age_ms")]
     pub max_hl_book_age_ms: u64,
+    #[serde(default = "default_max_venue_clock_skew_ms")]
+    pub max_venue_clock_skew_ms: u64,
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: f64,
     pub allocated_capital_usd: f64,
@@ -143,9 +151,9 @@ impl ArcusXyzBasisConfig {
         ensure!(
             self.clip_usd.is_finite()
                 && self.max_notional_usd.is_finite()
-                && self.clip_usd >= 5.0
+                && self.clip_usd >= HL_MIN_ORDER_NOTIONAL_USD
                 && self.max_notional_usd >= self.clip_usd,
-            "require 5.0 <= clip_usd <= max_notional_usd"
+            "require {HL_MIN_ORDER_NOTIONAL_USD:.1} <= clip_usd <= max_notional_usd"
         );
         ensure!(
             self.ladder_floor_frac.is_finite()
@@ -160,8 +168,9 @@ impl ArcusXyzBasisConfig {
             self.max_hold_ms >= 60_000
                 && self.max_arcus_book_age_ms > 0
                 && self.max_hl_book_age_ms > 0
+                && self.max_venue_clock_skew_ms <= 30_000
                 && self.poll_interval_ms >= 50,
-            "invalid hold, freshness, or polling timing bounds"
+            "invalid hold, freshness, clock-skew, or polling timing bounds"
         );
         ensure!(
             self.slippage_bps.is_finite() && self.slippage_bps > 0.0 && self.slippage_bps <= 100.0,
@@ -178,7 +187,7 @@ impl ArcusXyzBasisConfig {
         ensure!(
             self.canary_max_order_usd.is_finite()
                 && self.canary_max_total_notional_usd.is_finite()
-                && self.canary_max_order_usd >= 5.0
+                && self.canary_max_order_usd >= HL_MIN_ORDER_NOTIONAL_USD
                 && self.canary_max_total_notional_usd >= self.canary_max_order_usd,
             "invalid canary order/notional caps"
         );
@@ -253,7 +262,27 @@ pub enum BasisAction {
     },
 }
 
-/// Quantize base size down conservatively to satisfy both Arcus `step_size` and HL `sz_decimals`.
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Quantize base size down conservatively to HL's lot precision (`sz_decimals`).
+pub fn quantize_hl_base_qty(raw_qty: Decimal, hl_sz_decimals: u32) -> Result<Decimal> {
+    ensure!(
+        raw_qty > Decimal::ZERO && hl_sz_decimals <= 6,
+        "invalid HL quantization parameters"
+    );
+    Ok(raw_qty
+        .round_dp_with_strategy(hl_sz_decimals, RoundingStrategy::ToZero)
+        .normalize())
+}
+
+/// Quantize base size down onto the exact common LCM grid of Arcus `step_size` and HL `sz_decimals`.
 pub fn quantize_shared_base_qty(
     raw_qty: Decimal,
     arcus_step: Decimal,
@@ -263,17 +292,261 @@ pub fn quantize_shared_base_qty(
         raw_qty > Decimal::ZERO && arcus_step > Decimal::ZERO && hl_sz_decimals <= 6,
         "invalid quantization parameters"
     );
-    let hl_step = Decimal::new(1, hl_sz_decimals);
-    let coarse_step = arcus_step.max(hl_step);
-    let units = (raw_qty / coarse_step)
+    let arc_norm = arcus_step.normalize();
+    let hl_step = Decimal::new(1, hl_sz_decimals).normalize();
+    let scale = arc_norm.scale().max(hl_step.scale());
+    ensure!(scale <= 12, "step size precision exceeds 12 decimal places");
+    let pow10 = 10_i128.checked_pow(scale).context("step scale overflow")?;
+    let pow10_dec = Decimal::from_i128_with_scale(pow10, 0);
+    let arc_scaled = (arc_norm * pow10_dec).normalize();
+    ensure!(
+        arc_scaled.fract().is_zero() && arc_scaled > Decimal::ZERO,
+        "Arcus step_size {arcus_step} cannot be represented cleanly at scale {scale}"
+    );
+    let arc_ticks = u128::try_from(arc_scaled.mantissa()).context("Arcus step ticks overflow")?;
+    let hl_scaled = (hl_step * pow10_dec).normalize();
+    let hl_ticks = u128::try_from(hl_scaled.mantissa()).context("HL step ticks overflow")?;
+    let g = gcd_u128(arc_ticks, hl_ticks);
+    let lcm_ticks = (arc_ticks / g)
+        .checked_mul(hl_ticks)
+        .context("shared step LCM overflow")?;
+    let lcm_i128 = i128::try_from(lcm_ticks).context("shared step exceeds Decimal range")?;
+    let shared_step = Decimal::from_i128_with_scale(lcm_i128, scale).normalize();
+
+    let units = (raw_qty / shared_step)
         .round_dp_with_strategy(0, RoundingStrategy::ToZero)
         .max(Decimal::ZERO);
-    let q_arc = (units * coarse_step)
-        .round_dp_with_strategy(hl_sz_decimals, RoundingStrategy::ToZero)
-        .normalize();
-    // Ensure remaining integer multiples of arcus_step if hl_step < arcus_step.
-    let arc_units = (q_arc / arcus_step).round_dp_with_strategy(0, RoundingStrategy::ToZero);
-    Ok((arc_units * arcus_step).normalize())
+    let q = (units * shared_step).normalize();
+    if q > Decimal::ZERO {
+        ensure!(
+            (q % arcus_step).is_zero(),
+            "quantized qty {q} is not a multiple of arcus_step {arcus_step}"
+        );
+        ensure!(
+            q.scale() <= hl_sz_decimals,
+            "quantized qty {q} exceeds hl_sz_decimals {hl_sz_decimals}"
+        );
+    }
+    Ok(q)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VenueOrderConstraints {
+    pub arcus_step_size: Decimal,
+    pub arcus_min_order_size: Decimal,
+    pub arcus_min_order_notional_usd: f64,
+    pub hl_sz_decimals: u32,
+    pub hl_min_order_notional_usd: f64,
+}
+
+impl Default for VenueOrderConstraints {
+    fn default() -> Self {
+        Self {
+            arcus_step_size: Decimal::new(1, 6),
+            arcus_min_order_size: Decimal::new(1, 6),
+            arcus_min_order_notional_usd: 5.0,
+            hl_sz_decimals: 2,
+            hl_min_order_notional_usd: HL_MIN_ORDER_NOTIONAL_USD,
+        }
+    }
+}
+
+impl VenueOrderConstraints {
+    pub fn from_markets(arc: &ArcusMarket, hl: &HlPerpAsset) -> Result<Self> {
+        ensure!(
+            arc.step_size > Decimal::ZERO
+                && arc.min_order_size >= Decimal::ZERO
+                && arc.min_order_notional >= Decimal::ZERO
+                && hl.sz_decimals <= 6,
+            "invalid venue market constraints"
+        );
+        let arc_min_ntl = arc
+            .min_order_notional
+            .to_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .context("invalid Arcus min_order_notional")?;
+        Ok(Self {
+            arcus_step_size: arc.step_size,
+            arcus_min_order_size: arc.min_order_size.max(arc.step_size),
+            arcus_min_order_notional_usd: arc_min_ntl,
+            hl_sz_decimals: hl.sz_decimals,
+            hl_min_order_notional_usd: HL_MIN_ORDER_NOTIONAL_USD,
+        })
+    }
+
+    pub fn min_entry_notional_usd(&self) -> f64 {
+        HL_MIN_ORDER_NOTIONAL_USD
+            .max(self.hl_min_order_notional_usd)
+            .max(self.arcus_min_order_notional_usd)
+    }
+}
+
+/// Average-cost Arcus leg PnL estimator from verified fills and local mid price.
+/// Kept distinct from reported Hyperliquid equity in diagnostics/alerts.
+#[derive(Debug, Clone)]
+pub struct ArcusLegPnlTracker {
+    position: Decimal,
+    avg_cost: Decimal,
+    realized_pnl_usd: f64,
+    estimated_fees_usd: f64,
+    resynced: bool,
+}
+
+impl ArcusLegPnlTracker {
+    pub fn new(initial_pos: Decimal, initial_mid: Option<Decimal>) -> Self {
+        let avg_cost = if initial_pos == Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            initial_mid
+                .filter(|m| *m > Decimal::ZERO)
+                .unwrap_or(Decimal::ZERO)
+        };
+        Self {
+            position: initial_pos,
+            avg_cost,
+            realized_pnl_usd: 0.0,
+            estimated_fees_usd: 0.0,
+            resynced: false,
+        }
+    }
+
+    pub fn position(&self) -> Decimal {
+        self.position
+    }
+
+    pub fn avg_cost(&self) -> Decimal {
+        self.avg_cost
+    }
+
+    pub fn realized_pnl_usd(&self) -> f64 {
+        self.realized_pnl_usd
+    }
+
+    pub fn estimated_fees_usd(&self) -> f64 {
+        self.estimated_fees_usd
+    }
+
+    pub fn resynced(&self) -> bool {
+        self.resynced
+    }
+
+    /// Anchor cost basis on first live mid observation when session resumed with existing inventory.
+    pub fn anchor_initial_if_unpriced(&mut self, mark_mid: Decimal) {
+        if self.position != Decimal::ZERO
+            && self.avg_cost == Decimal::ZERO
+            && mark_mid > Decimal::ZERO
+        {
+            self.avg_cost = mark_mid;
+        }
+    }
+
+    pub fn record_fill(
+        &mut self,
+        is_buy: bool,
+        filled_qty: Decimal,
+        avg_price: Decimal,
+        fee_rate: f64,
+    ) {
+        if filled_qty <= Decimal::ZERO || avg_price <= Decimal::ZERO {
+            return;
+        }
+        if fee_rate.is_finite()
+            && fee_rate > 0.0
+            && let Some(notional) = (filled_qty * avg_price).to_f64()
+        {
+            self.estimated_fees_usd += notional * fee_rate;
+        }
+        let sign = if is_buy { Decimal::ONE } else { -Decimal::ONE };
+        if self.position == Decimal::ZERO || self.position.is_sign_positive() == is_buy {
+            let new_abs = self.position.abs() + filled_qty;
+            if self.avg_cost > Decimal::ZERO || self.position == Decimal::ZERO {
+                self.avg_cost =
+                    (self.position.abs() * self.avg_cost + filled_qty * avg_price) / new_abs;
+            }
+            self.position += sign * filled_qty;
+            return;
+        }
+        let close_qty = filled_qty.min(self.position.abs());
+        if self.avg_cost > Decimal::ZERO {
+            let close_sign = if self.position > Decimal::ZERO {
+                Decimal::ONE
+            } else {
+                -Decimal::ONE
+            };
+            let realized = close_qty * (avg_price - self.avg_cost) * close_sign;
+            if let Some(r_f64) = realized.to_f64() {
+                self.realized_pnl_usd += r_f64;
+            }
+        }
+        self.position += sign * close_qty;
+        let remainder = filled_qty - close_qty;
+        if self.position == Decimal::ZERO {
+            self.avg_cost = Decimal::ZERO;
+        }
+        if remainder > Decimal::ZERO {
+            self.position = sign * remainder;
+            self.avg_cost = avg_price;
+        }
+    }
+
+    pub fn sync_position(&mut self, venue_pos: Decimal, mark_mid: Option<Decimal>) {
+        if venue_pos == self.position {
+            return;
+        }
+        self.resynced = true;
+        if venue_pos == Decimal::ZERO {
+            self.position = Decimal::ZERO;
+            self.avg_cost = Decimal::ZERO;
+            return;
+        }
+        let mark = mark_mid.filter(|m| *m > Decimal::ZERO);
+        if self.position == Decimal::ZERO
+            || self.position.is_sign_positive() != venue_pos.is_sign_positive()
+        {
+            self.position = venue_pos;
+            self.avg_cost = mark.unwrap_or(Decimal::ZERO);
+        } else if venue_pos.abs() > self.position.abs() {
+            let extra = venue_pos.abs() - self.position.abs();
+            if self.avg_cost > Decimal::ZERO
+                && let Some(m) = mark
+            {
+                self.avg_cost = (self.position.abs() * self.avg_cost + extra * m) / venue_pos.abs();
+            }
+            self.position = venue_pos;
+        } else {
+            self.position = venue_pos;
+        }
+    }
+
+    pub fn estimated_total_pnl_usd(&self, current_mid: f64) -> Option<f64> {
+        let base = self.realized_pnl_usd - self.estimated_fees_usd;
+        if self.position == Decimal::ZERO {
+            return Some(base);
+        }
+        if !current_mid.is_finite() || current_mid <= 0.0 || self.avg_cost <= Decimal::ZERO {
+            return None;
+        }
+        let pos = self.position.to_f64()?;
+        let cost = self.avg_cost.to_f64()?;
+        Some(base + pos * (current_mid - cost))
+    }
+}
+
+/// Combine reported Hyperliquid equity delta with estimated Arcus fill/mid PnL for loss guarding.
+pub fn combined_guard_equity_usd(
+    allocated_capital_usd: f64,
+    hl_equity_delta_usd: f64,
+    arcus_estimated_pnl_usd: Option<f64>,
+) -> f64 {
+    let hl = if hl_equity_delta_usd.is_finite() {
+        hl_equity_delta_usd
+    } else {
+        0.0
+    };
+    let arc = arcus_estimated_pnl_usd
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    allocated_capital_usd + hl + arc
 }
 
 /// Conservatively align an IOC price bound inside the active Arcus tick grid.
@@ -324,6 +597,7 @@ pub struct BasisEngineCounters {
     pub entries_emitted: u64,
     pub exits_emitted: u64,
     pub residual_hedges_emitted: u64,
+    pub residual_blocked: u64,
     pub leung_li_blocked: u64,
     pub persist_reset_count: u64,
     pub brake_scaled_count: u64,
@@ -332,9 +606,11 @@ pub struct BasisEngineCounters {
 #[derive(Debug)]
 pub struct ArcusXyzBasisEngine {
     config: ArcusXyzBasisConfig,
+    constraints: VenueOrderConstraints,
     inv_arc: Decimal,
     inv_xyz: Decimal,
     in_flight: bool,
+    residual_blocked_reason: Option<&'static str>,
     entry_open_ms: Option<u64>,
     last_trade_arc_rx_ms: u64,
     last_trade_xyz_rx_ms: u64,
@@ -349,9 +625,11 @@ impl ArcusXyzBasisEngine {
         config.validate()?;
         Ok(Self {
             config,
+            constraints: VenueOrderConstraints::default(),
             inv_arc: Decimal::ZERO,
             inv_xyz: Decimal::ZERO,
             in_flight: false,
+            residual_blocked_reason: None,
             entry_open_ms: None,
             last_trade_arc_rx_ms: 0,
             last_trade_xyz_rx_ms: 0,
@@ -360,6 +638,18 @@ impl ArcusXyzBasisEngine {
             dust_qty: Decimal::new(1, 6),
             counters: BasisEngineCounters::default(),
         })
+    }
+
+    pub fn set_constraints(&mut self, constraints: VenueOrderConstraints) {
+        self.constraints = constraints;
+    }
+
+    pub fn constraints(&self) -> VenueOrderConstraints {
+        self.constraints
+    }
+
+    pub fn residual_blocked(&self) -> Option<&'static str> {
+        self.residual_blocked_reason
     }
 
     pub fn inv_arc(&self) -> Decimal {
@@ -386,6 +676,9 @@ impl ArcusXyzBasisEngine {
         self.inv_arc = inv_arc;
         self.inv_xyz = inv_xyz;
         self.in_flight = false;
+        if (self.inv_arc + self.inv_xyz).abs() <= self.dust_qty {
+            self.residual_blocked_reason = None;
+        }
         self.last_trade_arc_rx_ms = self.last_trade_arc_rx_ms.max(arc_rx_ms);
         self.last_trade_xyz_rx_ms = self.last_trade_xyz_rx_ms.max(xyz_rx_ms);
         if self.inv_arc.abs() <= self.dust_qty && self.inv_xyz.abs() <= self.dust_qty {
@@ -461,6 +754,35 @@ impl ArcusXyzBasisEngine {
                 reason: "stale_xyz_book",
             };
         }
+        let skew = self.config.max_venue_clock_skew_ms;
+        if arc.source_ms == 0 || arc.source_ms > now_ms.saturating_add(skew) {
+            self.reset_persist();
+            return BasisAction::Hold {
+                reason: "invalid_arcus_source_time",
+            };
+        }
+        if now_ms.saturating_sub(arc.source_ms)
+            > self.config.max_arcus_book_age_ms.saturating_add(skew)
+        {
+            self.reset_persist();
+            return BasisAction::Hold {
+                reason: "stale_arcus_source_book",
+            };
+        }
+        if xyz.bbo.timestamp_ms == 0 || xyz.bbo.timestamp_ms > now_ms.saturating_add(skew) {
+            self.reset_persist();
+            return BasisAction::Hold {
+                reason: "invalid_xyz_source_time",
+            };
+        }
+        if now_ms.saturating_sub(xyz.bbo.timestamp_ms)
+            > self.config.max_hl_book_age_ms.saturating_add(skew)
+        {
+            self.reset_persist();
+            return BasisAction::Hold {
+                reason: "stale_xyz_source_book",
+            };
+        }
 
         // Priority 0: Hedge unhedged single-leg residual before any exit or new entry.
         let unhedged = self.inv_arc + self.inv_xyz;
@@ -473,15 +795,49 @@ impl ArcusXyzBasisEngine {
                     reason: "invalid_hedge_limit",
                 };
             };
+            let cons_px = touch.min(limit_price);
+            let q_unhedged = quantize_hl_base_qty(unhedged.abs(), self.constraints.hl_sz_decimals)
+                .unwrap_or(Decimal::ZERO);
+            if q_unhedged <= Decimal::ZERO {
+                self.reset_persist();
+                self.residual_blocked_reason = Some("residual_below_hl_min_lot");
+                self.counters.residual_blocked += 1;
+                return BasisAction::Hold {
+                    reason: "residual_below_hl_min_lot",
+                };
+            }
+            let reduce_only_full =
+                (is_buy && self.inv_xyz < Decimal::ZERO && self.inv_xyz.abs() >= q_unhedged)
+                    || (!is_buy && self.inv_xyz > Decimal::ZERO && self.inv_xyz >= q_unhedged);
+            let unhedged_notional = (q_unhedged * cons_px).to_f64().unwrap_or(0.0);
+            if !reduce_only_full && unhedged_notional < self.constraints.hl_min_order_notional_usd {
+                self.reset_persist();
+                self.residual_blocked_reason = Some("residual_below_hl_min_notional");
+                self.counters.residual_blocked += 1;
+                return BasisAction::Hold {
+                    reason: "residual_below_hl_min_notional",
+                };
+            }
+
             let visible = xyz.visible_size_within_limit(is_buy, limit_price);
-            let qty = unhedged.abs().min(visible);
-            if qty <= self.dust_qty {
+            let raw_qty = unhedged.abs().min(visible);
+            let qty = if raw_qty > Decimal::ZERO {
+                quantize_hl_base_qty(raw_qty, self.constraints.hl_sz_decimals)
+                    .unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            let reduce_only = (is_buy && self.inv_xyz < Decimal::ZERO && self.inv_xyz.abs() >= qty)
+                || (!is_buy && self.inv_xyz > Decimal::ZERO && self.inv_xyz >= qty);
+            let visible_notional = (qty * cons_px).to_f64().unwrap_or(0.0);
+            if qty <= Decimal::ZERO
+                || (!reduce_only && visible_notional < self.constraints.hl_min_order_notional_usd)
+            {
                 return BasisAction::Hold {
                     reason: "thin_xyz_hedge_book",
                 };
             }
-            let reduce_only = (is_buy && self.inv_xyz < Decimal::ZERO && self.inv_xyz.abs() >= qty)
-                || (!is_buy && self.inv_xyz > Decimal::ZERO && self.inv_xyz >= qty);
+            self.residual_blocked_reason = None;
             self.reset_persist();
             self.in_flight = true;
             self.counters.residual_hedges_emitted += 1;
@@ -566,8 +922,24 @@ impl ArcusXyzBasisEngine {
                     arc.bid_sz
                 };
                 let xyz_vis = xyz.visible_size_within_limit(!direction_arcus_buy, xyz_limit_px);
-                let max_close = self.inv_arc.abs().min(arc_vis).min(xyz_vis);
-                if max_close <= self.dust_qty {
+                let raw_close = self.inv_arc.abs().min(arc_vis).min(xyz_vis);
+                let max_close = if raw_close > Decimal::ZERO {
+                    quantize_shared_base_qty(
+                        raw_close,
+                        self.constraints.arcus_step_size,
+                        self.constraints.hl_sz_decimals,
+                    )
+                    .unwrap_or(Decimal::ZERO)
+                } else {
+                    Decimal::ZERO
+                };
+                let arc_exit_ntl = (max_close * arc_touch.min(arcus_limit_px))
+                    .to_f64()
+                    .unwrap_or(0.0);
+                if max_close <= self.dust_qty
+                    || max_close < self.constraints.arcus_min_order_size
+                    || arc_exit_ntl < self.constraints.arcus_min_order_notional_usd
+                {
                     return BasisAction::Hold {
                         reason: "thin_exit_book",
                     };
@@ -605,9 +977,10 @@ impl ArcusXyzBasisEngine {
             };
         }
 
+        let min_entry_usd = self.constraints.min_entry_notional_usd();
         let pos_usd = self.inv_arc.abs().to_f64().unwrap_or(f64::MAX) * am;
         let remaining_usd = self.config.max_notional_usd - pos_usd;
-        if remaining_usd < 5.0 {
+        if remaining_usd < min_entry_usd {
             self.reset_persist();
             return BasisAction::Hold {
                 reason: "max_notional_reached",
@@ -675,7 +1048,7 @@ impl ArcusXyzBasisEngine {
         }
 
         let eff_clip_usd = (self.config.clip_usd * brake_scale).min(remaining_usd);
-        if eff_clip_usd < 5.0 {
+        if eff_clip_usd < min_entry_usd {
             self.reset_persist();
             return BasisAction::Hold {
                 reason: "braked_below_min_notional",
@@ -718,11 +1091,33 @@ impl ArcusXyzBasisEngine {
             arc.bid_sz
         };
         let xyz_vis = xyz.visible_size_within_limit(!direction_arcus_buy, xyz_limit_px);
-        let qty = raw_qty.min(arc_vis).min(xyz_vis);
-        let notional_usd = qty.to_f64().unwrap_or(0.0) * am;
-        if qty <= self.dust_qty || notional_usd < 5.0 {
+        let raw_capped_qty = raw_qty.min(arc_vis).min(xyz_vis);
+        let qty = if raw_capped_qty > Decimal::ZERO {
+            quantize_shared_base_qty(
+                raw_capped_qty,
+                self.constraints.arcus_step_size,
+                self.constraints.hl_sz_decimals,
+            )
+            .unwrap_or(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+        if qty <= self.dust_qty || qty < self.constraints.arcus_min_order_size {
+            self.reset_persist();
             return BasisAction::Hold {
                 reason: "thin_entry_book",
+            };
+        }
+        let arc_notional_usd = (qty * arc_touch.min(arcus_limit_px))
+            .to_f64()
+            .unwrap_or(0.0);
+        let hl_notional_usd = (qty * xyz_touch.min(xyz_limit_px)).to_f64().unwrap_or(0.0);
+        if arc_notional_usd < self.constraints.arcus_min_order_notional_usd
+            || hl_notional_usd < self.constraints.hl_min_order_notional_usd
+        {
+            self.reset_persist();
+            return BasisAction::Hold {
+                reason: "entry_below_venue_min",
             };
         }
 
@@ -1721,7 +2116,8 @@ mod tests {
             ladder_convex_power: 1.0,
             max_hold_ms: 7_200_000,
             max_arcus_book_age_ms: 250,
-            max_hl_book_age_ms: 30_000,
+            max_hl_book_age_ms: 5_000,
+            max_venue_clock_skew_ms: 2_000,
             slippage_bps: 8.0,
             allocated_capital_usd: 1_000.0,
             daily_loss_limit_pct: 0.05,
@@ -2874,5 +3270,187 @@ mod tests {
         let err = BasisJournal::check_clean_restart(&path).unwrap_err();
         assert!(err.to_string().contains("cancel_unknown"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quantize_shared_base_qty_uses_exact_lcm_for_non_divisible_steps() {
+        // 0.003 vs hl_sz_decimals=2 (0.01) has LCM = 0.03 -> 1.00 quantizes down to 0.99 (valid on HL!).
+        let q = quantize_shared_base_qty(d("1.00"), d("0.003"), 2).unwrap();
+        assert_eq!(q, d("0.99"));
+        assert!((q % d("0.003")).is_zero());
+
+        let hl_asset = HlPerpAsset {
+            name: "xyz:TEST".into(),
+            sz_decimals: 2,
+            max_leverage: 10,
+            is_delisted: false,
+            growth_mode: None,
+            deployer_fee_scale: None,
+        };
+        let order = crate::exchanges::hyperliquid::PerpOrder {
+            is_buy: true,
+            limit_price: d("100.0"),
+            size: q,
+            reduce_only: false,
+            time_in_force: crate::exchanges::hyperliquid::TimeInForce::Ioc,
+            client_order_id: None,
+        };
+        assert!(hl_asset.validate_order(&order).is_ok());
+
+        // ANT-USD (step 0.000001) with sz_decimals=2 (0.01) quantizes onto 0.01.
+        assert_eq!(
+            quantize_shared_base_qty(d("1.239"), d("0.000001"), 2).unwrap(),
+            d("1.23")
+        );
+    }
+
+    #[test]
+    fn engine_enforces_hl_min_notional_arcus_min_notional_and_unhedgeable_residual_halt() {
+        let mut cfg = test_config();
+        cfg.persist_ms = 0;
+        let mut engine = ArcusXyzBasisEngine::new(cfg).unwrap();
+        engine.set_constraints(VenueOrderConstraints {
+            arcus_step_size: d("0.01"),
+            arcus_min_order_size: d("0.1"),
+            arcus_min_order_notional_usd: 5.0,
+            hl_sz_decimals: 2,
+            hl_min_order_notional_usd: 10.0,
+        });
+        let guard = DailyLossGuard::open(None, 0.05, 1_000.0, 100).unwrap();
+
+        // Thin depth caps trade to 0.08 ANT (~$8): passes $5 old floor, MUST fail HL $10 / 0.1 min size!
+        let a_thin = arc_book(1_000, "99.90", "99.92", "0.08");
+        let x_thin = xyz_book(1_000, &[("100.10", "5.0")], &[("100.12", "5.0")]);
+        assert_eq!(
+            engine.on_books(1_000, &a_thin, &x_thin, 1_000, &guard, true),
+            BasisAction::Hold {
+                reason: "thin_entry_book"
+            }
+        );
+
+        // 0.09 ANT @ ~$100 = $9 (< $10 HL min) passes min_order_size=0.05 or not; test $9 vs $10 specifically.
+        engine.set_constraints(VenueOrderConstraints {
+            arcus_step_size: d("0.01"),
+            arcus_min_order_size: d("0.01"),
+            arcus_min_order_notional_usd: 15.0,
+            hl_sz_decimals: 2,
+            hl_min_order_notional_usd: 10.0,
+        });
+        let a_sub_arc = arc_book(1_100, "99.90", "99.92", "0.12"); // $12 >= $10 HL, < $15 Arcus min!
+        assert_eq!(
+            engine.on_books(1_100, &a_sub_arc, &x_thin, 1_100, &guard, true),
+            BasisAction::Hold {
+                reason: "entry_below_venue_min"
+            }
+        );
+
+        // Residual: unhedged +0.05 ANT (~$5 < $10) with inv_xyz=0 (non-reduce-only) -> permanent halt!
+        engine.set_constraints(VenueOrderConstraints::default());
+        engine.reconcile_positions(d("0.05"), Decimal::ZERO, 1_200, 1_200, 1_200);
+        let a_ok = arc_book(1_300, "99.90", "99.92", "5.0");
+        let x_ok = xyz_book(1_300, &[("100.10", "5.0")], &[("100.12", "5.0")]);
+        assert_eq!(
+            engine.on_books(1_300, &a_ok, &x_ok, 1_300, &guard, true),
+            BasisAction::Hold {
+                reason: "residual_below_hl_min_notional"
+            }
+        );
+        assert_eq!(
+            engine.residual_blocked(),
+            Some("residual_below_hl_min_notional")
+        );
+
+        // Sub-lot residual (< 0.01 lot when sz_decimals=2) -> permanent halt!
+        engine.reconcile_positions(d("0.004"), Decimal::ZERO, 1_400, 1_400, 1_400);
+        assert_eq!(
+            engine.on_books(1_500, &a_ok, &x_ok, 1_500, &guard, true),
+            BasisAction::Hold {
+                reason: "residual_below_hl_min_lot"
+            }
+        );
+        assert_eq!(engine.residual_blocked(), Some("residual_below_hl_min_lot"));
+
+        // Reduce-only residual < $10 (but >= 1 lot): HL closes existing long position from +0.05 -> 0!
+        engine.reconcile_positions(Decimal::ZERO, d("0.05"), 1_600, 1_600, 1_600);
+        let a_red = arc_book(1_700, "99.90", "99.92", "5.0");
+        let x_red = xyz_book(1_700, &[("100.10", "5.0")], &[("100.12", "5.0")]);
+        match engine.on_books(1_700, &a_red, &x_red, 1_700, &guard, true) {
+            BasisAction::HedgeResidualXyz {
+                is_buy,
+                qty,
+                reduce_only,
+                ..
+            } => {
+                assert!(!is_buy);
+                assert_eq!(qty, d("0.05"));
+                assert!(reduce_only);
+            }
+            other => panic!("expected reduce_only HedgeResidualXyz, got {other:?}"),
+        }
+        assert_eq!(engine.residual_blocked(), None);
+    }
+
+    #[test]
+    fn engine_checks_venue_source_timestamps_independently_of_receipt_time() {
+        let mut cfg = test_config();
+        cfg.persist_ms = 0;
+        let mut engine = ArcusXyzBasisEngine::new(cfg).unwrap();
+        let guard = DailyLossGuard::open(None, 0.05, 1_000.0, 100).unwrap();
+
+        // Stale Arcus venue source_ms (> max_arcus_book_age_ms + max_venue_clock_skew_ms) even with fresh receipt_ms!
+        let mut a_stale_src = arc_book(10_000, "99.90", "99.92", "10");
+        a_stale_src.source_ms = 7_000; // 3_000ms behind now_ms=10_000 (> 250 + 2000)
+        let x_fresh = xyz_book(10_000, &[("100.10", "10")], &[("100.12", "10")]);
+        assert_eq!(
+            engine.on_books(10_000, &a_stale_src, &x_fresh, 10_000, &guard, true),
+            BasisAction::Hold {
+                reason: "stale_arcus_source_book"
+            }
+        );
+
+        // Stale HL bbo.timestamp_ms even when xyz_rx_ms == now_ms!
+        let a_fresh = arc_book(10_000, "99.90", "99.92", "10");
+        let x_stale_src = xyz_book(2_000, &[("100.10", "10")], &[("100.12", "10")]);
+        assert_eq!(
+            engine.on_books(10_000, &a_fresh, &x_stale_src, 10_000, &guard, true),
+            BasisAction::Hold {
+                reason: "stale_xyz_source_book"
+            }
+        );
+
+        // Future timestamp beyond clock-skew tolerance fails closed.
+        let mut a_future = arc_book(10_000, "99.90", "99.92", "10");
+        a_future.source_ms = 12_500;
+        assert_eq!(
+            engine.on_books(10_000, &a_future, &x_fresh, 10_000, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_arcus_source_time"
+            }
+        );
+    }
+
+    #[test]
+    fn arcus_leg_pnl_tracker_drives_combined_daily_loss_guard() {
+        let mut tracker = ArcusLegPnlTracker::new(Decimal::ZERO, None);
+        tracker.record_fill(true, d("2.0"), d("100.0"), 0.0005); // +2 @ 100, fee = $0.10
+        assert_eq!(tracker.position(), d("2.0"));
+        assert_eq!(tracker.avg_cost(), d("100.0"));
+
+        // Arcus mid drops to $85 (-$30 unrealized - $0.10 fee = -$30.10) while HL equity delta is $0.
+        let est = tracker.estimated_total_pnl_usd(85.0).unwrap();
+        assert!((est - (-30.10)).abs() < 1e-9);
+        let combined = combined_guard_equity_usd(500.0, 0.0, Some(est));
+        assert!((combined - 469.90).abs() < 1e-9);
+
+        let mut guard = DailyLossGuard::open(None, 0.05, 500.0, 100).unwrap(); // budget $25
+        let err = guard.check(combined, 100).unwrap_err();
+        assert!(err.to_string().contains("daily loss limit breached"));
+        assert_eq!(guard.risk_scale(), 0.0); // halted!
+
+        // Partial close realizes loss cleanly and flips when crossing zero.
+        tracker.record_fill(false, d("3.0"), d("90.0"), 0.0005);
+        assert_eq!(tracker.position(), d("-1.0"));
+        assert_eq!(tracker.avg_cost(), d("90.0"));
+        assert!((tracker.realized_pnl_usd() - (-20.0)).abs() < 1e-9);
     }
 }

@@ -24,7 +24,7 @@ ladder_convex_power = 1.0
 
 max_hold_ms = 7200000
 max_arcus_book_age_ms = 250
-max_hl_book_age_ms = 30000
+max_hl_book_age_ms = 5000
 slippage_bps = 8.0
 
 # CRASH-IMP-01 real-time progressive drawdown brake anchored at 5% of allocated Canary capital
