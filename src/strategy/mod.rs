@@ -2,11 +2,13 @@ pub mod arcus_xyz_basis;
 pub mod cross_sectional;
 pub mod cross_venue;
 pub mod inventory_neutral_mm;
+pub mod kalman_basis;
 pub mod matched_settlement;
 pub mod multiday_carry;
 pub mod portfolio_risk;
 pub mod relative_value;
 mod replay_queue_depth;
+pub mod slow_cascade;
 pub mod tail_risk;
 
 use crate::shm_reader::ShmBboMessage;
