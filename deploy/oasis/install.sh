@@ -32,7 +32,7 @@ sudo -n install -m 0755 feeder/feeder-app feeder/perp-capture \
   target/release/{arcus_xyz_basis,cross_venue,lighter_inventory_mm} "$dest/bin/"
 sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
-sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts}.py "$dest/"
+sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts,sync_monitor_env}.py "$dest/"
 sudo -n install -m 0755 \
   scripts/{capture_timing,archive_public_capture,inventory_public_sources,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner}.py \
   "$dest/scripts/"

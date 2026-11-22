@@ -18,6 +18,8 @@ SNAPSHOT_STALE_MS = 60_000
 LOSS_WARN_FRACTION = 0.6  # warn at 60% of the configured daily loss budget
 QUOTA_WARN_THRESHOLD = 250
 QUOTA_CRIT_THRESHOLD = 50
+DISK_WARN_FREE_GIB = 8.0
+DISK_CRIT_FREE_GIB = 3.0
 
 
 def _alert(key, severity, message):
@@ -102,6 +104,18 @@ def evaluate(status, summary, now_ms):
             alerts.append(_alert("defense_regime", CRITICAL, "防御状态机已进入 Halt 停机保护"))
         elif defense == "reduce_only":
             alerts.append(_alert("defense_regime", WARNING, "防御状态机已进入 ReduceOnly 仅平仓模式"))
+
+    disk = (status or {}).get("disk") or {}
+    free_gib = disk.get("free_gib")
+    if (isinstance(free_gib, (int, float))
+            and not isinstance(free_gib, bool)
+            and math.isfinite(free_gib)):
+        if free_gib < DISK_CRIT_FREE_GIB:
+            alerts.append(_alert("disk_space_low", CRITICAL,
+                                 f"宿主机磁盘可用空间不足 ({free_gib:.2f} GiB < {DISK_CRIT_FREE_GIB:g} GiB)"))
+        elif free_gib < DISK_WARN_FREE_GIB:
+            alerts.append(_alert("disk_space_low", WARNING,
+                                 f"宿主机磁盘可用空间偏低 ({free_gib:.2f} GiB < {DISK_WARN_FREE_GIB:g} GiB)"))
 
     order = {CRITICAL: 0, WARNING: 1}
     return sorted(alerts, key=lambda a: (order[a["severity"]], a["key"]))

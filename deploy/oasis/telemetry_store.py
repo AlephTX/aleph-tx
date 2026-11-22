@@ -22,8 +22,10 @@ on it is null, never zero. Figures cover this session's trades, not account
 equity.
 """
 
+import argparse
 import json
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -686,3 +688,136 @@ class TelemetryStore:
             f" mid FROM snapshots WHERE {snap_where} GROUP BY t ORDER BY t",
             snap_args)
         return {"bucket": bucket, "pnl": rows, "equity": equity}
+
+    @locked
+    def prune_expired(self, retention_days=14, now_ms=None):
+        """Delete stopped sessions older than `retention_days` and trim old snapshots."""
+        if retention_days is None or retention_days <= 0:
+            return {"sessions": 0, "snapshots": 0, "fills": 0, "hedge_fills": 0, "orders": 0}
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        cutoff_ms = now - int(float(retention_days) * 86_400_000)
+        expired_ids = [
+            row["session_id"]
+            for row in self.db.execute(
+                "SELECT session_id FROM sessions WHERE stopped_ms IS NOT NULL AND stopped_ms < ?",
+                (cutoff_ms,),
+            ).fetchall()
+        ]
+        counts = {"sessions": 0, "snapshots": 0, "fills": 0, "hedge_fills": 0, "orders": 0}
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for sid in expired_ids:
+                for table in ("snapshots", "fills", "hedge_fills", "orders"):
+                    cur = self.db.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
+                    counts[table] += cur.rowcount
+                self.db.execute("DELETE FROM ingest_records WHERE session_id=?", (sid,))
+                # Keep ingest_offsets while the JSONL remains on disk so expired sessions are not re-ingested.
+                if not (self.source_dir / f"{sid}.jsonl").is_file():
+                    self.db.execute("DELETE FROM ingest_offsets WHERE file=?", (f"{sid}.jsonl",))
+                cur = self.db.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+                counts["sessions"] += cur.rowcount
+            cur = self.db.execute(
+                "DELETE FROM snapshots WHERE ts_ms < ? AND ts_ms < COALESCE("
+                "(SELECT MAX(s2.ts_ms) FROM snapshots s2 WHERE s2.session_id = snapshots.session_id), 0)",
+                (cutoff_ms,),
+            )
+            counts["snapshots"] += cur.rowcount
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        if any(counts.values()):
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return counts
+
+
+def prune_telemetry_dir(
+    telemetry_dir,
+    max_age_days=7,
+    max_total_bytes=200 * 1024 * 1024,
+    active_grace_secs=600,
+    now_secs=None,
+):
+    """Prune closed `*.jsonl` telemetry files by age first, then total size cap."""
+    root = Path(telemetry_dir)
+    if not root.is_dir():
+        return {"deleted": [], "deleted_bytes": 0, "remaining_bytes": 0}
+    now = time.time() if now_secs is None else float(now_secs)
+    age_cutoff = None if (max_age_days is None or max_age_days <= 0) else float(max_age_days) * 86_400.0
+    byte_cap = None if (max_total_bytes is None or max_total_bytes < 0) else int(max_total_bytes)
+
+    files = []
+    for path in root.glob("*.jsonl"):
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            continue
+        files.append((st.st_mtime, st.st_size, path))
+    files.sort(key=lambda item: (item[0], item[2].name))
+
+    total_bytes = sum(item[1] for item in files)
+    deleted = []
+    deleted_bytes = 0
+    survivors = []
+
+    for mtime, size, path in files:
+        age = max(0.0, now - mtime)
+        eligible = age >= active_grace_secs
+        if eligible and age_cutoff is not None and age > age_cutoff:
+            os.unlink(path)
+            deleted.append(path.name)
+            deleted_bytes += size
+            total_bytes -= size
+        else:
+            survivors.append((mtime, size, path, eligible))
+
+    if byte_cap is not None and total_bytes > byte_cap:
+        for _mtime, size, path, eligible in survivors:
+            if total_bytes <= byte_cap:
+                break
+            if not eligible:
+                continue
+            os.unlink(path)
+            deleted.append(path.name)
+            deleted_bytes += size
+            total_bytes -= size
+
+    return {
+        "deleted": deleted,
+        "deleted_bytes": deleted_bytes,
+        "remaining_bytes": max(0, total_bytes),
+    }
+
+
+def _main():
+    parser = argparse.ArgumentParser(description="Manage AlephTX strategy telemetry SQLite & JSONL retention.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("prune", help="Prune expired JSONL files and optionally SQLite telemetry rows")
+    p.add_argument("--dir", type=Path, required=True, help="Telemetry JSONL directory")
+    p.add_argument("--max-age-days", type=float, default=7.0)
+    p.add_argument("--max-mb", type=float, default=200.0)
+    p.add_argument("--active-grace-secs", type=float, default=600.0)
+    p.add_argument("--db", type=Path, default=None, help="Optional SQLite path to prune")
+    p.add_argument("--retention-days", type=float, default=14.0)
+    args = parser.parse_args()
+    if args.command == "prune":
+        file_stats = prune_telemetry_dir(
+            args.dir,
+            max_age_days=args.max_age_days,
+            max_total_bytes=int(args.max_mb * 1024 * 1024),
+            active_grace_secs=args.active_grace_secs,
+        )
+        db_stats = None
+        if args.db is not None:
+            store = TelemetryStore(args.db, args.dir)
+            try:
+                db_stats = store.prune_expired(retention_days=args.retention_days)
+            finally:
+                store.db.close()
+        print(json.dumps({"files": file_stats, "db": db_stats}, indent=2))
+
+
+if __name__ == "__main__":
+    _main()

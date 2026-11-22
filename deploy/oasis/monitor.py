@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -20,7 +21,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from alerts import Alerter, evaluate
@@ -49,6 +50,8 @@ DB_PATH = os.environ.get("ALEPH_MONITOR_DB", "/var/lib/aleph-tx-monitor/telemetr
 CONTROL_TOKEN = os.environ.get("ALEPH_MONITOR_CONTROL_TOKEN", "")
 ALERT_WEBHOOK = os.environ.get("ALEPH_MONITOR_ALERT_WEBHOOK", "").strip()
 ALERT_INTERVAL = 15
+RETENTION_DAYS = float(os.environ.get("ALEPH_MONITOR_RETENTION_DAYS", "14"))
+PRUNE_INTERVAL = 3600
 LIVE_UNIT = "aleph-tx-live.service"
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
@@ -172,10 +175,10 @@ def position(symbol, size, entry, pnl, liquidation):
             "liquidation": None if liquidation is None else decimal_string(liquidation)}
 
 
-def lighter_positions(index):
+def lighter_positions(index, base_url="https://mainnet.zklighter.elliot.ai"):
     if not re.fullmatch(r"[0-9]{1,19}", index) or int(index) > 2**63 - 1:
         raise ValueError("invalid account index")
-    data = request_json(f"https://mainnet.zklighter.elliot.ai/api/v1/account?by=index&value={index}")
+    data = request_json(f"{base_url.rstrip('/')}/api/v1/account?by=index&value={index}")
     if data["code"] != 200:
         raise ValueError("account query failed")
     account = next(a for a in data["accounts"] if a["index"] == int(index))
@@ -191,19 +194,85 @@ def lighter_positions(index):
     return rows
 
 
-def hyperliquid_positions(address):
+def hyperliquid_positions(address, dex=""):
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
         raise ValueError("invalid wallet address")
     data = request_json("https://api.hyperliquid.xyz/info",
-                        {"type": "clearinghouseState", "user": address, "dex": ""})
+                        {"type": "clearinghouseState", "user": address, "dex": dex})
     return [position(p["coin"], p["szi"], p.get("entryPx"), p["unrealizedPnl"], p.get("liquidationPx"))
             for item in data["assetPositions"] if Decimal((p := item["position"])["szi"]) != 0]
 
 
+def arcus_positions(spec):
+    if ":" in spec:
+        address, idx_str = spec.split(":", 1)
+    else:
+        address, idx_str = spec, "0"
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+        raise ValueError("invalid Arcus wallet address")
+    if not re.fullmatch(r"[0-9]", idx_str):
+        raise ValueError("invalid Arcus account index")
+    query = urlencode({"address": address.lower(), "accountIndex": idx_str})
+    data = request_json(f"https://api.arcus.xyz/v1/positions?{query}")
+    if not isinstance(data, dict) or "positions" not in data:
+        raise ValueError(data.get("error", "missing Arcus positions") if isinstance(data, dict) else "invalid Arcus response")
+    raw_positions = data["positions"]
+    items = raw_positions.values() if isinstance(raw_positions, dict) else raw_positions
+    rows = []
+    for item in items:
+        size = Decimal(str(item["size"]))
+        if size == 0:
+            continue
+        if not size.is_finite():
+            raise ValueError("invalid Arcus size")
+        symbol = item.get("marketDisplayName") or str(item.get("marketId", ""))
+        pnl = item.get("unrealizedPnl")
+        rows.append(position(symbol, size, item.get("entryPrice"),
+                             "0" if pnl is None else pnl, item.get("liquidationPrice")))
+    return rows
+
+
+def bulk_positions(pubkey):
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", pubkey):
+        raise ValueError("invalid BULK pubkey")
+    data = request_json("https://mainnet-api1.bulk.trade/api/v1/account",
+                        {"type": "fullAccount", "user": pubkey})
+    entries = data if isinstance(data, list) else [data]
+    rows = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        account = entry.get("fullAccount") if isinstance(entry.get("fullAccount"), dict) else entry
+        for item in account.get("positions", []):
+            size = Decimal(str(item["size"]))
+            if size == 0:
+                continue
+            if not size.is_finite():
+                raise ValueError("invalid BULK size")
+            pnl = item.get("unrealizedPnl")
+            rows.append(position(item["symbol"], size, item.get("entryPrice"),
+                                 "0" if pnl is None else pnl, item.get("liquidationPrice")))
+    return rows
+
+
 class Accounts:
-    def __init__(self):
-        self.sources = (("Lighter", os.environ.get("ALEPH_MONITOR_LIGHTER_INDEX", "").strip(), lighter_positions),
-                        ("Hyperliquid", os.environ.get("ALEPH_MONITOR_HL_ADDRESS", "").strip(), hyperliquid_positions))
+    def __init__(self, env=None):
+        cfg = os.environ if env is None else env
+        hl_addr = cfg.get("ALEPH_MONITOR_HL_ADDRESS", "").strip()
+        hl_xyz = cfg.get("ALEPH_MONITOR_HL_XYZ_ADDRESS", "").strip() or hl_addr
+        hl_io = cfg.get("ALEPH_MONITOR_HL_IO_ADDRESS", "").strip() or hl_addr
+        arc_addr = cfg.get("ALEPH_MONITOR_ARCUS_ADDRESS", "").strip()
+        arc_idx = cfg.get("ALEPH_MONITOR_ARCUS_INDEX", "").strip() or "0"
+        self.sources = (
+            ("Lighter", cfg.get("ALEPH_MONITOR_LIGHTER_INDEX", "").strip(), lighter_positions),
+            ("LighterRH", cfg.get("ALEPH_MONITOR_LIGHTER_RH_INDEX", "").strip(),
+             lambda idx: lighter_positions(idx, "https://api.rh.lighter.xyz")),
+            ("Hyperliquid", hl_addr, hyperliquid_positions),
+            ("TradeXYZ", hl_xyz, lambda addr: hyperliquid_positions(addr, "xyz")),
+            ("Entropy", hl_io, lambda addr: hyperliquid_positions(addr, "io")),
+            ("Arcus", f"{arc_addr}:{arc_idx}" if arc_addr else "", arcus_positions),
+            ("BULK", cfg.get("ALEPH_MONITOR_BULK_PUBKEY", "").strip(), bulk_positions),
+        )
         self.snapshots = {venue: {"state": "waiting" if account else "unconfigured"}
                           for venue, account, _ in self.sources}
 
@@ -253,10 +322,35 @@ def stop_live():
         raise PermissionError(proc.stderr.strip()[:300] or "systemctl stop failed")
 
 
+def disk_status(paths=(TELEMETRY_DIR, DB_PATH, "/")):
+    for candidate in paths:
+        target = Path(candidate)
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        try:
+            usage = shutil.disk_usage(target)
+        except OSError:
+            continue
+        if usage.total <= 0:
+            continue
+        return {
+            "path": str(target),
+            "free_gib": round(usage.free / (1 << 30), 2),
+            "total_gib": round(usage.total / (1 << 30), 2),
+            "used_pct": round((usage.total - usage.free) / usage.total * 100.0, 1),
+        }
+    return None
+
+
 def ingest_loop(store):
+    last_prune = 0.0
     while True:
         try:
             store.ingest()
+            now_mono = time.monotonic()
+            if RETENTION_DAYS > 0 and (last_prune == 0.0 or now_mono - last_prune >= PRUNE_INTERVAL):
+                store.prune_expired(RETENTION_DAYS)
+                last_prune = now_mono
         except Exception as exc:  # keep serving; the next pass retries
             print(f"telemetry ingest failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(2)
@@ -265,7 +359,7 @@ def ingest_loop(store):
 def alert_loop(store, alerter):
     while True:
         try:
-            status = {"services": services(), "markets": markets()}
+            status = {"services": services(), "markets": markets(), "disk": disk_status()}
             now_ms = int(time.time() * 1000)
             alerter.update(evaluate(status, store.summary(now_ms=now_ms), now_ms))
         except Exception as exc:  # keep serving; the next pass retries
@@ -302,6 +396,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"host": socket.gethostname(), "checked_at": now_iso(),
                     "release": self.server.release, "services": services(),
                     "markets": markets(), "accounts": self.server.accounts.snapshots.copy(),
+                    "disk": disk_status(),
                     "control_enabled": bool(CONTROL_TOKEN),
                     "alerts": self.server.alerter.snapshot()}
         if route == "/api/alerts":

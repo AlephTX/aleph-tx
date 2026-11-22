@@ -34,6 +34,13 @@ export interface AccountSnapshot {
   error?: string
 }
 
+export interface DiskStatus {
+  path: string
+  free_gib: number
+  total_gib: number
+  used_pct: number
+}
+
 export interface StatusResp {
   host: string
   checked_at: string
@@ -41,6 +48,7 @@ export interface StatusResp {
   services: Record<string, Service>
   markets: Market[]
   accounts: Record<string, AccountSnapshot>
+  disk?: DiskStatus | null
   control_enabled: boolean
   alerts?: Alert[]
 }

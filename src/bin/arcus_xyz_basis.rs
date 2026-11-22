@@ -22,6 +22,7 @@ use aleph_tx::strategy::arcus_xyz_basis::{
     ArcusBookSnapshot, ArcusXyzBasisConfig, ArcusXyzBasisEngine, BasisAction, BasisJournal,
     BasisJournalEvent, quantize_arcus_limit_price, quantize_shared_base_qty,
 };
+use aleph_tx::telemetry_sink::{SessionInfo, StrategySnapshot, TelemetrySink};
 use aleph_tx::venues::{
     CapabilityAssetScope, audited_execution_capabilities, select_execution_topology,
 };
@@ -488,6 +489,7 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
 
 struct LiveHandles {
     arc_account: ArcusAccount,
+    arc_account_index: u8,
     arc_info: ArcusInfo,
     arc_trading: ArcusTrading,
     arc_market: ArcusMarket,
@@ -594,6 +596,7 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
 
     Ok(LiveHandles {
         arc_account,
+        arc_account_index: arc_idx,
         arc_info,
         arc_trading,
         arc_market,
@@ -632,6 +635,55 @@ async fn reconcile_both_venues(
     Ok((inv_arc, inv_xyz, hl_equity))
 }
 
+fn emit_basis_snapshot(
+    sink: Option<&TelemetrySink>,
+    cfg: &ArcusXyzBasisConfig,
+    session_eq: f64,
+    daily_loss: &DailyLossGuard,
+    engine: &ArcusXyzBasisEngine,
+    arc_snap: &ArcusBookSnapshot,
+    rx_ms: u64,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    let mid = ((arc_snap.bid_px + arc_snap.ask_px) * Decimal::new(5, 1))
+        .to_f64()
+        .unwrap_or(0.0);
+    let spread_bps = if mid > 0.0 {
+        (arc_snap.ask_px - arc_snap.bid_px)
+            .to_f64()
+            .map(|diff| diff / mid * 10_000.0)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let risk_scale = daily_loss.risk_scale();
+    let defense_regime = if risk_scale <= 0.0 {
+        "halt"
+    } else if risk_scale < 1.0 {
+        "reduce_only"
+    } else {
+        "normal"
+    };
+    sink.snapshot(StrategySnapshot {
+        equity: session_eq,
+        session_start_equity: cfg.allocated_capital_usd,
+        daily_loss: Some(daily_loss.snapshot()),
+        exchange_position: engine.inv_arc().to_f64().unwrap_or(0.0),
+        confirmed_position: (engine.inv_arc() + engine.inv_xyz())
+            .to_f64()
+            .unwrap_or(0.0),
+        mid,
+        mark_source: Some("local_book"),
+        mark_sampled_ms: Some(rx_ms),
+        mark_feed_ms: Some(arc_snap.source_ms),
+        spread_bps,
+        defense_regime: Some(defense_regime),
+        ..StrategySnapshot::default()
+    });
+}
+
 async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
     let cfg = load_config(config_path)?;
     cfg.validate_canary_caps()?;
@@ -652,6 +704,17 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
         utc_day_now(),
     )?;
     let initial_hl_equity = handles.hl_equity;
+    let mut session_eq = cfg.allocated_capital_usd;
+    let telemetry = TelemetrySink::from_env(&SessionInfo {
+        session_id: format!("arcus-xyz-{}-{}", cfg.arcus_symbol, unix_ms()?),
+        network: cfg.network.clone(),
+        exchange: "arcus_xyz_basis".into(),
+        symbol: cfg.arcus_symbol.clone(),
+        market_id: u64::from(handles.arc_market.market_id),
+        account: i64::from(handles.arc_account_index),
+        hedge_account: Some(handles.hl_account.clone()),
+    });
+    let mut last_snapshot_at = Instant::now() - Duration::from_secs(5);
 
     let mut lease = CancelLease::new(
         handles.arc_account.clone(),
@@ -735,9 +798,19 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         journal_ms: now_rec,
                     })?;
                     engine.reconcile_positions(inv_a, inv_x, now_rec, now_rec, now_rec);
-                    let session_eq = cfg.allocated_capital_usd
+                    session_eq = cfg.allocated_capital_usd
                         + (hl_eq - initial_hl_equity).to_f64().unwrap_or(0.0);
                     daily_loss.check(session_eq, utc_day_now())?;
+                    emit_basis_snapshot(
+                        telemetry.as_ref(),
+                        &cfg,
+                        session_eq,
+                        &daily_loss,
+                        &engine,
+                        &arc_snap,
+                        now_rec,
+                    );
+                    last_snapshot_at = Instant::now();
                 } else {
                     engine.reconcile_positions(
                         engine.inv_arc(),
@@ -832,9 +905,19 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         journal_ms: now_rec,
                     })?;
                     engine.reconcile_positions(inv_a, inv_x, now_rec, now_rec, now_rec);
-                    let session_eq = cfg.allocated_capital_usd
+                    session_eq = cfg.allocated_capital_usd
                         + (hl_eq - initial_hl_equity).to_f64().unwrap_or(0.0);
                     daily_loss.check(session_eq, utc_day_now())?;
+                    emit_basis_snapshot(
+                        telemetry.as_ref(),
+                        &cfg,
+                        session_eq,
+                        &daily_loss,
+                        &engine,
+                        &arc_snap,
+                        now_rec,
+                    );
+                    last_snapshot_at = Instant::now();
                 } else {
                     engine.reconcile_positions(
                         engine.inv_arc(),
@@ -847,11 +930,27 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
             }
         }
 
+        if last_snapshot_at.elapsed() >= Duration::from_secs(5) {
+            emit_basis_snapshot(
+                telemetry.as_ref(),
+                &cfg,
+                session_eq,
+                &daily_loss,
+                &engine,
+                &arc_snap,
+                rx_ms,
+            );
+            last_snapshot_at = Instant::now();
+        }
+
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms)) => {}
             _ = tokio::signal::ctrl_c() => {
                 let _ = handles.arc_trading.cancel_all(Some(handles.arc_market.market_id)).await;
                 journal.append(&BasisJournalEvent::CleanShutdown { journal_ms: unix_ms()? })?;
+                if let Some(sink) = &telemetry {
+                    let _ = sink.stopped().await;
+                }
                 break;
             }
         }

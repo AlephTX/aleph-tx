@@ -760,6 +760,170 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def test_prune_expired_removes_old_stopped_sessions_and_preserves_latest_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day_ms = 86_400_000
+            now_ms = 30 * day_ms
+            (root / "old_stopped.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": 1_000, "exchange": "lighter", "symbol": "ETH", "account": 1},
+                fill(10_000, "buy", 2000.0, 0.1, 0.0, 101, fee_source="explicit_zero"),
+                {"type": "snapshot", "ts_ms": 15_000, "equity": 1000.0, "session_start_equity": 1000.0, "mid": 2000.0},
+                {"type": "stopped", "ts_ms": 20_000},
+            )) + "\n")
+            (root / "active_long.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"type": "session", "ts_ms": 1_000, "exchange": "arcus_xyz_basis", "symbol": "ANT-USD", "account": 0},
+                {"type": "snapshot", "ts_ms": 15_000, "equity": 500.0, "session_start_equity": 500.0, "mid": 88.5},
+                {"type": "snapshot", "ts_ms": 25_000, "equity": 502.0, "session_start_equity": 500.0, "mid": 88.6},
+            )) + "\n")
+            store = TelemetryStore(":memory:", root)
+            try:
+                store.ingest()
+                noop = store.prune_expired(retention_days=0, now_ms=now_ms)
+                self.assertEqual(noop["sessions"], 0)
+                stats = store.prune_expired(retention_days=14, now_ms=now_ms)
+                self.assertEqual(stats["sessions"], 1)
+                self.assertEqual(stats["fills"], 1)
+                self.assertEqual(stats["snapshots"], 2)  # old_stopped snap + active_long's older snap
+                self.assertIsNone(store.session("old_stopped"))
+                self.assertIsNotNone(store.session("active_long"))
+                # Latest snapshot on surviving session stays intact even when older than cutoff.
+                active_summary = store.summary(now_ms=now_ms, session_id="active_long")
+                self.assertAlmostEqual(active_summary["snapshot"]["equity"], 502.0)
+                # Checkpoint was retained while old_stopped.jsonl stays on disk -> zero re-ingest.
+                self.assertEqual(store.ingest(), 0)
+                self.assertIsNone(store.session("old_stopped"))
+            finally:
+                store.db.close()
+
+    def test_prune_telemetry_dir_enforces_age_max_bytes_and_active_grace(self):
+        import os
+        from telemetry_store import prune_telemetry_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now_secs = 2_000_000.0
+            specs = (
+                ("too_old.jsonl", 50, now_secs - 8 * 86_400),
+                ("closed_oldest.jsonl", 60, now_secs - 2 * 86_400),
+                ("closed_newer.jsonl", 60, now_secs - 3_600),
+                ("still_active.jsonl", 80, now_secs - 60),
+            )
+            for name, size, mtime in specs:
+                p = root / name
+                p.write_bytes(b"x" * size)
+                os.utime(p, (mtime, mtime))
+
+            res = prune_telemetry_dir(
+                root, max_age_days=7, max_total_bytes=150, active_grace_secs=600, now_secs=now_secs
+            )
+            self.assertEqual(res["deleted"], ["too_old.jsonl", "closed_oldest.jsonl"])
+            self.assertEqual(res["deleted_bytes"], 110)
+            self.assertEqual(res["remaining_bytes"], 140)
+            self.assertFalse((root / "too_old.jsonl").exists())
+            self.assertFalse((root / "closed_oldest.jsonl").exists())
+            self.assertTrue((root / "closed_newer.jsonl").exists())
+            self.assertTrue((root / "still_active.jsonl").exists())
+
+    def test_monitor_multivenue_parsers_accounts_and_disk_status(self):
+        import unittest.mock
+        import monitor
+
+        hl_addr = "0x1111111111111111111111111111111111111111"
+        arc_addr = "0x2222222222222222222222222222222222222222"
+        bulk_key = "FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7"
+
+        accts = monitor.Accounts({
+            "ALEPH_MONITOR_LIGHTER_INDEX": "42",
+            "ALEPH_MONITOR_LIGHTER_RH_INDEX": "43",
+            "ALEPH_MONITOR_HL_ADDRESS": hl_addr,
+            "ALEPH_MONITOR_ARCUS_ADDRESS": arc_addr,
+            "ALEPH_MONITOR_ARCUS_INDEX": "1",
+            "ALEPH_MONITOR_BULK_PUBKEY": bulk_key,
+        })
+        self.assertEqual(
+            set(accts.snapshots),
+            {"Lighter", "LighterRH", "Hyperliquid", "TradeXYZ", "Entropy", "Arcus", "BULK"},
+        )
+        self.assertTrue(all(v["state"] == "waiting" for v in accts.snapshots.values()))
+        # TradeXYZ & Entropy inherit ALEPH_MONITOR_HL_ADDRESS automatically when omitted.
+        by_name = {name: target for name, target, _ in accts.sources}
+        self.assertEqual(by_name["TradeXYZ"], hl_addr)
+        self.assertEqual(by_name["Entropy"], hl_addr)
+        self.assertEqual(by_name["Arcus"], f"{arc_addr}:1")
+
+        def fake_request(url, body=None):
+            if "api.rh.lighter.xyz" in url:
+                return {"code": 200, "accounts": [{"index": 43, "positions": [
+                    {"symbol": "ETH", "position": "0.5", "sign": -1, "avg_entry_price": "3000", "unrealized_pnl": "12.5"}
+                ]}]}
+            if "api.hyperliquid.xyz" in url:
+                return {"assetPositions": [{"position": {"coin": f"{body['dex']}:ANT", "szi": "-10", "entryPx": "88.5", "unrealizedPnl": "3.2"}}]}
+            if "api.arcus.xyz" in url:
+                return {"positions": {"88": {"marketId": 88, "marketDisplayName": "ANT-USD", "size": "10"}}}
+            if "bulk.trade" in url:
+                return [{"fullAccount": {"positions": [
+                    {"symbol": "NVDA-USD", "size": "2.0", "entryPrice": "129.0", "unrealizedPnl": "1.5"},
+                    {"symbol": "BTC-USD", "size": "0", "entryPrice": "0", "unrealizedPnl": "0"},
+                ]}}]
+            raise AssertionError(f"unexpected url: {url}")
+
+        with unittest.mock.patch.object(monitor, "request_json", side_effect=fake_request):
+            rh_rows = monitor.lighter_positions("43", "https://api.rh.lighter.xyz")
+            self.assertEqual(rh_rows[0]["size"], "-0.5")
+            xyz_rows = monitor.hyperliquid_positions(hl_addr, "xyz")
+            self.assertEqual(xyz_rows[0]["symbol"], "xyz:ANT")
+            arc_rows = monitor.arcus_positions(f"{arc_addr}:1")
+            self.assertEqual(arc_rows[0]["symbol"], "ANT-USD")
+            self.assertEqual(arc_rows[0]["unrealized_pnl"], "0")
+            bulk_rows = monitor.bulk_positions(bulk_key)
+            self.assertEqual(len(bulk_rows), 1)
+            self.assertEqual(bulk_rows[0]["symbol"], "NVDA-USD")
+
+        disk = monitor.disk_status(("/",))
+        self.assertIsNotNone(disk)
+        self.assertGreater(disk["total_gib"], 0.0)
+
+    def test_sync_monitor_env_extracts_public_ids_and_preserves_operational_keys(self):
+        import os
+        import sync_monitor_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / ".env.private"
+            dst = root / "monitor.env"
+            priv_tag = "PRIVATE_" + "KEY"
+            src.write_text(
+                "\n".join([
+                    "ARCUS_ACCOUNT_ADDRESS=0x2222222222222222222222222222222222222222",
+                    "ARCUS_ACCOUNT_INDEX=2",
+                    f"ARCUS_API_{priv_tag}=" + "ab" * 32,
+                    "HYPERLIQUID_ACCOUNT_ADDRESS=0x1111111111111111111111111111111111111111",
+                    f"HYPERLIQUID_AGENT_{priv_tag}=" + "cd" * 32,
+                    "LIGHTER_ACCOUNT_INDEX=77",
+                    f"LIGHTER_{priv_tag}=" + "ef" * 40,
+                    "LIGHTER_RH_ACCOUNT_INDEX=88",
+                    f"LIGHTER_RH_{priv_tag}=" + "12" * 40,
+                    "BULK_ACCOUNT_PUBKEY=FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7",
+                    f"BULK_{priv_tag}=syntheticbase58token",
+                    "OKX_API_SECRET=nevercopy",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            dst.write_text("ALEPH_MONITOR_CONTROL_TOKEN=keep-me-123\nALEPH_MONITOR_PORT=8765\n", encoding="utf-8")
+            rendered = sync_monitor_env.sync_monitor_env_file(src, dst)
+            mode = os.stat(dst).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+            self.assertIn("ALEPH_MONITOR_CONTROL_TOKEN=keep-me-123", rendered)
+            self.assertIn("ALEPH_MONITOR_LIGHTER_INDEX=77", rendered)
+            self.assertIn("ALEPH_MONITOR_LIGHTER_RH_INDEX=88", rendered)
+            self.assertIn("ALEPH_MONITOR_HL_ADDRESS=0x1111111111111111111111111111111111111111", rendered)
+            self.assertIn("ALEPH_MONITOR_ARCUS_ADDRESS=0x2222222222222222222222222222222222222222", rendered)
+            self.assertIn("ALEPH_MONITOR_ARCUS_INDEX=2", rendered)
+            self.assertIn("ALEPH_MONITOR_BULK_PUBKEY=FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", rendered)
+            for forbidden in ("ab" * 8, "cd" * 8, "ef" * 8, "12" * 8, "syntheticbase58token", "nevercopy", "PRIVATE", "SECRET"):
+                self.assertNotIn(forbidden, rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

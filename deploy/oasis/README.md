@@ -6,9 +6,9 @@ From your Mac, run `bash deploy/oasis/dashboard.sh` (override `OASIS_HOST`, `OAS
 
 The console (`dashboard/`, Vite + React 19 + TypeScript) organizes monitoring into four accessible workspaces: overview and risk guards (persisted UTC daily loss breaker, EWMA post-fill markout quality, and per-session unit cost per `$1M` gross turnover), orders and dual-leg fills (`fills` and `hedge_fills` with IOC price/fee provenance badges), a sortable multi-session matrix with one-click session pinning (`?session=<id>`), and shared-memory market basis alongside journal logs. Status, orders, and fills refresh every three seconds; quotes older than 15 seconds are labelled delayed. A failed account request is shown separately from a successful request with no open positions.
 
-## Telemetry and history
+## Telemetry, retention and history
 
-When `ALEPH_TELEMETRY_DIR` is set, `lighter_inventory_mm` appends one JSONL file per session (orders, fills, risk snapshots) to `/var/lib/aleph-tx-telemetry`. Writes go through a bounded queue off the trading path; dropped records are counted and shown on the console. The monitor ingests those files incrementally into SQLite at `/var/lib/aleph-tx-monitor/telemetry.sqlite3`, so history survives restarts and the database can be deleted and rebuilt from the JSONL files. PnL uses average cost, includes fees and rebates, and marks open inventory to the latest snapshot mid.
+When `ALEPH_TELEMETRY_DIR` is set, live strategies (`lighter_inventory_mm`, `arcus_xyz_basis`) append one JSONL file per session (orders, fills, risk snapshots) to `/var/lib/aleph-tx-telemetry`. Writes go through a bounded channel off the trading path; dropped records are counted and shown on the console. Closed JSONL files expire after 7 days (`systemd-tmpfiles` via `aleph-tx-telemetry.conf`), and `python3 /opt/aleph-tx/current/telemetry_store.py prune --dir /var/lib/aleph-tx-telemetry --max-age-days 7 --max-mb 200 --db /var/lib/aleph-tx-monitor/telemetry.sqlite3 --retention-days 14` enforces a `200 MB` JSONL cap plus SQLite pruning. The monitor ingests those files incrementally into SQLite at `/var/lib/aleph-tx-monitor/telemetry.sqlite3` and prunes stopped sessions older than `ALEPH_MONITOR_RETENTION_DAYS` (default `14` days) hourly, so history survives restarts while bounding disk growth. PnL uses average cost, includes fees and rebates, and marks open inventory to the latest snapshot mid.
 
 API: `/api/status`, `/api/summary?session=`, `/api/alerts`, `/api/orders?status=open|all&limit=&session=`, `/api/fills?limit=&before=&session=`, `/api/hedge_fills?limit=&before=&session=`, `/api/pnl?bucket=1m|5m|15m|1h|1d&since=&session=`, `/api/sessions?limit=`, `/api/logs?unit=aleph-tx-live|aleph-tx-feeder|aleph-tx-monitor`.
 
@@ -36,7 +36,8 @@ or restored to new inodes, and deduplicates each record before updating totals.
 The monitor evaluates alert rules every 15 seconds: feeder down, live unit
 failed, stale or missing quotes while live, stale telemetry, private-stream
 gaps, dropped telemetry records, daily drawdown approaching the loss breaker,
-and a cross-venue imbalance while hedged. Daily drawdown uses the strategy's
+cross-venue imbalance while hedged, and host free disk space (`disk_space_low`,
+warning `< 8 GiB`, critical `< 3 GiB`). Daily drawdown uses the strategy's
 persisted UTC-day equity baseline and configured `max_daily_loss_pct` from
 telemetry. It warns at 60% and turns critical at 90% of that limit. Snapshots
 without a baseline for the current UTC day cannot drive this alert. Active alerts appear
@@ -51,14 +52,29 @@ The console's stop button sends `systemctl stop aleph-tx-live.service`; the stra
 
 ## Add read-only positions
 
-On Oasis, use `sudoedit /etc/aleph-tx/monitor.env` and set either or both of these variables:
+On Oasis, extract public-only identifiers directly from a single local `.env` without duplicating or copying any private keys using `deploy/oasis/sync_monitor_env.py`:
 
-```dotenv
-ALEPH_MONITOR_LIGHTER_INDEX=<numeric account index>
-ALEPH_MONITOR_HL_ADDRESS=<actual account or subaccount address starting with 0x>
+```sh
+python3 /opt/aleph-tx/current/sync_monitor_env.py \
+  --source /etc/aleph-tx/.env.all_exchanges \
+  --output /etc/aleph-tx/monitor.env
+sudo systemctl restart aleph-tx-monitor.service
 ```
 
-Use mainnet identifiers. Hyperliquid reads perpetuals on the default DEX. The monitor polls the exchanges' public account endpoints about every 20 seconds, and requires no API key or signing key. Apply changes with `sudo systemctl restart aleph-tx-monitor.service`. This does not affect the feeder or the trading strategy.
+Supported public variables in `/etc/aleph-tx/monitor.env` (no API/signing keys; preserves existing `ALEPH_MONITOR_CONTROL_TOKEN` and webhook settings):
+
+```dotenv
+ALEPH_MONITOR_LIGHTER_INDEX=<numeric Lighter Core account index>
+ALEPH_MONITOR_LIGHTER_RH_INDEX=<numeric Lighter Robinhood account index>
+ALEPH_MONITOR_HL_ADDRESS=<Hyperliquid 0x address (also used for TradeXYZ & Entropy unless overridden)>
+ALEPH_MONITOR_HL_XYZ_ADDRESS=<optional separate xyz 0x address>
+ALEPH_MONITOR_HL_IO_ADDRESS=<optional separate io 0x address>
+ALEPH_MONITOR_ARCUS_ADDRESS=<Arcus 0x address>
+ALEPH_MONITOR_ARCUS_INDEX=<Arcus index 0..9, default 0>
+ALEPH_MONITOR_BULK_PUBKEY=<BULK Solana Base58 pubkey>
+```
+
+The monitor polls these public read-only endpoints (`Lighter`, `LighterRH`, `Hyperliquid`, `TradeXYZ`, `Entropy`, `Arcus`, `BULK`) about every 20 seconds without private keys, leaving trading latency and rate limits untouched. Apply changes with `sudo systemctl restart aleph-tx-monitor.service`.
 
 ## Operations
 

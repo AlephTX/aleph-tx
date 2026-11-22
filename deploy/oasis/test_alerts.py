@@ -114,6 +114,14 @@ class EvaluateTest(unittest.TestCase):
         stopped["snapshot"]["defense_regime"] = "halt"
         self.assertEqual(evaluate(status(), stopped, NOW), [])
 
+    def test_disk_space_low_alerts(self):
+        self.assertEqual(evaluate({**status(), "disk": {"free_gib": 8.0}}, summary(), NOW), [])
+        self.assertEqual(evaluate({**status(), "disk": {"free_gib": float("nan")}}, summary(), NOW), [])
+        warn = evaluate({**status(live="inactive"), "disk": {"free_gib": 6.5}}, summary(), NOW)
+        self.assertEqual([(a["key"], a["severity"]) for a in warn], [("disk_space_low", WARNING)])
+        crit = evaluate({**status(live="inactive"), "disk": {"free_gib": 2.1}}, summary(), NOW)
+        self.assertEqual([(a["key"], a["severity"]) for a in crit], [("disk_space_low", CRITICAL)])
+
 
 class AlerterTest(unittest.TestCase):
     def test_drawdown_escalation_refreshes_message_and_notifies_once(self):

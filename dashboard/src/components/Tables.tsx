@@ -512,7 +512,7 @@ export function Accounts({ accounts }: { accounts: Record<string, AccountSnapsho
     <Card
       title="交易所链上实时持仓"
       right={
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap gap-1.5">
           {entries.map(([venue, a]) => (
             <span key={venue} title={a.error ?? a.as_of ?? ''}>
               <Badge tone={a.state === 'ready' ? 'ok' : a.state === 'error' ? 'bad' : 'idle'}>{venue}</Badge>
