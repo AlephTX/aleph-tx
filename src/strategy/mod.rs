@@ -7,6 +7,7 @@ pub mod multiday_carry;
 pub mod portfolio_risk;
 pub mod relative_value;
 mod replay_queue_depth;
+pub mod tail_risk;
 
 use crate::shm_reader::ShmBboMessage;
 use std::future::Future;
