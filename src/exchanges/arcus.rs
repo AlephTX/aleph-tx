@@ -5,7 +5,9 @@ mod scheduled_cancel;
 use anyhow::{Context, Result, ensure};
 pub use cancel_lease::{CancelLease, CancelLeasePolicy, CancelRenewal};
 use ed25519_dalek::{Signer, SigningKey};
-pub use rest::{ArcusTrading, ExecutionError, Fill, HistoryWindow, Order, OrderReceipt, Position};
+pub use rest::{
+    ArcusTrading, ExecutionError, Fill, HistoryWindow, Order, OrderReceipt, Position, PreparedLimit,
+};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 pub use scheduled_cancel::ScheduledCancelReceipt;
 use serde::{Deserialize, Serialize};

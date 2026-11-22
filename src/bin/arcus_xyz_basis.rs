@@ -7,6 +7,8 @@
 //!   - `--canary-preflight <config.toml> --env <env_file>`: read-only agent/account/journal check.
 //!   - `--canary <config.toml> --env <env_file> --confirm-live-canary`: guarded small-notional live runner.
 
+#[path = "arcus_xyz_basis/risk.rs"]
+mod risk;
 use aleph_tx::daily_loss::{DailyLossGuard, utc_day_now};
 use aleph_tx::exchanges::arcus::{
     self, Account as ArcusAccount, ArcusInfo, ArcusSigner, ArcusTrading, CancelLease,
@@ -22,9 +24,9 @@ use aleph_tx::strategy::arcus_xyz_basis::{
     ArcusBookSnapshot, ArcusLegIntent, ArcusLegPnlTracker, ArcusSubmitOutcome, ArcusXyzBasisConfig,
     ArcusXyzBasisEngine, BasisAction, BasisJournal, BasisJournalEvent, HL_MIN_ORDER_NOTIONAL_USD,
     HlLegIntent, HlSubmitOutcome, ShutdownDisposition, VenueOrderConstraints, VerifiedLegTerminal,
-    classify_arcus_submit, classify_hl_submit, classify_shutdown, combined_guard_equity_usd,
-    parse_hl_market_position, quantize_arcus_limit_price, quantize_hl_base_qty,
-    quantize_shared_base_qty, verify_arcus_leg_terminal, verify_hl_leg_terminal,
+    classify_arcus_submit, classify_hl_submit, classify_shutdown, parse_hl_market_position,
+    quantize_arcus_limit_price, quantize_hl_base_qty, quantize_shared_base_qty,
+    verify_arcus_leg_terminal, verify_hl_leg_terminal,
 };
 use aleph_tx::telemetry_sink::{HedgeFillRecord, SessionInfo, StrategySnapshot, TelemetrySink};
 use aleph_tx::venues::{
@@ -32,6 +34,8 @@ use aleph_tx::venues::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::SigningKey;
+use futures::FutureExt;
+use risk::EquityBasis;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::json;
@@ -423,27 +427,70 @@ async fn run_probe_public(
     Ok(())
 }
 
-async fn shutdown_signal() -> &'static str {
+#[derive(Default)]
+struct StopLatch {
+    requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    handlers: Vec<signal_hook_registry::SigId>,
+}
+
+impl StopLatch {
+    fn install() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            let mut latch = Self::default();
+            for kind in [SignalKind::interrupt(), SignalKind::terminate()] {
+                let requested = latch.requested.clone();
+                // The handler only sets a lock-free flag. Admission observes the
+                // flag even if the runtime has not serviced its signal pipe.
+                let id = unsafe {
+                    signal_hook_registry::register(kind.as_raw_value(), move || {
+                        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                }?;
+                latch.handlers.push(id);
+            }
+            Ok(latch)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::default())
+        }
+    }
+    fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StopLatch {
+    fn drop(&mut self) {
+        for id in self.handlers.drain(..) {
+            signal_hook_registry::unregister(id);
+        }
+    }
+}
+
+fn registered_shutdown() -> Result<impl Future<Output = &'static str>> {
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = async {
-                match sigterm.as_mut() {
-                    Some(stream) => {
-                        let _ = stream.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => "SIGTERM",
-        }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        "SIGINT"
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        })
     }
 }
 
@@ -568,7 +615,7 @@ async fn run_shadow(config_path: &Path, duration_secs: u64) -> Result<()> {
     let started = Instant::now();
     let deadline = (duration_secs > 0).then(|| started + Duration::from_secs(duration_secs));
     let mut polls = 0_u64;
-    let shutdown = shutdown_signal();
+    let shutdown = registered_shutdown()?;
     tokio::pin!(shutdown);
 
     loop {
@@ -678,6 +725,8 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 struct LiveHandles {
+    scopes: [String; 2],
+    _account_locks: Vec<fs::File>,
     arc_account: ArcusAccount,
     arc_account_index: u8,
     arc_info: ArcusInfo,
@@ -693,7 +742,11 @@ struct LiveHandles {
     hl_equity: Decimal,
 }
 
-async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Result<LiveHandles> {
+async fn load_and_preflight(
+    cfg: &ArcusXyzBasisConfig,
+    env_path: &Path,
+    live: bool,
+) -> Result<LiveHandles> {
     BasisJournal::check_clean_restart(&cfg.journal_path)?;
     let env_map = read_env(env_path)?;
 
@@ -733,6 +786,12 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
 
     let (arc_net, hl_net) = parse_networks(&cfg.network)?;
     let arc_account = ArcusAccount::new(arc_addr, arc_idx)?;
+    let scopes = risk::account_scopes(&cfg.network, arc_addr, arc_idx, &hl_account);
+    let locks = if live {
+        risk::account_locks(&scopes)?
+    } else {
+        Vec::new()
+    };
     let arc_info = ArcusInfo::new(arc_net)?;
     let arc_trading = ArcusTrading::new(
         arc_net,
@@ -785,7 +844,11 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
     let inv_xyz = parse_hl_market_position(&dex_state, &cfg.hl_coin)?;
     let hl_equity = aggregate_multi_dex_equity(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
 
+    validate_flat_start(inv_arc, inv_xyz)?;
+    ensure_account_time(cfg, unix_ms()?, core_state.time, dex_state.time)?;
     Ok(LiveHandles {
+        scopes,
+        _account_locks: locks,
         arc_account,
         arc_account_index: arc_idx,
         arc_info,
@@ -802,7 +865,31 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
     })
 }
 
+fn validate_flat_start(arc: Decimal, hl: Decimal) -> Result<()> {
+    ensure!(
+        arc.is_zero() && hl.is_zero(),
+        "normal startup requires both configured markets flat; reconcile existing exposure"
+    );
+    Ok(())
+}
+
+fn ensure_account_time(cfg: &ArcusXyzBasisConfig, now: u64, core: u64, dex: u64) -> Result<()> {
+    for ts in [core, dex] {
+        ensure!(
+            ts > 0
+                && ts <= now.saturating_add(cfg.max_venue_clock_skew_ms)
+                && now.saturating_sub(ts)
+                    <= cfg
+                        .max_hl_book_age_ms
+                        .saturating_add(cfg.max_venue_clock_skew_ms),
+            "stale or invalid HL account valuation"
+        );
+    }
+    Ok(())
+}
+
 struct VenueSnapshot {
+    core_time: u64,
     inv_arc: Decimal,
     inv_xyz: Decimal,
     hl_equity: Decimal,
@@ -827,11 +914,129 @@ async fn reconcile_both_venues(
     let inv_xyz = parse_hl_market_position(&dex_state, &cfg.hl_coin)?;
     let hl_equity = aggregate_multi_dex_equity(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
     Ok(VenueSnapshot {
+        core_time: core_state.time,
         inv_arc,
         inv_xyz,
         hl_equity,
         hl_account_time_ms: dex_state.time,
     })
+}
+
+struct Valuation {
+    sampled_at: Instant,
+    sampled_ms: u64,
+    arc: ArcusBookSnapshot,
+    hl: hyperliquid::ValidatedBook,
+    hl_rx: u64,
+    account: VenueSnapshot,
+}
+
+impl Valuation {
+    fn fresh(&self, cfg: &ArcusXyzBasisConfig, now: u64) -> Result<()> {
+        if let Some(reason) = cfg.book_problem(now, &self.arc, &self.hl, self.hl_rx) {
+            bail!("{reason}");
+        }
+        let stamps = [
+            self.arc.source_ms,
+            self.hl.bbo.timestamp_ms,
+            self.account.core_time,
+            self.account.hl_account_time_ms,
+        ];
+        let spread = stamps.iter().max().unwrap() - stamps.iter().min().unwrap();
+        ensure!(
+            spread
+                <= cfg
+                    .max_arcus_book_age_ms
+                    .min(cfg.max_hl_book_age_ms)
+                    .saturating_add(cfg.max_venue_clock_skew_ms),
+            "legs and account valuation times are too far apart"
+        );
+        ensure_account_time(
+            cfg,
+            now,
+            self.account.core_time,
+            self.account.hl_account_time_ms,
+        )
+    }
+    fn admits(
+        &self,
+        cfg: &ArcusXyzBasisConfig,
+        now: u64,
+        mono: Instant,
+        lease_ok: bool,
+        stopping: bool,
+    ) -> bool {
+        let elapsed = mono
+            .saturating_duration_since(self.sampled_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        !stopping
+            && lease_ok
+            && self
+                .fresh(cfg, now.max(self.sampled_ms.saturating_add(elapsed)))
+                .is_ok()
+    }
+    fn admit_journaled(
+        &self,
+        cfg: &ArcusXyzBasisConfig,
+        exposure_lease: Option<&CancelLease>,
+        stopping: bool,
+        journal: &BasisJournal,
+        intent_id: &str,
+        engine: &mut ArcusXyzBasisEngine,
+    ) -> Result<bool> {
+        let now = unix_ms()?;
+        let mono = Instant::now();
+        if self.admits(
+            cfg,
+            now,
+            mono,
+            exposure_lease.is_none_or(|lease| lease.allows_new_exposure(mono)),
+            stopping,
+        ) {
+            return Ok(true);
+        }
+        journal.append(&BasisJournalEvent::IntentNotSent {
+            intent_id: intent_id.into(),
+            journal_ms: now,
+        })?;
+        engine.reconcile_positions(
+            self.account.inv_arc,
+            self.account.inv_xyz,
+            self.arc.receipt_ms,
+            self.hl_rx,
+            now,
+        );
+        Ok(false)
+    }
+    fn mid(&self) -> Decimal {
+        (self.arc.bid_px + self.arc.ask_px) * Decimal::new(5, 1)
+    }
+    fn verify_positions(&self, arc: Decimal, hl: Decimal) -> Result<()> {
+        ensure!(
+            self.account.inv_arc == arc && self.account.inv_xyz == hl,
+            "positions differ from reconciled inventory"
+        );
+        Ok(())
+    }
+}
+
+async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<Valuation> {
+    let (arc, (hl, hl_rx), account) = tokio::try_join!(
+        async { to_arcus_snapshot(&handles.arc_info.bbo(&cfg.arcus_symbol).await?, unix_ms()?) },
+        async { Ok((handles.hl_info.l2_book(&cfg.hl_coin).await?, unix_ms()?)) },
+        reconcile_both_venues(handles, cfg),
+    )?;
+    let v = Valuation {
+        sampled_at: Instant::now(),
+        sampled_ms: unix_ms()?,
+        arc,
+        hl,
+        hl_rx,
+        account,
+    };
+    v.fresh(cfg, unix_ms()?)?;
+    Ok(v)
 }
 
 async fn reconcile_both_venues_with_retry(
@@ -942,12 +1147,10 @@ async fn finalize_reconciled_intent(
     journal: &BasisJournal,
     telemetry: Option<&TelemetrySink>,
     engine: &mut ArcusXyzBasisEngine,
-    arc_pnl: &mut ArcusLegPnlTracker,
+    basis: &mut EquityBasis,
+    session_start_equity: f64,
     daily_loss: &mut DailyLossGuard,
-    initial_hl_equity: Decimal,
-    last_hl_equity_delta: &mut f64,
     session_eq: &mut f64,
-    arc_snap: &ArcusBookSnapshot,
     lease_ok: bool,
     kind: &str,
     intent_id: String,
@@ -1000,25 +1203,11 @@ async fn finalize_reconciled_intent(
         .context("missing resolved authoritative intent proof; keeping restart barrier armed")?;
 
     let reconcile_ms = rec_started.elapsed().as_secs_f64() * 1_000.0;
-    let now_rec = unix_ms()?;
     let terminal_status = if arc_ctx.is_some() {
         "reconciled_verified_pair"
     } else {
         "reconciled_verified_residual"
     };
-    journal.append(&BasisJournalEvent::IntentTerminal {
-        intent_id: intent_id.clone(),
-        status: terminal_status.into(),
-        inv_arc: snap.inv_arc,
-        inv_xyz: snap.inv_xyz,
-        journal_ms: now_rec,
-        arcus_status: arc_proof.as_ref().map(|p| p.status.clone()),
-        arcus_filled_qty: arc_proof.as_ref().map(|p| p.filled_qty),
-        hl_status: Some(hl_proof.status.clone()),
-        hl_filled_qty: Some(hl_proof.filled_qty),
-        hl_terminal_at_ms: hl_proof.terminal_at_ms,
-        hl_account_time_ms: hl_proof.account_time_ms,
-    })?;
     let signed_hl_fill = if hl_intent.is_buy {
         hl_proof.filled_qty
     } else {
@@ -1040,40 +1229,48 @@ async fn finalize_reconciled_intent(
         && let Some((arc_i, _)) = arc_ctx
         && arc_p.filled_qty > Decimal::ZERO
     {
-        arc_pnl.record_fill(
+        basis.arc.record_fill(
             matches!(arc_i.side, ArcusSide::Buy),
             arc_p.filled_qty,
             arc_p.avg_price.unwrap_or(arc_i.limit_price),
             ARCUS_TAKER_FEE_RATE,
         );
     }
-    let arc_mid_dec = (arc_snap.bid_px + arc_snap.ask_px) * Decimal::new(5, 1);
-    arc_pnl.sync_position(snap.inv_arc, Some(arc_mid_dec));
-    let arc_mid_f64 = arc_mid_dec.to_f64().unwrap_or(0.0);
-    let arc_est_pnl = arc_pnl.estimated_total_pnl_usd(arc_mid_f64);
-    *last_hl_equity_delta = (snap.hl_equity - initial_hl_equity).to_f64().unwrap_or(0.0);
-    *session_eq = combined_guard_equity_usd(
-        cfg.allocated_capital_usd,
-        *last_hl_equity_delta,
-        arc_est_pnl,
+    ensure!(
+        basis.arc.position() == snap.inv_arc,
+        "fill ledger differs from authoritative Arcus position"
     );
-
+    let v = retry_with_backoff(RECONCILE_MAX_ATTEMPTS, RECONCILE_BASE_BACKOFF_MS, || {
+        valuation(handles, cfg)
+    })
+    .await?;
+    v.verify_positions(snap.inv_arc, snap.inv_xyz)?;
+    ensure!(
+        v.account.hl_account_time_ms >= snap.hl_account_time_ms,
+        "account watermark regressed"
+    );
+    let arc_snap = &v.arc;
+    let (equity, hl_delta, arc_est_pnl) = basis.equity(v.account.hl_equity, v.mid())?;
+    *session_eq = equity;
+    basis.persist(cfg)?;
+    // Preserve a sticky loss breach before disarming the intent restart barrier.
+    let loss_check = daily_loss.check(equity, utc_day_now());
     engine.reconcile_positions(
         snap.inv_arc,
         snap.inv_xyz,
         arc_snap.receipt_ms,
-        now_rec,
-        now_rec,
+        v.hl_rx,
+        unix_ms()?,
     );
-    if let Err(err) = daily_loss.check(*session_eq, utc_day_now()) {
+    if let Err(err) = loss_check {
         emit_basis_snapshot(
             telemetry,
             cfg,
             *session_eq,
+            session_start_equity,
             daily_loss,
             engine,
             arc_snap,
-            now_rec,
             lease_ok,
             true,
         );
@@ -1081,14 +1278,27 @@ async fn finalize_reconciled_intent(
             handle_canary_shutdown("daily_loss_breached", handles, cfg, journal, telemetry).await;
         return Err(err);
     }
+    journal.append(&BasisJournalEvent::IntentTerminal {
+        intent_id: intent_id.clone(),
+        status: terminal_status.into(),
+        inv_arc: snap.inv_arc,
+        inv_xyz: snap.inv_xyz,
+        journal_ms: unix_ms()?,
+        arcus_status: arc_proof.as_ref().map(|p| p.status.clone()),
+        arcus_filled_qty: arc_proof.as_ref().map(|p| p.filled_qty),
+        hl_status: Some(hl_proof.status.clone()),
+        hl_filled_qty: Some(hl_proof.filled_qty),
+        hl_terminal_at_ms: hl_proof.terminal_at_ms,
+        hl_account_time_ms: hl_proof.account_time_ms,
+    })?;
     emit_basis_snapshot(
         telemetry,
         cfg,
         *session_eq,
+        session_start_equity,
         daily_loss,
         engine,
         arc_snap,
-        now_rec,
         lease_ok,
         false,
     );
@@ -1103,9 +1313,9 @@ async fn finalize_reconciled_intent(
             "hl_status": hl_proof.status,
             "hl_filled": hl_proof.filled_qty.to_string(),
             "hl_account_time_ms": hl_proof.account_time_ms,
-            "hl_reported_equity_delta_usd": (*last_hl_equity_delta * 10_000.0).round() / 10_000.0,
-            "arcus_estimated_pnl_usd": arc_est_pnl.map(|v| (v * 10_000.0).round() / 10_000.0),
-            "arcus_pnl_resynced": arc_pnl.resynced(),
+            "hl_reported_equity_delta_usd": (hl_delta * 10_000.0).round() / 10_000.0,
+            "arcus_estimated_pnl_usd": (arc_est_pnl * 10_000.0).round() / 10_000.0,
+            "arcus_pnl_resynced": basis.arc.resynced(),
             "combined_guard_equity_usd": (*session_eq * 10_000.0).round() / 10_000.0,
             "exec_ms": (exec_ms * 10.0).round() / 10.0,
             "reconcile_ms": (reconcile_ms * 10.0).round() / 10.0,
@@ -1129,7 +1339,7 @@ async fn handle_canary_shutdown(
 ) -> Result<()> {
     let cancel_res = handles
         .arc_trading
-        .cancel_all(Some(handles.arc_market.market_id))
+        .cancel_all_confirmed(Some(handles.arc_market.market_id))
         .await;
     let open_orders_res = retry_with_backoff(
         RECONCILE_MAX_ATTEMPTS,
@@ -1280,10 +1490,10 @@ fn emit_basis_snapshot(
     sink: Option<&TelemetrySink>,
     cfg: &ArcusXyzBasisConfig,
     session_eq: f64,
+    session_start_equity: f64,
     daily_loss: &DailyLossGuard,
     engine: &ArcusXyzBasisEngine,
     arc_snap: &ArcusBookSnapshot,
-    rx_ms: u64,
     lease_ok: bool,
     force_halt: bool,
 ) {
@@ -1311,7 +1521,7 @@ fn emit_basis_snapshot(
     };
     sink.snapshot(StrategySnapshot {
         equity: session_eq,
-        session_start_equity: cfg.allocated_capital_usd,
+        session_start_equity,
         daily_loss: Some(daily_loss.snapshot()),
         exchange_position: engine.inv_arc().to_f64().unwrap_or(0.0),
         confirmed_position: (engine.inv_arc() + engine.inv_xyz())
@@ -1319,7 +1529,7 @@ fn emit_basis_snapshot(
             .unwrap_or(0.0),
         mid,
         mark_source: Some("local_book"),
-        mark_sampled_ms: Some(rx_ms),
+        mark_sampled_ms: Some(arc_snap.receipt_ms),
         mark_feed_ms: Some(arc_snap.source_ms),
         spread_bps,
         defense_regime: Some(defense_regime),
@@ -1332,16 +1542,14 @@ async fn recover_cancel_lease(
     handles: &LiveHandles,
     cfg: &ArcusXyzBasisConfig,
     engine: &mut ArcusXyzBasisEngine,
-    arc_pnl: &mut ArcusLegPnlTracker,
-    initial_hl_equity: Decimal,
-    last_hl_equity_delta: &mut f64,
+    basis: &mut EquityBasis,
+
     session_eq: &mut f64,
     daily_loss: &mut DailyLossGuard,
-    last_arc_snap: Option<&ArcusBookSnapshot>,
 ) -> Result<CancelLease> {
     handles
         .arc_trading
-        .cancel_all(Some(handles.arc_market.market_id))
+        .cancel_all_confirmed(Some(handles.arc_market.market_id))
         .await
         .context("cancel all Arcus orders during lease recovery")?;
     let win = HistoryWindow::default();
@@ -1355,28 +1563,39 @@ async fn recover_cancel_lease(
         "Arcus still has {} open order(s) during CancelLease recovery",
         arc_open.len()
     );
-    let snap = reconcile_both_venues_with_retry(handles, cfg).await?;
-    let now_rec = unix_ms()?;
-    let mark_mid_dec = last_arc_snap.map(|s| (s.bid_px + s.ask_px) * Decimal::new(5, 1));
-    arc_pnl.sync_position(snap.inv_arc, mark_mid_dec);
-    engine.reconcile_positions(snap.inv_arc, snap.inv_xyz, now_rec, now_rec, now_rec);
-    *last_hl_equity_delta = (snap.hl_equity - initial_hl_equity).to_f64().unwrap_or(0.0);
-    let arc_est = mark_mid_dec
-        .and_then(|d| d.to_f64())
-        .and_then(|mid| arc_pnl.estimated_total_pnl_usd(mid));
-    *session_eq =
-        combined_guard_equity_usd(cfg.allocated_capital_usd, *last_hl_equity_delta, arc_est);
+    let v = valuation(handles, cfg).await?;
+    v.verify_positions(engine.inv_arc(), engine.inv_xyz())?;
+    *session_eq = basis.equity(v.account.hl_equity, v.mid())?.0;
     daily_loss.check(*session_eq, utc_day_now())?;
     let mut fresh = build_cancel_lease(handles)?;
     handles.arc_trading.renew_cancel_lease(&mut fresh).await?;
     Ok(fresh)
 }
 
+/// Both signing paths finish before the caller receives anything it can dispatch.
+async fn prepare_pair<H>(
+    arc: &ArcusTrading,
+    market: &ArcusMarket,
+    order: LimitOrder<'_>,
+    prepare_hedge: impl Future<Output = Result<H>>,
+) -> Result<(arcus::PreparedLimit, H)> {
+    let primary = arc.prepare_limit(market, order)?;
+    Ok((primary, prepare_hedge.await?))
+}
+
 async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
+    let stop = StopLatch::install()?;
     let cfg = load_config(config_path)?;
     cfg.validate_canary_caps()?;
-    let handles = load_and_preflight(&cfg, env_path).await?;
+    let shutdown = registered_shutdown()?;
+    tokio::pin!(shutdown);
     let journal = BasisJournal::open_and_check_restart(cfg.journal_path.clone())?;
+    let mut guard_lock_path = cfg.daily_loss_state_path.as_os_str().to_owned();
+    guard_lock_path.push(".lock");
+    let _guard_lock =
+        aleph_tx::strategy::arcus_xyz_basis::lock_state_file(Path::new(&guard_lock_path))?;
+    let handles = load_and_preflight(&cfg, env_path, true).await?;
+    let binding = risk::StateBinding::check(&cfg, &handles.scopes)?;
     journal.append(&BasisJournalEvent::SessionStart {
         network: cfg.network.clone(),
         arcus_symbol: cfg.arcus_symbol.clone(),
@@ -1385,16 +1604,20 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
         journal_ms: unix_ms()?,
     })?;
 
+    let mut basis = EquityBasis::restore(&cfg, &handles.scopes, handles.hl_equity)?;
+    let mut session_eq = basis.equity(handles.hl_equity, Decimal::ZERO)?.0;
+    let session_start_equity = session_eq;
+    let today = utc_day_now();
     let mut daily_loss = DailyLossGuard::open(
         Some(cfg.daily_loss_state_path.clone()),
         cfg.daily_loss_limit_pct,
-        cfg.allocated_capital_usd,
-        utc_day_now(),
+        session_eq.max(f64::MIN_POSITIVE),
+        today,
     )?;
-    let initial_hl_equity = handles.hl_equity;
-    let mut last_hl_equity_delta: f64 = 0.0;
-    let mut arc_pnl = ArcusLegPnlTracker::new(handles.inv_arc, None);
-    let mut session_eq = cfg.allocated_capital_usd;
+    daily_loss.check(session_eq, today)?;
+    if let Some(binding) = binding {
+        binding.record()?;
+    }
     let telemetry = TelemetrySink::from_env(&SessionInfo {
         session_id: format!("arcus-xyz-{}-{}", cfg.arcus_symbol, unix_ms()?),
         network: cfg.network.clone(),
@@ -1419,14 +1642,20 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
     let init_ms = unix_ms()?;
     engine.reconcile_positions(handles.inv_arc, handles.inv_xyz, init_ms, init_ms, init_ms);
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     let mut consecutive_poll_errors: u32 = 0;
     let mut consecutive_lease_errors: u32 = 0;
     let mut consecutive_residual_rejects: u32 = 0;
     let mut last_arc_snap: Option<ArcusBookSnapshot> = None;
 
     loop {
+        if let Some(sig) = shutdown
+            .as_mut()
+            .now_or_never()
+            .or_else(|| stop.requested().then_some("stop_requested"))
+        {
+            handle_canary_shutdown(sig, &handles, &cfg, &journal, telemetry.as_ref()).await?;
+            break;
+        }
         if cfg.require_arcus_cancel_lease {
             if lease.needs_renewal(Instant::now()) {
                 match handles.arc_trading.renew_cancel_lease(&mut lease).await {
@@ -1449,10 +1678,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         telemetry.as_ref(),
                         &cfg,
                         session_eq,
+                        session_start_equity,
                         &daily_loss,
                         &engine,
                         prev_snap,
-                        unix_ms()?,
                         false,
                         false,
                     );
@@ -1461,12 +1690,9 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                     &handles,
                     &cfg,
                     &mut engine,
-                    &mut arc_pnl,
-                    initial_hl_equity,
-                    &mut last_hl_equity_delta,
+                    &mut basis,
                     &mut session_eq,
                     &mut daily_loss,
-                    last_arc_snap.as_ref(),
                 )
                 .await
                 {
@@ -1488,10 +1714,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                                     telemetry.as_ref(),
                                     &cfg,
                                     session_eq,
+                                    session_start_equity,
                                     &daily_loss,
                                     &engine,
                                     prev_snap,
-                                    unix_ms()?,
                                     false,
                                     true,
                                 );
@@ -1522,10 +1748,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                                     telemetry.as_ref(),
                                     &cfg,
                                     session_eq,
+                                    session_start_equity,
                                     &daily_loss,
                                     &engine,
                                     prev_snap,
-                                    unix_ms()?,
                                     false,
                                     true,
                                 );
@@ -1546,27 +1772,14 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 }
             }
         }
-        let lease_ok = !cfg.require_arcus_cancel_lease || lease.allows_new_exposure(Instant::now());
-        let ((arc_res, arc_rx_res), (hl_res, hl_rx_res)) = tokio::join!(
-            async {
-                let r = handles.arc_info.bbo(&cfg.arcus_symbol).await;
-                (r, unix_ms())
-            },
-            async {
-                let r = handles.hl_info.l2_book(&cfg.hl_coin).await;
-                (r, unix_ms())
-            },
-        );
-        let arc_rx_ms = arc_rx_res?;
-        let hl_rx_ms = hl_rx_res?;
+        let valuation_result = valuation(&handles, &cfg).await;
         let eval_now_ms = unix_ms()?;
-        let arc_snap_res = arc_res.and_then(|b| to_arcus_snapshot(&b, arc_rx_ms));
-        let (arc_snap, hl_book) = match (arc_snap_res, hl_res) {
-            (Ok(arc_snap), Ok(hl_book)) => {
+        let v = match valuation_result {
+            Ok(v) => {
                 consecutive_poll_errors = 0;
-                (arc_snap, hl_book)
+                v
             }
-            (arc_err, hl_err) => {
+            Err(_) => {
                 consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
                 eprintln!(
                     "{}",
@@ -1574,8 +1787,6 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         "mode": "canary_warn",
                         "event": "book_poll_error",
                         "ms": eval_now_ms,
-                        "arcus_ok": arc_err.is_ok(),
-                        "hl_ok": hl_err.is_ok(),
                         "consecutive_poll_errors": consecutive_poll_errors,
                     })
                 );
@@ -1602,30 +1813,45 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 }
             }
         };
-        last_arc_snap = Some(arc_snap.clone());
-        let arc_mid_dec = (arc_snap.bid_px + arc_snap.ask_px) * Decimal::new(5, 1);
-        arc_pnl.anchor_initial_if_unpriced(arc_mid_dec);
-        if engine.inv_arc() != Decimal::ZERO || engine.inv_xyz() != Decimal::ZERO {
-            let cur_mid = arc_mid_dec.to_f64().unwrap_or(0.0);
-            session_eq = combined_guard_equity_usd(
-                cfg.allocated_capital_usd,
-                last_hl_equity_delta,
-                arc_pnl.estimated_total_pnl_usd(cur_mid),
+        let lease_ok = !cfg.require_arcus_cancel_lease || lease.allows_new_exposure(Instant::now());
+        if let Err(err) = v.verify_positions(engine.inv_arc(), engine.inv_xyz()) {
+            emit_basis_snapshot(
+                telemetry.as_ref(),
+                &cfg,
+                session_eq,
+                session_start_equity,
+                &daily_loss,
+                &engine,
+                &v.arc,
+                lease_ok,
+                true,
             );
-            if let Err(err) = daily_loss.check(session_eq, utc_day_now()) {
+            let _ = handle_canary_shutdown(
+                "position_mismatch",
+                &handles,
+                &cfg,
+                &journal,
+                telemetry.as_ref(),
+            )
+            .await;
+            return Err(err);
+        }
+        session_eq = match basis.equity(v.account.hl_equity, v.mid()) {
+            Ok((eq, _, _)) => eq,
+            Err(err) => {
                 emit_basis_snapshot(
                     telemetry.as_ref(),
                     &cfg,
                     session_eq,
+                    session_start_equity,
                     &daily_loss,
                     &engine,
-                    &arc_snap,
-                    eval_now_ms,
+                    &v.arc,
                     lease_ok,
                     true,
                 );
                 let _ = handle_canary_shutdown(
-                    "daily_loss_breached",
+                    "valuation_error",
                     &handles,
                     &cfg,
                     &journal,
@@ -1634,12 +1860,38 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 .await;
                 return Err(err);
             }
+        };
+        let arc_snap = &v.arc;
+        let hl_book = &v.hl;
+        let hl_rx_ms = v.hl_rx;
+        last_arc_snap = Some(arc_snap.clone());
+        if let Err(err) = daily_loss.check(session_eq, utc_day_now()) {
+            emit_basis_snapshot(
+                telemetry.as_ref(),
+                &cfg,
+                session_eq,
+                session_start_equity,
+                &daily_loss,
+                &engine,
+                arc_snap,
+                lease_ok,
+                true,
+            );
+            let _ = handle_canary_shutdown(
+                "daily_loss_breached",
+                &handles,
+                &cfg,
+                &journal,
+                telemetry.as_ref(),
+            )
+            .await;
+            return Err(err);
         }
 
         let action = engine.on_books(
             eval_now_ms,
-            &arc_snap,
-            &hl_book,
+            arc_snap,
+            hl_book,
             hl_rx_ms,
             &daily_loss,
             lease_ok,
@@ -1659,10 +1911,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 telemetry.as_ref(),
                 &cfg,
                 session_eq,
+                session_start_equity,
                 &daily_loss,
                 &engine,
-                &arc_snap,
-                eval_now_ms,
+                arc_snap,
                 lease_ok,
                 true,
             );
@@ -1689,10 +1941,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         telemetry.as_ref(),
                         &cfg,
                         session_eq,
+                        session_start_equity,
                         &daily_loss,
                         &engine,
-                        &arc_snap,
-                        eval_now_ms,
+                        arc_snap,
                         lease_ok,
                         true,
                     );
@@ -1721,6 +1973,21 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 let wire =
                     OrderWire::new(handles.hl_market.asset_id, &handles.hl_market.asset, &order)?;
                 let hl_action = OrderAction::new(vec![wire])?;
+                let touch = if is_buy {
+                    hl_book.bbo.ask
+                } else {
+                    hl_book.bbo.bid
+                };
+                ensure!(
+                    q <= cfg.leg_capacity(
+                        order.limit_price.max(touch),
+                        engine.inv_xyz(),
+                        is_buy,
+                        reduce_only
+                    ),
+                    "normalized residual exceeds cap"
+                );
+                let hl_prepared = handles.hl_trading.prepare_orders(&hl_action, None).await?;
                 let sent_at_ms = unix_ms()?;
                 let hl_intent = HlLegIntent {
                     cloid: cloid.clone(),
@@ -1739,8 +2006,28 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                     qty: q,
                     journal_ms: sent_at_ms,
                 })?;
+                let sig = shutdown
+                    .as_mut()
+                    .now_or_never()
+                    .or_else(|| stop.requested().then_some("stop_requested"));
+                if !v.admit_journaled(
+                    &cfg,
+                    (cfg.require_arcus_cancel_lease && !reduce_only).then_some(&lease),
+                    sig.is_some(),
+                    &journal,
+                    &intent_id,
+                    &mut engine,
+                )? {
+                    if let Some(sig) = sig {
+                        drop(hl_prepared);
+                        handle_canary_shutdown(sig, &handles, &cfg, &journal, telemetry.as_ref())
+                            .await?;
+                        break;
+                    }
+                    continue;
+                }
                 let exec_started = Instant::now();
-                let hl_submit_res = handles.hl_trading.submit_orders(&hl_action).await;
+                let hl_submit_res = hl_prepared.send().await;
                 let exec_ms = exec_started.elapsed().as_secs_f64() * 1_000.0;
                 let hl_submit = classify_hl_submit(&hl_submit_res, q);
                 if !matches!(
@@ -1763,12 +2050,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                     &journal,
                     telemetry.as_ref(),
                     &mut engine,
-                    &mut arc_pnl,
+                    &mut basis,
+                    session_start_equity,
                     &mut daily_loss,
-                    initial_hl_equity,
-                    &mut last_hl_equity_delta,
                     &mut session_eq,
-                    &arc_snap,
                     lease_ok,
                     "residual_hedge",
                     intent_id,
@@ -1785,10 +2070,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                             telemetry.as_ref(),
                             &cfg,
                             session_eq,
+                            session_start_equity,
                             &daily_loss,
                             &engine,
-                            &arc_snap,
-                            eval_now_ms,
+                            arc_snap,
                             lease_ok,
                             true,
                         );
@@ -1871,6 +2156,38 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &hl_order,
                     )?;
                     let hl_action = OrderAction::new(vec![hl_wire])?;
+                    let arc_touch = if direction_arcus_buy {
+                        arc_snap.ask_px
+                    } else {
+                        arc_snap.bid_px
+                    };
+                    let hl_touch = if direction_arcus_buy {
+                        hl_book.bbo.bid
+                    } else {
+                        hl_book.bbo.ask
+                    };
+                    ensure!(
+                        q <= cfg.leg_capacity(
+                            arc_px.max(arc_touch),
+                            engine.inv_arc(),
+                            direction_arcus_buy,
+                            reduce_only
+                        ) && q
+                            <= cfg.leg_capacity(
+                                hl_order.limit_price.max(hl_touch),
+                                engine.inv_xyz(),
+                                !direction_arcus_buy,
+                                reduce_only
+                            ),
+                        "normalized pair exceeds order or position cap"
+                    );
+                    let (arc_prepared, hl_prepared) = prepare_pair(
+                        &handles.arc_trading,
+                        &handles.arc_market,
+                        arc_order,
+                        handles.hl_trading.prepare_orders(&hl_action, None),
+                    )
+                    .await?;
                     let sent_at_ms = unix_ms()?;
                     let arc_intent = ArcusLegIntent {
                         market_id: handles.arc_market.market_id,
@@ -1898,12 +2215,36 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         qty: q,
                         journal_ms: sent_at_ms,
                     })?;
+                    let sig = shutdown
+                        .as_mut()
+                        .now_or_never()
+                        .or_else(|| stop.requested().then_some("stop_requested"));
+                    if !v.admit_journaled(
+                        &cfg,
+                        (cfg.require_arcus_cancel_lease && !reduce_only).then_some(&lease),
+                        sig.is_some(),
+                        &journal,
+                        &intent_id,
+                        &mut engine,
+                    )? {
+                        if let Some(sig) = sig {
+                            drop((arc_prepared, hl_prepared));
+                            handle_canary_shutdown(
+                                sig,
+                                &handles,
+                                &cfg,
+                                &journal,
+                                telemetry.as_ref(),
+                            )
+                            .await?;
+                            break;
+                        }
+                        continue;
+                    }
                     let exec_started = Instant::now();
                     let (arc_res, hl_res) = tokio::join!(
-                        handles
-                            .arc_trading
-                            .place_limit(&handles.arc_market, arc_order),
-                        handles.hl_trading.submit_orders(&hl_action)
+                        handles.arc_trading.submit_limit(arc_prepared),
+                        hl_prepared.send()
                     );
                     let exec_ms = exec_started.elapsed().as_secs_f64() * 1_000.0;
                     let arc_submit = classify_arcus_submit(&arc_res, &arc_cid);
@@ -1934,12 +2275,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &journal,
                         telemetry.as_ref(),
                         &mut engine,
-                        &mut arc_pnl,
+                        &mut basis,
+                        session_start_equity,
                         &mut daily_loss,
-                        initial_hl_equity,
-                        &mut last_hl_equity_delta,
                         &mut session_eq,
-                        &arc_snap,
                         lease_ok,
                         kind,
                         intent_id,
@@ -1961,10 +2300,10 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 telemetry.as_ref(),
                 &cfg,
                 session_eq,
+                session_start_equity,
                 &daily_loss,
                 &engine,
-                &arc_snap,
-                eval_now_ms,
+                arc_snap,
                 lease_ok,
                 false,
             );
@@ -2000,7 +2339,7 @@ async fn main() -> Result<()> {
         } => run_shadow(&config, duration_secs).await,
         Command::CanaryPreflight { config, env_path } => {
             let cfg = load_config(&config)?;
-            let handles = load_and_preflight(&cfg, &env_path).await?;
+            let handles = load_and_preflight(&cfg, &env_path, false).await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -2023,6 +2362,129 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_arcus_quantity_blocks_either_leg_from_dispatch() {
+        let address = format!("0x{}", "11".repeat(20));
+        let signer = ArcusSigner::new(SigningKey::from_bytes(&[7; 32]), &address, 0).unwrap();
+        let trader = ArcusTrading::new(ArcusNetwork::Testnet, signer).unwrap();
+        let market: ArcusMarket = serde_json::from_value(json!({"marketId":1,"marketDisplayName":"SYN-USD",
+            "status":"ONLINE","type":"PERPETUAL","baseAsset":"SYN","quoteAsset":"USD","tickSize":"0.01",
+            "stepSize":"0.01","minOrderSize":"0.01","maxOrderSize":"10","minOrderNotional":"5"})).unwrap();
+        let mut hedge_prepared = false;
+        let pair = prepare_pair(
+            &trader,
+            &market,
+            LimitOrder {
+                side: ArcusSide::Buy,
+                quantity: 11.into(),
+                price: 100.into(),
+                time_in_force: ArcusTif::Ioc,
+                reduce_only: false,
+                client_id: "synthetic",
+            },
+            async {
+                hedge_prepared = true;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(pair.is_err());
+        assert!(!hedge_prepared);
+    }
+
+    #[test]
+    fn normal_start_requires_both_positions_flat() {
+        for (a, h) in [(1, 0), (0, -1), (1, -1)] {
+            assert!(validate_flat_start(a.into(), h.into()).is_err());
+        }
+        assert!(validate_flat_start(Decimal::ZERO, Decimal::ZERO).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_after_slow_book_read_or_journal_delay_rechecks_every_gate() {
+        let cfg: ArcusXyzBasisConfig =
+            toml::from_str(include_str!("../../config.arcus_xyz_basis.example.toml")).unwrap();
+        let mono = Instant::now();
+        let now = 100_000;
+        let v = Valuation {
+            sampled_at: mono,
+            sampled_ms: now,
+            arc: ArcusBookSnapshot {
+                source_ms: now,
+                receipt_ms: now,
+                bid_px: 100.into(),
+                ask_px: 101.into(),
+                bid_sz: Decimal::ONE,
+                ask_sz: Decimal::ONE,
+            },
+            hl: hyperliquid::ValidatedBook::from_bbo(hyperliquid::BestBidAsk {
+                coin: "xyz:SYN".into(),
+                timestamp_ms: now,
+                bid: 100.into(),
+                ask: 101.into(),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+            }),
+            hl_rx: now,
+            account: VenueSnapshot {
+                core_time: now,
+                hl_account_time_ms: now,
+                hl_equity: 100.into(),
+                inv_arc: Decimal::ZERO,
+                inv_xyz: Decimal::ZERO,
+            },
+        };
+        assert!(v.admits(&cfg, now, mono, true, false));
+        assert!(!v.admits(&cfg, now, mono, false, false));
+        assert!(!v.admits(&cfg, now, mono + Duration::from_millis(251), true, false));
+        let stop = StopLatch::default();
+        let (sender, response) = tokio::sync::oneshot::channel();
+        let requested = stop.requested.clone();
+        tokio::spawn(async move {
+            requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            sender
+                .send(v)
+                .unwrap_or_else(|_| panic!("book receiver closed"));
+        });
+        let mut v = response.await.unwrap();
+        let mut submissions = 0;
+        if v.admits(&cfg, now, mono, true, stop.requested()) {
+            submissions += 1;
+        }
+        assert_eq!(submissions, 0);
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let journal = BasisJournal::open_and_check_restart(path.clone()).unwrap();
+        let mut engine = ArcusXyzBasisEngine::new(cfg.clone()).unwrap();
+        journal
+            .append(&BasisJournalEvent::IntentOpen {
+                intent_id: "delayed".into(),
+                kind: "entry_pair".into(),
+                arcus_client_id: None,
+                hl_cloid: None,
+                qty: Decimal::ONE,
+                journal_ms: now,
+            })
+            .unwrap();
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
+        assert!(
+            !v.admit_journaled(
+                &cfg,
+                None,
+                stop.requested(),
+                &journal,
+                "delayed",
+                &mut engine
+            )
+            .unwrap()
+        );
+        drop(journal);
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+        fs::remove_file(path).unwrap();
+        v.account.hl_account_time_ms = 1;
+        assert!(!v.admits(&cfg, now, mono, true, false));
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]

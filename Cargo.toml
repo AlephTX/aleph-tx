@@ -39,6 +39,9 @@ flume = "0.12"
 core_affinity = "0.8"
 crossbeam = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = "1"
+
 [dev-dependencies]
 # Paused clock for deterministic async timing tests; no new crate.
 tokio = { version = "1", features = ["full", "test-util"] }

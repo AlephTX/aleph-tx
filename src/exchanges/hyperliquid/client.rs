@@ -276,6 +276,16 @@ pub struct HyperliquidTrading {
     expires_after_rejects: Arc<AtomicU64>,
 }
 
+/// A serialized, locally signed request. The nonce lane remains reserved until
+/// the venue responds or the caller discards this unsubmitted request.
+pub struct PreparedSubmission<'a> {
+    client: &'a HyperliquidTrading,
+    request: reqwest::Request,
+    response_type: &'static str,
+    expected: usize,
+    _lane: tokio::sync::MutexGuard<'a, ()>,
+}
+
 /// Production always signs; the unsigned variant exists only in test builds.
 enum ActionSigner {
     Key(HyperliquidSigner),
@@ -340,6 +350,17 @@ impl HyperliquidTrading {
         action: &OrderAction,
         explicit_expires_after: Option<u64>,
     ) -> Result<Vec<ExecutionStatus>> {
+        self.prepare_orders(action, explicit_expires_after)
+            .await?
+            .send()
+            .await
+    }
+
+    pub async fn prepare_orders(
+        &self,
+        action: &OrderAction,
+        explicit_expires_after: Option<u64>,
+    ) -> Result<PreparedSubmission<'_>> {
         ensure!(
             !action.orders.is_empty() && action.orders.len() <= 100,
             "Order batch must contain 1..=100 orders"
@@ -357,7 +378,7 @@ impl HyperliquidTrading {
             ids.len() == action.orders.len(),
             "Duplicate client order ID within batch"
         );
-        self.submit(action, "order", action.orders.len(), explicit_expires_after)
+        self.prepare(action, "order", action.orders.len(), explicit_expires_after)
             .await
     }
 
@@ -366,18 +387,20 @@ impl HyperliquidTrading {
             !action.cancels.is_empty() && action.cancels.len() <= 100,
             "Cancel batch must contain 1..=100 orders"
         );
-        self.submit(action, "cancel", action.cancels.len(), None)
+        self.prepare(action, "cancel", action.cancels.len(), None)
+            .await?
+            .send()
             .await
     }
 
-    async fn submit<T: Serialize>(
+    async fn prepare<T: Serialize>(
         &self,
         action: &T,
-        response_type: &str,
+        response_type: &'static str,
         expected: usize,
         explicit_expires_after: Option<u64>,
-    ) -> Result<Vec<ExecutionStatus>> {
-        let _submission = self.nonce_pool.submission.lock().await;
+    ) -> Result<PreparedSubmission<'_>> {
+        let lane = self.nonce_pool.submission.lock().await;
         let now = unix_ms()?;
         let nonce = self.nonce_pool.next_nonce_now(now)?;
         let expires_after = match explicit_expires_after {
@@ -411,12 +434,29 @@ impl HyperliquidTrading {
             vault_address: self.vault_address.as_deref(),
             expires_after,
         };
-        let response = self
+        let request = self
             .info
             .client
             .post(format!("{}/exchange", self.info.base_url))
             .json(&request)
-            .send()
+            .build()?;
+        Ok(PreparedSubmission {
+            client: self,
+            request,
+            response_type,
+            expected,
+            _lane: lane,
+        })
+    }
+}
+
+impl PreparedSubmission<'_> {
+    pub async fn send(self) -> Result<Vec<ExecutionStatus>> {
+        let response = self
+            .client
+            .info
+            .client
+            .execute(self.request)
             .await
             .map_err(|err| SubmissionError::Uncertain(err.to_string()))?;
         let status = response.status();
@@ -428,7 +468,7 @@ impl HyperliquidTrading {
         if !status.is_success() {
             return Err(SubmissionError::Uncertain(format!("HTTP {status}")).into());
         }
-        match parse_execution_response(&body, response_type, expected) {
+        match parse_execution_response(&body, self.response_type, self.expected) {
             Ok(statuses) => {
                 let expired = statuses.iter().any(|s| {
                     matches!(
@@ -438,7 +478,9 @@ impl HyperliquidTrading {
                     )
                 });
                 if expired {
-                    self.expires_after_rejects.fetch_add(1, Ordering::Relaxed);
+                    self.client
+                        .expires_after_rejects
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(statuses)
             }
@@ -446,7 +488,9 @@ impl HyperliquidTrading {
                 if let SubmissionError::Rejected(reason) = &err
                     && reason.to_ascii_lowercase().contains("expire")
                 {
-                    self.expires_after_rejects.fetch_add(1, Ordering::Relaxed);
+                    self.client
+                        .expires_after_rejects
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err.into())
             }

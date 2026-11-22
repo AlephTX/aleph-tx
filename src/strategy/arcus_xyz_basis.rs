@@ -121,6 +121,73 @@ pub struct ArcusXyzBasisConfig {
 }
 
 impl ArcusXyzBasisConfig {
+    pub fn book_problem(
+        &self,
+        now_ms: u64,
+        arc: &ArcusBookSnapshot,
+        xyz: &ValidatedBook,
+        xyz_rx_ms: u64,
+    ) -> Option<&'static str> {
+        if arc.bid_px <= Decimal::ZERO
+            || arc.ask_px <= arc.bid_px
+            || arc.bid_sz <= Decimal::ZERO
+            || arc.ask_sz <= Decimal::ZERO
+        {
+            return Some("invalid_arcus_book");
+        }
+        if now_ms.saturating_sub(arc.receipt_ms) > self.max_arcus_book_age_ms {
+            return Some("stale_arcus_book");
+        }
+        if now_ms.saturating_sub(xyz_rx_ms) > self.max_hl_book_age_ms {
+            return Some("stale_xyz_book");
+        }
+        let skew = self.max_venue_clock_skew_ms;
+        if arc.source_ms == 0 || arc.source_ms > now_ms.saturating_add(skew) {
+            return Some("invalid_arcus_source_time");
+        }
+        if now_ms.saturating_sub(arc.source_ms) > self.max_arcus_book_age_ms.saturating_add(skew) {
+            return Some("stale_arcus_source_book");
+        }
+        if xyz.bbo.timestamp_ms == 0 || xyz.bbo.timestamp_ms > now_ms.saturating_add(skew) {
+            return Some("invalid_xyz_source_time");
+        }
+        if now_ms.saturating_sub(xyz.bbo.timestamp_ms)
+            > self.max_hl_book_age_ms.saturating_add(skew)
+        {
+            return Some("stale_xyz_source_book");
+        }
+        None
+    }
+
+    /// Largest additional quantity permitted at this leg's protected execution value.
+    pub fn leg_capacity(
+        &self,
+        price: Decimal,
+        position: Decimal,
+        buy: bool,
+        reduce_only: bool,
+    ) -> Decimal {
+        if price <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let order = decimal_from_f64(self.canary_max_order_usd.min(self.clip_usd))
+            .unwrap_or_default()
+            / price;
+        let along = if buy { position } else { -position };
+        let room = if reduce_only {
+            -along
+        } else {
+            decimal_from_f64(
+                self.max_notional_usd
+                    .min(self.canary_max_total_notional_usd),
+            )
+            .unwrap_or_default()
+                / price
+                - along
+        };
+        order.min(room).max(Decimal::ZERO)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             matches!(self.network.as_str(), "mainnet" | "testnet"),
@@ -383,9 +450,11 @@ impl VenueOrderConstraints {
 
 /// Average-cost Arcus leg PnL estimator from verified fills and local mid price.
 /// Kept distinct from reported Hyperliquid equity in diagnostics/alerts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArcusLegPnlTracker {
+    #[serde(with = "rust_decimal::serde::str")]
     position: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
     avg_cost: Decimal,
     realized_pnl_usd: f64,
     estimated_fees_usd: f64,
@@ -732,56 +801,9 @@ impl ArcusXyzBasisEngine {
                 reason: "in_flight",
             };
         }
-        if arc.bid_px <= Decimal::ZERO
-            || arc.ask_px <= arc.bid_px
-            || arc.bid_sz <= Decimal::ZERO
-            || arc.ask_sz <= Decimal::ZERO
-        {
+        if let Some(reason) = self.config.book_problem(now_ms, arc, xyz, xyz_rx_ms) {
             self.reset_persist();
-            return BasisAction::Hold {
-                reason: "invalid_arcus_book",
-            };
-        }
-        if now_ms.saturating_sub(arc.receipt_ms) > self.config.max_arcus_book_age_ms {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "stale_arcus_book",
-            };
-        }
-        if now_ms.saturating_sub(xyz_rx_ms) > self.config.max_hl_book_age_ms {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "stale_xyz_book",
-            };
-        }
-        let skew = self.config.max_venue_clock_skew_ms;
-        if arc.source_ms == 0 || arc.source_ms > now_ms.saturating_add(skew) {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "invalid_arcus_source_time",
-            };
-        }
-        if now_ms.saturating_sub(arc.source_ms)
-            > self.config.max_arcus_book_age_ms.saturating_add(skew)
-        {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "stale_arcus_source_book",
-            };
-        }
-        if xyz.bbo.timestamp_ms == 0 || xyz.bbo.timestamp_ms > now_ms.saturating_add(skew) {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "invalid_xyz_source_time",
-            };
-        }
-        if now_ms.saturating_sub(xyz.bbo.timestamp_ms)
-            > self.config.max_hl_book_age_ms.saturating_add(skew)
-        {
-            self.reset_persist();
-            return BasisAction::Hold {
-                reason: "stale_xyz_source_book",
-            };
+            return BasisAction::Hold { reason };
         }
 
         // Priority 0: Hedge unhedged single-leg residual before any exit or new entry.
@@ -820,7 +842,12 @@ impl ArcusXyzBasisEngine {
             }
 
             let visible = xyz.visible_size_within_limit(is_buy, limit_price);
-            let raw_qty = unhedged.abs().min(visible);
+            let raw_qty = unhedged.abs().min(visible).min(self.config.leg_capacity(
+                touch.max(limit_price),
+                self.inv_xyz,
+                is_buy,
+                reduce_only_full,
+            ));
             let qty = if raw_qty > Decimal::ZERO {
                 quantize_hl_base_qty(raw_qty, self.constraints.hl_sz_decimals)
                     .unwrap_or(Decimal::ZERO)
@@ -922,7 +949,23 @@ impl ArcusXyzBasisEngine {
                     arc.bid_sz
                 };
                 let xyz_vis = xyz.visible_size_within_limit(!direction_arcus_buy, xyz_limit_px);
-                let raw_close = self.inv_arc.abs().min(arc_vis).min(xyz_vis);
+                let raw_close = self
+                    .inv_arc
+                    .abs()
+                    .min(arc_vis)
+                    .min(xyz_vis)
+                    .min(self.config.leg_capacity(
+                        arc_touch.max(arcus_limit_px),
+                        self.inv_arc,
+                        direction_arcus_buy,
+                        true,
+                    ))
+                    .min(self.config.leg_capacity(
+                        xyz_touch.max(xyz_limit_px),
+                        self.inv_xyz,
+                        !direction_arcus_buy,
+                        true,
+                    ));
                 let max_close = if raw_close > Decimal::ZERO {
                     quantize_shared_base_qty(
                         raw_close,
@@ -933,13 +976,7 @@ impl ArcusXyzBasisEngine {
                 } else {
                     Decimal::ZERO
                 };
-                let arc_exit_ntl = (max_close * arc_touch.min(arcus_limit_px))
-                    .to_f64()
-                    .unwrap_or(0.0);
-                if max_close <= self.dust_qty
-                    || max_close < self.constraints.arcus_min_order_size
-                    || arc_exit_ntl < self.constraints.arcus_min_order_notional_usd
-                {
+                if max_close <= self.dust_qty || max_close < self.constraints.arcus_min_order_size {
                     return BasisAction::Hold {
                         reason: "thin_exit_book",
                     };
@@ -1054,12 +1091,6 @@ impl ArcusXyzBasisEngine {
                 reason: "braked_below_min_notional",
             };
         }
-        let Some(raw_qty) = decimal_from_f64(eff_clip_usd / am) else {
-            return BasisAction::Hold {
-                reason: "qty_overflow",
-            };
-        };
-
         let direction_arcus_buy = best_dir > 0;
         let arc_touch = if direction_arcus_buy {
             arc.ask_px
@@ -1091,7 +1122,20 @@ impl ArcusXyzBasisEngine {
             arc.bid_sz
         };
         let xyz_vis = xyz.visible_size_within_limit(!direction_arcus_buy, xyz_limit_px);
-        let raw_capped_qty = raw_qty.min(arc_vis).min(xyz_vis);
+        let arc_bound = arc_touch.max(arcus_limit_px);
+        let xyz_bound = xyz_touch.max(xyz_limit_px);
+        let clip = decimal_from_f64(eff_clip_usd).unwrap_or_default() / arc_bound.max(xyz_bound);
+        let raw_capped_qty = clip
+            .min(arc_vis)
+            .min(xyz_vis)
+            .min(
+                self.config
+                    .leg_capacity(arc_bound, self.inv_arc, direction_arcus_buy, false),
+            )
+            .min(
+                self.config
+                    .leg_capacity(xyz_bound, self.inv_xyz, !direction_arcus_buy, false),
+            );
         let qty = if raw_capped_qty > Decimal::ZERO {
             quantize_shared_base_qty(
                 raw_capped_qty,
@@ -1955,6 +1999,10 @@ pub enum BasisJournalEvent {
         qty: Decimal,
         journal_ms: u64,
     },
+    IntentNotSent {
+        intent_id: String,
+        journal_ms: u64,
+    },
     IntentTerminal {
         intent_id: String,
         status: String,
@@ -2009,15 +2057,34 @@ pub enum BasisJournalEvent {
 }
 
 /// Fail-closed intent durability log: every dispatch writes & fsyncs `IntentOpen` first.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BasisJournal {
-    path: PathBuf,
+    file: File,
+}
+
+/// Keep the returned descriptor alive for the entire writer session.
+pub fn lock_state_file(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let file = opts.open(path)?;
+    file.try_lock()
+        .context("state is already in use or cannot be locked")?;
+    File::open(parent)?.sync_all()?;
+    Ok(file)
 }
 
 impl BasisJournal {
     pub fn open_and_check_restart(path: PathBuf) -> Result<Self> {
+        let file = lock_state_file(&path)?;
         Self::check_clean_restart(&path)?;
-        Ok(Self { path })
+        Ok(Self { file })
     }
 
     pub fn check_clean_restart(path: &Path) -> Result<()> {
@@ -2045,7 +2112,8 @@ impl BasisJournal {
                 BasisJournalEvent::IntentOpen { intent_id, .. } => {
                     pending.insert(intent_id);
                 }
-                BasisJournalEvent::IntentTerminal { intent_id, .. } => {
+                BasisJournalEvent::IntentNotSent { intent_id, .. }
+                | BasisJournalEvent::IntentTerminal { intent_id, .. } => {
                     pending.remove(&intent_id);
                 }
                 BasisJournalEvent::CleanShutdown { .. } => {
@@ -2075,16 +2143,7 @@ impl BasisJournal {
     }
 
     pub fn append(&self, event: &BasisJournalEvent) -> Result<()> {
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts
-            .open(&self.path)
-            .with_context(|| format!("open journal {} for append", self.path.display()))?;
+        let mut file = &self.file;
         let mut encoded = serde_json::to_vec(event)?;
         encoded.push(b'\n');
         file.write_all(&encoded)?;
@@ -2158,6 +2217,79 @@ mod tests {
             },
             bids: bids.iter().map(|(p, s)| (d(p), d(s))).collect(),
             asks: asks.iter().map(|(p, s)| (d(p), d(s))).collect(),
+        }
+    }
+
+    #[test]
+    fn cap_every_leg_and_allow_small_reduce_only_exit() {
+        let mut cfg = test_config();
+        cfg.persist_ms = 0;
+        cfg.clip_usd = 50.0;
+        cfg.canary_max_order_usd = 50.0;
+        cfg.max_notional_usd = 100.0;
+        let g = DailyLossGuard::open(None, 0.05, 500.0, 1).unwrap();
+        let mut engine = ArcusXyzBasisEngine::new(cfg.clone()).unwrap();
+        let now = cfg.max_hold_ms + 10;
+        let a = arc_book(now, "99.99", "100.01", "10");
+        let x = xyz_book(now, &[("100.20", "10")], &[("100.22", "10")]);
+        let enter = engine.on_books(now, &a, &x, now, &g, true);
+        let BasisAction::EnterPairIoc {
+            qty,
+            arcus_limit_px,
+            xyz_limit_px,
+            ..
+        } = enter
+        else {
+            panic!("expected entry");
+        };
+        assert!(qty * arcus_limit_px <= d("50") && qty * xyz_limit_px.max(x.bbo.bid) <= d("50"));
+        for pos in ["1", "0.03"] {
+            let mut engine = ArcusXyzBasisEngine::new(cfg.clone()).unwrap();
+            engine.reconcile_positions(d(pos), -d(pos), 1, 1, 1);
+            let BasisAction::ExitPairIoc {
+                qty,
+                arcus_limit_px,
+                xyz_limit_px,
+                ..
+            } = engine.on_books(now, &a, &x, now, &g, true)
+            else {
+                panic!("expected timed exit for {pos}");
+            };
+            assert!(qty * xyz_limit_px <= d("50") && qty * arcus_limit_px.max(a.bid_px) <= d("50"));
+            if pos == "0.03" {
+                assert_eq!(qty, d(pos));
+            }
+        }
+        engine.reconcile_positions(d("1"), Decimal::ZERO, 1, 1, 1);
+        let BasisAction::HedgeResidualXyz {
+            qty, limit_price, ..
+        } = engine.on_books(now, &a, &x, now, &g, true)
+        else {
+            panic!("expected residual");
+        };
+        assert!(qty * limit_price.max(x.bbo.bid) <= d("50"));
+    }
+
+    #[test]
+    fn live_raw_edge_cap_matches_oos_boundaries() {
+        let g = DailyLossGuard::open(None, 0.05, 500.0, 1).unwrap();
+        for (bid, ask, admitted) in [
+            ("100.34", "100.35", true),
+            ("100.36", "100.37", false),
+            ("100.48", "100.49", false),
+        ] {
+            let mut cfg = test_config();
+            cfg.persist_ms = 0;
+            let mut engine = ArcusXyzBasisEngine::new(cfg).unwrap();
+            let action = engine.on_books(
+                1000,
+                &arc_book(1000, "99.99", "100", "10"),
+                &xyz_book(1000, &[(bid, "10")], &[(ask, "10")]),
+                1000,
+                &g,
+                true,
+            );
+            assert_eq!(matches!(action, BasisAction::EnterPairIoc { .. }), admitted);
         }
     }
 
@@ -2312,6 +2444,7 @@ mod tests {
             .join(format!("aleph-basis-journal-{}", uuid::Uuid::new_v4()))
             .join("basis.ndjson");
         let journal = BasisJournal::open_and_check_restart(path.clone()).unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
         journal
             .append(&BasisJournalEvent::IntentOpen {
                 intent_id: "i-1".into(),
@@ -2324,7 +2457,7 @@ mod tests {
             .unwrap();
 
         // Unresolved intent blocks restart!
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
 
         journal
             .append(&BasisJournalEvent::IntentTerminal {
@@ -2341,7 +2474,7 @@ mod tests {
                 hl_account_time_ms: None,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+        assert!(BasisJournal::check_clean_restart(&path).is_ok());
 
         // ShutdownUnverified(cancel_unknown / open_orders_remaining) keeps restart blocked even across subsequent residual_position until CleanShutdown.
         journal
@@ -2355,7 +2488,7 @@ mod tests {
                 journal_ms: 1_300,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
 
         journal
             .append(&BasisJournalEvent::ShutdownUnverified {
@@ -2368,7 +2501,7 @@ mod tests {
                 journal_ms: 1_350,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
 
         journal
             .append(&BasisJournalEvent::ShutdownUnverified {
@@ -2381,12 +2514,12 @@ mod tests {
                 journal_ms: 1_400,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
 
         journal
             .append(&BasisJournalEvent::CleanShutdown { journal_ms: 1_420 })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+        assert!(BasisJournal::check_clean_restart(&path).is_ok());
 
         journal
             .append(&BasisJournalEvent::ShutdownUnverified {
@@ -2399,7 +2532,7 @@ mod tests {
                 journal_ms: 1_450,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+        assert!(BasisJournal::check_clean_restart(&path).is_ok());
 
         // ShutdownUnverified must never clear an unresolved IntentOpen.
         journal
@@ -2423,7 +2556,7 @@ mod tests {
                 journal_ms: 1_550,
             })
             .unwrap();
-        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+        assert!(BasisJournal::check_clean_restart(&path).is_err());
 
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

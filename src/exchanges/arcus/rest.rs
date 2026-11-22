@@ -25,6 +25,21 @@ pub struct OrderReceipt {
     pub rejection_reason: Option<String>,
 }
 
+impl OrderReceipt {
+    fn confirm_cancel(&self) -> Result<()> {
+        ensure!(
+            self.http_status == 200
+                && self.rejection_reason.is_none()
+                && matches!(
+                    self.status.to_ascii_lowercase().as_str(),
+                    "success" | "cancelled" | "canceled"
+                ),
+            "Arcus cancel-all lacks a confirmed success receipt"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("Arcus rejected {path} with HTTP {status}: {message}")]
@@ -36,6 +51,8 @@ pub enum ExecutionError {
     #[error("Unknown Arcus outcome for {path}: {message}. Reconcile the order before retrying")]
     Uncertain { path: &'static str, message: String },
 }
+
+pub struct PreparedLimit(SignedRequest);
 
 pub struct ArcusTrading {
     info: ArcusInfo,
@@ -76,8 +93,19 @@ impl ArcusTrading {
         market: &Market,
         order: LimitOrder<'_>,
     ) -> Result<OrderReceipt> {
-        let request = self.signer.place_limit(market, order, self.timestamp()?)?;
-        self.submit(request).await
+        self.submit_limit(self.prepare_limit(market, order)?).await
+    }
+
+    pub fn prepare_limit(&self, market: &Market, order: LimitOrder<'_>) -> Result<PreparedLimit> {
+        Ok(PreparedLimit(self.signer.place_limit(
+            market,
+            order,
+            self.timestamp()?,
+        )?))
+    }
+
+    pub async fn submit_limit(&self, order: PreparedLimit) -> Result<OrderReceipt> {
+        self.submit(order.0).await
     }
 
     pub async fn cancel_by_order_id(&self, market_id: u16, order_id: &str) -> Result<OrderReceipt> {
@@ -101,6 +129,11 @@ impl ArcusTrading {
     pub async fn cancel_all(&self, market_id: Option<u16>) -> Result<OrderReceipt> {
         let request = self.signer.cancel_all(market_id, self.timestamp()?)?;
         self.submit(request).await
+    }
+
+    pub async fn cancel_all_confirmed(&self, market_id: Option<u16>) -> Result<()> {
+        let receipt = self.cancel_all(market_id).await?;
+        receipt.confirm_cancel()
     }
 
     /// One explicit renewal attempt. This starts no background task and never
@@ -460,6 +493,35 @@ mod tests {
 
     const ADDRESS: &str = "0x11111111111111111111111111111111111111ab";
     const KEY: [u8; 32] = [7; 32];
+
+    #[test]
+    fn cancel_receipt_must_confirm_business_success() {
+        for (http, status, reason, ok) in [
+            (200, "canceled", None, true),
+            (200, "rejected", None, false),
+            (200, "success", Some("denied"), false),
+            (202, "accepted", None, false),
+            (200, "unrecognized", None, false),
+        ] {
+            let receipt = OrderReceipt {
+                http_status: http,
+                status: status.into(),
+                order_id: None,
+                client_id: None,
+                rejection_reason: reason.map(str::to_owned),
+            };
+            let confirmed = receipt.confirm_cancel().is_ok();
+            assert_eq!(confirmed, ok);
+            use crate::strategy::arcus_xyz_basis::{ShutdownDisposition, classify_shutdown};
+            assert_eq!(
+                matches!(
+                    classify_shutdown(confirmed, Ok((0, 0)), Ok((Decimal::ZERO, Decimal::ZERO))),
+                    ShutdownDisposition::Clean
+                ),
+                ok
+            );
+        }
+    }
 
     async fn read_request(
         socket: TcpStream,

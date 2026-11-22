@@ -39,6 +39,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "signal-hook-registry",
  "thiserror",
  "tokio",
  "toml",
