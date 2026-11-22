@@ -112,6 +112,183 @@ the gateway responds.
 subaccount. Verify the outcome through order and fill queries before releasing
 reserved exposure.
 
+### Arcus scheduled cancellation backstop
+
+The Rust library exposes `ArcusSigner::schedule_cancel` and
+`ArcusTrading::schedule_cancel(market_id, deadline_us)`. The deadline is absolute
+Unix **microseconds**, 5 seconds to 5 minutes ahead; signing uses nanoseconds.
+`None` deadline disarms exactly the selected scope. Account-wide and per-market
+switches are independent. A refresh must send a later deadline before expiry.
+There is no automatic retry, disarm, CLI command or live supervisor integration.
+
+Only HTTP 200 with a matching account, market scope, deadline and status confirms
+the schedule; 202 is insufficient. Expired or uncorrelated receipts and transport
+failures are uncertain. The caller must stop new exposure on renewal failure,
+re-establish protection, and reconcile authoritative orders/fills/positions before
+releasing reserves. Scheduling or eventual auto-cancellation is not fill-terminal
+evidence. Respect daily trigger and active-switch quotas; see the
+[official DMS contract](https://docs.arcus.xyz/api-reference/exchange/schedule-cancel-all-dead-mans-switch.md).
+
+`CancelLease` now models one account/scope with an explicit lifetime, refresh
+interval, safety margin and allowed clock-step tolerance. `renew_cancel_lease`
+performs one attempt and validates the client account before any request. It
+starts no loop and grants no order authorization. Use `allows_new_exposure`
+only as one conjunct of the supervisor's admission checks, immediately before
+dispatch. Protection expires against a monotonic deadline anchored at request
+start; response latency never extends it. Pending renewal closes the gate.
+
+Failure, a mismatched/late receipt, timeout or cancellation of the polled async
+future sets a sticky `requires_reconciliation` boundary. Expiry, or receiving a
+renewal after the previous deadline, also requires reconciliation: the old switch
+may have fired. A new ACK cannot clear this condition in the same guard. Complete
+both-venue order/fill/position reconciliation through the durable supervisor,
+then create a fresh unprotected guard and obtain a new confirmed schedule.
+Do not clear this boundary from an empty open-order snapshot or a timer alone.
+The gate is intentionally not serializable, never releases exposure, and does
+not implement that durable supervisor. Absolute venue-clock synchronization and
+order/session/fee checks remain separate requirements. No live order path has
+been connected to it yet.
+
+The [ANT research and readiness plan](ANT_CAMPAIGN_REVIEW_AND_48H_PLAN_2026_11_20.md)
+includes a public-only snapshot auditor. It deliberately never grants live
+readiness; fees, session bands and account eligibility still need execution-boundary
+integration and current evidence.
+
+### ANT durable execution ledger (offline boundary)
+
+`hedging::durable::ExecutionJournal` adds an independent Arcus ANT / TradeXYZ
+`xyz:ANT` execution ledger. It reuses `OrderIntent`, `Leg`, `HedgeSide` and
+`OrderStatus`; the existing IOC `HedgeMachine` and Lighter journal schema are
+unchanged. There is no live coordinator, signer, dispatch loop or CLI promotion.
+`PreparedOrder` is durable data, not an authorization token or an instruction to
+resubmit after recovery.
+
+- Start from independently budgeted, flat accounts. `SessionSpec` binds both
+  accounts/subaccounts, network, markets, resolved market IDs, lot sizes and
+  explicit base/notional limits. A new session needs fresh dual-leg reconciliation
+  before its first intent. Example limits and test identities are synthetic.
+- `prepare_intent` validates lots, order notional, reduce-only direction and the
+  worst-case remaining quantities of **all** unsettled orders. It persists the
+  logical-to-wire client ID mapping and fsyncs both journal and committed markers
+  before returning. Opposing pending legs do not cancel each other's reserve.
+  An unresolved submission blocks further preparation until authoritative evidence.
+- An ACK binds identity only. Exact fills update inventory and retain fees by
+  venue and asset. Duplicate trade IDs are idempotent only if every field agrees;
+  conflicting duplicates stop preparation. A confirmed partial maker fill can
+  support a separately reserved hedge while the maker remainder stays reserved.
+- Cancel requests, timeouts, terminal status and empty open-order lists alone do
+  not release remaining exposure. Explicit reconciliation requires each order's
+  terminal evidence, exact cumulative-fill coverage, both empty order snapshots,
+  matching positions, source fill watermarks and fresh receipt/query boundaries.
+  Each venue must report a positive fill watermark even for a flat account.
+  Its position timestamp and fill watermark must each reach that venue's own
+  highest previously accepted value. Equal values allow an unchanged venue state
+  to be confirmed by a fresh query. Recovery reconstructs these two maxima from
+  all checkpoints, including those written by older schema 1 writers.
+  Evidence is tied to the journal revision. A failed check retains all reserves.
+- Fill effects distinguish closing, opening and crossing zero. These are provisional
+  quantity attributions, not realized PnL. Late or tied source timestamps retain
+  positions and fees but withhold cycle attribution and require reconciliation.
+
+All evidence structs are **normalized adapter contracts**. This module neither
+fetches nor authenticates raw venue responses. The adapters still must verify
+side, account/market/order identity, pagination completeness, source timestamps,
+native units, fee asset and response provenance. Missing source watermarks must
+remain unknown; a local receipt timestamp cannot replace one. It cannot yet
+perform a real-account reconciliation.
+
+Use one canonical, owner-only state directory outside Git for both accounts on
+the execution host. Journal and marker files are private activity, not research
+fixtures; do not print, commit or transfer them. Account locks span markets and
+session UUIDs within that directory, but are not distributed locks across hosts
+or different directories. Directory permissions must be 0700, files 0600;
+symlinks and multiply linked files are rejected. The advisory lock inode is
+separate from the atomically replaced active marker.
+
+Each journal record has a sequence and chained checksum. Two durable account
+markers retain the session and committed sequence/checksum, detecting even loss
+of a complete last record. Recovery accepts an intact WAL ahead of a marker as
+possibly dispatched work and reserves it; a WAL behind a marker is rejected.
+Write, fsync or marker-publication failure poisons the writer. Recovery never
+truncates, repairs, resends or resumes automatically. A checksum detects damage,
+not malicious rewriting of all state.
+
+`recover` always starts behind a fresh two-venue reconciliation barrier.
+`audit_journal` is read-only and always returns `restart_allowed: false`.
+`close_session` requires a fresh reconciled checkpoint with **each** leg flat;
+net-flat hedged positions are insufficient. It fsyncs `Closed` before removing
+active markers and preserves the journal. Partial marker cleanup can finish from
+that closed record. Do not delete markers or invent a new UUID to bypass recovery.
+
+This implementation clones ledger state and performs blocking disk I/O. Run it
+on a dedicated execution writer, outside the quote path. The 64 MiB journal and
+1 MiB record bounds fail closed; there is no automatic compaction or demonstrated
+production throughput. Next integration must add the raw response adapters,
+single-owner asynchronous coordinator, cancellation/drop handling, maker/IOC
+transport mapping and immediate pre-dispatch conjunction of the DMS lease,
+fresh books, session bands, fees, loss/capital limits and durable reservations.
+Neither this ledger nor the DMS lease supplies that complete admission policy.
+
+Offline fault-injection checks:
+
+```sh
+cargo test --offline --locked --lib hedging::durable
+```
+
+### Native ANT REST evidence normalization (offline)
+
+`hedging::durable::native::NativeEvidence` consumes bounded raw REST response
+bytes and a collector-supplied `RequestContext`. It makes no network request.
+The collector must bind the actual account/subaccount, network, HIP-3 dex and
+request/receipt clocks; caller-supplied context is not authentication. A parser
+constructed for one response is not a reusable live freshness permit.
+
+Order rows must match the durable client ID, market, side, original quantity and
+limit. Arcus REST account fields are checked as well. Native decimal strings
+must fit exactly; rounding, numeric JSON amounts, conflicting IDs, duplicate
+position keys and malformed evidence are rejected with errors that omit raw
+values. Added fields are ignored while the original private receipt remains
+the collector's responsibility. The existing general REST types and trading
+transport remain unchanged; those older types alone do not supply this boundary.
+
+`unknownOid` stays unknown. Arcus `CANCEL_PENDING` is not terminal. Arcus terminal
+quantity uses the documented original-minus-remaining fields, checking
+`filledSize` if present. Hyperliquid cancellation status is retained as
+`canceled_quantity_unproven`; it does not manufacture an exact terminal quantity
+from an empty orders list or a cancel ACK. Native terminal observations still
+require the ledger's independent fill and position reconciliation.
+[Arcus order schema](https://docs.arcus.xyz/api-reference/public/get-order-history.md) ·
+[Hyperliquid info schema](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint).
+
+Fill pages retain exact amounts, venue IDs and source times. Hyperliquid
+milliseconds are checked before conversion to microseconds; Arcus uses native
+microseconds. Fills without a client ID require an already verified order-ID
+binding before `execution_fill` conversion. Hyperliquid `fee` includes
+`builderFee`, so the latter is not added again. Arcus REST does not name the fee
+asset: its `NativeFill.fee_asset` stays `None`, and conversion is withheld until
+a separate evidence-backed accounting design resolves it. Do not assign USDG,
+USDC or the market's display quote currency by assumption.
+[Arcus fills schema](https://docs.arcus.xyz/api-reference/public/get-fills.md).
+
+`HistoryQuery` records inclusive native-unit bounds and the actual page limit.
+Arcus permits up to 1,000 rows; Hyperliquid returns up to 2,000 and retains only
+the latest 10,000 fills. Aggregation is rejected. A full page requests two
+disjoint integer time intervals; a full single-timestamp bucket returns
+`SaturatedTimestamp`, never a cursor that skips tied fills. Execute all requested
+subranges with overlap/conflict checks and a bounded work budget in the future
+collector. Below-cap and empty pages **never** establish retention completeness,
+indexing catch-up or `complete_through_venue_us`; that field remains unknown.
+
+Arcus positions preserve signed size, explicit identity and other-position
+counts, but have no source timestamp in the reviewed REST schema. Hyperliquid
+positions preserve `clearinghouseState.time`; it is not a fill-stream watermark.
+These observations cannot yet construct a complete `PositionEvidence` or clear
+the restart barrier. There is no asynchronous collection/pagination runner,
+source completeness protocol, automatic reconciliation or live promotion.
+The next task must resolve those source gaps before wiring the supervisor.
+[Arcus positions schema](https://docs.arcus.xyz/api-reference/public/get-positions.md) ·
+[Hyperliquid account state](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals).
+
 ## Risk and interpretation
 
 - The planner computes executable entry limits, sizes both legs to a common

@@ -60,6 +60,12 @@ Validate both station-wide continuity and strategy-scoped feed dependencies with
 `scripts/audit_tokyo_selection_readiness.py` before admitting a continuous
 ten-hour research window.
 
+The readiness audit records subscription confirmation and usable data recovery
+separately. For Core and Robinhood, the recovery clock waits for a book message
+with a positive integer nonce. For Arcus, it waits for a book message with a
+positive venue timestamp. The replay compiler applies its own per-market book
+reconstruction and continuity checks.
+
 The quant and turnover runner accepts `--public-archive` and `--compiled-dir`.
 Use `--program quant` or `--program turnover` to schedule each objective
 independently, and `--symbols ETH` to select one asset. The turnover matrix

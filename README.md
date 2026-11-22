@@ -14,8 +14,8 @@
 </p>
 
 <p align="center">
-  <code>Rust 1.95.0</code> ·
-  <code>Go 1.25.0</code> ·
+  <code>Rust 1.100.0</code> ·
+  <code>Go 1.27.4</code> ·
   <code>12-Slot Seqlock SHM (64B / 256B)</code> ·
   <code>128B V2 Private Event Ring</code> ·
   <code>Tokyo &lt;10ms Edge</code> ·
@@ -26,7 +26,7 @@
 
 **AlephTX** is an institutional-grade perpetual futures execution and causal relative-value research engine engineered around three strictly separated operational planes:
 
-1. **Sub-10ms Supervised Execution (`oasis-tokyo` · `Go 1.25` + `Rust 1.95`)** — A multi-venue Go feed daemon reconstructs full orderbooks and publishes lock-free BBO (`aleph-matrix`, `64B`) and Top-5 depth (`aleph-depth`, `256B`, `64B`-aligned) across **12 exchange slots**, paired with a `128`-byte V2 private execution ring (`aleph-events`). The Rust execution core (`lighter_inventory_mm`) runs zero-allocation multi-venue fair-value pricing, asymmetric adverse-selection cancel shields (`per_side_bound_cancel`), multi-lane API-key signing isolation (`Maker` / `Cancel` / `Taker`) with per-lane monotonic nonce management and failure rollback/resync, and write-ahead recovery journals with optional protected IOC hedging on native Hyperliquid.
+1. **Sub-10ms Supervised Execution (`oasis-tokyo` · `Go 1.27` + `Rust 1.100`)** — A multi-venue Go feed daemon reconstructs full orderbooks and publishes lock-free BBO (`aleph-matrix`, `64B`) and Top-5 depth (`aleph-depth`, `256B`, `64B`-aligned) across **12 exchange slots**, paired with a `128`-byte V2 private execution ring (`aleph-events`). The Rust execution core (`lighter_inventory_mm`) runs zero-allocation multi-venue fair-value pricing, asymmetric adverse-selection cancel shields (`per_side_bound_cancel`), multi-lane API-key signing isolation (`Maker` / `Cancel` / `Taker`) with per-lane monotonic nonce management and failure rollback/resync, and write-ahead recovery journals with optional protected IOC hedging on native Hyperliquid.
 2. **24×7 Rolling Public Capture & Live-as-Data Flywheel** — Three physically isolated systemd capture streams (`crypto`, `rwa`, `bulk`) record orderbooks, public trade prints (with Lighter fee-signature integers and edge-redacted Arcus prints), funding histories, and dual CEX anchors (`Binance USD-M` + `Coinbase Spot`) under a `<25 µs` paired VDSO monotonic/wall-clock guard. Completed `10h15m` (`36,900s`) windows and zero-gap in-process segments (`-segment-duration`) are cryptographically sealed (`.bronze_manifest.json`) and shipped under Linux `SCHED_IDLE` / `ionice -c 3` to a **20 TB Medallion Lakehouse** with zero impact on hot-path latency.
 3. **Causal 10-Hour Backtesting & Post-Trade Attribution (`aleph` Workstation)** — A 3-tier NVMe workstation (`ext4` Hot Compute + `E:` Cold Bronze Vault + `C:` Bundle/Evidence Cache, `DuckDB 2.0` + `RTX 4070 Ti`) compiles arrival-ordered raw archives into causal replay frames (`cross_venue`) and runs millisecond `ASOF JOIN` fill markout attribution (`scripts/live_attribution.py`) across **three strictly non-subsidized strategy programs**: **Quant Profit (`01`)**, **Hedge Arbitrage (`02`)**, and **Incentive Turnover (`03`)**.
 
@@ -147,7 +147,7 @@ make trade MODE=check \
   CONFIG=config.example.toml
 ```
 
-Use **Rust 1.95.0** (`rustfmt`, `clippy`) and **Go 1.25.0**. Offline CI covers Linux and macOS; the native Lighter CGo/FFI signer and supervised live sessions target `x86_64` Linux.
+Use **Rust 1.100.0** (`rustfmt`, `clippy`) and **Go 1.27.4**. Offline CI covers Linux and macOS; the native Lighter CGo/FFI signer and supervised live sessions target `x86_64` Linux.
 [CI workflow](.github/workflows/ci.yml) · [Go module](feeder/go.mod) · [Configuration reference](docs/CONFIGURATION.md)
 
 ```sh

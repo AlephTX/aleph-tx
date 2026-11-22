@@ -68,7 +68,7 @@
 2. **`$1,000` 保证金 + `25×` 杠杆台湾 Core BTC Mode B 冻结规格**（[prepare_leveraged_taiwan_lead.py](../scripts/prepare_leveraged_taiwan_lead.py)）：
    - 明确阻断 `$50k -> $1k` 直接缩容时的三大工程陷阱：(a) `reference_portfolio_value` 错配或 `portfolio_scale` 把 `$5,000` 单笔缩小 50× 至 `$100`；(b) 默认 `10×` 杠杆无法通过 `$10,000` 峰值仓位的初始保证金校验；(c) `0.2%` 日损阈值（`$2`）在历史正常回撤（`$22.99` / `$40.00`）内提前熔断（固定为 `5%` = `$50` 硬止损 + `cap_utilization_floor_to_base_notional = true` + `MMF = 0.012` / `1.8×` 强平前退出），并自动附带 `rh_direct_rule_eligible_turnover_quote = "0"` 的诚实标签供 `aleph` 放上独立新日期 10h 验证。
 3. **价差 / 短期波动率（`spread/vol`）选标筛选器**（[screen_market_spread_to_vol.py](../scripts/screen_market_spread_to_vol.py)）：计算 `median_spread_bps / realized_1s_vol_bps` 与 `net_half_spread_after_maker_fee_bps = 0.5 * spread - maker_fee_bps`，并与 `multi_venue_program_scope` 绑定，指导做市退出拥挤的 0 费 BTC/ETH、转向 Arcus RWA 0 费标的与宽价差长尾市场。
-4. **总案纠偏与参数冻结纪律**：[实盘盈利演进总案](LIVE_PROFITABILITY_MASTERPLAN_2026_11_18.md) 顶部已增补 `§0 Sprint 8 实证纠偏与可行边界勘误`，明确停止 `50–200 ms` 吃单竞速套利，冻结参数并在 `W07–W16` 留出窗验收，杜绝同一批历史 14 窗继续多参数选优。
+4. **总案纠偏与参数冻结纪律**：[实盘盈利演进总案](LIVE_PROFITABILITY_MASTERPLAN_2026_11_18.md) 顶部已增补 `§0 Sprint 8 实证纠偏与可行边界勘误`，明确停止 `50–200 ms` 吃单竞速套利，冻结参数并在 `W07–W16` 事前冻结前向窗验收，杜绝同一批历史 14 窗继续多参数选优。
 
 ---
 

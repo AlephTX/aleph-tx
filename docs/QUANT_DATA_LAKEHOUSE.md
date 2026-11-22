@@ -243,6 +243,36 @@ For other markets, `v_stream_health.arcus_trade_subscriptions` counts observed
 Arcus trade subscriptions. Check the relevant connection epochs and gaps as well
 when a strategy needs continuous trade coverage.
 
+For a Lighter public trade update with positive price and zero quantity, first
+audit the sealed Bronze input. Record its digest, the source, the numeric market
+ID, the number of observations (including retransmissions), and whether the same
+trade identity also appears with different economics. In a separate projection
+pass `--quarantine-zero-size-trade SOURCE MARKET_ID OBSERVATIONS` to `normalize`.
+For example, the audited W08 RWA input uses
+`--quarantine-zero-size-trade lighter_robinhood_trades 32 1`. This scope may
+accompany `--withhold-arcus-trade-market` when both omissions apply.
+
+The normalizer checks identities across subscription snapshots and updates.
+A conflicting duplicate, an unexpected zero, a negative size, or a different
+count prevents publication of the Silver manifest. A count mismatch removes the
+staging directory created by that attempt. After rechecking the source count,
+retry at the same path. Positive-quantity transfers at zero price retain their
+transfer flag. Build the partial catalog at a distinct
+destination with `--allow-partial-projection`. Both receipts record the scope
+under `quarantined_zero_quantity`. Reconcile retained identities, times, sides,
+prices and sizes against Bronze before using the affected market.
+
+For a Lighter book with nonpositive sequence numbers, audit the sealed source
+by venue and numeric market ID. In a separate campaign,
+`--withhold-lighter-book SOURCE MARKET_ID INVALID_NONCES` omits every book
+snapshot and update for that channel, including valid observations. An exact
+count mismatch aborts publication. Other venues, market statistics and trade
+channels retain their own coverage. Both the partial Silver manifest and the
+DuckDB build receipt record the scope, snapshot count and update count under
+`withheld_lighter_book`. Use a dedicated database and Parquet root. Verify any
+dependent strategy’s book, reference clock and public trades independently
+against the original archive before scoring it.
+
 ### 3. Example Causal DuckDB Queries (Zero Look-Ahead)
 
 ```sql
@@ -323,6 +353,17 @@ feed post-trade attribution on `aleph` with zero impact on order/cancel latency:
      slices after `--min-evict-age-secs` (see opt-in unit templates
      [aleph-tx-flywheel.service](../deploy/oasis/aleph-tx-flywheel.service) and
      [aleph-tx-flywheel.timer](../deploy/oasis/aleph-tx-flywheel.timer)).
+     With a configured upload destination, `shipped_count` includes archives
+     covered by a matching size and SHA-256 receipt. A shipped entry reports
+     `remote_uri` only when its receipt names the configured object exactly.
+     A Drive object receipt or an earlier destination yields `remote_uri=null`
+     and `configured_uri_matches_receipt=false`. The original receipt stays
+     available for recovery. The summary and the eviction check both require
+     an integer byte count, the matching hash, and a nonempty object location.
+     When a pass starts below `--evict-below-free-gib`, it checks old closed
+     captures with an existing manifest and upload receipt first, in age order.
+     Each eviction recomputes the archive size and SHA-256 and verifies the
+     receipt before it writes the tombstone and removes the local copy.
    - **Private Telemetry (`backup-private`)**: Hard-blocks any destination path
      matching public Lakehouse folders (`10_bronze_raw`, `20_silver_normalized`,
      `public`, etc.). Uses SQLite's online `Connection.backup()` API (`0600`

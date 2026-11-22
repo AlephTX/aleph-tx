@@ -47,7 +47,7 @@ Sprint 9 交付了 `quantile_floor_p`、`as_risk_budget_bps_at_max_pos` 与离�
 1. **只用选择期数据**：取既有 14 个月首做市窗（或 W01–W06）对照臂配置，仅追加 `diagnose_cross_market: true` 与 `calibration_telemetry: true`（已验证不改变原报告字段），BTC 与 ETH 分别回放。
 2. 每个市场运行：
    `python3 scripts/extract_mm_calibration_inputs.py <reports...> --split-label selection_dev --max-pos-for-as <归一化最大仓位> --target-risk-budget-bps 6 --maker-fee-bps 0 --min-profit-bps 1 --quantile-p 0.5 --calibrate --output <market>_cal.json`
-3. 冻结四臂（对照 / 仅 `quantile_floor_p` / 仅 `as_risk_budget_bps_at_max_pos` / 两者）后再评估。由于 W08 在 Sprint 9 代码发布前已开窗，建议从 **W09** 起作为留出窗；冻结清单脚本目前由 Codex 持有编辑锁，由 Codex 决定登记方式。
+3. 冻结四臂（对照 / 仅 `quantile_floor_p` / 仅 `as_risk_budget_bps_at_max_pos` / 两者）后再评估。由于 W08 在 Sprint 9 代码发布前已开窗，建议从 **W09** 起按逐配置冻结凭据作为前向窗（来源为 `selection_dev`，非未触碰留出集）；冻结清单脚本目前由 Codex 持有编辑锁，由 Codex 决定登记方式。
 4. 报告所有臂（含失败、缺口、未结清），不得只报最优臂。
 
 ## 五、 本地验证门禁记录

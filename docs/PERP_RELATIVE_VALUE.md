@@ -6,6 +6,15 @@ executable depth. The paper runner applies order latency, partial fills,
 hedge recovery and an independent cash and position ledger. Its order
 intents stay inside the simulation.
 
+The separate Python [ANT continuous-inventory research wallet](../scripts/research_ant_inventory.py)
+preserves both venues' inventory across maker quote cycles, reserves pending
+sides independently, and hedges only the net excess using decision-fixed IOC
+limits. Its public queue model is not private execution or recovery evidence.
+Complete L2-prefix price gaps have zero displayed queue; prices outside that
+prefix stay unknown. Partial fills retain their exact quantity even below the
+order lot. Residual inventory, ambiguous cancels and missing funding payments
+withhold terminal cash. See the [model, six historical results and limitations](ANT_CONTINUOUS_INVENTORY_AND_QUEUE_COVERAGE_2026_11_20.md).
+
 | Strategy | Entry signal | Exits |
 | --- | --- | --- |
 | Funding carry | Conservative net funding over a scheduled hold covers both round trips, basis risk and the cost of capital. Entry assumes zero basis convergence. | Time limit, adverse basis, lost reference or insufficient or negative remaining funding forecast. |
@@ -1384,7 +1393,15 @@ known UTC funding schedule. The default is hourly on the UTC hour.
 common schedule. Each input rate is per contractual settlement. The
 pre-entry ten-hour forecast uses the count of scheduled settlements in
 the next ten hours and only the prior rates available by the configured
-publication cutoff.
+publication cutoff. The forecast gives each eligible settlement timestamp
+one weight. Repeated identical rates at the same timestamp collapse to one
+observation. Conflicting rates for that timestamp stop the replay.
+
+Use `leg_entry_fee_bps` and `leg_exit_fee_bps` to specify a rate per
+venue in `legs` order. Each pair overrides the corresponding symmetric
+maker fee field. Set the symmetric field to zero or omit it when providing
+the corresponding per-leg rates. Fees are charged on each leg's own notional
+at entry and exit.
 
 Supply a fresh paired valuation at each ten-hour boundary and at the
 campaign end while exposed. Funding accrues for settlements after entry
@@ -1393,6 +1410,11 @@ a funding gap. A later frame cannot supply a price for an earlier
 checkpoint. A terminal exit pays both leg fees before its checkpoint
 equity is recorded. Inspect `status`, `expected_checkpoints`,
 `missing_checkpoints`, and `missing_witness_slots` alongside cash.
+The Python sub-track wrapper checks that the reported price PnL plus witnessed
+funding less venue fees matches variable cash. It also checks terminal equity
+and all-in cash after fixed cost. Missing or inconsistent components withhold
+the cost score. The comparison allows bounded rounding at Rust Decimal
+precision and preserves the reported values.
 An observed mark and funding transfer can value a position. Evidence of
 executable size, timing and both legs' entry and exit fills is additionally
 needed to score a trading strategy.
@@ -1435,8 +1457,221 @@ only labels retained in the current quantile. A configured
 `max_sample_age_ms` expires labels and returns the gate to its prior
 when fewer than four remain. [Implementation](../src/strategy/relative_value/paper/maker_first.rs)
 
+With `diagnose_entry_hedge` enabled, `forced_drain_triggered_ms` records when
+the episode first observes the drain. The risk clock continues until the ledger
+is flat, is balanced, or reaches the configured partner-step deadband.
+`risk_resolved_ms` records that event. Only an opening partner fill that exactly
+balances the legs sets `fully_hedged_ms`. A passive offset, a forced unwind, and
+a hedge that leaves an accepted residual have distinct outcomes. An open
+episode at cutoff reports its elapsed lower bound in `censored_unhedged_ms`.
+The report totals completed and censored exposure separately. The IOC flight
+and retry interval covers completed opening hedges with recorded submissions.
+
 The ablation generator's version 2 manifest hashes every byte of each
 saved configuration, including the trailing newline. Version 1 hashed
 the canonical JSON before writing the newline. Preserve the original
 manifest next to an independent file-byte digest when auditing an older
 registration. [Configuration generator](../scripts/build_preregistered_ablation_arms.py)
+
+### Recorded maker pricing constraints
+
+Set `diagnose_quote_constraints: true` in a **copy** of a recorded maker JSON
+configuration and run the same public tape with `maker_replay`. This optional
+research diagnostic emits `quote_constraints`; it does not change quote prices,
+order lifecycle, risk, fills or cash. The default is off and omits the field.
+It works independently of `diagnose_cross_market` and `calibration_telemetry`.
+
+- `evaluated = quoted + unquoted` counts primary pricing evaluations only.
+  Cross-market counterfactual evaluations are excluded. These are candidate
+  prices before sizing, admission, requote checks and dispatch, not order counts.
+- `base_spread` partitions successful evaluations into `floor_raised`,
+  `floor_equal`, `interior`, `cap_equal`, `cap_lowered`, and `floor_equals_cap`.
+  The measured stage clamps the toxicity-adjusted A-S half-spread, before
+  momentum, flattening and directional reserves. Floor/cap configuration uses
+  **full spread bps**; a 16 bp floor contributes 8 bp on each side at this stage.
+  Equal floor/cap erases local sensitivity of this base spread to A-S inputs.
+- Bid/ask each split `entry_or_flat` and `toward_flat` by quoting-position sign.
+  The latter describes price direction toward flat, not final order reduce-only
+  status. `placement_tightened`, `placement_equal`, and `placement_slack` form
+  a partition. `touch_or_stabilization_changed`, `passive_exit_changed`, and
+  `final_at_placement_bound` are overlapping stage observations. Placement
+  bounds include fees, profit, anchors and any enabled quantile reserve; they
+  are not a pure min-profit attribution.
+
+Compare complete reports with diagnostics off/on, removing only the new member.
+Preserve old configurations, source/engine/tape hashes and unknown cash fields.
+Report distinct historical cohorts and retain each uninterrupted ten-hour unit,
+with pre-window warm-up and terminal drain separate. A high floor-clamp count
+does not prove which constraint caused a fill loss or that lowering it improves
+cash. This diagnostic cannot establish profitability or authorize live changes.
+
+### Sprint 9 forward evidence labels
+
+Tokyo W08–W16 sources remain `selection_dev`. Only configurations with valid
+pre-start freeze evidence qualify as **preregistered forward windows**. That
+does not certify untouched holdout custody. The legacy-named
+`freeze_sprint9_w08_holdout_manifest.py` now emits `sprint9_forward_manifest.v2`
+with hash-bound `evidence_class`, `source_role`, and `untouched_holdout: false`.
+Its time and probability gates remain enforced. Do not regenerate or rewrite
+existing v1 manifests, relabel source archives, backdate freezes, or apply new
+parameters to windows whose results have already been inspected.
+
+### Linking constraints to fills and testing placement headroom
+
+`diagnose_quote_fill_linkage: true` additionally requires the three diagnostic
+flags `diagnose_quote_constraints`, `diagnose_cross_market`, and
+`diagnose_cancel_attribution`. It emits `quote_constraints.fill_linkage`.
+Decision-time tags travel with the dispatched order and accepted queue, including
+partial fills and late receipts after cancellation. Side-anchor constraints and
+actual grid-order boundary flags are distinct. Cohorts retain first cancel reason,
+receipt-pending state, source-clock uncertainty, and all horizon label gaps.
+Toward-flat at decision does not imply reduce-only or prove that a later fill
+closed inventory. Markouts exclude fees and are not realized cash.
+
+The optional `bound_breach_guard_bps` is an **economic research variant**, not a
+read-only diagnostic. It adds a fixed one-way reserve to the toward-flat side's
+placement bound, rounded outward to ticks; a flat decision is unchanged. The
+original cancel bounds and order/risk lifecycle remain intact. It accepts finite
+values in `(0, 10]` only for Core-only replay with per-side bound cancellation and
+no passive-touch override. It is absent from production strategy configuration,
+defaults to off, and is echoed in enabled reports. Freeze its value, training and
+assessment periods, and rejection criteria before running economic comparisons.
+See [the 2026-11-20 experiment](BOUND_BREACH_LINKAGE_AND_GUARD_2026_11_20.md).
+
+### Actual inventory cycles and cash attribution
+
+`diagnose_inventory_cycles: true` requires `diagnose_quote_fill_linkage` and its
+three diagnostic prerequisites. It defaults off and adds only `inventory_cycles`
+to the recorded replay report. The simulated venue's e8 ledger position classifies
+each maker or IOC fill as open, add, reduce, close, or cross-zero; order intent
+does not determine this classification. Cross-zero fills allocate closing and
+opening quantities and fees to separate natural episodes. FIFO pairs and episodes
+are aggregate simulation diagnostics, with no raw order identifiers serialized.
+
+Validate the report's position mismatch counts and cash residuals before using
+it. At flat inventory, cash equals receipt-known book fill edge plus inventory
+drift minus fees, and independently equals FIFO closed gross less fees. At nonflat
+inventory, retain the signed open-lot cost and equity adjustment; an open episode
+is not settled cash. Receipt-book identities do not certify executable prices or
+continuous data. Missing initial references and empty book publications remain
+explicit. The 1/5/30-second labels preserve source/receipt eligibility and expired
+or unknown labels, including IOC fills. FIFO bridges between two post-fill prices
+are algebraic attribution, not the return over the actual holding interval.
+
+Compare paths using unions of overlapping or touching episodes until both arms
+are flat, rather than joining episode ordinal numbers. Keep native quantity-time
+statistics separate by market. Freeze economic parameters separately; this flag
+must not change any existing report field. See the
+[complete-cycle attribution](INVENTORY_CYCLE_CASH_ATTRIBUTION_2026_11_20.md).
+
+### Frozen short-horizon forecast audit
+
+`scripts/causal_book_forecast.py` is an offline public-book audit. It does not
+change maker quotes, orders, capital, or any strategy profile. It tests one fixed
+two-feature ridge model against zero drift, the training mean, and unscaled touch
+microprice. Features are touch microprice displacement and the preceding one-second
+midpoint return. Training-only centering/scaling and coefficients are written to
+an immutable model artifact before validation scoring and later-window reads.
+
+Use a copied, hash-frozen design and the original public configuration directory:
+
+```bash
+python3 scripts/causal_book_forecast.py \
+  --design /path/to/research/design.json \
+  --config-root /path/to/original/configs \
+  --output /path/to/new/forecast-results
+```
+
+The matching `design.freeze.json` must sit beside the design. This first protocol
+uses the registered 19 ten-hour histories: two May BTC/ETH windows have six-hour
+training and four-hour validation partitions; other May windows are regression,
+and the 15 later histories remain selection data. The short partitions validate
+predictions, not continuous ten-hour trading profitability. Repeated grid labels
+and same-date markets are not independent trading samples.
+
+One-second ASOF features use receipt-available books. Labels use the first book
+whose source time reaches the one-second due time, with at most one further second
+of receipt lateness. Source time cannot exceed original receipt time. Explicit
+empty books, stale intervals (including sub-grid gaps), and decreasing source
+timestamps break feature history and pending labels. Labels cannot cross a split
+boundary; absent and expired labels remain counted rather than becoming zero
+returns. Trade-feed continuity and executable depth are separate, unverified
+conditions for any later execution experiment.
+
+The frozen gates include per-market validation and breadth across later windows.
+Failure stops this model without retuning. Passing prediction MSE would still
+require a separately frozen complete-cycle experiment covering actual fills,
+queue selection, costs, inventory and pending cancellation risk before changing
+quotes. Outputs and consumed-source hashes stay outside Git. See
+[the first forecast audit](SHORT_HORIZON_FORECAST_AUDIT_2026_11_20.md).
+
+### Offline paired cash exit experiment
+
+`maker-first-replay` accepts an optional `paired_cash_exit` object alongside
+`hedged_exit`. It is disabled when absent, and disabled reports omit its field.
+For a copied research configuration, the single registered policy is:
+
+```json
+"paired_cash_exit": {
+  "all_turnover_cost_bps": "0.25",
+  "extra_taker_cost_bps": "1"
+}
+```
+
+The trigger requires a confirmed, exactly balanced nonzero pair, no outstanding
+IOC or fill notice, and fresh, unconsumed full exit depth under the existing
+reduction rules. Estimated cycle cash includes already filled legs, venue fees,
+the two hypothetical taker exits, and both explicit cost allowances. A
+nonnegative value requests the existing drain sequence. Resting maker orders
+retain their cancellation and late-print barriers; subsequent fills alter the
+confirmed remaining positions before sequential IOC reductions. Existing
+funding, position, lot, minimum-size and risk rules remain in force.
+
+`paired_cash_exit` in the report separates trigger count, pending-quote count,
+first trigger time, conditional quoted cash, settled triggered cycles and their
+realized cash after the configured allowances. A positive trigger does not lock
+an exit price or guarantee a nonnegative result. Unknown terminal or funding
+states still withhold whole-wallet cash. Evaluate the original uninterrupted
+wallet, including future entries, with warm-up, ten-hour decision interval,
+terminal drain and source outages reported separately. A changed cycle cannot
+be matched to the original merely by its ordinal number.
+
+This is an offline research policy. Its first historical evaluation and retained
+limitations are in [the paired cash exit audit](PAIRED_CASH_EXIT_AUDIT_2026_11_20.md).
+
+
+### Sealed public trade delivery lineage
+
+Use the existing `replay_trade_preflight.py` before a new offline policy matrix.
+To explain its timing failures against a signed Lighter public archive, run:
+
+```bash
+python3 scripts/audit_replay_trade_delivery.py \
+  /absolute/frozen-config.json /absolute/frozen-tape.jsonl \
+  /absolute/sealed-public-archive lighter_robinhood 1 1 \
+  /absolute/new-clock-link.json
+```
+
+The arguments after the archive are venue domain, native market ID and replay
+leg index. Resolve market IDs for that domain; the example uses RH native ID 1
+and leg 1. Every selected trade must match the frozen projection in all fields.
+The read-only report keeps preflight and original clock-bound failures, alongside
+execution, local receipt, processing and millisecond-rounding components. Missing
+execution metadata stays unknown. Snapshots, duplicates and conflicting metadata
+are counted separately. Output is aggregate-only and cannot overwrite an existing
+file. Success means the audit completed; it does not admit the input for trading.
+Inspect preflight for the configured maker leg and the linked leg independently.
+
+Schema 2 sets `projection_identity_verified` only after at least one public
+print matches the frozen leg and the complete input comparison succeeds. For
+two empty projections, `projection_status` distinguishes a missing venue trade
+source, no market-channel messages during the configured window, and an
+observed market channel with zero projected prints. The market-message count
+includes subscription snapshots. A silent interval leaves trade identity and
+delivery times unverified. Earlier schema 1 reports require checking
+`counts.matched_prints` alongside the identity flag.
+
+This command does not change `source_ms`, cash, grace or cancellation barriers.
+Cross-clock differences are not calibrated network latency, and observed maxima
+cannot certify a future bound. Timing admission alone does not certify stream
+coverage. See the [first full lineage audit](TRADE_DELIVERY_CLOCK_LINEAGE_2026_11_20.md).

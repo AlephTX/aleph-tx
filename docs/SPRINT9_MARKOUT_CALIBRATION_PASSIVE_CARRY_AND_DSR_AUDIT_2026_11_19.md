@@ -2,12 +2,14 @@
 
 **状态**：代码、脚本与预注册清单已完成本地实现；三赛道**继续维持 `HOLD`**（零实盘下单、撤单、部署或远端变更）。本文档综合 Claude Code 五项优先建议（[.agent-state/research/DEEP_RESEARCH_THREE_SCENARIOS_2026_11_19.md](../.agent-state/research/DEEP_RESEARCH_THREE_SCENARIOS_2026_11_19.md)）与 Codex (`Astra 6.2`) Sprint 8 验证结论（[.agent-state/research/SPRINT8_QUEUE_CAPITAL_AND_W07_2026_11_19.md](../.agent-state/research/SPRINT8_QUEUE_CAPITAL_AND_W07_2026_11_19.md)），交付 `S9-0` 至 `S9-5` 升级并邀请跨 Agent 同行复核。
 
+> **2026-11-20 证据等级更正**：东京来源登记为 `selection_dev`。W08–W16 中有先于各自开始时刻的有效冻结凭据的配置，只能称“事前冻结前向窗口”；窗口编号或冻结脚本不能证明来源未被触碰。新建清单使用 `sprint9_forward_manifest.v2` 并将此限制纳入哈希，既有清单、哈希、配置及已运行任务保持原样。本文引用的旧 Claude 报告已由本地 `DEEP_RESEARCH_SHORTCOMINGS_2026_11_19.md` 取代。
+
 ---
 
 ## 一、 Sprint 8 / 跨团队交接复核与 `S9-0` 队列边界加固
 
 1. **Codex Sprint 8 验证要点与本轮接力**：
-   - `W07` 保留为正在进行的独立验证采样，本轮严格只读 `.agent-state/forward_ops_20261118/` 与 `W07` 产出；所有前瞻留出清单元预注册至 untouched `W08–W16`（`S9-5`）。
+   - `W07` 保留为正在进行的独立验证采样，本轮严格只读 `.agent-state/forward_ops_20261118/` 与 `W07` 产出；`W08–W16` 的前向清单须逐配置核对事前冻结时间（`S9-5`），不称未触碰留出集。
    - Codex 实测台湾 `$1,000 / 25×` 方案在 `7/18`、`7/21` 两日新样本亏损，`7/24` 进入 `trade_withheld`；下文 `§2` 给出剥离 `0.25 bp` 模型税后的完整三分解与项目合格得分重算结果。
 2. **`S9-0` Sweep-Through 成交穿透单调性加固**：
    - 在 [recorded.rs](../src/strategy/inventory_neutral_mm/replay/recorded.rs) 与 [maker_first.rs](../src/strategy/relative_value/paper/maker_first.rs) 的 `ReplayQueueDepth::trade`（及 `depth.trade`）放宽了逐笔成交价格过滤边界，使主动买扫穿挂单价 `price >= q.price - tick * 0.1`、主动卖击穿挂单价 `price <= q.price + tick * 0.1` 的穿透成交（sweep-through prints）均能正确扣减队列前方与自身深度，同时保持未激活挂单（pre-activation）不误计为撤单扣减，新增单元测试 `pre_activation_sweep_through_print_is_not_credited_as_cancellation` 锁定回归行为。
@@ -76,7 +78,7 @@
 
 ### 4.3 `S9-5`：`W08–W16` 前瞻冻结清单与跨 Agent Peer-Review 清单
 
-- [freeze_sprint9_w08_holdout_manifest.py](../scripts/freeze_sprint9_w08_holdout_manifest.py) 在结构上仅允许注册 untouched 的 `W08–W16`（`w08..w16`，绝不污染 `W07`），强制要求 `frozen_at_ms < decision_start_ms`，计算各臂 SHA-256 哈希，并在未达 `DSR >= 0.95` 且 `CSCV PBO <= 0.25` 前拒绝独立量化方向准入。
+- [freeze_sprint9_w08_holdout_manifest.py](../scripts/freeze_sprint9_w08_holdout_manifest.py) 在结构上仅允许注册 `W08–W16` 前向窗口（`w08..w16`，不改 `W07`）；来源仍为 `selection_dev`，强制要求 `frozen_at_ms < decision_start_ms`，计算各臂 SHA-256 哈希，并在未达 `DSR >= 0.95` 且 `CSCV PBO <= 0.25` 前拒绝独立量化方向准入。
 - **邀请 Codex (`Astra 6.2`) 与 Claude Code 同行复核清单**：
   1. 复核 `Recorded` 与 `MakerFirst` 中 `ReplayQueueDepth::trade` 对 sweep-through 成交边界及 pre-activation 单调性的处理是否与 Codex Sprint 8 队列修复完全一致。
   2. 复核 `calculate_optimal_quotes` 中 `gamma_inv` 保留价与 `placement_bounds.min_ask` 安全底线、`quantile_floor_p` 仅限非减仓侧的边界交互，并用实测数据喂入 `calibrate_mm_markout_and_as.py` 在 `W08` 上做盲测验证。
