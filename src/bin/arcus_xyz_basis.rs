@@ -888,6 +888,7 @@ fn ensure_account_time(cfg: &ArcusXyzBasisConfig, now: u64, core: u64, dex: u64)
     Ok(())
 }
 
+#[derive(Clone)]
 struct VenueSnapshot {
     core_time: u64,
     inv_arc: Decimal,
@@ -1021,6 +1022,37 @@ impl Valuation {
     }
 }
 
+const KNOWN_POLL_REASONS: &[&str] = &[
+    "stale_arcus_book",
+    "stale_xyz_book",
+    "stale_arcus_source_book",
+    "stale_xyz_source_book",
+    "invalid_arcus_book",
+    "invalid_arcus_source_time",
+    "invalid_xyz_source_time",
+    "legs and account valuation times are too far apart",
+    "stale or invalid HL account valuation",
+];
+
+fn should_refresh_account(last_refresh: Option<Instant>, now: Instant, interval_ms: u64) -> bool {
+    match last_refresh {
+        None => true,
+        Some(prev) => now.saturating_duration_since(prev) >= Duration::from_millis(interval_ms),
+    }
+}
+
+fn classify_poll_error(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        for &reason in KNOWN_POLL_REASONS {
+            if msg.contains(reason) {
+                return reason;
+            }
+        }
+    }
+    "poll_failed"
+}
+
 async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<Valuation> {
     let (arc, (hl, hl_rx), account) = tokio::try_join!(
         async { to_arcus_snapshot(&handles.arc_info.bbo(&cfg.arcus_symbol).await?, unix_ms()?) },
@@ -1037,6 +1069,51 @@ async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<V
     };
     v.fresh(cfg, unix_ms()?)?;
     Ok(v)
+}
+
+async fn poll_valuation(
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+    cached_account: &mut Option<(VenueSnapshot, Instant)>,
+) -> Result<(Valuation, bool)> {
+    let now = Instant::now();
+    let last_refresh = cached_account.as_ref().map(|(_, t)| *t);
+    if !should_refresh_account(last_refresh, now, cfg.account_refresh_interval_ms)
+        && let Some((cached, _)) = cached_account.as_ref()
+    {
+        let cached_snap = cached.clone();
+        let arc_fut = async {
+            to_arcus_snapshot(&handles.arc_info.bbo(&cfg.arcus_symbol).await?, unix_ms()?)
+        };
+        let hl_fut = async {
+            let book = handles.hl_info.l2_book(&cfg.hl_coin).await?;
+            Ok::<_, anyhow::Error>((book, unix_ms()?))
+        };
+        let (arc, (hl, hl_rx)) = tokio::try_join!(arc_fut, hl_fut)?;
+        let sampled_ms = unix_ms()?;
+        let v = Valuation {
+            sampled_at: Instant::now(),
+            sampled_ms,
+            arc,
+            hl,
+            hl_rx,
+            account: cached_snap,
+        };
+        match v.fresh(cfg, unix_ms()?) {
+            Ok(()) => return Ok((v, false)),
+            Err(err)
+                if matches!(
+                    classify_poll_error(&err),
+                    "legs and account valuation times are too far apart"
+                        | "stale or invalid HL account valuation"
+                ) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    *cached_account = None;
+    let v = valuation(handles, cfg).await?;
+    *cached_account = Some((v.account.clone(), v.sampled_at));
+    Ok((v, true))
 }
 
 async fn reconcile_both_venues_with_retry(
@@ -1583,6 +1660,83 @@ async fn prepare_pair<H>(
     Ok((primary, prepare_hedge.await?))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn verify_and_mark_valuation(
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+    journal: &BasisJournal,
+    telemetry: Option<&TelemetrySink>,
+    engine: &ArcusXyzBasisEngine,
+    basis: &EquityBasis,
+    daily_loss: &mut DailyLossGuard,
+    v: &Valuation,
+    session_eq: &mut f64,
+    session_start_equity: f64,
+    lease_ok: bool,
+) -> Result<()> {
+    let halt_reason = if let Err(err) = v.verify_positions(engine.inv_arc(), engine.inv_xyz()) {
+        Some(("position_mismatch", err))
+    } else {
+        match basis.equity(v.account.hl_equity, v.mid()) {
+            Ok((eq, _, _)) => {
+                *session_eq = eq;
+                daily_loss
+                    .check(*session_eq, utc_day_now())
+                    .err()
+                    .map(|err| ("daily_loss_breached", err))
+            }
+            Err(err) => Some(("valuation_error", err)),
+        }
+    };
+    if let Some((reason, err)) = halt_reason {
+        emit_basis_snapshot(
+            telemetry,
+            cfg,
+            *session_eq,
+            session_start_equity,
+            daily_loss,
+            engine,
+            &v.arc,
+            lease_ok,
+            true,
+        );
+        let _ = handle_canary_shutdown(reason, handles, cfg, journal, telemetry).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn record_poll_error(
+    consecutive_poll_errors: &mut u32,
+    err: &anyhow::Error,
+    now_ms: u64,
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+    journal: &BasisJournal,
+    telemetry: Option<&TelemetrySink>,
+) -> Result<()> {
+    *consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
+    eprintln!(
+        "{}",
+        json!({
+            "mode": "canary_warn",
+            "event": "book_poll_error",
+            "ms": now_ms,
+            "reason": classify_poll_error(err),
+            "consecutive_poll_errors": *consecutive_poll_errors,
+        })
+    );
+    if *consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+        let _ = handle_canary_shutdown("consecutive_poll_errors", handles, cfg, journal, telemetry)
+            .await;
+        bail!(
+            "aborting canary after {} consecutive book poll errors",
+            *consecutive_poll_errors
+        );
+    }
+    Ok(())
+}
+
 async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
     let stop = StopLatch::install()?;
     let cfg = load_config(config_path)?;
@@ -1646,6 +1800,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
     let mut consecutive_lease_errors: u32 = 0;
     let mut consecutive_residual_rejects: u32 = 0;
     let mut last_arc_snap: Option<ArcusBookSnapshot> = None;
+    let mut cached_account: Option<(VenueSnapshot, Instant)> = None;
 
     loop {
         if let Some(sig) = shutdown
@@ -1698,6 +1853,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 {
                     Ok(fresh) => {
                         lease = fresh;
+                        cached_account = None;
                         consecutive_lease_errors = 0;
                         eprintln!(
                             "{}",
@@ -1772,37 +1928,24 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 }
             }
         }
-        let valuation_result = valuation(&handles, &cfg).await;
+        let valuation_result = poll_valuation(&handles, &cfg, &mut cached_account).await;
         let eval_now_ms = unix_ms()?;
-        let v = match valuation_result {
-            Ok(v) => {
+        let (mut v, account_fresh) = match valuation_result {
+            Ok(res) => {
                 consecutive_poll_errors = 0;
-                v
+                res
             }
-            Err(_) => {
-                consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
-                eprintln!(
-                    "{}",
-                    json!({
-                        "mode": "canary_warn",
-                        "event": "book_poll_error",
-                        "ms": eval_now_ms,
-                        "consecutive_poll_errors": consecutive_poll_errors,
-                    })
-                );
-                if consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
-                    let _ = handle_canary_shutdown(
-                        "consecutive_poll_errors",
-                        &handles,
-                        &cfg,
-                        &journal,
-                        telemetry.as_ref(),
-                    )
-                    .await;
-                    bail!(
-                        "aborting canary after {consecutive_poll_errors} consecutive book poll errors"
-                    );
-                }
+            Err(err) => {
+                record_poll_error(
+                    &mut consecutive_poll_errors,
+                    &err,
+                    eval_now_ms,
+                    &handles,
+                    &cfg,
+                    &journal,
+                    telemetry.as_ref(),
+                )
+                .await?;
                 tokio::select! {
                     biased;
                     sig = &mut shutdown => {
@@ -1814,88 +1957,23 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
             }
         };
         let lease_ok = !cfg.require_arcus_cancel_lease || lease.allows_new_exposure(Instant::now());
-        if let Err(err) = v.verify_positions(engine.inv_arc(), engine.inv_xyz()) {
-            emit_basis_snapshot(
-                telemetry.as_ref(),
-                &cfg,
-                session_eq,
-                session_start_equity,
-                &daily_loss,
-                &engine,
-                &v.arc,
-                lease_ok,
-                true,
-            );
-            let _ = handle_canary_shutdown(
-                "position_mismatch",
-                &handles,
-                &cfg,
-                &journal,
-                telemetry.as_ref(),
-            )
-            .await;
-            return Err(err);
-        }
-        session_eq = match basis.equity(v.account.hl_equity, v.mid()) {
-            Ok((eq, _, _)) => eq,
-            Err(err) => {
-                emit_basis_snapshot(
-                    telemetry.as_ref(),
-                    &cfg,
-                    session_eq,
-                    session_start_equity,
-                    &daily_loss,
-                    &engine,
-                    &v.arc,
-                    lease_ok,
-                    true,
-                );
-                let _ = handle_canary_shutdown(
-                    "valuation_error",
-                    &handles,
-                    &cfg,
-                    &journal,
-                    telemetry.as_ref(),
-                )
-                .await;
-                return Err(err);
-            }
-        };
-        let arc_snap = &v.arc;
-        let hl_book = &v.hl;
-        let hl_rx_ms = v.hl_rx;
-        last_arc_snap = Some(arc_snap.clone());
-        if let Err(err) = daily_loss.check(session_eq, utc_day_now()) {
-            emit_basis_snapshot(
-                telemetry.as_ref(),
-                &cfg,
-                session_eq,
-                session_start_equity,
-                &daily_loss,
-                &engine,
-                arc_snap,
-                lease_ok,
-                true,
-            );
-            let _ = handle_canary_shutdown(
-                "daily_loss_breached",
-                &handles,
-                &cfg,
-                &journal,
-                telemetry.as_ref(),
-            )
-            .await;
-            return Err(err);
-        }
-
-        let action = engine.on_books(
-            eval_now_ms,
-            arc_snap,
-            hl_book,
-            hl_rx_ms,
-            &daily_loss,
+        verify_and_mark_valuation(
+            &handles,
+            &cfg,
+            &journal,
+            telemetry.as_ref(),
+            &engine,
+            &basis,
+            &mut daily_loss,
+            &v,
+            &mut session_eq,
+            session_start_equity,
             lease_ok,
-        );
+        )
+        .await?;
+        last_arc_snap = Some(v.arc.clone());
+
+        let action = engine.on_books(eval_now_ms, &v.arc, &v.hl, v.hl_rx, &daily_loss, lease_ok);
         if let Some(reason) = engine.residual_blocked() {
             eprintln!(
                 "{}",
@@ -1914,7 +1992,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 session_start_equity,
                 &daily_loss,
                 &engine,
-                arc_snap,
+                &v.arc,
                 lease_ok,
                 true,
             );
@@ -1922,6 +2000,76 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 handle_canary_shutdown(reason, &handles, &cfg, &journal, telemetry.as_ref()).await;
             bail!("aborting canary: unhedgeable residual ({reason})");
         }
+
+        if !matches!(action, BasisAction::Hold { .. }) && !account_fresh {
+            match reconcile_both_venues(&handles, &cfg).await {
+                Ok(fresh_account) => {
+                    v.account = fresh_account;
+                    cached_account = Some((v.account.clone(), Instant::now()));
+                }
+                Err(err) => {
+                    cached_account = None;
+                    let now_ms = unix_ms()?;
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        now_ms,
+                    );
+                    record_poll_error(
+                        &mut consecutive_poll_errors,
+                        &err,
+                        now_ms,
+                        &handles,
+                        &cfg,
+                        &journal,
+                        telemetry.as_ref(),
+                    )
+                    .await?;
+                    tokio::select! {
+                        biased;
+                        sig = &mut shutdown => {
+                            handle_canary_shutdown(sig, &handles, &cfg, &journal, telemetry.as_ref()).await?;
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(cfg.poll_interval_ms)) => continue,
+                    }
+                }
+            }
+            verify_and_mark_valuation(
+                &handles,
+                &cfg,
+                &journal,
+                telemetry.as_ref(),
+                &engine,
+                &basis,
+                &mut daily_loss,
+                &v,
+                &mut session_eq,
+                session_start_equity,
+                lease_ok,
+            )
+            .await?;
+            let fresh_now_ms = unix_ms()?;
+            let brake_tightened = matches!(
+                action,
+                BasisAction::EnterPairIoc { brake_scale, .. }
+                    if daily_loss.risk_scale() < brake_scale
+            );
+            if v.fresh(&cfg, fresh_now_ms).is_err() || brake_tightened {
+                engine.reconcile_positions(
+                    v.account.inv_arc,
+                    v.account.inv_xyz,
+                    v.arc.receipt_ms,
+                    v.hl_rx,
+                    fresh_now_ms,
+                );
+                continue;
+            }
+        }
+        let arc_snap = &v.arc;
+        let hl_book = &v.hl;
 
         match action {
             BasisAction::Hold { .. } => {}
@@ -2063,6 +2211,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                     exec_ms,
                 )
                 .await?;
+                cached_account = None;
                 if hl_rejected && (engine.inv_arc() + engine.inv_xyz()).abs() > Decimal::new(1, 6) {
                     consecutive_residual_rejects = consecutive_residual_rejects.saturating_add(1);
                     if consecutive_residual_rejects >= MAX_CONSECUTIVE_RESIDUAL_REJECTS {
@@ -2288,6 +2437,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         exec_ms,
                     )
                     .await?;
+                    cached_account = None;
                     last_snapshot_at = Instant::now();
                 } else {
                     bail!("pair action quantized to zero size ({qty}) despite preflight guard");
@@ -2645,5 +2795,96 @@ mod tests {
             &HlSubmitOutcome::CanceledAck,
             "temporary HTTP 503 service unavailable"
         ));
+    }
+
+    #[test]
+    fn should_refresh_account_enforces_interval_and_monotonic_bounds() {
+        let t0 = Instant::now();
+        assert!(should_refresh_account(None, t0, 1_000));
+        assert!(!should_refresh_account(Some(t0), t0, 1_000));
+        assert!(!should_refresh_account(
+            Some(t0),
+            t0 + Duration::from_millis(999),
+            1_000
+        ));
+        assert!(should_refresh_account(
+            Some(t0),
+            t0 + Duration::from_millis(1_000),
+            1_000
+        ));
+        assert!(should_refresh_account(
+            Some(t0),
+            t0 + Duration::from_millis(2_500),
+            1_000
+        ));
+        assert!(!should_refresh_account(
+            Some(t0 + Duration::from_millis(50)),
+            t0,
+            1_000
+        ));
+        assert!(should_refresh_account(Some(t0), t0, 0));
+    }
+
+    #[test]
+    fn classify_poll_error_maps_known_static_reasons_and_redacts_unknown() {
+        for reason in KNOWN_POLL_REASONS {
+            let direct = anyhow::anyhow!("{reason}");
+            assert_eq!(classify_poll_error(&direct), *reason);
+            let wrapped = anyhow::anyhow!("{reason}").context("outer poll failure");
+            assert_eq!(classify_poll_error(&wrapped), *reason);
+        }
+        let sensitive = anyhow::anyhow!(
+            "HTTP 429 from https://example.invalid/info?user=0x1111 header x-secret=abc"
+        );
+        assert_eq!(classify_poll_error(&sensitive), "poll_failed");
+    }
+
+    #[test]
+    fn cached_account_freshness_respects_spread_and_post_reconcile_book_age() {
+        let cfg: ArcusXyzBasisConfig =
+            toml::from_str(include_str!("../../config.arcus_xyz_basis.example.toml")).unwrap();
+        let now = 100_000_u64;
+        let mut v = Valuation {
+            sampled_at: Instant::now(),
+            sampled_ms: now,
+            arc: ArcusBookSnapshot {
+                source_ms: now,
+                receipt_ms: now,
+                bid_px: 100.into(),
+                ask_px: 101.into(),
+                bid_sz: Decimal::ONE,
+                ask_sz: Decimal::ONE,
+            },
+            hl: hyperliquid::ValidatedBook::from_bbo(hyperliquid::BestBidAsk {
+                coin: "xyz:ANT".into(),
+                timestamp_ms: now,
+                bid: 100.into(),
+                ask: 101.into(),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+            }),
+            hl_rx: now,
+            account: VenueSnapshot {
+                core_time: now - cfg.account_refresh_interval_ms,
+                inv_arc: Decimal::ZERO,
+                inv_xyz: Decimal::ZERO,
+                hl_equity: 100.into(),
+                hl_account_time_ms: now - cfg.account_refresh_interval_ms,
+            },
+        };
+        assert!(v.fresh(&cfg, now).is_ok());
+
+        v.arc.source_ms = now + 1_500;
+        let skew_err = v.fresh(&cfg, now).unwrap_err();
+        assert_eq!(
+            classify_poll_error(&skew_err),
+            "legs and account valuation times are too far apart"
+        );
+
+        v.arc.source_ms = now;
+        v.account.core_time = now + 251;
+        v.account.hl_account_time_ms = now + 251;
+        let aged_err = v.fresh(&cfg, now + 251).unwrap_err();
+        assert_eq!(classify_poll_error(&aged_err), "stale_arcus_book");
     }
 }

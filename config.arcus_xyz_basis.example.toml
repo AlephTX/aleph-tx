@@ -36,6 +36,7 @@ canary_max_total_notional_usd = 100.0
 require_arcus_cancel_lease = true
 dry_run = true
 poll_interval_ms = 250
+account_refresh_interval_ms = 1000
 
 journal_path = "state/arcus_xyz_basis_journal.ndjson"
 daily_loss_state_path = "state/arcus_xyz_basis_daily_loss.json"

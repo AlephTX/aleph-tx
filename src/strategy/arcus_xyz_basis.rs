@@ -70,6 +70,9 @@ fn default_slippage_bps() -> f64 {
 fn default_poll_interval_ms() -> u64 {
     250
 }
+fn default_account_refresh_interval_ms() -> u64 {
+    1_000
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +119,8 @@ pub struct ArcusXyzBasisConfig {
     pub dry_run: bool,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_account_refresh_interval_ms")]
+    pub account_refresh_interval_ms: u64,
     pub journal_path: PathBuf,
     pub daily_loss_state_path: PathBuf,
 }
@@ -236,7 +241,9 @@ impl ArcusXyzBasisConfig {
                 && self.max_arcus_book_age_ms > 0
                 && self.max_hl_book_age_ms > 0
                 && self.max_venue_clock_skew_ms <= 30_000
-                && self.poll_interval_ms >= 50,
+                && self.poll_interval_ms >= 50
+                && self.account_refresh_interval_ms >= self.poll_interval_ms
+                && self.account_refresh_interval_ms <= self.max_hl_book_age_ms,
             "invalid hold, freshness, clock-skew, or polling timing bounds"
         );
         ensure!(
@@ -2185,6 +2192,7 @@ mod tests {
             require_arcus_cancel_lease: false,
             dry_run: true,
             poll_interval_ms: 250,
+            account_refresh_interval_ms: 1_000,
             journal_path: PathBuf::from("state/test-journal.ndjson"),
             daily_loss_state_path: PathBuf::from("state/test-daily-loss.json"),
         }
@@ -2309,6 +2317,30 @@ mod tests {
         cfg.clip_usd = 100.0;
         cfg.hl_coin = "ANT".into(); // missing xyz: prefix when hl_dex="xyz"
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_out_of_bounds_account_refresh_interval() {
+        let mut cfg = test_config();
+        assert!(cfg.validate().is_ok());
+
+        cfg.account_refresh_interval_ms = cfg.poll_interval_ms - 1;
+        assert!(cfg.validate().is_err());
+
+        cfg.account_refresh_interval_ms = cfg.max_hl_book_age_ms + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg.account_refresh_interval_ms = cfg.poll_interval_ms;
+        assert!(cfg.validate().is_ok());
+
+        cfg.account_refresh_interval_ms = cfg.max_hl_book_age_ms;
+        assert!(cfg.validate().is_ok());
+
+        let without_refresh = include_str!("../../config.arcus_xyz_basis.example.toml")
+            .replace("account_refresh_interval_ms = 1000\n", "");
+        let parsed: ArcusXyzBasisConfig = toml::from_str(&without_refresh).unwrap();
+        assert_eq!(parsed.account_refresh_interval_ms, 1_000);
+        assert!(parsed.validate().is_ok());
     }
 
     #[test]
