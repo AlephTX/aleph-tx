@@ -39,6 +39,11 @@ def evaluate(status, summary, now_ms):
     if live.get("ActiveState") == "failed":
         alerts.append(_alert("live_failed", CRITICAL,
                              f"实盘策略异常退出 ({live.get('Result', 'unknown')})"))
+    arcus = services.get("aleph-tx-arcus-xyz", {})
+    arcus_active = arcus.get("ActiveState") == "active"
+    if arcus.get("ActiveState") == "failed":
+        alerts.append(_alert("arcus_live_failed", CRITICAL,
+                             f"Arcus-XYZ 套利策略异常退出 ({arcus.get('Result', 'unknown')})"))
 
     for market in (status or {}).get("markets", []):
         if market.get("optional"):
@@ -50,7 +55,7 @@ def evaluate(status, summary, now_ms):
 
     session = (summary or {}).get("session") or {}
     snapshot = (summary or {}).get("snapshot") or {}
-    running = live_active and session and not session.get("stopped_ms")
+    running = (live_active or arcus_active) and session and not session.get("stopped_ms")
     if running:
         last = session.get("last_ms") or 0
         if now_ms - last > SNAPSHOT_STALE_MS:

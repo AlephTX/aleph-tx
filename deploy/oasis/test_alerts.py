@@ -122,6 +122,40 @@ class EvaluateTest(unittest.TestCase):
         crit = evaluate({**status(live="inactive"), "disk": {"free_gib": 2.1}}, summary(), NOW)
         self.assertEqual([(a["key"], a["severity"]) for a in crit], [("disk_space_low", CRITICAL)])
 
+    def test_arcus_xyz_service_alerts_and_telemetry_gating(self):
+        base_inactive = {
+            "services": {
+                "aleph-tx-feeder": {"ActiveState": "active"},
+                "aleph-tx-live": {"ActiveState": "inactive"},
+                "aleph-tx-arcus-xyz": {"ActiveState": "inactive", "Result": "success"},
+            },
+            "markets": [{"venue": "Lighter", "symbol": "ETH", "state": "stale"}],
+        }
+        stale = summary(last=NOW - 120_000)
+        self.assertEqual(evaluate(base_inactive, stale, NOW), [])
+
+        failed = {
+            **base_inactive,
+            "services": {
+                **base_inactive["services"],
+                "aleph-tx-arcus-xyz": {"ActiveState": "failed", "Result": "exit-code"},
+            },
+        }
+        self.assertEqual(
+            [(a["key"], a["severity"]) for a in evaluate(failed, stale, NOW)],
+            [("arcus_live_failed", CRITICAL)],
+        )
+
+        # Active Arcus-XYZ gates telemetry/drawdown/defense alerts without raising SHM Lighter quote alerts.
+        active = {
+            **base_inactive,
+            "services": {
+                **base_inactive["services"],
+                "aleph-tx-arcus-xyz": {"ActiveState": "active", "Result": "success"},
+            },
+        }
+        self.assertEqual(keys(evaluate(active, stale, NOW)), ["telemetry_stale"])
+
 
 class AlerterTest(unittest.TestCase):
     def test_drawdown_escalation_refreshes_message_and_notifies_once(self):

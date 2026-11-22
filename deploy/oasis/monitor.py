@@ -29,7 +29,7 @@ from telemetry_store import TelemetryStore
 
 ROOT = Path(__file__).resolve().parent
 MATRIX = "/run/aleph-tx-market/aleph-matrix"
-SERVICES = ("aleph-tx-feeder", "aleph-tx-monitor", "aleph-tx-live")
+SERVICES = ("aleph-tx-feeder", "aleph-tx-monitor", "aleph-tx-live", "aleph-tx-arcus-xyz")
 # Layout in feeder/shm/matrix.go; symbol and exchange IDs in feeder/exchanges/common.go.
 NUM_SYMBOLS = 2048
 NUM_EXCHANGES = 12
@@ -52,7 +52,7 @@ ALERT_WEBHOOK = os.environ.get("ALEPH_MONITOR_ALERT_WEBHOOK", "").strip()
 ALERT_INTERVAL = 15
 RETENTION_DAYS = float(os.environ.get("ALEPH_MONITOR_RETENTION_DAYS", "14"))
 PRUNE_INTERVAL = 3600
-LIVE_UNIT = "aleph-tx-live.service"
+LIVE_UNITS = ("aleph-tx-live.service", "aleph-tx-arcus-xyz.service")
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
         ".ico": "image/x-icon", ".json": "application/json", ".woff2": "font/woff2",
@@ -315,8 +315,8 @@ def journal_tail(unit, lines):
 
 
 def stop_live():
-    """Stop the live unit. The strategy cancels orders and verifies flat on SIGTERM."""
-    proc = subprocess.run(["systemctl", "stop", "--no-block", LIVE_UNIT], capture_output=True,
+    """Stop all live strategy units. Each cancels orders and verifies flat on SIGTERM."""
+    proc = subprocess.run(["systemctl", "stop", "--no-block", *LIVE_UNITS], capture_output=True,
                           text=True, timeout=10, check=False)
     if proc.returncode != 0:
         raise PermissionError(proc.stderr.strip()[:300] or "systemctl stop failed")

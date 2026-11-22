@@ -38,18 +38,19 @@ CLOUDSDK_PYTHON_SITEPACKAGES=1 gcloud compute ssh oasis-tokyo \
 target/release/arcus_xyz_basis --shadow config.arcus_xyz_basis.example.toml --duration-secs 30
 ```
 
-4. **Read-only live credential & journal preflight** (requires `/etc/aleph-tx/.env.arcus_xyz` on host):
+4. **Read-only live credential & journal preflight** (requires `/etc/aleph-tx/arcus_xyz_basis.env` on host):
 
-Expected environment variables in `.env.arcus_xyz` (`chmod 600`, root/trader-only, never in Git):
+Expected environment variables in `/etc/aleph-tx/arcus_xyz_basis.env` (`chmod 640`, `root:aleph-tx-trader`, never in Git):
 
 - `ARCUS_ACCOUNT_ADDRESS`
 - `ARCUS_ACCOUNT_INDEX` (optional, default `0`)
 - `ARCUS_API_PRIVATE_KEY` (32-byte Ed25519 hex key)
-- `HYPERLIQUID_ACCOUNT_ADDRESS` (master/subaccount address)
+- `HYPERLIQUID_ACCOUNT_ADDRESS` (master wallet address validated by `HYPERLIQUID_AGENT_PRIVATE_KEY`)
+- `HYPERLIQUID_VAULT_ADDRESS` (optional subaccount / vault `0x` address; when set, orders, equity, and `xyz` positions route to the vault/subaccount while agent authorization is validated against the master wallet)
 - `HYPERLIQUID_AGENT_PRIVATE_KEY` (approved Hyperliquid agent secp256k1 hex key)
 
 ```bash
-target/release/arcus_xyz_basis --canary-preflight /etc/aleph-tx/arcus_xyz_basis.toml --env /etc/aleph-tx/.env.arcus_xyz
+target/release/arcus_xyz_basis --canary-preflight /etc/aleph-tx/arcus_xyz_basis.toml --env /etc/aleph-tx/arcus_xyz_basis.env
 ```
 
 ---
@@ -99,13 +100,22 @@ python3 scripts/run_oos_validation_gate.py w17-crash-pause-verify \
 
 ## Step 3: Graduated Live Canary Execution (Only After Step 2 `GO`)
 
-1. Copy/install release artifacts on `oasis-tokyo` (includes `arcus_xyz_basis` via `deploy/oasis/install.sh`).
-2. Create host config `/etc/aleph-tx/arcus_xyz_basis.toml` from `config.arcus_xyz_basis.example.toml` with `dry_run = false`, keeping conservative Canary caps (`clip_usd = 50.0`, `max_notional_usd = 100.0`, `canary_max_order_usd = 50.0`, `canary_max_total_notional_usd = 100.0`).
-3. Re-run `--canary-preflight`, then start explicitly with confirmation flag:
+1. Copy/install release artifacts on `oasis-tokyo` (includes `arcus_xyz_basis` and manual-start `aleph-tx-arcus-xyz.service` via `deploy/oasis/install.sh`).
+2. Create host config `/etc/aleph-tx/arcus_xyz_basis.toml` from `config.arcus_xyz_basis.example.toml` with `dry_run = false`, keeping conservative Canary caps (`clip_usd = 50.0`, `max_notional_usd = 100.0`, `canary_max_order_usd = 50.0`, `canary_max_total_notional_usd = 100.0`), and place mode `0640` `root:aleph-tx-trader` credentials at `/etc/aleph-tx/arcus_xyz_basis.env`.
+3. Re-run `--canary-preflight`, then start explicitly via systemd (never enabled on boot) or CLI confirmation flag:
 
 ```bash
+# Option A: manual systemd unit (integrates with dashboard status, logs, alerts, and emergency stop):
+sudo systemctl start aleph-tx-arcus-xyz.service
+
+# Option B: foreground CLI test with explicit confirmation:
 /opt/aleph-tx/current/bin/arcus_xyz_basis \
   --canary /etc/aleph-tx/arcus_xyz_basis.toml \
-  --env /etc/aleph-tx/.env.arcus_xyz \
+  --env /etc/aleph-tx/arcus_xyz_basis.env \
   --confirm-live-canary
 ```
+
+Operational notes for live `aleph-tx-arcus-xyz.service`:
+- Transient REST polling and `CancelLease` renewal errors are tolerated up to `12` consecutive failed polls before cancelling open Arcus orders and failing closed; post-dispatch venue reconciliation retries up to `5` times with exponential backoff so transient network errors do not leave `BasisJournal` orphaned.
+- On `SIGTERM` (`systemctl stop` or dashboard emergency stop) / `SIGINT`, the runner cancels open Arcus orders, reconciles both venues with retry, appends `CleanShutdown`, and flushes `TelemetrySink` (`StrategySnapshot` + `HedgeFillRecord` for `hyperliquid_xyz` position deltas) before exit.
+- Dashboard `/api/status`, `/api/alerts` (`arcus_live_failed` + telemetry/drawdown/imbalance gating), `/api/logs?unit=aleph-tx-arcus-xyz`, and the emergency stop button monitor `aleph-tx-arcus-xyz.service` without interfering when `inactive`.

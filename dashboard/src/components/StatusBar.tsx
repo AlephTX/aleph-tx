@@ -8,6 +8,7 @@ const LABELS: Record<string, string> = {
   'aleph-tx-feeder': '行情 Feeder',
   'aleph-tx-monitor': '监控',
   'aleph-tx-live': '实盘策略',
+  'aleph-tx-arcus-xyz': 'Arcus-XYZ 套利',
 }
 
 function serviceTone(s: Service): BadgeTone {
@@ -40,7 +41,8 @@ export function StatusBar({
 }) {
   const now = useNow()
   const live = status?.services['aleph-tx-live']
-  const liveActive = live?.ActiveState === 'active'
+  const arcusLive = status?.services['aleph-tx-arcus-xyz']
+  const liveActive = live?.ActiveState === 'active' || arcusLive?.ActiveState === 'active'
   const stale = updatedAt > 0 && now - updatedAt > 15_000
   const link: { tone: BadgeTone; text: string } = error
     ? { tone: 'bad', text: '连接中断' }

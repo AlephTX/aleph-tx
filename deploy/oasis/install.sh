@@ -14,11 +14,13 @@ if [[ ! -f dashboard/dist/index.html ]]; then
   exit 1
 fi
 
-live_state=$(systemctl show -p ActiveState --value aleph-tx-live.service)
-case "$live_state" in
-  inactive|failed) ;;
-  *) printf 'Stop the live strategy cleanly before installing (state: %s).\n' "$live_state" >&2; exit 1 ;;
-esac
+for unit in aleph-tx-live.service aleph-tx-arcus-xyz.service; do
+  unit_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo inactive)
+  case "$unit_state" in
+    inactive|failed|'') ;;
+    *) printf 'Stop %s cleanly before installing (state: %s).\n' "$unit" "$unit_state" >&2; exit 1 ;;
+  esac
+done
 
 for user in aleph-tx aleph-tx-trader; do
   if ! getent passwd "$user" >/dev/null; then
@@ -46,7 +48,7 @@ LD_LIBRARY_PATH="$dest/lib" "$dest/bin/cross_venue" perp-replay "$dest/examples/
 if [[ ! -e /etc/aleph-tx/feeder.toml ]]; then
   sudo -n install -m 0644 deploy/oasis/feeder.toml /etc/aleph-tx/feeder.toml
 fi
-for unit in feeder monitor live flywheel; do
+for unit in feeder monitor live arcus-xyz flywheel; do
   sudo -n install -m 0644 "deploy/oasis/aleph-tx-$unit.service" /etc/systemd/system/
 done
 sudo -n install -m 0644 deploy/oasis/aleph-tx-flywheel.timer /etc/systemd/system/

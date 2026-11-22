@@ -4,6 +4,7 @@ import { Card, Empty, ErrorNote } from './ui'
 
 const UNITS = [
   ['aleph-tx-live', '实盘策略'],
+  ['aleph-tx-arcus-xyz', 'Arcus-XYZ'],
   ['aleph-tx-feeder', 'Feeder'],
   ['aleph-tx-monitor', '监控'],
 ] as const

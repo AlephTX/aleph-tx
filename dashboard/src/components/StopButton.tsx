@@ -6,8 +6,9 @@ const TOKEN_KEY = 'aleph-control-token'
 const CONFIRM_WORD = 'STOP'
 
 /**
- * Emergency stop for aleph-tx-live. Requires typing a confirmation word and the
- * control token. The token is kept in sessionStorage only for this tab.
+ * Emergency stop for active live strategy units (`aleph-tx-live` / `aleph-tx-arcus-xyz`).
+ * Requires typing a confirmation word and the control token. The token is kept
+ * in sessionStorage only for this tab.
  */
 export function StopButton({ liveActive }: { liveActive: boolean }) {
   const [open, setOpen] = useState(false)
@@ -27,7 +28,7 @@ export function StopButton({ liveActive }: { liveActive: boolean }) {
         disabled={!liveActive}
         onClick={() => setOpen(true)}
         className="rounded-md bg-down px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-down/85 disabled:cursor-not-allowed disabled:bg-panel-2 disabled:text-muted"
-        title={liveActive ? '停止实盘策略 (aleph-tx-live)' : '实盘策略未运行'}
+        title={liveActive ? '停止运行中的实盘策略 (aleph-tx-live / aleph-tx-arcus-xyz)' : '实盘策略未运行'}
       >
         ■ 紧急停止
       </button>
@@ -63,7 +64,7 @@ function StopForm({ onDone }: { onDone: () => void }) {
       <div className="space-y-4 p-5">
         <h3 className="text-base font-semibold text-up">停止指令已发送</h3>
         <p className="text-sm text-muted">
-          systemd 正在停止 aleph-tx-live，策略会执行优雅退出（撤单 + 对冲收尾）。请在服务状态和日志中确认。
+          systemd 正在停止运行中的实盘策略（<code className="num text-text">aleph-tx-live</code> / <code className="num text-text">aleph-tx-arcus-xyz</code>），策略会执行优雅退出（撤单 + 对冲收尾）。请在服务状态和日志中确认。
         </p>
         <div className="flex justify-end">
           <button type="button" onClick={onDone} className="rounded-md bg-panel-2 px-3 py-1.5 text-sm hover:bg-line">
@@ -86,7 +87,7 @@ function StopForm({ onDone }: { onDone: () => void }) {
       <div>
         <h3 className="text-base font-semibold text-down">紧急停止实盘策略</h3>
         <p className="mt-1 text-sm text-muted">
-          将执行 <code className="num text-text">systemctl stop aleph-tx-live</code>。服务停止后不会自动重启，需在 VM 上手动启动。
+          将执行 <code className="num text-text">systemctl stop aleph-tx-live aleph-tx-arcus-xyz</code>。服务停止后不会自动重启，需在 VM 上手动启动。
         </p>
       </div>
       <label className="block space-y-1">

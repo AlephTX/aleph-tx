@@ -1,0 +1,25 @@
+[Unit]
+Description=AlephTX Arcus <-> Hyperliquid HIP-3 basis strategy (manual start)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/aleph-tx/arcus_xyz_basis.toml
+ConditionPathExists=/etc/aleph-tx/arcus_xyz_basis.env
+
+[Service]
+User=aleph-tx-trader
+Group=aleph-tx-trader
+StateDirectory=aleph-tx-arcus-xyz
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/aleph-tx-arcus-xyz
+Environment=LD_LIBRARY_PATH=/opt/aleph-tx/current/lib
+Environment=ALEPH_TELEMETRY_DIR=/var/lib/aleph-tx-telemetry
+ReadWritePaths=/var/lib/aleph-tx-telemetry
+ExecStartPre=/opt/aleph-tx/current/bin/arcus_xyz_basis --check /etc/aleph-tx/arcus_xyz_basis.toml
+ExecStartPre=/opt/aleph-tx/current/bin/arcus_xyz_basis --canary-preflight /etc/aleph-tx/arcus_xyz_basis.toml --env /etc/aleph-tx/arcus_xyz_basis.env
+ExecStart=/opt/aleph-tx/current/bin/arcus_xyz_basis --canary /etc/aleph-tx/arcus_xyz_basis.toml --env /etc/aleph-tx/arcus_xyz_basis.env --confirm-live-canary
+KillMode=mixed
+TimeoutStopSec=45
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
