@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -972,10 +972,19 @@ pub fn verify_hl_leg_terminal(
             intent.cloid
         );
     }
-    if open_orders
-        .iter()
-        .any(|o| o.cloid.as_deref() == Some(intent.cloid.as_str()))
-    {
+    let expected_oid = match submit {
+        HlSubmitOutcome::FilledAck { order_id, .. } => Some(*order_id),
+        _ => None,
+    };
+    let lookup_oid = match lookup {
+        HlOrderLookup::Found(located) => Some(located.order.oid),
+        HlOrderLookup::Unknown => None,
+    };
+    if open_orders.iter().any(|o| {
+        o.cloid.as_deref() == Some(intent.cloid.as_str())
+            || expected_oid == Some(o.oid)
+            || lookup_oid == Some(o.oid)
+    }) {
         bail!(
             "hyperliquid IOC cloid {} is still open in open_orders",
             intent.cloid
@@ -1005,14 +1014,34 @@ pub fn verify_hl_leg_terminal(
             };
             let avg_price = match submit {
                 HlSubmitOutcome::FilledAck {
+                    order_id,
                     total_size,
                     average_price,
-                    ..
                 } => {
+                    ensure!(
+                        *order_id == located.order.oid,
+                        "Hyperliquid filled acknowledgement order ID differs from terminal lookup"
+                    );
                     ensure!(
                         filled == *total_size,
                         "hyperliquid cloid {} lookup fill {filled} disagrees with filled ack {total_size}",
                         intent.cloid
+                    );
+                    ensure!(
+                        *average_price > Decimal::ZERO,
+                        "hyperliquid cloid {} filled ack has non-positive avg_price {average_price}",
+                        intent.cloid
+                    );
+                    let within_limit = if intent.is_buy {
+                        *average_price <= intent.limit_price
+                    } else {
+                        *average_price >= intent.limit_price
+                    };
+                    ensure!(
+                        within_limit,
+                        "hyperliquid cloid {} filled ack avg_price {average_price} exceeded journaled IOC limit {}",
+                        intent.cloid,
+                        intent.limit_price
                     );
                     Some(*average_price)
                 }
@@ -1074,41 +1103,104 @@ pub fn verify_hl_leg_terminal(
     }
 }
 
+fn is_arcus_order_open_status(norm_status: &str) -> bool {
+    matches!(
+        norm_status,
+        "open" | "new" | "pending" | "accepted" | "partially_filled"
+    )
+}
+
+enum ArcusOrderMatch<'a> {
+    None,
+    PendingPropagation,
+    Matched(&'a ArcusOrder),
+}
+
+fn validate_matching_arcus_order_pair(
+    intent: &ArcusLegIntent,
+    prev: &ArcusOrder,
+    hist: &ArcusOrder,
+) -> Result<bool> {
+    ensure!(
+        prev.order_id == hist.order_id,
+        "conflicting Arcus order_ids ({} vs {}) for client_id {}",
+        prev.order_id,
+        hist.order_id,
+        intent.client_id
+    );
+    ensure!(
+        arcus_sides_match(prev.side, hist.side)
+            && prev.price == hist.price
+            && prev.original_size == hist.original_size,
+        "conflicting Arcus order attributes for {}",
+        prev.order_id
+    );
+    let prev_status = prev.status.trim().to_ascii_lowercase();
+    let hist_status = hist.status.trim().to_ascii_lowercase();
+    if is_arcus_order_open_status(&prev_status) || is_arcus_order_open_status(&hist_status) {
+        return Ok(true);
+    }
+    ensure!(
+        prev_status == hist_status && prev.remaining_size == hist.remaining_size,
+        "conflicting terminal Arcus order state for {}",
+        prev.order_id
+    );
+    Ok(false)
+}
+
 fn arcus_order_matches_intent<'a>(
     intent: &ArcusLegIntent,
     expected_oid: Option<&str>,
     direct_order: Option<&'a ArcusOrder>,
     order_history: &'a [ArcusOrder],
-) -> Result<Option<&'a ArcusOrder>> {
-    let mut matched_oid: Option<&str> = None;
+) -> Result<ArcusOrderMatch<'a>> {
     let mut chosen: Option<&ArcusOrder> = None;
-    let matches_key = |order: &ArcusOrder| -> bool {
-        let cid_match = order.client_id.as_deref() == Some(intent.client_id.as_str());
-        let oid_match = expected_oid.is_some_and(|oid| order.order_id == oid);
-        order.market_id == intent.market_id && (cid_match || oid_match)
-    };
-    if let Some(direct) = direct_order
-        && matches_key(direct)
-    {
-        matched_oid = Some(direct.order_id.as_str());
+    let mut pending_propagation = false;
+    if let Some(direct) = direct_order {
+        ensure!(
+            expected_oid.is_none_or(|eid| direct.order_id == eid)
+                && direct.market_id == intent.market_id
+                && direct
+                    .client_id
+                    .as_deref()
+                    .is_none_or(|cid| cid == intent.client_id),
+            "Arcus direct order {} disagrees with journaled intent",
+            direct.order_id
+        );
         chosen = Some(direct);
     }
     for hist in order_history {
-        if matches_key(hist) {
-            if let Some(prev_oid) = matched_oid {
-                ensure!(
-                    prev_oid == hist.order_id,
-                    "conflicting Arcus order_ids ({prev_oid} vs {}) for client_id {}",
-                    hist.order_id,
-                    intent.client_id
-                );
-            } else {
-                matched_oid = Some(hist.order_id.as_str());
-                chosen = Some(hist);
+        let matches = hist.client_id.as_deref() == Some(intent.client_id.as_str())
+            || expected_oid.is_some_and(|eid| hist.order_id == eid)
+            || chosen.is_some_and(|prev| hist.order_id == prev.order_id);
+        if !matches {
+            continue;
+        }
+        ensure!(
+            hist.market_id == intent.market_id
+                && hist
+                    .client_id
+                    .as_deref()
+                    .is_none_or(|cid| cid == intent.client_id)
+                && expected_oid.is_none_or(|eid| hist.order_id == eid),
+            "Arcus history order {} disagrees with journaled intent",
+            hist.order_id
+        );
+        if let Some(prev) = chosen {
+            if validate_matching_arcus_order_pair(intent, prev, hist)? {
+                pending_propagation = true;
             }
+        } else {
+            chosen = Some(hist);
         }
     }
-    Ok(chosen)
+    if pending_propagation {
+        Ok(ArcusOrderMatch::PendingPropagation)
+    } else if let Some(order) = chosen {
+        Ok(ArcusOrderMatch::Matched(order))
+    } else {
+        Ok(ArcusOrderMatch::None)
+    }
 }
 
 /// Authoritative Arcus leg verifier: HTTP 202 `GatewayAccepted` alone is never terminal.
@@ -1128,49 +1220,64 @@ pub fn verify_arcus_leg_terminal(
         | ArcusSubmitOutcome::GatewayRejected { order_id, .. } => order_id.as_deref(),
         ArcusSubmitOutcome::HardRejected { .. } | ArcusSubmitOutcome::Ambiguous { .. } => None,
     };
+    let order_match =
+        arcus_order_matches_intent(intent, expected_oid, direct_order, order_history)?;
+    let known_oid = match &order_match {
+        ArcusOrderMatch::Matched(order) => Some(order.order_id.as_str()),
+        _ => expected_oid,
+    };
 
-    if open_orders.iter().any(|o| {
-        o.market_id == intent.market_id
-            && (o.client_id.as_deref() == Some(intent.client_id.as_str())
-                || expected_oid.is_some_and(|eid| o.order_id == eid))
-    }) {
-        return Ok(None);
+    for o in open_orders {
+        let matches = o.client_id.as_deref() == Some(intent.client_id.as_str())
+            || known_oid.is_some_and(|id| o.order_id == id);
+        if matches {
+            ensure!(
+                o.market_id == intent.market_id
+                    && o.client_id
+                        .as_deref()
+                        .is_none_or(|cid| cid == intent.client_id)
+                    && known_oid.is_none_or(|id| o.order_id == id),
+                "Arcus open order {} disagrees with journaled intent",
+                o.order_id
+            );
+            return Ok(None);
+        }
     }
 
-    let Some(order) =
-        arcus_order_matches_intent(intent, expected_oid, direct_order, order_history)?
-    else {
-        return match submit {
-            ArcusSubmitOutcome::HardRejected { .. }
-            | ArcusSubmitOutcome::GatewayRejected { .. } => {
-                let any_fill = fills.iter().any(|f| {
-                    f.market_id == intent.market_id
-                        && (f.client_id.as_deref() == Some(intent.client_id.as_str())
-                            || expected_oid.is_some_and(|eid| f.order_id == eid))
-                });
-                ensure!(
-                    !any_fill,
-                    "Arcus rejected intent {} unexpectedly matched a fill",
-                    intent.client_id
-                );
-                ensure!(
-                    inv_arc == intent.prev_inv_arc,
-                    "Arcus rejected intent {} shifted inventory ({} -> {inv_arc})",
-                    intent.client_id,
-                    intent.prev_inv_arc
-                );
-                Ok(Some(VerifiedLegTerminal {
-                    status: "rejected".into(),
-                    filled_qty: Decimal::ZERO,
-                    avg_price: None,
-                    terminal_at_ms: Some(intent.sent_at_us / 1_000),
-                    account_time_ms: None,
-                }))
-            }
-            ArcusSubmitOutcome::GatewayAccepted { .. } | ArcusSubmitOutcome::Ambiguous { .. } => {
-                Ok(None)
-            }
-        };
+    let order = match order_match {
+        ArcusOrderMatch::Matched(order) => order,
+        ArcusOrderMatch::PendingPropagation => return Ok(None),
+        ArcusOrderMatch::None => {
+            return match submit {
+                ArcusSubmitOutcome::HardRejected { .. }
+                | ArcusSubmitOutcome::GatewayRejected { .. } => {
+                    let any_fill = fills.iter().any(|f| {
+                        f.client_id.as_deref() == Some(intent.client_id.as_str())
+                            || expected_oid.is_some_and(|eid| f.order_id == eid)
+                    });
+                    ensure!(
+                        !any_fill,
+                        "Arcus rejected intent {} unexpectedly matched a fill",
+                        intent.client_id
+                    );
+                    ensure!(
+                        inv_arc == intent.prev_inv_arc,
+                        "Arcus rejected intent {} shifted inventory ({} -> {inv_arc})",
+                        intent.client_id,
+                        intent.prev_inv_arc
+                    );
+                    Ok(Some(VerifiedLegTerminal {
+                        status: "rejected".into(),
+                        filled_qty: Decimal::ZERO,
+                        avg_price: None,
+                        terminal_at_ms: Some(intent.sent_at_us / 1_000),
+                        account_time_ms: None,
+                    }))
+                }
+                ArcusSubmitOutcome::GatewayAccepted { .. }
+                | ArcusSubmitOutcome::Ambiguous { .. } => Ok(None),
+            };
+        }
     };
 
     ensure!(
@@ -1242,29 +1349,61 @@ pub fn verify_arcus_leg_terminal(
         ),
     };
 
-    let mut seen_trade_ids = HashSet::new();
+    let mut seen_trade_ids: HashMap<&str, (Decimal, Decimal)> = HashMap::new();
     let mut fills_qty = Decimal::ZERO;
     let mut fills_notional = Decimal::ZERO;
     for fill in fills {
-        let matches = fill.market_id == intent.market_id
-            && (fill.order_id == order.order_id
-                || fill.client_id.as_deref() == Some(intent.client_id.as_str()));
+        let matches = fill.order_id == order.order_id
+            || fill.client_id.as_deref() == Some(intent.client_id.as_str());
         if !matches {
             continue;
         }
-        if !seen_trade_ids.insert(fill.trade_id.as_str()) {
-            continue;
-        }
+        ensure!(
+            !fill.trade_id.trim().is_empty(),
+            "Arcus fill for order {} has empty trade_id",
+            order.order_id
+        );
+        ensure!(
+            fill.market_id == intent.market_id,
+            "Arcus fill {} disagrees with market_id",
+            fill.trade_id
+        );
         ensure!(
             fill.order_id == order.order_id && arcus_sides_match(fill.side, intent.side),
             "Arcus fill {} disagrees with order/side",
             fill.trade_id
         );
         ensure!(
+            fill.client_id
+                .as_deref()
+                .is_none_or(|client_id| client_id == intent.client_id),
+            "Arcus fill client ID differs from the journaled intent"
+        );
+        ensure!(
             fill.size > Decimal::ZERO && fill.price > Decimal::ZERO,
             "Arcus fill {} has non-positive size/price",
             fill.trade_id
         );
+        let within_limit = match intent.side {
+            ArcusSide::Buy => fill.price <= intent.limit_price,
+            ArcusSide::Sell => fill.price >= intent.limit_price,
+        };
+        ensure!(
+            within_limit,
+            "Arcus fill {} exceeded the journaled IOC limit",
+            fill.trade_id
+        );
+        if let Some(&(prev_size, prev_price)) = seen_trade_ids.get(fill.trade_id.as_str()) {
+            ensure!(
+                prev_size == fill.size && prev_price == fill.price,
+                "Arcus duplicate trade_id {} disagrees on size/price ({prev_size}@{prev_price} vs {}@{})",
+                fill.trade_id,
+                fill.size,
+                fill.price
+            );
+            continue;
+        }
+        seen_trade_ids.insert(fill.trade_id.as_str(), (fill.size, fill.price));
         fills_qty += fill.size;
         fills_notional += fill.size * fill.price;
     }
@@ -2112,7 +2251,7 @@ mod tests {
         let ok = verify_hl_leg_terminal(
             &intent,
             &filled_submit,
-            &HlOrderLookup::Found(loc_filled),
+            &HlOrderLookup::Found(loc_filled.clone()),
             &[],
             d("-1.0"),
             5_100,
@@ -2121,6 +2260,23 @@ mod tests {
         .unwrap();
         assert_eq!(ok.filled_qty, d("1.0"));
         assert_eq!(ok.avg_price, Some(d("100.0")));
+
+        let wrong_order_ack = HlSubmitOutcome::FilledAck {
+            order_id: 78,
+            total_size: d("1.0"),
+            average_price: d("100.0"),
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &wrong_order_ack,
+                &HlOrderLookup::Found(loc_filled),
+                &[],
+                d("-1.0"),
+                5_100,
+            )
+            .is_err()
+        );
 
         // Definitive reject with Unknown lookup + unchanged inv_xyz -> Ok(Some(rejected, 0)).
         let rej = verify_hl_leg_terminal(
@@ -2137,11 +2293,142 @@ mod tests {
         .unwrap();
         assert_eq!(rej.status, "rejected");
         assert_eq!(rej.filled_qty, Decimal::ZERO);
+
+        // Hyperliquid FilledAck average_price must be positive and within the journaled IOC limit.
+        let sell_bad_px = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: d("99.49"),
+        };
+        let loc_sell = hl_located(&intent.cloid, false, "1.0", "0.0", "99.5", "filled", 5_100);
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &sell_bad_px,
+                &HlOrderLookup::Found(loc_sell.clone()),
+                &[],
+                d("-1.0"),
+                5_100,
+            )
+            .is_err()
+        );
+        let sell_zero_px = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: Decimal::ZERO,
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &sell_zero_px,
+                &HlOrderLookup::Found(loc_sell.clone()),
+                &[],
+                d("-1.0"),
+                5_100,
+            )
+            .is_err()
+        );
+        let sell_exact_px = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: intent.limit_price,
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &sell_exact_px,
+                &HlOrderLookup::Found(loc_sell),
+                &[],
+                d("-1.0"),
+                5_100,
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let buy_intent = HlLegIntent {
+            is_buy: true,
+            ..intent.clone()
+        };
+        let loc_buy = hl_located(
+            &buy_intent.cloid,
+            true,
+            "1.0",
+            "0.0",
+            "99.5",
+            "filled",
+            5_100,
+        );
+        let buy_bad_px = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: d("99.51"),
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &buy_intent,
+                &buy_bad_px,
+                &HlOrderLookup::Found(loc_buy.clone()),
+                &[],
+                d("1.0"),
+                5_100,
+            )
+            .is_err()
+        );
+        let buy_exact_px = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: buy_intent.limit_price,
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &buy_intent,
+                &buy_exact_px,
+                &HlOrderLookup::Found(loc_buy.clone()),
+                &[],
+                d("1.0"),
+                5_100,
+            )
+            .unwrap()
+            .is_some()
+        );
+        let open_by_oid_no_cloid = HlOpenOrder {
+            coin: "xyz:ANT".into(),
+            side: "B".into(),
+            limit_px: "99.5".into(),
+            sz: "1.0".into(),
+            oid: 77,
+            timestamp: 5_100,
+            cloid: None,
+            original_size: Some("1.0".into()),
+        };
+        assert!(
+            verify_hl_leg_terminal(
+                &buy_intent,
+                &ambig,
+                &HlOrderLookup::Found(loc_buy.clone()),
+                std::slice::from_ref(&open_by_oid_no_cloid),
+                d("1.0"),
+                5_100,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_hl_leg_terminal(
+                &buy_intent,
+                &buy_exact_px,
+                &HlOrderLookup::Found(loc_buy),
+                &[open_by_oid_no_cloid],
+                d("1.0"),
+                5_100,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn verify_arcus_leg_terminal_never_trusts_http_202_alone_and_checks_fills_and_position() {
-        let intent = ArcusLegIntent {
+        let mut intent = ArcusLegIntent {
             market_id: 7,
             client_id: "axb123".into(),
             side: ArcusSide::Buy,
@@ -2170,7 +2457,7 @@ mod tests {
             None
         );
 
-        let arc_order = ArcusOrder {
+        let mut arc_order = ArcusOrder {
             order_id: "arc-ord-1".into(),
             client_id: Some("axb123".into()),
             market_id: 7,
@@ -2182,7 +2469,7 @@ mod tests {
             created_at: Some(10_000_100),
             updated_at: 10_050_000,
         };
-        let arc_fill = ArcusFill {
+        let mut arc_fill = ArcusFill {
             trade_id: "tr-1".into(),
             order_id: "arc-ord-1".into(),
             client_id: Some("axb123".into()),
@@ -2253,6 +2540,57 @@ mod tests {
         assert_eq!(ok.filled_qty, d("1.0"));
         assert_eq!(ok.avg_price, Some(d("99.95")));
 
+        let ambiguous = ArcusSubmitOutcome::Ambiguous {
+            reason: "http timeout".into(),
+        };
+        let history = std::slice::from_ref(&arc_order);
+        let fills = std::slice::from_ref(&arc_fill);
+        assert!(
+            verify_arcus_leg_terminal(&intent, &ambiguous, None, &[], history, fills, d("1.0"))
+                .unwrap()
+                .is_some()
+        );
+        let open_without_client_id = ArcusOrder {
+            order_id: arc_order.order_id.clone(),
+            client_id: None,
+            market_id: arc_order.market_id,
+            side: arc_order.side,
+            status: "OPEN".into(),
+            price: arc_order.price,
+            original_size: arc_order.original_size,
+            remaining_size: arc_order.original_size,
+            created_at: arc_order.created_at,
+            updated_at: arc_order.updated_at,
+        };
+        assert_eq!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &ambiguous,
+                None,
+                &[open_without_client_id],
+                history,
+                fills,
+                d("1.0"),
+            )
+            .unwrap(),
+            None
+        );
+
+        let client_id = arc_fill.client_id.replace("different-client-id".into());
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                std::slice::from_ref(&arc_fill),
+                d("1.0"),
+            )
+            .is_err()
+        );
+        arc_fill.client_id = client_id;
+
         // Hard rejection with empty order_history/fills and unchanged position -> Ok(Some(rejected)).
         let hard_rej = classify_arcus_submit(
             &Err(anyhow::Error::new(ArcusExecutionError::Rejected {
@@ -2267,6 +2605,212 @@ mod tests {
             .unwrap();
         assert_eq!(rej.status, "rejected");
         assert_eq!(rej.filled_qty, Decimal::ZERO);
+
+        // An impossible fill beyond the signed price cannot clear the intent,
+        // even when its quantity agrees with the order and account position.
+        arc_fill.price = d("100.01");
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                std::slice::from_ref(&arc_fill),
+                d("1.0"),
+            )
+            .is_err()
+        );
+        intent.side = ArcusSide::Sell;
+        arc_order.side = ArcusSide::Sell;
+        arc_fill.side = ArcusSide::Sell;
+        let verify_sale = |fill: &ArcusFill| {
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                std::slice::from_ref(fill),
+                d("-1.0"),
+            )
+        };
+        arc_fill.price = d("99.99");
+        assert!(verify_sale(&arc_fill).is_err());
+        arc_fill.price = intent.limit_price;
+        assert!(verify_sale(&arc_fill).unwrap().is_some());
+
+        // Identical duplicate trade_id is idempotently deduped, while conflicting duplicate size/price fails closed.
+        let mk_fill = |size: Decimal, price: Decimal| ArcusFill {
+            trade_id: "tr-1".into(),
+            order_id: "arc-ord-1".into(),
+            client_id: Some("axb123".into()),
+            market_id: 7,
+            side: ArcusSide::Sell,
+            size,
+            price,
+            fee: d("0.01"),
+            role: "TAKER".into(),
+            created_at: 10_050_000,
+        };
+        let dup_identical = [
+            mk_fill(d("1.0"), intent.limit_price),
+            mk_fill(d("1.0"), intent.limit_price),
+        ];
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &dup_identical,
+                d("-1.0"),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let conflicting_px = [
+            mk_fill(d("1.0"), intent.limit_price),
+            mk_fill(d("1.0"), d("100.05")),
+        ];
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &conflicting_px,
+                d("-1.0"),
+            )
+            .is_err()
+        );
+        let conflicting_sz = [
+            mk_fill(d("1.0"), intent.limit_price),
+            mk_fill(d("0.5"), intent.limit_price),
+        ];
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &conflicting_sz,
+                d("-1.0"),
+            )
+            .is_err()
+        );
+
+        let valid_sell_fill = mk_fill(d("1.0"), intent.limit_price);
+        let mut wrong_mkt_direct = ArcusOrder {
+            order_id: arc_order.order_id.clone(),
+            client_id: arc_order.client_id.clone(),
+            market_id: 99,
+            side: arc_order.side,
+            status: arc_order.status.clone(),
+            price: arc_order.price,
+            original_size: arc_order.original_size,
+            remaining_size: arc_order.remaining_size,
+            created_at: arc_order.created_at,
+            updated_at: arc_order.updated_at,
+        };
+        let gw_rej = ArcusSubmitOutcome::GatewayRejected {
+            order_id: Some("arc-ord-1".into()),
+            reason: "rejected".into(),
+        };
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &gw_rej,
+                Some(&wrong_mkt_direct),
+                &[],
+                &[],
+                &[],
+                Decimal::ZERO,
+            )
+            .is_err()
+        );
+        wrong_mkt_direct.market_id = 7;
+
+        let hist_open = ArcusOrder {
+            status: "OPEN".into(),
+            remaining_size: d("1.0"),
+            ..wrong_mkt_direct
+        };
+        assert_eq!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[hist_open],
+                std::slice::from_ref(&valid_sell_fill),
+                d("-1.0"),
+            )
+            .unwrap(),
+            None
+        );
+
+        let hist_canceled = ArcusOrder {
+            order_id: arc_order.order_id.clone(),
+            client_id: arc_order.client_id.clone(),
+            market_id: 7,
+            side: arc_order.side,
+            status: "CANCELED".into(),
+            price: arc_order.price,
+            original_size: arc_order.original_size,
+            remaining_size: d("1.0"),
+            created_at: arc_order.created_at,
+            updated_at: arc_order.updated_at,
+        };
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[hist_canceled],
+                std::slice::from_ref(&valid_sell_fill),
+                d("-1.0"),
+            )
+            .is_err()
+        );
+
+        let wrong_mkt_fill = ArcusFill {
+            market_id: 99,
+            ..mk_fill(d("1.0"), intent.limit_price)
+        };
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &[wrong_mkt_fill],
+                d("-1.0"),
+            )
+            .is_err()
+        );
+
+        let empty_trade_id_fill = ArcusFill {
+            trade_id: "   ".into(),
+            ..mk_fill(d("1.0"), intent.limit_price)
+        };
+        assert!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &[empty_trade_id_fill],
+                d("-1.0"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
