@@ -32,6 +32,7 @@ NS_PER_MS = 1_000_000
 TEN_HOURS_MS = 36_000_000
 MIN_WITNESSED_HOURS_10H = 9
 CAPTURE_COVERAGE_TOLERANCE_MS = 60_000
+MAX_SOURCE_BOOK_GAP_MS = 300_000
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 ET_TZ = ZoneInfo("America/New_York")
 FROZEN_ANT_ENGINE_FILES = (
@@ -42,6 +43,10 @@ FROZEN_ANT_ENGINE_FILES = (
 
 def _is_valid_ms(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_pos_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _is_sha256(value: Any) -> bool:
@@ -113,35 +118,154 @@ def _engine_hashes_match(
     return True
 
 
+def _book_stream_ok(stream: Any, start_ms: int, end_ms: int, max_gap_ms: int) -> bool:
+    if not isinstance(stream, dict):
+        return False
+    events = stream.get("events")
+    first_rx_ns = stream.get("first_rx_ns")
+    last_rx_ns = stream.get("last_rx_ns")
+    max_gap_ns = stream.get("max_gap_ns")
+    if not (_is_pos_int(events) and _is_pos_int(first_rx_ns) and _is_pos_int(last_rx_ns) and first_rx_ns <= last_rx_ns):
+        return False
+    if not (_is_valid_ms(max_gap_ns) and max_gap_ns <= max_gap_ms * NS_PER_MS):
+        return False
+    return (
+        (first_rx_ns // NS_PER_MS) <= start_ms + CAPTURE_COVERAGE_TOLERANCE_MS
+        and (last_rx_ns // NS_PER_MS) >= end_ms - CAPTURE_COVERAGE_TOLERANCE_MS
+    )
+
+
+def _verify_dual_source_continuity(
+    prereg_manifest: dict[str, Any],
+    *,
+    window_result: dict[str, Any],
+    seal_receipt: dict[str, Any] | None,
+    start_ms: int,
+    end_ms: int,
+) -> bool:
+    raw_cap = prereg_manifest.get("max_source_book_gap_ms")
+    if raw_cap is None:
+        max_gap_ms = MAX_SOURCE_BOOK_GAP_MS
+    elif _is_pos_int(raw_cap) and raw_cap <= MAX_SOURCE_BOOK_GAP_MS:
+        max_gap_ms = raw_cap
+    else:
+        return False
+
+    continuity = window_result.get("source_continuity")
+    if not isinstance(continuity, dict):
+        return False
+    arc_stream = continuity.get("arcus_book")
+    xyz_stream = continuity.get("xyz_book")
+    fund_stream = continuity.get("xyz_funding")
+    if not (_book_stream_ok(arc_stream, start_ms, end_ms, max_gap_ms) and _book_stream_ok(xyz_stream, start_ms, end_ms, max_gap_ms)):
+        return False
+    if not (
+        isinstance(fund_stream, dict)
+        and _is_pos_int(fund_stream.get("events"))
+        and _is_valid_ms(fund_stream.get("max_gap_ns"))
+        and fund_stream["max_gap_ns"] <= HOUR_MS * NS_PER_MS
+    ):
+        return False
+
+    gaps = window_result.get("gaps")
+    if gaps is not None:
+        if not isinstance(gaps, list):
+            return False
+        for item in gaps:
+            if not isinstance(item, dict):
+                return False
+            gap_s = item.get("gap_s")
+            if not isinstance(gap_s, (int, float)) or isinstance(gap_s, bool) or not (0.0 <= float(gap_s) * 1000.0 <= max_gap_ms):
+                return False
+
+    obs_first_ns = window_result.get("first_rx_ns")
+    obs_last_ns = window_result.get("last_rx_ns")
+    if not (_is_pos_int(obs_first_ns) and _is_pos_int(obs_last_ns) and obs_first_ns <= obs_last_ns):
+        return False
+    if (obs_first_ns // NS_PER_MS) > start_ms + CAPTURE_COVERAGE_TOLERANCE_MS or (obs_last_ns // NS_PER_MS) < end_ms - CAPTURE_COVERAGE_TOLERANCE_MS:
+        return False
+
+    if not isinstance(seal_receipt, dict):
+        return False
+    cov = seal_receipt.get("measured_source_coverage")
+    if not isinstance(cov, dict):
+        return False
+    arch_first_ns = cov.get("archive_first_rx_ns")
+    arch_last_ns = cov.get("archive_last_rx_ns")
+    cov_arc = cov.get("arcus_book_events")
+    cov_xyz = cov.get("xyz_book_events")
+    if not (_is_pos_int(arch_first_ns) and _is_pos_int(arch_last_ns) and arch_first_ns <= arch_last_ns):
+        return False
+    if not (_is_pos_int(cov_arc) and _is_pos_int(cov_xyz)):
+        return False
+    return (
+        arch_first_ns <= (start_ms + CAPTURE_COVERAGE_TOLERANCE_MS) * NS_PER_MS
+        and arch_last_ns >= (end_ms - CAPTURE_COVERAGE_TOLERANCE_MS) * NS_PER_MS
+        and arch_first_ns <= obs_first_ns
+        and arch_last_ns >= obs_last_ns
+        and cov_arc >= arc_stream["events"]
+        and cov_xyz >= xyz_stream["events"]
+    )
+
+
 def verify_rth_ant_provenance(
     prereg_manifest: dict[str, Any] | None,
     *,
     window_result: dict[str, Any],
+    seal_receipt: dict[str, Any] | None = None,
+    verified_prereg_sha256: str | None = None,
     verified_segment_digests: dict[str, str] | None = None,
     verified_engine_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Verify fail-closed OOS pre-registration, 10h RTH session coverage, and sealed hashes."""
+    """Verify fail-closed split pre-capture/post-seal receipts, bounded 10h RTH replay, and continuity."""
     if not isinstance(prereg_manifest, dict):
         checks = {
             "prereg_manifest_supplied": False,
+            "seal_receipt_supplied": isinstance(seal_receipt, dict),
+            "seal_links_prereg_sha256": False,
+            "sealed_after_decision_end": False,
             "classification_is_monday_rth_oos": False,
             "pre_registered_before_decision_start": False,
-            "continuous_10h_span": False,
+            "exact_10h_bounded_decision_window": False,
             "funding_hours_cover_decision_window": False,
             "us_rth_weekday_session_covered": False,
-            "observed_capture_covers_decision_window": False,
+            "dual_source_continuity_verified": False,
             "sealed_segment_hashes_verified": False,
             "frozen_engine_hashes_verified": False,
         }
-        return {"qualified": False, "checks": checks, "covered_rth_dates_et": []}
+        return {
+            "qualified": False,
+            "checks": checks,
+            "covered_rth_dates_et": [],
+            "decision_start_ms": None,
+            "decision_end_ms": None,
+            "frozen_at_ms": None,
+            "sealed_at_ms": None,
+        }
+
+    prereg_supplied_ok = "segment_sha256" not in prereg_manifest
+    seal_supplied_ok = isinstance(seal_receipt, dict)
+    seal_links_ok = bool(
+        seal_supplied_ok
+        and _is_sha256(verified_prereg_sha256)
+        and seal_receipt.get("prereg_manifest_sha256") == verified_prereg_sha256
+    )
 
     frozen_at_ms = prereg_manifest.get("frozen_at_ms")
     start_ms = prereg_manifest.get("decision_start_ms")
     end_ms = prereg_manifest.get("decision_end_ms")
     valid_times = _is_valid_ms(frozen_at_ms) and _is_valid_ms(start_ms) and _is_valid_ms(end_ms)
+    sealed_at_ms = seal_receipt.get("sealed_at_ms") if seal_supplied_ok else None
+    sealed_after_end_ok = bool(valid_times and _is_valid_ms(sealed_at_ms) and sealed_at_ms >= end_ms)
 
     pre_reg_ok = bool(valid_times and frozen_at_ms <= start_ms < end_ms)
-    span_ok = bool(valid_times and end_ms > start_ms and (end_ms - start_ms) >= TEN_HOURS_MS)
+    expected_bounds = (start_ms * NS_PER_MS, end_ms * NS_PER_MS) if valid_times else None
+    actual_bounds = window_result.get("decision_bounds_ns")
+    bounds_matched = bool(
+        expected_bounds is not None
+        and (actual_bounds == list(expected_bounds) or actual_bounds == expected_bounds)
+    )
+    span_ok = bool(valid_times and (end_ms - start_ms) == TEN_HOURS_MS and bounds_matched)
 
     witnessed = int(window_result.get("funding_hours_witnessed", 0))
     missing = int(window_result.get("funding_hours_missing_witness", -1))
@@ -163,26 +287,32 @@ def verify_rth_ant_provenance(
     session_decl = prereg_manifest.get("market_session")
     session_ok = bool(rth_dates) and (session_decl in (None, "us_equities_rth"))
 
-    first_rx_ns = window_result.get("first_rx_ns")
-    last_rx_ns = window_result.get("last_rx_ns")
-    observed_cov_ok = False
-    if valid_times and isinstance(first_rx_ns, int) and isinstance(last_rx_ns, int) and 0 < first_rx_ns <= last_rx_ns:
-        first_rx_ms = first_rx_ns // NS_PER_MS
-        last_rx_ms = last_rx_ns // NS_PER_MS
-        observed_cov_ok = (
-            first_rx_ms <= start_ms + CAPTURE_COVERAGE_TOLERANCE_MS
-            and last_rx_ms >= end_ms - CAPTURE_COVERAGE_TOLERANCE_MS
+    continuity_ok = (
+        _verify_dual_source_continuity(
+            prereg_manifest,
+            window_result=window_result,
+            seal_receipt=seal_receipt,
+            start_ms=start_ms,
+            end_ms=end_ms,
         )
+        if valid_times
+        else False
+    )
 
     checks = {
-        "prereg_manifest_supplied": True,
+        "prereg_manifest_supplied": prereg_supplied_ok,
+        "seal_receipt_supplied": seal_supplied_ok,
+        "seal_links_prereg_sha256": seal_links_ok,
+        "sealed_after_decision_end": sealed_after_end_ok,
         "classification_is_monday_rth_oos": prereg_manifest.get("classification") == "monday_rth_oos",
         "pre_registered_before_decision_start": pre_reg_ok,
-        "continuous_10h_span": span_ok,
+        "exact_10h_bounded_decision_window": span_ok,
         "funding_hours_cover_decision_window": funding_cov_ok,
         "us_rth_weekday_session_covered": session_ok,
-        "observed_capture_covers_decision_window": observed_cov_ok,
-        "sealed_segment_hashes_verified": _segment_hashes_match(prereg_manifest.get("segment_sha256"), verified_segment_digests),
+        "dual_source_continuity_verified": continuity_ok,
+        "sealed_segment_hashes_verified": bool(
+            seal_supplied_ok and _segment_hashes_match(seal_receipt.get("segment_sha256"), verified_segment_digests)
+        ),
         "frozen_engine_hashes_verified": _engine_hashes_match(prereg_manifest.get("frozen_engine_sha256"), verified_engine_digests),
     }
     return {
@@ -192,6 +322,7 @@ def verify_rth_ant_provenance(
         "decision_start_ms": start_ms if _is_valid_ms(start_ms) else None,
         "decision_end_ms": end_ms if _is_valid_ms(end_ms) else None,
         "frozen_at_ms": frozen_at_ms if _is_valid_ms(frozen_at_ms) else None,
+        "sealed_at_ms": sealed_at_ms if _is_valid_ms(sealed_at_ms) else None,
     }
 
 
@@ -200,6 +331,8 @@ def evaluate_rth_ant_gate(
     *,
     role: str,
     prereg_manifest: dict[str, Any] | None = None,
+    seal_receipt: dict[str, Any] | None = None,
+    verified_prereg_sha256: str | None = None,
     verified_segment_digests: dict[str, str] | None = None,
     verified_engine_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -245,15 +378,19 @@ def evaluate_rth_ant_gate(
         provenance = verify_rth_ant_provenance(
             prereg_manifest,
             window_result=window_result,
+            seal_receipt=seal_receipt,
+            verified_prereg_sha256=verified_prereg_sha256,
             verified_segment_digests=verified_segment_digests,
             verified_engine_digests=verified_engine_digests,
         )
         verdict = "GO" if (passed_metrics and provenance["qualified"]) else "NO_GO"
     else:
-        if prereg_manifest is not None:
+        if prereg_manifest is not None or seal_receipt is not None:
             provenance = verify_rth_ant_provenance(
                 prereg_manifest,
                 window_result=window_result,
+                seal_receipt=seal_receipt,
+                verified_prereg_sha256=verified_prereg_sha256,
                 verified_segment_digests=verified_segment_digests,
                 verified_engine_digests=verified_engine_digests,
             )
@@ -417,8 +554,8 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _collect_segment_hashes(capture_dirs: list[Path], manifest: dict[str, Any] | None) -> dict[str, str]:
-    expected = manifest.get("segment_sha256") if isinstance(manifest, dict) else None
+def _collect_segment_hashes(capture_dirs: list[Path], seal_receipt: dict[str, Any] | None) -> dict[str, str]:
+    expected = seal_receipt.get("segment_sha256") if isinstance(seal_receipt, dict) else None
     use_dir_prefix = (
         isinstance(expected, dict)
         and bool(expected)
@@ -453,12 +590,20 @@ def run_rth_ant_cli(
     output: Path,
     repo_root: Path,
     prereg_manifest_path: Path | None = None,
+    seal_receipt_path: Path | None = None,
 ) -> int:
     mod = _load_ant_ablation_module(repo_root)
     manifest: dict[str, Any] | None = None
+    verified_prereg_sha256: str | None = None
     if prereg_manifest_path is not None:
+        verified_prereg_sha256 = _sha256_file(prereg_manifest_path)
         loaded = json.loads(prereg_manifest_path.read_text())
         manifest = loaded if isinstance(loaded, dict) else {}
+
+    seal_receipt: dict[str, Any] | None = None
+    if seal_receipt_path is not None:
+        loaded_seal = json.loads(seal_receipt_path.read_text())
+        seal_receipt = loaded_seal if isinstance(loaded_seal, dict) else {}
 
     gate_specs = []
     for mode in ("TAKER_TAKER", "MAKER_ARCUS_TAKER_XYZ"):
@@ -480,18 +625,30 @@ def run_rth_ant_cli(
                     dd_brake_budget_usd=MAX_DRAWDOWN_BUDGET_USD,
                 )
             )
-    raw = mod.run_ablation(capture_dirs, gate_specs)
-    seg_digests = _collect_segment_hashes(capture_dirs, manifest)
+
+    decision_bounds_ns: tuple[int, int] | None = None
+    if isinstance(manifest, dict):
+        start_ms = manifest.get("decision_start_ms")
+        end_ms = manifest.get("decision_end_ms")
+        if _is_valid_ms(start_ms) and _is_valid_ms(end_ms) and 0 < start_ms < end_ms:
+            decision_bounds_ns = (start_ms * NS_PER_MS, end_ms * NS_PER_MS)
+
+    raw = mod.run_ablation(capture_dirs, gate_specs, decision_bounds_ns=decision_bounds_ns)
+    seg_digests = _collect_segment_hashes(capture_dirs, seal_receipt)
     eng_digests = _collect_engine_hashes(repo_root)
     report = evaluate_rth_ant_gate(
         raw,
         role=role,
         prereg_manifest=manifest,
+        seal_receipt=seal_receipt,
+        verified_prereg_sha256=verified_prereg_sha256,
         verified_segment_digests=seg_digests,
         verified_engine_digests=eng_digests,
     )
     report["capture_dirs"] = [str(p) for p in capture_dirs]
     report["prereg_manifest"] = str(prereg_manifest_path) if prereg_manifest_path is not None else None
+    report["prereg_manifest_sha256"] = verified_prereg_sha256
+    report["seal_receipt"] = str(seal_receipt_path) if seal_receipt_path is not None else None
     output.write_text(json.dumps(report, indent=2) + "\n")
     print(
         json.dumps(
@@ -519,7 +676,8 @@ def main() -> int:
     p_ant = sub.add_parser("rth-ant", help="Run frozen EXP-ARB-A2 ANT gate on sealed captures")
     p_ant.add_argument("--capture-dirs", nargs="+", type=Path, required=True)
     p_ant.add_argument("--role", choices=("monday_rth_oos", "selection_dev_dryrun"), required=True)
-    p_ant.add_argument("--prereg-manifest", type=Path, default=None, help="Pre-registration manifest JSON (required for monday_rth_oos GO)")
+    p_ant.add_argument("--prereg-manifest", type=Path, default=None, help="Pre-capture frozen plan JSON (required for monday_rth_oos GO)")
+    p_ant.add_argument("--seal-receipt", type=Path, default=None, help="Post-capture seal receipt JSON referencing prereg SHA-256")
     p_ant.add_argument("--output", type=Path, required=True)
 
     p_rwa = sub.add_parser("w15-rwa", help="Evaluate W15+ Core RWA <= $20/M gate")
@@ -532,7 +690,14 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "rth-ant":
-        return run_rth_ant_cli(args.capture_dirs, args.role, args.output, repo_root, args.prereg_manifest)
+        return run_rth_ant_cli(
+            args.capture_dirs,
+            args.role,
+            args.output,
+            repo_root,
+            args.prereg_manifest,
+            args.seal_receipt,
+        )
     if args.command == "w15-rwa":
         summary = json.loads(args.rwa_summary_json.read_text())
         res = evaluate_w15_rwa_gate(summary, max_cost_per_million=args.max_cost_per_million)

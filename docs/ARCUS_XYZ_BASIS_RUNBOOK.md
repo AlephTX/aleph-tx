@@ -65,19 +65,20 @@ python3 scripts/run_oos_validation_gate.py rth-ant \
   --capture-dirs ~/aleph-tx-lakehouse/research_captures/<MONDAY_RTH_CAPTURE_DIR> \
   --role monday_rth_oos \
   --prereg-manifest <MONDAY_RTH_PREREG_MANIFEST.json> \
+  --seal-receipt <MONDAY_RTH_SEAL_RECEIPT.json> \
   --output /tmp/rth_ant_oos_gate.json
 ```
 
 Pass criteria (`verdict == "GO"` requires BOTH metric checks AND fail-closed OOS provenance checks):
 - `all_taker_latencies_positive`: `net_cash_usd > 0` across all `100 ms`, `250 ms`, `500 ms` `TAKER_TAKER` runs (`Q = $500`, `in = 10 bp`, `out = 0 bp`, `lad = 2, p = 1`, `ddbrk = $50`)
-- `all_terminal_flat`: `terminal_flat == true` across all gate arms
+- `all_terminal_flat`: `terminal_flat == true` across all gate arms (including stale terminal book / incomplete drain checks)
 - `zero_missing_funding_witness`: `funding_hours_missing_witness == 0`
 - `max_drawdown_within_budget`: max `max_drawdown_usd <= $50.00`
 - `sufficient_cycles_and_win_rate`: min `cycles_closed >= 3` and min `win_rate >= 0.60`
-- `provenance.qualified == true` (fail-closed for `monday_rth_oos`):
-  - `--prereg-manifest` supplied with `classification == "monday_rth_oos"` and `frozen_at_ms <= decision_start_ms`
-  - Continuous `>= 10h` span covering Monday US RTH (`09:30–16:00 ET`), matching observed `first_rx_ns`/`last_rx_ns` coverage and `>= 9` witnessed interior UTC funding ticks (`missing == 0`)
-  - Exact SHA-256 verification of all sealed `tokyo-research-*.seg*.ndjson.gz` files (`segment_sha256`) and frozen ANT engine scripts (`frozen_engine_sha256`: `sim_ant_arcus_xyz_basis.py`, `run_arb_imp_ablation_w01_w02.py`)
+- `provenance.qualified == true` (fail-closed 12-point verification for `monday_rth_oos`):
+  - **Split two-receipt chain**: pre-capture `--prereg-manifest` (`classification == "monday_rth_oos"`, `frozen_at_ms <= decision_start_ms`, zero post-hoc `segment_sha256` keys) + post-capture `--seal-receipt` (`sealed_at_ms >= decision_end_ms`, matching `prereg_manifest_sha256`)
+  - **Exact bounded 10h RTH replay**: engine runs strictly inside half-open `[decision_start_ms, decision_end_ms)` (`== 10h` span covering Monday US RTH `09:30–16:00 ET`), excluding warmup (`< decision_start_ms`) and post-window (`>= decision_end_ms`) records, with `>= 9` witnessed interior UTC funding ticks (`missing == 0`)
+  - **Dual-source continuity & integrity**: both `arcus_book` (`ANT-USD`) and `xyz_book` (`xyz:ANT`) independently cover `[decision_start_ms, decision_end_ms)` with `<= 5 min` gaps (`xyz_funding` gap `<= 1h`), consistent with `seal_receipt.measured_source_coverage`, plus exact SHA-256 verification of all sealed `tokyo-research-*.seg*.ndjson.gz` files (`seal_receipt.segment_sha256`) and frozen ANT engine scripts (`prereg_manifest.frozen_engine_sha256`: `sim_ant_arcus_xyz_basis.py`, `run_arb_imp_ablation_w01_w02.py`)
 
 2. **`W15+` Core Standard RWA cost gate (`<= $20/M`)**:
 
