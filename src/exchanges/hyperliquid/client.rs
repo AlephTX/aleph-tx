@@ -2,8 +2,11 @@ use super::model::*;
 use super::signing::{HyperliquidSigner, L1Signature};
 use anyhow::{Context, Result, ensure};
 use reqwest::Client;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -66,14 +69,24 @@ impl HyperliquidInfo {
         parse_markets_for_dex(meta, contexts, dex, offset)
     }
 
-    pub async fn bbo(&self, coin: &str) -> Result<BestBidAsk> {
+    pub async fn l2_book(&self, coin: &str) -> Result<ValidatedBook> {
         ensure!(!coin.is_empty(), "Coin must not be empty");
         let book: L2Book = self.info(json!({"type": "l2Book", "coin": coin})).await?;
         ensure!(
             book.coin == coin,
             "Returned book belongs to a different coin"
         );
-        book.best_bid_ask()
+        book.validated_book()
+    }
+
+    pub async fn bbo(&self, coin: &str) -> Result<BestBidAsk> {
+        Ok(self.l2_book(coin).await?.bbo)
+    }
+
+    /// Lightweight read to keep the HTTP/TLS connection pool warm across sparse opportunities.
+    pub async fn warm_http(&self) -> Result<()> {
+        let _status: serde_json::Value = self.info(json!({"type": "exchangeStatus"})).await?;
+        Ok(())
     }
 
     /// Master/subaccount address, never substitute an approved agent's address.
@@ -220,15 +233,47 @@ struct SignedRequest<'a, T> {
     expires_after: u64,
 }
 
-/// A client instance owns one approved API key's nonce sequence. Do not share the
-/// same key with other processes; Hyperliquid tracks nonce usage by signer.
-/// Requests are never retried automatically, including transport failures.
+/// Shared monotonic nonce and submission serializer for a single agent signing
+/// key used across multiple Hyperliquid DEXes (e.g. native core, `io`, `xyz`).
+#[derive(Clone, Default)]
+pub struct SharedNoncePool {
+    nonce: Arc<AtomicU64>,
+    submission: Arc<Mutex<()>>,
+}
+
+impl SharedNoncePool {
+    pub fn next_nonce_now(&self, now_ms: u64) -> Result<u64> {
+        next_nonce(&self.nonce, now_ms)
+    }
+}
+
+/// Deduplicates Core collateral when aggregating isolated HIP-3 DEX states.
+pub fn aggregate_multi_dex_equity(
+    core_state: &AccountState,
+    dex_states: &[(&str, &AccountState)],
+) -> Result<Decimal> {
+    let mut total: Decimal = core_state.margin_summary.account_value.parse()?;
+    let mut seen = HashSet::new();
+    for (dex, state) in dex_states {
+        let key = dex.trim().to_ascii_lowercase();
+        if key.is_empty() || key == "core" || !seen.insert(key) {
+            continue;
+        }
+        total += state.margin_summary.account_value.parse::<Decimal>()?;
+    }
+    Ok(total)
+}
+
+/// A client instance owns or shares one approved API key's nonce sequence. Do
+/// not share the same key with external processes; Hyperliquid tracks nonce
+/// usage by signer. Requests are never retried automatically, including
+/// transport failures.
 pub struct HyperliquidTrading {
     info: HyperliquidInfo,
     signer: ActionSigner,
     vault_address: Option<String>,
-    nonce: AtomicU64,
-    submission: Mutex<()>,
+    nonce_pool: SharedNoncePool,
+    expires_after_rejects: Arc<AtomicU64>,
 }
 
 /// Production always signs; the unsigned variant exists only in test builds.
@@ -244,6 +289,15 @@ impl HyperliquidTrading {
         signer: HyperliquidSigner,
         vault_address: Option<String>,
     ) -> Result<Self> {
+        Self::with_shared_nonce(info, signer, vault_address, SharedNoncePool::default())
+    }
+
+    pub fn with_shared_nonce(
+        info: HyperliquidInfo,
+        signer: HyperliquidSigner,
+        vault_address: Option<String>,
+        nonce_pool: SharedNoncePool,
+    ) -> Result<Self> {
         if let Some(address) = &vault_address {
             validate_hex(address, 20)?;
         }
@@ -251,9 +305,13 @@ impl HyperliquidTrading {
             info,
             signer: ActionSigner::Key(signer),
             vault_address,
-            nonce: AtomicU64::new(0),
-            submission: Mutex::new(()),
+            nonce_pool,
+            expires_after_rejects: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn expires_after_reject_count(&self) -> u64 {
+        self.expires_after_rejects.load(Ordering::Relaxed)
     }
 
     /// Test client that skips only the L1 signature (a fixed placeholder is
@@ -265,8 +323,8 @@ impl HyperliquidTrading {
             info,
             signer: ActionSigner::UnsignedTest,
             vault_address: None,
-            nonce: AtomicU64::new(0),
-            submission: Mutex::new(()),
+            nonce_pool: SharedNoncePool::default(),
+            expires_after_rejects: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -319,9 +377,9 @@ impl HyperliquidTrading {
         expected: usize,
         explicit_expires_after: Option<u64>,
     ) -> Result<Vec<ExecutionStatus>> {
-        let _submission = self.submission.lock().await;
+        let _submission = self.nonce_pool.submission.lock().await;
         let now = unix_ms()?;
-        let nonce = next_nonce(&self.nonce, now)?;
+        let nonce = self.nonce_pool.next_nonce_now(now)?;
         let expires_after = match explicit_expires_after {
             Some(exp) => exp,
             None => now.checked_add(5_000).context("Expiry overflow")?,
@@ -370,7 +428,29 @@ impl HyperliquidTrading {
         if !status.is_success() {
             return Err(SubmissionError::Uncertain(format!("HTTP {status}")).into());
         }
-        Ok(parse_execution_response(&body, response_type, expected)?)
+        match parse_execution_response(&body, response_type, expected) {
+            Ok(statuses) => {
+                let expired = statuses.iter().any(|s| {
+                    matches!(
+                        s,
+                        ExecutionStatus::Rejected { reason }
+                            if reason.to_ascii_lowercase().contains("expire")
+                    )
+                });
+                if expired {
+                    self.expires_after_rejects.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(statuses)
+            }
+            Err(err) => {
+                if let SubmissionError::Rejected(reason) = &err
+                    && reason.to_ascii_lowercase().contains("expire")
+                {
+                    self.expires_after_rejects.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err.into())
+            }
+        }
     }
 }
 

@@ -186,6 +186,36 @@ pub struct BestBidAsk {
     pub ask_size: Decimal,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedBook {
+    pub bbo: BestBidAsk,
+    pub bids: Vec<(Decimal, Decimal)>,
+    pub asks: Vec<(Decimal, Decimal)>,
+}
+
+impl ValidatedBook {
+    pub fn from_bbo(bbo: BestBidAsk) -> Self {
+        let bids = vec![(bbo.bid, bbo.bid_size)];
+        let asks = vec![(bbo.ask, bbo.ask_size)];
+        Self { bbo, bids, asks }
+    }
+
+    /// Cumulative base quantity across validated levels up to and including `limit_price`.
+    pub fn visible_size_within_limit(&self, is_buy: bool, limit_price: Decimal) -> Decimal {
+        let levels = if is_buy { &self.asks } else { &self.bids };
+        levels
+            .iter()
+            .take_while(|(px, _)| {
+                if is_buy {
+                    *px <= limit_price
+                } else {
+                    *px >= limit_price
+                }
+            })
+            .fold(Decimal::ZERO, |acc, (_, sz)| acc + *sz)
+    }
+}
+
 impl L2Book {
     pub fn best_bid_ask(&self) -> Result<BestBidAsk> {
         let bid = self.levels[0]
@@ -212,6 +242,34 @@ impl L2Book {
             "Invalid BBO"
         );
         Ok(result)
+    }
+
+    pub fn validated_book(&self) -> Result<ValidatedBook> {
+        let bbo = self.best_bid_ask()?;
+        let collect_side = |raw: &[BookLevel], descending: bool| -> Vec<(Decimal, Decimal)> {
+            let mut out = Vec::with_capacity(raw.len().min(20));
+            for level in raw.iter().take(20) {
+                let Ok(px) = parse_decimal(&level.px) else {
+                    break;
+                };
+                let Ok(sz) = parse_decimal(&level.sz) else {
+                    break;
+                };
+                if px <= Decimal::ZERO || sz <= Decimal::ZERO {
+                    break;
+                }
+                if let Some(&(prev_px, _)) = out.last()
+                    && ((descending && px >= prev_px) || (!descending && px <= prev_px))
+                {
+                    break;
+                }
+                out.push((px, sz));
+            }
+            out
+        };
+        let bids = collect_side(&self.levels[0], true);
+        let asks = collect_side(&self.levels[1], false);
+        Ok(ValidatedBook { bbo, bids, asks })
     }
 }
 

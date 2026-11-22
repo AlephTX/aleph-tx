@@ -307,6 +307,103 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
     ]
 }
 
+const ASYMMETRIC_TAKER_DELAY_MS: u64 = 100;
+const CONCURRENT_MAX_TAKER_DELAY_MS: u64 = 20;
+
+/// Latency-driven execution topology for a two-leg cross-venue strategy (`ARB-IMP-07`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "topology", rename_all = "snake_case")]
+pub enum ExecutionTopology {
+    MakerFirst { maker_leg: usize, hedge_leg: usize },
+    SlowLegFirst { first_leg: usize, second_leg: usize },
+    ConcurrentProtectedIoc,
+}
+
+/// Selects a causal execution topology from venue speed-bump and settlement contracts.
+/// Rejects identical liquidity domains, mismatched settlement assets (`USDC` vs `USDG`),
+/// and dual-slow pairs with no fast IOC hedge leg.
+pub fn select_execution_topology(
+    leg_a: &VenueExecutionCapability,
+    leg_b: &VenueExecutionCapability,
+    dual_taker_required: bool,
+) -> Result<ExecutionTopology> {
+    ensure!(
+        leg_a.settlement_currency == leg_b.settlement_currency,
+        "settlement currency mismatch ({} != {}): cross-stablecoin hedge requires explicit FX ledger",
+        leg_a.settlement_currency,
+        leg_b.settlement_currency
+    );
+    ensure!(
+        leg_a.liquidity_domain != leg_b.liquidity_domain,
+        "legs share liquidity domain {}",
+        leg_a.liquidity_domain
+    );
+
+    let a_delay = leg_a.taker_delay_ms;
+    let b_delay = leg_b.taker_delay_ms;
+    let (slower_idx, faster_idx, slower_delay, faster_delay) = if a_delay >= b_delay {
+        (0, 1, a_delay, b_delay)
+    } else {
+        (1, 0, b_delay, a_delay)
+    };
+
+    if dual_taker_required {
+        if slower_delay <= CONCURRENT_MAX_TAKER_DELAY_MS {
+            return Ok(ExecutionTopology::ConcurrentProtectedIoc);
+        }
+        if slower_delay > faster_delay && faster_delay <= CONCURRENT_MAX_TAKER_DELAY_MS {
+            return Ok(ExecutionTopology::SlowLegFirst {
+                first_leg: slower_idx,
+                second_leg: faster_idx,
+            });
+        }
+        bail!(
+            "no fast hedge leg available for dual-taker execution ({} taker_delay={}ms, {} taker_delay={}ms)",
+            leg_a.venue_id,
+            a_delay,
+            leg_b.venue_id,
+            b_delay
+        );
+    }
+
+    if slower_delay >= ASYMMETRIC_TAKER_DELAY_MS {
+        if faster_delay < ASYMMETRIC_TAKER_DELAY_MS {
+            return Ok(ExecutionTopology::MakerFirst {
+                maker_leg: slower_idx,
+                hedge_leg: faster_idx,
+            });
+        }
+        bail!(
+            "no fast hedge leg available ({} taker_delay={}ms, {} taker_delay={}ms)",
+            leg_a.venue_id,
+            a_delay,
+            leg_b.venue_id,
+            b_delay
+        );
+    }
+
+    if slower_delay <= CONCURRENT_MAX_TAKER_DELAY_MS {
+        if leg_a.maker_fee_bps < leg_b.maker_fee_bps {
+            return Ok(ExecutionTopology::MakerFirst {
+                maker_leg: 0,
+                hedge_leg: 1,
+            });
+        }
+        if leg_b.maker_fee_bps < leg_a.maker_fee_bps {
+            return Ok(ExecutionTopology::MakerFirst {
+                maker_leg: 1,
+                hedge_leg: 0,
+            });
+        }
+        return Ok(ExecutionTopology::ConcurrentProtectedIoc);
+    }
+
+    Ok(ExecutionTopology::MakerFirst {
+        maker_leg: slower_idx,
+        hedge_leg: faster_idx,
+    })
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderSupport {
@@ -732,5 +829,63 @@ mod tests {
         assert!(
             compute_hip3_execution_fees(base_maker, base_taker, dec("-0.1"), false, false).is_err()
         );
+    }
+
+    #[test]
+    fn execution_topology_router_respects_speed_bumps_fees_and_settlement_domains() {
+        let registry = VenueRegistry::default();
+        let core_std = registry
+            .resolve_execution_capability("lighter", "standard", "equity")
+            .unwrap();
+        let rh_std = registry
+            .resolve_execution_capability("lighter_robinhood", "standard", "equity")
+            .unwrap();
+        let arcus_eq = registry
+            .resolve_execution_capability("arcus", "level_0", "equity")
+            .unwrap();
+        let hl_base = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+
+        // Core Standard (300ms taker, 0ms PostOnly) <-> Arcus Equity (0ms)
+        assert_eq!(
+            select_execution_topology(&core_std, &arcus_eq, false).unwrap(),
+            ExecutionTopology::MakerFirst {
+                maker_leg: 0,
+                hedge_leg: 1
+            }
+        );
+        // Dual taker across Core Standard (300ms) vs Arcus Equity (0ms) enforces SlowLegFirst
+        assert_eq!(
+            select_execution_topology(&core_std, &arcus_eq, true).unwrap(),
+            ExecutionTopology::SlowLegFirst {
+                first_leg: 0,
+                second_leg: 1
+            }
+        );
+        // Fast <-> Fast routes MakerFirst onto lower maker fee leg (Arcus 0bp vs HL 1.50bp)
+        assert_eq!(
+            select_execution_topology(&arcus_eq, &hl_base, false).unwrap(),
+            ExecutionTopology::MakerFirst {
+                maker_leg: 0,
+                hedge_leg: 1
+            }
+        );
+        assert_eq!(
+            select_execution_topology(&arcus_eq, &hl_base, true).unwrap(),
+            ExecutionTopology::ConcurrentProtectedIoc
+        );
+        // Cross-settlement (USDC vs USDG) fails closed
+        assert!(select_execution_topology(&core_std, &rh_std, false).is_err());
+        // Dual-slow fails closed without a fast hedge leg
+        let core_slow = VenueExecutionCapability {
+            venue_id: "lighter_b",
+            liquidity_domain: "lighter_b",
+            settlement_currency: "USDG",
+            ..core_std
+        };
+        assert!(select_execution_topology(&core_slow, &rh_std, false).is_err());
+        // Same liquidity domain fails closed
+        assert!(select_execution_topology(&core_std, &core_std, false).is_err());
     }
 }

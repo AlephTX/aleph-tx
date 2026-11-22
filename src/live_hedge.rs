@@ -6,9 +6,9 @@
 
 use crate::exchange::{BatchAction, Side};
 use crate::exchanges::hyperliquid::{
-    AccountState, BestBidAsk, CancelAction, CancelWire, ExecutionStatus, HyperliquidInfo,
-    HyperliquidSigner, HyperliquidTrading, LocatedOrder, Network, OrderAction, OrderLookup,
-    OrderWire, PerpMarket, PerpOrder, TimeInForce,
+    AccountState, CancelAction, CancelWire, ExecutionStatus, HyperliquidInfo, HyperliquidSigner,
+    HyperliquidTrading, LocatedOrder, Network, OrderAction, OrderLookup, OrderWire, PerpMarket,
+    PerpOrder, TimeInForce, ValidatedBook,
 };
 use crate::lighter_trading::{LighterTrading, PositionEvidence};
 use anyhow::{Context, Result, bail, ensure};
@@ -128,13 +128,13 @@ struct Observation {
     hedge: Decimal,
     /// Hyperliquid clearinghouse `state.time` attached to this snapshot.
     hedge_account_time_ms: u64,
-    book: BestBidAsk,
+    book: ValidatedBook,
 }
 
 struct VenueSnapshot {
     primary: PositionEvidence,
     account: AccountState,
-    book: BestBidAsk,
+    book: ValidatedBook,
 }
 
 impl VenueSnapshot {
@@ -147,7 +147,7 @@ impl VenueSnapshot {
         let (primary, account, book) = tokio::try_join!(
             primary.position_evidence(),
             info.account_state(account),
-            info.bbo(symbol),
+            info.l2_book(symbol),
         )?;
         Ok(Self {
             primary,
@@ -496,17 +496,19 @@ impl LiveInventoryHedge {
                 .is_some()
         {
             let now_ms = unix_ms()?;
-            let book_remaining =
-                MAX_QUOTE_AGE_MS.saturating_sub(now_ms.saturating_sub(observed.book.timestamp_ms));
+            let book_remaining = MAX_QUOTE_AGE_MS
+                .saturating_sub(now_ms.saturating_sub(observed.book.bbo.timestamp_ms));
             let account_remaining =
                 MAX_ACCOUNT_AGE_MS.saturating_sub(now_ms.saturating_sub(account_time_ms));
             let fee = self.limits.taker_fee_bps / 10_000.0;
-            let sell_limit = hedge_price_limit(observed.book.bid, self.limits.slippage_bps, false)?
-                .to_f64()
-                .context("Invalid Hyperliquid sell limit")?;
-            let buy_limit = hedge_price_limit(observed.book.ask, self.limits.slippage_bps, true)?
-                .to_f64()
-                .context("Invalid Hyperliquid buy limit")?;
+            let sell_limit =
+                hedge_price_limit(observed.book.bbo.bid, self.limits.slippage_bps, false)?
+                    .to_f64()
+                    .context("Invalid Hyperliquid sell limit")?;
+            let buy_limit =
+                hedge_price_limit(observed.book.bbo.ask, self.limits.slippage_bps, true)?
+                    .to_f64()
+                    .context("Invalid Hyperliquid buy limit")?;
             self.allowance = Some(QuoteAllowance {
                 primary: observed
                     .primary
@@ -698,7 +700,7 @@ impl LiveInventoryHedge {
                 "Hyperliquid balance or loss limit breached"
             );
             ensure!(
-                fresh(now, book.timestamp_ms, MAX_QUOTE_AGE_MS),
+                fresh(now, book.bbo.timestamp_ms, MAX_QUOTE_AGE_MS),
                 "Hyperliquid book is stale"
             );
         }
@@ -733,7 +735,7 @@ impl LiveInventoryHedge {
         let sent_at_ms = unix_ms()?;
         let expires_after_ms = sent_at_ms.checked_add(5_000).context("Expiry overflow")?;
         ensure!(
-            fresh(sent_at_ms, observed.book.timestamp_ms, MAX_QUOTE_AGE_MS),
+            fresh(sent_at_ms, observed.book.bbo.timestamp_ms, MAX_QUOTE_AGE_MS),
             "Hyperliquid book is stale at hedge dispatch"
         );
         // One decision time: the journaled age is the one checked, with the
@@ -957,12 +959,13 @@ fn plan_ioc(
     }
     let is_buy = delta > Decimal::ZERO;
     let reduce_only = !observation.hedge.is_zero() && (observation.hedge < Decimal::ZERO) == is_buy;
-    let (touch, visible) = if is_buy {
-        (observation.book.ask, observation.book.ask_size)
+    let touch = if is_buy {
+        observation.book.bbo.ask
     } else {
-        (observation.book.bid, observation.book.bid_size)
+        observation.book.bbo.bid
     };
     let price = hedge_price_limit(touch, limits.slippage_bps, is_buy)?;
+    let visible = observation.book.visible_size_within_limit(is_buy, price);
     let cap = limits
         .max_order_notional_usd
         .checked_div(price.max(touch))

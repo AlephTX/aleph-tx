@@ -6164,6 +6164,8 @@ mod tests {
             cancel_dislocation_bps: d("1.0"),
             reversion_fraction: d("0.75"),
             use_quote_level_dislocation: false,
+            max_dislocation_bps: None,
+            min_persist_ms: None,
         });
         improved.entry_flow_filter = Some(EntryFlowFilter {
             lookback_ms: 1_000,
@@ -6333,6 +6335,8 @@ mod tests {
             cancel_dislocation_bps: d("1.0"),
             reversion_fraction: d("0.8"),
             use_quote_level_dislocation: true,
+            max_dislocation_bps: None,
+            min_persist_ms: None,
         });
         let pair_book = |at: u64, m_bid1: &str, m_ask: &str| {
             let lvl = |p: &str, c: &str| Level {

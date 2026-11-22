@@ -19,6 +19,16 @@ pub struct MakerBasisReversion {
     /// candidate/resting quote price vs hedge mid rather than maker mid only.
     #[serde(default)]
     pub use_quote_level_dislocation: bool,
+    /// Optional structural-break upper cap on dislocation (`Leung-Li` bounded entry zone).
+    #[serde(
+        default,
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_dislocation_bps: Option<Decimal>,
+    /// Optional signal persistence window (ms) requiring sustained dislocation before entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_persist_ms: Option<u64>,
 }
 
 impl MakerBasisReversion {
@@ -28,13 +38,17 @@ impl MakerBasisReversion {
                 && config.hedged_exit.is_some()
                 && config.passive_offset.is_none()
                 && (5_000..=1_800_000).contains(&self.warmup_ms)
-                && (5_000..=1_800_000).contains(&self.half_life_ms)
+                && (5_000..=86_400_000).contains(&self.half_life_ms)
                 && (100..=60_000).contains(&self.max_gap_ms)
                 && self.max_gap_ms <= self.warmup_ms
                 && self.min_dislocation_bps > Decimal::ZERO
                 && self.min_dislocation_bps <= Decimal::from(500)
                 && (-Decimal::from(500)..=self.min_dislocation_bps)
                     .contains(&self.cancel_dislocation_bps)
+                && self
+                    .max_dislocation_bps
+                    .is_none_or(|max| max > self.min_dislocation_bps && max <= Decimal::from(500))
+                && self.min_persist_ms.is_none_or(|ms| ms <= 60_000)
                 && (Decimal::ZERO..=Decimal::ONE).contains(&self.reversion_fraction),
             "invalid maker basis reversion policy"
         );
@@ -63,6 +77,7 @@ pub(super) struct BasisReversionState {
     last_identity: Option<[u64; 2]>,
     mean_basis_bps: Option<Decimal>,
     current_basis_bps: Option<Decimal>,
+    persist_since_ms: [Option<u64>; 2],
     ready_samples: usize,
     resets: usize,
     reset_events: usize,
@@ -79,6 +94,7 @@ impl BasisReversionState {
         self.last_identity = None;
         self.mean_basis_bps = None;
         self.current_basis_bps = None;
+        self.persist_since_ms = [None; 2];
     }
 
     pub(super) fn feed_offline(&mut self) {
@@ -141,6 +157,15 @@ impl BasisReversionState {
                 self.max_abs_dislocation_bps
                     .map_or(abs_dev, |prev| prev.max(abs_dev)),
             );
+            for (idx, side_disloc) in [mean - basis_bps, basis_bps - mean].into_iter().enumerate() {
+                if side_disloc >= policy.min_dislocation_bps {
+                    self.persist_since_ms[idx].get_or_insert(now);
+                } else {
+                    self.persist_since_ms[idx] = None;
+                }
+            }
+        } else {
+            self.persist_since_ms = [None; 2];
         }
     }
 
@@ -214,6 +239,25 @@ impl BasisReversionState {
         if dislocation < policy.min_dislocation_bps {
             return Err("basis_dislocation");
         }
+        if policy
+            .max_dislocation_bps
+            .is_some_and(|max| dislocation > max)
+        {
+            return Err("basis_dislocation_above_max");
+        }
+        if let Some(req_ms) = policy.min_persist_ms
+            && req_ms > 0
+        {
+            let side_idx = match side {
+                HedgeSide::Buy => 0,
+                HedgeSide::Sell => 1,
+            };
+            let persisted = self.persist_since_ms[side_idx]
+                .is_some_and(|since| now.saturating_sub(since) >= req_ms);
+            if !persisted {
+                return Err("basis_dislocation_persist");
+            }
+        }
         Ok(dislocation)
     }
 
@@ -269,6 +313,8 @@ mod tests {
             cancel_dislocation_bps: d("0.5"),
             reversion_fraction: d("0.6"),
             use_quote_level_dislocation: false,
+            max_dislocation_bps: None,
+            min_persist_ms: None,
         }
     }
 
@@ -310,5 +356,58 @@ mod tests {
         );
         assert!(!s.exceeds_gap(p, 7_100));
         assert!(s.exceeds_gap(p, 7_101));
+    }
+
+    #[test]
+    fn supports_long_slow_equilibrium_leung_li_cap_and_persistence_dip_reset() {
+        let legacy_json = r#"{
+            "warmup_ms": 5000,
+            "half_life_ms": 14400000,
+            "max_gap_ms": 1000,
+            "min_dislocation_bps": "3.0",
+            "cancel_dislocation_bps": "0.5",
+            "reversion_fraction": "0.6"
+        }"#;
+        let legacy: MakerBasisReversion = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.half_life_ms, 14_400_000);
+        assert_eq!(legacy.max_dislocation_bps, None);
+        assert_eq!(legacy.min_persist_ms, None);
+
+        let guarded = MakerBasisReversion {
+            half_life_ms: 14_400_000, // 4h slow equilibrium
+            max_dislocation_bps: Some(d("25.0")),
+            min_persist_ms: Some(300),
+            ..legacy
+        };
+        let mut s = BasisReversionState::default();
+        for at in (1_000..=6_000).step_by(500) {
+            s.observe(guarded, at, Some((d("0.0"), [at; 2])));
+        }
+
+        // First sample exceeding min_dislocation starts persistence clock, but < 300ms fails.
+        s.observe(guarded, 6_100, Some((d("-5.0"), [6_100; 2])));
+        assert_eq!(
+            s.favorable_dislocation_bps(guarded, HedgeSide::Buy, 6_100),
+            Err("basis_dislocation_persist")
+        );
+        // Dip below threshold clears persistence clock.
+        s.observe(guarded, 6_250, Some((d("-1.0"), [6_250; 2])));
+        s.observe(guarded, 6_450, Some((d("-5.0"), [6_450; 2])));
+        assert_eq!(
+            s.favorable_dislocation_bps(guarded, HedgeSide::Buy, 6_450),
+            Err("basis_dislocation_persist")
+        );
+        // Sustained >= 300ms after re-arming passes.
+        s.observe(guarded, 6_750, Some((d("-5.0"), [6_750; 2])));
+        assert!(
+            s.favorable_dislocation_bps(guarded, HedgeSide::Buy, 6_750)
+                .is_ok()
+        );
+        // Structural break beyond max_dislocation_bps fails closed (`Leung-Li` bounded entry).
+        s.observe(guarded, 6_900, Some((d("-40.0"), [6_900; 2])));
+        assert_eq!(
+            s.favorable_dislocation_bps(guarded, HedgeSide::Buy, 6_900),
+            Err("basis_dislocation_above_max")
+        );
     }
 }

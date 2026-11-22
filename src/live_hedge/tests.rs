@@ -1,7 +1,7 @@
 use super::journal::{JOURNAL_SCHEMA, StartRecord};
 use super::*;
 use crate::exchange::{OrderParams, OrderType};
-use crate::exchanges::hyperliquid::PerpAsset;
+use crate::exchanges::hyperliquid::{BestBidAsk, PerpAsset, ValidatedBook};
 use serde_json::json;
 use std::str::FromStr;
 
@@ -54,14 +54,14 @@ fn observation(primary: &str, hedge: &str) -> Observation {
         },
         hedge: d(hedge),
         hedge_account_time_ms: 0,
-        book: BestBidAsk {
+        book: ValidatedBook::from_bbo(BestBidAsk {
             coin: "ETH".into(),
             timestamp_ms: 100,
             bid: d("2000"),
             bid_size: d("0.08"),
             ask: d("2001"),
             ask_size: d("0.12"),
-        },
+        }),
     }
 }
 
@@ -107,11 +107,14 @@ fn hedge_ioc_caps_notional_and_visible_size_and_never_flips_a_reduce_only_order(
     assert!(!sell.is_buy && !sell.reduce_only);
     assert_eq!(sell.time_in_force, TimeInForce::Ioc);
     assert!(sell.size < long.primary);
-    assert!(sell.size * long.book.bid <= limits.max_order_notional_usd);
-    assert!(sell.limit_price >= long.book.bid * d("0.999"));
-    long.book.bid_size = d("0.006");
+    assert!(sell.size * long.book.bbo.bid <= limits.max_order_notional_usd);
+    assert!(sell.limit_price >= long.book.bbo.bid * d("0.999"));
+    long.book = ValidatedBook::from_bbo(BestBidAsk {
+        bid_size: d("0.006"),
+        ..long.book.bbo.clone()
+    });
     let thin = plan_ioc(&market, &limits, &long, false).unwrap().unwrap();
-    assert_eq!(thin.size, long.book.bid_size);
+    assert_eq!(thin.size, long.book.bbo.bid_size);
 
     let sign_flip = observation("-0.02", "-0.004");
     let close = plan_ioc(&market, &limits, &sign_flip, false)
@@ -119,7 +122,7 @@ fn hedge_ioc_caps_notional_and_visible_size_and_never_flips_a_reduce_only_order(
         .unwrap();
     assert!(close.is_buy && close.reduce_only);
     assert_eq!(close.size, d("0.004"));
-    assert!(close.limit_price <= sign_flip.book.ask * d("1.001"));
+    assert!(close.limit_price <= sign_flip.book.bbo.ask * d("1.001"));
     assert!(
         plan_ioc(&market, &limits, &observation("0.001", "0"), false)
             .unwrap()
@@ -332,7 +335,7 @@ async fn signed_ioc_is_journaled_before_dispatch_and_a_lost_ack_blocks_another_o
     .unwrap();
     hedge.set_telemetry(Some(sink.clone()));
     let mut observed = observation("0.03", "0");
-    observed.book.timestamp_ms = unix_ms().unwrap();
+    observed.book.bbo.timestamp_ms = unix_ms().unwrap();
     hedge.execute(observed, false).await.unwrap();
     assert_eq!(hedge.confirmed, Decimal::ZERO);
     // Crash after the intent is durable but before any terminal is known.
@@ -1296,4 +1299,50 @@ fn preflight_rejects_zero_or_sub_ten_dollar_deadband_to_prevent_unhedgeable_stal
         )
         .is_ok()
     );
+}
+
+#[test]
+fn hedge_ioc_sweeps_multiple_levels_within_slippage_and_excludes_deeper_levels() {
+    let market = market();
+    let limits = limits(); // slippage_bps = 10 -> buy limit = 2001 * 1.001 = 2003.001; notional cap = $30
+    let mut obs = observation("-0.02", "0");
+    // L1 ask is a tiny $2 dust lot (below $10 HL minimum alone), L2/L3 fit within slippage, L4 is outside.
+    obs.book = ValidatedBook {
+        bbo: BestBidAsk {
+            coin: "ETH".into(),
+            timestamp_ms: 100,
+            bid: d("2000"),
+            bid_size: d("0.002"),
+            ask: d("2001"),
+            ask_size: d("0.001"),
+        },
+        bids: vec![
+            (d("2000"), d("0.002")),
+            (d("1999"), d("0.005")),
+            (d("1997"), d("0.050")),
+        ],
+        asks: vec![
+            (d("2001"), d("0.001")),
+            (d("2002"), d("0.004")),
+            (d("2003"), d("0.005")),
+            (d("2005"), d("0.500")),
+        ],
+    };
+    let buy = plan_ioc(&market, &limits, &obs, false).unwrap().unwrap();
+    assert!(buy.is_buy);
+    // Visible within 2003.001 is 0.001 + 0.004 + 0.005 = 0.010 ETH (excludes 2005 ask!),
+    // which fits under cap $30 / 2003.001 = 0.0149 and clears >= $10 min notional.
+    assert_eq!(buy.size, d("0.010"));
+    assert!(!buy.reduce_only);
+
+    // Verify reduce-only cap still takes precedence over multi-level visible depth on sell side.
+    let mut sell_obs = obs;
+    sell_obs.primary = Decimal::ZERO;
+    sell_obs.hedge = d("0.006");
+    let sell = plan_ioc(&market, &limits, &sell_obs, true)
+        .unwrap()
+        .unwrap();
+    assert!(!sell.is_buy && sell.reduce_only);
+    // Sell visible within 2000 * 0.999 = 1998 is L1(0.002) + L2(0.005) = 0.007, clamped by hedge 0.006.
+    assert_eq!(sell.size, d("0.006"));
 }

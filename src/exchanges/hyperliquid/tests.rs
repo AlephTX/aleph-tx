@@ -426,3 +426,149 @@ async fn live_submission_preconditions_fail_before_network_access() {
     empty.orders.clear();
     assert!(client.submit_orders(&empty).await.is_err());
 }
+
+#[test]
+fn validated_book_walks_ordered_depth_within_limit_and_rejects_crossed_levels() {
+    let book: L2Book = serde_json::from_value(json!({
+        "coin": "ANT",
+        "time": 1_795_200_000_000_u64,
+        "levels": [
+            [
+                {"px": "100.00", "sz": "0.5"},
+                {"px": "99.95", "sz": "1.5"},
+                {"px": "99.80", "sz": "10.0"}
+            ],
+            [
+                {"px": "100.10", "sz": "0.2"},
+                {"px": "100.18", "sz": "1.2"},
+                {"px": "100.25", "sz": "5.0"}
+            ]
+        ]
+    }))
+    .unwrap();
+    let v = book.validated_book().unwrap();
+    assert_eq!(v.bids.len(), 3);
+    assert_eq!(v.asks.len(), 3);
+    assert_eq!(
+        v.visible_size_within_limit(true, decimal("100.20")),
+        decimal("1.4")
+    );
+    assert_eq!(
+        v.visible_size_within_limit(false, decimal("99.95")),
+        decimal("2.0")
+    );
+    // Out-of-order deeper level stops cleanly before bad levels.
+    let mut dirty = book;
+    dirty.levels[1].push(BookLevel {
+        px: "100.20".into(),
+        sz: "99.0".into(),
+    });
+    let clean = dirty.validated_book().unwrap();
+    assert_eq!(clean.asks.len(), 3);
+}
+
+#[test]
+fn aggregate_multi_dex_equity_deduplicates_core_and_duplicate_dex_keys() {
+    let mk_state = |val: &str| AccountState {
+        margin_summary: MarginSummary {
+            account_value: val.into(),
+            total_ntl_pos: "0".into(),
+            total_margin_used: "0".into(),
+        },
+        asset_positions: vec![],
+        withdrawable: val.into(),
+        time: 1_795_200_000_000,
+    };
+    let core = mk_state("1000.5");
+    let io_dex = mk_state("250.25");
+    let xyz_dex = mk_state("125.75");
+    let total = aggregate_multi_dex_equity(
+        &core,
+        &[
+            ("", &core),
+            ("Core", &core),
+            ("io", &io_dex),
+            ("IO", &io_dex),
+            ("xyz", &xyz_dex),
+        ],
+    )
+    .unwrap();
+    assert_eq!(total, decimal("1376.50"));
+}
+
+#[tokio::test]
+async fn shared_nonce_pool_and_warm_http_and_expiry_counter_work() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_nonces = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let nonces_srv = seen_nonces.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..5 {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(&mut sock);
+            let mut path = String::new();
+            let mut len = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                if line.starts_with("POST ") {
+                    path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                } else if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                } else if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            let resp = if path == "/info" {
+                r#"{"time":1795200000000,"specialStatuses":[]}"#.to_owned()
+            } else {
+                nonces_srv.lock().push(body["nonce"].as_u64().unwrap());
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order expiresAfter rejected"}]}}}"#.to_owned()
+            };
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp.len(),
+                resp
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+
+    let info = HyperliquidInfo::new(Network::Testnet)
+        .unwrap()
+        .with_test_url(format!("http://{addr}"));
+    info.warm_http().await.unwrap();
+
+    let pool = SharedNoncePool::default();
+    let signer = HyperliquidSigner::from_private_key(SDK_TEST_KEY).unwrap();
+    let c1 =
+        HyperliquidTrading::with_shared_nonce(info.clone(), signer, None, pool.clone()).unwrap();
+    let signer2 = HyperliquidSigner::from_private_key(SDK_TEST_KEY).unwrap();
+    let c2 = HyperliquidTrading::with_shared_nonce(info, signer2, None, pool).unwrap();
+
+    let o = sdk_order(true);
+    let (r1, r2, r3, r4) = tokio::join!(
+        c1.submit_orders(&o),
+        c2.submit_orders(&o),
+        c1.submit_orders(&o),
+        c2.submit_orders(&o),
+    );
+    assert!(r1.is_ok() && r2.is_ok() && r3.is_ok() && r4.is_ok());
+    server.await.unwrap();
+
+    let mut nonces = seen_nonces.lock().clone();
+    assert_eq!(nonces.len(), 4);
+    nonces.sort_unstable();
+    nonces.dedup();
+    assert_eq!(nonces.len(), 4);
+    assert_eq!(
+        c1.expires_after_reject_count() + c2.expires_after_reject_count(),
+        4
+    );
+}
