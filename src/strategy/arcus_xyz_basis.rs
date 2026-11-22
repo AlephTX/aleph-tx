@@ -18,6 +18,7 @@ use crate::exchanges::hyperliquid::{
 use crate::live_hedge::{
     IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill, classify_lookup,
 };
+use crate::order_budget::OrderBudgetConfig;
 use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -121,6 +122,8 @@ pub struct ArcusXyzBasisConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_account_refresh_interval_ms")]
     pub account_refresh_interval_ms: u64,
+    #[serde(default)]
+    pub order_budget: OrderBudgetConfig,
     pub journal_path: PathBuf,
     pub daily_loss_state_path: PathBuf,
 }
@@ -270,6 +273,7 @@ impl ArcusXyzBasisConfig {
                 && !self.daily_loss_state_path.as_os_str().is_empty(),
             "journal_path and daily_loss_state_path must be non-empty"
         );
+        self.order_budget.validate()?;
         Ok(())
     }
 
@@ -2193,6 +2197,7 @@ mod tests {
             dry_run: true,
             poll_interval_ms: 250,
             account_refresh_interval_ms: 1_000,
+            order_budget: OrderBudgetConfig::default(),
             journal_path: PathBuf::from("state/test-journal.ndjson"),
             daily_loss_state_path: PathBuf::from("state/test-daily-loss.json"),
         }
@@ -3617,5 +3622,31 @@ mod tests {
         assert_eq!(tracker.position(), d("-1.0"));
         assert_eq!(tracker.avg_cost(), d("90.0"));
         assert!((tracker.realized_pnl_usd() - (-20.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_validates_order_budget_defaults_and_bounds() {
+        let base_toml = include_str!("../../config.arcus_xyz_basis.example.toml");
+        let parsed: ArcusXyzBasisConfig = toml::from_str(base_toml).unwrap();
+        assert_eq!(parsed.order_budget, OrderBudgetConfig::default());
+        assert!(parsed.validate().is_ok());
+
+        let without_budget = base_toml.split("[order_budget]").next().unwrap();
+        let omitted: ArcusXyzBasisConfig = toml::from_str(without_budget).unwrap();
+        assert_eq!(omitted.order_budget, OrderBudgetConfig::default());
+        assert!(omitted.validate().is_ok());
+
+        let mut bad = test_config();
+        bad.order_budget.entry_soft_cap_pct = 0;
+        assert!(bad.validate().is_err());
+
+        let mut bad_halt = test_config();
+        bad_halt
+            .order_budget
+            .max_consecutive_rate_limits_before_halt = 0;
+        assert!(bad_halt.validate().is_err());
+
+        let unknown_field = format!("{without_budget}\n[order_budget]\nunknown_key = 1\n");
+        assert!(toml::from_str::<ArcusXyzBasisConfig>(&unknown_field).is_err());
     }
 }

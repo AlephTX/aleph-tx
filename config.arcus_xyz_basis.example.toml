@@ -40,3 +40,12 @@ account_refresh_interval_ms = 1000
 
 journal_path = "state/arcus_xyz_basis_journal.ndjson"
 daily_loss_state_path = "state/arcus_xyz_basis_daily_loss.json"
+
+# ARB-IMP-09 per-venue sliding order budget & 429 cooldown/halt guard.
+# Risk-reducing exits, emergency hedges, and cancels are always exempt from caps, cooldowns, and halts.
+[order_budget]
+window_ms = 60000
+max_weight_per_window = 60
+entry_soft_cap_pct = 80
+cooldown_ms_on_rate_limit = 15000
+max_consecutive_rate_limits_before_halt = 5
