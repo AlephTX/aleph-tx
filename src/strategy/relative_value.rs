@@ -1964,5 +1964,797 @@ fn sides(buy_leg: usize) -> [HedgeSide; 2] {
     }
 }
 
+/// Parameters for dual-pointer marginal cross-book depth pricing (`ARB-IMP-06`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarginalCrossParams {
+    /// Buy-side fee in bps (positive = fee, negative = maker rebate).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub buy_fee_bps: Decimal,
+    /// Sell-side fee in bps (positive = fee, negative = maker rebate).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub sell_fee_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub min_net_edge_bps: Decimal,
+    /// Fraction of raw crossable base depth to target (`(0, 1]`).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub take_fraction: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub min_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub step_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub buy_tick: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub sell_tick: Decimal,
+}
+
+/// Bounded cross-book quote derived from marginal level-by-level matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MarginalCrossQuote {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub base_quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub raw_crossable_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub buy_limit_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub sell_limit_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub buy_vwap: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub sell_vwap: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub marginal_net_edge_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub vwap_net_edge_bps: Decimal,
+    pub buy_levels_used: usize,
+    pub sell_levels_used: usize,
+}
+
+fn validate_marginal_book_side(
+    levels: &[Level],
+    base_per_contract: Decimal,
+    ascending: bool,
+    side_name: &str,
+) -> Result<()> {
+    for level in levels {
+        ensure!(
+            level.price > Decimal::ZERO,
+            "{side_name} level price must be positive"
+        );
+        ensure!(
+            level.contracts > Decimal::ZERO,
+            "{side_name} level contracts must be positive"
+        );
+        level
+            .contracts
+            .checked_mul(base_per_contract)
+            .with_context(|| format!("{side_name} level base size overflow"))?;
+    }
+    for window in levels.windows(2) {
+        let monotonic = if ascending {
+            window[0].price < window[1].price
+        } else {
+            window[0].price > window[1].price
+        };
+        ensure!(
+            monotonic,
+            "{side_name} book prices must be strictly monotonic"
+        );
+    }
+    Ok(())
+}
+
+fn validate_marginal_inputs(
+    buy_asks: &[Level],
+    sell_bids: &[Level],
+    buy_base_per_contract: Decimal,
+    sell_base_per_contract: Decimal,
+    params: &MarginalCrossParams,
+) -> Result<()> {
+    ensure!(
+        params.take_fraction > Decimal::ZERO && params.take_fraction <= Decimal::ONE,
+        "take_fraction must be in (0, 1]"
+    );
+    ensure!(params.max_base > Decimal::ZERO, "max_base must be positive");
+    ensure!(
+        params.min_base >= Decimal::ZERO && params.min_base <= params.max_base,
+        "min_base must be in [0, max_base]"
+    );
+    ensure!(
+        params.step_base > Decimal::ZERO,
+        "step_base must be positive"
+    );
+    ensure!(params.buy_tick > Decimal::ZERO, "buy_tick must be positive");
+    ensure!(
+        params.sell_tick > Decimal::ZERO,
+        "sell_tick must be positive"
+    );
+    ensure!(
+        buy_base_per_contract > Decimal::ZERO,
+        "buy_base_per_contract must be positive"
+    );
+    ensure!(
+        sell_base_per_contract > Decimal::ZERO,
+        "sell_base_per_contract must be positive"
+    );
+    ensure!(
+        params.buy_fee_bps > -BPS,
+        "buy_fee_bps rebate cannot imply non-positive effective buy price"
+    );
+    validate_marginal_book_side(buy_asks, buy_base_per_contract, true, "buy_asks")?;
+    validate_marginal_book_side(sell_bids, sell_base_per_contract, false, "sell_bids")?;
+    Ok(())
+}
+
+fn floor_to_step(value: Decimal, step: Decimal) -> Result<Decimal> {
+    ensure!(
+        value >= Decimal::ZERO && step > Decimal::ZERO,
+        "floor_to_step requires non-negative value and positive step"
+    );
+    let mut steps = value
+        .checked_div(step)
+        .context("step division overflow")?
+        .trunc();
+    // `value / step` rounds to 28 digits, so `trunc()` can overshoot by 1 step
+    // when the exact ratio lies just below an integer.
+    loop {
+        match steps.checked_mul(step) {
+            Some(aligned) if aligned <= value => {
+                if aligned.checked_add(step).is_some_and(|next| next <= value) {
+                    steps = steps
+                        .checked_add(Decimal::ONE)
+                        .context("step count overflow")?;
+                    continue;
+                }
+                return Ok(aligned);
+            }
+            Some(_) | None => {
+                steps = steps
+                    .checked_sub(Decimal::ONE)
+                    .context("step count underflow")?;
+            }
+        }
+    }
+}
+
+fn round_price_down_to_tick(price: Decimal, tick: Decimal) -> Result<Decimal> {
+    floor_to_step(price, tick)
+}
+
+fn round_price_up_to_tick(price: Decimal, tick: Decimal) -> Result<Decimal> {
+    let down = round_price_down_to_tick(price, tick)?;
+    if down == price {
+        Ok(down)
+    } else {
+        down.checked_add(tick)
+            .context("price tick rounding overflow")
+    }
+}
+
+fn marginal_edge_bps(
+    buy_px: Decimal,
+    sell_px: Decimal,
+    params: &MarginalCrossParams,
+) -> Result<Decimal> {
+    let buy_factor = Decimal::ONE
+        .checked_add(
+            params
+                .buy_fee_bps
+                .checked_div(BPS)
+                .context("buy fee scaling overflow")?,
+        )
+        .context("buy fee factor overflow")?;
+    let sell_factor = Decimal::ONE
+        .checked_sub(
+            params
+                .sell_fee_bps
+                .checked_div(BPS)
+                .context("sell fee scaling overflow")?,
+        )
+        .context("sell fee factor overflow")?;
+    let eff_buy = buy_px
+        .checked_mul(buy_factor)
+        .context("effective buy price overflow")?;
+    ensure!(
+        eff_buy > Decimal::ZERO,
+        "effective buy price must be positive"
+    );
+    let eff_sell = sell_px
+        .checked_mul(sell_factor)
+        .context("effective sell price overflow")?;
+    eff_sell
+        .checked_sub(eff_buy)
+        .context("net edge difference overflow")?
+        .checked_div(eff_buy)
+        .context("net edge division overflow")?
+        .checked_mul(BPS)
+        .context("net edge bps scaling overflow")
+}
+
+fn sweep_vwap_and_limit(
+    levels: &[Level],
+    base_per_contract: Decimal,
+    target_base: Decimal,
+) -> Result<(Decimal, Decimal, usize)> {
+    ensure!(
+        target_base > Decimal::ZERO,
+        "sweep target_base must be positive"
+    );
+    let mut remaining = target_base;
+    let mut notional = Decimal::ZERO;
+    let mut worst_price = Decimal::ZERO;
+    let mut levels_used = 0usize;
+
+    for level in levels {
+        let level_base = level
+            .contracts
+            .checked_mul(base_per_contract)
+            .context("level base size overflow")?;
+        let take = remaining.min(level_base);
+        if take > Decimal::ZERO {
+            let level_notional = take
+                .checked_mul(level.price)
+                .context("level notional overflow")?;
+            notional = notional
+                .checked_add(level_notional)
+                .context("cumulative sweep notional overflow")?;
+            worst_price = level.price;
+            levels_used += 1;
+            remaining -= take;
+            if remaining == Decimal::ZERO {
+                break;
+            }
+        }
+    }
+
+    ensure!(
+        remaining == Decimal::ZERO,
+        "insufficient book depth for target base quantity"
+    );
+    let vwap = if levels_used == 1 {
+        worst_price
+    } else {
+        notional
+            .checked_div(target_base)
+            .context("vwap division overflow")?
+    };
+    Ok((vwap, worst_price, levels_used))
+}
+
+/// Computes the crossable base quantity, VWAPs, net edge, and tick-rounded
+/// limit prices across two opposite-side L2 books using a two-pointer
+/// marginal level sweep.
+pub fn crossable_marginal_depth(
+    buy_asks: &[Level],
+    sell_bids: &[Level],
+    buy_base_per_contract: Decimal,
+    sell_base_per_contract: Decimal,
+    params: &MarginalCrossParams,
+) -> Result<Option<MarginalCrossQuote>> {
+    validate_marginal_inputs(
+        buy_asks,
+        sell_bids,
+        buy_base_per_contract,
+        sell_base_per_contract,
+        params,
+    )?;
+    if buy_asks.is_empty() || sell_bids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut rem_buy = buy_asks[0]
+        .contracts
+        .checked_mul(buy_base_per_contract)
+        .context("buy level base size overflow")?;
+    let mut rem_sell = sell_bids[0]
+        .contracts
+        .checked_mul(sell_base_per_contract)
+        .context("sell level base size overflow")?;
+    let mut raw_crossable_base = Decimal::ZERO;
+
+    loop {
+        let edge_bps = marginal_edge_bps(buy_asks[i].price, sell_bids[j].price, params)?;
+        if edge_bps < params.min_net_edge_bps {
+            break;
+        }
+        let slice = rem_buy.min(rem_sell);
+        raw_crossable_base = raw_crossable_base
+            .checked_add(slice)
+            .context("raw crossable base overflow")?;
+        rem_buy -= slice;
+        rem_sell -= slice;
+
+        if rem_buy == Decimal::ZERO {
+            i += 1;
+            if i == buy_asks.len() {
+                break;
+            }
+            rem_buy = buy_asks[i]
+                .contracts
+                .checked_mul(buy_base_per_contract)
+                .context("buy level base size overflow")?;
+        }
+        if rem_sell == Decimal::ZERO {
+            j += 1;
+            if j == sell_bids.len() {
+                break;
+            }
+            rem_sell = sell_bids[j]
+                .contracts
+                .checked_mul(sell_base_per_contract)
+                .context("sell level base size overflow")?;
+        }
+    }
+
+    if raw_crossable_base <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    let desired = raw_crossable_base
+        .checked_mul(params.take_fraction)
+        .context("take fraction scaling overflow")?
+        .min(params.max_base);
+    let base_quantity = floor_to_step(desired, params.step_base)?;
+    if base_quantity <= Decimal::ZERO || base_quantity < params.min_base {
+        return Ok(None);
+    }
+
+    let (buy_vwap, worst_buy_px, buy_levels_used) =
+        sweep_vwap_and_limit(buy_asks, buy_base_per_contract, base_quantity)?;
+    let (sell_vwap, worst_sell_px, sell_levels_used) =
+        sweep_vwap_and_limit(sell_bids, sell_base_per_contract, base_quantity)?;
+
+    let buy_limit_price = round_price_up_to_tick(worst_buy_px, params.buy_tick)?;
+    let sell_limit_price = round_price_down_to_tick(worst_sell_px, params.sell_tick)?;
+
+    // Because both sides consume the exact same cumulative `base_quantity`, the
+    // marginal slice at `base_quantity` pairs `worst_buy_px` with `worst_sell_px`.
+    let marginal_net_edge_bps = marginal_edge_bps(worst_buy_px, worst_sell_px, params)?;
+    let vwap_net_edge_bps = marginal_edge_bps(buy_vwap, sell_vwap, params)?;
+
+    Ok(Some(MarginalCrossQuote {
+        base_quantity,
+        raw_crossable_base,
+        buy_limit_price,
+        sell_limit_price,
+        buy_vwap,
+        sell_vwap,
+        marginal_net_edge_bps,
+        vwap_net_edge_bps,
+        buy_levels_used,
+        sell_levels_used,
+    }))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod marginal_cross_tests {
+    use super::*;
+
+    fn dec_str(value: &str) -> Decimal {
+        value.parse().unwrap()
+    }
+
+    fn lvl(price: &str, contracts: &str) -> Level {
+        Level {
+            price: dec_str(price),
+            contracts: dec_str(contracts),
+        }
+    }
+
+    fn base_params() -> MarginalCrossParams {
+        MarginalCrossParams {
+            buy_fee_bps: dec_str("2"),
+            sell_fee_bps: dec_str("3"),
+            min_net_edge_bps: dec_str("10"),
+            take_fraction: dec_str("1"),
+            max_base: dec_str("10"),
+            min_base: dec_str("0.1"),
+            step_base: dec_str("0.1"),
+            buy_tick: dec_str("0.05"),
+            sell_tick: dec_str("0.05"),
+        }
+    }
+
+    #[test]
+    fn marginal_cross_sweeps_asymmetric_thin_l1_and_cuts_off_unprofitable_l3() {
+        let buy_asks = [lvl("100.00", "1"), lvl("100.10", "8"), lvl("100.50", "10")];
+        let sell_bids = [
+            lvl("100.40", "0.5"),
+            lvl("100.30", "1.0"),
+            lvl("100.05", "5.0"),
+        ];
+        let params = base_params();
+        let quote =
+            crossable_marginal_depth(&buy_asks, &sell_bids, dec_str("0.5"), dec_str("2"), &params)
+                .unwrap()
+                .expect("crossable depth must exist");
+
+        assert_eq!(quote.raw_crossable_base, dec_str("3.0"));
+        assert_eq!(quote.base_quantity, dec_str("3.0"));
+        assert_eq!(quote.buy_levels_used, 2);
+        assert_eq!(quote.sell_levels_used, 2);
+        assert_eq!(quote.buy_limit_price, dec_str("100.10"));
+        assert_eq!(quote.sell_limit_price, dec_str("100.30"));
+
+        let expected_buy_vwap = dec_str("300.25") / dec_str("3");
+        let expected_sell_vwap = dec_str("301.00") / dec_str("3");
+        assert_eq!(quote.buy_vwap, expected_buy_vwap);
+        assert_eq!(quote.sell_vwap, expected_sell_vwap);
+
+        let buy_factor = dec_str("1.0002");
+        let sell_factor = dec_str("0.9997");
+        let expected_marginal_eff_buy = dec_str("100.10") * buy_factor;
+        let expected_marginal_eff_sell = dec_str("100.30") * sell_factor;
+        let expected_marginal_edge = (expected_marginal_eff_sell - expected_marginal_eff_buy)
+            / expected_marginal_eff_buy
+            * BPS;
+        assert_eq!(quote.marginal_net_edge_bps, expected_marginal_edge);
+
+        let expected_vwap_eff_buy = expected_buy_vwap * buy_factor;
+        let expected_vwap_eff_sell = expected_sell_vwap * sell_factor;
+        let expected_vwap_edge =
+            (expected_vwap_eff_sell - expected_vwap_eff_buy) / expected_vwap_eff_buy * BPS;
+        assert_eq!(quote.vwap_net_edge_bps, expected_vwap_edge);
+        assert!(quote.marginal_net_edge_bps >= params.min_net_edge_bps);
+        assert!(quote.vwap_net_edge_bps > quote.marginal_net_edge_bps);
+    }
+
+    #[test]
+    fn take_fraction_step_floor_and_directional_tick_rounding() {
+        let buy_asks = [lvl("100.003", "1"), lvl("100.044", "3")];
+        let sell_bids = [lvl("100.498", "2"), lvl("100.303", "2")];
+        let params = MarginalCrossParams {
+            buy_fee_bps: Decimal::ZERO,
+            sell_fee_bps: Decimal::ZERO,
+            min_net_edge_bps: dec_str("10"),
+            take_fraction: dec_str("0.6"),
+            max_base: dec_str("10"),
+            min_base: dec_str("0.5"),
+            step_base: dec_str("0.5"),
+            buy_tick: dec_str("0.01"),
+            sell_tick: dec_str("0.01"),
+        };
+
+        let quote =
+            crossable_marginal_depth(&buy_asks, &sell_bids, Decimal::ONE, Decimal::ONE, &params)
+                .unwrap()
+                .expect("expected partial take quote");
+
+        assert_eq!(quote.raw_crossable_base, dec_str("4"));
+        assert_eq!(quote.base_quantity, dec_str("2.0"));
+        assert_eq!(quote.buy_levels_used, 2);
+        assert_eq!(quote.sell_levels_used, 1);
+        assert_eq!(quote.buy_vwap, dec_str("100.0235"));
+        assert_eq!(quote.sell_vwap, dec_str("100.498"));
+        assert_eq!(quote.buy_limit_price, dec_str("100.05"));
+        assert_eq!(quote.sell_limit_price, dec_str("100.49"));
+
+        let expected_marginal_edge =
+            (dec_str("100.498") - dec_str("100.044")) / dec_str("100.044") * BPS;
+        assert_eq!(quote.marginal_net_edge_bps, expected_marginal_edge);
+
+        // Max base capping still floors to `step_base`.
+        let capped = MarginalCrossParams {
+            take_fraction: dec_str("1"),
+            max_base: dec_str("1.75"),
+            ..params
+        };
+        let capped_quote =
+            crossable_marginal_depth(&buy_asks, &sell_bids, Decimal::ONE, Decimal::ONE, &capped)
+                .unwrap()
+                .expect("expected capped quote");
+        assert_eq!(capped_quote.base_quantity, dec_str("1.5"));
+
+        // Guard against 28-digit division rounding up when ratio sits just below an integer.
+        assert_eq!(
+            round_price_down_to_tick(dec_str("0.8999999999999999999999999999"), dec_str("0.3"))
+                .unwrap(),
+            dec_str("0.6")
+        );
+        assert_eq!(
+            round_price_up_to_tick(dec_str("0.8999999999999999999999999999"), dec_str("0.3"))
+                .unwrap(),
+            dec_str("0.9")
+        );
+        assert_eq!(
+            round_price_up_to_tick(dec_str("0.9"), dec_str("0.3")).unwrap(),
+            dec_str("0.9")
+        );
+    }
+
+    #[test]
+    fn negative_fee_maker_rebate_creates_positive_net_edge() {
+        let buy_asks = [lvl("100.00", "2")];
+        let sell_bids = [lvl("100.00", "2")];
+        let rebate_params = MarginalCrossParams {
+            buy_fee_bps: dec_str("-2"),
+            sell_fee_bps: dec_str("-3"),
+            min_net_edge_bps: dec_str("4"),
+            take_fraction: Decimal::ONE,
+            max_base: dec_str("10"),
+            min_base: dec_str("0.1"),
+            step_base: dec_str("0.1"),
+            buy_tick: dec_str("0.01"),
+            sell_tick: dec_str("0.01"),
+        };
+
+        let quote = crossable_marginal_depth(
+            &buy_asks,
+            &sell_bids,
+            Decimal::ONE,
+            Decimal::ONE,
+            &rebate_params,
+        )
+        .unwrap()
+        .expect("rebate should make zero-spread profitable");
+
+        assert_eq!(quote.base_quantity, dec_str("2.0"));
+        assert_eq!(quote.buy_vwap, dec_str("100.00"));
+        assert_eq!(quote.sell_vwap, dec_str("100.00"));
+        let expected_edge = (dec_str("100.03") - dec_str("99.98")) / dec_str("99.98") * BPS;
+        assert_eq!(quote.marginal_net_edge_bps, expected_edge);
+        assert_eq!(quote.vwap_net_edge_bps, expected_edge);
+
+        let fee_params = MarginalCrossParams {
+            buy_fee_bps: dec_str("2"),
+            sell_fee_bps: dec_str("3"),
+            ..rebate_params
+        };
+        assert_eq!(
+            crossable_marginal_depth(
+                &buy_asks,
+                &sell_bids,
+                Decimal::ONE,
+                Decimal::ONE,
+                &fee_params,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn min_base_cutoff_and_empty_or_unprofitable_books_return_none() {
+        let buy_asks = [lvl("100.00", "0.05")];
+        let sell_bids = [lvl("101.00", "0.50")];
+        let params = base_params();
+        assert_eq!(
+            crossable_marginal_depth(&buy_asks, &sell_bids, Decimal::ONE, Decimal::ONE, &params)
+                .unwrap(),
+            None
+        );
+
+        let sub_step = MarginalCrossParams {
+            min_base: Decimal::ZERO,
+            take_fraction: dec_str("0.5"),
+            step_base: dec_str("0.1"),
+            ..params
+        };
+        assert_eq!(
+            crossable_marginal_depth(
+                &[lvl("100.00", "0.15")],
+                &sell_bids,
+                Decimal::ONE,
+                Decimal::ONE,
+                &sub_step,
+            )
+            .unwrap(),
+            None
+        );
+
+        assert_eq!(
+            crossable_marginal_depth(&[], &sell_bids, Decimal::ONE, Decimal::ONE, &params).unwrap(),
+            None
+        );
+        assert_eq!(
+            crossable_marginal_depth(&buy_asks, &[], Decimal::ONE, Decimal::ONE, &params).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn fail_closed_rejects_invalid_books_and_params() {
+        let valid_asks = [lvl("100.00", "1"), lvl("100.10", "1")];
+        let valid_bids = [lvl("100.50", "1"), lvl("100.40", "1")];
+        let valid_params = base_params();
+
+        // Unsorted / duplicate asks
+        assert!(
+            crossable_marginal_depth(
+                &[lvl("100.10", "1"), lvl("100.00", "1")],
+                &valid_bids,
+                Decimal::ONE,
+                Decimal::ONE,
+                &valid_params,
+            )
+            .is_err()
+        );
+        assert!(
+            crossable_marginal_depth(
+                &[lvl("100.00", "1"), lvl("100.00", "2")],
+                &valid_bids,
+                Decimal::ONE,
+                Decimal::ONE,
+                &valid_params,
+            )
+            .is_err()
+        );
+
+        // Unsorted / duplicate bids
+        assert!(
+            crossable_marginal_depth(
+                &valid_asks,
+                &[lvl("100.40", "1"), lvl("100.50", "1")],
+                Decimal::ONE,
+                Decimal::ONE,
+                &valid_params,
+            )
+            .is_err()
+        );
+        assert!(
+            crossable_marginal_depth(
+                &valid_asks,
+                &[lvl("100.50", "1"), lvl("100.50", "2")],
+                Decimal::ONE,
+                Decimal::ONE,
+                &valid_params,
+            )
+            .is_err()
+        );
+
+        // Zero / negative prices & contracts
+        for bad_level in [
+            lvl("0", "1"),
+            lvl("-1", "1"),
+            lvl("100", "0"),
+            lvl("100", "-1"),
+        ] {
+            assert!(
+                crossable_marginal_depth(
+                    &[bad_level],
+                    &valid_bids,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    &valid_params,
+                )
+                .is_err()
+            );
+            assert!(
+                crossable_marginal_depth(
+                    &valid_asks,
+                    &[bad_level],
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    &valid_params,
+                )
+                .is_err()
+            );
+        }
+
+        // Invalid contract multipliers
+        for bad_mult in [Decimal::ZERO, dec_str("-1")] {
+            assert!(
+                crossable_marginal_depth(
+                    &valid_asks,
+                    &valid_bids,
+                    bad_mult,
+                    Decimal::ONE,
+                    &valid_params,
+                )
+                .is_err()
+            );
+            assert!(
+                crossable_marginal_depth(
+                    &valid_asks,
+                    &valid_bids,
+                    Decimal::ONE,
+                    bad_mult,
+                    &valid_params,
+                )
+                .is_err()
+            );
+        }
+
+        // Invalid params
+        let bad_param_cases = [
+            MarginalCrossParams {
+                take_fraction: Decimal::ZERO,
+                ..valid_params
+            },
+            MarginalCrossParams {
+                take_fraction: dec_str("-0.1"),
+                ..valid_params
+            },
+            MarginalCrossParams {
+                take_fraction: dec_str("1.01"),
+                ..valid_params
+            },
+            MarginalCrossParams {
+                max_base: Decimal::ZERO,
+                ..valid_params
+            },
+            MarginalCrossParams {
+                min_base: dec_str("-0.1"),
+                ..valid_params
+            },
+            MarginalCrossParams {
+                min_base: dec_str("10.1"),
+                ..valid_params
+            },
+            MarginalCrossParams {
+                step_base: Decimal::ZERO,
+                ..valid_params
+            },
+            MarginalCrossParams {
+                buy_tick: Decimal::ZERO,
+                ..valid_params
+            },
+            MarginalCrossParams {
+                sell_tick: dec_str("-0.01"),
+                ..valid_params
+            },
+            MarginalCrossParams {
+                buy_fee_bps: dec_str("-10000"),
+                ..valid_params
+            },
+        ];
+        for bad in bad_param_cases {
+            assert!(
+                crossable_marginal_depth(
+                    &valid_asks,
+                    &valid_bids,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    &bad
+                )
+                .is_err()
+            );
+            assert!(crossable_marginal_depth(&[], &[], Decimal::ONE, Decimal::ONE, &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn marginal_cross_serde_preserves_exact_decimals_and_denies_unknown_fields() {
+        let params = base_params();
+        let json = serde_json::to_string(&params).unwrap();
+        let decoded: MarginalCrossParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, params);
+
+        let unknown = format!("{},\"extra\":\"1\"}}", json.trim_end_matches('}'));
+        assert!(serde_json::from_str::<MarginalCrossParams>(&unknown).is_err());
+
+        let quote = crossable_marginal_depth(
+            &[lvl("100.00", "1")],
+            &[lvl("100.30", "1")],
+            Decimal::ONE,
+            Decimal::ONE,
+            &params,
+        )
+        .unwrap()
+        .unwrap();
+        let quote_json = serde_json::to_string(&quote).unwrap();
+        let quote_value: serde_json::Value = serde_json::from_str(&quote_json).unwrap();
+        assert_eq!(
+            quote_value["base_quantity"]
+                .as_str()
+                .and_then(|s| s.parse::<Decimal>().ok()),
+            Some(quote.base_quantity)
+        );
+        assert_eq!(
+            quote_value["buy_limit_price"]
+                .as_str()
+                .and_then(|s| s.parse::<Decimal>().ok()),
+            Some(quote.buy_limit_price)
+        );
+        assert_eq!(quote_value["buy_levels_used"].as_u64(), Some(1));
+    }
+}
