@@ -278,7 +278,7 @@ class RthAntPreregToolTests(unittest.TestCase):
             ts_cnf.write_text(
                 "[tsa]\ndefault_tsa = tsa_config1\n\n[tsa_config1]\n"
                 f"dir = {root}\nserial = {serial}\nsigner_cert = {leaf_cert}\nsigner_key = {leaf_key}\n"
-                "default_policy = 1.2.3.4.1\ndigests = sha256\nclock_precision_digits = 0\nordering = yes\nsigner_digest = sha256\n",
+                "default_policy = 1.2.3.4.1\ndigests = sha256\naccuracy = millisecs:1\nclock_precision_digits = 0\nordering = yes\nsigner_digest = sha256\n",
                 encoding="utf-8",
             )
             subprocess.run(

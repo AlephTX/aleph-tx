@@ -868,7 +868,7 @@ class OosValidationGateTests(unittest.TestCase):
             f"signer_key = {leaf_key}\n"
             "default_policy = 1.2.3.4.1\n"
             "digests = sha256\n"
-            "clock_precision_digits = 0\n"
+            "accuracy = millisecs:1\nclock_precision_digits = 0\n"
             "ordering = yes\n"
             "signer_digest = sha256\n",
             encoding="utf-8",
@@ -915,6 +915,18 @@ class OosValidationGateTests(unittest.TestCase):
             capture_output=True,
         )
 
+    def test_rfc3161_fraction_and_signed_accuracy(self):
+        from scripts.run_oos_validation_gate import _openssl_witness_bounds_ms as bounds
+
+        def reply(frac, accuracy):
+            return f"Status: Granted.\nTime stamp: Jan 01 00:00:00{frac} 1970 GMT\nAccuracy: {accuracy}\n"
+
+        self.assertEqual(bounds(reply(".123000001", "unspecified seconds, unspecified millis, 0x01 micros")), (123, 124))
+        self.assertEqual(bounds(reply(".999875", "0x02 seconds, 0x015E millis, 0x7D micros")), (999, 3350))
+        self.assertEqual(bounds(reply(".999876", "0x02 seconds, 0x015E millis, 0x7D micros")), (999, 3351))
+        self.assertIsNone(bounds(reply("", "unspecified")))
+        self.assertIsNone(bounds(reply("", "unspecified seconds, 0x03E8 millis, unspecified micros")))
+
     def test_verify_rfc3161_witness_enforces_ca_digest_base64_and_timestamp_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -944,11 +956,11 @@ class OosValidationGateTests(unittest.TestCase):
             self.assertIsInstance(ts_ms, int)
             self.assertEqual(detail, "verified_rfc3161_tsa_witness")
 
-            # Boundary equality witness_time_ms == decision_start_ms passes; -1 fails.
+            # Equality at the latest creation time passes.
             ok_eq, ts_eq, _ = verify_rfc3161_witness(
                 witness,
                 expected_prereg_sha256=manifest_sha,
-                decision_start_ms=ts_ms,
+                decision_start_ms=ts_ms + 1,
                 trusted_ca_path=ca_cert,
             )
             self.assertTrue(ok_eq)
@@ -957,7 +969,7 @@ class OosValidationGateTests(unittest.TestCase):
             ok_late, ts_late, late_reason = verify_rfc3161_witness(
                 witness,
                 expected_prereg_sha256=manifest_sha,
-                decision_start_ms=ts_ms - 1,
+                decision_start_ms=ts_ms,
                 trusted_ca_path=ca_cert,
             )
             self.assertFalse(ok_late)
@@ -1129,6 +1141,16 @@ class OosValidationGateTests(unittest.TestCase):
             self.assertFalse(late_rep["provenance"]["checks"]["independent_preregistration_witness_verified"])
             self.assertIsNone(late_rep["provenance"]["witness_time_ms"])
 
+    def test_w15_replay_requires_each_sealed_segment_exactly_once(self):
+        from scripts.run_oos_validation_gate import _sealed_inputs_match_seal_segments as matches
+
+        a, b = "a" * 64, "b" * 64
+        seal = {"run/part-1": a, "run/part-2": b}
+        self.assertTrue(matches({"part-1": a, "part-2": b}, seal))
+        self.assertFalse(matches({"part-1": a}, seal))
+        self.assertFalse(matches({"part-1": a, "run/part-1": a}, seal))
+        self.assertFalse(matches({"../run/part-1": a}, {"../run/part-1": a}))
+
     def test_w15_rwa_formal_replay_receipt_end_to_end_and_tamper_checks(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         start_ms = MON_RTH_START_MS
@@ -1233,12 +1255,20 @@ class OosValidationGateTests(unittest.TestCase):
                 ],
             ), patch("sys.stdout", new_callable=io.StringIO):
                 rc_ok = cli_main()
-            self.assertEqual(rc_ok, 0)
+            self.assertEqual(rc_ok, 2)
             rep_ok = json.loads(gate_out.read_text(encoding="utf-8"))
-            self.assertEqual(rep_ok["verdict"], "GO_HEDGED")
-            self.assertIs(rep_ok["formal_admission"], True)
+            self.assertEqual(rep_ok["verdict"], "FORMAL_WITHHELD")
+            self.assertEqual(rep_ok["diagnostic_verdict"], "GO_HEDGED")
+            self.assertIs(rep_ok["formal_admission"], False)
             self.assertIs(rep_ok["receipt_verified"], True)
             self.assertTrue(all(rep_ok["receipt_checks"].values()))
+
+            shifted_seal = json.loads(seal_path.read_text())
+            shifted_seal.update(decision_start_ms=start_ms + 1, decision_end_ms=end_ms + 1)
+            from scripts.run_oos_validation_gate import _verify_w15_rwa_formal_receipt
+            ok, checks = _verify_w15_rwa_formal_receipt(summary, seal_receipt=shifted_seal, repo_root=repo_root)
+            self.assertFalse(ok)
+            self.assertFalse(checks["supplied_seal_bounds_consistent"])
 
             # Tamper payload, method hash, segment hash, and 10h window -> NO_GO (exit 1)
             for label, mutator, failed_check in (
@@ -1342,7 +1372,7 @@ class OosValidationGateTests(unittest.TestCase):
             self.assertEqual(rc_thr, 2)
             self.assertEqual(json.loads(gate_out.read_text(encoding="utf-8"))["reason"], "formal_threshold_must_be_20")
 
-            # Valid formal receipt with failing economics -> formal_admission=True, verdict=NO_GO, exit 1
+            # A losing v1 summary also keeps its diagnostic result.
             nogo_summary = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-15.0)
             nogo_summary["formal_replay_receipt"] = build_formal_replay_receipt(
                 nogo_summary,
@@ -1370,10 +1400,11 @@ class OosValidationGateTests(unittest.TestCase):
                 ],
             ), patch("sys.stdout", new_callable=io.StringIO):
                 rc_nogo = cli_main()
-            self.assertEqual(rc_nogo, 1)
+            self.assertEqual(rc_nogo, 2)
             rep_nogo = json.loads(gate_out.read_text(encoding="utf-8"))
-            self.assertEqual(rep_nogo["verdict"], "NO_GO")
-            self.assertIs(rep_nogo["formal_admission"], True)
+            self.assertEqual(rep_nogo["verdict"], "FORMAL_WITHHELD")
+            self.assertEqual(rep_nogo["diagnostic_verdict"], "NO_GO")
+            self.assertIs(rep_nogo["formal_admission"], False)
             self.assertIs(rep_nogo["receipt_verified"], True)
 
             # Ambiguous basename across two sealed dirs -> invalid_formal_replay_receipt (exit 1)

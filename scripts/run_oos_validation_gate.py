@@ -241,7 +241,7 @@ def _verify_dual_source_continuity(
     )
 
 
-def _parse_openssl_ts_timestamp_ms(reply_text: str) -> int | None:
+def _openssl_witness_bounds_ms(reply_text: str) -> tuple[int, int] | None:
     status_lines = [line.split("Status:", 1)[1].strip() for line in reply_text.splitlines() if line.startswith("Status:")]
     if len(status_lines) != 1 or not status_lines[0].startswith("Granted"):
         return None
@@ -264,8 +264,27 @@ def _parse_openssl_ts_timestamp_ms(reply_text: str) -> int | None:
         )
     except ValueError:
         return None
-    frac_ms = int((frac_s + "000")[:3]) if frac_s else 0
-    return int(dt.timestamp()) * 1000 + frac_ms
+    # RFC 3161 §2.4.2 defines the latest creation time as genTime + accuracy.
+    # OpenSSL displays absent components as "unspecified" and present ones in hex.
+    accuracy_rows = [line.removeprefix("Accuracy:").strip() for line in reply_text.splitlines()
+                     if line.startswith("Accuracy:")]
+    if len(accuracy_rows) != 1:
+        return None
+    component = r"(unspecified|0x[0-9a-fA-F]+)"
+    match = re.fullmatch(rf"{component} seconds, {component} millis, {component} micros", accuracy_rows[0])
+    if match is None or all(part == "unspecified" for part in match.groups()):
+        return None
+    sec, ms, us = (0 if part == "unspecified" else int(part, 16) for part in match.groups())
+    if any(value > 999 or (value == 0 and part != "unspecified")
+           for value, part in zip((ms, us), match.groups()[1:])):
+        return None
+    frac = frac_s or ""
+    frac_us = int(frac[:6].ljust(6, "0"))
+    # Preserve sub-microsecond precision at an integer-millisecond decision boundary.
+    round_up_us = any(digit != "0" for digit in frac[6:])
+    base_ms = int(dt.timestamp()) * 1000
+    upper_us = frac_us + round_up_us + sec * 1_000_000 + ms * 1000 + us
+    return base_ms + frac_us // 1000, base_ms + (upper_us + 999) // 1000
 
 
 def verify_rfc3161_witness(
@@ -339,11 +358,12 @@ def verify_rfc3161_witness(
 
     if text_proc.returncode != 0:
         return (False, None, "openssl_ts_reply_text_failed")
-    witness_time_ms = _parse_openssl_ts_timestamp_ms(text_proc.stdout)
-    if witness_time_ms is None:
-        return (False, None, "unparseable_witness_timestamp")
-    if witness_time_ms > decision_start_ms:
-        return (False, None, f"witness_after_decision_start:{witness_time_ms}>{decision_start_ms}")
+    bounds = _openssl_witness_bounds_ms(text_proc.stdout)
+    if bounds is None:
+        return (False, None, "unresolved_witness_timestamp_or_accuracy")
+    witness_time_ms, upper_ms = bounds
+    if upper_ms > decision_start_ms:
+        return (False, None, f"witness_after_decision_start:{upper_ms}>{decision_start_ms}")
     return (True, witness_time_ms, "verified_rfc3161_tsa_witness")
 
 
@@ -773,31 +793,29 @@ def evaluate_w15_rwa_gate(
 
 
 def _sealed_inputs_match_seal_segments(sealed_inputs: Any, seal_segments: Any) -> bool:
-    if not isinstance(sealed_inputs, dict) or not sealed_inputs:
-        return False
-    if not all(isinstance(k, str) and bool(k) and _is_sha256(v) for k, v in sealed_inputs.items()):
-        return False
-    if not isinstance(seal_segments, dict) or not seal_segments:
-        return False
-    if not all(isinstance(k, str) and bool(k) and _is_sha256(v) for k, v in seal_segments.items()):
-        return False
-
-    for inp_key, inp_sha in sealed_inputs.items():
-        if inp_key.startswith("/") or inp_key.endswith("/") or ".." in inp_key.split("/"):
+    for mapping in (sealed_inputs, seal_segments):
+        if not isinstance(mapping, dict) or not mapping:
             return False
-        if inp_key in seal_segments:
-            if seal_segments[inp_key] != inp_sha:
+        for name, digest in mapping.items():
+            if (not isinstance(name, str) or any(p in ("", ".", "..") for p in name.split("/"))
+                    or not _is_sha256(digest)):
                 return False
-            continue
-        if "/" not in inp_key:
-            matches = [sk for sk in seal_segments if sk.rsplit("/", 1)[-1] == inp_key]
+
+    if len(sealed_inputs) != len(seal_segments):
+        return False
+    matched = set()
+    for name, digest in sealed_inputs.items():
+        if name in seal_segments:
+            key = name
         else:
-            matches = [
-                sk for sk in seal_segments
-                if sk.endswith("/" + inp_key) or inp_key.endswith("/" + sk)
-            ]
-        if len(matches) != 1 or seal_segments[matches[0]] != inp_sha:
+            matches = [key for key in seal_segments
+                       if key.endswith("/" + name) or name.endswith("/" + key)]
+            if len(matches) != 1:
+                return False
+            key = matches[0]
+        if key in matched or seal_segments[key] != digest:
             return False
+        matched.add(key)
     return True
 
 
@@ -821,6 +839,14 @@ def _verify_w15_rwa_formal_receipt(
     d_start = receipt.get("decision_start_ms")
     d_end = receipt.get("decision_end_ms")
     exact_10h = bool(_is_pos_int(d_start) and _is_pos_int(d_end) and (d_end - d_start) == TEN_HOURS_MS)
+
+    # Some seal formats also record their scoring boundaries. Compare both when supplied.
+    seal = seal_receipt if isinstance(seal_receipt, dict) else {}
+    bounds_in_seal = "decision_start_ms" in seal or "decision_end_ms" in seal
+    seal_bounds_ok = not bounds_in_seal or (
+        _is_pos_int(seal.get("decision_start_ms")) and _is_pos_int(seal.get("decision_end_ms"))
+        and (seal["decision_start_ms"], seal["decision_end_ms"]) == (d_start, d_end)
+    )
 
     frozen_map = receipt.get("frozen_method_sha256")
     method_ok = isinstance(frozen_map, dict) and set(frozen_map.keys()) == set(FROZEN_RWA_METHOD_FILES)
@@ -855,6 +881,7 @@ def _verify_w15_rwa_formal_receipt(
     checks = {
         "formal_replay_receipt_schema_ok": schema_ok,
         "exact_10h_decision_window": exact_10h,
+        "supplied_seal_bounds_consistent": seal_bounds_ok,
         "frozen_method_hashes_verified": method_ok,
         "sealed_input_hashes_verified": sealed_input_ok,
         "payload_sha256_verified": payload_ok,
@@ -923,14 +950,17 @@ def run_w15_rwa_cli(
                     )
                     exit_code = 1
                 else:
+                    # The v1 receipt is generated after replay. It can establish internal
+                    # consistency, but it carries no independently registered window or method.
                     report.update(
-                        formal_admission=True,
-                        verdict=economics["verdict"],
+                        verdict="FORMAL_WITHHELD",
+                        reason="missing_independent_registered_replay_contract",
+                        diagnostic_verdict=economics["verdict"],
                         arms=economics["arms"],
                         receipt_verified=True,
                         receipt_checks=receipt_checks,
                     )
-                    exit_code = 0 if economics["verdict"] != "NO_GO" else 1
+                    exit_code = 2
     else:
         economics = evaluate_w15_rwa_gate(summary, max_cost_per_million=threshold)
         report.update(verdict="DIAGNOSTIC_ONLY", diagnostic_verdict=economics["verdict"], arms=economics["arms"])
