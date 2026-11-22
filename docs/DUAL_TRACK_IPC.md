@@ -24,14 +24,14 @@ exchange slot table across Go (`feeder/exchanges/common.go`), Rust
 
 | Slot ID | Venue / Domain | Config Section | Notes |
 | --- | --- | --- | --- |
-| `1` | Hyperliquid (Core) | `[hyperliquid]` | Multiplexed with `[entropy]` and `[tradexyz]` over one WebSocket per `ws_url` |
+| `1` | Hyperliquid (Core) | `[hyperliquid]` | Multiplexed with `[entropy]` and `[tradexyz]` over one WebSocket per `ws_url`; publishes BBO + top-5 `aleph-depth` |
 | `2` | Lighter (Core) | `[lighter]` | Private account stats keep single-symbol ABI; extra public BBOs use `feeder_public_symbols` |
 | `3`..`5` | Legacy reserved | — | Preserved ABI slots (`EdgeX`, `01`, `Backpack` in `legacy/v3_archive/`) |
 | `6` | Binance USD-M | `[binance]` | `bookTicker` lead-lag shield & fair-value reference |
 | `7` | Arcus | `[arcus]` | `l2Orderbook` (`nLevels: 20`) BBO + top-5 `aleph-depth` |
 | `8` | Lighter Robinhood | `[lighter_robinhood]` | Independent `wss://api.rh.lighter.xyz/stream` public BBO + top-5 `aleph-depth` |
-| `9` | Entropy (`io:*`) | `[entropy]` | HIP-3 RWA/perp coins (`io:NVDA`, `io:SNDK`, etc.) isolated from Core & TradeXYZ |
-| `10` | TradeXYZ (`xyz:*`) | `[tradexyz]` | HIP-3 RWA/perp coins (`xyz:NVDA`, `xyz:SNDK`, etc.) isolated from Core & Entropy |
+| `9` | Entropy (`io:*`) | `[entropy]` | HIP-3 RWA/perp coins (`io:NVDA`, `io:SNDK`, etc.) BBO + top-5 `aleph-depth`, isolated from Core & TradeXYZ |
+| `10` | TradeXYZ (`xyz:*`) | `[tradexyz]` | HIP-3 RWA/perp coins (`xyz:NVDA`, `xyz:SNDK`, etc.) BBO + top-5 `aleph-depth`, isolated from Core & Entropy |
 | `11` | Extended | — | Reserved slot |
 
 In `[strategy]`, `external_reference_exchanges = [6, 7, 8, 9, 10]` optionally
@@ -46,9 +46,7 @@ identity under acquire-release seqlock barriers.
 
 ## Depth and book continuity
 
-The Lighter Core (`2`), Lighter Robinhood (`8`), and Arcus (`7`) public adapters
-publish top-5 levels into `aleph-depth` (`ShmDepthSnapshot`: 256 bytes, C layout with
-64-byte alignment) alongside `aleph-matrix` (`ShmBboMessage`: 64 bytes).
+The Hyperliquid Core (`1`), Lighter Core (`2`), Arcus (`7`), Lighter Robinhood (`8`), Entropy (`9`), and TradeXYZ (`10`) public adapters publish top-5 levels into `aleph-depth` (`ShmDepthSnapshot`: 256 bytes, C layout with 64-byte alignment) alongside `aleph-matrix` (`ShmBboMessage`: 64 bytes).
 
 - **Delta sequence continuity**: `lighterBook.apply` validates `nonce`,
   `begin_nonce` (`begin_nonce == previous nonce`), and monotonic

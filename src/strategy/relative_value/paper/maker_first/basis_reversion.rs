@@ -49,6 +49,9 @@ impl MakerBasisReversion {
                     .max_dislocation_bps
                     .is_none_or(|max| max > self.min_dislocation_bps && max <= Decimal::from(500))
                 && self.min_persist_ms.is_none_or(|ms| ms <= 60_000)
+                && (!self.use_quote_level_dislocation
+                    || self.min_persist_ms.is_none_or(|ms| ms == 0)
+                    || config.opening_max_levels == 1)
                 && (Decimal::ZERO..=Decimal::ONE).contains(&self.reversion_fraction),
             "invalid maker basis reversion policy"
         );
@@ -113,6 +116,16 @@ impl BasisReversionState {
         now: u64,
         observation: Option<(Decimal, [u64; 2])>,
     ) {
+        self.observe_with_quotes(policy, now, observation, None);
+    }
+
+    pub(super) fn observe_with_quotes(
+        &mut self,
+        policy: MakerBasisReversion,
+        now: u64,
+        observation: Option<(Decimal, [u64; 2])>,
+        quote_basis_bps: Option<[Decimal; 2]>,
+    ) {
         let Some((basis_bps, identity)) = observation else {
             self.reset();
             return;
@@ -157,12 +170,21 @@ impl BasisReversionState {
                 self.max_abs_dislocation_bps
                     .map_or(abs_dev, |prev| prev.max(abs_dev)),
             );
-            for (idx, side_disloc) in [mean - basis_bps, basis_bps - mean].into_iter().enumerate() {
-                if side_disloc >= policy.min_dislocation_bps {
-                    self.persist_since_ms[idx].get_or_insert(now);
-                } else {
-                    self.persist_since_ms[idx] = None;
+            let persist_dislocs = if policy.use_quote_level_dislocation {
+                quote_basis_bps.map(|[buy_q_bps, sell_q_bps]| [mean - buy_q_bps, sell_q_bps - mean])
+            } else {
+                Some([mean - basis_bps, basis_bps - mean])
+            };
+            if let Some(sides) = persist_dislocs {
+                for (idx, side_disloc) in sides.into_iter().enumerate() {
+                    if side_disloc >= policy.min_dislocation_bps {
+                        self.persist_since_ms[idx].get_or_insert(now);
+                    } else {
+                        self.persist_since_ms[idx] = None;
+                    }
                 }
+            } else {
+                self.persist_since_ms = [None; 2];
             }
         } else {
             self.persist_since_ms = [None; 2];
@@ -408,6 +430,54 @@ mod tests {
         assert_eq!(
             s.favorable_dislocation_bps(guarded, HedgeSide::Buy, 6_900),
             Err("basis_dislocation_above_max")
+        );
+    }
+
+    #[test]
+    fn quote_level_persistence_uses_quote_series_not_mid_series() {
+        let q_policy = MakerBasisReversion {
+            use_quote_level_dislocation: true,
+            min_persist_ms: Some(200),
+            ..policy()
+        };
+        let mut s = BasisReversionState::default();
+        for at in (1_000..=6_000).step_by(500) {
+            s.observe_with_quotes(
+                q_policy,
+                at,
+                Some((d("0.0"), [at; 2])),
+                Some([d("0.0"), d("0.0")]),
+            );
+        }
+
+        // Mid basis is -5 bps, but candidate buy quote basis is only -1 bps (< 3 bps): must NOT arm persistence!
+        s.observe_with_quotes(
+            q_policy,
+            6_100,
+            Some((d("-5.0"), [6_100; 2])),
+            Some([d("-1.0"), d("-1.0")]),
+        );
+        s.observe_with_quotes(
+            q_policy,
+            6_350,
+            Some((d("-5.0"), [6_350; 2])),
+            Some([d("-5.0"), d("-1.0")]),
+        );
+        assert_eq!(
+            s.favorable_quote_dislocation_bps(q_policy, HedgeSide::Buy, Some(d("-5.0")), 6_350),
+            Err("basis_dislocation_persist")
+        );
+
+        // Once quote dislocation sustains >= 200ms (even if mid is neutral 0 bps), persistence passes.
+        s.observe_with_quotes(
+            q_policy,
+            6_600,
+            Some((d("0.0"), [6_600; 2])),
+            Some([d("-5.0"), d("0.0")]),
+        );
+        assert!(
+            s.favorable_quote_dislocation_bps(q_policy, HedgeSide::Buy, Some(d("-5.0")), 6_600)
+                .is_ok()
         );
     }
 }

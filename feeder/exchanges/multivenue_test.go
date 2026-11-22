@@ -272,13 +272,26 @@ func TestHyperliquidWritesTop5DepthAndHandlesBBOInterleaving(t *testing.T) {
 		t.Fatalf("newer l2Book did not update depth: ok=%v %+v", ok, dSnapAfter)
 	}
 
-	// 4. Null side in bbo invalidates matrix BBO safely without wiping depth.
+	// 4. Null side or crossed BBO in bbo channel invalidates matrix BBO safely without wiping depth.
 	nullBbo := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726300,"bbo":[null,{"px":"145.10","sz":"1.0","n":1}]}}`)
 	if err := hl.handleMessageWithDepth(nullBbo, now, lastBbo, lastDepth); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); ok {
 		t.Fatal("null bbo side failed to invalidate matrix BBO")
+	}
+	if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); !ok {
+		t.Fatal("null bbo side unexpectedly wiped valid l2Book depth")
+	}
+	crossedBbo := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726350,"bbo":[{"px":"145.20","sz":"1.0","n":1},{"px":"145.10","sz":"1.0","n":1}]}}`)
+	if err := hl.handleMessageWithDepth(crossedBbo, now, lastBbo, lastDepth); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); ok {
+		t.Fatal("crossed bbo failed to invalidate matrix BBO")
+	}
+	if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); !ok {
+		t.Fatal("crossed bbo unexpectedly wiped valid l2Book depth")
 	}
 
 	// 5. Crossed l2Book invalidates both BBO and depth.

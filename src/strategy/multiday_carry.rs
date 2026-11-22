@@ -184,6 +184,7 @@ pub enum CarryExitReason {
     SoftDrawdownBrake,
     BasisDrawdownBreached,
     MissingFundingWitness,
+    InsufficientVolPrior,
     CampaignEnd,
 }
 
@@ -218,6 +219,8 @@ pub struct MultiDayCarryReport {
     pub exit_reason: CarryExitReason,
     #[serde(with = "rust_decimal::serde::str")]
     pub vol_scale_applied: Decimal,
+    #[serde(default)]
+    pub vol_scale_insufficient: bool,
     #[serde(with = "rust_decimal::serde::str")]
     pub effective_leg_notional_usd: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -250,20 +253,34 @@ pub struct MultiDayCarryReport {
     pub ten_hour_checkpoints: Vec<TenHourCarryCheckpoint>,
 }
 
+enum CausalVolScale {
+    Disabled,
+    Applied(Decimal),
+    InsufficientSamples,
+}
+
 fn causal_vol_scale(
     causal_prior: &BTreeMap<u64, Decimal>,
     target_prior_rate_vol_bps: Option<Decimal>,
-) -> Decimal {
+) -> Result<CausalVolScale> {
     let Some(target_bps) = target_prior_rate_vol_bps else {
-        return Decimal::ONE;
+        return Ok(CausalVolScale::Disabled);
     };
-    let rates_bps: Vec<f64> = causal_prior
-        .values()
-        .filter_map(|r| (*r * BPS).to_f64())
-        .collect();
+    let target = target_bps
+        .to_f64()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("target_prior_rate_vol_bps must be finite and positive"))?;
+    let mut rates_bps = Vec::with_capacity(causal_prior.len());
+    for r in causal_prior.values() {
+        let val = (*r * BPS)
+            .to_f64()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("non-finite causal prior settlement rate"))?;
+        rates_bps.push(val);
+    }
     let n = rates_bps.len();
     if n < 2 {
-        return Decimal::ONE;
+        return Ok(CausalVolScale::InsufficientSamples);
     }
     let mean_bps = rates_bps.iter().sum::<f64>() / n as f64;
     let var_bps = rates_bps
@@ -275,13 +292,15 @@ fn causal_vol_scale(
         .sum::<f64>()
         / (n - 1) as f64;
     let obs_std_bps = var_bps.max(0.0).sqrt();
-    let target = target_bps.to_f64().unwrap_or(0.0);
     // Strict ceiling of 1.0: never amplify leverage during calm periods.
-    if obs_std_bps > target && target > 0.0 {
+    if obs_std_bps > target {
         let clamped = (target / obs_std_bps).clamp(0.10, 1.0);
-        Decimal::new((clamped * 1_000_000.0).round() as i64, 6)
+        Ok(CausalVolScale::Applied(Decimal::new(
+            (clamped * 1_000_000.0).round() as i64,
+            6,
+        )))
     } else {
-        Decimal::ONE
+        Ok(CausalVolScale::Applied(Decimal::ONE))
     }
 }
 
@@ -404,7 +423,12 @@ impl MultiDayCarryScenario {
         let campaign_ms = self.config.end_ms - self.config.decision_start_ms;
         let fixed_infra_usd = self.config.fixed_overhead_usd_per_day * Decimal::from(campaign_ms)
             / Decimal::from(DAY_MS);
-        let vol_scale = causal_vol_scale(&causal_prior, self.config.target_prior_rate_vol_bps);
+        let (vol_scale, vol_scale_insufficient) =
+            match causal_vol_scale(&causal_prior, self.config.target_prior_rate_vol_bps)? {
+                CausalVolScale::Disabled => (Decimal::ONE, false),
+                CausalVolScale::Applied(s) => (s, false),
+                CausalVolScale::InsufficientSamples => (Decimal::ZERO, true),
+            };
         let effective_leg_notional_usd = self.config.target_leg_notional_usd * vol_scale;
 
         let build_flat_report =
@@ -420,6 +444,7 @@ impl MultiDayCarryScenario {
                 entered: false,
                 exit_reason: reason,
                 vol_scale_applied: vol_scale,
+                vol_scale_insufficient,
                 effective_leg_notional_usd,
                 base_quantity: Decimal::ZERO,
                 capital_usd: self.config.capital_usd,
@@ -440,6 +465,14 @@ impl MultiDayCarryScenario {
                 missing_checkpoints: 0,
                 ten_hour_checkpoints: Vec::new(),
             };
+
+        if vol_scale_insufficient {
+            return Ok(build_flat_report(
+                0,
+                CarryExitReason::InsufficientVolPrior,
+                "vol_scale_insufficient",
+            ));
+        }
 
         if forecast_10h_bps.abs() < self.config.min_forecast_bps {
             return Ok(build_flat_report(0, CarryExitReason::NoSignal, "no_signal"));
@@ -627,6 +660,7 @@ impl MultiDayCarryScenario {
             entered: true,
             exit_reason,
             vol_scale_applied: vol_scale,
+            vol_scale_insufficient,
             effective_leg_notional_usd,
             base_quantity: base_qty,
             capital_usd: self.config.capital_usd,
@@ -1006,5 +1040,17 @@ mod tests {
             sc.config.soft_drawdown_brake_fraction = Some(bad_frac);
             assert!(sc.evaluate().is_err());
         }
+    }
+
+    #[test]
+    fn vol_scaling_with_insufficient_prior_samples_blocks_entry_explicitly() {
+        let mut sc = scenario("2.0"); // scenario helper seeds only 1 prior settlement
+        sc.config.target_prior_rate_vol_bps = Some(d("1.0"));
+        let rep = sc.evaluate().unwrap();
+        assert!(!rep.entered);
+        assert!(rep.vol_scale_insufficient);
+        assert_eq!(rep.vol_scale_applied, Decimal::ZERO);
+        assert_eq!(rep.exit_reason, CarryExitReason::InsufficientVolPrior);
+        assert_eq!(rep.status, "vol_scale_insufficient");
     }
 }

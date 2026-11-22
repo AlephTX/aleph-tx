@@ -320,7 +320,7 @@ func (h *Hyperliquid) handleBBO(
 	bidPx, bidSz, bidOK := parsePositiveLevel(*ev.BBO[0])
 	askPx, askSz, askOK := parsePositiveLevel(*ev.BBO[1])
 	if !bidOK || !askOK || bidPx >= askPx {
-		h.invalidateTarget(target)
+		h.invalidateBBO(target)
 		lastBboPub[target] = ev.Time
 		return nil
 	}

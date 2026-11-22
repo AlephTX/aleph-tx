@@ -1763,15 +1763,28 @@ impl Replay<'_> {
             if !self.feed_online || !self.usable[0] || !self.usable[1] {
                 self.basis_reversion.observe(policy, now, None);
             } else if let Some(b) = self.pair_books(now) {
-                let maker = b[self.maker()].mid();
+                let maker_book = b[self.maker()];
+                let maker = maker_book.mid();
                 let hedge = b[1 - self.maker()].mid();
-                self.basis_reversion.observe(
+                let quote_basis_bps = if policy.use_quote_level_dislocation && hedge > Decimal::ZERO
+                {
+                    let buy_touch = maker_book.side(opposite(HedgeSide::Buy))[0].price;
+                    let sell_touch = maker_book.side(opposite(HedgeSide::Sell))[0].price;
+                    Some([
+                        (buy_touch - hedge) / hedge * BPS,
+                        (sell_touch - hedge) / hedge * BPS,
+                    ])
+                } else {
+                    None
+                };
+                self.basis_reversion.observe_with_quotes(
                     policy,
                     now,
                     Some((
                         (maker - hedge) / hedge * BPS,
                         [b[0].timestamp_ms, b[1].timestamp_ms],
                     )),
+                    quote_basis_bps,
                 );
             } else if self.basis_reversion.exceeds_gap(policy, now) {
                 self.basis_reversion.observe(policy, now, None);
