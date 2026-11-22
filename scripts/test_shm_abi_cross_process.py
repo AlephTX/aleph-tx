@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -299,6 +300,104 @@ class ShmAbiCrossProcessTests(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(bad_file.returncode, 0)
+
+    def test_concurrent_go_writer_and_rust_reader_stress_zero_torn_reads(self) -> None:
+        matrix, depth = self._shm_paths("stress")
+        ready = matrix.parent / "ready"
+        stop = matrix.parent / "stop"
+
+        proc = subprocess.Popen(
+            [
+                str(self._go_bin),
+                "-matrix",
+                str(matrix),
+                "-depth",
+                str(depth),
+                "-mode",
+                "stress",
+                "-iterations",
+                "20000",
+                "-ready-file",
+                str(ready),
+                "-stop-file",
+                str(stop),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not ready.exists():
+                rc = proc.poll()
+                if rc is not None:
+                    stdout, stderr = proc.communicate(timeout=2)
+                    self.fail(
+                        f"shm-verify exited early with code {rc} before ready file appeared\n"
+                        f"stdout: {stdout}\nstderr: {stderr}"
+                    )
+                if time.monotonic() >= deadline:
+                    self.fail("timed out waiting for shm-verify ready file")
+                time.sleep(0.01)
+
+            rust_proc = subprocess.run(
+                [
+                    str(self._rust_bin),
+                    "--matrix",
+                    str(matrix),
+                    "--depth",
+                    str(depth),
+                    "--symbol",
+                    "1001",
+                    "--exchange",
+                    "1",
+                    "--stress-reads",
+                    "5000",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            payload = json.loads(rust_proc.stdout)
+            self.assertEqual(payload["symbol_id"], 1001)
+            self.assertEqual(payload["exchange_id"], 1)
+            self.assertEqual(payload["reads_requested"], 5000)
+            self.assertGreaterEqual(payload["valid_bbo_reads"], 2500)
+            self.assertGreaterEqual(payload["valid_depth_reads"], 2500)
+            self.assertGreaterEqual(payload["bbo_updates_seen"], 2)
+            self.assertGreaterEqual(payload["depth_updates_seen"], 2)
+            self.assertGreater(payload["bbo_max_ts"], payload["bbo_min_ts"])
+            self.assertGreater(payload["depth_max_ts"], payload["depth_min_ts"])
+            self.assertLessEqual(payload["bbo_exhausted_spins"] * 100, 5000)
+            self.assertLessEqual(payload["depth_exhausted_spins"] * 100, 5000)
+
+            stop.touch()
+            stdout, stderr = proc.communicate(timeout=10)
+            self.assertEqual(
+                proc.returncode,
+                0,
+                msg=(
+                    f"shm-verify failed with code {proc.returncode}\n"
+                    f"stdout: {stdout}\nstderr: {stderr}"
+                ),
+            )
+        finally:
+            stop.touch(exist_ok=True)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
 
 
 if __name__ == "__main__":
