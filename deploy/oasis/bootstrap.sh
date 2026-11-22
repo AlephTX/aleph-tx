@@ -49,12 +49,12 @@ BASHRC
   fi
 fi
 zsh -n "$zshrc"
-rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
 if ! rustup show active-toolchain >/dev/null 2>&1; then
-  rustup default 1.95.0
+  rustup default 1.100.0
 fi
 printf '\nDevelopment tools:\n'
 go version
-rustup run 1.95.0 rustc --version
+rustup run 1.100.0 rustc --version
 zsh --version
 printf 'Login shell: %s\n' "$(getent passwd "$(id -un)" | cut -d: -f7)"

@@ -1,12 +1,12 @@
 module github.com/AlephTX/aleph-tx/feeder
 
-go 1.25.0
+go 1.27.4
 
 require (
-	github.com/elliottech/lighter-go v1.0.12
-	github.com/pelletier/go-toml/v2 v2.2.4
-	github.com/tidwall/gjson v1.18.0
-	nhooyr.io/websocket v1.8.17
+	github.com/coder/websocket v1.8.15
+	github.com/elliottech/lighter-go v1.0.13
+	github.com/pelletier/go-toml/v2 v2.4.3
+	github.com/tidwall/gjson v1.20.5
 )
 
 require (
@@ -21,7 +21,7 @@ require (
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe // indirect
 	github.com/tidwall/match v1.1.1 // indirect
-	github.com/tidwall/pretty v1.2.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	github.com/tidwall/pretty v1.3.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )

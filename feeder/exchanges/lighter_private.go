@@ -13,8 +13,8 @@ import (
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	"github.com/coder/websocket"
 	"github.com/tidwall/gjson"
-	"nhooyr.io/websocket"
 )
 
 const orderDetailCapacity = 4096

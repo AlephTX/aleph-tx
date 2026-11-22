@@ -10,7 +10,7 @@ import (
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func TestBuildBinanceStreamURLUsesPublicCombinedStream(t *testing.T) {

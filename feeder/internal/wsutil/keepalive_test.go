@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func TestKeepaliveSendsApplicationHeartbeatAndClosesStalledPeer(t *testing.T) {

@@ -32,7 +32,7 @@ impl HyperliquidSigner {
     }
 
     pub fn address(&self) -> String {
-        let public_key = self.key.verifying_key().to_encoded_point(false);
+        let public_key = self.key.verifying_key().to_sec1_point(false);
         let digest = Keccak256::digest(&public_key.as_bytes()[1..]);
         format!("0x{}", hex::encode(&digest[12..]))
     }
@@ -47,10 +47,7 @@ impl HyperliquidSigner {
     ) -> Result<L1Signature> {
         let hash = action_hash(action, vault_address, nonce, expires_after)?;
         let digest = l1_digest(hash, network);
-        let (signature, recovery) = self
-            .key
-            .sign_prehash_recoverable(&digest)
-            .map_err(|_| anyhow::anyhow!("L1 signing failed"))?;
+        let (signature, recovery) = self.key.sign_prehash_recoverable(&digest);
         let bytes = signature.to_bytes();
         Ok(L1Signature {
             r: format!("0x{}", hex::encode(&bytes[..32]).trim_start_matches('0')),

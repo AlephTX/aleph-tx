@@ -11,8 +11,8 @@ import (
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
-	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wsjson"
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 func TestArcusHandleMessageWritesBBOAndDepthAndInvalidates(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
 	"github.com/AlephTX/aleph-tx/feeder/shm"
+	"github.com/coder/websocket"
 	"github.com/tidwall/gjson"
-	"nhooyr.io/websocket"
 )
 
 // LighterAccountStats connects to Lighter WebSocket for account statistics

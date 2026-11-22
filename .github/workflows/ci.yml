@@ -22,8 +22,8 @@ jobs:
           cache-dependency-path: feeder/go.sum
       - name: Rust toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.95.0
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.100.0
       - run: make fmt-check
       - run: make check
       - run: make test

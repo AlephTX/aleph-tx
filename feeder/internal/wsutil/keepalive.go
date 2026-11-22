@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // StartKeepalive probes the peer without refreshing market data. An optional

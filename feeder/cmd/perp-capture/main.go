@@ -23,9 +23,9 @@ import (
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 	"github.com/tidwall/gjson"
-	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wsjson"
 )
 
 type record struct {
