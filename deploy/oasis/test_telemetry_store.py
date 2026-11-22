@@ -900,6 +900,7 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
                     f"ARCUS_API_{priv_tag}=" + "ab" * 32,
                     "HYPERLIQUID_ACCOUNT_ADDRESS=0x1111111111111111111111111111111111111111",
                     f"HYPERLIQUID_AGENT_{priv_tag}=" + "cd" * 32,
+                    "HYPERLIQUID_VAULT_ADDRESS=0x3333333333333333333333333333333333333333",
                     "LIGHTER_ACCOUNT_INDEX=77",
                     f"LIGHTER_{priv_tag}=" + "ef" * 40,
                     "LIGHTER_RH_ACCOUNT_INDEX=88",
@@ -910,7 +911,15 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
                 ]) + "\n",
                 encoding="utf-8",
             )
-            dst.write_text("ALEPH_MONITOR_CONTROL_TOKEN=keep-me-123\nALEPH_MONITOR_PORT=8765\n", encoding="utf-8")
+            dst.write_text(
+                "\n".join([
+                    "ALEPH_MONITOR_CONTROL_TOKEN=keep-me-123",
+                    "ALEPH_MONITOR_PORT=8765",
+                    "ALEPH_MONITOR_HL_XYZ_ADDRESS=0x9999999999999999999999999999999999999999",
+                    "ALEPH_MONITOR_HL_IO_ADDRESS=0x4444444444444444444444444444444444444444",
+                ]) + "\n",
+                encoding="utf-8",
+            )
             rendered = sync_monitor_env.sync_monitor_env_file(src, dst)
             mode = os.stat(dst).st_mode & 0o777
             self.assertEqual(mode, 0o600)
@@ -918,6 +927,10 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
             self.assertIn("ALEPH_MONITOR_LIGHTER_INDEX=77", rendered)
             self.assertIn("ALEPH_MONITOR_LIGHTER_RH_INDEX=88", rendered)
             self.assertIn("ALEPH_MONITOR_HL_ADDRESS=0x1111111111111111111111111111111111111111", rendered)
+            self.assertIn("ALEPH_MONITOR_HL_XYZ_ADDRESS=0x3333333333333333333333333333333333333333", rendered)
+            self.assertNotIn("0x9999999999999999999999999999999999999999", rendered)
+            self.assertIn("ALEPH_MONITOR_HL_IO_ADDRESS=0x4444444444444444444444444444444444444444", rendered)
+            self.assertEqual(rendered.count("ALEPH_MONITOR_HL_XYZ_ADDRESS="), 1)
             self.assertIn("ALEPH_MONITOR_ARCUS_ADDRESS=0x2222222222222222222222222222222222222222", rendered)
             self.assertIn("ALEPH_MONITOR_ARCUS_INDEX=2", rendered)
             self.assertIn("ALEPH_MONITOR_BULK_PUBKEY=FuueqefENiGEW6uMqZQgmwjzgpnb85EgUcZa5Em4PQh7", rendered)

@@ -36,7 +36,7 @@ sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
 sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts,sync_monitor_env}.py "$dest/"
 sudo -n install -m 0755 \
-  scripts/{capture_timing,archive_public_capture,inventory_public_sources,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner}.py \
+  scripts/{capture_timing,archive_public_capture,inventory_public_sources,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner,run_oos_validation_gate,rth_ant_prereg_tool,onboard_exchange_env,verify_venue_readiness}.py \
   "$dest/scripts/"
 sudo -n cp -R --no-preserve=ownership dashboard/dist/. "$dest/dashboard/"
 sudo -n chmod -R u=rwX,go=rX "$dest/dashboard"

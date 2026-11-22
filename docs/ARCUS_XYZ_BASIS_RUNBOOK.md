@@ -49,7 +49,12 @@ Expected environment variables in `/etc/aleph-tx/arcus_xyz_basis.env` (`chmod 64
 - `HYPERLIQUID_VAULT_ADDRESS` (optional subaccount / vault `0x` address; when set, orders, equity, and `xyz` positions route to the vault/subaccount while agent authorization is validated against the master wallet)
 - `HYPERLIQUID_AGENT_PRIVATE_KEY` (approved Hyperliquid agent secp256k1 hex key)
 
+To audit your unified `.env.all_exchanges` (zero secret values printed), split least-privilege runtime env files (`arcus_xyz_basis.env`, `live.env`, `monitor.env`), and run the read-only 7-venue readiness check:
+
 ```bash
+python3 scripts/onboard_exchange_env.py audit --env .env.all_exchanges
+python3 scripts/onboard_exchange_env.py split --env .env.all_exchanges --out-dir /tmp/aleph_env_split
+python3 scripts/verify_venue_readiness.py --monitor-env /tmp/aleph_env_split/monitor.env --live
 target/release/arcus_xyz_basis --canary-preflight /etc/aleph-tx/arcus_xyz_basis.toml --env /etc/aleph-tx/arcus_xyz_basis.env
 ```
 
@@ -62,11 +67,24 @@ Run strictly once per sealed capture window with zero parameter changes:
 1. **Monday US Equities RTH `Arcus ANT-USD <-> xyz:ANT` (`EXP-ARB-A2` + Leung-Li `35 bp` + `CRASH-IMP-01` `5%` brake)**:
 
 ```bash
+# Before decision_start (07:00 ET = 12:00 UTC), freeze prereg manifest:
+python3 scripts/rth_ant_prereg_tool.py prereg \
+  --rth-date 2026-11-23 \
+  --window-start-et 07:00 \
+  --output /tmp/monday_rth_prereg_manifest.json
+
+# After decision_end (17:00 ET = 22:00 UTC), seal completed capture segments & coverage:
+python3 scripts/rth_ant_prereg_tool.py seal \
+  --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
+  --capture-dirs ~/aleph-tx-lakehouse/research_captures/<MONDAY_RTH_CAPTURE_DIR> \
+  --output /tmp/monday_rth_seal_receipt.json
+
+# Run fail-closed 12-dimension OOS validation gate:
 python3 scripts/run_oos_validation_gate.py rth-ant \
   --capture-dirs ~/aleph-tx-lakehouse/research_captures/<MONDAY_RTH_CAPTURE_DIR> \
   --role monday_rth_oos \
-  --prereg-manifest <MONDAY_RTH_PREREG_MANIFEST.json> \
-  --seal-receipt <MONDAY_RTH_SEAL_RECEIPT.json> \
+  --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
+  --seal-receipt /tmp/monday_rth_seal_receipt.json \
   --output /tmp/rth_ant_oos_gate.json
 ```
 
@@ -116,6 +134,6 @@ sudo systemctl start aleph-tx-arcus-xyz.service
 ```
 
 Operational notes for live `aleph-tx-arcus-xyz.service`:
-- Transient REST polling and `CancelLease` renewal errors are tolerated up to `12` consecutive failed polls before cancelling open Arcus orders and failing closed; post-dispatch venue reconciliation retries up to `5` times with exponential backoff so transient network errors do not leave `BasisJournal` orphaned.
-- On `SIGTERM` (`systemctl stop` or dashboard emergency stop) / `SIGINT`, the runner cancels open Arcus orders, reconciles both venues with retry, appends `CleanShutdown`, and flushes `TelemetrySink` (`StrategySnapshot` + `HedgeFillRecord` for `hyperliquid_xyz` position deltas) before exit.
+- Transient REST polling and `CancelLease` renewal errors are tolerated up to `12` consecutive failed polls before cancelling open Arcus orders and failing closed; post-dispatch venue reconciliation requires authoritative per-leg terminal proof (`client_id`/`order_id` status + Arcus history/fills & HL clearinghouse watermark `hl_account_time_ms >= terminal_at_ms`), treating Arcus HTTP `202` as non-terminal and Hyperliquid `Resting` IOC as fatal so unresolved intents remain armed in `BasisJournal`.
+- On `SIGTERM` (`systemctl stop` or dashboard emergency stop) / `SIGINT`, the runner cancels open Arcus orders, checks open orders + positions on both venues via `classify_shutdown`, writes `CleanShutdown` ONLY when cancel succeeded and both venues are confirmed `0` open orders / `0` position (otherwise recording `ShutdownUnverified`, where `cancel_unknown` / `open_orders_remaining` stay sticky across subsequent restarts until resolved), and flushes `TelemetrySink` (`StrategySnapshot` + `HedgeFillRecord` using fill avg price when present).
 - Dashboard `/api/status`, `/api/alerts` (`arcus_live_failed` + telemetry/drawdown/imbalance gating), `/api/logs?unit=aleph-tx-arcus-xyz`, and the emergency stop button monitor `aleph-tx-arcus-xyz.service` without interfering when `inactive`.

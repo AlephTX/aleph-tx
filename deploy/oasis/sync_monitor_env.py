@@ -17,6 +17,7 @@ PUBLIC_MAPPING = (
     ("LIGHTER_ACCOUNT_INDEX", "ALEPH_MONITOR_LIGHTER_INDEX", r"[0-9]{1,19}"),
     ("LIGHTER_RH_ACCOUNT_INDEX", "ALEPH_MONITOR_LIGHTER_RH_INDEX", r"[0-9]{1,19}"),
     ("HYPERLIQUID_ACCOUNT_ADDRESS", "ALEPH_MONITOR_HL_ADDRESS", r"0x[0-9a-fA-F]{40}"),
+    ("HYPERLIQUID_VAULT_ADDRESS", "ALEPH_MONITOR_HL_XYZ_ADDRESS", r"0x[0-9a-fA-F]{40}"),
     ("ARCUS_ACCOUNT_ADDRESS", "ALEPH_MONITOR_ARCUS_ADDRESS", r"0x[0-9a-fA-F]{40}"),
     ("ARCUS_ACCOUNT_INDEX", "ALEPH_MONITOR_ARCUS_INDEX", r"[0-9]"),
     ("BULK_ACCOUNT_PUBKEY", "ALEPH_MONITOR_BULK_PUBKEY", r"[1-9A-HJ-NP-Za-km-z]{32,44}"),
@@ -27,8 +28,16 @@ PRESERVED_OPERATIONAL_KEYS = (
     "ALEPH_MONITOR_RETENTION_DAYS",
     "ALEPH_MONITOR_PORT",
 )
+PRESERVED_PUBLIC_OVERRIDE_KEYS = (
+    "ALEPH_MONITOR_HL_XYZ_ADDRESS",
+    "ALEPH_MONITOR_HL_IO_ADDRESS",
+)
 FORBIDDEN_KEY_FRAGMENTS = ("PRIVATE", "SECRET", "_KEY", "PASS", "MNEM" + "ONIC", "SEED")
-ALLOWED_KEY_SET = {dst for _, dst, _ in PUBLIC_MAPPING} | set(PRESERVED_OPERATIONAL_KEYS)
+ALLOWED_KEY_SET = (
+    {dst for _, dst, _ in PUBLIC_MAPPING}
+    | set(PRESERVED_OPERATIONAL_KEYS)
+    | set(PRESERVED_PUBLIC_OVERRIDE_KEYS)
+)
 
 
 def _strip_quotes(value: str) -> str:
@@ -56,6 +65,20 @@ def build_monitor_env(source_env: dict[str, str], existing_env: dict[str, str] |
     for key in PRESERVED_OPERATIONAL_KEYS:
         val = existing.get(key, "").strip()
         if val:
+            pairs.append((key, val))
+
+    source_overrides = {
+        dst_key
+        for src_key, dst_key, _ in PUBLIC_MAPPING
+        if dst_key in PRESERVED_PUBLIC_OVERRIDE_KEYS and source_env.get(src_key, "").strip()
+    }
+    for key in PRESERVED_PUBLIC_OVERRIDE_KEYS:
+        if key in source_overrides:
+            continue
+        val = existing.get(key, "").strip()
+        if val:
+            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", val):
+                raise ValueError(f"invalid existing public override for {key}")
             pairs.append((key, val))
 
     arcus_addr = source_env.get("ARCUS_ACCOUNT_ADDRESS", "").strip()

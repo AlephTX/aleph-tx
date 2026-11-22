@@ -46,9 +46,20 @@ monitor. Alerts never act on trading.
 
 The console's stop button sends `systemctl stop --no-block aleph-tx-live.service aleph-tx-arcus-xyz.service`; each strategy cancels open orders and reconciles positions on `SIGTERM` / `SIGINT`. A polkit rule allows user `aleph-tx` to stop those two units and nothing else; there is no start control. `install.sh` generates the control token once in `/etc/aleph-tx/monitor.env` (mode 0600). Read it with `sudo grep CONTROL_TOKEN /etc/aleph-tx/monitor.env`; the browser keeps it only for the tab session. Remove the line and restart the monitor to disable the button.
 
-## Add read-only positions
+## Add read-only positions and onboard credentials
 
-On Oasis, extract public-only identifiers directly from a single local `.env` without duplicating or copying any private keys using `deploy/oasis/sync_monitor_env.py`:
+Audit your unified local `.env` (no secrets printed) and split least-privilege files + public-only `monitor.env` (maps `HYPERLIQUID_VAULT_ADDRESS` to `ALEPH_MONITOR_HL_XYZ_ADDRESS` when set while preserving `CONTROL_TOKEN`, webhook settings, and existing overrides):
+
+```sh
+python3 scripts/onboard_exchange_env.py audit --env .env.all_exchanges
+python3 scripts/onboard_exchange_env.py split --env .env.all_exchanges --out-dir /etc/aleph-tx
+sudo systemctl restart aleph-tx-monitor.service
+
+# Read-only public readiness & fee-tier check across configured venues:
+python3 scripts/verify_venue_readiness.py --monitor-env /etc/aleph-tx/monitor.env --live
+```
+
+Or synchronize only public identifiers directly via `deploy/oasis/sync_monitor_env.py`:
 
 ```sh
 python3 /opt/aleph-tx/current/sync_monitor_env.py \
