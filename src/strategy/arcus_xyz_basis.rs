@@ -6,9 +6,18 @@
 //! laddering, and progressive intraday drawdown scaling (`DailyLossGuard::risk_scale`).
 
 use crate::daily_loss::DailyLossGuard;
-use crate::exchanges::arcus::Market as ArcusMarket;
-use crate::exchanges::hyperliquid::ValidatedBook;
-use anyhow::{Context, Result, ensure};
+use crate::exchanges::arcus::{
+    ExecutionError as ArcusExecutionError, Fill as ArcusFill, Market as ArcusMarket,
+    Order as ArcusOrder, OrderReceipt as ArcusOrderReceipt, Side as ArcusSide,
+};
+use crate::exchanges::hyperliquid::{
+    AccountState as HlAccountState, ExecutionStatus as HlExecutionStatus, OpenOrder as HlOpenOrder,
+    OrderLookup as HlOrderLookup, SubmissionError as HlSubmissionError, ValidatedBook,
+};
+use crate::live_hedge::{
+    IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill, classify_lookup,
+};
+use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
@@ -736,6 +745,663 @@ impl ArcusXyzBasisEngine {
     }
 }
 
+const ARCUS_CLOCK_SKEW_US: u64 = 5_000_000;
+
+fn arcus_sides_match(a: ArcusSide, b: ArcusSide) -> bool {
+    matches!(
+        (a, b),
+        (ArcusSide::Buy, ArcusSide::Buy) | (ArcusSide::Sell, ArcusSide::Sell)
+    )
+}
+
+/// Strict Hyperliquid HIP-3/Core position parser: fails closed on stale timestamp,
+/// duplicate coin entries, or malformed `szi` rather than defaulting to zero.
+pub fn parse_hl_market_position(state: &HlAccountState, coin: &str) -> Result<Decimal> {
+    ensure!(
+        state.time > 0,
+        "Hyperliquid clearinghouse state missing positive watermark time for {coin}"
+    );
+    let mut found: Option<Decimal> = None;
+    for entry in &state.asset_positions {
+        if entry.position.coin == coin {
+            let size = Decimal::from_str_exact(entry.position.szi.trim()).with_context(|| {
+                format!(
+                    "malformed Hyperliquid position size {:?} for {coin}",
+                    entry.position.szi
+                )
+            })?;
+            ensure!(
+                found.replace(size).is_none(),
+                "duplicate Hyperliquid position entry for {coin}"
+            );
+        }
+    }
+    Ok(found.unwrap_or(Decimal::ZERO))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HlSubmitOutcome {
+    FilledAck {
+        order_id: u64,
+        total_size: Decimal,
+        average_price: Decimal,
+    },
+    CanceledAck,
+    DefinitiveRejected {
+        reason: String,
+    },
+    UnexpectedResting {
+        order_id: u64,
+    },
+    Ambiguous {
+        reason: String,
+    },
+}
+
+pub fn classify_hl_submit(
+    res: &Result<Vec<HlExecutionStatus>>,
+    planned_qty: Decimal,
+) -> HlSubmitOutcome {
+    match res {
+        Ok(statuses) => match statuses.as_slice() {
+            [
+                HlExecutionStatus::Filled {
+                    order_id,
+                    total_size,
+                    average_price,
+                },
+            ] => {
+                if *total_size > Decimal::ZERO
+                    && *total_size <= planned_qty
+                    && *average_price > Decimal::ZERO
+                {
+                    HlSubmitOutcome::FilledAck {
+                        order_id: *order_id,
+                        total_size: *total_size,
+                        average_price: *average_price,
+                    }
+                } else {
+                    HlSubmitOutcome::Ambiguous {
+                        reason: format!(
+                            "invalid filled ack size={total_size} avg_px={average_price} planned={planned_qty}"
+                        ),
+                    }
+                }
+            }
+            [HlExecutionStatus::Canceled] => HlSubmitOutcome::CanceledAck,
+            [HlExecutionStatus::Rejected { reason }] => HlSubmitOutcome::DefinitiveRejected {
+                reason: reason.clone(),
+            },
+            [HlExecutionStatus::Resting { order_id }] => HlSubmitOutcome::UnexpectedResting {
+                order_id: *order_id,
+            },
+            [] => HlSubmitOutcome::Ambiguous {
+                reason: "empty Hyperliquid execution status list".into(),
+            },
+            many => HlSubmitOutcome::Ambiguous {
+                reason: format!("unexpected {} Hyperliquid execution statuses", many.len()),
+            },
+        },
+        Err(err) => {
+            if let Some(HlSubmissionError::Rejected(reason)) =
+                err.downcast_ref::<HlSubmissionError>()
+            {
+                HlSubmitOutcome::DefinitiveRejected {
+                    reason: reason.clone(),
+                }
+            } else {
+                HlSubmitOutcome::Ambiguous {
+                    reason: err.to_string(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HlLegIntent {
+    pub cloid: String,
+    pub coin: String,
+    pub is_buy: bool,
+    pub qty: Decimal,
+    pub limit_price: Decimal,
+    pub sent_at_ms: u64,
+    pub prev_inv_xyz: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArcusLegIntent {
+    pub market_id: u16,
+    pub client_id: String,
+    pub side: ArcusSide,
+    pub qty: Decimal,
+    pub limit_price: Decimal,
+    pub sent_at_us: u64,
+    pub prev_inv_arc: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArcusSubmitOutcome {
+    GatewayAccepted {
+        http_status: u16,
+        order_id: Option<String>,
+    },
+    GatewayRejected {
+        order_id: Option<String>,
+        reason: String,
+    },
+    HardRejected {
+        reason: String,
+    },
+    Ambiguous {
+        reason: String,
+    },
+}
+
+pub fn classify_arcus_submit(
+    res: &Result<ArcusOrderReceipt>,
+    expected_client_id: &str,
+) -> ArcusSubmitOutcome {
+    match res {
+        Ok(receipt) => {
+            if let Some(cid) = receipt.client_id.as_deref()
+                && cid != expected_client_id
+            {
+                return ArcusSubmitOutcome::Ambiguous {
+                    reason: format!(
+                        "Arcus receipt client_id {cid:?} mismatches expected {expected_client_id:?}"
+                    ),
+                };
+            }
+            if receipt.rejection_reason.is_some() || receipt.status.eq_ignore_ascii_case("rejected")
+            {
+                ArcusSubmitOutcome::GatewayRejected {
+                    order_id: receipt.order_id.clone(),
+                    reason: receipt
+                        .rejection_reason
+                        .clone()
+                        .unwrap_or_else(|| receipt.status.clone()),
+                }
+            } else {
+                ArcusSubmitOutcome::GatewayAccepted {
+                    http_status: receipt.http_status,
+                    order_id: receipt.order_id.clone(),
+                }
+            }
+        }
+        Err(err) => {
+            if let Some(ArcusExecutionError::Rejected {
+                status, message, ..
+            }) = err.downcast_ref::<ArcusExecutionError>()
+            {
+                ArcusSubmitOutcome::HardRejected {
+                    reason: format!("HTTP {status}: {message}"),
+                }
+            } else {
+                ArcusSubmitOutcome::Ambiguous {
+                    reason: err.to_string(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLegTerminal {
+    pub status: String,
+    pub filled_qty: Decimal,
+    pub avg_price: Option<Decimal>,
+    pub terminal_at_ms: Option<u64>,
+    pub account_time_ms: Option<u64>,
+}
+
+/// Authoritative Hyperliquid leg verifier: requires client ID status proof and
+/// clearinghouse watermark coverage (`hl_account_time_ms >= terminal_at_ms`),
+/// never trusting bare `Resting` or `submit_err` position diffs alone.
+pub fn verify_hl_leg_terminal(
+    intent: &HlLegIntent,
+    submit: &HlSubmitOutcome,
+    lookup: &HlOrderLookup,
+    open_orders: &[HlOpenOrder],
+    inv_xyz: Decimal,
+    hl_account_time_ms: u64,
+) -> Result<Option<VerifiedLegTerminal>> {
+    if let HlSubmitOutcome::UnexpectedResting { order_id } = submit {
+        bail!(
+            "hyperliquid IOC cloid {} unexpectedly rested as order {order_id}",
+            intent.cloid
+        );
+    }
+    if open_orders
+        .iter()
+        .any(|o| o.cloid.as_deref() == Some(intent.cloid.as_str()))
+    {
+        bail!(
+            "hyperliquid IOC cloid {} is still open in open_orders",
+            intent.cloid
+        );
+    }
+    match lookup {
+        HlOrderLookup::Found(located) => {
+            let outcome = classify_lookup(
+                &IocIdentity {
+                    cloid: &intent.cloid,
+                    coin: &intent.coin,
+                    is_buy: intent.is_buy,
+                    size: intent.qty,
+                    limit_price: intent.limit_price,
+                    sent_at_ms: intent.sent_at_ms,
+                },
+                located,
+            )?;
+            let (at_ms, filled) = match outcome {
+                LookupOutcome::Open { oid } => {
+                    bail!(
+                        "hyperliquid IOC cloid {} returned non-terminal open status (oid={oid})",
+                        intent.cloid
+                    );
+                }
+                LookupOutcome::Terminal { at_ms, filled } => (at_ms, filled),
+            };
+            let avg_price = match submit {
+                HlSubmitOutcome::FilledAck {
+                    total_size,
+                    average_price,
+                    ..
+                } => {
+                    ensure!(
+                        filled == *total_size,
+                        "hyperliquid cloid {} lookup fill {filled} disagrees with filled ack {total_size}",
+                        intent.cloid
+                    );
+                    Some(*average_price)
+                }
+                HlSubmitOutcome::CanceledAck | HlSubmitOutcome::DefinitiveRejected { .. } => {
+                    ensure!(
+                        filled == Decimal::ZERO,
+                        "hyperliquid cloid {} rejected/canceled ack conflicts with lookup fill {filled}",
+                        intent.cloid
+                    );
+                    None
+                }
+                HlSubmitOutcome::Ambiguous { .. } => None,
+                HlSubmitOutcome::UnexpectedResting { .. } => unreachable!(),
+            };
+            let Some(confirmed_fill) = account_confirmed_fill(
+                intent.is_buy,
+                intent.prev_inv_xyz,
+                intent.qty,
+                at_ms,
+                filled,
+                inv_xyz,
+                hl_account_time_ms,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(VerifiedLegTerminal {
+                status: located.status.clone(),
+                filled_qty: confirmed_fill,
+                avg_price,
+                terminal_at_ms: Some(at_ms),
+                account_time_ms: Some(hl_account_time_ms),
+            }))
+        }
+        HlOrderLookup::Unknown => match submit {
+            HlSubmitOutcome::DefinitiveRejected { .. } => {
+                if hl_account_time_ms < intent.sent_at_ms.saturating_sub(LOOKUP_SKEW_MS) {
+                    return Ok(None);
+                }
+                ensure!(
+                    inv_xyz == intent.prev_inv_xyz,
+                    "hyperliquid definitive reject for {} has unexpected position shift ({} -> {inv_xyz})",
+                    intent.cloid,
+                    intent.prev_inv_xyz
+                );
+                Ok(Some(VerifiedLegTerminal {
+                    status: "rejected".into(),
+                    filled_qty: Decimal::ZERO,
+                    avg_price: None,
+                    terminal_at_ms: Some(intent.sent_at_ms),
+                    account_time_ms: Some(hl_account_time_ms),
+                }))
+            }
+            HlSubmitOutcome::FilledAck { .. }
+            | HlSubmitOutcome::CanceledAck
+            | HlSubmitOutcome::Ambiguous { .. } => Ok(None),
+            HlSubmitOutcome::UnexpectedResting { .. } => unreachable!(),
+        },
+    }
+}
+
+fn arcus_order_matches_intent<'a>(
+    intent: &ArcusLegIntent,
+    expected_oid: Option<&str>,
+    direct_order: Option<&'a ArcusOrder>,
+    order_history: &'a [ArcusOrder],
+) -> Result<Option<&'a ArcusOrder>> {
+    let mut matched_oid: Option<&str> = None;
+    let mut chosen: Option<&ArcusOrder> = None;
+    let matches_key = |order: &ArcusOrder| -> bool {
+        let cid_match = order.client_id.as_deref() == Some(intent.client_id.as_str());
+        let oid_match = expected_oid.is_some_and(|oid| order.order_id == oid);
+        order.market_id == intent.market_id && (cid_match || oid_match)
+    };
+    if let Some(direct) = direct_order
+        && matches_key(direct)
+    {
+        matched_oid = Some(direct.order_id.as_str());
+        chosen = Some(direct);
+    }
+    for hist in order_history {
+        if matches_key(hist) {
+            if let Some(prev_oid) = matched_oid {
+                ensure!(
+                    prev_oid == hist.order_id,
+                    "conflicting Arcus order_ids ({prev_oid} vs {}) for client_id {}",
+                    hist.order_id,
+                    intent.client_id
+                );
+            } else {
+                matched_oid = Some(hist.order_id.as_str());
+                chosen = Some(hist);
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+/// Authoritative Arcus leg verifier: HTTP 202 `GatewayAccepted` alone is never terminal.
+/// Requires open-orders exclusion, terminal `Order` identity match, deduped fills parity,
+/// and exact `inv_arc` inventory parity.
+pub fn verify_arcus_leg_terminal(
+    intent: &ArcusLegIntent,
+    submit: &ArcusSubmitOutcome,
+    direct_order: Option<&ArcusOrder>,
+    open_orders: &[ArcusOrder],
+    order_history: &[ArcusOrder],
+    fills: &[ArcusFill],
+    inv_arc: Decimal,
+) -> Result<Option<VerifiedLegTerminal>> {
+    let expected_oid = match submit {
+        ArcusSubmitOutcome::GatewayAccepted { order_id, .. }
+        | ArcusSubmitOutcome::GatewayRejected { order_id, .. } => order_id.as_deref(),
+        ArcusSubmitOutcome::HardRejected { .. } | ArcusSubmitOutcome::Ambiguous { .. } => None,
+    };
+
+    if open_orders.iter().any(|o| {
+        o.market_id == intent.market_id
+            && (o.client_id.as_deref() == Some(intent.client_id.as_str())
+                || expected_oid.is_some_and(|eid| o.order_id == eid))
+    }) {
+        return Ok(None);
+    }
+
+    let Some(order) =
+        arcus_order_matches_intent(intent, expected_oid, direct_order, order_history)?
+    else {
+        return match submit {
+            ArcusSubmitOutcome::HardRejected { .. }
+            | ArcusSubmitOutcome::GatewayRejected { .. } => {
+                let any_fill = fills.iter().any(|f| {
+                    f.market_id == intent.market_id
+                        && (f.client_id.as_deref() == Some(intent.client_id.as_str())
+                            || expected_oid.is_some_and(|eid| f.order_id == eid))
+                });
+                ensure!(
+                    !any_fill,
+                    "Arcus rejected intent {} unexpectedly matched a fill",
+                    intent.client_id
+                );
+                ensure!(
+                    inv_arc == intent.prev_inv_arc,
+                    "Arcus rejected intent {} shifted inventory ({} -> {inv_arc})",
+                    intent.client_id,
+                    intent.prev_inv_arc
+                );
+                Ok(Some(VerifiedLegTerminal {
+                    status: "rejected".into(),
+                    filled_qty: Decimal::ZERO,
+                    avg_price: None,
+                    terminal_at_ms: Some(intent.sent_at_us / 1_000),
+                    account_time_ms: None,
+                }))
+            }
+            ArcusSubmitOutcome::GatewayAccepted { .. } | ArcusSubmitOutcome::Ambiguous { .. } => {
+                Ok(None)
+            }
+        };
+    };
+
+    ensure!(
+        order.market_id == intent.market_id && arcus_sides_match(order.side, intent.side),
+        "Arcus order {} disagrees with journaled market/side",
+        order.order_id
+    );
+    ensure!(
+        order.price == intent.limit_price && order.original_size == intent.qty,
+        "Arcus order {} disagrees with journaled price/size",
+        order.order_id
+    );
+    if let Some(cid) = order.client_id.as_deref() {
+        ensure!(
+            cid == intent.client_id,
+            "Arcus order {} client_id {cid:?} disagrees with {}",
+            order.order_id,
+            intent.client_id
+        );
+    }
+    if let Some(eid) = expected_oid {
+        ensure!(
+            order.order_id == eid,
+            "Arcus order_id {} disagrees with receipt {eid}",
+            order.order_id
+        );
+    }
+    ensure!(
+        order.updated_at >= intent.sent_at_us.saturating_sub(ARCUS_CLOCK_SKEW_US),
+        "Arcus order {} updated_at {} predates intent {}",
+        order.order_id,
+        order.updated_at,
+        intent.sent_at_us
+    );
+    ensure!(
+        order.remaining_size >= Decimal::ZERO && order.remaining_size <= order.original_size,
+        "Arcus order {} has invalid remaining_size {}",
+        order.order_id,
+        order.remaining_size
+    );
+
+    let norm_status = order.status.trim().to_ascii_lowercase();
+    let expected_filled = match norm_status.as_str() {
+        "open" | "new" | "pending" | "accepted" | "partially_filled" => return Ok(None),
+        "filled" => {
+            ensure!(
+                order.remaining_size == Decimal::ZERO,
+                "Arcus filled order {} still has remaining_size {}",
+                order.order_id,
+                order.remaining_size
+            );
+            order.original_size
+        }
+        "canceled" | "cancelled" | "expired" | "ioc_canceled" => {
+            order.original_size - order.remaining_size
+        }
+        "rejected" => {
+            ensure!(
+                order.remaining_size == order.original_size,
+                "Arcus rejected order {} has partial remaining_size {}",
+                order.order_id,
+                order.remaining_size
+            );
+            Decimal::ZERO
+        }
+        other => bail!(
+            "unrecognized Arcus order {} status {other:?}",
+            order.order_id
+        ),
+    };
+
+    let mut seen_trade_ids = HashSet::new();
+    let mut fills_qty = Decimal::ZERO;
+    let mut fills_notional = Decimal::ZERO;
+    for fill in fills {
+        let matches = fill.market_id == intent.market_id
+            && (fill.order_id == order.order_id
+                || fill.client_id.as_deref() == Some(intent.client_id.as_str()));
+        if !matches {
+            continue;
+        }
+        if !seen_trade_ids.insert(fill.trade_id.as_str()) {
+            continue;
+        }
+        ensure!(
+            fill.order_id == order.order_id && arcus_sides_match(fill.side, intent.side),
+            "Arcus fill {} disagrees with order/side",
+            fill.trade_id
+        );
+        ensure!(
+            fill.size > Decimal::ZERO && fill.price > Decimal::ZERO,
+            "Arcus fill {} has non-positive size/price",
+            fill.trade_id
+        );
+        fills_qty += fill.size;
+        fills_notional += fill.size * fill.price;
+    }
+
+    ensure!(
+        fills_qty <= expected_filled,
+        "Arcus fills sum {fills_qty} exceeds order {} filled {expected_filled}",
+        order.order_id
+    );
+    if fills_qty < expected_filled {
+        return Ok(None);
+    }
+
+    let pos_delta = match intent.side {
+        ArcusSide::Buy => inv_arc - intent.prev_inv_arc,
+        ArcusSide::Sell => intent.prev_inv_arc - inv_arc,
+    };
+    if pos_delta != expected_filled {
+        return Ok(None);
+    }
+
+    let avg_price = if fills_qty > Decimal::ZERO {
+        Some(fills_notional / fills_qty)
+    } else {
+        None
+    };
+    Ok(Some(VerifiedLegTerminal {
+        status: norm_status,
+        filled_qty: expected_filled,
+        avg_price,
+        terminal_at_ms: Some(order.updated_at / 1_000),
+        account_time_ms: None,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownDisposition {
+    Clean,
+    ResidualPosition {
+        inv_arc: Decimal,
+        inv_xyz: Decimal,
+    },
+    OpenOrdersRemaining {
+        open_orders_arcus: usize,
+        open_orders_hl: usize,
+        inv_arc: Option<Decimal>,
+        inv_xyz: Option<Decimal>,
+    },
+    CancelUnknown {
+        cancel_ok: bool,
+        open_orders_arcus: Option<usize>,
+        open_orders_hl: Option<usize>,
+        inv_arc: Option<Decimal>,
+        inv_xyz: Option<Decimal>,
+        detail: String,
+    },
+}
+
+pub fn classify_shutdown(
+    cancel_ok: bool,
+    open_orders: Result<(usize, usize)>,
+    reconciled: Result<(Decimal, Decimal)>,
+) -> ShutdownDisposition {
+    let (open_res, open_err) = match open_orders {
+        Ok(counts) => (Some(counts), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let (pos_res, pos_err) = match reconciled {
+        Ok(pos) => (Some(pos), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    if !cancel_ok || open_res.is_none() || pos_res.is_none() {
+        let mut details = Vec::new();
+        if !cancel_ok {
+            details.push("arcus_cancel_all_failed".to_owned());
+        }
+        if let Some(err) = open_err {
+            details.push(format!("open_orders_err={err}"));
+        }
+        if let Some(err) = pos_err {
+            details.push(format!("reconcile_err={err}"));
+        }
+        return ShutdownDisposition::CancelUnknown {
+            cancel_ok,
+            open_orders_arcus: open_res.map(|c| c.0),
+            open_orders_hl: open_res.map(|c| c.1),
+            inv_arc: pos_res.map(|p| p.0),
+            inv_xyz: pos_res.map(|p| p.1),
+            detail: details.join("; "),
+        };
+    }
+    let (open_arc, open_hl) = open_res.unwrap();
+    let (inv_a, inv_x) = pos_res.unwrap();
+    if open_arc > 0 || open_hl > 0 {
+        return ShutdownDisposition::OpenOrdersRemaining {
+            open_orders_arcus: open_arc,
+            open_orders_hl: open_hl,
+            inv_arc: Some(inv_a),
+            inv_xyz: Some(inv_x),
+        };
+    }
+    if inv_a != Decimal::ZERO || inv_x != Decimal::ZERO {
+        return ShutdownDisposition::ResidualPosition {
+            inv_arc: inv_a,
+            inv_xyz: inv_x,
+        };
+    }
+    ShutdownDisposition::Clean
+}
+
+mod opt_decimal_str {
+    use rust_decimal::Decimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        value: &Option<Decimal>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(dec) => serializer.serialize_some(&dec.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        opt.map(|s| Decimal::from_str_exact(s.trim()).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum BasisJournalEvent {
@@ -763,8 +1429,47 @@ pub enum BasisJournalEvent {
         #[serde(with = "rust_decimal::serde::str")]
         inv_xyz: Decimal,
         journal_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arcus_status: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "opt_decimal_str"
+        )]
+        arcus_filled_qty: Option<Decimal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hl_status: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "opt_decimal_str"
+        )]
+        hl_filled_qty: Option<Decimal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hl_terminal_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hl_account_time_ms: Option<u64>,
     },
     CleanShutdown {
+        journal_ms: u64,
+    },
+    ShutdownUnverified {
+        reason: String,
+        cancel_ok: bool,
+        open_orders_arcus: Option<usize>,
+        open_orders_hl: Option<usize>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "opt_decimal_str"
+        )]
+        inv_arc: Option<Decimal>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "opt_decimal_str"
+        )]
+        inv_xyz: Option<Decimal>,
         journal_ms: u64,
     },
 }
@@ -791,6 +1496,7 @@ impl BasisJournal {
         };
         let reader = BufReader::new(file);
         let mut pending = HashSet::new();
+        let mut blocking_shutdown: Option<String> = None;
         for (line_no, line) in reader.lines().enumerate() {
             let line = line.with_context(|| {
                 format!("read journal line {} in {}", line_no + 1, path.display())
@@ -808,8 +1514,15 @@ impl BasisJournal {
                 BasisJournalEvent::IntentTerminal { intent_id, .. } => {
                     pending.remove(&intent_id);
                 }
-                BasisJournalEvent::SessionStart { .. }
-                | BasisJournalEvent::CleanShutdown { .. } => {}
+                BasisJournalEvent::CleanShutdown { .. } => {
+                    blocking_shutdown = None;
+                }
+                BasisJournalEvent::ShutdownUnverified { reason, .. } => {
+                    if reason != "residual_position" {
+                        blocking_shutdown = Some(reason);
+                    }
+                }
+                BasisJournalEvent::SessionStart { .. } => {}
             }
         }
         ensure!(
@@ -818,6 +1531,12 @@ impl BasisJournal {
             path.display(),
             pending
         );
+        if let Some(reason) = blocking_shutdown {
+            bail!(
+                "prior shutdown in {} was unverified ({reason}); verify and clear open orders/cancels before restart",
+                path.display()
+            );
+        }
         Ok(())
     }
 
@@ -1079,10 +1798,537 @@ mod tests {
                 inv_arc: d("0.5"),
                 inv_xyz: d("-0.5"),
                 journal_ms: 1_200,
+                arcus_status: None,
+                arcus_filled_qty: None,
+                hl_status: None,
+                hl_filled_qty: None,
+                hl_terminal_at_ms: None,
+                hl_account_time_ms: None,
             })
             .unwrap();
         assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
 
+        // ShutdownUnverified(cancel_unknown / open_orders_remaining) keeps restart blocked even across subsequent residual_position until CleanShutdown.
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "cancel_unknown".into(),
+                cancel_ok: false,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(Decimal::ZERO),
+                inv_xyz: Some(Decimal::ZERO),
+                journal_ms: 1_300,
+            })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "open_orders_remaining".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(1),
+                open_orders_hl: Some(0),
+                inv_arc: Some(Decimal::ZERO),
+                inv_xyz: Some(Decimal::ZERO),
+                journal_ms: 1_350,
+            })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "residual_position".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(d("0.5")),
+                inv_xyz: Some(d("-0.5")),
+                journal_ms: 1_400,
+            })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+
+        journal
+            .append(&BasisJournalEvent::CleanShutdown { journal_ms: 1_420 })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "residual_position".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(d("0.5")),
+                inv_xyz: Some(d("-0.5")),
+                journal_ms: 1_450,
+            })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_ok());
+
+        // ShutdownUnverified must never clear an unresolved IntentOpen.
+        journal
+            .append(&BasisJournalEvent::IntentOpen {
+                intent_id: "i-2".into(),
+                kind: "entry".into(),
+                arcus_client_id: Some("arc-2".into()),
+                hl_cloid: Some("0x02".into()),
+                qty: d("0.5"),
+                journal_ms: 1_500,
+            })
+            .unwrap();
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "residual_position".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(d("0.5")),
+                inv_xyz: Some(Decimal::ZERO),
+                journal_ms: 1_550,
+            })
+            .unwrap();
+        assert!(BasisJournal::open_and_check_restart(path.clone()).is_err());
+
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn hl_state(coin: &str, szi: &str, time: u64) -> HlAccountState {
+        use crate::exchanges::hyperliquid::{AssetPosition, MarginSummary, Position as HlPos};
+        HlAccountState {
+            margin_summary: MarginSummary {
+                account_value: "1000".into(),
+                total_ntl_pos: "0".into(),
+                total_margin_used: "0".into(),
+            },
+            asset_positions: if coin.is_empty() {
+                vec![]
+            } else {
+                vec![AssetPosition {
+                    position: HlPos {
+                        coin: coin.into(),
+                        szi: szi.into(),
+                        entry_px: Some("100".into()),
+                        unrealized_pnl: "0".into(),
+                    },
+                }]
+            },
+            withdrawable: "1000".into(),
+            time,
+        }
+    }
+
+    fn hl_located(
+        cloid: &str,
+        is_buy: bool,
+        orig_sz: &str,
+        rem_sz: &str,
+        limit_px: &str,
+        status: &str,
+        status_ts: u64,
+    ) -> crate::exchanges::hyperliquid::LocatedOrder {
+        use crate::exchanges::hyperliquid::LocatedOrder;
+        LocatedOrder {
+            order: HlOpenOrder {
+                coin: "xyz:ANT".into(),
+                side: if is_buy { "B".into() } else { "A".into() },
+                limit_px: limit_px.into(),
+                sz: rem_sz.into(),
+                oid: 77,
+                timestamp: status_ts,
+                cloid: Some(cloid.into()),
+                original_size: Some(orig_sz.into()),
+            },
+            status: status.into(),
+            status_timestamp: status_ts,
+        }
+    }
+
+    #[test]
+    fn parse_hl_market_position_fails_closed_on_malformed_duplicate_or_zero_time() {
+        assert_eq!(
+            parse_hl_market_position(&hl_state("xyz:ANT", "-1.25", 10_000), "xyz:ANT").unwrap(),
+            d("-1.25")
+        );
+        assert_eq!(
+            parse_hl_market_position(&hl_state("xyz:OTHER", "2", 10_000), "xyz:ANT").unwrap(),
+            Decimal::ZERO
+        );
+        assert!(
+            parse_hl_market_position(&hl_state("xyz:ANT", "bad_num", 10_000), "xyz:ANT").is_err()
+        );
+        assert!(parse_hl_market_position(&hl_state("xyz:ANT", "1.0", 0), "xyz:ANT").is_err());
+
+        let mut dup = hl_state("xyz:ANT", "1.0", 10_000);
+        dup.asset_positions.push(dup.asset_positions[0].clone());
+        assert!(parse_hl_market_position(&dup, "xyz:ANT").is_err());
+    }
+
+    #[test]
+    fn classify_hl_submit_rejects_resting_and_distinguishes_terminal_vs_ambiguous() {
+        assert_eq!(
+            classify_hl_submit(
+                &Ok(vec![HlExecutionStatus::Resting { order_id: 9 }]),
+                d("1")
+            ),
+            HlSubmitOutcome::UnexpectedResting { order_id: 9 }
+        );
+        assert_eq!(
+            classify_hl_submit(
+                &Ok(vec![HlExecutionStatus::Filled {
+                    order_id: 10,
+                    total_size: d("0.5"),
+                    average_price: d("100.1"),
+                }]),
+                d("1")
+            ),
+            HlSubmitOutcome::FilledAck {
+                order_id: 10,
+                total_size: d("0.5"),
+                average_price: d("100.1"),
+            }
+        );
+        assert_eq!(
+            classify_hl_submit(&Ok(vec![HlExecutionStatus::Canceled]), d("1")),
+            HlSubmitOutcome::CanceledAck
+        );
+        assert_eq!(
+            classify_hl_submit(
+                &Ok(vec![HlExecutionStatus::Rejected {
+                    reason: "min ntl".into()
+                }]),
+                d("1")
+            ),
+            HlSubmitOutcome::DefinitiveRejected {
+                reason: "min ntl".into()
+            }
+        );
+        assert_eq!(
+            classify_hl_submit(
+                &Err(anyhow::Error::new(HlSubmissionError::Rejected(
+                    "bad".into()
+                ))),
+                d("1")
+            ),
+            HlSubmitOutcome::DefinitiveRejected {
+                reason: "bad".into()
+            }
+        );
+        assert!(matches!(
+            classify_hl_submit(
+                &Err(anyhow::Error::new(HlSubmissionError::Uncertain(
+                    "timeout".into()
+                ))),
+                d("1")
+            ),
+            HlSubmitOutcome::Ambiguous { .. }
+        ));
+        assert!(matches!(
+            classify_hl_submit(&Ok(vec![]), d("1")),
+            HlSubmitOutcome::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_hl_leg_terminal_enforces_cloid_and_watermark() {
+        let intent = HlLegIntent {
+            cloid: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            coin: "xyz:ANT".into(),
+            is_buy: false,
+            qty: d("1.0"),
+            limit_price: d("99.5"),
+            sent_at_ms: 5_000,
+            prev_inv_xyz: Decimal::ZERO,
+        };
+        let filled_submit = HlSubmitOutcome::FilledAck {
+            order_id: 77,
+            total_size: d("1.0"),
+            average_price: d("100.0"),
+        };
+        let ambig = HlSubmitOutcome::Ambiguous {
+            reason: "http timeout".into(),
+        };
+        let loc_filled = hl_located(&intent.cloid, false, "1.0", "0.0", "99.5", "filled", 5_100);
+
+        // Resting is always fatal.
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &HlSubmitOutcome::UnexpectedResting { order_id: 1 },
+                &HlOrderLookup::Unknown,
+                &[],
+                Decimal::ZERO,
+                5_200,
+            )
+            .is_err()
+        );
+        // Open lookup is fatal.
+        assert!(
+            verify_hl_leg_terminal(
+                &intent,
+                &ambig,
+                &HlOrderLookup::Found(hl_located(
+                    &intent.cloid,
+                    false,
+                    "1.0",
+                    "1.0",
+                    "99.5",
+                    "open",
+                    5_100,
+                )),
+                &[],
+                Decimal::ZERO,
+                5_200,
+            )
+            .is_err()
+        );
+        // Ambiguous + Unknown stays pending (Ok(None)), never terminal!
+        assert_eq!(
+            verify_hl_leg_terminal(
+                &intent,
+                &ambig,
+                &HlOrderLookup::Unknown,
+                &[],
+                Decimal::ZERO,
+                5_500,
+            )
+            .unwrap(),
+            None
+        );
+        // Stale account watermark < terminal_at_ms -> Ok(None) (retry).
+        assert_eq!(
+            verify_hl_leg_terminal(
+                &intent,
+                &filled_submit,
+                &HlOrderLookup::Found(loc_filled.clone()),
+                &[],
+                d("-1.0"),
+                5_050,
+            )
+            .unwrap(),
+            None
+        );
+        // Fresh watermark + exact delta -> Ok(Some(VerifiedLegTerminal)).
+        let ok = verify_hl_leg_terminal(
+            &intent,
+            &filled_submit,
+            &HlOrderLookup::Found(loc_filled),
+            &[],
+            d("-1.0"),
+            5_100,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok.filled_qty, d("1.0"));
+        assert_eq!(ok.avg_price, Some(d("100.0")));
+
+        // Definitive reject with Unknown lookup + unchanged inv_xyz -> Ok(Some(rejected, 0)).
+        let rej = verify_hl_leg_terminal(
+            &intent,
+            &HlSubmitOutcome::DefinitiveRejected {
+                reason: "rejected".into(),
+            },
+            &HlOrderLookup::Unknown,
+            &[],
+            Decimal::ZERO,
+            5_200,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rej.status, "rejected");
+        assert_eq!(rej.filled_qty, Decimal::ZERO);
+    }
+
+    #[test]
+    fn verify_arcus_leg_terminal_never_trusts_http_202_alone_and_checks_fills_and_position() {
+        let intent = ArcusLegIntent {
+            market_id: 7,
+            client_id: "axb123".into(),
+            side: ArcusSide::Buy,
+            qty: d("1.0"),
+            limit_price: d("100.0"),
+            sent_at_us: 10_000_000,
+            prev_inv_arc: Decimal::ZERO,
+        };
+        let receipt_202 = ArcusOrderReceipt {
+            http_status: 202,
+            status: "accepted".into(),
+            order_id: Some("arc-ord-1".into()),
+            client_id: Some("axb123".into()),
+            rejection_reason: None,
+        };
+        let accepted = classify_arcus_submit(&Ok(receipt_202), "axb123");
+        assert!(matches!(
+            accepted,
+            ArcusSubmitOutcome::GatewayAccepted { .. }
+        ));
+
+        // HTTP 202 + missing history stays pending (Ok(None)).
+        assert_eq!(
+            verify_arcus_leg_terminal(&intent, &accepted, None, &[], &[], &[], Decimal::ZERO)
+                .unwrap(),
+            None
+        );
+
+        let arc_order = ArcusOrder {
+            order_id: "arc-ord-1".into(),
+            client_id: Some("axb123".into()),
+            market_id: 7,
+            side: ArcusSide::Buy,
+            status: "FILLED".into(),
+            price: d("100.0"),
+            original_size: d("1.0"),
+            remaining_size: Decimal::ZERO,
+            created_at: Some(10_000_100),
+            updated_at: 10_050_000,
+        };
+        let arc_fill = ArcusFill {
+            trade_id: "tr-1".into(),
+            order_id: "arc-ord-1".into(),
+            client_id: Some("axb123".into()),
+            market_id: 7,
+            side: ArcusSide::Buy,
+            size: d("1.0"),
+            price: d("99.95"),
+            fee: d("0.01"),
+            role: "TAKER".into(),
+            created_at: 10_050_000,
+        };
+
+        // Still in open_orders -> Ok(None).
+        assert_eq!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                std::slice::from_ref(&arc_order),
+                &[],
+                std::slice::from_ref(&arc_fill),
+                d("1.0"),
+            )
+            .unwrap(),
+            None
+        );
+        // Terminal order without matching fills -> Ok(None).
+        assert_eq!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                &[],
+                d("1.0")
+            )
+            .unwrap(),
+            None
+        );
+        // Terminal order + matching fill + stale inventory -> Ok(None).
+        assert_eq!(
+            verify_arcus_leg_terminal(
+                &intent,
+                &accepted,
+                Some(&arc_order),
+                &[],
+                &[],
+                std::slice::from_ref(&arc_fill),
+                Decimal::ZERO,
+            )
+            .unwrap(),
+            None
+        );
+        // Terminal order + matching fills + matching inventory -> Ok(Some(...)).
+        let ok = verify_arcus_leg_terminal(
+            &intent,
+            &accepted,
+            Some(&arc_order),
+            &[],
+            &[],
+            std::slice::from_ref(&arc_fill),
+            d("1.0"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ok.status, "filled");
+        assert_eq!(ok.filled_qty, d("1.0"));
+        assert_eq!(ok.avg_price, Some(d("99.95")));
+
+        // Hard rejection with empty order_history/fills and unchanged position -> Ok(Some(rejected)).
+        let hard_rej = classify_arcus_submit(
+            &Err(anyhow::Error::new(ArcusExecutionError::Rejected {
+                path: "/v1/order",
+                status: reqwest::StatusCode::BAD_REQUEST,
+                message: "min_notional".into(),
+            })),
+            "axb123",
+        );
+        let rej = verify_arcus_leg_terminal(&intent, &hard_rej, None, &[], &[], &[], Decimal::ZERO)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rej.status, "rejected");
+        assert_eq!(rej.filled_qty, Decimal::ZERO);
+    }
+
+    #[test]
+    fn classify_shutdown_distinguishes_clean_open_orders_residual_and_cancel_unknown() {
+        assert_eq!(
+            classify_shutdown(true, Ok((0, 0)), Ok((Decimal::ZERO, Decimal::ZERO))),
+            ShutdownDisposition::Clean
+        );
+        assert_eq!(
+            classify_shutdown(true, Ok((0, 0)), Ok((d("0.5"), d("-0.5")))),
+            ShutdownDisposition::ResidualPosition {
+                inv_arc: d("0.5"),
+                inv_xyz: d("-0.5"),
+            }
+        );
+        assert!(matches!(
+            classify_shutdown(true, Ok((1, 0)), Ok((Decimal::ZERO, Decimal::ZERO))),
+            ShutdownDisposition::OpenOrdersRemaining {
+                open_orders_arcus: 1,
+                open_orders_hl: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_shutdown(false, Ok((0, 0)), Ok((Decimal::ZERO, Decimal::ZERO))),
+            ShutdownDisposition::CancelUnknown {
+                cancel_ok: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn journal_keeps_prior_blocking_shutdown_across_subsequent_residual_position() {
+        let dir = std::env::temp_dir().join(format!("aleph-basis-jtest-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("journal.ndjson");
+        let journal = BasisJournal::open_and_check_restart(path.clone()).unwrap();
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "cancel_unknown".into(),
+                cancel_ok: false,
+                open_orders_arcus: None,
+                open_orders_hl: None,
+                inv_arc: None,
+                inv_xyz: None,
+                journal_ms: 1_000,
+            })
+            .unwrap();
+        journal
+            .append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "residual_position".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(d("0.5")),
+                inv_xyz: Some(d("-0.5")),
+                journal_ms: 2_000,
+            })
+            .unwrap();
+
+        let err = BasisJournal::check_clean_restart(&path).unwrap_err();
+        assert!(err.to_string().contains("cancel_unknown"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

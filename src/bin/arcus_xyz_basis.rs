@@ -19,8 +19,11 @@ use aleph_tx::exchanges::hyperliquid::{
     aggregate_multi_dex_equity,
 };
 use aleph_tx::strategy::arcus_xyz_basis::{
-    ArcusBookSnapshot, ArcusXyzBasisConfig, ArcusXyzBasisEngine, BasisAction, BasisJournal,
-    BasisJournalEvent, quantize_arcus_limit_price, quantize_shared_base_qty,
+    ArcusBookSnapshot, ArcusLegIntent, ArcusSubmitOutcome, ArcusXyzBasisConfig,
+    ArcusXyzBasisEngine, BasisAction, BasisJournal, BasisJournalEvent, HlLegIntent,
+    HlSubmitOutcome, ShutdownDisposition, VerifiedLegTerminal, classify_arcus_submit,
+    classify_hl_submit, classify_shutdown, parse_hl_market_position, quantize_arcus_limit_price,
+    quantize_shared_base_qty, verify_arcus_leg_terminal, verify_hl_leg_terminal,
 };
 use aleph_tx::telemetry_sink::{HedgeFillRecord, SessionInfo, StrategySnapshot, TelemetrySink};
 use aleph_tx::venues::{
@@ -449,6 +452,7 @@ where
 fn build_xyz_hedge_fill_record(
     client_order_id: String,
     xyz_delta: Decimal,
+    avg_price: Option<Decimal>,
     limit_price: Decimal,
     position_after: Decimal,
     fee_rate: f64,
@@ -465,7 +469,13 @@ fn build_xyz_hedge_fill_record(
         .abs()
         .to_f64()
         .filter(|v| v.is_finite() && *v > 0.0)?;
-    let price = limit_price.to_f64().filter(|v| v.is_finite() && *v > 0.0)?;
+    let (chosen_price, price_source) = match avg_price.filter(|p| *p > Decimal::ZERO) {
+        Some(fill_px) => (fill_px, "fill"),
+        None => (limit_price, "limit"),
+    };
+    let price = chosen_price
+        .to_f64()
+        .filter(|v| v.is_finite() && *v > 0.0)?;
     let pos_after = position_after.to_f64().filter(|v| v.is_finite())?;
     let fee = if fee_rate.is_finite() && fee_rate >= 0.0 {
         size * price * fee_rate
@@ -478,7 +488,7 @@ fn build_xyz_hedge_fill_record(
         side,
         size,
         price,
-        price_source: "limit",
+        price_source,
         fee,
         fee_source: "configured_rate",
         position_after: pos_after,
@@ -704,12 +714,7 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
         .get(&arc_market.market_id)
         .map(|p| p.size)
         .unwrap_or(Decimal::ZERO);
-    let inv_xyz = dex_state
-        .asset_positions
-        .iter()
-        .find(|ap| ap.position.coin == cfg.hl_coin)
-        .and_then(|ap| ap.position.szi.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO);
+    let inv_xyz = parse_hl_market_position(&dex_state, &cfg.hl_coin)?;
     let hl_equity = aggregate_multi_dex_equity(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
 
     Ok(LiveHandles {
@@ -729,10 +734,17 @@ async fn load_and_preflight(cfg: &ArcusXyzBasisConfig, env_path: &Path) -> Resul
     })
 }
 
+struct VenueSnapshot {
+    inv_arc: Decimal,
+    inv_xyz: Decimal,
+    hl_equity: Decimal,
+    hl_account_time_ms: u64,
+}
+
 async fn reconcile_both_venues(
     handles: &LiveHandles,
     cfg: &ArcusXyzBasisConfig,
-) -> Result<(Decimal, Decimal, Decimal)> {
+) -> Result<VenueSnapshot> {
     let (arc_positions, core_state, dex_state) = tokio::try_join!(
         handles.arc_info.positions(&handles.arc_account),
         handles.hl_info.account_state(&handles.hl_account),
@@ -744,35 +756,115 @@ async fn reconcile_both_venues(
         .get(&handles.arc_market.market_id)
         .map(|p| p.size)
         .unwrap_or(Decimal::ZERO);
-    let inv_xyz = dex_state
-        .asset_positions
-        .iter()
-        .find(|ap| ap.position.coin == cfg.hl_coin)
-        .and_then(|ap| ap.position.szi.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO);
+    let inv_xyz = parse_hl_market_position(&dex_state, &cfg.hl_coin)?;
     let hl_equity = aggregate_multi_dex_equity(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
-    Ok((inv_arc, inv_xyz, hl_equity))
+    Ok(VenueSnapshot {
+        inv_arc,
+        inv_xyz,
+        hl_equity,
+        hl_account_time_ms: dex_state.time,
+    })
 }
 
 async fn reconcile_both_venues_with_retry(
     handles: &LiveHandles,
     cfg: &ArcusXyzBasisConfig,
-) -> Result<(Decimal, Decimal, Decimal)> {
+) -> Result<VenueSnapshot> {
     retry_with_backoff(RECONCILE_MAX_ATTEMPTS, RECONCILE_BASE_BACKOFF_MS, || {
         reconcile_both_venues(handles, cfg)
     })
     .await
 }
 
-fn hl_submission_ok(res: &Result<Vec<hyperliquid::ExecutionStatus>>) -> bool {
-    matches!(
-        res,
-        Ok(statuses)
-            if !statuses.is_empty()
-                && !statuses
-                    .iter()
-                    .any(|s| matches!(s, hyperliquid::ExecutionStatus::Rejected { .. }))
-    )
+async fn query_arcus_order_opt(
+    handles: &LiveHandles,
+    order_id: Option<&str>,
+) -> Result<Option<arcus::Order>> {
+    match order_id {
+        Some(oid) => handles.arc_info.order(&handles.arc_account, oid).await,
+        None => Ok(None),
+    }
+}
+
+async fn verify_intent_round(
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+    arc_ctx: Option<(&ArcusLegIntent, &ArcusSubmitOutcome)>,
+    hl_intent: &HlLegIntent,
+    hl_submit: &HlSubmitOutcome,
+) -> std::result::Result<
+    Option<(
+        Option<VerifiedLegTerminal>,
+        VerifiedLegTerminal,
+        VenueSnapshot,
+    )>,
+    anyhow::Error,
+> {
+    let (hl_lookup, hl_open) = tokio::try_join!(
+        handles
+            .hl_info
+            .order_by_client_id(&handles.hl_account, &hl_intent.cloid),
+        handles
+            .hl_info
+            .open_orders_for_dex(&handles.hl_account, &cfg.hl_dex),
+    )?;
+
+    let arc_evidence = match arc_ctx {
+        Some((arc_intent, arc_submit)) => {
+            let oid = match arc_submit {
+                ArcusSubmitOutcome::GatewayAccepted { order_id, .. }
+                | ArcusSubmitOutcome::GatewayRejected { order_id, .. } => order_id.as_deref(),
+                ArcusSubmitOutcome::HardRejected { .. } | ArcusSubmitOutcome::Ambiguous { .. } => {
+                    None
+                }
+            };
+            let arc_win = HistoryWindow {
+                from_us: Some(arc_intent.sent_at_us.saturating_sub(5_000_000)),
+                to_us: None,
+                limit: Some(100),
+            };
+            let (direct_ord, arc_open, arc_hist, arc_fills) = tokio::try_join!(
+                query_arcus_order_opt(handles, oid),
+                handles.arc_info.open_orders(&handles.arc_account, &arc_win),
+                handles
+                    .arc_info
+                    .order_history(&handles.arc_account, &arc_win),
+                handles.arc_info.fills(&handles.arc_account, &arc_win),
+            )?;
+            Some((direct_ord, arc_open, arc_hist, arc_fills))
+        }
+        None => None,
+    };
+
+    let snap = reconcile_both_venues(handles, cfg).await?;
+    let hl_proof = verify_hl_leg_terminal(
+        hl_intent,
+        hl_submit,
+        &hl_lookup,
+        &hl_open,
+        snap.inv_xyz,
+        snap.hl_account_time_ms,
+    )?;
+    let arc_proof = match (arc_ctx, arc_evidence.as_ref()) {
+        (Some((arc_intent, arc_submit)), Some((direct_ord, arc_open, arc_hist, arc_fills))) => {
+            verify_arcus_leg_terminal(
+                arc_intent,
+                arc_submit,
+                direct_ord.as_ref(),
+                arc_open,
+                arc_hist,
+                arc_fills,
+                snap.inv_arc,
+            )?
+            .map(Some)
+        }
+        (None, None) => Some(None),
+        _ => unreachable!(),
+    };
+    match (arc_proof, hl_proof) {
+        (Some(arc_p), Some(hl_p)) => Ok(Some((arc_p, hl_p, snap))),
+        _ => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,45 +880,99 @@ async fn finalize_reconciled_intent(
     arc_snap: &ArcusBookSnapshot,
     kind: &str,
     intent_id: String,
-    hl_cloid: String,
-    xyz_limit_px: Decimal,
-    arc_ok: Option<bool>,
-    hl_ok: bool,
+    arc_ctx: Option<(&ArcusLegIntent, &ArcusSubmitOutcome)>,
+    hl_intent: &HlLegIntent,
+    hl_submit: &HlSubmitOutcome,
     exec_ms: f64,
 ) -> Result<()> {
-    let prev_arc = engine.inv_arc();
-    let prev_xyz = engine.inv_xyz();
     let rec_started = Instant::now();
-    let (inv_a, inv_x, hl_eq) = reconcile_both_venues_with_retry(handles, cfg).await?;
+    let mut resolved: Option<(
+        Option<VerifiedLegTerminal>,
+        VerifiedLegTerminal,
+        VenueSnapshot,
+    )> = None;
+    for attempt in 0..RECONCILE_MAX_ATTEMPTS {
+        match verify_intent_round(handles, cfg, arc_ctx, hl_intent, hl_submit).await {
+            Ok(Some(res)) => {
+                resolved = Some(res);
+                break;
+            }
+            Ok(None) if attempt + 1 < RECONCILE_MAX_ATTEMPTS => {}
+            Ok(None) => {
+                if let Some(sink) = telemetry {
+                    let _ = sink.stopped().await;
+                }
+                bail!(
+                    "authoritative reconciliation remained non-terminal for {intent_id}; keeping restart barrier armed"
+                );
+            }
+            Err(err) => {
+                // Fatal invariants (e.g. Resting IOC, duplicate/mismatched order identity, malformed position)
+                // abort immediately without clearing IntentOpen or releasing the flight lock.
+                let is_fatal_verify =
+                    matches!(hl_submit, HlSubmitOutcome::UnexpectedResting { .. })
+                        || err.to_string().contains("disagrees")
+                        || err.to_string().contains("still open")
+                        || err.to_string().contains("unexpectedly rested")
+                        || err.to_string().contains("malformed")
+                        || err.to_string().contains("duplicate");
+                if is_fatal_verify || attempt + 1 >= RECONCILE_MAX_ATTEMPTS {
+                    if let Some(sink) = telemetry {
+                        let _ = sink.stopped().await;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        let shift = u32::try_from(attempt.min(5)).unwrap_or(5);
+        let delay_ms = RECONCILE_BASE_BACKOFF_MS.saturating_mul(1_u64 << shift);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+    let (arc_proof, hl_proof, snap) = resolved
+        .context("missing resolved authoritative intent proof; keeping restart barrier armed")?;
+
     let reconcile_ms = rec_started.elapsed().as_secs_f64() * 1_000.0;
     let now_rec = unix_ms()?;
-    let terminal_status = if hl_ok && arc_ok.unwrap_or(true) {
-        "reconciled"
+    let terminal_status = if arc_ctx.is_some() {
+        "reconciled_verified_pair"
     } else {
-        "reconciled_after_submit_err"
+        "reconciled_verified_residual"
     };
     journal.append(&BasisJournalEvent::IntentTerminal {
         intent_id: intent_id.clone(),
         status: terminal_status.into(),
-        inv_arc: inv_a,
-        inv_xyz: inv_x,
+        inv_arc: snap.inv_arc,
+        inv_xyz: snap.inv_xyz,
         journal_ms: now_rec,
+        arcus_status: arc_proof.as_ref().map(|p| p.status.clone()),
+        arcus_filled_qty: arc_proof.as_ref().map(|p| p.filled_qty),
+        hl_status: Some(hl_proof.status.clone()),
+        hl_filled_qty: Some(hl_proof.filled_qty),
+        hl_terminal_at_ms: hl_proof.terminal_at_ms,
+        hl_account_time_ms: hl_proof.account_time_ms,
     })?;
-    let arc_delta = inv_a - prev_arc;
-    let xyz_delta = inv_x - prev_xyz;
+    let signed_hl_fill = if hl_intent.is_buy {
+        hl_proof.filled_qty
+    } else {
+        -hl_proof.filled_qty
+    };
     if let Some(sink) = telemetry
         && let Some(rec) = build_xyz_hedge_fill_record(
-            hl_cloid,
-            xyz_delta,
-            xyz_limit_px,
-            inv_x,
+            hl_intent.cloid.clone(),
+            signed_hl_fill,
+            hl_proof.avg_price,
+            hl_intent.limit_price,
+            snap.inv_xyz,
             HL_XYZ_GROWTH_TAKER_FEE_RATE,
         )
     {
         sink.hedge_fill(rec);
     }
-    engine.reconcile_positions(inv_a, inv_x, now_rec, now_rec, now_rec);
-    *session_eq = cfg.allocated_capital_usd + (hl_eq - initial_hl_equity).to_f64().unwrap_or(0.0);
+    engine.reconcile_positions(snap.inv_arc, snap.inv_xyz, now_rec, now_rec, now_rec);
+    *session_eq =
+        cfg.allocated_capital_usd + (snap.hl_equity - initial_hl_equity).to_f64().unwrap_or(0.0);
     daily_loss.check(*session_eq, utc_day_now())?;
     emit_basis_snapshot(
         telemetry,
@@ -843,14 +989,15 @@ async fn finalize_reconciled_intent(
             "mode": "cycle_exec",
             "kind": kind,
             "intent_id": intent_id,
-            "arc_ok": arc_ok,
-            "hl_ok": hl_ok,
+            "arc_status": arc_proof.as_ref().map(|p| p.status.as_str()),
+            "arc_filled": arc_proof.as_ref().map(|p| p.filled_qty.to_string()),
+            "hl_status": hl_proof.status,
+            "hl_filled": hl_proof.filled_qty.to_string(),
+            "hl_account_time_ms": hl_proof.account_time_ms,
             "exec_ms": (exec_ms * 10.0).round() / 10.0,
             "reconcile_ms": (reconcile_ms * 10.0).round() / 10.0,
-            "arc_delta": arc_delta.to_string(),
-            "xyz_delta": xyz_delta.to_string(),
-            "inv_arc": inv_a.to_string(),
-            "inv_xyz": inv_x.to_string(),
+            "inv_arc": snap.inv_arc.to_string(),
+            "inv_xyz": snap.inv_xyz.to_string(),
             "status": terminal_status,
         })
     );
@@ -868,47 +1015,148 @@ async fn handle_canary_shutdown(
         .arc_trading
         .cancel_all(Some(handles.arc_market.market_id))
         .await;
-    let rec_res = reconcile_both_venues_with_retry(handles, cfg).await;
-    match rec_res {
-        Ok((inv_a, inv_x, _)) => {
-            let terminal_flat = inv_a == Decimal::ZERO && inv_x == Decimal::ZERO;
+    let open_orders_res = retry_with_backoff(
+        RECONCILE_MAX_ATTEMPTS,
+        RECONCILE_BASE_BACKOFF_MS,
+        || async {
+            let win = HistoryWindow::default();
+            let (arc_open, hl_open) = tokio::try_join!(
+                handles.arc_info.open_orders(&handles.arc_account, &win),
+                handles
+                    .hl_info
+                    .open_orders_for_dex(&handles.hl_account, &cfg.hl_dex),
+            )?;
+            Ok((arc_open.len(), hl_open.len()))
+        },
+    )
+    .await;
+    let rec_res = reconcile_both_venues_with_retry(handles, cfg)
+        .await
+        .map(|snap| (snap.inv_arc, snap.inv_xyz));
+
+    let disp = classify_shutdown(cancel_res.is_ok(), open_orders_res, rec_res);
+    let now_ms = unix_ms()?;
+    let res = match disp {
+        ShutdownDisposition::Clean => {
             println!(
                 "{}",
                 json!({
                     "mode": "canary_shutdown",
                     "signal": sig,
-                    "cancel_ok": cancel_res.is_ok(),
-                    "reconciled": true,
-                    "inv_arc": inv_a.to_string(),
-                    "inv_xyz": inv_x.to_string(),
-                    "terminal_flat": terminal_flat,
+                    "shutdown_outcome": "clean",
+                    "cancel_ok": true,
+                    "open_orders_arcus": 0,
+                    "open_orders_hl": 0,
+                    "inv_arc": "0",
+                    "inv_xyz": "0",
+                    "terminal_flat": true,
                 })
             );
-            journal.append(&BasisJournalEvent::CleanShutdown {
-                journal_ms: unix_ms()?,
-            })?;
-            if let Some(sink) = telemetry {
-                let _ = sink.stopped().await;
-            }
+            journal.append(&BasisJournalEvent::CleanShutdown { journal_ms: now_ms })?;
             Ok(())
         }
-        Err(err) => {
+        ShutdownDisposition::ResidualPosition { inv_arc, inv_xyz } => {
             println!(
                 "{}",
                 json!({
                     "mode": "canary_shutdown",
                     "signal": sig,
-                    "cancel_ok": cancel_res.is_ok(),
-                    "reconciled": false,
-                    "error": err.to_string(),
+                    "shutdown_outcome": "residual_position",
+                    "cancel_ok": true,
+                    "open_orders_arcus": 0,
+                    "open_orders_hl": 0,
+                    "inv_arc": inv_arc.to_string(),
+                    "inv_xyz": inv_xyz.to_string(),
+                    "terminal_flat": false,
                 })
             );
-            if let Some(sink) = telemetry {
-                let _ = sink.stopped().await;
-            }
-            bail!("shutdown reconciliation failed after {sig}: {err}");
+            journal.append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "residual_position".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(0),
+                open_orders_hl: Some(0),
+                inv_arc: Some(inv_arc),
+                inv_xyz: Some(inv_xyz),
+                journal_ms: now_ms,
+            })?;
+            Err(anyhow::anyhow!(
+                "shutdown left residual positions (inv_arc={inv_arc}, inv_xyz={inv_xyz}) after {sig}"
+            ))
         }
+        ShutdownDisposition::OpenOrdersRemaining {
+            open_orders_arcus,
+            open_orders_hl,
+            inv_arc,
+            inv_xyz,
+        } => {
+            println!(
+                "{}",
+                json!({
+                    "mode": "canary_shutdown",
+                    "signal": sig,
+                    "shutdown_outcome": "open_orders_remaining",
+                    "cancel_ok": true,
+                    "open_orders_arcus": open_orders_arcus,
+                    "open_orders_hl": open_orders_hl,
+                    "inv_arc": inv_arc.map(|v| v.to_string()),
+                    "inv_xyz": inv_xyz.map(|v| v.to_string()),
+                    "terminal_flat": false,
+                })
+            );
+            journal.append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "open_orders_remaining".into(),
+                cancel_ok: true,
+                open_orders_arcus: Some(open_orders_arcus),
+                open_orders_hl: Some(open_orders_hl),
+                inv_arc,
+                inv_xyz,
+                journal_ms: now_ms,
+            })?;
+            Err(anyhow::anyhow!(
+                "shutdown observed remaining open orders (arcus={open_orders_arcus}, hl={open_orders_hl}) after {sig}"
+            ))
+        }
+        ShutdownDisposition::CancelUnknown {
+            cancel_ok,
+            open_orders_arcus,
+            open_orders_hl,
+            inv_arc,
+            inv_xyz,
+            detail,
+        } => {
+            println!(
+                "{}",
+                json!({
+                    "mode": "canary_shutdown",
+                    "signal": sig,
+                    "shutdown_outcome": "cancel_unknown",
+                    "cancel_ok": cancel_ok,
+                    "open_orders_arcus": open_orders_arcus,
+                    "open_orders_hl": open_orders_hl,
+                    "inv_arc": inv_arc.map(|v| v.to_string()),
+                    "inv_xyz": inv_xyz.map(|v| v.to_string()),
+                    "terminal_flat": false,
+                    "detail": detail,
+                })
+            );
+            journal.append(&BasisJournalEvent::ShutdownUnverified {
+                reason: "cancel_unknown".into(),
+                cancel_ok,
+                open_orders_arcus,
+                open_orders_hl,
+                inv_arc,
+                inv_xyz,
+                journal_ms: now_ms,
+            })?;
+            Err(anyhow::anyhow!(
+                "shutdown could not prove clean cancel/flat state after {sig}: {detail}"
+            ))
+        }
+    };
+    if let Some(sink) = telemetry {
+        let _ = sink.stopped().await;
     }
+    res
 }
 
 fn emit_basis_snapshot(
@@ -1107,26 +1355,39 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &order,
                     )?;
                     let hl_action = OrderAction::new(vec![wire])?;
+                    let sent_at_ms = unix_ms()?;
+                    let hl_intent = HlLegIntent {
+                        cloid: cloid.clone(),
+                        coin: cfg.hl_coin.clone(),
+                        is_buy,
+                        qty: q,
+                        limit_price: order.limit_price,
+                        sent_at_ms,
+                        prev_inv_xyz: engine.inv_xyz(),
+                    };
                     journal.append(&BasisJournalEvent::IntentOpen {
                         intent_id: intent_id.clone(),
                         kind: "residual_hedge".into(),
                         arcus_client_id: None,
-                        hl_cloid: Some(cloid.clone()),
+                        hl_cloid: Some(cloid),
                         qty: q,
-                        journal_ms: unix_ms()?,
+                        journal_ms: sent_at_ms,
                     })?;
                     let exec_started = Instant::now();
                     let hl_submit_res = handles.hl_trading.submit_orders(&hl_action).await;
                     let exec_ms = exec_started.elapsed().as_secs_f64() * 1_000.0;
-                    let hl_ok = hl_submission_ok(&hl_submit_res);
-                    if let Err(ref err) = hl_submit_res {
+                    let hl_submit = classify_hl_submit(&hl_submit_res, q);
+                    if !matches!(
+                        hl_submit,
+                        HlSubmitOutcome::FilledAck { .. } | HlSubmitOutcome::CanceledAck
+                    ) {
                         eprintln!(
                             "{}",
                             json!({
                                 "mode": "canary_warn",
-                                "event": "residual_submit_error",
+                                "event": "residual_submit_non_ok",
                                 "intent_id": intent_id,
-                                "error": err.to_string(),
+                                "hl_outcome": format!("{hl_submit:?}"),
                             })
                         );
                     }
@@ -1142,10 +1403,9 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &arc_snap,
                         "residual_hedge",
                         intent_id,
-                        cloid,
-                        order.limit_price,
                         None,
-                        hl_ok,
+                        &hl_intent,
+                        &hl_submit,
                         exec_ms,
                     )
                     .await?;
@@ -1194,12 +1454,13 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &handles.arc_market,
                         direction_arcus_buy,
                     )?;
+                    let arc_side = if direction_arcus_buy {
+                        ArcusSide::Buy
+                    } else {
+                        ArcusSide::Sell
+                    };
                     let arc_order = LimitOrder {
-                        side: if direction_arcus_buy {
-                            ArcusSide::Buy
-                        } else {
-                            ArcusSide::Sell
-                        },
+                        side: arc_side,
                         quantity: q,
                         price: arc_px,
                         time_in_force: ArcusTif::Ioc,
@@ -1220,13 +1481,32 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &hl_order,
                     )?;
                     let hl_action = OrderAction::new(vec![hl_wire])?;
+                    let sent_at_ms = unix_ms()?;
+                    let arc_intent = ArcusLegIntent {
+                        market_id: handles.arc_market.market_id,
+                        client_id: arc_cid.clone(),
+                        side: arc_side,
+                        qty: q,
+                        limit_price: arc_px,
+                        sent_at_us: sent_at_ms.saturating_mul(1_000),
+                        prev_inv_arc: engine.inv_arc(),
+                    };
+                    let hl_intent = HlLegIntent {
+                        cloid: hl_cloid.clone(),
+                        coin: cfg.hl_coin.clone(),
+                        is_buy: !direction_arcus_buy,
+                        qty: q,
+                        limit_price: hl_order.limit_price,
+                        sent_at_ms,
+                        prev_inv_xyz: engine.inv_xyz(),
+                    };
                     journal.append(&BasisJournalEvent::IntentOpen {
                         intent_id: intent_id.clone(),
                         kind: kind.into(),
                         arcus_client_id: Some(arc_cid.clone()),
-                        hl_cloid: Some(hl_cloid.clone()),
+                        hl_cloid: Some(hl_cloid),
                         qty: q,
-                        journal_ms: unix_ms()?,
+                        journal_ms: sent_at_ms,
                     })?;
                     let exec_started = Instant::now();
                     let (arc_res, hl_res) = tokio::join!(
@@ -1236,17 +1516,25 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         handles.hl_trading.submit_orders(&hl_action)
                     );
                     let exec_ms = exec_started.elapsed().as_secs_f64() * 1_000.0;
-                    let arc_ok = arc_res.is_ok();
-                    let hl_ok = hl_submission_ok(&hl_res);
-                    if !arc_ok || !hl_ok {
+                    let arc_submit = classify_arcus_submit(&arc_res, &arc_cid);
+                    let hl_submit = classify_hl_submit(&hl_res, q);
+                    if matches!(
+                        arc_submit,
+                        ArcusSubmitOutcome::GatewayRejected { .. }
+                            | ArcusSubmitOutcome::HardRejected { .. }
+                            | ArcusSubmitOutcome::Ambiguous { .. }
+                    ) || !matches!(
+                        hl_submit,
+                        HlSubmitOutcome::FilledAck { .. } | HlSubmitOutcome::CanceledAck
+                    ) {
                         eprintln!(
                             "{}",
                             json!({
                                 "mode": "canary_warn",
-                                "event": "pair_submit_partial_error",
+                                "event": "pair_submit_non_ok",
                                 "intent_id": intent_id,
-                                "arc_err": arc_res.as_ref().err().map(ToString::to_string),
-                                "hl_err": hl_res.as_ref().err().map(ToString::to_string),
+                                "arc_outcome": format!("{arc_submit:?}"),
+                                "hl_outcome": format!("{hl_submit:?}"),
                             })
                         );
                     }
@@ -1262,10 +1550,9 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                         &arc_snap,
                         kind,
                         intent_id,
-                        hl_cloid,
-                        hl_order.limit_price,
-                        Some(arc_ok),
-                        hl_ok,
+                        Some((&arc_intent, &arc_submit)),
+                        &hl_intent,
+                        &hl_submit,
                         exec_ms,
                     )
                     .await?;
@@ -1440,11 +1727,12 @@ mod tests {
     }
 
     #[test]
-    fn build_xyz_hedge_fill_record_handles_buy_sell_and_zero_delta() {
+    fn build_xyz_hedge_fill_record_handles_buy_sell_fill_avg_and_zero_delta() {
         assert!(
             build_xyz_hedge_fill_record(
                 "0x01".into(),
                 Decimal::ZERO,
+                None,
                 Decimal::new(100, 0),
                 Decimal::ZERO,
                 HL_XYZ_GROWTH_TAKER_FEE_RATE,
@@ -1455,6 +1743,7 @@ mod tests {
         let buy = build_xyz_hedge_fill_record(
             "0x02".into(),
             Decimal::new(5, 1),
+            None,
             Decimal::new(100, 0),
             Decimal::new(5, 1),
             HL_XYZ_GROWTH_TAKER_FEE_RATE,
@@ -1470,12 +1759,15 @@ mod tests {
         let sell = build_xyz_hedge_fill_record(
             "0x03".into(),
             Decimal::new(-25, 2),
+            Some(Decimal::new(795, 1)),
             Decimal::new(80, 0),
             Decimal::new(25, 2),
             HL_XYZ_GROWTH_TAKER_FEE_RATE,
         )
         .unwrap();
         assert_eq!(sell.side, "sell");
+        assert_eq!(sell.price_source, "fill");
+        assert!((sell.price - 79.5).abs() < 1e-12);
         assert!((sell.size - 0.25).abs() < 1e-12);
         assert!((sell.position_after - 0.25).abs() < 1e-12);
     }
