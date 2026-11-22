@@ -22,8 +22,11 @@ use entry_book::EntryBookState;
 pub use entry_book::{EntryBookFilter, EntryBookReport};
 use entry_flow::EntryFlowState;
 pub use entry_flow::{EntryFlowFilter, EntryFlowReport};
-pub use funding::{FlatAtFunding, FundingFlatReport};
-use funding::{FundingState, TimerKind};
+pub use funding::{
+    CarryDriftAdjustment, CarryDriftReport, FlatAtFunding, FundingFlatReport,
+    FundingLifecycleReport, FundingSettlementPolicy,
+};
+use funding::{CarryDriftState, FundingLifecycleState, FundingState, TimerKind};
 pub use paired_cash_exit::{PairedCashExit, PairedCashExitReport};
 use posture::PostureState;
 pub use posture::{TurnoverControl, TurnoverPosture, TurnoverPosturePolicy, TurnoverPostureReport};
@@ -168,6 +171,13 @@ pub struct MakerFirstConfig {
     /// requires signed opening distance from companion anchor mid `>= fee + conditional_markout + min_profit`.
     #[serde(default)]
     pub entry_markout_gate: Option<EntryMarkoutGate>,
+    /// Research-only: reconcile continuous cash across funding slots using
+    /// `source_time` fill watermarks and explicit `WitnessedSettlement` events (`ARB-IMP-05`).
+    #[serde(default)]
+    pub funding_settlement: Option<FundingSettlementPolicy>,
+    /// Optional hourly carry-drift basis threshold adjustment (`ARB-IMP-05`).
+    #[serde(default)]
+    pub carry_drift_adjustment: Option<CarryDriftAdjustment>,
 }
 
 fn default_entry_markout_quantile_p() -> f64 {
@@ -705,6 +715,18 @@ pub enum MakerFirstEvent {
         at_ms: u64,
         control: TurnoverControl,
     },
+    FundingSettlement {
+        at_ms: u64,
+        leg: usize,
+        settlement: WitnessedSettlement,
+    },
+    FundingRate {
+        at_ms: u64,
+        leg: usize,
+        source_ms: u64,
+        #[serde(with = "rust_decimal::serde::str")]
+        rate_per_settlement: Decimal,
+    },
     End {
         at_ms: u64,
     },
@@ -717,6 +739,8 @@ impl MakerFirstEvent {
             | Self::Trade { at_ms, .. }
             | Self::TradeFeed { at_ms, .. }
             | Self::TurnoverControl { at_ms, .. }
+            | Self::FundingSettlement { at_ms, .. }
+            | Self::FundingRate { at_ms, .. }
             | Self::End { at_ms } => at_ms,
         }
     }
@@ -816,6 +840,10 @@ pub struct MakerFirstReport {
     pub incomplete: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub funding_flat: Option<FundingFlatReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_lifecycle: Option<FundingLifecycleReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carry_drift: Option<CarryDriftReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_model: Option<QueueModelReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -961,6 +989,7 @@ struct Quote {
 
 struct Candidate {
     edge_bps: Decimal,
+    raw_edge_bps_before_carry: Option<Decimal>,
     cycle_edge_bps: Option<Decimal>,
     passive_entry: bool,
     queue_ahead: Decimal,
@@ -1001,6 +1030,7 @@ struct SubMinSunk {
 }
 
 struct Cycle {
+    id: usize,
     posture: TurnoverPosture,
     started_ms: u64,
     initial_cash: Decimal,
@@ -1023,6 +1053,17 @@ struct Cycle {
     cash_exit_triggered: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ClosedCycleSummary {
+    posture_idx: usize,
+    draining: bool,
+    externalizing: bool,
+    paired_maker_close: bool,
+    forced_ioc_filled: bool,
+    cash_exit_triggered: bool,
+    recorded_in_attribution: bool,
+}
+
 struct Replay<'a> {
     config: &'a MakerFirstConfig,
     rules: Rules,
@@ -1042,6 +1083,8 @@ struct Replay<'a> {
     quote: Option<Quote>,
     ioc: Option<Ioc>,
     cycle: Option<Cycle>,
+    next_cycle_id: usize,
+    closed_cycles_meta: BTreeMap<usize, ClosedCycleSummary>,
     next_quote_ms: u64,
     next_ioc_ms: u64,
     next_entry_ioc_ms: u64,
@@ -1056,6 +1099,8 @@ struct Replay<'a> {
     entry_hedge_diag: Option<EntryHedgeDiagState>,
     posture: PostureState,
     funding: Option<FundingState>,
+    funding_lifecycle: Option<FundingLifecycleState>,
+    carry_drift: CarryDriftState,
     report: MakerFirstReport,
 }
 
@@ -1369,7 +1414,9 @@ impl MakerFirstConfig {
             policy.validate(&self.pair)?;
         }
         ensure!(
-            (self.pair.asset_class == AssetClass::Crypto || self.flat_at_funding.is_some())
+            (self.pair.asset_class == AssetClass::Crypto
+                || self.flat_at_funding.is_some()
+                || self.funding_settlement.is_some())
                 && (self.pair.mode.is_pair_hedge() || self.require_net_edge)
                 && self.maker_leg < 2
                 && (1..=DAY_MS).contains(&self.start_ms.abs_diff(self.end_ms))
@@ -1502,7 +1549,17 @@ impl MakerFirstConfig {
                 "invalid hedged exit policy"
             );
         }
+        ensure!(
+            self.flat_at_funding.is_none() || self.funding_settlement.is_none(),
+            "cannot enable both flat_at_funding and funding_settlement"
+        );
         if let Some(policy) = self.flat_at_funding {
+            policy.validate(self)?;
+        }
+        if let Some(policy) = self.funding_settlement {
+            policy.validate(self)?;
+        }
+        if let Some(policy) = self.carry_drift_adjustment {
             policy.validate(self)?;
         }
         let mut slots = [0; 2];
@@ -1515,7 +1572,8 @@ impl MakerFirstConfig {
             slots[i] = count;
             first[i] = (count > 0).then_some(at);
         }
-        let supported = slots == [0; 2] || self.flat_at_funding.is_some();
+        let supported =
+            slots == [0; 2] || self.flat_at_funding.is_some() || self.funding_settlement.is_some();
         let equity_session_gate_enforced =
             self.pair.asset_class != AssetClass::Equity || self.enforce_equity_session_gate;
         let mut required_evidence = if self.flat_at_funding.is_some() {
@@ -1524,6 +1582,12 @@ impl MakerFirstConfig {
                 "bounded_source_to_receipt_trade_delivery",
                 "public_trade_and_book_continuity_across_payment_boundaries",
                 "flat_positions_and_resolved_orders_at_every_funding_guard",
+            ]
+        } else if self.funding_settlement.is_some() {
+            vec![
+                "verified_funding_schedule_and_settlement_guard",
+                "bounded_source_to_receipt_trade_delivery",
+                "witnessed_settlement_for_every_held_slot",
             ]
         } else if supported {
             vec![]
@@ -1578,6 +1642,118 @@ impl Replay<'_> {
         self.report.incomplete.get_or_insert(reason);
         if let Some(state) = &mut self.funding {
             state.report.failure.get_or_insert(reason);
+        }
+    }
+
+    fn funding_lifecycle_failure(&mut self, reason: &'static str) {
+        self.report.incomplete.get_or_insert(reason);
+        if let Some(lifecycle) = &mut self.funding_lifecycle {
+            lifecycle.report.failure.get_or_insert(reason);
+        }
+    }
+
+    fn funding_lifecycle_guard_active(&self, now: u64) -> bool {
+        self.funding_lifecycle
+            .as_ref()
+            .is_some_and(|s| s.guard_active(now))
+    }
+
+    fn funding_lifecycle_blocks_quote(&self, now: u64) -> bool {
+        self.funding_lifecycle.as_ref().is_some_and(|s| {
+            s.guard_active(now) || s.guard_active(now + self.config.maker_arrival_delay_ms())
+        })
+    }
+
+    fn resolve_funding_settlements(&mut self, now: u64, at_cutoff: bool) {
+        let Some(lifecycle) = &mut self.funding_lifecycle else {
+            return;
+        };
+        let (payouts, err) = lifecycle.resolve_ready(now, at_cutoff);
+        let active_id = self.cycle.as_ref().map(|c| c.id);
+        for payout in payouts {
+            let low = payout.low;
+            let high = payout.high;
+            self.ledger.cash += low;
+            self.ledger.funding += low;
+            self.ledger.funding_upper += high;
+            self.ledger.witnessed_funding_payments += 1;
+            let belongs_to_active = payout.cycle_id.is_some() && payout.cycle_id == active_id;
+            if let Some(costs) = &mut self.report.execution_costs {
+                costs.book_funding(payout.cycle_id, low);
+            }
+            if !belongs_to_active {
+                // Keep currently active cycle PnL isolated from late funding belonging to an
+                // earlier closed cycle or unattributed cross-cycle remainder.
+                if let Some(active) = &mut self.cycle {
+                    active.initial_cash += low;
+                }
+                self.report.realized_pnl += low;
+                if let Some(closed) = payout
+                    .cycle_id
+                    .and_then(|id| self.closed_cycles_meta.get(&id).copied())
+                {
+                    self.report.turnover_posture.realized_pnl[closed.posture_idx] += low;
+                    if closed.draining {
+                        self.report.forced_close_pnl += low;
+                    } else if !closed.externalizing {
+                        self.report.passive_only_pnl += low;
+                    }
+                    if closed.recorded_in_attribution {
+                        if closed.forced_ioc_filled {
+                            self.report.cycle_attribution.forced_ioc_cycle_pnl += low;
+                        }
+                        if closed.paired_maker_close {
+                            self.report.cycle_attribution.paired_maker_close_pnl += low;
+                        }
+                    }
+                    if closed.cash_exit_triggered
+                        && let Some(stats) = &mut self.report.paired_cash_exit
+                    {
+                        stats.realized_stress_cash += low;
+                    }
+                }
+            }
+        }
+        if let Some(reason) = err {
+            self.funding_lifecycle_failure(reason);
+        }
+    }
+
+    fn record_funding_lifecycle_fill(
+        &mut self,
+        leg: usize,
+        cycle_id: Option<usize>,
+        source_ms: u64,
+        receipt_ms: u64,
+        signed_base: Decimal,
+    ) {
+        let Some(lifecycle) = &mut self.funding_lifecycle else {
+            return;
+        };
+        if let Some(reason) = lifecycle.on_fill(leg, cycle_id, source_ms, receipt_ms, signed_base) {
+            self.funding_lifecycle_failure(reason);
+        }
+    }
+
+    fn funding_lifecycle_timers(&mut self, until: u64) -> Result<()> {
+        loop {
+            let next = self
+                .funding_lifecycle
+                .as_mut()
+                .and_then(|s| s.pop_timer_due(until));
+            let Some(now) = next else {
+                return Ok(());
+            };
+            if self.posture.expire(now) {
+                self.report.turnover_posture.controls_expired += 1;
+                self.posture_changed(now);
+            }
+            self.resolve_funding_settlements(now, false);
+            self.risk(now);
+            self.advance_quote(now, false);
+            self.advance(now)?;
+            self.resolve_funding_settlements(now, false);
+            self.risk(now);
         }
     }
 
@@ -2175,7 +2351,10 @@ impl Replay<'_> {
             self.quote = None;
         }
         let cycle = self.cycle.get_or_insert_with(|| {
+            let id = self.next_cycle_id;
+            self.next_cycle_id += 1;
             if let Some(costs) = &mut self.report.execution_costs {
+                debug_assert_eq!(costs.cycles.len(), id);
                 costs.begin(now, reference_mids);
             }
             if let Some(i) = passive_side {
@@ -2183,6 +2362,7 @@ impl Replay<'_> {
             }
             self.report.turnover_posture.cycles_started[posture.index()] += 1;
             Cycle {
+                id,
                 posture,
                 started_ms: now,
                 initial_cash: self.ledger.cash,
@@ -2210,6 +2390,7 @@ impl Replay<'_> {
         if !closing {
             cycle.hedge_fill_at_ms = None;
         }
+        let cycle_id = cycle.id;
         self.report.maker_fills += 1;
         self.report.maker_buy_fills += usize::from(side == HedgeSide::Buy);
         self.report.maker_sell_fills += usize::from(side == HedgeSide::Sell);
@@ -2222,6 +2403,8 @@ impl Replay<'_> {
         let fee = self
             .ledger
             .trade(i, side, Fill { base, notional }, self.config.maker_fee_bps);
+        let signed_base = if side == HedgeSide::Buy { base } else { -base };
+        self.record_funding_lifecycle_fill(i, Some(cycle_id), source, now, signed_base);
         self.report.maker_fees += fee;
         if let Some(costs) = &mut self.report.execution_costs {
             costs.fill(costs::CostFill {
@@ -2468,6 +2651,19 @@ impl Replay<'_> {
         let fee = self
             .ledger
             .trade(order.leg, order.side, fill, terms.taker_fee_bps);
+        let signed_ioc_base = if order.side == HedgeSide::Buy {
+            fill_base
+        } else {
+            -fill_base
+        };
+        let active_cycle_id = self.cycle.as_ref().map(|c| c.id);
+        self.record_funding_lifecycle_fill(
+            order.leg,
+            active_cycle_id,
+            fill_time,
+            now,
+            signed_ioc_base,
+        );
         if let Some(costs) = &mut self.report.execution_costs {
             costs.fill(costs::CostFill {
                 now,
@@ -2917,7 +3113,7 @@ impl Replay<'_> {
         closing: bool,
         level: &Level,
     ) -> Result<Option<Candidate>> {
-        self.candidate_with_dislocation(books, side, closing, level, None)
+        self.candidate_with_dislocation(books, side, closing, level, None, None)
     }
 
     fn candidate_with_dislocation(
@@ -2927,6 +3123,7 @@ impl Replay<'_> {
         closing: bool,
         level: &Level,
         dislocation_bps: Option<Decimal>,
+        carry_adj_bps: Option<Decimal>,
     ) -> Result<Option<Candidate>> {
         let i = self.maker();
         let j = 1 - i;
@@ -3014,6 +3211,7 @@ impl Replay<'_> {
         });
         let mut candidate = Candidate {
             edge_bps: Decimal::ZERO,
+            raw_edge_bps_before_carry: None,
             cycle_edge_bps,
             passive_entry: false,
             queue_ahead: level.contracts,
@@ -3023,15 +3221,21 @@ impl Replay<'_> {
             hedge_limit: Some(hedge_price),
             turnover: None,
         };
-        let cash_edge = if hedged_exit.is_some() {
+        let (cash_edge, raw_cash_edge) = if hedged_exit.is_some() {
             // The paired hedge IOC is identical for both exits. Sunk cash
             // and that shared hedge cost cancel out of the comparison.
             let Some(ioc) = self.reduce_limit(books[i], i, side, quantity) else {
                 return Ok(None);
             };
-            maker_cash - cash(side, ioc * quantity, maker.taker_fee_bps)
+            (
+                maker_cash - cash(side, ioc * quantity, maker.taker_fee_bps),
+                None,
+            )
         } else if let Some(cycle) = self.cycle.as_ref().filter(|_| closing) {
-            (maker_cash + hedge_cash) + (self.ledger.cash - cycle.initial_cash)
+            (
+                (maker_cash + hedge_cash) + (self.ledger.cash - cycle.initial_cash),
+                None,
+            )
         } else {
             let Some(edge) = self.opening_edge(
                 books,
@@ -3039,6 +3243,7 @@ impl Replay<'_> {
                 maker_cash,
                 hedge_cash,
                 dislocation_bps,
+                carry_adj_bps,
                 sunk,
             ) else {
                 return Ok(None);
@@ -3051,9 +3256,12 @@ impl Replay<'_> {
             sunk.base + quantity
         };
         candidate.edge_bps = self.edge_bps(cash_edge, edge_qty * mark);
+        candidate.raw_edge_bps_before_carry =
+            raw_cash_edge.map(|raw| self.edge_bps(raw, edge_qty * mark));
         Ok(Some(candidate))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn opening_edge(
         &self,
         books: [&Book; 2],
@@ -3061,8 +3269,9 @@ impl Replay<'_> {
         maker_cash: Decimal,
         hedge_cash: Decimal,
         dislocation_bps: Option<Decimal>,
+        carry_adj_bps: Option<Decimal>,
         sunk: SubMinSunk,
-    ) -> Option<Decimal> {
+    ) -> Option<(Decimal, Option<Decimal>)> {
         let i = self.maker();
         let j = 1 - i;
         let maker = &self.config.pair.legs[i];
@@ -3091,9 +3300,19 @@ impl Replay<'_> {
         }
         let probabilities = offset.and_then(|policy| policy.close_probability);
         let mode = self.config.pair.mode;
+        let carry_cash = if mode.is_pair_hedge() {
+            carry_adj_bps.map_or(Decimal::ZERO, |adj| {
+                adj / BPS * (total_qty * books[j].mid())
+            })
+        } else {
+            Decimal::ZERO
+        };
         if offset.is_some() && probabilities.is_none() && mode.is_pair_hedge() {
             candidate.passive_entry = true;
-            return Some(passive_cash);
+            return Some((
+                passive_cash + carry_cash,
+                carry_adj_bps.map(|_| passive_cash),
+            ));
         }
         let hedge_exit = self.limit(books[j], j, side, total_qty)?;
         let hedge_exit_cash = cash(side, hedge_exit * total_qty, hedge.taker_fee_bps);
@@ -3105,7 +3324,8 @@ impl Replay<'_> {
                 }
                 _ => Decimal::ZERO,
             };
-            return Some(paired_cash + reversion_cash);
+            let raw = paired_cash + reversion_cash;
+            return Some((raw + carry_cash, carry_adj_bps.map(|_| raw)));
         }
         let maker_exit = self.limit(books[i], i, opposite(side), total_qty)?;
         let fallback_cash = maker_cash
@@ -3156,8 +3376,9 @@ impl Replay<'_> {
                 fallback_cash: worst_cash,
                 eligible,
             });
+            return Some((edge, None));
         }
-        Some(edge)
+        Some((edge + carry_cash, carry_adj_bps.map(|_| edge)))
     }
 
     fn turnover_rank(
@@ -3248,6 +3469,7 @@ impl Replay<'_> {
         );
         let mut candidate = Candidate {
             edge_bps: Decimal::ZERO,
+            raw_edge_bps_before_carry: None,
             cycle_edge_bps: None,
             passive_entry: false,
             queue_ahead: quote.ahead,
@@ -3258,7 +3480,15 @@ impl Replay<'_> {
             turnover: None,
         };
         if self
-            .opening_edge(books, &mut candidate, maker_cash, hedge_cash, None, sunk)
+            .opening_edge(
+                books,
+                &mut candidate,
+                maker_cash,
+                hedge_cash,
+                None,
+                None,
+                sunk,
+            )
             .is_none()
             || candidate.passive_entry != quote.passive_entry
         {
@@ -3317,6 +3547,13 @@ impl Replay<'_> {
             self.report.blocked("book_age_or_skew");
             return Ok(());
         };
+        if self.funding_lifecycle_blocks_quote(now) {
+            if let Some(lifecycle) = &mut self.funding_lifecycle {
+                lifecycle.report.boundary_guard_blocks += 1;
+            }
+            self.report.blocked("funding_boundary_guard");
+            return Ok(());
+        }
         let mode = self.config.pair.mode;
         let incentive = mode.incentive();
         let feedback = self.config.turnover_feedback.filter(|_| !closing);
@@ -3355,6 +3592,8 @@ impl Replay<'_> {
         let mut blocked = None;
         let mut best_edge = self.report.best_modeled_edge_bps;
         let mut best_cost = self.report.best_projected_turnover_cost_bps;
+        let mut carry_observations: [Option<std::result::Result<Decimal, &'static str>>; 2] =
+            [None; 2];
         for side in [HedgeSide::Buy, HedgeSide::Sell] {
             let permitted = if closing {
                 side == direction(self.ledger.positions[self.maker()])
@@ -3413,6 +3652,25 @@ impl Replay<'_> {
                             blocked = Some(reason);
                             continue;
                         }
+                    }
+                }
+            } else {
+                None
+            };
+            let carry_adj_bps = if !closing && let Some(policy) = self.config.carry_drift_adjustment
+            {
+                match self
+                    .carry_drift
+                    .adjustment_bps(policy, self.maker(), side, now)
+                {
+                    Ok(adj) => {
+                        carry_observations[side_index(side)] = Some(Ok(adj));
+                        Some(adj)
+                    }
+                    Err(reason) => {
+                        carry_observations[side_index(side)] = Some(Err(reason));
+                        blocked = Some(reason);
+                        continue;
                     }
                 }
             } else {
@@ -3477,6 +3735,7 @@ impl Replay<'_> {
                     closing,
                     level,
                     mid_dislocation_bps,
+                    carry_adj_bps,
                 )?
                 else {
                     continue;
@@ -3515,6 +3774,13 @@ impl Replay<'_> {
                 break;
             }
         }
+        for obs in carry_observations.into_iter().flatten() {
+            match obs {
+                Ok(adj) => self.carry_drift.record_adjustment(adj),
+                Err("carry_rate_conflict") => self.carry_drift.record_conflict_block(),
+                Err(_) => self.carry_drift.record_stale_block(),
+            }
+        }
         self.report.best_modeled_edge_bps = best_edge;
         self.report.best_projected_turnover_cost_bps = best_cost;
         self.next_quote_ms = now + self.config.reprice_ms;
@@ -3528,6 +3794,13 @@ impl Replay<'_> {
             && hedged_exit.is_none()
             && best.edge_bps < self.rules.min_edge
         {
+            if !closing
+                && best
+                    .raw_edge_bps_before_carry
+                    .is_some_and(|raw| raw >= self.rules.min_edge)
+            {
+                self.carry_drift.record_adverse_block();
+            }
             self.report.blocked(if closing {
                 "exit_net_edge"
             } else {
@@ -3659,6 +3932,7 @@ impl Replay<'_> {
                 price,
                 quantity,
                 edge_bps,
+                raw_edge_bps_before_carry: None,
                 cycle_edge_bps: None,
                 queue_ahead,
                 hedge_limit: None,
@@ -4219,6 +4493,9 @@ impl Replay<'_> {
         if funding_pause {
             self.cancel(now, "funding_guard");
         }
+        if self.funding_lifecycle_guard_active(now) {
+            self.cancel(now, "funding_boundary_guard");
+        }
         self.poll_ioc(now)?;
         let mut confirmed = false;
         while self.notices.front().is_some_and(|(at, _)| *at <= now) {
@@ -4385,7 +4662,10 @@ impl Replay<'_> {
                     && self.quote.as_ref().is_some_and(|quote| !quote.closing)
                     && self.net_below_minimum(now));
             if !awaiting_sub_min_opening {
-                if let Some(cancel_by) = self.passive_cancel_by(now) {
+                if let Some(cancel_by) = self
+                    .passive_cancel_by(now)
+                    .filter(|_| !self.funding_lifecycle_blocks_quote(now))
+                {
                     self.quote_passive_offset(now, cancel_by);
                 } else {
                     self.externalize(now)?;
@@ -4413,6 +4693,22 @@ impl Replay<'_> {
                     pnl - policy.cost(turnover, turnover - cycle.maker_turnover);
             }
             self.record_completed_cycle(&cycle, now, pnl);
+            let recorded_in_attribution =
+                self.report.incomplete.is_none() && self.notices.is_empty();
+            self.closed_cycles_meta.insert(
+                cycle.id,
+                ClosedCycleSummary {
+                    posture_idx: cycle.posture.index(),
+                    draining: cycle.draining,
+                    externalizing: cycle.externalizing,
+                    paired_maker_close: cycle.paired_at_ms.is_some()
+                        && cycle.closing_maker_filled
+                        && !cycle.forced_ioc_filled,
+                    forced_ioc_filled: cycle.forced_ioc_filled,
+                    cash_exit_triggered: cycle.cash_exit_triggered,
+                    recorded_in_attribution,
+                },
+            );
             let eligible = std::mem::take(&mut self.ledger.cycle_eligible_turnover);
             if let Some(policy) = self.config.turnover_feedback {
                 if self.report.incomplete.is_none() && self.notices.is_empty() {
@@ -4571,6 +4867,7 @@ impl Replay<'_> {
             );
             previous = now;
             self.funding_timers(now)?;
+            self.funding_lifecycle_timers(now)?;
             if self.posture.expire(now) {
                 self.report.turnover_posture.controls_expired += 1;
                 self.posture_changed(now);
@@ -4605,30 +4902,38 @@ impl Replay<'_> {
                         "invalid maker-first print"
                     );
                     if leg == self.maker()
-                        && let Some(state) = &mut self.funding
+                        && (self.funding.is_some() || self.funding_lifecycle.is_some())
                     {
                         if source_ms < self.config.start_ms {
                             // The replay starts with no orders or inventory. A
                             // reconnect history print cannot fill our later order.
-                            state.report.ignored_prestart_prints += 1;
+                            if let Some(state) = &mut self.funding {
+                                state.report.ignored_prestart_prints += 1;
+                            }
+                            if let Some(lifecycle) = &mut self.funding_lifecycle {
+                                lifecycle.report.ignored_prestart_prints += 1;
+                            }
                             self.report.trade_prints += 1;
                             continue;
                         }
-                        state.report.max_trade_delivery_ms = state
-                            .report
-                            .max_trade_delivery_ms
-                            .max(now.saturating_sub(source_ms));
-                    }
-                    if self.funding.is_some()
-                        && leg == self.maker()
-                        && (source_ms > now
-                            || now - source_ms > self.config.trade_delivery_grace_ms)
-                    {
-                        self.report.late_trade_prints += 1;
-                        self.report.trade_prints += 1;
-                        self.funding_failure("funding_trade_delivery_bound_violated");
-                        self.cancel(now, "unbounded_trade_delivery");
-                        continue;
+                        let delivery_ms = now.saturating_sub(source_ms);
+                        if let Some(state) = &mut self.funding {
+                            state.report.max_trade_delivery_ms =
+                                state.report.max_trade_delivery_ms.max(delivery_ms);
+                        }
+                        if let Some(lifecycle) = &mut self.funding_lifecycle {
+                            lifecycle.report.max_trade_delivery_ms =
+                                lifecycle.report.max_trade_delivery_ms.max(delivery_ms);
+                        }
+                        if source_ms > now || now - source_ms > self.config.trade_delivery_grace_ms
+                        {
+                            self.report.late_trade_prints += 1;
+                            self.report.trade_prints += 1;
+                            self.funding_failure("funding_trade_delivery_bound_violated");
+                            self.funding_lifecycle_failure("funding_trade_delivery_bound_violated");
+                            self.cancel(now, "unbounded_trade_delivery");
+                            continue;
+                        }
                     }
                     if leg == self.maker() && self.feed_online {
                         self.trade(now, source_ms, aggressor, px, contracts)?;
@@ -4656,6 +4961,13 @@ impl Replay<'_> {
                             {
                                 self.report.incomplete = Some("resting_order_during_trade_gap");
                             }
+                            if self.funding_lifecycle.as_ref().is_some_and(|lifecycle| {
+                                lifecycle.has_unwatermarked_slot(self.maker(), now)
+                            }) {
+                                self.funding_lifecycle_failure(
+                                    "funding_trade_feed_gap_at_settlement",
+                                );
+                            }
                             self.cancel(now, "trade_feed_gap");
                         }
                     }
@@ -4674,6 +4986,38 @@ impl Replay<'_> {
                     } else {
                         self.report.turnover_posture.controls_rejected += 1;
                     }
+                }
+                MakerFirstEvent::FundingSettlement {
+                    leg, settlement, ..
+                } => {
+                    let failure = match &mut self.funding_lifecycle {
+                        Some(lifecycle) => lifecycle.on_witness(leg, now, settlement)?,
+                        None => {
+                            anyhow::bail!(
+                                "unexpected funding settlement without funding_settlement policy"
+                            );
+                        }
+                    };
+                    if let Some(reason) = failure {
+                        self.funding_lifecycle_failure(reason);
+                    } else {
+                        self.resolve_funding_settlements(now, false);
+                    }
+                }
+                MakerFirstEvent::FundingRate {
+                    leg,
+                    source_ms,
+                    rate_per_settlement,
+                    ..
+                } => {
+                    ensure!(leg < 2, "invalid funding rate leg");
+                    self.carry_drift.observe_rate(
+                        leg,
+                        source_ms,
+                        now,
+                        rate_per_settlement,
+                        self.config.pair.legs[leg].funding.interval_ms,
+                    )?;
                 }
                 MakerFirstEvent::End { .. } => {
                     ensure!(
@@ -4722,6 +5066,12 @@ impl Replay<'_> {
                     .is_some_and(|c| c.paired_at_ms.is_some()),
         );
         self.report.fees = self.ledger.fees;
+        self.resolve_funding_settlements(self.config.end_ms, true);
+        if let Some(lifecycle) = &self.funding_lifecycle
+            && lifecycle.report.resolved_slots_by_leg != lifecycle.report.planned_slots_by_leg
+        {
+            self.funding_lifecycle_failure("unresolved_funding_slot_at_cutoff");
+        }
         if let Some(state) = &self.funding
             && state.report.verified_slots_by_leg != state.report.planned_slots_by_leg
         {
@@ -4735,7 +5085,9 @@ impl Replay<'_> {
             self.report.incomplete.get_or_insert("residual_at_cutoff");
         }
         // A marked residual cannot repair an unproven historical funding cashflow.
-        let final_mark = if self.funding.is_some() && self.report.incomplete.is_some() {
+        let final_mark = if (self.funding.is_some() || self.funding_lifecycle.is_some())
+            && self.report.incomplete.is_some()
+        {
             None
         } else {
             self.final_mark()?
@@ -4835,6 +5187,21 @@ impl Replay<'_> {
         });
         self.report.rwa_session = self.saw_rwa_metadata.then_some(self.rwa_session);
         self.report.funding_flat = self.funding.map(|state| state.report);
+        self.report.funding_lifecycle = self.funding_lifecycle.take().map(|mut lifecycle| {
+            if let Some(net_pnl) = self.report.net_pnl {
+                let price_pnl = net_pnl - self.ledger.funding + self.ledger.fees;
+                lifecycle.report.price_pnl_usd = Some(price_pnl);
+                lifecycle.report.cash_identity_reconciled =
+                    price_pnl + lifecycle.report.witnessed_funding_cash_usd - self.ledger.fees
+                        == net_pnl
+                        && lifecycle.report.witnessed_funding_cash_usd == self.ledger.funding;
+            }
+            lifecycle.report
+        });
+        self.report.carry_drift = self
+            .config
+            .carry_drift_adjustment
+            .map(|_| self.carry_drift.report);
         self.report.basis_risk_reserve = self.config.basis_risk_reserve.map(|policy| {
             self.basis_risk
                 .report(policy, self.config.latency_reserve_bps)
@@ -4889,6 +5256,8 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         quote: None,
         ioc: None,
         cycle: None,
+        next_cycle_id: 0,
+        closed_cycles_meta: BTreeMap::new(),
         next_quote_ms: 0,
         next_ioc_ms: 0,
         next_entry_ioc_ms: 0,
@@ -4905,6 +5274,8 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
             .then(EntryHedgeDiagState::default),
         posture: PostureState::new(config.turnover_posture),
         funding: FundingState::new(config)?,
+        funding_lifecycle: FundingLifecycleState::new(config)?,
+        carry_drift: CarryDriftState::default(),
         report: MakerFirstReport {
             conservative_cancel_guard: config.conservative_cancel_guard,
             start_ms: config.start_ms,
@@ -4991,6 +5362,8 @@ mod tests {
             enforce_equity_session_gate: false,
             queue_model: None,
             entry_markout_gate: None,
+            funding_settlement: None,
+            carry_drift_adjustment: None,
         }
     }
 
@@ -8708,6 +9081,7 @@ mod tests {
             replay.last_source_ms = [start, start];
             replay.last_usable_at_ms = [Some(start), Some(start)];
             replay.cycle = Some(Cycle {
+                id: 0,
                 posture: replay.posture.posture,
                 started_ms: start,
                 initial_cash: Decimal::ZERO,

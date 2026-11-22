@@ -20,6 +20,7 @@ fn run(cfg: &MakerFirstConfig, mut rows: Vec<MakerFirstEvent>) -> MakerFirstRepo
 
 fn cycle(at: u64) -> Cycle {
     Cycle {
+        id: 0,
         posture: TurnoverPosture::Neutral,
         started_ms: at,
         initial_cash: Decimal::ZERO,
@@ -360,4 +361,899 @@ fn funding_drain_closes_both_legs_and_keeps_all_exit_costs() {
     assert_eq!(report.fees, fees);
     assert_eq!(report.forced_closes, 1);
     assert_eq!(report.funding_flat.unwrap().verified_slots_by_leg, [1, 1]);
+}
+
+fn settlement_config() -> MakerFirstConfig {
+    let mut cfg = config();
+    cfg.start_ms = HOUR - 30_000;
+    cfg.end_ms = HOUR + 30_000;
+    cfg.hold_ms = 20_000;
+    cfg.unhedged_timeout_ms = 10_000;
+    cfg.drain_ms = 10_000;
+    cfg.quote_lifetime_ms = 5_000;
+    cfg.trade_delivery_grace_ms = 3_000;
+    cfg.funding_settlement = Some(FundingSettlementPolicy {
+        settlement_guard_ms: 1_000,
+        max_settlement_arrival_lag_ms: 10_000,
+    });
+    cfg
+}
+
+fn witnessed(at_ms: u64, rate: &str, low_per_base: &str, high_per_base: &str) -> WitnessedSettlement {
+    WitnessedSettlement {
+        at_ms,
+        exchange_time_ms: at_ms + 50,
+        rate: d(rate),
+        long_cash_low_per_base: d(low_per_base),
+        long_cash_high_per_base: d(high_per_base),
+    }
+}
+
+#[test]
+fn funding_settlement_preflight_admits_cross_slot_and_rejects_mutual_exclusion() {
+    let registry = VenueRegistry::default();
+    let mut bare = config();
+    bare.start_ms = HOUR - 30_000;
+    bare.end_ms = HOUR + 30_000;
+    let pre = bare.preflight(&registry).unwrap();
+    assert!(!pre.execution_supported);
+    assert_eq!(pre.funding_slots_by_leg, [1, 1]);
+    assert_eq!(pre.blockers, vec!["maker_first_funding_lifecycle_not_supported"]);
+
+    let mut cfg = settlement_config();
+    let ok_pre = cfg.preflight(&registry).unwrap();
+    assert!(ok_pre.execution_supported);
+    assert!(ok_pre.blockers.is_empty());
+    assert!(ok_pre.required_engine_work.is_empty());
+    assert!(
+        ok_pre
+            .required_evidence
+            .contains(&"witnessed_settlement_for_every_held_slot")
+    );
+
+    let mut eq_cfg = settlement_config();
+    eq_cfg.pair.asset_class = AssetClass::Equity;
+    eq_cfg.pair.oracle_max_age_ms = 5_000;
+    eq_cfg.pair.equity_close_buffer_ms = 1_000;
+    eq_cfg.enforce_equity_session_gate = true;
+    assert!(eq_cfg.preflight(&registry).unwrap().execution_supported);
+
+    cfg.flat_at_funding = Some(FlatAtFunding {
+        settlement_guard_ms: 1_000,
+    });
+    assert!(cfg.preflight(&registry).is_err());
+}
+
+#[test]
+fn late_pre_slot_maker_fill_and_post_slot_fill_attribute_by_source_time() {
+    let mut cfg = settlement_config();
+    cfg.end_ms = HOUR + 45_000;
+    cfg.diagnose_cycles = true;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.hold_ms = 20_000;
+    cfg.drain_ms = 8_000;
+    cfg.trade_from_ms = Some(HOUR - 3_000);
+
+    let mut rows = vec![
+        MakerFirstEvent::TradeFeed {
+            at_ms: cfg.start_ms,
+            leg: 0,
+            online: true,
+        },
+        books(&cfg, HOUR - 3_000, "1000"),
+        books(&cfg, HOUR - 2_000, "1000"),
+        // Executed at HOUR - 1_500 (< HOUR - guard 1_000, before cancel at HOUR - 1_000),
+        // but delivered late at HOUR + 200 (after funding slot HOUR).
+        partial(HOUR + 200, HOUR - 1_500, "0.14"),
+        books(&cfg, HOUR + 1_100, "1000"),
+        books(&cfg, HOUR + 1_200, "1000"),
+        books(&cfg, HOUR + 1_500, "1000"),
+        books(&cfg, HOUR + 2_500, "1000"),
+        MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR + 2_600,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+        },
+        books(&cfg, HOUR + 3_500, "1000"),
+        books(&cfg, HOUR + 20_200, "1000"),
+        books(&cfg, HOUR + 23_400, "1000"),
+        books(&cfg, HOUR + 23_600, "1000"),
+        books(&cfg, HOUR + 23_800, "1000"),
+    ];
+    rows.sort_by_key(MakerFirstEvent::time);
+    let r = run(&cfg, rows);
+    assert_eq!(r.incomplete, None, "{r:?}");
+    let lc = r.funding_lifecycle.expect("lifecycle report");
+    assert_eq!(lc.planned_slots_by_leg, [1, 1]);
+    assert_eq!(lc.resolved_slots_by_leg, [1, 1]);
+    assert_eq!(lc.held_slots_by_leg, [1, 0]);
+    assert_eq!(lc.flat_slots_by_leg, [0, 1]);
+    assert_eq!(lc.witnessed_payments, 1);
+    assert_eq!(lc.late_pre_slot_fills_attributed, 1);
+    assert!(lc.post_slot_fills_excluded >= 1);
+    assert_eq!(
+        r.opening_cancel_requested.get("funding_boundary_guard"),
+        Some(&1)
+    );
+    // Leg 0 held +0.04 by source_time <= HOUR; 0.04 * (-0.50) = -0.02 USD.
+    assert_eq!(lc.witnessed_funding_cash_usd, d("-0.02"));
+    assert_eq!(lc.witnessed_funding_cash_upper_usd, d("-0.02"));
+    assert!(lc.cash_identity_reconciled);
+    let net_pnl = r.net_pnl.expect("net_pnl");
+    let price_pnl = lc.price_pnl_usd.expect("price_pnl_usd");
+    assert_eq!(price_pnl + lc.witnessed_funding_cash_usd - r.fees, net_pnl);
+    let costs = r.execution_costs.expect("execution costs");
+    assert!(costs.whole_ledger_cash_reconciled);
+
+    // Also verify a fresh flat book arriving inside the guard window is blocked before quoting.
+    let guard_probe = run(
+        &cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: cfg.start_ms,
+                leg: 0,
+                online: true,
+            },
+            books(&cfg, HOUR - 500, "1000"),
+        ],
+    );
+    assert_eq!(guard_probe.quotes_submitted, 0);
+    assert_eq!(
+        guard_probe.entry_blocked.get("funding_boundary_guard"),
+        Some(&1)
+    );
+    assert_eq!(
+        guard_probe.funding_lifecycle.unwrap().boundary_guard_blocks,
+        1
+    );
+}
+
+#[test]
+fn multi_hour_funding_settlement_reconciles_continuous_cash_and_cycles() {
+    let mut cfg = settlement_config();
+    cfg.start_ms = HOUR - 30_000;
+    cfg.end_ms = 2 * HOUR + 30_000;
+    cfg.hold_ms = 12_000;
+    cfg.drain_ms = 10_000;
+    cfg.trade_delivery_grace_ms = 4_000;
+    cfg.diagnose_cycles = true;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.pair.legs[1].funding.interval_ms = 8 * HOUR;
+
+    let mut rows = vec![
+        MakerFirstEvent::TradeFeed {
+            at_ms: cfg.start_ms,
+            leg: 0,
+            online: true,
+        },
+        // Cycle 1: opens before HOUR, drains and closes at ~HOUR + 3_000 BEFORE watermark (HOUR + 4_000).
+        books(&cfg, HOUR - 10_000, "1000"),
+        books(&cfg, HOUR - 9_500, "1000"),
+        partial(HOUR - 9_400, HOUR - 9_450, "0.14"),
+        books(&cfg, HOUR - 9_000, "1000"),
+        books(&cfg, HOUR - 8_800, "1000"),
+        books(&cfg, HOUR - 2_000, "1000"),
+        books(&cfg, HOUR + 2_600, "1000"),
+        books(&cfg, HOUR + 2_800, "1000"),
+        books(&cfg, HOUR + 3_000, "1000"),
+        MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR + 3_100,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.45"),
+        },
+        books(&cfg, HOUR + 4_500, "1000"),
+        // Cycle 2: opens at 2*HOUR - 5_000, holds past watermark (2*HOUR + 4_000), closes at ~2*HOUR + 8_000.
+        books(&cfg, 2 * HOUR - 5_000, "1000"),
+        books(&cfg, 2 * HOUR - 4_500, "1000"),
+        partial(2 * HOUR - 4_400, 2 * HOUR - 4_450, "0.14"),
+        books(&cfg, 2 * HOUR - 4_000, "1000"),
+        books(&cfg, 2 * HOUR - 3_800, "1000"),
+        books(&cfg, 2 * HOUR - 2_000, "1000"),
+        books(&cfg, 2 * HOUR + 1_200, "1000"),
+        MakerFirstEvent::FundingSettlement {
+            at_ms: 2 * HOUR + 3_000,
+            leg: 0,
+            settlement: witnessed(2 * HOUR, "0.0010", "-1.00", "-0.95"),
+        },
+        books(&cfg, 2 * HOUR + 4_100, "1000"),
+        books(&cfg, 2 * HOUR + 7_600, "1000"),
+        books(&cfg, 2 * HOUR + 11_800, "1000"),
+        books(&cfg, 2 * HOUR + 12_000, "1000"),
+        books(&cfg, 2 * HOUR + 12_200, "1000"),
+    ];
+    rows.sort_by_key(MakerFirstEvent::time);
+    let r = run(&cfg, rows);
+    assert_eq!(r.incomplete, None, "{r:?}");
+    let lc = r.funding_lifecycle.expect("lifecycle report");
+    assert_eq!(lc.planned_slots_by_leg, [2, 0]);
+    assert_eq!(lc.resolved_slots_by_leg, [2, 0]);
+    assert_eq!(lc.held_slots_by_leg, [2, 0]);
+    assert_eq!(lc.witnessed_payments, 2);
+    // Slot 1: 0.04 * (-0.50) = -0.02; Slot 2: 0.04 * (-1.00) = -0.04; total = -0.06 USD.
+    assert_eq!(lc.witnessed_funding_cash_usd, d("-0.06"));
+    assert_eq!(lc.witnessed_funding_cash_upper_usd, d("-0.056"));
+    assert!(lc.cash_identity_reconciled);
+    let net_pnl = r.net_pnl.expect("net_pnl");
+    let price_pnl = lc.price_pnl_usd.expect("price_pnl_usd");
+    assert_eq!(price_pnl + lc.witnessed_funding_cash_usd - r.fees, net_pnl);
+    assert_eq!(r.realized_pnl, net_pnl);
+    let costs = r.execution_costs.expect("execution costs");
+    assert_eq!(costs.post_cycle_funding_cash_quote, Decimal::ZERO);
+    assert_eq!(costs.cycles.len(), 2);
+    assert_eq!(costs.cycles[0].funding_cash_quote, d("-0.02"));
+    assert_eq!(costs.cycles[1].funding_cash_quote, d("-0.04"));
+    assert!(costs.cycles[0].cash_reconciled && costs.cycles[1].cash_reconciled);
+    assert!(costs.whole_ledger_cash_reconciled);
+}
+
+#[test]
+fn funding_settlement_fails_closed_on_missing_witness_ambiguous_fill_and_non_causal() {
+    let mut cfg = settlement_config();
+    cfg.end_ms = HOUR + 40_000;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.pair.legs[1].funding.interval_ms = 8 * HOUR;
+
+    // 1. Missing witness for a held position at deadline -> incomplete
+    let missing_rows = vec![
+        MakerFirstEvent::TradeFeed {
+            at_ms: cfg.start_ms,
+            leg: 0,
+            online: true,
+        },
+        books(&cfg, HOUR - 5_000, "1000"),
+        books(&cfg, HOUR - 4_500, "1000"),
+        partial(HOUR - 4_400, HOUR - 4_450, "0.14"),
+        books(&cfg, HOUR - 4_000, "1000"),
+        books(&cfg, HOUR - 3_800, "1000"),
+        books(&cfg, HOUR + 15_000, "1000"),
+        books(&cfg, HOUR + 15_200, "1000"),
+    ];
+    let missing = run(&cfg, missing_rows);
+    assert_eq!(missing.incomplete, Some("missing_witnessed_funding_settlement"));
+    assert_eq!(missing.net_pnl, None);
+    assert_eq!(missing.final_liquidation_pnl, None);
+
+    // 2. Ambiguous fill inside [HOUR - guard, HOUR + guard] -> fail closed
+    let mut r = new_replay(&cfg).unwrap();
+    r.record_funding_lifecycle_fill(0, Some(0), HOUR - 500, HOUR, d("0.04"));
+    assert_eq!(r.report.incomplete, Some("funding_boundary_ambiguous_fill"));
+
+    // 3. Duplicate witnessed settlement -> fail closed
+    let dup_rows = vec![
+        MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR + 100,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+        },
+        MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR + 200,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+        },
+        books(&cfg, cfg.start_ms, "1000"),
+    ];
+    let dup = run(&cfg, dup_rows);
+    assert_eq!(dup.incomplete, Some("duplicate_funding_settlement"));
+
+    // 4. Non-causal witnessed settlement (at_ms > now) -> Err
+    let err_rows = vec![
+        Ok(books(&cfg, cfg.start_ms, "1000")),
+        Ok(MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR - 10,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+        }),
+        Ok(MakerFirstEvent::End { at_ms: cfg.end_ms }),
+    ];
+    let err = run_maker_first(&cfg, err_rows, &VenueRegistry::default()).unwrap_err();
+    assert!(err.to_string().contains("non-causal"), "{err:#}");
+}
+
+#[test]
+fn carry_drift_adjustment_penalizes_adverse_caps_favorable_and_respects_freshness() {
+    // Disallow CarryDriftAdjustment in Turnover incentive mode.
+    let mut turnover_cfg = posture_config(TurnoverPosture::LongFirst);
+    turnover_cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+        expected_hold_ms: HOUR,
+        max_rate_age_ms: 10_000,
+        favorable_credit_fraction: d("0.25"),
+        max_favorable_credit_bps: d("1"),
+        max_adverse_penalty_bps: d("20"),
+        require_fresh_rates: true,
+    });
+    assert!(turnover_cfg.preflight(&VenueRegistry::default()).is_err());
+
+    let make_cfg = |req_fresh: bool, fav_frac: &str| {
+        let mut cfg = config();
+        cfg.maker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[0].tick = d("0.01");
+        cfg.pair.legs[1].tick = d("0.01");
+        cfg.opening_max_levels = 1;
+        cfg.require_net_edge = true;
+        cfg.pair.planner.min_net_edge_bps = 1.0;
+        cfg.entry_side = Some(HedgeSide::Buy);
+        cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+            expected_hold_ms: HOUR,
+            max_rate_age_ms: 5_000,
+            favorable_credit_fraction: d(fav_frac),
+            max_favorable_credit_bps: d("1.5"),
+            max_adverse_penalty_bps: d("8"),
+            require_fresh_rates: req_fresh,
+        });
+        cfg
+    };
+    let custom_books = |cfg: &MakerFirstConfig, at: u64, leg0_ask: &str, leg1_ask: &str| MakerFirstEvent::Book {
+        at_ms: at,
+        books: [
+            Book {
+                market: cfg.pair.legs[0].market.clone(),
+                timestamp_ms: at,
+                tradable: true,
+                bids: vec![Level {
+                    price: d("1000.0"),
+                    contracts: d("0.1"),
+                }],
+                asks: vec![Level {
+                    price: d(leg0_ask),
+                    contracts: d("1"),
+                }],
+                bounds: None,
+                available_notional: Decimal::from(150),
+            },
+            Book {
+                market: cfg.pair.legs[1].market.clone(),
+                timestamp_ms: at,
+                tradable: true,
+                bids: vec![Level {
+                    price: d("1000.20"),
+                    contracts: d("0.1"),
+                }],
+                asks: vec![Level {
+                    price: d(leg1_ask),
+                    contracts: d("1"),
+                }],
+                bounds: None,
+                available_notional: Decimal::from(150),
+            },
+        ],
+        reference: None,
+        equity_session: None,
+        leg_oracles: None,
+    };
+
+    // 1. Stale rates block when require_fresh_rates = true, fall back to 0 when false.
+    let stale_cfg = make_cfg(true, "0.25");
+    let stale_blocked = run(
+        &stale_cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: stale_cfg.start_ms,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: stale_cfg.start_ms,
+                leg: 0,
+                source_ms: stale_cfg.start_ms,
+                rate_per_settlement: d("0.0005"),
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: stale_cfg.start_ms,
+                leg: 1,
+                source_ms: stale_cfg.start_ms,
+                rate_per_settlement: Decimal::ZERO,
+            },
+            custom_books(&stale_cfg, stale_cfg.start_ms + 6_000, "1000.20", "1000.25"),
+        ],
+    );
+    assert_eq!(stale_blocked.quotes_submitted, 0);
+    assert_eq!(
+        stale_blocked.entry_blocked.get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+    assert_eq!(stale_blocked.carry_drift.unwrap().stale_or_missing_blocks, 1);
+
+    // Without fresh rates (require_fresh_rates = false), raw +1.5 bp passes with 0 bps carry adj.
+    let fallback_cfg = make_cfg(false, "0.25");
+    let fallback_ok = run(
+        &fallback_cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: fallback_cfg.start_ms,
+                leg: 0,
+                online: true,
+            },
+            custom_books(&fallback_cfg, fallback_cfg.start_ms, "1000.20", "1000.25"),
+        ],
+    );
+    assert_eq!(fallback_ok.quotes_submitted, 1);
+    let fb_cd = fallback_ok.carry_drift.unwrap();
+    assert_eq!(fb_cd.stale_or_missing_blocks, 0);
+    assert_eq!(fb_cd.min_adjustment_bps, Some(Decimal::ZERO));
+
+    // 2. Adverse carry (-5 bp) blocks raw +1.5 bp -> -3.5 bp (< 1 bp min_edge).
+    let adv_cfg = make_cfg(true, "0.25");
+    let t0 = adv_cfg.start_ms;
+    let adv = run(
+        &adv_cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: d("0.0006"),
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 1,
+                source_ms: t0,
+                rate_per_settlement: d("0.0001"),
+            },
+            custom_books(&adv_cfg, t0, "1000.20", "1000.25"),
+        ],
+    );
+    assert_eq!(adv.quotes_submitted, 0);
+    let cd = adv.carry_drift.unwrap();
+    assert_eq!(cd.adverse_adjustments, 1);
+    assert_eq!(cd.min_adjustment_bps, Some(d("-5")));
+    assert_eq!(cd.adverse_carry_blocked_entries, 1);
+    assert_eq!(adv.entry_blocked.get("entry_net_edge"), Some(&1));
+
+    // 3. Favorable carry (+40 bp/h * 0.25 capped at 1.5 bp) promotes raw -0.4 bp -> +1.1 bp >= 1 bp.
+    let fav_cfg = make_cfg(true, "0.25");
+    let fav = run(
+        &fav_cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: Decimal::ZERO,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 1,
+                source_ms: t0,
+                rate_per_settlement: d("0.0040"),
+            },
+            custom_books(&fav_cfg, t0, "1000.04", "1000.28"),
+        ],
+    );
+    assert_eq!(fav.quotes_submitted, 1);
+    let fav_cd = fav.carry_drift.unwrap();
+    assert_eq!(fav_cd.favorable_adjustments, 1);
+    assert_eq!(fav_cd.max_adjustment_bps, Some(d("1.5")));
+
+    // 4. With favorable_credit_fraction = 0, raw -0.4 bp remains < 1 bp (no carry credit).
+    let no_credit_cfg = make_cfg(true, "0");
+    let no_credit = run(
+        &no_credit_cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: Decimal::ZERO,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 1,
+                source_ms: t0,
+                rate_per_settlement: d("0.0040"),
+            },
+            custom_books(&no_credit_cfg, t0, "1000.04", "1000.28"),
+        ],
+    );
+    assert_eq!(no_credit.quotes_submitted, 0);
+    assert_eq!(
+        no_credit.carry_drift.unwrap().max_adjustment_bps,
+        Some(Decimal::ZERO)
+    );
+}
+
+#[test]
+fn funding_settlement_inclusive_arrival_deadline_accepts_exact_limit_and_rejects_plus_1ms() {
+    for (lag, expected) in [
+        (Some(9_999), None),
+        (Some(10_000), None),
+        (Some(10_001), Some("missing_witnessed_funding_settlement")),
+        (None, Some("missing_witnessed_funding_settlement")),
+    ] {
+        let mut cfg = settlement_config();
+        cfg.end_ms = HOUR + 45_000;
+        cfg.diagnose_cycles = true;
+        cfg.entry_side = Some(HedgeSide::Buy);
+        cfg.hold_ms = 20_000;
+        cfg.drain_ms = 8_000;
+        cfg.trade_from_ms = Some(HOUR - 3_000);
+
+        let mut rows = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: cfg.start_ms,
+                leg: 0,
+                online: true,
+            },
+            books(&cfg, HOUR - 3_000, "1000"),
+            books(&cfg, HOUR - 2_000, "1000"),
+            partial(HOUR + 200, HOUR - 1_500, "0.14"),
+            books(&cfg, HOUR + 1_100, "1000"),
+            books(&cfg, HOUR + 1_200, "1000"),
+            books(&cfg, HOUR + 1_500, "1000"),
+            books(&cfg, HOUR + 2_500, "1000"),
+            books(&cfg, HOUR + 3_500, "1000"),
+            books(&cfg, HOUR + 20_200, "1000"),
+            books(&cfg, HOUR + 23_400, "1000"),
+            books(&cfg, HOUR + 23_600, "1000"),
+            books(&cfg, HOUR + 23_800, "1000"),
+        ];
+        if let Some(lag_ms) = lag {
+            rows.push(MakerFirstEvent::FundingSettlement {
+                at_ms: HOUR + lag_ms,
+                leg: 0,
+                settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+            });
+        }
+        rows.sort_by_key(MakerFirstEvent::time);
+        let rep = run(&cfg, rows);
+        assert_eq!(rep.incomplete, expected, "lag={lag:?}: {rep:?}");
+        if expected.is_none() {
+            assert!(
+                rep.funding_lifecycle
+                    .as_ref()
+                    .unwrap()
+                    .cash_identity_reconciled
+            );
+        } else {
+            assert_eq!(rep.net_pnl, None);
+        }
+    }
+
+    // Also verify the exact `end_ms == deadline_ms` cutoff boundary:
+    // a witness at `at_ms == end_ms == deadline_ms` is accepted, whereas a missing
+    // witness at `end_ms == deadline_ms` fails closed with `missing_witnessed_funding_settlement`.
+    for (include_witness, expected) in [
+        (true, None),
+        (false, Some("missing_witnessed_funding_settlement")),
+    ] {
+        let mut cfg = settlement_config();
+        cfg.end_ms = HOUR + 10_000;
+        cfg.trade_from_ms = Some(HOUR - 3_000);
+        cfg.hold_ms = 3_000;
+        cfg.drain_ms = 5_000;
+        cfg.quote_lifetime_ms = 2_000;
+        cfg.diagnose_cycles = true;
+        cfg.entry_side = Some(HedgeSide::Buy);
+        cfg.pair.legs[1].funding.interval_ms = 8 * HOUR;
+
+        let mut rows = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: cfg.start_ms,
+                leg: 0,
+                online: true,
+            },
+            books(&cfg, HOUR - 3_000, "1000"),
+            books(&cfg, HOUR - 2_000, "1000"),
+            partial(HOUR + 200, HOUR - 1_500, "0.14"),
+            books(&cfg, HOUR + 1_100, "1000"),
+            books(&cfg, HOUR + 1_200, "1000"),
+            books(&cfg, HOUR + 1_500, "1000"),
+            books(&cfg, HOUR + 2_500, "1000"),
+            books(&cfg, HOUR + 3_200, "1000"),
+            books(&cfg, HOUR + 6_400, "1000"),
+            books(&cfg, HOUR + 6_600, "1000"),
+            books(&cfg, HOUR + 6_800, "1000"),
+        ];
+        if include_witness {
+            rows.push(MakerFirstEvent::FundingSettlement {
+                at_ms: HOUR + 10_000,
+                leg: 0,
+                settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.50"),
+            });
+        }
+        rows.sort_by_key(MakerFirstEvent::time);
+        let rep = run(&cfg, rows);
+        assert_eq!(rep.incomplete, expected, "include_witness={include_witness}: {rep:?}");
+        if expected.is_none() {
+            let lc = rep.funding_lifecycle.as_ref().unwrap();
+            assert!(lc.cash_identity_reconciled);
+            assert_eq!(lc.witnessed_funding_cash_usd, d("-0.02"));
+            let costs = rep.execution_costs.as_ref().unwrap();
+            assert_eq!(costs.cycles.len(), 1);
+            assert_eq!(costs.cycles[0].funding_cash_quote, d("-0.02"));
+            assert!(costs.whole_ledger_cash_reconciled);
+        } else {
+            assert_eq!(rep.net_pnl, None);
+        }
+    }
+}
+
+#[test]
+fn funding_settlement_late_witness_attributes_to_economic_owning_cycle_not_next_open_cycle() {
+    let mut cfg = settlement_config();
+    cfg.start_ms = HOUR - 30_000;
+    cfg.end_ms = HOUR + 42_000;
+    cfg.hold_ms = 12_000;
+    cfg.drain_ms = 10_000;
+    cfg.trade_delivery_grace_ms = 4_000;
+    cfg.diagnose_cycles = true;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.pair.legs[1].funding.interval_ms = 8 * HOUR;
+
+    let mut rows = vec![
+        MakerFirstEvent::TradeFeed {
+            at_ms: cfg.start_ms,
+            leg: 0,
+            online: true,
+        },
+        // Cycle 0 opens before HOUR and closes at ~HOUR + 3_000 while still waiting for witness.
+        books(&cfg, HOUR - 10_000, "1000"),
+        books(&cfg, HOUR - 9_500, "1000"),
+        partial(HOUR - 9_400, HOUR - 9_450, "0.14"),
+        books(&cfg, HOUR - 9_000, "1000"),
+        books(&cfg, HOUR - 8_800, "1000"),
+        books(&cfg, HOUR - 2_000, "1000"),
+        books(&cfg, HOUR + 2_600, "1000"),
+        books(&cfg, HOUR + 2_800, "1000"),
+        books(&cfg, HOUR + 3_000, "1000"),
+        // Cycle 0 late settlement arrives at HOUR + 9_300 AFTER Cycle 1 has already opened!
+        MakerFirstEvent::FundingSettlement {
+            at_ms: HOUR + 9_300,
+            leg: 0,
+            settlement: witnessed(HOUR, "0.0005", "-0.50", "-0.45"),
+        },
+        books(&cfg, HOUR + 4_500, "1000"),
+        books(&cfg, HOUR + 5_000, "1000"),
+        books(&cfg, HOUR + 5_500, "1000"),
+        partial(HOUR + 5_600, HOUR + 5_550, "0.14"),
+        books(&cfg, HOUR + 6_000, "1000"),
+        books(&cfg, HOUR + 6_200, "1000"),
+        books(&cfg, HOUR + 8_000, "1000"),
+        books(&cfg, HOUR + 11_200, "1000"),
+        books(&cfg, HOUR + 14_100, "1000"),
+        books(&cfg, HOUR + 17_600, "1000"),
+        books(&cfg, HOUR + 21_800, "1000"),
+        books(&cfg, HOUR + 22_000, "1000"),
+        books(&cfg, HOUR + 22_200, "1000"),
+    ];
+    rows.sort_by_key(MakerFirstEvent::time);
+    let rep = run(&cfg, rows);
+    assert_eq!(rep.incomplete, None, "{rep:?}");
+
+    let lc = rep.funding_lifecycle.expect("lifecycle report");
+    assert_eq!(lc.witnessed_funding_cash_usd, d("-0.02"));
+    assert_eq!(lc.unattributed_cross_cycle_payments, 0);
+    assert!(lc.cash_identity_reconciled);
+
+    let costs = rep.execution_costs.expect("cycle costs");
+    assert_eq!(costs.cycles.len(), 2);
+    assert_eq!(costs.cycles[0].funding_cash_quote, d("-0.02"));
+    assert_eq!(costs.cycles[1].funding_cash_quote, Decimal::ZERO);
+    assert_eq!(costs.post_cycle_funding_cash_quote, Decimal::ZERO);
+    assert!(costs.cycles[0].cash_reconciled);
+    assert!(costs.cycles[0].price_decomposition_reconciled);
+    assert!(costs.cycles[1].cash_reconciled);
+    assert!(costs.cycles[1].price_decomposition_reconciled);
+    assert!(costs.whole_ledger_cash_reconciled);
+
+    let net = rep.net_pnl.expect("net pnl");
+    assert_eq!(rep.realized_pnl, net);
+    assert_eq!(rep.forced_closes, 2);
+    assert_eq!(rep.forced_close_pnl, net);
+    assert_eq!(rep.turnover_posture.realized_pnl[0], net);
+    let c0_net = costs.cycles[0].net_before_overhead.unwrap();
+    let c1_net = costs.cycles[1].net_before_overhead.unwrap();
+    assert_eq!(c0_net + c1_net, net);
+    assert_eq!(costs.cycles[0].price_loss_quote, costs.cycles[1].price_loss_quote);
+    assert_eq!(c0_net - c1_net, d("-0.02"));
+}
+
+#[test]
+fn carry_drift_same_source_ms_conflicting_rates_fail_closed_and_identical_is_idempotent() {
+    let policy = CarryDriftAdjustment {
+        expected_hold_ms: HOUR,
+        max_rate_age_ms: 60_000,
+        favorable_credit_fraction: Decimal::ONE,
+        max_favorable_credit_bps: d("100"),
+        max_adverse_penalty_bps: d("100"),
+        require_fresh_rates: false,
+    };
+
+    let mut strict_policy = policy;
+    strict_policy.require_fresh_rates = true;
+
+    // 1. Conflicting rates at identical source_ms are order-independent and suspend adjustment.
+    for (first, second) in [("0.0005", "-0.0005"), ("-0.0005", "0.0005")] {
+        let mut state = CarryDriftState::default();
+        state
+            .observe_rate(0, HOUR, HOUR, d(first), HOUR)
+            .unwrap();
+        // Out-of-order older rate update must be ignored without distorting state.
+        state
+            .observe_rate(0, HOUR - 1, HOUR, d("0.0099"), HOUR)
+            .unwrap();
+        state
+            .observe_rate(0, HOUR, HOUR, d(second), HOUR)
+            .unwrap();
+        // Subsequent observation at the already-conflicted source_ms stays fail-closed.
+        state
+            .observe_rate(0, HOUR, HOUR, d("0.0005"), HOUR)
+            .unwrap();
+        state
+            .observe_rate(0, HOUR - 1, HOUR, d("0.0001"), HOUR)
+            .unwrap();
+        state
+            .observe_rate(1, HOUR, HOUR, Decimal::ZERO, HOUR)
+            .unwrap();
+        assert_eq!(
+            state.adjustment_bps(policy, 0, HedgeSide::Buy, HOUR),
+            Err("carry_rate_conflict")
+        );
+        assert_eq!(
+            state.adjustment_bps(strict_policy, 0, HedgeSide::Buy, HOUR),
+            Err("carry_rate_conflict")
+        );
+        assert_eq!(state.report.conflicting_rate_events, 2);
+
+        // Strictly newer unambiguous source_ms supersedes conflict cleanly.
+        state
+            .observe_rate(0, HOUR + 1, HOUR + 1, d("0.0002"), HOUR)
+            .unwrap();
+        assert_eq!(
+            state.adjustment_bps(policy, 0, HedgeSide::Buy, HOUR + 1),
+            Ok(d("-2"))
+        );
+    }
+
+    // 2. Duplicate identical observation at same source_ms is idempotent.
+    let mut idem = CarryDriftState::default();
+    idem.observe_rate(0, HOUR, HOUR, d("0.0005"), HOUR).unwrap();
+    idem.observe_rate(0, HOUR, HOUR, d("0.0005"), HOUR).unwrap();
+    idem.observe_rate(1, HOUR, HOUR, Decimal::ZERO, HOUR)
+        .unwrap();
+    assert_eq!(idem.report.rate_updates_by_leg, [1, 1]);
+    assert_eq!(idem.report.conflicting_rate_events, 0);
+    assert_eq!(
+        idem.adjustment_bps(policy, 0, HedgeSide::Buy, HOUR),
+        Ok(d("-5"))
+    );
+
+    // 3. End-to-end replay suspends quoting on conflicting same-source_ms rate updates.
+    let mut cfg = config();
+    cfg.maker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+    cfg.opening_max_levels = 1;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.carry_drift_adjustment = Some(policy);
+    let t0 = cfg.start_ms;
+    let blocked = run(
+        &cfg,
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: d("0.0005"),
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: d("-0.0005"),
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 1,
+                source_ms: t0,
+                rate_per_settlement: Decimal::ZERO,
+            },
+            books(&cfg, t0, "1000"),
+        ],
+    );
+    assert_eq!(blocked.quotes_submitted, 0);
+    assert_eq!(blocked.entry_blocked.get("carry_rate_conflict"), Some(&1));
+    let cd = blocked.carry_drift.unwrap();
+    assert_eq!(cd.conflicting_rate_events, 1);
+    assert_eq!(cd.conflicting_rate_blocks, 1);
+}
+
+#[test]
+fn funding_lifecycle_multi_slot_and_concurrent_cross_cycle_attribution() {
+    let mut cfg = settlement_config();
+    cfg.start_ms = HOUR - 30_000;
+    cfg.end_ms = 3 * HOUR + 30_000;
+    cfg.pair.legs[1].funding.interval_ms = 8 * HOUR;
+    cfg.validate(&VenueRegistry::default()).unwrap();
+
+    let mut lc = FundingLifecycleState::new(&cfg).unwrap().unwrap();
+    // Slot 1 (`HOUR`): Cycle 0 opens and closes flat before the slot -> flat slot.
+    assert_eq!(
+        lc.on_fill(0, Some(0), HOUR - 10_000, HOUR - 10_000, d("0.10")),
+        None
+    );
+    assert_eq!(
+        lc.on_fill(0, Some(0), HOUR - 5_000, HOUR - 5_000, d("-0.10")),
+        None
+    );
+    let (p1, e1) = lc.resolve_ready(HOUR + 3_000, false);
+    assert!(p1.is_empty() && e1.is_none());
+    assert_eq!(lc.report.flat_slots_by_leg, [1, 0]);
+
+    // Slot 2 (`2 * HOUR`): two concurrent cycles hold across the slot -> unattributed (`None`).
+    assert_eq!(
+        lc.on_fill(0, Some(1), HOUR + 20_000, HOUR + 20_000, d("0.05")),
+        None
+    );
+    assert_eq!(
+        lc.on_fill(0, Some(2), HOUR + 30_000, HOUR + 30_000, d("0.05")),
+        None
+    );
+    assert_eq!(
+        lc.on_witness(
+            0,
+            2 * HOUR + 5_000,
+            witnessed(2 * HOUR, "0.0010", "-1.00", "-0.90")
+        )
+        .unwrap(),
+        None
+    );
+    let (p2, e2) = lc.resolve_ready(2 * HOUR + 5_000, false);
+    assert_eq!(e2, None);
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].cycle_id, None);
+    assert_eq!(p2[0].low, d("-0.10"));
+    assert_eq!(p2[0].high, d("-0.09"));
+    assert_eq!(lc.report.unattributed_cross_cycle_payments, 1);
+
+    // Slot 3 (`3 * HOUR`): Cycles 1 and 2 close after `2 * HOUR`; Cycle 3 holds across `3 * HOUR` -> `Some(3)`.
+    assert_eq!(
+        lc.on_fill(0, Some(1), 2 * HOUR + 10_000, 2 * HOUR + 10_000, d("-0.05")),
+        None
+    );
+    assert_eq!(
+        lc.on_fill(0, Some(2), 2 * HOUR + 12_000, 2 * HOUR + 12_000, d("-0.05")),
+        None
+    );
+    assert_eq!(
+        lc.on_fill(0, Some(3), 2 * HOUR + 20_000, 2 * HOUR + 20_000, d("0.04")),
+        None
+    );
+    assert_eq!(
+        lc.on_witness(
+            0,
+            3 * HOUR + 5_000,
+            witnessed(3 * HOUR, "0.0005", "-0.50", "-0.45")
+        )
+        .unwrap(),
+        None
+    );
+    let (p3, e3) = lc.resolve_ready(3 * HOUR + 5_000, false);
+    assert_eq!(e3, None);
+    assert_eq!(p3.len(), 1);
+    assert_eq!(p3[0].cycle_id, Some(3));
+    assert_eq!(p3[0].low, d("-0.02"));
+    assert_eq!(p3[0].high, d("-0.018"));
+    assert_eq!(lc.report.unattributed_cross_cycle_payments, 1);
 }

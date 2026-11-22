@@ -34,6 +34,7 @@ fn seed(cfg: &MakerFirstConfig) -> Replay<'_> {
     r.ledger.cash = Decimal::ONE;
     r.ledger.turnover = d("80");
     r.cycle = Some(Cycle {
+        id: 0,
         posture: TurnoverPosture::Neutral,
         started_ms: start,
         initial_cash: Decimal::ZERO,

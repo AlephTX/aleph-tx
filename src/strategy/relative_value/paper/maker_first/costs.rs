@@ -57,6 +57,8 @@ pub struct CycleCost {
     pub gross_turnover: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub fees_quote: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub funding_cash_quote: Decimal,
     #[serde(with = "rust_decimal::serde::str_option")]
     pub overhead_quote: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str_option")]
@@ -102,6 +104,8 @@ pub struct Costs {
     pub whole_ledger_net_before_overhead: Option<Decimal>,
     #[serde(with = "rust_decimal::serde::str_option")]
     pub whole_ledger_net_after_overhead: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub post_cycle_funding_cash_quote: Decimal,
     pub whole_ledger_cash_reconciled: bool,
     #[serde(skip)]
     active: Option<usize>,
@@ -129,9 +133,36 @@ impl Costs {
             cycles: Vec::new(),
             whole_ledger_net_before_overhead: None,
             whole_ledger_net_after_overhead: None,
+            post_cycle_funding_cash_quote: Decimal::ZERO,
             whole_ledger_cash_reconciled: false,
             active: None,
             pending: std::array::from_fn(|_| VecDeque::new()),
+        }
+    }
+
+    pub(super) fn book_funding(&mut self, cycle_id: Option<usize>, cash: Decimal) {
+        if let Some(row) = cycle_id.and_then(|id| self.cycles.get_mut(id)) {
+            row.cash += cash;
+            row.funding_cash_quote += cash;
+            if row.completed {
+                row.net_before_overhead = row.net_before_overhead.map(|net| net + cash);
+                row.net_after_overhead = row.net_after_overhead.map(|net| net + cash);
+                row.cash_reconciled = row.positions == [Decimal::ZERO; 2]
+                    && row.net_before_overhead == Some(row.cash);
+                row.price_loss_quote = row
+                    .net_before_overhead
+                    .map(|net| -net + row.funding_cash_quote - row.fees_quote);
+                if row.missing_mid_fills == 0 {
+                    let execution: Decimal =
+                        row.stages.iter().map(|s| s.execution_cost_quote).sum();
+                    row.price_decomposition_reconciled = row.cash_reconciled
+                        && row
+                            .price_loss_quote
+                            .is_some_and(|loss| execution + row.drift == loss);
+                }
+            }
+        } else {
+            self.post_cycle_funding_cash_quote += cash;
         }
     }
 
@@ -160,6 +191,7 @@ impl Costs {
             target_turnover: Decimal::ZERO,
             gross_turnover: Decimal::ZERO,
             fees_quote: Decimal::ZERO,
+            funding_cash_quote: Decimal::ZERO,
             overhead_quote: None,
             net_before_overhead: None,
             net_after_overhead: None,
@@ -257,12 +289,12 @@ impl Costs {
         row.net_before_overhead = Some(pnl);
         row.net_after_overhead = Some(pnl - overhead);
         row.overhead_quote = Some(overhead);
-        row.price_loss_quote = Some(-pnl - row.fees_quote);
+        row.price_loss_quote = Some(-pnl + row.funding_cash_quote - row.fees_quote);
         if row.missing_mid_fills == 0 {
             row.price_drift_cost_quote = Some(row.drift);
             let execution: Decimal = row.stages.iter().map(|s| s.execution_cost_quote).sum();
-            row.price_decomposition_reconciled =
-                row.cash_reconciled && execution + row.drift == -pnl - row.fees_quote;
+            row.price_decomposition_reconciled = row.cash_reconciled
+                && execution + row.drift == -pnl + row.funding_cash_quote - row.fees_quote;
         }
     }
 
@@ -290,6 +322,7 @@ impl Costs {
                     .iter()
                     .map(|c| c.net_before_overhead.unwrap_or_default())
                     .sum::<Decimal>()
+                    + self.post_cycle_funding_cash_quote
                     == net
             })
             && after.is_some_and(|after| {
@@ -297,6 +330,7 @@ impl Costs {
                     .iter()
                     .map(|c| c.net_after_overhead.unwrap_or_default())
                     .sum::<Decimal>()
+                    + self.post_cycle_funding_cash_quote
                     == after
             });
     }

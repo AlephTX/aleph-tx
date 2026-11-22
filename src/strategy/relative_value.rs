@@ -298,7 +298,7 @@ impl FundingSchedule {
         time % self.interval_ms == self.offset_ms
     }
 
-    fn near_payment(self, time: u64, guard_ms: u64) -> bool {
+    pub(crate) fn near_payment(self, time: u64, guard_ms: u64) -> bool {
         let distance = (time % self.interval_ms).abs_diff(self.offset_ms);
         guard_ms > 0 && distance.min(self.interval_ms - distance) <= guard_ms
     }
@@ -483,7 +483,7 @@ impl WitnessedSettlement {
             }
     }
 
-    fn cash_bounds(&self, position: Decimal) -> (Decimal, Decimal) {
+    pub(crate) fn cash_bounds(&self, position: Decimal) -> (Decimal, Decimal) {
         let a = position * self.long_cash_low_per_base;
         let b = position * self.long_cash_high_per_base;
         (a.min(b), a.max(b))
