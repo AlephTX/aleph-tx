@@ -307,6 +307,116 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
     ]
 }
 
+/// Audit readiness status for a venue's execution capability and fee schedule (`OPT-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAuditStatus {
+    Audited,
+    AccountEvidenceRequired,
+}
+
+/// Onboarding capability profile across all configured or onboarded venues (`OPT-01`).
+/// Unaudited venues remain explicit rather than defaulting unknown fees or delays to zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VenueOnboardingProfile {
+    pub venue_id: &'static str,
+    pub liquidity_domain: &'static str,
+    pub settlement_currency: &'static str,
+    pub audit_status: CapabilityAuditStatus,
+    pub missing_evidence: &'static str,
+}
+
+/// Returns the onboarding capability catalog for all 12 configured or onboarded venues (`OPT-01`).
+pub fn audited_onboarding_profiles() -> Vec<VenueOnboardingProfile> {
+    use CapabilityAuditStatus::{AccountEvidenceRequired, Audited};
+    vec![
+        VenueOnboardingProfile {
+            venue_id: "lighter",
+            liquidity_domain: "lighter",
+            settlement_currency: "USDC",
+            audit_status: Audited,
+            missing_evidence: "",
+        },
+        VenueOnboardingProfile {
+            venue_id: "lighter_robinhood",
+            liquidity_domain: "lighter:robinhood",
+            settlement_currency: "USDG",
+            audit_status: Audited,
+            missing_evidence: "",
+        },
+        VenueOnboardingProfile {
+            venue_id: "arcus",
+            liquidity_domain: "arcus",
+            settlement_currency: "USDC",
+            audit_status: Audited,
+            missing_evidence: "",
+        },
+        VenueOnboardingProfile {
+            venue_id: "hyperliquid",
+            liquidity_domain: "hyperliquid:core",
+            settlement_currency: "USDC",
+            audit_status: Audited,
+            missing_evidence: "",
+        },
+        VenueOnboardingProfile {
+            venue_id: "trade_xyz",
+            liquidity_domain: "hyperliquid:xyz",
+            settlement_currency: "USDC",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "per-asset HIP-3 deployerFeeScale, growthMode, collateralToken, and fees",
+        },
+        VenueOnboardingProfile {
+            venue_id: "entropy",
+            liquidity_domain: "hyperliquid:io",
+            settlement_currency: "USDC",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "per-asset HIP-3 deployerFeeScale, growthMode, and account fee tier",
+        },
+        VenueOnboardingProfile {
+            venue_id: "backpack",
+            liquidity_domain: "backpack",
+            settlement_currency: "USDC",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "account fee tier, speed-bump/cancel-quota, and settled funding terms",
+        },
+        VenueOnboardingProfile {
+            venue_id: "extended",
+            liquidity_domain: "extended",
+            settlement_currency: "USDC",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "account fee/rebate tier, speed-bump/quota, and execution gateway audit",
+        },
+        VenueOnboardingProfile {
+            venue_id: "bulk",
+            liquidity_domain: "bulk",
+            settlement_currency: "USDC",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "account fee tier, precision/time units, trade queue, and funding terms",
+        },
+        VenueOnboardingProfile {
+            venue_id: "okx",
+            liquidity_domain: "okx",
+            settlement_currency: "USDT",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "account VIP/fee tier, rate/cancel-quota, latency, and USDT contract",
+        },
+        VenueOnboardingProfile {
+            venue_id: "binance",
+            liquidity_domain: "binance",
+            settlement_currency: "USDT",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "account VIP/fee tier, USD-M quota, execution gateway, and latency",
+        },
+        VenueOnboardingProfile {
+            venue_id: "coinbase",
+            liquidity_domain: "coinbase",
+            settlement_currency: "USD",
+            audit_status: AccountEvidenceRequired,
+            missing_evidence: "reference-only spot ticker; account fee, gateway, and settlement audit",
+        },
+    ]
+}
+
 const ASYMMETRIC_TAKER_DELAY_MS: u64 = 100;
 const CONCURRENT_MAX_TAKER_DELAY_MS: u64 = 20;
 
@@ -602,6 +712,30 @@ impl VenueRegistry {
             "Unverified execution capability for venue={venue_id} tier={tier} asset_class={asset_class} (snapshot={VENUE_CAPABILITY_SNAPSHOT_VERSION})"
         )
     }
+
+    /// Return onboarding capability profiles across all 12 configured/onboarded venues (`OPT-01`).
+    pub fn onboarding_profiles(&self) -> Vec<VenueOnboardingProfile> {
+        audited_onboarding_profiles()
+    }
+
+    /// Look up a venue's onboarding profile by canonical ID, known alias,
+    /// or registered HIP-3 liquidity domain (`OPT-01`).
+    pub fn lookup_onboarding_profile(&self, venue_id: &str) -> Option<VenueOnboardingProfile> {
+        let canonical = match venue_id {
+            "lighter_core" => "lighter",
+            "lighter_rh" | "lighter-robinhood" => "lighter_robinhood",
+            "tradexyz" | "trade-xyz" => "trade_xyz",
+            other => other,
+        };
+        let profiles = self.onboarding_profiles();
+        if let Some(profile) = profiles.iter().find(|p| p.venue_id == canonical) {
+            return Some(profile.clone());
+        }
+        let venue = self.get(venue_id).ok()?;
+        profiles
+            .into_iter()
+            .find(|p| p.liquidity_domain == venue.liquidity_domain)
+    }
 }
 
 /// Effective per-asset HIP-3 fee and volume credit terms (`OPT-01`).
@@ -887,5 +1021,142 @@ mod tests {
         assert!(select_execution_topology(&core_slow, &rh_std, false).is_err());
         // Same liquidity domain fails closed
         assert!(select_execution_topology(&core_std, &core_std, false).is_err());
+    }
+
+    #[test]
+    fn onboarding_profiles_cover_all_twelve_venues_and_fail_closed_unverified_capabilities() {
+        let mut registry = VenueRegistry::default();
+        let profiles = registry.onboarding_profiles();
+        assert_eq!(profiles.len(), 12);
+
+        let expected = [
+            ("lighter", "lighter", "USDC", CapabilityAuditStatus::Audited),
+            (
+                "lighter_robinhood",
+                "lighter:robinhood",
+                "USDG",
+                CapabilityAuditStatus::Audited,
+            ),
+            ("arcus", "arcus", "USDC", CapabilityAuditStatus::Audited),
+            (
+                "hyperliquid",
+                "hyperliquid:core",
+                "USDC",
+                CapabilityAuditStatus::Audited,
+            ),
+            (
+                "trade_xyz",
+                "hyperliquid:xyz",
+                "USDC",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "entropy",
+                "hyperliquid:io",
+                "USDC",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "backpack",
+                "backpack",
+                "USDC",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "extended",
+                "extended",
+                "USDC",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "bulk",
+                "bulk",
+                "USDC",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "okx",
+                "okx",
+                "USDT",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "binance",
+                "binance",
+                "USDT",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+            (
+                "coinbase",
+                "coinbase",
+                "USD",
+                CapabilityAuditStatus::AccountEvidenceRequired,
+            ),
+        ];
+
+        let audited_caps = audited_execution_capabilities();
+        for (venue_id, domain, currency, status) in expected {
+            let profile = registry
+                .lookup_onboarding_profile(venue_id)
+                .expect("expected onboarding profile");
+            assert_eq!(profile.venue_id, venue_id);
+            assert_eq!(profile.liquidity_domain, domain);
+            assert_eq!(profile.settlement_currency, currency);
+            assert_eq!(profile.audit_status, status);
+            match status {
+                CapabilityAuditStatus::Audited => {
+                    assert!(profile.missing_evidence.is_empty());
+                    assert!(audited_caps.iter().any(|cap| cap.venue_id == venue_id));
+                }
+                CapabilityAuditStatus::AccountEvidenceRequired => {
+                    assert!(!profile.missing_evidence.is_empty());
+                    assert!(!audited_caps.iter().any(|cap| cap.venue_id == venue_id));
+                }
+            }
+        }
+
+        // Canonical aliases and registered HIP-3 aliases resolve; unknown venues stay None.
+        registry.register_hip3("entropy-alias", "io").unwrap();
+        let resolved = |id| {
+            registry
+                .lookup_onboarding_profile(id)
+                .map(|profile| profile.venue_id)
+        };
+        assert_eq!(resolved("lighter_core"), Some("lighter"));
+        assert_eq!(resolved("lighter_rh"), Some("lighter_robinhood"));
+        assert_eq!(resolved("lighter-robinhood"), Some("lighter_robinhood"));
+        assert_eq!(resolved("tradexyz"), Some("trade_xyz"));
+        assert_eq!(resolved("trade-xyz"), Some("trade_xyz"));
+        assert_eq!(resolved("entropy-alias"), Some("entropy"));
+        assert_eq!(resolved("edgex"), None);
+        assert_eq!(resolved("variational"), None);
+
+        // Newly onboarded and unverified venues still fail closed on execution capability lookup.
+        for venue in [
+            "trade_xyz",
+            "entropy",
+            "backpack",
+            "extended",
+            "bulk",
+            "okx",
+            "binance",
+            "coinbase",
+        ] {
+            for tier in ["base", "standard"] {
+                for asset_class in ["crypto", "equity"] {
+                    assert!(
+                        registry
+                            .resolve_execution_capability(venue, tier, asset_class)
+                            .is_err(),
+                        "{venue}/{tier}/{asset_class} unexpectedly resolved capability"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            serde_json::to_string(&CapabilityAuditStatus::AccountEvidenceRequired).unwrap(),
+            "\"account_evidence_required\""
+        );
     }
 }
