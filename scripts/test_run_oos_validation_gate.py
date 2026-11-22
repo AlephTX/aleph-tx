@@ -16,6 +16,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.run_oos_validation_gate import (
+    ANT_STRATEGY_CONTRACT,
     FROZEN_ANT_ENGINE_FILES,
     evaluate_rth_ant_gate,
     evaluate_w15_rwa_gate,
@@ -124,6 +125,7 @@ def _sample_ant_prereg(
 ) -> dict:
     return {
         "classification": classification,
+        "strategy_contract": dict(ANT_STRATEGY_CONTRACT),
         "frozen_at_ms": frozen_at_ms,
         "decision_start_ms": decision_start_ms,
         "decision_end_ms": decision_end_ms,
@@ -181,6 +183,10 @@ def _sample_rwa_summary(*, nvda_cash: float, other_cash: float, other_dd: float 
                 },
             }
         }
+    for market in markets.values():
+        for arm in market["arms"].values():
+            for field in ("core_maker_usd", "terminal_liq_cash_usd"):
+                arm[field + "_exact"] = str(arm[field])
     total_core = 3_000_000.0
     total_pure = nvda_cash + 5 * other_cash
     total_hedge = (nvda_cash - 5.0) + 5 * (other_cash - 5.0)
@@ -208,6 +214,86 @@ def _sample_rwa_summary(*, nvda_cash: float, other_cash: float, other_dd: float 
 
 
 class OosValidationGateTests(unittest.TestCase):
+    def test_oos_does_not_execute_engine_with_mismatched_or_missing_pin(self):
+        from scripts.run_oos_validation_gate import run_rth_ant_cli
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / FROZEN_ANT_ENGINE_FILES[0]
+            path.parent.mkdir()
+            plan = root / "plan.json"
+            plan.write_text(json.dumps(_sample_ant_prereg()))
+            for present in (False, True):
+                if present:
+                    path.write_text("raise AssertionError('unverified engine executed')")
+                out = root / "result.json"
+                self.assertEqual(run_rth_ant_cli([], "monday_rth_oos", out, root, plan), 1)
+                self.assertEqual(json.loads(out.read_text())["verdict"], "NO_GO")
+
+    def test_replay_uses_executable_cap_at_arm_and_persistence_wakeup(self):
+        from scripts.ant_rth_replay import AblationSim, AblationSpec, MS_NS
+        for bp, admitted in [(34, True), (36, False), (48, False)]:
+            sim = AblationSim([AblationSpec("synthetic", "TAKER_TAKER", 100, 500, 10)])
+            t = 1000 * MS_NS
+            sim.on_arc_seen_book(t, [(99.99, 10)], [(100, 10)])
+            sim.on_xyz_book(t, [(100 + bp / 100, 10)], [(100.01 + bp / 100, 10)])
+            self.assertEqual(sim.arms[0].pend_action, admitted)
+        sim = AblationSim([AblationSpec("synthetic", "TAKER_TAKER", 100, 500, 10, persist_ms=100)])
+        sim.on_arc_seen_book(t, [(99.99, 10)], [(100, 10)])
+        sim.on_xyz_book(t, [(100.34, 10)], [(100.35, 10)])
+        self.assertTrue(sim.arms[0].armed_since_ns)
+        sim.on_arc_seen_book(t + 50 * MS_NS, [(99.5, 10)], [(99.9, 10)])
+        sim.drain(t + 100 * MS_NS)
+        self.assertFalse(sim.arms[0].armed_since_ns)
+        self.assertFalse(sim.arms[0].pend_action)
+
+    def test_monday_role_rejects_changed_contract_and_weekday_override(self):
+        for offset in (0, 86_400_000):
+            start, end = MON_RTH_START_MS + offset, MON_RTH_END_MS + offset
+            plan = _sample_ant_prereg(frozen_at_ms=start-1000, decision_start_ms=start,
+                decision_end_ms=end, expected_rth_date_et="2026-11-24" if offset else "2026-11-23")
+            if offset:
+                plan["require_monday"] = False
+            else:
+                plan["strategy_contract"]["entry_bp"] = 999
+            digest = _sample_prereg_sha(plan)
+            report = evaluate_rth_ant_gate(_sample_ant_window(start_ms=start,end_ms=end), role="monday_rth_oos",
+                prereg_manifest=plan, verified_prereg_sha256=digest, verified_segment_digests=_sample_seg_digests(),
+                verified_engine_digests=_sample_eng_digests(), seal_receipt=_sample_seal_receipt(digest,
+                    sealed_at_ms=end+1000, archive_first_rx_ns=start*1_000_000, archive_last_rx_ns=end*1_000_000))
+            self.assertEqual(report["verdict"], "NO_GO")
+            self.assertFalse(report["provenance"]["checks"]["us_rth_weekday_session_covered" if offset else "strategy_contract_matches"])
+
+    def test_current_rwa_producer_preserves_pre_rounding_decimals(self):
+        from decimal import Decimal
+        from scripts.sim_lighter_core_rwa_maker import CoreMakerSim, CORE_SPECS, summarize_sim
+        sim = CoreMakerSim(tuple(CORE_SPECS))
+        for market in sim.mk.values():
+            for arm in market.arms:
+                arm.cash_maker = Decimal("-0.20004")
+                arm.vol_maker_usd = Decimal("10000")
+        summary = summarize_sim(sim, Path("synthetic"), 0, 0)
+        row = summary["markets"]["SPY"]["arms"]["CORE_HEDGE_SELF_PULL05_C310"]
+        self.assertEqual(row["terminal_liq_cash_usd"], -0.2)
+        self.assertEqual(Decimal(row["terminal_liq_cash_usd_exact"]), Decimal("-0.20004"))
+        self.assertEqual(evaluate_w15_rwa_gate(summary)["verdict"], "NO_GO")
+
+    def test_w15_rounding_can_hide_over_budget_cost(self):
+        summary = _sample_rwa_summary(nvda_cash=-20,other_cash=-10)
+        for market in summary["markets"].values():
+            for arm in market["arms"].values():
+                arm.update(core_maker_usd=10000, terminal_liq_cash_usd=-0.2)
+                arm.pop("core_maker_usd_exact")
+                arm.pop("terminal_liq_cash_usd_exact")
+        report = evaluate_w15_rwa_gate(summary)
+        self.assertEqual(report["verdict"], "NO_GO")
+        self.assertEqual(report["arms"]["CORE_HEDGE_SELF_PULL05_C310"]["ex_nvda"]["cost_evidence"], "insufficient_precision")
+        for market in summary["markets"].values():
+            for arm in market["arms"].values():
+                arm.update(core_maker_usd_exact="10000", terminal_liq_cash_usd_exact="-0.20004")
+        report = evaluate_w15_rwa_gate(summary)
+        self.assertEqual(report["verdict"], "NO_GO")
+        self.assertEqual(report["arms"]["CORE_HEDGE_SELF_PULL05_C310"]["ex_nvda"]["cost_evidence"], "above_or_no_volume")
+
     def test_rth_ant_gate_enforces_oos_role_and_failure_conditions(self) -> None:
         good = _sample_ant_window()
         prereg = _sample_ant_prereg()
@@ -216,7 +302,7 @@ class OosValidationGateTests(unittest.TestCase):
         segs = _sample_seg_digests()
         engs = _sample_eng_digests()
 
-        go = evaluate_rth_ant_gate(
+        no_witness = evaluate_rth_ant_gate(
             good,
             role="monday_rth_oos",
             prereg_manifest=prereg,
@@ -225,8 +311,15 @@ class OosValidationGateTests(unittest.TestCase):
             verified_segment_digests=segs,
             verified_engine_digests=engs,
         )
-        self.assertEqual(go["verdict"], "GO")
-        self.assertTrue(go["provenance"]["qualified"])
+        self.assertEqual(no_witness["verdict"], "NO_GO")
+        self.assertTrue(no_witness["passed_metrics"])
+        self.assertTrue(no_witness["provenance"]["structural_checks_passed"])
+        self.assertFalse(no_witness["provenance"]["qualified"])
+        self.assertFalse(no_witness["provenance"]["checks"]["independent_preregistration_witness_verified"])
+        self.assertEqual(
+            no_witness["provenance"]["pre_registration_clock_trust"],
+            "self_asserted_json_only_requires_external_witness",
+        )
 
         # Historical selection_dev can NEVER emit GO, even with strong metrics.
         dry = evaluate_rth_ant_gate(good, role="selection_dev_dryrun")
@@ -261,6 +354,10 @@ class OosValidationGateTests(unittest.TestCase):
         self.assertEqual(no_manifest["verdict"], "NO_GO")
         self.assertTrue(no_manifest["passed_metrics"])
         self.assertFalse(no_manifest["provenance"]["checks"]["prereg_manifest_supplied"])
+        self.assertEqual(
+            no_manifest["provenance"]["pre_registration_clock_trust"],
+            "self_asserted_json_only_requires_external_witness",
+        )
 
         # 1b. Single merged post-hoc manifest containing segment_sha256 -> NO_GO.
         merged_prereg = {**prereg, "segment_sha256": segs}
@@ -602,14 +699,16 @@ class OosValidationGateTests(unittest.TestCase):
             self.assertEqual(rc_pre, 1)
             self.assertEqual(rep_pre["verdict"], "NO_GO")
             self.assertEqual({v["cycles_closed"] for v in rep_pre["taker_variants"]}, {0})
-            self.assertTrue(rep_pre["provenance"]["qualified"])
+            self.assertTrue(rep_pre["provenance"]["structural_checks_passed"])
 
-            # Positive in-window control -> GO across all latencies with full provenance verified.
+            # Positive in-window control has complete structure and passes economics.
             rc_pos, rep_pos = _run_case(root, "positive", [*_opportunities(start_ns + 103 * sec), *quiet_rows])
-            self.assertEqual(rc_pos, 0)
-            self.assertEqual(rep_pos["verdict"], "GO")
+            self.assertEqual(rc_pos, 1)
+            self.assertEqual(rep_pos["verdict"], "NO_GO")
             self.assertEqual({v["cycles_closed"] for v in rep_pos["taker_variants"]}, {4})
-            self.assertTrue(rep_pos["provenance"]["qualified"])
+            self.assertTrue(rep_pos["passed_metrics"])
+            self.assertTrue(rep_pos["provenance"]["structural_checks_passed"])
+            self.assertFalse(rep_pos["provenance"]["qualified"])
 
     def test_w15_rwa_gate_distinguishes_hedged_unhedged_and_no_go(self) -> None:
         # Pure ex-NVDA = +$2.5M volume, -$25 cash = $10/M (<=20); Hedged ex-NVDA = -$50 = $20/M (<=20)
@@ -647,10 +746,62 @@ class OosValidationGateTests(unittest.TestCase):
             go_json.write_text(json.dumps(_sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)))
             no_go_json.write_text(json.dumps(_sample_rwa_summary(nvda_cash=-80.0, other_cash=-15.0)))
 
-            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--rwa-summary-json", str(go_json), "--output", str(out_json)]):
+            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--role", "diagnostic", "--rwa-summary-json", str(go_json), "--output", str(out_json)]):
                 self.assertEqual(cli_main(), 0)
-            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--rwa-summary-json", str(no_go_json), "--output", str(out_json)]):
+                self.assertEqual(json.loads(out_json.read_text())["verdict"], "DIAGNOSTIC_ONLY")
+            with patch.object(sys, "argv", ["run_oos_validation_gate.py", "w15-rwa", "--role", "diagnostic", "--rwa-summary-json", str(no_go_json), "--output", str(out_json)]):
                 self.assertEqual(cli_main(), 1)
+
+    def test_w15_rwa_never_promotes_legacy_summary_to_formal_admission(self) -> None:
+        summary = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
+        summary.update(role="historical_diagnostic", window="w14", decision_start_ms=0,
+                       decision_end_ms=600_000, segments_sha256={})
+        with tempfile.TemporaryDirectory() as tmp:
+            source, output = Path(tmp) / "summary.json", Path(tmp) / "report.json"
+            source.write_text(json.dumps(summary))
+            common = ["run_oos_validation_gate.py", "w15-rwa", "--rwa-summary-json", str(source), "--output", str(output)]
+            for extra, code, verdict, threshold in (
+                ([], 2, "FORMAL_WITHHELD", 20.0),
+                (["--role", "formal", "--max-cost-per-million", "20.01"], 2, "FORMAL_WITHHELD", 20.01),
+                (["--role", "diagnostic", "--max-cost-per-million", "20.01"], 0, "DIAGNOSTIC_ONLY", 20.01),
+            ):
+                with self.subTest(extra=extra), patch.object(sys, "argv", common + extra), patch("builtins.print") as printer:
+                    self.assertEqual(cli_main(), code)
+                    result = json.loads(output.read_text())
+                    self.assertEqual(result["verdict"], verdict)
+                    self.assertIs(result["formal_admission"], False)
+                    self.assertEqual(result["max_cost_per_million_usd"], threshold)
+                    self.assertEqual(result["input_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+                    self.assertEqual(json.loads(printer.call_args.args[0]), {k: v for k, v in result.items() if k != "input_json"})
+
+    def test_w15_rwa_applies_exact_cost_threshold_before_display_rounding(self) -> None:
+        for market_cash, expected in (
+            (-9.999, "GO_UNHEDGED_ONLY"),
+            (-10.0, "GO_UNHEDGED_ONLY"),
+            (-10.002, "NO_GO"),
+        ):
+            with self.subTest(market_cash=market_cash):
+                result = evaluate_w15_rwa_gate(_sample_rwa_summary(nvda_cash=-80.0, other_cash=market_cash))
+                self.assertEqual(result["verdict"], expected)
+                self.assertEqual(result["arms"]["CORE_PURE_PULL05_C310"]["ex_nvda"]["core_usd_per_m_liq"], 20.0)
+
+    def test_w15_rwa_requires_finite_and_plausible_evidence(self) -> None:
+        for field, value in (
+            ("max_drawdown_usd", float("nan")),
+            ("max_drawdown_usd", -1.0),
+            ("core_maker_usd", float("inf")),
+            ("dual_usd", -1.0),
+            ("terminal_liq_cash_usd", float("nan")),
+        ):
+            with self.subTest(field=field, value=value):
+                summary = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-3.0)
+                summary["markets"]["SPY"]["arms"]["CORE_HEDGE_SELF_PULL05_C310"][field] = value
+                with self.assertRaises(ValueError):
+                    evaluate_w15_rwa_gate(summary)
+        for bad_max in (True, float("nan"), 0.0, -5.0):
+            with self.subTest(bad_max=bad_max):
+                with self.assertRaises(ValueError):
+                    evaluate_w15_rwa_gate(_sample_rwa_summary(nvda_cash=-80.0, other_cash=-3.0), max_cost_per_million=bad_max)
 
     def test_w17_crash_pause_verify_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

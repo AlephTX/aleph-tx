@@ -137,6 +137,7 @@ def real_time_drawdown_brake_scale(
     equity: float,
     daily_budget_usd: float,
     prev_tier: int = 0,
+    *, day_start_equity: float,
 ) -> tuple[int, float]:
     """Python mirror of `DailyLossGuard` progressive brake (`CRASH-IMP-01`).
 
@@ -147,7 +148,9 @@ def real_time_drawdown_brake_scale(
     if daily_budget_usd <= 0.0:
         raise ValueError("daily_budget_usd must be positive")
     r_dd = max(0.0, peak_equity - equity) / daily_budget_usd
-    if r_dd >= 1.0:
+    if not math.isfinite(day_start_equity) or day_start_equity <= 0:
+        raise ValueError("day_start_equity must be positive finite")
+    if prev_tier == 4 or equity <= 0 or day_start_equity - equity > daily_budget_usd:
         return 4, 0.0
     if r_dd >= 0.75:
         escalated = 3

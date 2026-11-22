@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.rth_ant_prereg_tool import create_prereg_manifest, create_seal_receipt
+from scripts.rth_ant_prereg_tool import create_prereg_manifest, create_seal_receipt, main as prereg_cli_main
 from scripts.run_oos_validation_gate import FROZEN_ANT_ENGINE_FILES, TEN_HOURS_MS, run_rth_ant_cli
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -86,6 +86,11 @@ class RthAntPreregToolTests(unittest.TestCase):
                     now_ms=start_ms - 10_000_000,
                 )
 
+            diagnostic = root / "diagnostic.json"
+            create_prereg_manifest(rth_date_str="2026-11-24", output=diagnostic, repo_root=REPO_ROOT,
+                                   allow_non_monday=True, now_ms=start_ms-60_000)
+            self.assertEqual(json.loads(diagnostic.read_text())["classification"], "weekday_rth_diagnostic")
+
             res = create_prereg_manifest(
                 rth_date_str="2026-11-23",
                 window_start_et="07:00",
@@ -140,7 +145,7 @@ class RthAntPreregToolTests(unittest.TestCase):
                     now_ms=end_ms,
                 )
 
-    def test_end_to_end_prereg_seal_passes_run_oos_validation_gate_monday_rth_go(self) -> None:
+    def test_end_to_end_prereg_seal_requires_independent_time_witness(self) -> None:
         start_ms = int(datetime(2026, 11, 23, 7, 0, tzinfo=ET_TZ).timestamp() * 1000)
         end_ms = start_ms + TEN_HOURS_MS
         ms = 1_000_000
@@ -201,11 +206,35 @@ class RthAntPreregToolTests(unittest.TestCase):
                 prereg_manifest_path=pre,
                 seal_receipt_path=seal,
             )
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 1)
             rep = json.loads(gate_out.read_text(encoding="utf-8"))
-            self.assertEqual(rep["verdict"], "GO")
-            self.assertTrue(rep["provenance"]["qualified"])
-            self.assertTrue(all(rep["provenance"]["checks"].values()), rep["provenance"]["checks"])
+            self.assertEqual(rep["verdict"], "NO_GO")
+            self.assertTrue(rep["passed_metrics"])
+            self.assertTrue(rep["provenance"]["structural_checks_passed"])
+            self.assertFalse(rep["provenance"]["qualified"])
+            self.assertEqual([k for k, v in rep["provenance"]["checks"].items() if not v],
+                             ["independent_preregistration_witness_verified"])
+
+    def test_cli_rejects_manual_now_ms_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for argv in (
+                ["prereg", "--rth-date", "2026-11-23", "--output", str(root / "m.json"), "--now-ms", "1"],
+                [
+                    "seal",
+                    "--prereg-manifest",
+                    str(root / "m.json"),
+                    "--capture-dirs",
+                    str(root),
+                    "--output",
+                    str(root / "s.json"),
+                    "--now-ms",
+                    "1",
+                ],
+            ):
+                with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit) as ctx:
+                    prereg_cli_main(argv)
+                self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":

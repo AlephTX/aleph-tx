@@ -64,17 +64,23 @@ class PortfolioRiskBudgetTests(unittest.TestCase):
         self.assertLessEqual(capped_fractional_kelly(0.20, 0.01, fraction=0.25, max_scale=0.6), 0.6)
         self.assertAlmostEqual(capped_fractional_kelly(0.01, 0.01, fraction=0.25), 0.25, places=12)
 
+    def test_peak_to_day_start_only_soft_brakes(self):
+        from scripts.ant_rth_replay import _next_drawdown_brake
+        for equity, prior, expected in [(500, 0, (3, 0.25)), (475, 3, (3, 0.25)), (474, 3, (4, 0.0)), (510, 4, (4, 0.0))]:
+            self.assertEqual(_next_drawdown_brake(530, equity, 25, prior, 500), expected)
+            self.assertEqual(real_time_drawdown_brake_scale(530, equity, 25, prior, day_start_equity=500), expected)
+
     def test_real_time_drawdown_brake_matches_rust_hysteresis_spec(self) -> None:
-        tier, scale = real_time_drawdown_brake_scale(1000.0, 987.5, 50.0, prev_tier=0)
+        tier, scale = real_time_drawdown_brake_scale(1000.0, 987.5, 50.0, day_start_equity=1000.0, prev_tier=0)
         self.assertEqual((tier, scale), (1, 0.75))
         # Stay Tier 1 in hysteresis band (r_dd = 0.22 >= 0.20)
-        tier, scale = real_time_drawdown_brake_scale(1000.0, 989.0, 50.0, prev_tier=tier)
+        tier, scale = real_time_drawdown_brake_scale(1000.0, 989.0, 50.0, day_start_equity=1000.0, prev_tier=tier)
         self.assertEqual((tier, scale), (1, 0.75))
         # Drop to r_dd = 0.75 -> Tier 3
-        tier, scale = real_time_drawdown_brake_scale(1000.0, 962.5, 50.0, prev_tier=tier)
+        tier, scale = real_time_drawdown_brake_scale(1000.0, 962.5, 50.0, day_start_equity=1000.0, prev_tier=tier)
         self.assertEqual((tier, scale), (3, 0.25))
         # Rebound to r_dd = 0.0 -> cleanly recovers to Tier 0 (no 260-period deadlock!)
-        tier, scale = real_time_drawdown_brake_scale(1000.0, 1000.0, 50.0, prev_tier=tier)
+        tier, scale = real_time_drawdown_brake_scale(1000.0, 1000.0, 50.0, day_start_equity=1000.0, prev_tier=tier)
         self.assertEqual((tier, scale), (0, 1.0))
 
     def test_perp_stress_evaluator_and_input_validation(self) -> None:

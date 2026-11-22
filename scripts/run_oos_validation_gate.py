@@ -4,8 +4,8 @@
 Supports three locked acceptance gates with zero post-freeze parameter tuning:
 1. `rth-ant`: Evaluates frozen `EXP-ARB-A2` (`Q=$500, in=10bp, out=0bp, persist=100ms,
    lad=2,p=1, ddbrk=$50`) across `lat_ms in {100, 250, 500}` for Monday US RTH captures.
-2. `w15-rwa`: Evaluates `W15+` Core Standard RWA cost against hard `<= $20/M` and zero
-   58% halt criteria on both full 6-market and `ex-NVDA` 5-market baskets.
+2. `w15-rwa`: Diagnoses Core Standard RWA cost on full and `ex-NVDA` baskets.
+   Formal admission remains withheld until the producer supplies frozen-source evidence.
 3. `w17-crash-pause-verify`: Verifies SHA-256 integrity of all frozen `W17+` artifacts
    against `crash_pause_abc_preregistration_v1_frozen.json` and fails closed on drift.
 """
@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import hashlib
-import importlib.util
+from types import ModuleType
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -35,10 +38,18 @@ CAPTURE_COVERAGE_TOLERANCE_MS = 60_000
 MAX_SOURCE_BOOK_GAP_MS = 300_000
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 ET_TZ = ZoneInfo("America/New_York")
-FROZEN_ANT_ENGINE_FILES = (
-    ".agent-state/research/ant_three_venue_20261120/sim_ant_arcus_xyz_basis.py",
-    ".agent-state/research/ant_three_venue_20261120/run_arb_imp_ablation_w01_w02.py",
-)
+FROZEN_ANT_ENGINE_FILES = ("scripts/ant_rth_replay.py",)
+ANT_STRATEGY_CONTRACT = {
+    "arm_family": "EXP-CRASH-A2B", "q_usd": 500.0, "entry_bp": 10.0, "exit_bp": 0.0,
+    "max_entry_bp": 35.0, "persist_ms": 100, "post_trade_refresh_lock": True,
+    "allow_batch_add": True, "floor_frac": 0.25, "scale_bps": 2.0, "convex_power": 1.0,
+    "dd_brake_budget_usd": MAX_DRAWDOWN_BUDGET_USD, "max_hold_s": 7200,
+    "required_taker_latencies_ms": list(REQUIRED_TAKER_LATS),
+}
+
+
+def _contract_matches(value: Any) -> bool:
+    return json.dumps(value, sort_keys=True) == json.dumps(ANT_STRATEGY_CONTRACT, sort_keys=True)
 
 
 def _is_valid_ms(value: Any) -> bool:
@@ -109,6 +120,8 @@ def _engine_hashes_match(
     verified_engine_digests: dict[str, str] | None,
 ) -> bool:
     if not isinstance(expected_engines, dict) or not isinstance(verified_engine_digests, dict):
+        return False
+    if set(expected_engines) != set(FROZEN_ANT_ENGINE_FILES) or set(verified_engine_digests) != set(FROZEN_ANT_ENGINE_FILES):
         return False
     for rel_path in FROZEN_ANT_ENGINE_FILES:
         exp = expected_engines.get(rel_path)
@@ -221,11 +234,13 @@ def verify_rth_ant_provenance(
     if not isinstance(prereg_manifest, dict):
         checks = {
             "prereg_manifest_supplied": False,
+            "strategy_contract_matches": False,
             "seal_receipt_supplied": isinstance(seal_receipt, dict),
             "seal_links_prereg_sha256": False,
             "sealed_after_decision_end": False,
             "classification_is_monday_rth_oos": False,
             "pre_registered_before_decision_start": False,
+            "independent_preregistration_witness_verified": False,
             "exact_10h_bounded_decision_window": False,
             "funding_hours_cover_decision_window": False,
             "us_rth_weekday_session_covered": False,
@@ -235,6 +250,8 @@ def verify_rth_ant_provenance(
         }
         return {
             "qualified": False,
+            "structural_checks_passed": False,
+            "pre_registration_clock_trust": "self_asserted_json_only_requires_external_witness",
             "checks": checks,
             "covered_rth_dates_et": [],
             "decision_start_ms": None,
@@ -272,20 +289,19 @@ def verify_rth_ant_provenance(
     min_req_hours = max(MIN_WITNESSED_HOURS_10H, _expected_interior_utc_hours(start_ms, end_ms) if valid_times else MIN_WITNESSED_HOURS_10H)
     funding_cov_ok = bool(valid_times and missing == 0 and witnessed >= min_req_hours)
 
-    require_monday = bool(prereg_manifest.get("require_monday", True))
     expected_date = prereg_manifest.get("expected_rth_date_et")
     rth_dates = (
         _covered_us_rth_dates(
             start_ms,
             end_ms,
-            require_monday=require_monday,
+            require_monday=True,
             expected_rth_date_et=expected_date if isinstance(expected_date, str) else None,
         )
         if valid_times
         else []
     )
     session_decl = prereg_manifest.get("market_session")
-    session_ok = bool(rth_dates) and (session_decl in (None, "us_equities_rth"))
+    session_ok = expected_date in rth_dates and session_decl == "us_equities_rth" and prereg_manifest.get("require_monday") is True
 
     continuity_ok = (
         _verify_dual_source_continuity(
@@ -301,6 +317,7 @@ def verify_rth_ant_provenance(
 
     checks = {
         "prereg_manifest_supplied": prereg_supplied_ok,
+        "strategy_contract_matches": _contract_matches(prereg_manifest.get("strategy_contract")),
         "seal_receipt_supplied": seal_supplied_ok,
         "seal_links_prereg_sha256": seal_links_ok,
         "sealed_after_decision_end": sealed_after_end_ok,
@@ -315,8 +332,15 @@ def verify_rth_ant_provenance(
         ),
         "frozen_engine_hashes_verified": _engine_hashes_match(prereg_manifest.get("frozen_engine_sha256"), verified_engine_digests),
     }
+    structural_checks_passed = all(checks.values())
+    # Neither supplied JSON establishes when the preregistration digest was
+    # independently observed. Keep the formal gate closed until a trusted
+    # pre-window witness is verified by this runner.
+    checks["independent_preregistration_witness_verified"] = False
     return {
         "qualified": all(checks.values()),
+        "structural_checks_passed": structural_checks_passed,
+        "pre_registration_clock_trust": "self_asserted_json_only_requires_external_witness",
         "checks": checks,
         "covered_rth_dates_et": rth_dates,
         "decision_start_ms": start_ms if _is_valid_ms(start_ms) else None,
@@ -424,6 +448,29 @@ def _require_bool(mapping: dict[str, Any], key: str, *, ctx: str) -> bool:
     return val
 
 
+def _require_finite_number(
+    mapping: dict[str, Any], key: str, *, ctx: str, nonnegative: bool = False,
+) -> float:
+    value = mapping.get(key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or (nonnegative and value < 0.0)
+    ):
+        raise ValueError(f"invalid numeric field {key!r} in {ctx}")
+    return float(value)
+
+
+def _rwa_cost_per_million(cash: float, core_volume: float) -> float:
+    if not math.isfinite(core_volume) or core_volume <= 0.0:
+        raise ValueError("RWA gate requires positive finite Core volume")
+    cost = -cash / (core_volume / 1e6)
+    if not math.isfinite(cost):
+        raise ValueError("RWA gate requires finite cost")
+    return cost
+
+
 def _summarize_rwa_arm(summary: dict[str, Any], arm_name: str, *, exclude_nvda: bool) -> dict[str, Any]:
     markets = summary.get("markets")
     if not isinstance(markets, dict):
@@ -439,10 +486,10 @@ def _summarize_rwa_arm(summary: dict[str, Any], arm_name: str, *, exclude_nvda: 
             raise KeyError(f"missing aggregate_6markets arm {arm_name!r}")
         ctx = f"aggregate_6markets.{arm_name}"
         return {
-            "core_maker_usd": float(arm["core_maker_usd"]),
-            "dual_usd": float(arm["dual_usd"]),
-            "terminal_liq_cash_usd": float(arm["terminal_liq_cash_usd"]),
-            "core_usd_per_m_liq": float(arm["single_venue_core_usd_per_m_liq"]),
+            "core_maker_usd": _require_finite_number(arm, "core_maker_usd", ctx=ctx, nonnegative=True),
+            "dual_usd": _require_finite_number(arm, "dual_usd", ctx=ctx, nonnegative=True),
+            "terminal_liq_cash_usd": _require_finite_number(arm, "terminal_liq_cash_usd", ctx=ctx),
+            "core_usd_per_m_liq": _require_finite_number(arm, "single_venue_core_usd_per_m_liq", ctx=ctx),
             "terminal_flat_all": _require_bool(arm, "terminal_flat_all", ctx=ctx),
             "drawdown_58_breached": _require_bool(arm, "drawdown_58_breached", ctx=ctx),
         }
@@ -467,30 +514,71 @@ def _summarize_rwa_arm(summary: dict[str, Any], arm_name: str, *, exclude_nvda: 
         if not arm:
             raise KeyError(f"missing market {sym!r} arm {arm_name!r}")
         ctx = f"markets.{sym}.arms.{arm_name}"
-        core_vol += float(arm["core_maker_usd"])
-        dual_vol += float(arm["dual_usd"])
-        liq_cash += float(arm["terminal_liq_cash_usd"])
-        flat_all = flat_all and _require_bool(arm, "terminal_flat_liq_ok", ctx=ctx)
-        if "max_drawdown_usd" not in arm or isinstance(arm["max_drawdown_usd"], bool):
-            raise ValueError(f"missing or non-numeric max_drawdown_usd in {ctx}")
-        mkt_dd = float(arm["max_drawdown_usd"])
+        core_vol += _require_finite_number(arm, "core_maker_usd", ctx=ctx, nonnegative=True)
+        dual_vol += _require_finite_number(arm, "dual_usd", ctx=ctx, nonnegative=True)
+        liq_cash += _require_finite_number(arm, "terminal_liq_cash_usd", ctx=ctx)
+        market_flat = _require_bool(arm, "terminal_flat_liq_ok", ctx=ctx)
+        flat_all = flat_all and market_flat
+        mkt_dd = _require_finite_number(arm, "max_drawdown_usd", ctx=ctx, nonnegative=True)
         max_mkt_dd = max(max_mkt_dd, mkt_dd)
-        any_58_breach = any_58_breach or bool(arm.get("drawdown_58_breached", False)) or mkt_dd >= 580.0
+        reported_breach = (
+            _require_bool(arm, "drawdown_58_breached", ctx=ctx)
+            if "drawdown_58_breached" in arm else False
+        )
+        any_58_breach = any_58_breach or reported_breach or mkt_dd >= 580.0
         halt_blocks += int(arm.get("halt_blocked", 0))
         count += 1
-    if count != len(EXPECTED_RWA_EX_NVDA_MARKETS) or core_vol <= 0.0:
-        raise ValueError(f"invalid ex-NVDA volume/count ({count}) for {arm_name}")
+    if not math.isfinite(dual_vol):
+        raise ValueError(f"non-finite ex-NVDA dual-venue volume for {arm_name}")
+    cost = _rwa_cost_per_million(liq_cash, core_vol)
     return {
         "markets_included": count,
-        "core_maker_usd": round(core_vol, 2),
-        "dual_usd": round(dual_vol, 2),
-        "terminal_liq_cash_usd": round(liq_cash, 4),
-        "core_usd_per_m_liq": round(-liq_cash / (core_vol / 1e6), 2),
+        "core_maker_usd": core_vol,
+        "dual_usd": dual_vol,
+        "terminal_liq_cash_usd": liq_cash,
+        "core_usd_per_m_liq": cost,
         "terminal_flat_all": flat_all,
         "max_market_drawdown_usd": round(max_mkt_dd, 4),
         "drawdown_58_breached": any_58_breach,
         "feed_halt_blocks": halt_blocks,
     }
+
+
+def _rwa_cost_evidence(arms: list[dict], threshold: float) -> str:
+    # A legacy cash value represents a rounded 4dp interval, turnover a 2dp interval.
+    # Compare cross products exactly, including at equality.
+    low = high = Fraction(0)
+    min_volume = max_volume = Fraction(0)
+    target = Fraction(str(threshold))
+    for arm in arms:
+        bounds = []
+        for field, half_unit in (("terminal_liq_cash_usd", "0.00005"), ("core_maker_usd", "0.005")):
+            shown = Fraction(str(arm[field]))
+            error = Fraction(half_unit)
+            key = field + "_exact"
+            if key in arm:
+                raw = arm[key]
+                try:
+                    value = Decimal(raw) if isinstance(raw, str) else None
+                except InvalidOperation:
+                    value = None
+                if value is None or not value.is_finite() or abs(Fraction(value) - shown) > error:
+                    raise ValueError(f"invalid or inconsistent {key}")
+                bounds.append((Fraction(value), Fraction(value)))
+            else:
+                bounds.append((shown - error, shown + error))
+        (cash_lo, cash_hi), (vol_lo, vol_hi) = bounds
+        if vol_hi < 0 or ("core_maker_usd_exact" in arm and vol_lo < 0):
+            raise ValueError("negative maker turnover")
+        min_volume += max(0, vol_lo)
+        max_volume += max(0, vol_hi)
+        low += -cash_hi * 1_000_000 - target * vol_hi
+        high += -cash_lo * 1_000_000 - target * max(0, vol_lo)
+    if max_volume == 0 or low > 0:
+        return "above_or_no_volume"
+    if min_volume > 0 and high <= 0:
+        return "within_threshold"
+    return "insufficient_precision"
 
 
 def evaluate_w15_rwa_gate(
@@ -499,23 +587,27 @@ def evaluate_w15_rwa_gate(
     max_cost_per_million: float = 20.0,
 ) -> dict[str, Any]:
     """Evaluate `W15+` Core Standard RWA cost threshold (`<= $20/M`) on 6-sym & ex-NVDA."""
-    if max_cost_per_million <= 0.0:
-        raise ValueError("max_cost_per_million must be positive")
+    if (
+        isinstance(max_cost_per_million, bool)
+        or not isinstance(max_cost_per_million, (int, float))
+        or not math.isfinite(max_cost_per_million)
+        or max_cost_per_million <= 0.0
+    ):
+        raise ValueError("max_cost_per_million must be positive finite")
     arms = ("CORE_PURE_PULL05_C310", "CORE_HEDGE_SELF_PULL05_C310")
     rows: dict[str, Any] = {}
     for arm_name in arms:
         full = _summarize_rwa_arm(summary, arm_name, exclude_nvda=False)
         ex_nvda = _summarize_rwa_arm(summary, arm_name, exclude_nvda=True)
-        full["pass_cost_le_threshold"] = (
-            full["core_usd_per_m_liq"] <= max_cost_per_million
-            and full["terminal_flat_all"]
-            and not full["drawdown_58_breached"]
-        )
-        ex_nvda["pass_cost_le_threshold"] = (
-            ex_nvda["core_usd_per_m_liq"] <= max_cost_per_million
-            and ex_nvda["terminal_flat_all"]
-            and not ex_nvda["drawdown_58_breached"]
-        )
+        market_arms = [summary["markets"][sym]["arms"][arm_name] for sym in sorted(EXPECTED_RWA_EX_NVDA_MARKETS)]
+        for row, inputs in ((full, [summary["aggregate_6markets"][arm_name]]), (ex_nvda, market_arms)):
+            evidence = _rwa_cost_evidence(inputs, max_cost_per_million)
+            row["cost_evidence"] = evidence
+            row["pass_cost_le_threshold"] = evidence == "within_threshold" and row["terminal_flat_all"] and not row["drawdown_58_breached"]
+        ex_nvda["core_maker_usd"] = round(ex_nvda["core_maker_usd"], 2)
+        ex_nvda["dual_usd"] = round(ex_nvda["dual_usd"], 2)
+        ex_nvda["terminal_liq_cash_usd"] = round(ex_nvda["terminal_liq_cash_usd"], 4)
+        ex_nvda["core_usd_per_m_liq"] = round(ex_nvda["core_usd_per_m_liq"], 2)
         rows[arm_name] = {"full_6markets": full, "ex_nvda": ex_nvda}
 
     hedged_ex_nvda_ok = rows["CORE_HEDGE_SELF_PULL05_C310"]["ex_nvda"]["pass_cost_le_threshold"]
@@ -527,6 +619,32 @@ def evaluate_w15_rwa_gate(
         "verdict": verdict,
         "arms": rows,
     }
+
+
+def run_w15_rwa_cli(summary_path: Path, output: Path, role: str, threshold: float) -> int:
+    source = summary_path.read_bytes()
+    report = {
+        "gate": "w15_rwa",
+        "role": role,
+        "formal_admission": False,
+        "input_json": str(summary_path),
+        "input_sha256": hashlib.sha256(source).hexdigest(),
+        "max_cost_per_million_usd": threshold if math.isfinite(threshold) else None,
+    }
+    if role == "formal":
+        # Current producer emits a diagnostic aggregate with an input pathname.
+        # Its bytes cannot establish the frozen engine, 10h coverage or sealed inputs.
+        report.update(verdict="FORMAL_WITHHELD", reason="missing_registered_cost_replay_receipt")
+        if threshold != 20.0:
+            report["reason"] = "formal_threshold_must_be_20"
+        exit_code = 2
+    else:
+        economics = evaluate_w15_rwa_gate(json.loads(source), max_cost_per_million=threshold)
+        report.update(verdict="DIAGNOSTIC_ONLY", diagnostic_verdict=economics["verdict"], arms=economics["arms"])
+        exit_code = 1 if economics["verdict"] == "NO_GO" else 0
+    output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    print(json.dumps({k: v for k, v in report.items() if k != "input_json"}, indent=2, allow_nan=False))
+    return exit_code
 
 
 def verify_w17_crash_pause_prereg(prereg_path: Path, repo_root: Path) -> dict[str, Any]:
@@ -560,21 +678,6 @@ def verify_w17_crash_pause_prereg(prereg_path: Path, repo_root: Path) -> dict[st
     }
 
 
-def _load_ant_ablation_module(repo_root: Path) -> Any:
-    mod_dir = repo_root / ".agent-state" / "research" / "ant_three_venue_20261120"
-    mod_path = mod_dir / "run_arb_imp_ablation_w01_w02.py"
-    if not mod_path.is_file():
-        raise FileNotFoundError(f"missing ablation engine at {mod_path}")
-    if str(mod_dir) not in sys.path:
-        sys.path.insert(0, str(mod_dir))
-    spec = importlib.util.spec_from_file_location("run_arb_imp_ablation_w01_w02", mod_path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -604,13 +707,26 @@ def _collect_segment_hashes(capture_dirs: list[Path], seal_receipt: dict[str, An
     return digests
 
 
-def _collect_engine_hashes(repo_root: Path) -> dict[str, str]:
-    digests: dict[str, str] = {}
-    for rel in FROZEN_ANT_ENGINE_FILES:
-        path = repo_root / rel
-        if path.is_file():
-            digests[rel] = _sha256_file(path)
-    return digests
+def _run_pinned_replay(source: bytes, path: Path, captures: list[Path], contract: dict, bounds: tuple[int, int] | None) -> dict:
+    # Compile exactly the bytes fingerprinted by the caller. Dataclasses need
+    # a module registration while their types are built.
+    name = "_ant_rth_" + hashlib.sha256(source).hexdigest()
+    mod = ModuleType(name)
+    mod.__file__ = str(path)
+    prior = sys.modules.get(name)
+    sys.modules[name] = mod
+    try:
+        exec(compile(source, str(path), "exec"), mod.__dict__)
+        params = dict(contract)
+        latencies = params.pop("required_taker_latencies_ms")
+        specs = [mod.AblationSpec(mode=mode, lat_ms=lat, **params)
+                 for mode in ("TAKER_TAKER", "MAKER_ARCUS_TAKER_XYZ") for lat in latencies]
+        return mod.run_ablation(captures, specs, decision_bounds_ns=bounds)
+    finally:
+        if prior is None:
+            del sys.modules[name]
+        else:
+            sys.modules[name] = prior
 
 
 def run_rth_ant_cli(
@@ -621,12 +737,12 @@ def run_rth_ant_cli(
     prereg_manifest_path: Path | None = None,
     seal_receipt_path: Path | None = None,
 ) -> int:
-    mod = _load_ant_ablation_module(repo_root)
     manifest: dict[str, Any] | None = None
     verified_prereg_sha256: str | None = None
     if prereg_manifest_path is not None:
-        verified_prereg_sha256 = _sha256_file(prereg_manifest_path)
-        loaded = json.loads(prereg_manifest_path.read_text())
+        frozen_bytes = prereg_manifest_path.read_bytes()
+        verified_prereg_sha256 = hashlib.sha256(frozen_bytes).hexdigest()
+        loaded = json.loads(frozen_bytes)
         manifest = loaded if isinstance(loaded, dict) else {}
 
     seal_receipt: dict[str, Any] | None = None
@@ -634,27 +750,7 @@ def run_rth_ant_cli(
         loaded_seal = json.loads(seal_receipt_path.read_text())
         seal_receipt = loaded_seal if isinstance(loaded_seal, dict) else {}
 
-    gate_specs = []
-    for mode in ("TAKER_TAKER", "MAKER_ARCUS_TAKER_XYZ"):
-        for lat in REQUIRED_TAKER_LATS:
-            gate_specs.append(
-                mod.AblationSpec(
-                    arm_family="EXP-CRASH-A2B",
-                    mode=mode,
-                    lat_ms=lat,
-                    q_usd=500.0,
-                    entry_bp=10.0,
-                    persist_ms=100,
-                    post_trade_refresh_lock=True,
-                    allow_batch_add=True,
-                    floor_frac=0.25,
-                    scale_bps=2.0,
-                    convex_power=1.0,
-                    max_entry_bp=35.0,
-                    dd_brake_budget_usd=MAX_DRAWDOWN_BUDGET_USD,
-                )
-            )
-
+    declared = manifest.get("strategy_contract") if manifest else None
     decision_bounds_ns: tuple[int, int] | None = None
     if isinstance(manifest, dict):
         start_ms = manifest.get("decision_start_ms")
@@ -662,9 +758,18 @@ def run_rth_ant_cli(
         if _is_valid_ms(start_ms) and _is_valid_ms(end_ms) and 0 < start_ms < end_ms:
             decision_bounds_ns = (start_ms * NS_PER_MS, end_ms * NS_PER_MS)
 
-    raw = mod.run_ablation(capture_dirs, gate_specs, decision_bounds_ns=decision_bounds_ns)
+    engine_key, = FROZEN_ANT_ENGINE_FILES
+    path = repo_root / engine_key
+    try:
+        source = path.read_bytes()
+    except FileNotFoundError:
+        source = None
+    eng_digests = {engine_key: hashlib.sha256(source).hexdigest()} if source is not None else {}
+    qualified_engine = _contract_matches(declared) and _engine_hashes_match((manifest or {}).get("frozen_engine_sha256"), eng_digests)
+    raw = {}
+    if source is not None and (role == "selection_dev_dryrun" or qualified_engine):
+        raw = _run_pinned_replay(source, path, capture_dirs, declared if qualified_engine else ANT_STRATEGY_CONTRACT, decision_bounds_ns)
     seg_digests = _collect_segment_hashes(capture_dirs, seal_receipt)
-    eng_digests = _collect_engine_hashes(repo_root)
     report = evaluate_rth_ant_gate(
         raw,
         role=role,
@@ -709,7 +814,8 @@ def main() -> int:
     p_ant.add_argument("--seal-receipt", type=Path, default=None, help="Post-capture seal receipt JSON referencing prereg SHA-256")
     p_ant.add_argument("--output", type=Path, required=True)
 
-    p_rwa = sub.add_parser("w15-rwa", help="Evaluate W15+ Core RWA <= $20/M gate")
+    p_rwa = sub.add_parser("w15-rwa", help="Diagnose Core RWA cost or report formal admission status")
+    p_rwa.add_argument("--role", choices=("formal", "diagnostic"), default="formal")
     p_rwa.add_argument("--rwa-summary-json", type=Path, required=True)
     p_rwa.add_argument("--max-cost-per-million", type=float, default=20.0)
     p_rwa.add_argument("--output", type=Path, required=True)
@@ -728,12 +834,7 @@ def main() -> int:
             args.seal_receipt,
         )
     if args.command == "w15-rwa":
-        summary = json.loads(args.rwa_summary_json.read_text())
-        res = evaluate_w15_rwa_gate(summary, max_cost_per_million=args.max_cost_per_million)
-        res["input_json"] = str(args.rwa_summary_json)
-        args.output.write_text(json.dumps(res, indent=2) + "\n")
-        print(json.dumps({"gate": res["gate"], "verdict": res["verdict"], "arms": res["arms"]}, indent=2))
-        return 0 if res["verdict"] in ("GO_HEDGED", "GO_UNHEDGED_ONLY") else 1
+        return run_w15_rwa_cli(args.rwa_summary_json, args.output, args.role, args.max_cost_per_million)
     if args.command == "w17-crash-pause-verify":
         res = verify_w17_crash_pause_prereg(args.prereg, repo_root)
         print(json.dumps(res, indent=2))

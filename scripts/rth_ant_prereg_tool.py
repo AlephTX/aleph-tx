@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 try:
     from scripts.run_oos_validation_gate import (
+        ANT_STRATEGY_CONTRACT,
         FROZEN_ANT_ENGINE_FILES,
         TEN_HOURS_MS,
         _covered_us_rth_dates,
@@ -33,6 +34,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct CLI invocation
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from scripts.run_oos_validation_gate import (
+        ANT_STRATEGY_CONTRACT,
         FROZEN_ANT_ENGINE_FILES,
         TEN_HOURS_MS,
         _covered_us_rth_dates,
@@ -121,7 +123,7 @@ def create_prereg_manifest(
 
     manifest = {
         "schema": "aleph_tx_rth_ant_prereg_manifest_v1",
-        "classification": "monday_rth_oos",
+        "classification": "weekday_rth_diagnostic" if allow_non_monday else "monday_rth_oos",
         "market_session": "us_equities_rth",
         "require_monday": not allow_non_monday,
         "expected_rth_date_et": target_date.isoformat(),
@@ -131,19 +133,7 @@ def create_prereg_manifest(
         "decision_end_ms": decision_end_ms,
         "max_source_book_gap_ms": 300_000,
         "frozen_engine_sha256": engine_hashes,
-        "strategy_contract": {
-            "arm_family": "EXP-CRASH-A2B",
-            "q_usd": 500.0,
-            "entry_bp": 10.0,
-            "exit_bp": 0.0,
-            "max_entry_bp": 35.0,
-            "persist_ms": 100,
-            "post_trade_refresh_lock": True,
-            "ladder_levels": 2,
-            "ladder_convex_power": 1.0,
-            "dd_brake_budget_usd": 50.0,
-            "required_taker_latencies_ms": [100, 250, 500],
-        },
+        "strategy_contract": ANT_STRATEGY_CONTRACT,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -305,14 +295,12 @@ def main(argv: list[str] | None = None) -> int:
     p_pre.add_argument("--window-start-et", default="07:00", help="10h decision window start in ET (default 07:00 -> 17:00 ET)")
     p_pre.add_argument("--output", type=Path, required=True)
     p_pre.add_argument("--allow-non-monday", action="store_true")
-    p_pre.add_argument("--now-ms", type=int, default=None)
     p_pre.add_argument("--force", action="store_true")
 
     p_seal = sub.add_parser("seal", help="Seal completed capture directories against a frozen prereg manifest")
     p_seal.add_argument("--prereg-manifest", type=Path, required=True)
     p_seal.add_argument("--capture-dirs", nargs="+", type=Path, required=True)
     p_seal.add_argument("--output", type=Path, required=True)
-    p_seal.add_argument("--now-ms", type=int, default=None)
     p_seal.add_argument("--force", action="store_true")
 
     args = parser.parse_args(argv)
@@ -322,7 +310,6 @@ def main(argv: list[str] | None = None) -> int:
             window_start_et=args.window_start_et,
             output=args.output,
             allow_non_monday=args.allow_non_monday,
-            now_ms=args.now_ms,
             force=args.force,
         )
         print(json.dumps(res, indent=2))
@@ -332,7 +319,6 @@ def main(argv: list[str] | None = None) -> int:
             prereg_manifest_path=args.prereg_manifest,
             capture_dirs=args.capture_dirs,
             output=args.output,
-            now_ms=args.now_ms,
             force=args.force,
         )
         print(json.dumps(res, indent=2))
