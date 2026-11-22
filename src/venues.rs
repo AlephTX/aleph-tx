@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, str::FromStr};
 
 /// Versioned snapshot identifier for audited venue latency, fee, and quota semantics.
-pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-18.v1";
+pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-22.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +115,25 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
             venue_id: "lighter",
             liquidity_domain: "lighter",
             settlement_currency: "USDC",
+            tier: "plus",
+            asset_scope: All,
+            maker_post_only_delay_ms: 0,
+            non_post_only_limit_delay_ms: 300,
+            cancel_delay_ms: 300,
+            modify_delay_ms: 300,
+            taker_delay_ms: 300,
+            maker_fee_bps: dec("0.50"),
+            taker_fee_bps: dec("0.50"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/reference/account-types",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter",
+            liquidity_domain: "lighter",
+            settlement_currency: "USDC",
             tier: "premium",
             asset_scope: All,
             maker_post_only_delay_ms: 0,
@@ -153,15 +172,36 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
             venue_id: "lighter_robinhood",
             liquidity_domain: "lighter:robinhood",
             settlement_currency: "USDG",
+            tier: "plus",
+            asset_scope: All,
+            maker_post_only_delay_ms: 200,
+            non_post_only_limit_delay_ms: 300,
+            cancel_delay_ms: 200,
+            modify_delay_ms: 200,
+            taker_delay_ms: 300,
+            maker_fee_bps: dec("1.50"),
+            taker_fee_bps: dec("1.50"),
+            batch_quota_semantics: PerTransaction,
+            grouped_orders_semantics: ConditionalAttachedOnly,
+            scheduled_cancel_support: SdkDocumentedProbeRequired,
+            primary_source: "https://docs.lighter.xyz/developers/robinhood-chain/overview",
+        },
+        VenueExecutionCapability {
+            snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
+            venue_id: "lighter_robinhood",
+            liquidity_domain: "lighter:robinhood",
+            settlement_currency: "USDG",
             tier: "premium",
             asset_scope: All,
             maker_post_only_delay_ms: 0,
             non_post_only_limit_delay_ms: 200,
             cancel_delay_ms: 0,
             modify_delay_ms: 0,
-            taker_delay_ms: 200, // Conservative upper bound of RH Premium 200ms->150ms tier schedule
-            maker_fee_bps: dec("0.4"),
-            taker_fee_bps: dec("2.8"),
+            // Base RH Premium (<$1M 14d volume): 1.20/3.50 bps and 200ms taker delay,
+            // scaling to 0.84/2.45 bps and 150ms above $500M (never mainnet 0.4/2.8 bps).
+            taker_delay_ms: 200,
+            maker_fee_bps: dec("1.20"),
+            taker_fee_bps: dec("3.50"),
             batch_quota_semantics: PerTransaction,
             grouped_orders_semantics: ConditionalAttachedOnly,
             scheduled_cancel_support: SdkDocumentedProbeRequired,
@@ -186,6 +226,8 @@ pub fn audited_execution_capabilities() -> Vec<VenueExecutionCapability> {
             scheduled_cancel_support: ScheduledCancelSupport::Unsupported,
             primary_source: "arcus_v1_feetiers_20261117.json#sha256=0d608aa1",
         },
+        // Default Arcus RWA schedule (0.00 / 2.25 bps); markets with hasCustomFeeSchedule=true
+        // (e.g. ANT-USD at 0.00 / 1.12 bps) require per-market lookup via /v1/markets/feeSchedules.
         VenueExecutionCapability {
             snapshot_version: VENUE_CAPABILITY_SNAPSHOT_VERSION,
             venue_id: "arcus",
@@ -501,9 +543,12 @@ pub fn compute_hip3_execution_fees(
         !(growth_mode_enabled && is_verified_core_crypto_asset),
         "HIP-3 growth mode excludes verified core crypto assets"
     );
-    // Standard HIP-3 fee is 2x Hyperliquid base scaled by deployerFeeScale;
-    // Growth Mode reduces both fees and 14d tier volume credit by 90% (0.10x).
-    let scale_factor = Decimal::ONE + deployer_fee_scale;
+    // Above a 100% deployer fee scale, the protocol share rises to match the deployer share.
+    let scale_factor = if deployer_fee_scale < Decimal::ONE {
+        Decimal::ONE + deployer_fee_scale
+    } else {
+        Decimal::TWO * deployer_fee_scale
+    };
     let growth_factor = if growth_mode_enabled {
         dec("0.10")
     } else {
@@ -570,7 +615,30 @@ mod tests {
             .resolve_execution_capability("lighter_robinhood", "premium", "equity")
             .unwrap();
         assert_eq!(core_prem.taker_delay_ms, 140);
+        assert_eq!(core_prem.maker_fee_bps, dec("0.4"));
+        assert_eq!(core_prem.taker_fee_bps, dec("2.8"));
         assert_eq!(rh_prem.taker_delay_ms, 200);
+        assert_eq!(rh_prem.maker_fee_bps, dec("1.20"));
+        assert_eq!(rh_prem.taker_fee_bps, dec("3.50"));
+        assert_ne!(rh_prem.maker_fee_bps, core_prem.maker_fee_bps);
+        assert_ne!(rh_prem.taker_fee_bps, core_prem.taker_fee_bps);
+
+        let core_plus = registry
+            .resolve_execution_capability("lighter", "plus", "crypto")
+            .unwrap();
+        let rh_plus = registry
+            .resolve_execution_capability("lighter_robinhood", "plus", "equity")
+            .unwrap();
+        assert_eq!(core_plus.maker_post_only_delay_ms, 0);
+        assert_eq!(core_plus.cancel_delay_ms, 300);
+        assert_eq!(core_plus.taker_delay_ms, 300);
+        assert_eq!(core_plus.maker_fee_bps, dec("0.50"));
+        assert_eq!(core_plus.taker_fee_bps, dec("0.50"));
+        assert_eq!(rh_plus.maker_post_only_delay_ms, 200);
+        assert_eq!(rh_plus.cancel_delay_ms, 200);
+        assert_eq!(rh_plus.taker_delay_ms, 300);
+        assert_eq!(rh_plus.maker_fee_bps, dec("1.50"));
+        assert_eq!(rh_plus.taker_fee_bps, dec("1.50"));
         assert_eq!(
             core_prem.batch_quota_semantics,
             BatchQuotaSemantics::PerTransaction
@@ -645,6 +713,11 @@ mod tests {
         assert_eq!(regular.effective_maker_fee_bps, dec("3"));
         assert_eq!(regular.effective_taker_fee_bps, dec("9"));
         assert_eq!(regular.tier_volume_credit_weight, Decimal::ONE);
+
+        let high_scale =
+            compute_hip3_execution_fees(base_maker, base_taker, dec("2"), false, false).unwrap();
+        assert_eq!(high_scale.effective_maker_fee_bps, dec("6"));
+        assert_eq!(high_scale.effective_taker_fee_bps, dec("18"));
 
         let growth =
             compute_hip3_execution_fees(base_maker, base_taker, Decimal::ONE, true, false).unwrap();

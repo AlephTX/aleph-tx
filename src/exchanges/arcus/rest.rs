@@ -1,4 +1,7 @@
-use super::{Account, ArcusInfo, ArcusSigner, LimitOrder, Market, Network, Side, SignedRequest};
+use super::{
+    Account, ArcusInfo, ArcusSigner, CancelLease, LimitOrder, Market, Network,
+    ScheduledCancelReceipt, Side, SignedRequest,
+};
 use anyhow::{Context, Result, ensure};
 use reqwest::{RequestBuilder, StatusCode, Url};
 use rust_decimal::Decimal;
@@ -6,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// A submission receipt. An HTTP 202 confirms receipt by the gateway.
@@ -38,6 +41,23 @@ pub struct ArcusTrading {
     info: ArcusInfo,
     signer: ArcusSigner,
     last_timestamp: AtomicU64,
+    #[cfg(test)]
+    wall_clock_override: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+// An async timeout/cancellation drops the future without returning an error
+// through the normal path. Keep that outcome as unsafe as a transport error.
+struct CancelLeaseAttempt<'a> {
+    lease: &'a mut CancelLease,
+    confirmed: bool,
+}
+
+impl Drop for CancelLeaseAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            self.lease.invalidate();
+        }
+    }
 }
 
 impl ArcusTrading {
@@ -46,6 +66,8 @@ impl ArcusTrading {
             info: ArcusInfo::new(network)?,
             signer,
             last_timestamp: AtomicU64::new(0),
+            #[cfg(test)]
+            wall_clock_override: None,
         })
     }
 
@@ -81,12 +103,121 @@ impl ArcusTrading {
         self.submit(request).await
     }
 
+    /// One explicit renewal attempt. This starts no background task and never
+    /// submits/disarms orders. Failure invalidates local protection; the caller
+    /// must also supervise unresolved exposure and its durable recovery barrier.
+    pub async fn renew_cancel_lease(&self, lease: &mut CancelLease) -> Result<()> {
+        let mut attempt = CancelLeaseAttempt {
+            lease,
+            confirmed: false,
+        };
+        ensure!(
+            attempt.lease.matches_account(&self.signer.account),
+            "Arcus lease account mismatch"
+        );
+        let sent_mono = Instant::now();
+        let request = attempt
+            .lease
+            .begin_renewal(self.wall_clock_ns()?, sent_mono)?;
+        let (receipt, received_wall, received_mono) = self
+            .schedule_cancel_observed(request.market_id(), Some(request.deadline_us()))
+            .await?;
+        attempt
+            .lease
+            .confirm_renewal(&receipt, received_wall, received_mono)?;
+        attempt.confirmed = true;
+        Ok(())
+    }
+
+    /// Arm/refresh/disarm exactly one cancellation scope. No retry or automatic
+    /// disarm: uncertainty must stop new risk until protection is re-established.
+    /// Callers still reconcile orders and fills before releasing exposure.
+    pub async fn schedule_cancel(
+        &self,
+        market_id: Option<u16>,
+        deadline_us: Option<u64>,
+    ) -> Result<ScheduledCancelReceipt> {
+        let (receipt, _, _) = self
+            .schedule_cancel_observed(market_id, deadline_us)
+            .await?;
+        Ok(receipt)
+    }
+
+    async fn schedule_cancel_observed(
+        &self,
+        market_id: Option<u16>,
+        deadline_us: Option<u64>,
+    ) -> Result<(ScheduledCancelReceipt, u64, Instant)> {
+        let request = self
+            .signer
+            .schedule_cancel(market_id, deadline_us, self.timestamp()?)?;
+        let path = request.path;
+        let uncertain = |message| ExecutionError::Uncertain { path, message };
+        let response = self
+            .info
+            .client
+            .post(format!("{}{path}", self.info.base_url))
+            .query(&[("address", &self.signer.account.address)])
+            .header("X-API-Key", request.api_key)
+            .header("X-Timestamp", request.timestamp_ns.to_string())
+            .header("X-Signature", request.signature)
+            .json(&request.body)
+            .send()
+            .await
+            .map_err(|_| uncertain("schedule transport failed".into()))?;
+        let status = response.status();
+        if status == StatusCode::OK {
+            let receipt: ScheduledCancelReceipt = response
+                .json()
+                .await
+                .map_err(|_| uncertain("invalid schedule response".into()))?;
+            let received_mono = Instant::now();
+            let received_ns = self
+                .wall_clock_ns()
+                .map_err(|_| uncertain("local clock unavailable".into()))?;
+            receipt
+                .validate(&self.signer.account, market_id, deadline_us, received_ns)
+                .map_err(|_| uncertain("uncorrelated or expired schedule receipt".into()))?;
+            return Ok((receipt, received_ns, received_mono));
+        }
+        // DMS 429 is a documented quota/switch-cap rejection. It is not a
+        // successful renewal, and never cancels or extends an earlier lease.
+        if matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return Err(ExecutionError::Rejected {
+                path,
+                status,
+                message: "cancel schedule rejected".into(),
+            }
+            .into());
+        }
+        // In particular, an order-style 202 is not a confirmed DMS schedule.
+        Err(uncertain(format!("HTTP {status}")).into())
+    }
+
+    fn wall_clock_ns(&self) -> Result<u64> {
+        #[cfg(test)]
+        if let Some(clock) = &self.wall_clock_override {
+            return Ok(clock());
+        }
+        Ok(u64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        )?)
+    }
+
     fn timestamp(&self) -> Result<u64> {
-        let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
+        // Signing timestamps must advance even when the wall clock moves.
+        // Lease validation compares the raw clock with monotonic elapsed time.
+        let now = self.wall_clock_ns()?;
         let next = |last: u64| last.checked_add(1).map(|value| value.max(now));
         let previous = self
             .last_timestamp
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next)
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, next)
             .map_err(|_| anyhow::anyhow!("Arcus timestamp exhausted"))?;
         next(previous).context("Arcus timestamp exhausted")
     }
@@ -316,6 +447,8 @@ impl ArcusInfo {
 
 #[cfg(test)]
 mod tests {
+    mod cancel_lease_tests;
+    mod scheduled_cancel_tests;
     use super::*;
     use crate::exchanges::arcus::TimeInForce;
     use ed25519_dalek::{Signature, SigningKey, Verifier};

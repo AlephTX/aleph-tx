@@ -15,6 +15,8 @@
 //! Fill-first hedging follows the separation used in Hummingbot XEMM:
 //! https://hummingbot.org/strategies/v1-strategies/cross-exchange-market-making/
 
+pub mod durable;
+
 use anyhow::{Result, anyhow, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

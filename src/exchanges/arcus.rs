@@ -1,9 +1,13 @@
 //! Arcus perpetual-market data, order signing, and REST execution.
+mod cancel_lease;
 mod rest;
+mod scheduled_cancel;
 use anyhow::{Context, Result, ensure};
+pub use cancel_lease::{CancelLease, CancelLeasePolicy, CancelRenewal};
 use ed25519_dalek::{Signer, SigningKey};
 pub use rest::{ArcusTrading, ExecutionError, Fill, HistoryWindow, Order, OrderReceipt, Position};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+pub use scheduled_cancel::ScheduledCancelReceipt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -46,7 +50,7 @@ pub struct Market {
     pub min_order_notional: Decimal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TickTier {
     #[serde(with = "rust_decimal::serde::str")]
@@ -223,9 +227,8 @@ impl ArcusSigner {
             "Arcus market is not an online perpetual"
         );
         validate_client_id(order.client_id)?;
-        let p = units(order.price, market.tick_size)?;
+        let p = validate_price_tick(order.price, market.tick_size, &market.tick_tiers)?;
         let q = units(order.quantity, market.step_size)?;
-        market.validate_tier(order.price)?;
         ensure!(
             order.quantity >= market.min_order_size
                 && order.quantity <= market.max_order_size
@@ -435,26 +438,50 @@ fn units(value: Decimal, step: Decimal) -> Result<u64> {
         .context("Arcus tick or quantity overflow")
 }
 
-impl Market {
-    fn validate_tier(&self, price: Decimal) -> Result<()> {
-        let mut last = Decimal::ZERO;
-        for tier in &self.tick_tiers {
-            ensure!(
-                tier.up_to_price.is_none_or(|upper| upper > last),
-                "Invalid Arcus tick ladder"
-            );
-            if tier.up_to_price.is_none_or(|upper| price <= upper) {
-                units(price, tier.tick)?;
-                return Ok(());
-            }
-            last = tier.up_to_price.context("Invalid Arcus tick ladder")?;
-        }
+/// Validate base tick and optional ascending price-band tiers for an Arcus market.
+pub fn validate_tick_rules(tick_size: Decimal, tick_tiers: &[TickTier]) -> Result<()> {
+    ensure!(
+        tick_size > Decimal::ZERO,
+        "Arcus tick size must be positive"
+    );
+    let mut last = Decimal::ZERO;
+    let mut unbounded = false;
+    for tier in tick_tiers {
         ensure!(
-            self.tick_tiers.is_empty(),
-            "Price outside Arcus tick ladder"
+            !unbounded && tier.tick > Decimal::ZERO,
+            "Invalid Arcus tick ladder"
         );
-        Ok(())
+        if let Some(upper) = tier.up_to_price {
+            ensure!(upper > last, "Invalid Arcus tick ladder");
+            last = upper;
+        } else {
+            unbounded = true;
+        }
     }
+    Ok(())
+}
+
+/// Validate a price against Arcus base tick and any matching price-band tier.
+pub fn validate_price_tick(
+    price: Decimal,
+    tick_size: Decimal,
+    tick_tiers: &[TickTier],
+) -> Result<u64> {
+    let base_units = units(price, tick_size)?;
+    let mut last = Decimal::ZERO;
+    for tier in tick_tiers {
+        ensure!(
+            tier.up_to_price.is_none_or(|upper| upper > last),
+            "Invalid Arcus tick ladder"
+        );
+        if tier.up_to_price.is_none_or(|upper| price <= upper) {
+            units(price, tier.tick)?;
+            return Ok(base_units);
+        }
+        last = tier.up_to_price.context("Invalid Arcus tick ladder")?;
+    }
+    ensure!(tick_tiers.is_empty(), "Price outside Arcus tick ladder");
+    Ok(base_units)
 }
 
 #[cfg(test)]

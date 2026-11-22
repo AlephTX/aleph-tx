@@ -676,7 +676,14 @@ pub struct QuoteHysteresisConfig {
     pub enforce_reduce_only_on_reducing_side: bool,
     /// When `true`, prevent one-sided adverse retreats, active re-entry cooldowns, and
     /// empty-side post-cooldown re-entries from disabling churn-deferral guards on the
-    /// surviving opposite side (never suppresses safety/bound-breach/adverse-retreat cancels, `S12-1`).
+    /// surviving opposite side (never suppresses safety/bound-breach/adverse-retreat cancels, `S12-1`/`S13-1`).
+    ///
+    /// **Empirically falsified (`S14-2`, 2026-11-19)**: even with `S13-1` directional cancel
+    /// safety, Codex's 19-window × 3-horizon (`t20/t30/t50`) matrix showed `true` is dominated
+    /// by `false` in 8/9 `(cohort, horizon)` cells (1 tied), increased total cancels in `monthly`
+    /// and `w07`, and degraded 30s markout (`-1.03 -> -1.72 bp` on `monthly t50`) by delaying
+    /// passive-side repricing/inventory unloading. Keep `false` (default) for new configs; field
+    /// retained only for historical replay reproducibility.
     #[serde(default)]
     pub isolate_cooldown_cancel_churn: bool,
 }
