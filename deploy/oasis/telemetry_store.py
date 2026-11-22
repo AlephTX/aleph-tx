@@ -500,6 +500,13 @@ class TelemetryStore:
         closes = result["winning"] + result["losing"]
         result["win_rate"] = result["winning"] / closes if closes else None
         result["net_bps"] = result["net_pnl"] / result["volume"] * 1e4 if result["volume"] > 0 else None
+        # This window can span multiple sessions. A missing primary ledger
+        # invalidates the PnL aggregate even when other sessions have fills.
+        if self.db.execute(
+            "SELECT 1 FROM sessions WHERE exchange='arcus_xyz_basis' AND last_ms>=?"
+            + (" AND session_id=?" if session_id is not None else "") + " LIMIT 1", args
+        ).fetchone():
+            result.update(realized=None, fees=None, net_pnl=None, net_bps=None, win_rate=None)
         return result
 
     def _hedge_sources(self, session_id):
@@ -628,8 +635,14 @@ class TelemetryStore:
         if fee["unknown"]:
             missing.append("hedge_fee_source")
         missing.append("funding")
+        primary_missing = session["exchange"] == "arcus_xyz_basis"
+        if primary_missing:
+            missing.append("arcus_fill_ledger")
+            lighter.update(realized="unknown", fees="unknown", unrealized="unknown", quality="unknown")
+            net = total = unrealized = None
         start_equity = snapshot["session_start_equity"] if snapshot else 0.0
         return {
+            **({"realized": None, "fees": None} if primary_missing else {}),
             "unrealized": unrealized, "net_pnl": net, "total_pnl": total,
             "hedge_unrealized": hedge_unrealized, "hedge_net_pnl": hedge_net,
             "hedge_total_pnl": hedge_total,

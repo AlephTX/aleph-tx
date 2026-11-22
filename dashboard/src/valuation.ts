@@ -73,6 +73,7 @@ const FUNDING_NOTE = '资金费未计入'
 const MISSING: Record<string, string> = {
   mark_price: '无有效标记价，浮动盈亏未知',
   mark_time: '标记价观测时间未知，仅知快照写入时间',
+  arcus_fill_ledger: '缺少 Arcus 主腿成交账本，合计盈亏未知',
   lighter_actual_fee: 'Lighter 手续费按成交声明费率估算，非实际扣款',
   lighter_fee_rate: '部分 Lighter 成交费率缺失或无效，手续费未知',
   lighter_fee_source: '旧记录 Lighter 手续费来源未知',

@@ -92,6 +92,21 @@ class VerifyVenueReadinessTests(unittest.TestCase):
         self.assertTrue(rep["readiness"]["lighter_mm_ready_flat"])
         self.assertEqual(rep["readiness"]["error_venues"], ["BULK"])
 
+    def test_business_errors_and_missing_sizes_never_report_flat(self):
+        cfg = {"ALEPH_MONITOR_HL_ADDRESS": "0x" + "1"*40, "ALEPH_MONITOR_ARCUS_ADDRESS": "0x" + "2"*40}
+        for bad in ("orders", "size"):
+            def request(url, body):
+                if "positions?" in url:
+                    return {"positions": [{"size": "nan"}] if bad == "size" else []}
+                if body and body.get("type") == "clearinghouseState":
+                    return {"marginSummary":{"accountValue":"10"}, "withdrawable":"10",
+                            "assetPositions":[{"position":{}}] if bad == "size" else []}
+                return {"status":"error"} if bad == "orders" else []
+            result = evaluate_readiness(cfg,requester=request)
+            self.assertFalse(result["readiness"]["arcus_xyz_basis_ready_flat"])
+            self.assertEqual(result["venues"]["TradeXYZ"]["status"], "error")
+            self.assertEqual(result["venues"]["Arcus"]["status"], "error")
+
     def test_cli_refuses_network_without_live_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             mon = Path(tmp) / "monitor.env"

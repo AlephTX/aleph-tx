@@ -73,8 +73,8 @@ export interface Session {
   stopped_ms: number | null
   position: number
   avg_cost: number
-  realized: number
-  fees: number
+  realized: number | null
+  fees: number | null
   volume: number
   fills: number
   buy_volume: number
@@ -83,7 +83,7 @@ export interface Session {
   rejected: number
   /** null when an open position has no valid mark. */
   unrealized: number | null
-  net_pnl: number
+  net_pnl: number | null
   /** null when an open position has no valid mark. */
   total_pnl: number | null
   equity_change: number | null
@@ -219,14 +219,14 @@ export interface Snapshot {
 export interface Window {
   fills: number
   volume: number
-  realized: number
-  fees: number
+  realized: number | null
+  fees: number | null
   rebates: number
   buy_volume: number
   sell_volume: number
   winning: number
   losing: number
-  net_pnl: number
+  net_pnl: number | null
   win_rate: number | null
   net_bps: number | null
 }

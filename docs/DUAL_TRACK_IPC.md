@@ -54,11 +54,13 @@ The Hyperliquid Core (`1`), Lighter Core (`2`), Arcus (`7`), Lighter Robinhood (
   older nonces/offsets are ignored; any sequence gap, timestamp regression, or
   crossed book clears the reconstructed state and forces a WebSocket reconnect
   from a fresh snapshot.
-- **Disconnect and one-sided invalidation**: Startup, WebSocket disconnects,
-  and one-sided books immediately invalidate both `aleph-matrix` (`InvalidateBBO`)
-  and `aleph-depth` (`InvalidateDepth`, zeroing `TimestampNs`, `Bids`, and
-  `Asks` under the seqlock) so stale pre-disconnect depth weights are never
-  readable during reconnection.
+- Startup and WebSocket disconnect invalidate both `aleph-matrix` and
+  `aleph-depth`. Depth invalidation clears `TimestampNs`, `Bids` and
+  `Asks` under the seqlock.
+- Hyperliquid checks each output's last source timestamp when invalidating a
+  one-sided or crossed `l2Book`. An L2 update newer than depth and older
+  than the latest `bbo` clears depth and preserves that BBO. An invalid
+  `bbo` update clears only its own output.
 
 ## V2 event ABI
 

@@ -45,7 +45,7 @@ export interface SessionEfficiency {
   grossVolume: number
   totalFills: number
   /** Realized cash PnL net of booked/estimated fees (excludes unrealized & funding). */
-  realizedCombinedNet: number
+  realizedCombinedNet: number | null
   /** Marked total PnL across both legs; null when an open leg lacks a valid mark. */
   markedCombinedPnl: number | null
   /** Lighter net realized return in bps of Lighter turnover; null when volume == 0. */
@@ -67,14 +67,14 @@ export function sessionEfficiency(s: Session | null | undefined): SessionEfficie
   const hedgeVolume = Math.max(0, s.hedge_volume || 0)
   const grossVolume = lighterVolume + hedgeVolume
   const totalFills = (s.fills || 0) + (s.hedge_fills || 0)
-  const realizedCombinedNet = s.net_pnl + (s.hedge_account ? s.hedge_net_pnl : 0)
+  const realizedCombinedNet = s.net_pnl == null ? null : s.net_pnl + (s.hedge_account ? s.hedge_net_pnl : 0)
   const markedCombinedPnl = s.hedge_account ? s.combined_pnl : s.total_pnl
-  const lighterRealizedBps = lighterVolume > 0 ? (s.net_pnl / lighterVolume) * 10_000 : null
-  const combinedRealizedBps = grossVolume > 0 ? (realizedCombinedNet / grossVolume) * 10_000 : null
+  const lighterRealizedBps = s.net_pnl != null && lighterVolume > 0 ? (s.net_pnl / lighterVolume) * 10_000 : null
+  const combinedRealizedBps = realizedCombinedNet != null && grossVolume > 0 ? (realizedCombinedNet / grossVolume) * 10_000 : null
   const costUsdPerMillionGross =
-    grossVolume > 0 ? (-realizedCombinedNet / grossVolume) * 1_000_000 : null
+    realizedCombinedNet != null && grossVolume > 0 ? (-realizedCombinedNet / grossVolume) * 1_000_000 : null
   const volumePerDollarLoss =
-    realizedCombinedNet < -EPS && grossVolume > 0
+    realizedCombinedNet != null && realizedCombinedNet < -EPS && grossVolume > 0
       ? grossVolume / Math.abs(realizedCombinedNet)
       : null
   const netExposure = s.position + (s.hedge_account ? s.hedge_position : 0)

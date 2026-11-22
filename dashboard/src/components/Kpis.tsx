@@ -324,11 +324,11 @@ export function SessionEfficiencyCard({ summary }: { summary: SummaryResp | unde
           value={
             eff?.volumePerDollarLoss != null
               ? compactUsd(eff.volumePerDollarLoss)
-              : eff && eff.grossVolume > 0 && eff.realizedCombinedNet >= 0
+              : eff && eff.grossVolume > 0 && eff.realizedCombinedNet != null && eff.realizedCombinedNet >= 0
                 ? '净盈利 / 零损耗'
                 : '—'
           }
-          valueClass={eff && eff.grossVolume > 0 && eff.realizedCombinedNet >= 0 ? 'text-up' : ''}
+          valueClass={eff && eff.grossVolume > 0 && eff.realizedCombinedNet != null && eff.realizedCombinedNet >= 0 ? 'text-up' : ''}
         />
         <WindowRow
           label="双腿净敞口"

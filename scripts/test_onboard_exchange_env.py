@@ -62,6 +62,42 @@ class OnboardExchangeEnvTests(unittest.TestCase):
             for secret_frag in (arc_hex, hl_hex, lgt_hex, "ext-only-one", "not_printed_bp_value"):
                 self.assertNotIn(secret_frag, proc.stdout)
 
+    def test_audit_accepts_solana_base58_bulk_stark_felt252_and_decouples_monitor_env(self) -> None:
+        bulk_pub = "3" * 44
+        bulk_agent = "4" * 44
+        bulk_priv = "5" * 88
+        stark_priv = "0x" + "a" * 63
+        stark_pub = "0x" + "b" * 63
+        env = {
+            "BULK_ACCOUNT_PUBKEY": bulk_pub,
+            "BULK_AGENT_PUBKEY": bulk_agent,
+            "BULK_PRIVATE_KEY": bulk_priv,
+            "BULK_API_URL": "https://exchange-api.example.test",
+            "EXTENDED_API_KEY": "synth-ext-api-key",
+            "EXTENDED_STARK_PRIVATE_KEY": stark_priv,
+            "EXTENDED_STARK_PUBLIC_KEY": stark_pub,
+        }
+        rep = audit_env_dict(env)
+        self.assertEqual(rep["venues"]["bulk"]["status"], "ready")
+        self.assertEqual(rep["venues"]["extended"]["status"], "ready")
+        self.assertEqual(rep["summary"]["invalid"], [])
+        self.assertTrue(rep["split_eligible"]["monitor.env"])
+
+        # Zero Stark key must still be rejected.
+        rep_zero = audit_env_dict({
+            "EXTENDED_API_KEY": "synth-ext-api-key",
+            "EXTENDED_STARK_PRIVATE_KEY": "0x" + "0" * 63,
+        })
+        self.assertEqual(rep_zero["venues"]["extended"]["status"], "invalid")
+
+        # An unrelated invalid private key must not block public monitor.env split eligibility.
+        rep_decoupled = audit_env_dict({
+            "BULK_ACCOUNT_PUBKEY": bulk_pub,
+            "BULK_PRIVATE_KEY": "not-valid-key",
+        })
+        self.assertEqual(rep_decoupled["venues"]["bulk"]["status"], "invalid")
+        self.assertTrue(rep_decoupled["split_eligible"]["monitor.env"])
+
     def test_split_preserves_existing_dir_mode_and_supports_0640(self) -> None:
         priv = "PRIVATE_" + "KEY"
         with tempfile.TemporaryDirectory() as tmp:

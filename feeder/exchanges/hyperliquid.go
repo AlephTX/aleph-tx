@@ -258,27 +258,18 @@ func (h *Hyperliquid) handleL2Book(
 		return nil
 	}
 
-	rawBids := book.Levels[0]
-	rawAsks := book.Levels[1]
-	if len(rawBids) == 0 || len(rawAsks) == 0 {
-		h.invalidateTarget(target)
-		if bboFresh {
-			lastBboPub[target] = book.Time
-		}
-		if depthFresh {
-			lastDepthPub[target] = book.Time
-		}
-		return nil
-	}
-
-	bids, bidCount, bidOK := parseHyperliquidDepth(rawBids, true)
-	asks, askCount, askOK := parseHyperliquidDepth(rawAsks, false)
+	bids, bidCount, bidOK := parseHyperliquidDepth(book.Levels[0], true)
+	asks, askCount, askOK := parseHyperliquidDepth(book.Levels[1], false)
 	if !bidOK || !askOK || bidCount == 0 || askCount == 0 || bids[0].Price >= asks[0].Price {
-		h.invalidateTarget(target)
+		// The bbo channel may have already published a newer top of book.
 		if bboFresh {
+			h.invalidateBBO(target)
 			lastBboPub[target] = book.Time
 		}
 		if depthFresh {
+			if h.depthWriter != nil {
+				h.depthWriter.InvalidateDepth(target.symbolID, target.exchangeID)
+			}
 			lastDepthPub[target] = book.Time
 		}
 		return nil

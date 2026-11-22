@@ -2,6 +2,7 @@ package exchanges
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -272,6 +273,39 @@ func TestHyperliquidWritesTop5DepthAndHandlesBBOInterleaving(t *testing.T) {
 		t.Fatalf("newer l2Book did not update depth: ok=%v %+v", ok, dSnapAfter)
 	}
 
+	for _, tc := range []struct {
+		name     string
+		levels   string
+		badTime  string
+		nextTime string
+	}{
+		{"one-sided", `[[],[{"px":"145.10","sz":"1.0"}]]`, "1794712726150", "1794712726160"},
+		{"crossed", `[[{"px":"145.20","sz":"1.0"}],[{"px":"145.10","sz":"1.0"}]]`, "1794712726170", "1794712726180"},
+	} {
+		t.Run(tc.name+" delayed L2", func(t *testing.T) {
+			invalid := fmt.Sprintf(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":%s,"levels":%s}}`, tc.badTime, tc.levels)
+			if err := hl.handleMessageWithDepth([]byte(invalid), now, lastBbo, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if snap, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); !ok || snap.TimestampNs != bSnap.TimestampNs {
+				t.Fatal("delayed invalid L2 erased the newer BBO")
+			}
+			if err := hl.handleMessageWithDepth(olderL2, now, lastBbo, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); ok {
+				t.Fatal("invalid L2 did not clear depth or older L2 restored it")
+			}
+			fresh := strings.Replace(string(olderL2), "1794712726100", tc.nextTime, 1)
+			if err := hl.handleMessageWithDepth([]byte(fresh), now, lastBbo, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); !ok {
+				t.Fatal("valid newer L2 did not restore depth")
+			}
+		})
+	}
+
 	// 4. Null side or crossed BBO in bbo channel invalidates matrix BBO safely without wiping depth.
 	nullBbo := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726300,"bbo":[null,{"px":"145.10","sz":"1.0","n":1}]}}`)
 	if err := hl.handleMessageWithDepth(nullBbo, now, lastBbo, lastDepth); err != nil {
@@ -295,6 +329,12 @@ func TestHyperliquidWritesTop5DepthAndHandlesBBOInterleaving(t *testing.T) {
 	}
 
 	// 5. Crossed l2Book invalidates both BBO and depth.
+	if err := hl.handleMessageWithDepth([]byte(strings.Replace(string(bboMsg), "1794712726200", "1794712726375", 1)), now, lastBbo, lastDepth); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); !ok {
+		t.Fatal("valid BBO did not restore the matrix")
+	}
 	crossedL2 := []byte(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1794712726400,"levels":[
 		[{"px":"145.20","sz":"1.0"}],
 		[{"px":"145.10","sz":"1.0"}]
@@ -304,6 +344,9 @@ func TestHyperliquidWritesTop5DepthAndHandlesBBOInterleaving(t *testing.T) {
 	}
 	if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); ok {
 		t.Fatal("crossed l2Book left stale depth readable")
+	}
+	if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); ok {
+		t.Fatal("crossed l2Book left older BBO readable")
 	}
 }
 

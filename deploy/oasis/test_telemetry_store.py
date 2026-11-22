@@ -166,6 +166,20 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(order["status"], "partial")
         self.assertEqual(order["filled"], 0.5)
 
+    def test_basis_hedge_roundtrip_does_not_imply_combined_pnl(self):
+        self.write({"type": "session", "ts_ms": 1000, "exchange": "arcus_xyz_basis"},
+                   *[{"type": "hedge_fill", "ts_ms": ts, "side": side, "size": 1, "price": price,
+                      "client_order_id": str(ts), "price_source": "fill", "fee": 0}
+                     for ts, side, price in [(1100, "buy", 100), (1200, "sell", 105)]])
+        self.store.ingest()
+        summary = self.store.summary(now_ms=2000)
+        session = summary["session"]
+        self.assertEqual(session["hedge_net_pnl"], 5)
+        for field in ("combined_pnl", "total_pnl", "realized", "fees", "net_pnl"):
+            self.assertIsNone(session[field])
+        self.assertIn("arcus_fill_ledger", session["valuation"]["missing"])
+        self.assertIsNone(summary["windows"]["today"]["net_pnl"])
+
     def test_hedge_fills_track_a_separate_leg_and_dedupe_by_cloid(self):
         hedge = lambda ts, side, price, size, cloid: {
             "type": "hedge_fill", "ts_ms": ts, "venue": "hyperliquid", "client_order_id": cloid,
@@ -974,6 +988,32 @@ class MultiSessionAndMarketsTest(unittest.TestCase):
             self.assertIn("ALEPH_MONITOR_CONTROL_TOKEN=<redacted>", proc.stdout)
             # dry-run must leave dst untouched
             self.assertIn(tok, dst.read_text(encoding="utf-8"))
+
+    def test_tmpfiles_leaves_telemetry_expiry_to_ingest_offsets(self):
+        config = Path(__file__).with_name("aleph-tx-telemetry.conf").read_text().splitlines()
+        entries = [line.split() for line in config if line.startswith("d /var/lib/aleph-tx-telemetry ")]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0][5], "-")
+
+    def test_installer_requires_authoritative_unit_state(self):
+        import os
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "systemctl"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$PROPERTY_REPLY"\nexit "$PROPERTY_RC"\n')
+            fake.chmod(0o700)
+            for rc, props, allowed in [
+                (0, "LoadState=loaded\nActiveState=inactive", True),
+                (4, "LoadState=not-found\nActiveState=inactive", True),
+                (0, "ActiveState=active\nLoadState=loaded", False),
+                (1, "", False), (0, "", False),
+                (1, "LoadState=loaded\nActiveState=inactive", False),
+            ]:
+                env = {**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"],
+                       "PROPERTY_RC": str(rc), "PROPERTY_REPLY": props}
+                result = subprocess.run(["bash", str(Path(__file__).with_name("check-stopped-units.sh")), "synthetic"],
+                                        env=env, capture_output=True)
+                self.assertEqual(result.returncode == 0, allowed, (rc,props))
 
     def test_prune_telemetry_dir_verifies_ingest_offsets_before_unlink(self):
         import os

@@ -77,17 +77,43 @@ def extract_public_monitor_config(
     raise ValueError("one of --monitor-env or --env is required")
 
 
+def _rows(value: Any) -> list[dict]:
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError("expected venue record list")
+    return value
+
+
+def _required_number(record: dict, field: str) -> Decimal:
+    value = _dec_or_none(record.get(field))
+    if value is None:
+        raise ValueError(f"missing or invalid {field}")
+    return value
+
+
+def _response(value: Any) -> dict:
+    if not isinstance(value, dict) or value.get("error") or value.get("status") in ("err", "error", "failed"):
+        raise ValueError("venue returned an invalid response")
+    return value
+
+
 def _probe_lighter(index: str, base_url: str, req: JsonRequester) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9]{1,19}", index) or not (0 < int(index) <= 2**63 - 1):
         raise ValueError("invalid Lighter account index")
     data = req(f"{base_url.rstrip('/')}/api/v1/account?by=index&value={index}", None)
     if not isinstance(data, dict) or data.get("code") != 200:
         raise ValueError(f"Lighter account query code={data.get('code') if isinstance(data, dict) else 'invalid'}")
-    acct = next(a for a in data.get("accounts") or [] if a.get("index") == int(index))
-    non_zero_pos = [p for p in acct.get("positions") or [] if (_dec_or_none(p.get("position")) or Decimal(0)) != 0]
-    collateral = _dec_or_none(acct.get("collateral"))
-    avail = _dec_or_none(acct.get("available_balance"))
-    open_orders = sum(int(p.get("open_order_count") or 0) for p in acct.get("positions") or [])
+    matches = [a for a in _rows(data.get("accounts")) if a.get("index") == int(index)]
+    if len(matches) != 1:
+        raise ValueError("expected exactly one matching account")
+    acct = matches[0]
+    positions = _rows(acct.get("positions"))
+    non_zero_pos = [p for p in positions if _required_number(p, "position") != 0]
+    collateral = _required_number(acct, "collateral")
+    avail = _required_number(acct, "available_balance")
+    counts = [_required_number(p, "open_order_count") for p in positions]
+    if any(c < 0 or c != int(c) for c in counts):
+        raise ValueError("invalid open order count")
+    open_orders = sum(map(int, counts))
     return {
         "configured": True,
         "status": "ok_flat" if (not non_zero_pos and open_orders == 0) else "ok_open_state",
@@ -102,18 +128,16 @@ def _probe_hyperliquid_dex(address: str, dex: str, req: JsonRequester, *, includ
     if not EVM_ADDR_RE.fullmatch(address):
         raise ValueError("invalid EVM address")
     state = req("https://api.hyperliquid.xyz/info", {"type": "clearinghouseState", "user": address, "dex": dex})
-    margin = (state or {}).get("marginSummary") or {}
-    acct_val = _dec_or_none(margin.get("accountValue"))
-    withdrawable = _dec_or_none((state or {}).get("withdrawable"))
-    positions = [
-        item for item in (state or {}).get("assetPositions") or []
-        if (_dec_or_none((item.get("position") or {}).get("szi")) or Decimal(0)) != 0
-    ]
+    state = _response(state)
+    acct_val = _required_number(_response(state.get("marginSummary")), "accountValue")
+    withdrawable = _required_number(state, "withdrawable")
+    positions = [item for item in _rows(state.get("assetPositions"))
+                 if _required_number(_response(item.get("position")), "szi") != 0]
     orders_payload: dict[str, Any] = {"type": "frontendOpenOrders", "user": address}
     if dex:
         orders_payload["dex"] = dex
     open_orders = req("https://api.hyperliquid.xyz/info", orders_payload)
-    open_cnt = len(open_orders) if isinstance(open_orders, list) else 0
+    open_cnt = len(_rows(open_orders))
     out: dict[str, Any] = {
         "configured": True,
         "status": "ok_flat" if (not positions and open_cnt == 0) else "ok_open_state",
@@ -141,19 +165,12 @@ def _probe_arcus(address: str, index: str, req: JsonRequester) -> dict[str, Any]
         raise ValueError("invalid Arcus account index")
     query = urlencode({"address": address.lower(), "accountIndex": index})
     pos_data = req(f"https://api.arcus.xyz/v1/positions?{query}", None)
-    if not isinstance(pos_data, dict) or "positions" not in pos_data:
-        raise ValueError(str(pos_data.get("error", "missing Arcus positions")) if isinstance(pos_data, dict) else "invalid Arcus positions response")
-    raw_pos = pos_data["positions"]
-    items = raw_pos.values() if isinstance(raw_pos, dict) else raw_pos
-    non_zero_pos = [it for it in items if (_dec_or_none(it.get("size")) or Decimal(0)) != 0]
-
+    raw_pos = _response(pos_data).get("positions")
+    items = _rows(list(raw_pos.values()) if isinstance(raw_pos, dict) else raw_pos)
+    non_zero_pos = [it for it in items if _required_number(it, "size") != 0]
     orders_data = req(f"https://api.arcus.xyz/v1/openOrders?{query}", None)
-    if isinstance(orders_data, dict) and isinstance(orders_data.get("orders"), list):
-        open_cnt = len(orders_data["orders"])
-    elif isinstance(orders_data, list):
-        open_cnt = len(orders_data)
-    else:
-        open_cnt = 0
+    orders = _response(orders_data).get("orders") if isinstance(orders_data, dict) else orders_data
+    open_cnt = len(_rows(orders))
     return {
         "configured": True,
         "status": "ok_flat" if (not non_zero_pos and open_cnt == 0) else "ok_open_state",
@@ -169,16 +186,13 @@ def _probe_bulk(pubkey: str, req: JsonRequester) -> dict[str, Any]:
     entries = data if isinstance(data, list) else [data]
     pos_cnt = 0
     open_cnt = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        acct = entry.get("fullAccount") if isinstance(entry.get("fullAccount"), dict) else entry
-        for it in acct.get("positions") or []:
-            if (_dec_or_none(it.get("size")) or Decimal(0)) != 0:
-                pos_cnt += 1
-        orders = acct.get("openOrders")
-        if isinstance(orders, list):
-            open_cnt += len(orders)
+    if not entries:
+        raise ValueError("missing BULK account")
+    for entry in _rows(entries):
+        entry = _response(entry)
+        acct = _response(entry.get("fullAccount", entry))
+        pos_cnt += sum(_required_number(it, "size") != 0 for it in _rows(acct.get("positions")))
+        open_cnt += len(_rows(acct.get("openOrders")))
     return {
         "configured": True,
         "status": "ok_flat" if (pos_cnt == 0 and open_cnt == 0) else "ok_open_state",

@@ -24,6 +24,15 @@ const cost = costSummary as unknown as SummaryResp
 const legacy = legacySummary as unknown as SummaryResp
 
 describe('strategy analytics & guard invariants', () => {
+  it('propagates the missing Arcus ledger through combined cost and efficiency', () => {
+    const session = { ...cost.session, exchange: 'arcus_xyz_basis', net_pnl: null, combined_pnl: null } as Session
+    const eff = sessionEfficiency(session)!
+    expect(eff.realizedCombinedNet).toBeNull()
+    expect(eff.markedCombinedPnl).toBeNull()
+    expect(eff.costUsdPerMillionGross).toBeNull()
+    expect(eff.volumePerDollarLoss).toBeNull()
+  })
+
   it('keeps realized combined PnL distinct from unmarked combined_pnl and computes $/1M cost', () => {
     const base = cost.session as Session
     const eff = sessionEfficiency(base)
@@ -33,7 +42,7 @@ describe('strategy analytics & guard invariants', () => {
     // Unmarked open hedge leg keeps markedCombinedPnl null (never 0).
     expect(eff.markedCombinedPnl).toBeNull()
     // Realized cashflow across legs remains exact and finite.
-    expect(eff.realizedCombinedNet).toBeCloseTo(base.net_pnl + base.hedge_net_pnl, 8)
+    expect(eff.realizedCombinedNet).toBeCloseTo(base.net_pnl! + base.hedge_net_pnl, 8)
 
     // Turnover efficiency check: -$100 realized net on $50M gross turnover => +$2.00 / $1M cost, $500k / $1 loss.
     const turnoverSession: Session = {

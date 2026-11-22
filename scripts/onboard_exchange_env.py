@@ -30,6 +30,8 @@ RE_EVM_ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 RE_HEX32 = re.compile(r"(?:0x)?[0-9a-fA-F]{64}")
 RE_HEX40 = re.compile(r"(?:0x)?[0-9a-fA-F]{80}")
 RE_BASE58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+RE_SOLANA_KEY = re.compile(r"[1-9A-HJ-NP-Za-km-z]{43,90}")
+RE_STARK_HEX = re.compile(r"(?:0x)?[0-9a-fA-F]{1,64}")
 RE_INT = re.compile(r"[0-9]{1,20}")
 
 ARCUS_ENV_WHITELIST = (
@@ -139,7 +141,13 @@ VENUE_SPECS: tuple[VenueSpec, ...] = (
     VenueSpec(
         name="bulk",
         required=(("BULK_ACCOUNT_PUBKEY", "BULK_PUBKEY"),),
-        optional=("BULK_PRIVATE_KEY", "BULK_API_PRIVATE_KEY", "BULK_SIGNER_PRIVATE_KEY"),
+        optional=(
+            "BULK_PRIVATE_KEY",
+            "BULK_API_PRIVATE_KEY",
+            "BULK_SIGNER_PRIVATE_KEY",
+            "BULK_AGENT_PUBKEY",
+            "BULK_API_URL",
+        ),
         prefixes=("BULK_",),
     ),
     VenueSpec(
@@ -148,7 +156,12 @@ VENUE_SPECS: tuple[VenueSpec, ...] = (
             ("EXTENDED_API_KEY",),
             ("EXTENDED_STARK_PRIVATE_KEY",),
         ),
-        optional=("EXTENDED_PUBLIC_KEY", "EXTENDED_VAULT_ID", "EXTENDED_ACCOUNT_ADDRESS"),
+        optional=(
+            "EXTENDED_PUBLIC_KEY",
+            "EXTENDED_STARK_PUBLIC_KEY",
+            "EXTENDED_VAULT_ID",
+            "EXTENDED_ACCOUNT_ADDRESS",
+        ),
         prefixes=("EXTENDED_",),
     ),
     VenueSpec(
@@ -258,16 +271,29 @@ def _valid_value(key: str, val: str) -> bool:
     if key in (
         "ARCUS_API_PRIVATE_KEY",
         "HYPERLIQUID_AGENT_PRIVATE_KEY",
-        "EXTENDED_STARK_PRIVATE_KEY",
-        "EDGEX_STARK_PRIVATE_KEY",
         "EDGEX_L2_PRIVATE_KEY",
-        "ZEROONE_PRIVATE_KEY",
-        "O1_PRIVATE_KEY",
+    ):
+        return RE_HEX32.fullmatch(val) is not None
+    if key in (
+        "EXTENDED_STARK_PRIVATE_KEY",
+        "EXTENDED_STARK_PUBLIC_KEY",
+        "EDGEX_STARK_PRIVATE_KEY",
+    ):
+        return (
+            RE_STARK_HEX.fullmatch(val) is not None
+            and int(val[2:] if val.startswith(("0x", "0X")) else val, 16) > 0
+        )
+    if key in (
         "BULK_PRIVATE_KEY",
         "BULK_API_PRIVATE_KEY",
         "BULK_SIGNER_PRIVATE_KEY",
+        "ZEROONE_PRIVATE_KEY",
+        "O1_PRIVATE_KEY",
     ):
-        return RE_HEX32.fullmatch(val) is not None
+        return (
+            RE_HEX32.fullmatch(val) is not None
+            or RE_SOLANA_KEY.fullmatch(val) is not None
+        )
     if key in (
         "LIGHTER_PRIVATE_KEY",
         "API_KEY_PRIVATE_KEY",
@@ -284,6 +310,7 @@ def _valid_value(key: str, val: str) -> bool:
     if key in (
         "BULK_ACCOUNT_PUBKEY",
         "BULK_PUBKEY",
+        "BULK_AGENT_PUBKEY",
         "ZEROONE_ACCOUNT_PUBKEY",
         "ZEROONE_PUBKEY",
         "O1_PUBLIC_KEY",
@@ -368,10 +395,10 @@ def audit_env_dict(env: dict[str, str], duplicates: list[str] | None = None, *, 
     arcus_ok = venues_report["arcus"]["status"] == "ready"
     hl_ok = venues_report["hyperliquid"]["status"] == "ready"
     lighter_ok = venues_report["lighter_core"]["status"] == "ready"
-    monitor_ok = bool(sync_monitor_env.build_monitor_env(env, None)) if not any(
-        venues_report[v]["status"] == "invalid"
-        for v in ("lighter_core", "lighter_rh", "hyperliquid", "arcus", "bulk")
-    ) else False
+    try:
+        monitor_ok = bool(sync_monitor_env.build_monitor_env(env, None))
+    except ValueError:
+        monitor_ok = False
 
     return {
         "env_path": env_path,

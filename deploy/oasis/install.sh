@@ -14,13 +14,7 @@ if [[ ! -f dashboard/dist/index.html ]]; then
   exit 1
 fi
 
-for unit in aleph-tx-live.service aleph-tx-arcus-xyz.service; do
-  unit_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo inactive)
-  case "$unit_state" in
-    inactive|failed|'') ;;
-    *) printf 'Stop %s cleanly before installing (state: %s).\n' "$unit" "$unit_state" >&2; exit 1 ;;
-  esac
-done
+bash deploy/oasis/check-stopped-units.sh aleph-tx-live.service aleph-tx-arcus-xyz.service
 
 for user in aleph-tx aleph-tx-trader; do
   if ! getent passwd "$user" >/dev/null; then
@@ -36,7 +30,7 @@ sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
 sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts,sync_monitor_env}.py "$dest/"
 sudo -n install -m 0755 \
-  scripts/{capture_timing,archive_public_capture,inventory_public_sources,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner,run_oos_validation_gate,rth_ant_prereg_tool,onboard_exchange_env,verify_venue_readiness}.py \
+  scripts/{capture_timing,archive_public_capture,inventory_public_sources,quant_lakehouse,flywheel_sync,live_attribution,perp_rolling_runner,run_oos_validation_gate,ant_rth_replay,rth_ant_prereg_tool,onboard_exchange_env,verify_venue_readiness}.py \
   "$dest/scripts/"
 sudo -n cp -R --no-preserve=ownership dashboard/dist/. "$dest/dashboard/"
 sudo -n chmod -R u=rwX,go=rX "$dest/dashboard"
