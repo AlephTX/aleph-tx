@@ -14,11 +14,13 @@ Produces the split two-receipt provenance chain required by
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import date, datetime, time as dt_time
 import gzip
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any
@@ -286,6 +288,86 @@ def create_seal_receipt(
     }
 
 
+def _load_valid_prereg_manifest_sha256(prereg_manifest_path: Path) -> str:
+    if not prereg_manifest_path.is_file():
+        raise FileNotFoundError(f"missing prereg manifest: {prereg_manifest_path}")
+    raw_bytes = prereg_manifest_path.read_bytes()
+    manifest = json.loads(raw_bytes.decode("utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"prereg manifest must be a JSON object: {prereg_manifest_path}")
+    if "segment_sha256" in manifest:
+        raise ValueError("prereg manifest unexpectedly contains segment_sha256")
+    return hashlib.sha256(raw_bytes).hexdigest()
+
+
+def create_witness_query(
+    *,
+    prereg_manifest_path: Path,
+    output: Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Create an RFC 3161 `.tsq` timestamp query bound to `--prereg-manifest` SHA-256."""
+    if output.exists() and not force:
+        raise FileExistsError(f"refusing to overwrite existing witness query {output} without --force")
+    prereg_sha256 = _load_valid_prereg_manifest_sha256(prereg_manifest_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "openssl",
+            "ts",
+            "-query",
+            "-digest",
+            prereg_sha256,
+            "-sha256",
+            "-cert",
+            "-out",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return {
+        "output": str(output),
+        "prereg_manifest_sha256": prereg_sha256,
+        "tsq_sha256": _sha256_file(output),
+    }
+
+
+def wrap_witness_receipt(
+    *,
+    prereg_manifest_path: Path,
+    tsr_path: Path,
+    output: Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Wrap a TSA `.tsr` response into `aleph_tx_external_prereg_witness_v1` JSON."""
+    if output.exists() and not force:
+        raise FileExistsError(f"refusing to overwrite existing witness receipt {output} without --force")
+    if not tsr_path.is_file():
+        raise FileNotFoundError(f"missing TSR reply file: {tsr_path}")
+    tsr_bytes = tsr_path.read_bytes()
+    if not tsr_bytes:
+        raise ValueError(f"empty TSR reply file: {tsr_path}")
+    prereg_sha256 = _load_valid_prereg_manifest_sha256(prereg_manifest_path)
+    witness = {
+        "schema": "aleph_tx_external_prereg_witness_v1",
+        "provider": "rfc3161_tsa",
+        "prereg_manifest_sha256": prereg_sha256,
+        "tsr_base64": base64.b64encode(tsr_bytes).decode("ascii"),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(witness, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "output": str(output),
+        "schema": witness["schema"],
+        "provider": witness["provider"],
+        "prereg_manifest_sha256": prereg_sha256,
+        "witness_sha256": _sha256_file(output),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -303,6 +385,17 @@ def main(argv: list[str] | None = None) -> int:
     p_seal.add_argument("--output", type=Path, required=True)
     p_seal.add_argument("--force", action="store_true")
 
+    p_wq = sub.add_parser("witness-query", help="Create RFC 3161 .tsq query for a preregistration manifest")
+    p_wq.add_argument("--prereg-manifest", type=Path, required=True)
+    p_wq.add_argument("--output", type=Path, required=True)
+    p_wq.add_argument("--force", action="store_true")
+
+    p_ww = sub.add_parser("wrap-witness", help="Wrap an RFC 3161 .tsr reply into external witness JSON")
+    p_ww.add_argument("--prereg-manifest", type=Path, required=True)
+    p_ww.add_argument("--tsr", type=Path, required=True)
+    p_ww.add_argument("--output", type=Path, required=True)
+    p_ww.add_argument("--force", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "prereg":
         res = create_prereg_manifest(
@@ -318,6 +411,23 @@ def main(argv: list[str] | None = None) -> int:
         res = create_seal_receipt(
             prereg_manifest_path=args.prereg_manifest,
             capture_dirs=args.capture_dirs,
+            output=args.output,
+            force=args.force,
+        )
+        print(json.dumps(res, indent=2))
+        return 0
+    if args.command == "witness-query":
+        res = create_witness_query(
+            prereg_manifest_path=args.prereg_manifest,
+            output=args.output,
+            force=args.force,
+        )
+        print(json.dumps(res, indent=2))
+        return 0
+    if args.command == "wrap-witness":
+        res = wrap_witness_receipt(
+            prereg_manifest_path=args.prereg_manifest,
+            tsr_path=args.tsr,
             output=args.output,
             force=args.force,
         )

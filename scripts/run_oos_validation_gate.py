@@ -13,6 +13,8 @@ Supports three locked acceptance gates with zero post-freeze parameter tuning:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from datetime import datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -22,7 +24,9 @@ import json
 import math
 from pathlib import Path
 import re
+import subprocess
 import sys
+import tempfile
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -38,7 +42,23 @@ CAPTURE_COVERAGE_TOLERANCE_MS = 60_000
 MAX_SOURCE_BOOK_GAP_MS = 300_000
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 ET_TZ = ZoneInfo("America/New_York")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 FROZEN_ANT_ENGINE_FILES = ("scripts/ant_rth_replay.py",)
+EXTERNAL_PREREG_WITNESS_SCHEMA = "aleph_tx_external_prereg_witness_v1"
+EXTERNAL_PREREG_WITNESS_PROVIDER = "rfc3161_tsa"
+W15_RWA_REPLAY_RECEIPT_SCHEMA = "aleph_tx_w15_rwa_replay_receipt_v1"
+FROZEN_RWA_METHOD_FILES = (
+    "scripts/sim_lighter_core_rwa_maker.py",
+    "scripts/maker_hedge_risk_guards.py",
+)
+_MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+_OPENSSL_TS_RE = re.compile(
+    r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+"
+    r"(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s+(\d{4})\s+(GMT|UTC)\Z"
+)
 ANT_STRATEGY_CONTRACT = {
     "arm_family": "EXP-CRASH-A2B", "q_usd": 500.0, "entry_bp": 10.0, "exit_bp": 0.0,
     "max_entry_bp": 35.0, "persist_ms": 100, "post_trade_refresh_lock": True,
@@ -221,6 +241,112 @@ def _verify_dual_source_continuity(
     )
 
 
+def _parse_openssl_ts_timestamp_ms(reply_text: str) -> int | None:
+    status_lines = [line.split("Status:", 1)[1].strip() for line in reply_text.splitlines() if line.startswith("Status:")]
+    if len(status_lines) != 1 or not status_lines[0].startswith("Granted"):
+        return None
+    ts_lines = [line.split("Time stamp:", 1)[1].strip() for line in reply_text.splitlines() if line.startswith("Time stamp:")]
+    if len(ts_lines) != 1:
+        return None
+    match = _OPENSSL_TS_RE.fullmatch(ts_lines[0])
+    if match is None:
+        return None
+    mon_s, day_s, hr_s, min_s, sec_s, frac_s, year_s, _tz = match.groups()
+    try:
+        dt = datetime(
+            int(year_s),
+            _MONTH_MAP[mon_s],
+            int(day_s),
+            int(hr_s),
+            int(min_s),
+            int(sec_s),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+    frac_ms = int((frac_s + "000")[:3]) if frac_s else 0
+    return int(dt.timestamp()) * 1000 + frac_ms
+
+
+def verify_rfc3161_witness(
+    witness: dict[str, Any] | None,
+    *,
+    expected_prereg_sha256: str,
+    decision_start_ms: int,
+    trusted_ca_path: Path | None,
+) -> tuple[bool, int | None, str]:
+    """Fail-closed RFC 3161 TSA verification against an explicit trusted CA file."""
+    if not isinstance(witness, dict):
+        return (False, None, "external_witness_not_supplied" if witness is None else "invalid_witness_object")
+    if witness.get("schema") != EXTERNAL_PREREG_WITNESS_SCHEMA:
+        return (False, None, "invalid_witness_schema")
+    if witness.get("provider") != EXTERNAL_PREREG_WITNESS_PROVIDER:
+        return (False, None, "invalid_witness_provider")
+    if not _is_sha256(expected_prereg_sha256):
+        return (False, None, "invalid_expected_prereg_sha256")
+    if witness.get("prereg_manifest_sha256") != expected_prereg_sha256:
+        return (False, None, "prereg_manifest_sha256_mismatch")
+    if not _is_valid_ms(decision_start_ms):
+        return (False, None, "invalid_decision_start_ms")
+    if trusted_ca_path is None:
+        return (False, None, "missing_trusted_tsa_ca")
+    ca_path = Path(trusted_ca_path)
+    if not ca_path.is_file():
+        return (False, None, "missing_trusted_tsa_ca_file")
+
+    tsr_b64 = witness.get("tsr_base64")
+    if not isinstance(tsr_b64, str) or not tsr_b64:
+        return (False, None, "missing_tsr_base64")
+    try:
+        tsr_bytes = base64.b64decode(tsr_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return (False, None, "invalid_tsr_base64")
+    if not tsr_bytes:
+        return (False, None, "empty_tsr_bytes")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tsr_path = Path(tmp_dir) / "witness.tsr"
+        tsr_path.write_bytes(tsr_bytes)
+        try:
+            verify_proc = subprocess.run(
+                [
+                    "openssl",
+                    "ts",
+                    "-verify",
+                    "-digest",
+                    expected_prereg_sha256,
+                    "-in",
+                    str(tsr_path),
+                    "-CAfile",
+                    str(ca_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            if verify_proc.returncode != 0:
+                return (False, None, "openssl_ts_verify_failed")
+            text_proc = subprocess.run(
+                ["openssl", "ts", "-reply", "-in", str(tsr_path), "-text"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return (False, None, "openssl_ts_exec_error")
+
+    if text_proc.returncode != 0:
+        return (False, None, "openssl_ts_reply_text_failed")
+    witness_time_ms = _parse_openssl_ts_timestamp_ms(text_proc.stdout)
+    if witness_time_ms is None:
+        return (False, None, "unparseable_witness_timestamp")
+    if witness_time_ms > decision_start_ms:
+        return (False, None, f"witness_after_decision_start:{witness_time_ms}>{decision_start_ms}")
+    return (True, witness_time_ms, "verified_rfc3161_tsa_witness")
+
+
 def verify_rth_ant_provenance(
     prereg_manifest: dict[str, Any] | None,
     *,
@@ -229,6 +355,8 @@ def verify_rth_ant_provenance(
     verified_prereg_sha256: str | None = None,
     verified_segment_digests: dict[str, str] | None = None,
     verified_engine_digests: dict[str, str] | None = None,
+    external_witness: dict[str, Any] | None = None,
+    trusted_tsa_ca_path: Path | None = None,
 ) -> dict[str, Any]:
     """Verify fail-closed split pre-capture/post-seal receipts, bounded 10h RTH replay, and continuity."""
     if not isinstance(prereg_manifest, dict):
@@ -252,6 +380,8 @@ def verify_rth_ant_provenance(
             "qualified": False,
             "structural_checks_passed": False,
             "pre_registration_clock_trust": "self_asserted_json_only_requires_external_witness",
+            "witness_time_ms": None,
+            "witness_verification_detail": "prereg_manifest_missing",
             "checks": checks,
             "covered_rth_dates_et": [],
             "decision_start_ms": None,
@@ -333,14 +463,29 @@ def verify_rth_ant_provenance(
         "frozen_engine_hashes_verified": _engine_hashes_match(prereg_manifest.get("frozen_engine_sha256"), verified_engine_digests),
     }
     structural_checks_passed = all(checks.values())
-    # Neither supplied JSON establishes when the preregistration digest was
-    # independently observed. Keep the formal gate closed until a trusted
-    # pre-window witness is verified by this runner.
-    checks["independent_preregistration_witness_verified"] = False
+    if external_witness is None:
+        witness_ok, witness_time_ms, witness_detail = False, None, "external_witness_not_supplied"
+    elif not (valid_times and _is_sha256(verified_prereg_sha256)):
+        witness_ok, witness_time_ms, witness_detail = False, None, "missing_prereg_sha256_or_decision_start_ms"
+    else:
+        witness_ok, witness_time_ms, witness_detail = verify_rfc3161_witness(
+            external_witness,
+            expected_prereg_sha256=verified_prereg_sha256,
+            decision_start_ms=start_ms,
+            trusted_ca_path=trusted_tsa_ca_path,
+        )
+    checks["independent_preregistration_witness_verified"] = witness_ok
+    clock_trust = (
+        "verified_rfc3161_tsa_witness"
+        if witness_ok
+        else "self_asserted_json_only_requires_external_witness"
+    )
     return {
         "qualified": all(checks.values()),
         "structural_checks_passed": structural_checks_passed,
-        "pre_registration_clock_trust": "self_asserted_json_only_requires_external_witness",
+        "pre_registration_clock_trust": clock_trust,
+        "witness_time_ms": witness_time_ms if witness_ok else None,
+        "witness_verification_detail": witness_detail,
         "checks": checks,
         "covered_rth_dates_et": rth_dates,
         "decision_start_ms": start_ms if _is_valid_ms(start_ms) else None,
@@ -359,6 +504,8 @@ def evaluate_rth_ant_gate(
     verified_prereg_sha256: str | None = None,
     verified_segment_digests: dict[str, str] | None = None,
     verified_engine_digests: dict[str, str] | None = None,
+    external_witness: dict[str, Any] | None = None,
+    trusted_tsa_ca_path: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate pre-registered `rth-ant` Go/No-Go gate on a simulated window dict."""
     if role not in ("monday_rth_oos", "selection_dev_dryrun"):
@@ -406,10 +553,12 @@ def evaluate_rth_ant_gate(
             verified_prereg_sha256=verified_prereg_sha256,
             verified_segment_digests=verified_segment_digests,
             verified_engine_digests=verified_engine_digests,
+            external_witness=external_witness,
+            trusted_tsa_ca_path=trusted_tsa_ca_path,
         )
         verdict = "GO" if (passed_metrics and provenance["qualified"]) else "NO_GO"
     else:
-        if prereg_manifest is not None or seal_receipt is not None:
+        if prereg_manifest is not None or seal_receipt is not None or external_witness is not None:
             provenance = verify_rth_ant_provenance(
                 prereg_manifest,
                 window_result=window_result,
@@ -417,6 +566,8 @@ def evaluate_rth_ant_gate(
                 verified_prereg_sha256=verified_prereg_sha256,
                 verified_segment_digests=verified_segment_digests,
                 verified_engine_digests=verified_engine_digests,
+                external_witness=external_witness,
+                trusted_tsa_ca_path=trusted_tsa_ca_path,
             )
         verdict = "NO_GO" if not passed_metrics else "DRY_RUN_NOT_OOS"
 
@@ -621,9 +772,107 @@ def evaluate_w15_rwa_gate(
     }
 
 
-def run_w15_rwa_cli(summary_path: Path, output: Path, role: str, threshold: float) -> int:
+def _sealed_inputs_match_seal_segments(sealed_inputs: Any, seal_segments: Any) -> bool:
+    if not isinstance(sealed_inputs, dict) or not sealed_inputs:
+        return False
+    if not all(isinstance(k, str) and bool(k) and _is_sha256(v) for k, v in sealed_inputs.items()):
+        return False
+    if not isinstance(seal_segments, dict) or not seal_segments:
+        return False
+    if not all(isinstance(k, str) and bool(k) and _is_sha256(v) for k, v in seal_segments.items()):
+        return False
+
+    for inp_key, inp_sha in sealed_inputs.items():
+        if inp_key.startswith("/") or inp_key.endswith("/") or ".." in inp_key.split("/"):
+            return False
+        if inp_key in seal_segments:
+            if seal_segments[inp_key] != inp_sha:
+                return False
+            continue
+        if "/" not in inp_key:
+            matches = [sk for sk in seal_segments if sk.rsplit("/", 1)[-1] == inp_key]
+        else:
+            matches = [
+                sk for sk in seal_segments
+                if sk.endswith("/" + inp_key) or inp_key.endswith("/" + sk)
+            ]
+        if len(matches) != 1 or seal_segments[matches[0]] != inp_sha:
+            return False
+    return True
+
+
+def _verify_w15_rwa_formal_receipt(
+    summary: dict[str, Any],
+    *,
+    seal_receipt: dict[str, Any] | None,
+    repo_root: Path,
+) -> tuple[bool, dict[str, bool]]:
+    receipt = summary.get("formal_replay_receipt") if isinstance(summary, dict) else None
+    if not isinstance(receipt, dict):
+        return False, {
+            "formal_replay_receipt_schema_ok": False,
+            "exact_10h_decision_window": False,
+            "frozen_method_hashes_verified": False,
+            "sealed_input_hashes_verified": False,
+            "payload_sha256_verified": False,
+        }
+
+    schema_ok = receipt.get("schema") == W15_RWA_REPLAY_RECEIPT_SCHEMA
+    d_start = receipt.get("decision_start_ms")
+    d_end = receipt.get("decision_end_ms")
+    exact_10h = bool(_is_pos_int(d_start) and _is_pos_int(d_end) and (d_end - d_start) == TEN_HOURS_MS)
+
+    frozen_map = receipt.get("frozen_method_sha256")
+    method_ok = isinstance(frozen_map, dict) and set(frozen_map.keys()) == set(FROZEN_RWA_METHOD_FILES)
+    if method_ok:
+        for rel_path in FROZEN_RWA_METHOD_FILES:
+            target = (repo_root / rel_path).resolve()
+            exp_sha = frozen_map.get(rel_path)
+            if not (target.is_file() and _is_sha256(exp_sha) and _sha256_file(target) == exp_sha):
+                method_ok = False
+                break
+
+    seal_segments = seal_receipt.get("segment_sha256") if isinstance(seal_receipt, dict) else None
+    sealed_input_ok = _sealed_inputs_match_seal_segments(receipt.get("sealed_input_sha256"), seal_segments)
+
+    payload_ok = False
+    markets = summary.get("markets")
+    agg6 = summary.get("aggregate_6markets")
+    exp_payload_sha = receipt.get("payload_sha256")
+    if isinstance(markets, dict) and isinstance(agg6, dict) and _is_sha256(exp_payload_sha):
+        try:
+            canonical = json.dumps(
+                {"markets": markets, "aggregate_6markets": agg6},
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            canonical = None
+        if canonical is not None:
+            payload_ok = hashlib.sha256(canonical).hexdigest() == exp_payload_sha
+
+    checks = {
+        "formal_replay_receipt_schema_ok": schema_ok,
+        "exact_10h_decision_window": exact_10h,
+        "frozen_method_hashes_verified": method_ok,
+        "sealed_input_hashes_verified": sealed_input_ok,
+        "payload_sha256_verified": payload_ok,
+    }
+    return all(checks.values()), checks
+
+
+def run_w15_rwa_cli(
+    summary_path: Path,
+    output: Path,
+    role: str,
+    threshold: float,
+    *,
+    seal_receipt_path: Path | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> int:
     source = summary_path.read_bytes()
-    report = {
+    report: dict[str, Any] = {
         "gate": "w15_rwa",
         "role": role,
         "formal_admission": False,
@@ -631,15 +880,59 @@ def run_w15_rwa_cli(summary_path: Path, output: Path, role: str, threshold: floa
         "input_sha256": hashlib.sha256(source).hexdigest(),
         "max_cost_per_million_usd": threshold if math.isfinite(threshold) else None,
     }
+    summary = json.loads(source)
     if role == "formal":
-        # Current producer emits a diagnostic aggregate with an input pathname.
-        # Its bytes cannot establish the frozen engine, 10h coverage or sealed inputs.
-        report.update(verdict="FORMAL_WITHHELD", reason="missing_registered_cost_replay_receipt")
         if threshold != 20.0:
-            report["reason"] = "formal_threshold_must_be_20"
-        exit_code = 2
+            report.update(verdict="FORMAL_WITHHELD", reason="formal_threshold_must_be_20")
+            exit_code = 2
+        elif not isinstance(summary, dict) or summary.get("formal_replay_receipt") is None or seal_receipt_path is None:
+            report.update(verdict="FORMAL_WITHHELD", reason="missing_registered_cost_replay_receipt")
+            exit_code = 2
+        else:
+            seal_receipt: dict[str, Any] | None = None
+            try:
+                loaded_seal = json.loads(seal_receipt_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_seal, dict):
+                    seal_receipt = loaded_seal
+            except (OSError, ValueError):
+                seal_receipt = None
+            receipt_ok, receipt_checks = _verify_w15_rwa_formal_receipt(
+                summary,
+                seal_receipt=seal_receipt,
+                repo_root=repo_root,
+            )
+            if not receipt_ok:
+                report.update(
+                    verdict="NO_GO",
+                    formal_admission=False,
+                    reason="invalid_formal_replay_receipt",
+                    receipt_verified=False,
+                    receipt_checks=receipt_checks,
+                )
+                exit_code = 1
+            else:
+                try:
+                    economics = evaluate_w15_rwa_gate(summary, max_cost_per_million=20.0)
+                except (KeyError, ValueError):
+                    report.update(
+                        verdict="NO_GO",
+                        formal_admission=False,
+                        reason="invalid_rwa_summary_metrics",
+                        receipt_verified=False,
+                        receipt_checks=receipt_checks,
+                    )
+                    exit_code = 1
+                else:
+                    report.update(
+                        formal_admission=True,
+                        verdict=economics["verdict"],
+                        arms=economics["arms"],
+                        receipt_verified=True,
+                        receipt_checks=receipt_checks,
+                    )
+                    exit_code = 0 if economics["verdict"] != "NO_GO" else 1
     else:
-        economics = evaluate_w15_rwa_gate(json.loads(source), max_cost_per_million=threshold)
+        economics = evaluate_w15_rwa_gate(summary, max_cost_per_million=threshold)
         report.update(verdict="DIAGNOSTIC_ONLY", diagnostic_verdict=economics["verdict"], arms=economics["arms"])
         exit_code = 1 if economics["verdict"] == "NO_GO" else 0
     output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
@@ -736,6 +1029,8 @@ def run_rth_ant_cli(
     repo_root: Path,
     prereg_manifest_path: Path | None = None,
     seal_receipt_path: Path | None = None,
+    external_witness_path: Path | None = None,
+    trusted_tsa_ca_path: Path | None = None,
 ) -> int:
     manifest: dict[str, Any] | None = None
     verified_prereg_sha256: str | None = None
@@ -749,6 +1044,14 @@ def run_rth_ant_cli(
     if seal_receipt_path is not None:
         loaded_seal = json.loads(seal_receipt_path.read_text())
         seal_receipt = loaded_seal if isinstance(loaded_seal, dict) else {}
+
+    external_witness: Any = None
+    if external_witness_path is not None:
+        try:
+            loaded_witness = json.loads(external_witness_path.read_text(encoding="utf-8"))
+            external_witness = {"_null": True} if loaded_witness is None else loaded_witness
+        except (OSError, ValueError):
+            external_witness = {"_load_error": True}
 
     declared = manifest.get("strategy_contract") if manifest else None
     decision_bounds_ns: tuple[int, int] | None = None
@@ -778,11 +1081,15 @@ def run_rth_ant_cli(
         verified_prereg_sha256=verified_prereg_sha256,
         verified_segment_digests=seg_digests,
         verified_engine_digests=eng_digests,
+        external_witness=external_witness,
+        trusted_tsa_ca_path=trusted_tsa_ca_path,
     )
     report["capture_dirs"] = [str(p) for p in capture_dirs]
     report["prereg_manifest"] = str(prereg_manifest_path) if prereg_manifest_path is not None else None
     report["prereg_manifest_sha256"] = verified_prereg_sha256
     report["seal_receipt"] = str(seal_receipt_path) if seal_receipt_path is not None else None
+    report["external_witness"] = str(external_witness_path) if external_witness_path is not None else None
+    report["trusted_tsa_ca"] = str(trusted_tsa_ca_path) if trusted_tsa_ca_path is not None else None
     output.write_text(json.dumps(report, indent=2) + "\n")
     print(
         json.dumps(
@@ -812,12 +1119,15 @@ def main() -> int:
     p_ant.add_argument("--role", choices=("monday_rth_oos", "selection_dev_dryrun"), required=True)
     p_ant.add_argument("--prereg-manifest", type=Path, default=None, help="Pre-capture frozen plan JSON (required for monday_rth_oos GO)")
     p_ant.add_argument("--seal-receipt", type=Path, default=None, help="Post-capture seal receipt JSON referencing prereg SHA-256")
+    p_ant.add_argument("--external-witness", type=Path, default=None, help="External RFC 3161 TSA preregistration witness JSON")
+    p_ant.add_argument("--trusted-tsa-ca", type=Path, default=None, help="Explicit trusted TSA CA PEM file (never embedded)")
     p_ant.add_argument("--output", type=Path, required=True)
 
     p_rwa = sub.add_parser("w15-rwa", help="Diagnose Core RWA cost or report formal admission status")
     p_rwa.add_argument("--role", choices=("formal", "diagnostic"), default="formal")
     p_rwa.add_argument("--rwa-summary-json", type=Path, required=True)
     p_rwa.add_argument("--max-cost-per-million", type=float, default=20.0)
+    p_rwa.add_argument("--seal-receipt", type=Path, default=None, help="Post-capture seal receipt JSON verifying sealed RWA input segments")
     p_rwa.add_argument("--output", type=Path, required=True)
 
     p_w17 = sub.add_parser("w17-crash-pause-verify", help="Verify frozen W17+ artifact SHA-256")
@@ -832,9 +1142,18 @@ def main() -> int:
             repo_root,
             args.prereg_manifest,
             args.seal_receipt,
+            args.external_witness,
+            args.trusted_tsa_ca,
         )
     if args.command == "w15-rwa":
-        return run_w15_rwa_cli(args.rwa_summary_json, args.output, args.role, args.max_cost_per_million)
+        return run_w15_rwa_cli(
+            args.rwa_summary_json,
+            args.output,
+            args.role,
+            args.max_cost_per_million,
+            seal_receipt_path=args.seal_receipt,
+            repo_root=repo_root,
+        )
     if args.command == "w17-crash-pause-verify":
         res = verify_w17_crash_pause_prereg(args.prereg, repo_root)
         print(json.dumps(res, indent=2))

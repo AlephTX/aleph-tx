@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 import gzip
+import hashlib
 import heapq
 import json
 import math
@@ -35,6 +36,11 @@ HEDGE_RETRY_NS = 100 * MS_NS
 HEDGE_MAX_TRIES = 20
 STALE_BOOK_NS = 5 * SEC_NS
 BIG = 1 << 62
+W15_RWA_REPLAY_RECEIPT_SCHEMA = "aleph_tx_w15_rwa_replay_receipt_v1"
+FROZEN_RWA_METHOD_FILES = (
+    "scripts/sim_lighter_core_rwa_maker.py",
+    "scripts/maker_hedge_risk_guards.py",
+)
 
 # Exact Lighter Core RWA specs fetched from mainnet /api/v1/orderBookDetails (2026-11-22)
 CORE_SPECS: dict[str, dict[str, Any]] = {
@@ -968,129 +974,181 @@ def parse_arcus_pairs(c: dict[str, Any]) -> tuple[list[tuple[Decimal, Decimal]],
     return bids, asks
 
 
-def run_simulation(path: Path, symbols: tuple[str, ...]) -> dict[str, Any]:
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_decision_bounds_ms(
+    decision_start_ms: int | None,
+    decision_end_ms: int | None,
+) -> tuple[int, int] | None:
+    if decision_start_ms is None and decision_end_ms is None:
+        return None
+    if decision_start_ms is None or decision_end_ms is None:
+        raise ValueError("both decision_start_ms and decision_end_ms must be provided together")
+    if (
+        isinstance(decision_start_ms, bool)
+        or isinstance(decision_end_ms, bool)
+        or not isinstance(decision_start_ms, int)
+        or not isinstance(decision_end_ms, int)
+        or not (0 < decision_start_ms < decision_end_ms)
+    ):
+        raise ValueError(f"invalid decision bounds ms: {decision_start_ms!r}, {decision_end_ms!r}")
+    return decision_start_ms * MS_NS, decision_end_ms * MS_NS
+
+
+def run_simulation(
+    path: Path,
+    symbols: tuple[str, ...],
+    *,
+    decision_start_ms: int | None = None,
+    decision_end_ms: int | None = None,
+) -> dict[str, Any]:
+    bounds_ns = _validate_decision_bounds_ms(decision_start_ms, decision_end_ms)
+    if path.is_dir():
+        input_files = sorted(path.glob("*.ndjson.gz"))
+        if not input_files:
+            raise FileNotFoundError(f"no *.ndjson.gz files found in {path}")
+    else:
+        input_files = [path]
+
     sim = CoreMakerSim(symbols)
     lines_seen = 0
     bad_lines = 0
     t_rx_max = 0
 
-    with gzip.open(path, "rt") as f:
-        for line in f:
-            lines_seen += 1
-            if '"source":"binance"' in line or '"source":"coinbase"' in line or '"source":"hyperliquid"' in line:
-                continue
-            try:
-                d = json.loads(line)
-            except Exception:
-                bad_lines += 1
-                continue
-            if d.get("event") != "message":
-                continue
-            ct = d.get("capture_timing") or {}
-            t_rx = ct.get("available_wall_ns")
-            if not isinstance(t_rx, int) or t_rx <= 0:
-                continue
-            t_rx_max = max(t_rx_max, t_rx)
-            src = d.get("source")
-            pl = d.get("payload") or {}
-            epoch = ct.get("connection_epoch")
-
-            if src == "lighter":
-                ch = str(pl.get("channel", ""))
-                if not ch.startswith("order_book:"):
+    for input_file in input_files:
+        with gzip.open(input_file, "rt") as f:
+            for line in f:
+                lines_seen += 1
+                if '"source":"binance"' in line or '"source":"coinbase"' in line or '"source":"hyperliquid"' in line:
                     continue
-                sym = CORE_ID_TO_SYM.get(ch.split(":", 1)[1])
-                if sym is None or sym not in sim.mk:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    bad_lines += 1
                     continue
-                m = sim.mk[sym]
-                m.first_ns = m.first_ns or t_rx
-                m.last_ns = max(m.last_ns, t_rx)
-                m.n_core_books += 1
-                ob = pl.get("order_book") or {}
-                bids, asks = parse_lighter_pairs(ob)
-                is_snap = str(pl.get("type", "")).startswith("subscribed")
-                lu = ob.get("last_updated_at")
-                if not is_snap and isinstance(lu, (int, float)) and lu > 0:
-                    raw_ex = int(lu) * 1000
-                elif not is_snap and pl.get("timestamp"):
-                    raw_ex = int(pl["timestamp"]) * MS_NS
-                else:
-                    raw_ex = t_rx
-                if raw_ex > t_rx + 5 * SEC_NS:
-                    raw_ex = t_rx
-                if raw_ex < sim.now:
-                    m.n_late += 1
-                    raw_ex = sim.now
-                sim.push(raw_ex, P_SNAP, sim.on_core_ex_book, m, is_snap, bids, asks)
-                sim.push(t_rx, P_ACT, sim.on_core_seen, m, is_snap, epoch, bids, asks)
-
-            elif src == "lighter_trades":
-                ch = str(pl.get("channel", ""))
-                if not ch.startswith("trade:"):
+                if d.get("event") != "message":
                     continue
-                sym = CORE_ID_TO_SYM.get(ch.split(":", 1)[1])
-                if sym is None or sym not in sim.mk:
+                ct = d.get("capture_timing") or {}
+                t_rx = ct.get("available_wall_ns")
+                if not isinstance(t_rx, int) or isinstance(t_rx, bool) or t_rx <= 0:
                     continue
-                if str(pl.get("type", "")).startswith("subscribed"):
-                    continue
-                m = sim.mk[sym]
-                for tr in pl.get("trades") or []:
-                    tid = tr.get("trade_id")
-                    if tid in m.seen_tids:
-                        m.n_core_trade_dups += 1
+                if bounds_ns is not None:
+                    if t_rx < bounds_ns[0] or t_rx >= bounds_ns[1]:
                         continue
-                    if tid is not None:
-                        m.seen_tids.add(tid)
-                    px = D(str(tr["price"]))
-                    sz = D(str(tr["size"]))
-                    if px <= ZERO or sz <= ZERO:
+                t_rx_max = max(t_rx_max, t_rx)
+                src = d.get("source")
+                pl = d.get("payload") or {}
+                epoch = ct.get("connection_epoch")
+
+                if src == "lighter":
+                    ch = str(pl.get("channel", ""))
+                    if not ch.startswith("order_book:"):
                         continue
-                    tt = tr.get("transaction_time")
-                    if isinstance(tt, (int, float)) and tt > 0:
-                        ex_ns = int(tt) * 1000
-                    elif tr.get("timestamp"):
-                        ex_ns = int(tr["timestamp"]) * MS_NS
+                    sym = CORE_ID_TO_SYM.get(ch.split(":", 1)[1])
+                    if sym is None or sym not in sim.mk:
+                        continue
+                    m = sim.mk[sym]
+                    m.first_ns = m.first_ns or t_rx
+                    m.last_ns = max(m.last_ns, t_rx)
+                    m.n_core_books += 1
+                    ob = pl.get("order_book") or {}
+                    bids, asks = parse_lighter_pairs(ob)
+                    is_snap = str(pl.get("type", "")).startswith("subscribed")
+                    lu = ob.get("last_updated_at")
+                    if not is_snap and isinstance(lu, (int, float)) and lu > 0:
+                        raw_ex = int(lu) * 1000
+                    elif not is_snap and pl.get("timestamp"):
+                        raw_ex = int(pl["timestamp"]) * MS_NS
                     else:
-                        ex_ns = t_rx
-                    if ex_ns > t_rx + 5 * SEC_NS:
-                        ex_ns = t_rx
-                    if ex_ns < sim.now:
+                        raw_ex = t_rx
+                    if raw_ex > t_rx + 5 * SEC_NS:
+                        raw_ex = t_rx
+                    if raw_ex < sim.now:
                         m.n_late += 1
-                        ex_ns = sim.now
-                    taker = 1 if tr.get("is_maker_ask") is True else -1
-                    m.n_core_trades += 1
-                    m.core_trade_usd += float(px * sz)
-                    sim.push(ex_ns, P_PRINT, sim.on_core_ex_print, m, t_rx, taker, px, sz)
+                        raw_ex = sim.now
+                    sim.push(raw_ex, P_SNAP, sim.on_core_ex_book, m, is_snap, bids, asks)
+                    sim.push(t_rx, P_ACT, sim.on_core_seen, m, is_snap, epoch, bids, asks)
 
-            elif src == "arcus" and pl.get("channel") == "l2Orderbook":
-                sym = ARCUS_ID_TO_SYM.get(pl.get("id", ""))
-                if sym is None or sym not in sim.mk:
-                    continue
-                m = sim.mk[sym]
-                c = pl.get("contents") or {}
-                bids, asks = parse_arcus_pairs(c)
-                is_snap = str(pl.get("type", "")).startswith("subscribed") or True  # Arcus l2Orderbook emits full top-20 snapshots
-                sim.push(t_rx, P_SNAP, sim.on_arc_seen, m, is_snap, epoch, bids, asks)
+                elif src == "lighter_trades":
+                    ch = str(pl.get("channel", ""))
+                    if not ch.startswith("trade:"):
+                        continue
+                    sym = CORE_ID_TO_SYM.get(ch.split(":", 1)[1])
+                    if sym is None or sym not in sim.mk:
+                        continue
+                    if str(pl.get("type", "")).startswith("subscribed"):
+                        continue
+                    m = sim.mk[sym]
+                    for tr in pl.get("trades") or []:
+                        tid = tr.get("trade_id")
+                        if tid in m.seen_tids:
+                            m.n_core_trade_dups += 1
+                            continue
+                        if tid is not None:
+                            m.seen_tids.add(tid)
+                        px = D(str(tr["price"]))
+                        sz = D(str(tr["size"]))
+                        if px <= ZERO or sz <= ZERO:
+                            continue
+                        tt = tr.get("transaction_time")
+                        if isinstance(tt, (int, float)) and tt > 0:
+                            ex_ns = int(tt) * 1000
+                        elif tr.get("timestamp"):
+                            ex_ns = int(tr["timestamp"]) * MS_NS
+                        else:
+                            ex_ns = t_rx
+                        if ex_ns > t_rx + 5 * SEC_NS:
+                            ex_ns = t_rx
+                        if ex_ns < sim.now:
+                            m.n_late += 1
+                            ex_ns = sim.now
+                        taker = 1 if tr.get("is_maker_ask") is True else -1
+                        m.n_core_trades += 1
+                        m.core_trade_usd += float(px * sz)
+                        sim.push(ex_ns, P_PRINT, sim.on_core_ex_print, m, t_rx, taker, px, sz)
 
-            elif src == "lighter_robinhood":
-                ch = str(pl.get("channel", ""))
-                if not ch.startswith("order_book:"):
-                    continue
-                sym = RH_ID_TO_SYM.get(ch.split(":", 1)[1])
-                if sym is None or sym not in sim.mk:
-                    continue
-                m = sim.mk[sym]
-                ob = pl.get("order_book") or {}
-                bids, asks = parse_lighter_pairs(ob)
-                is_snap = str(pl.get("type", "")).startswith("subscribed")
-                sim.push(t_rx, P_SNAP, sim.on_rh_seen, m, is_snap, epoch, bids, asks)
+                elif src == "arcus" and pl.get("channel") == "l2Orderbook":
+                    sym = ARCUS_ID_TO_SYM.get(pl.get("id", ""))
+                    if sym is None or sym not in sim.mk:
+                        continue
+                    m = sim.mk[sym]
+                    c = pl.get("contents") or {}
+                    bids, asks = parse_arcus_pairs(c)
+                    is_snap = str(pl.get("type", "")).startswith("subscribed") or True  # Arcus l2Orderbook emits full top-20 snapshots
+                    sim.push(t_rx, P_SNAP, sim.on_arc_seen, m, is_snap, epoch, bids, asks)
 
-            if t_rx_max > WATERMARK_NS:
-                sim.drain(t_rx_max - WATERMARK_NS)
+                elif src == "lighter_robinhood":
+                    ch = str(pl.get("channel", ""))
+                    if not ch.startswith("order_book:"):
+                        continue
+                    sym = RH_ID_TO_SYM.get(ch.split(":", 1)[1])
+                    if sym is None or sym not in sim.mk:
+                        continue
+                    m = sim.mk[sym]
+                    ob = pl.get("order_book") or {}
+                    bids, asks = parse_lighter_pairs(ob)
+                    is_snap = str(pl.get("type", "")).startswith("subscribed")
+                    sim.push(t_rx, P_SNAP, sim.on_rh_seen, m, is_snap, epoch, bids, asks)
 
-    sim.drain(BIG)
+                if t_rx_max > WATERMARK_NS:
+                    sim.drain(t_rx_max - WATERMARK_NS)
+
+    if bounds_ns is None:
+        sim.drain(BIG)
+    else:
+        sim.drain(bounds_ns[1] - 1)
     for m in sim.mk.values():
-        end_t = max(sim.now, m.last_ns)
+        end_t = (
+            bounds_ns[1] - 1
+            if (bounds_ns is not None and max(sim.now, m.last_ns) > 0)
+            else max(sim.now, m.last_ns)
+        )
         for a in m.arms:
             a.res.settle_modeled_cancels(end_t)
             a.unhedged.finalize(end_t)
@@ -1098,6 +1156,55 @@ def run_simulation(path: Path, symbols: tuple[str, ...]) -> dict[str, Any]:
             a.shadows.clear()
 
     return summarize_sim(sim, path, lines_seen, bad_lines)
+
+
+def build_formal_replay_receipt(
+    summary: dict[str, Any],
+    *,
+    input_path: Path,
+    decision_start_ms: int,
+    decision_end_ms: int,
+    repo_root: Path,
+) -> dict[str, Any]:
+    """Build tamper-evident formal replay receipt binding frozen method, bounds, inputs, and payload."""
+    _validate_decision_bounds_ms(decision_start_ms, decision_end_ms)
+    if not isinstance(summary.get("markets"), dict) or not isinstance(summary.get("aggregate_6markets"), dict):
+        raise ValueError("summary missing required 'markets' or 'aggregate_6markets' mapping")
+
+    frozen_method_sha256: dict[str, str] = {}
+    for rel_path in FROZEN_RWA_METHOD_FILES:
+        target = (repo_root / rel_path).resolve()
+        if not target.is_file():
+            raise FileNotFoundError(f"missing frozen RWA method file: {target}")
+        frozen_method_sha256[rel_path] = _sha256_file(target)
+
+    if input_path.is_dir():
+        seg_files = sorted(input_path.glob("*.ndjson.gz"))
+        if not seg_files:
+            raise FileNotFoundError(f"no *.ndjson.gz files found in {input_path}")
+        sealed_input_sha256 = {f"{input_path.name}/{f.name}": _sha256_file(f) for f in seg_files}
+    elif input_path.is_file():
+        sealed_input_sha256 = {input_path.name: _sha256_file(input_path)}
+    else:
+        raise FileNotFoundError(f"missing input path for formal replay receipt: {input_path}")
+
+    canonical_payload = json.dumps(
+        {
+            "markets": summary["markets"],
+            "aggregate_6markets": summary["aggregate_6markets"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "schema": W15_RWA_REPLAY_RECEIPT_SCHEMA,
+        "decision_start_ms": decision_start_ms,
+        "decision_end_ms": decision_end_ms,
+        "frozen_method_sha256": frozen_method_sha256,
+        "sealed_input_sha256": sealed_input_sha256,
+        "payload_sha256": hashlib.sha256(canonical_payload).hexdigest(),
+    }
 
 
 def summarize_sim(sim: CoreMakerSim, path: Path, lines_seen: int, bad_lines: int) -> dict[str, Any]:
@@ -1465,19 +1572,44 @@ def _self_test() -> None:
           f"liq=${pure_agg['terminal_liq_cash_usd']:.4f}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--symbols", nargs="*", default=list(CORE_SPECS.keys()))
-    args = parser.parse_args()
+    parser.add_argument("--decision-start-ms", type=int, default=None)
+    parser.add_argument("--decision-end-ms", type=int, default=None)
+    parser.add_argument("--emit-formal-receipt", action="store_true")
+    args = parser.parse_args(argv)
     if args.self_test:
         _self_test()
         return 0
     if not args.input or not args.output:
         parser.error("--input and --output required unless --self-test")
-    res = run_simulation(args.input, tuple(args.symbols))
+    if (args.decision_start_ms is None) != (args.decision_end_ms is None):
+        parser.error("--decision-start-ms and --decision-end-ms must both be provided")
+    if args.decision_start_ms is not None and not (0 < args.decision_start_ms < args.decision_end_ms):
+        parser.error("require 0 < --decision-start-ms < --decision-end-ms")
+    if args.emit_formal_receipt and (args.decision_start_ms is None or args.decision_end_ms is None):
+        parser.error("--emit-formal-receipt requires --decision-start-ms and --decision-end-ms")
+
+    res = run_simulation(
+        args.input,
+        tuple(args.symbols),
+        decision_start_ms=args.decision_start_ms,
+        decision_end_ms=args.decision_end_ms,
+    )
+    if args.emit_formal_receipt:
+        repo_root = Path(__file__).resolve().parent.parent
+        res["formal_replay_receipt"] = build_formal_replay_receipt(
+            res,
+            input_path=args.input,
+            decision_start_ms=args.decision_start_ms,
+            decision_end_ms=args.decision_end_ms,
+            repo_root=repo_root,
+        )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(res, indent=2) + "\n")
     print(f"Done Core Maker Sim ({res['lines_seen']} lines, bad={res['bad_lines']})")
     for name, row in res["aggregate_6markets"].items():

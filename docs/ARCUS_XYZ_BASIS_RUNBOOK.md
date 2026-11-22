@@ -73,18 +73,30 @@ python3 scripts/rth_ant_prereg_tool.py prereg \
   --window-start-et 07:00 \
   --output /tmp/monday_rth_prereg_manifest.json
 
+# Create RFC 3161 timestamp query, submit to your trusted TSA, and wrap the .tsr reply before decision_start:
+python3 scripts/rth_ant_prereg_tool.py witness-query \
+  --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
+  --output /tmp/monday_rth_prereg.tsq
+# Submit /tmp/monday_rth_prereg.tsq to TSA -> /tmp/monday_rth_prereg.tsr, then wrap:
+python3 scripts/rth_ant_prereg_tool.py wrap-witness \
+  --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
+  --tsr /tmp/monday_rth_prereg.tsr \
+  --output /tmp/monday_rth_external_witness.json
+
 # After decision_end (17:00 ET = 22:00 UTC), seal completed capture segments & coverage:
 python3 scripts/rth_ant_prereg_tool.py seal \
   --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
   --capture-dirs ~/aleph-tx-lakehouse/research_captures/<MONDAY_RTH_CAPTURE_DIR> \
   --output /tmp/monday_rth_seal_receipt.json
 
-# Run fail-closed 12-dimension OOS validation gate:
+# Run fail-closed OOS validation gate with explicit trusted TSA CA PEM (never embedded in witness JSON):
 python3 scripts/run_oos_validation_gate.py rth-ant \
   --capture-dirs ~/aleph-tx-lakehouse/research_captures/<MONDAY_RTH_CAPTURE_DIR> \
   --role monday_rth_oos \
   --prereg-manifest /tmp/monday_rth_prereg_manifest.json \
   --seal-receipt /tmp/monday_rth_seal_receipt.json \
+  --external-witness /tmp/monday_rth_external_witness.json \
+  --trusted-tsa-ca /path/to/trusted_tsa_ca.pem \
   --output /tmp/rth_ant_oos_gate.json
 ```
 
@@ -95,22 +107,37 @@ Pass criteria (`verdict == "GO"` requires BOTH metric checks AND fail-closed OOS
 - `max_drawdown_within_budget`: max `max_drawdown_usd <= $50.00`
 - `sufficient_cycles_and_win_rate`: min `cycles_closed >= 3` and min `win_rate >= 0.60`
 - `provenance.qualified == true` (fail-closed provenance verification for `monday_rth_oos`):
-  - **Independent preregistration witness**. The modern runner keeps formal admission closed until it can verify an external observation of the exact manifest digest before the decision start. `provenance.structural_checks_passed` reports the existing receipt, clock, coverage and hash checks for diagnostics. Use `selection_dev_dryrun` for diagnostic replay. The isolated legacy runner retains its original scope.
+  - **Independent RFC 3161 TSA preregistration witness**: `--external-witness` (`aleph_tx_external_prereg_witness_v1`) + `--trusted-tsa-ca` must cryptographically verify via `openssl ts -verify` against `prereg_manifest_sha256` with TSA `Time stamp:` `witness_time_ms <= decision_start_ms`, advancing `pre_registration_clock_trust` to `verified_rfc3161_tsa_witness` and `checks.independent_preregistration_witness_verified = true`. Any omitted/invalid witness, untrusted CA, digest mismatch, or post-start timestamp fails closed (`witness_time_ms = null`, `pre_registration_clock_trust = self_asserted_json_only_requires_external_witness`). `provenance.structural_checks_passed` continues to report the structural receipt, clock, coverage, and hash checks independently; use `selection_dev_dryrun` for diagnostic replay.
   - **Split two-receipt chain**: pre-capture `--prereg-manifest` (`classification == "monday_rth_oos"`, `frozen_at_ms <= decision_start_ms`, zero post-hoc `segment_sha256` keys) + post-capture `--seal-receipt` (`sealed_at_ms >= decision_end_ms`, matching `prereg_manifest_sha256`)
   - **Exact bounded 10h RTH replay**: engine runs strictly inside half-open `[decision_start_ms, decision_end_ms)` (`== 10h` span covering Monday US RTH `09:30–16:00 ET`), excluding warmup (`< decision_start_ms`) and post-window (`>= decision_end_ms`) records, with `>= 9` witnessed interior UTC funding ticks (`missing == 0`)
-  - **Dual-source continuity & integrity**: both `arcus_book` (`ANT-USD`) and `xyz_book` (`xyz:ANT`) independently cover `[decision_start_ms, decision_end_ms)` with `<= 5 min` gaps (`xyz_funding` gap `<= 1h`), consistent with `seal_receipt.measured_source_coverage`, plus exact SHA-256 verification of all sealed `tokyo-research-*.seg*.ndjson.gz` files (`seal_receipt.segment_sha256`) and the versioned replay engine (`scripts/ant_rth_replay.py`). The preregistered strategy contract must equal the parameters admitted by this gate. Both the replay and live runner reject executable entry edges above 35 bp. The weekday override produces a diagnostic manifest. Preserve older manifests and seal receipts with their original engines. A validation run on this version needs a new preregistration before its untouched window. CLI `prereg`/`seal` always stamp live wall-clock time (no `--now-ms` CLI override), JSON `frozen_at_ms` alone is self-asserted (`pre_registration_clock_trust = self_asserted_json_only_requires_external_witness`), and formal OOS admission for any future window must pair `prereg_manifest_sha256` with an independent pre-start external witness (e.g., Git commit/push or append-only cross-host digest recorded before `decision_start_ms`), while the already-frozen Monday `2026-11-23` (`2a7d2242...`) manifest runs via its isolated legacy runner.
+  - **Dual-source continuity & integrity**: both `arcus_book` (`ANT-USD`) and `xyz_book` (`xyz:ANT`) independently cover `[decision_start_ms, decision_end_ms)` with `<= 5 min` gaps (`xyz_funding` gap `<= 1h`), consistent with `seal_receipt.measured_source_coverage`, plus exact SHA-256 verification of all sealed `tokyo-research-*.seg*.ndjson.gz` files (`seal_receipt.segment_sha256`) and the versioned replay engine (`scripts/ant_rth_replay.py`). The preregistered strategy contract must equal the parameters admitted by this gate. Both the replay and live runner reject executable entry edges above 35 bp. The weekday override produces a diagnostic manifest. Preserve older manifests and seal receipts with their original engines. A validation run on this version needs a new preregistration before its untouched window. CLI `prereg`/`seal` always stamp live wall-clock time (no `--now-ms` CLI override), and the already-frozen Monday `2026-11-23` (`2a7d2242...`) manifest runs via its isolated legacy runner.
 
-2. **`W15+` Core Standard RWA cost diagnostic (`<= $20/M`)**
+2. **`W15+` Core Standard RWA cost validation (`<= $20/M`)**
 
 ```bash
+# Diagnostic mode on an unsealed or historical summary:
 python3 scripts/run_oos_validation_gate.py w15-rwa --role diagnostic \
   --rwa-summary-json .agent-state/research/ant_three_venue_20261120/core_rwa_maker_w15.json \
   --output /tmp/w15_rwa_gate.json
+
+# Bounded 10h simulation emitting formal_replay_receipt (`aleph_tx_w15_rwa_replay_receipt_v1`):
+python3 scripts/sim_lighter_core_rwa_maker.py \
+  --input <CAPTURE_OR_SEGMENT.ndjson.gz> \
+  --decision-start-ms <START_MS> \
+  --decision-end-ms <END_MS> \
+  --emit-formal-receipt \
+  --output /tmp/w15_rwa_formal_summary.json
+
+# Formal OOS gate (`--role formal` requires `--seal-receipt`, `20.0` threshold, exact 10h bounds, live frozen method hashes, sealed input hashes, and canonical payload SHA-256):
+python3 scripts/run_oos_validation_gate.py w15-rwa --role formal \
+  --rwa-summary-json /tmp/w15_rwa_formal_summary.json \
+  --seal-receipt /tmp/w15_seal_receipt.json \
+  --output /tmp/w15_rwa_formal_gate.json
 ```
 
-The diagnostic report always uses `DIAGNOSTIC_ONLY` and records its `diagnostic_verdict` and applied threshold. Omitting `--role` requests formal admission. That entry point reports `FORMAL_WITHHELD` with exit code 2 until the simulator emits a registered replay receipt binding the frozen method, exact ten-hour range, sealed source digests and output digest. Keep deployment on HOLD when formal admission is withheld.
+The diagnostic report always uses `DIAGNOSTIC_ONLY` and records its `diagnostic_verdict` and applied threshold. Omitting `--role` requests `--role formal`: legacy summaries lacking `formal_replay_receipt` or omitting `--seal-receipt` return `FORMAL_WITHHELD` (exit `2`), invalid/tampered receipts fail closed with `NO_GO` (`invalid_formal_replay_receipt`, exit `1`), and verified formal receipts admit the evaluated `<= $20/M` verdict (`formal_admission = true`, exit `0` for `GO_HEDGED` / `GO_UNHEDGED_ONLY`, exit `1` for `NO_GO`). Keep deployment on HOLD when formal admission is withheld or `NO_GO`.
 
-Generate new W15-format inputs with `python3 scripts/sim_lighter_core_rwa_maker.py --input CAPTURE --output SUMMARY`. The summary carries exact decimal terminal cash and maker turnover alongside the display values. For older summaries the gate evaluates the full rounding interval and records `insufficient_precision` if it straddles the cost limit.
+Generate new W15-format inputs with `python3 scripts/sim_lighter_core_rwa_maker.py --input CAPTURE --output SUMMARY` (add `--decision-start-ms`, `--decision-end-ms`, and `--emit-formal-receipt` for formal admission). The summary carries exact decimal terminal cash and maker turnover alongside the display values. For older summaries the gate evaluates the full rounding interval and records `insufficient_precision` if it straddles the cost limit.
 
 3. **Frozen `W17+` `crash_pause` A/B/C artifact integrity verification**:
 

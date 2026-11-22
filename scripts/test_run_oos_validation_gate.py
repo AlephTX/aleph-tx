@@ -3,25 +3,35 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import gzip
 import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.rth_ant_prereg_tool import create_witness_query, wrap_witness_receipt
 from scripts.run_oos_validation_gate import (
     ANT_STRATEGY_CONTRACT,
     FROZEN_ANT_ENGINE_FILES,
+    TEN_HOURS_MS,
     evaluate_rth_ant_gate,
     evaluate_w15_rwa_gate,
     main as cli_main,
+    verify_rfc3161_witness,
     verify_w17_crash_pause_prereg,
+)
+from scripts.sim_lighter_core_rwa_maker import (
+    build_formal_replay_receipt,
+    main as sim_rwa_cli_main,
 )
 
 ET_TZ = ZoneInfo("America/New_York")
@@ -829,6 +839,586 @@ class OosValidationGateTests(unittest.TestCase):
             target.write_bytes(b"fn tampered() {}\n")
             bad = verify_w17_crash_pause_prereg(prereg, root)
             self.assertEqual(bad["verdict"], "MISMATCH")
+
+    def _create_ephemeral_tsa(self, root: Path, *, name: str = "tsa") -> tuple[Path, Path]:
+        ca_key = root / f"{name}_ca.key"
+        ca_cert = root / f"{name}_ca.pem"
+        leaf_key = root / f"{name}_leaf.key"
+        leaf_csr = root / f"{name}_leaf.csr"
+        leaf_cert = root / f"{name}_leaf.pem"
+        ext_cnf = root / f"{name}_ext.cnf"
+        ts_cnf = root / f"{name}_ts.cnf"
+        serial_file = root / f"{name}_serial"
+        serial_file.write_text("01\n", encoding="utf-8")
+
+        ext_cnf.write_text(
+            "[tsa_ext]\n"
+            "basicConstraints = critical,CA:FALSE\n"
+            "keyUsage = critical,digitalSignature\n"
+            "extendedKeyUsage = critical,timeStamping\n",
+            encoding="utf-8",
+        )
+        ts_cnf.write_text(
+            "[tsa]\n"
+            "default_tsa = tsa_config1\n\n"
+            "[tsa_config1]\n"
+            f"dir = {root}\n"
+            f"serial = {serial_file}\n"
+            f"signer_cert = {leaf_cert}\n"
+            f"signer_key = {leaf_key}\n"
+            "default_policy = 1.2.3.4.1\n"
+            "digests = sha256\n"
+            "clock_precision_digits = 0\n"
+            "ordering = yes\n"
+            "signer_digest = sha256\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(ca_key), "-out", str(ca_cert), "-days", "30",
+                "-subj", f"/CN=AlephTestCA-{name}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(leaf_key), "-out", str(leaf_csr),
+                "-subj", f"/CN=AlephTestTSA-{name}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl", "x509", "-req", "-in", str(leaf_csr),
+                "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial",
+                "-out", str(leaf_cert), "-days", "30",
+                "-extfile", str(ext_cnf), "-extensions", "tsa_ext",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return ca_cert, ts_cnf
+
+    def _issue_tsr(self, ts_cnf: Path, tsq_path: Path, tsr_path: Path) -> None:
+        subprocess.run(
+            [
+                "openssl", "ts", "-reply",
+                "-config", str(ts_cnf),
+                "-queryfile", str(tsq_path),
+                "-out", str(tsr_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_verify_rfc3161_witness_enforces_ca_digest_base64_and_timestamp_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ca_cert, ts_cnf = self._create_ephemeral_tsa(root, name="primary")
+            wrong_ca_cert, _ = self._create_ephemeral_tsa(root, name="wrong")
+
+            manifest = _sample_ant_prereg()
+            manifest_path = root / "prereg.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+            tsq_path = root / "req.tsq"
+            tsr_path = root / "resp.tsr"
+            witness_path = root / "witness.json"
+            create_witness_query(prereg_manifest_path=manifest_path, output=tsq_path)
+            self._issue_tsr(ts_cnf, tsq_path, tsr_path)
+            wrap_witness_receipt(prereg_manifest_path=manifest_path, tsr_path=tsr_path, output=witness_path)
+            witness = json.loads(witness_path.read_text(encoding="utf-8"))
+
+            ok, ts_ms, detail = verify_rfc3161_witness(
+                witness,
+                expected_prereg_sha256=manifest_sha,
+                decision_start_ms=4_102_444_800_000,  # 2100-01-01 UTC
+                trusted_ca_path=ca_cert,
+            )
+            self.assertTrue(ok, detail)
+            self.assertIsInstance(ts_ms, int)
+            self.assertEqual(detail, "verified_rfc3161_tsa_witness")
+
+            # Boundary equality witness_time_ms == decision_start_ms passes; -1 fails.
+            ok_eq, ts_eq, _ = verify_rfc3161_witness(
+                witness,
+                expected_prereg_sha256=manifest_sha,
+                decision_start_ms=ts_ms,
+                trusted_ca_path=ca_cert,
+            )
+            self.assertTrue(ok_eq)
+            self.assertEqual(ts_eq, ts_ms)
+
+            ok_late, ts_late, late_reason = verify_rfc3161_witness(
+                witness,
+                expected_prereg_sha256=manifest_sha,
+                decision_start_ms=ts_ms - 1,
+                trusted_ca_path=ca_cert,
+            )
+            self.assertFalse(ok_late)
+            self.assertIsNone(ts_late)
+            self.assertIn("witness_after_decision_start", late_reason)
+
+            # Fail closed on wrong CA, missing CA, embedded CA bypass attempt, tampered digest, bad base64/schema.
+            for label, w_arg, exp_sha, ca_arg in (
+                ("wrong_ca", witness, manifest_sha, wrong_ca_cert),
+                ("missing_ca", witness, manifest_sha, None),
+                ("nonexistent_ca", witness, manifest_sha, root / "does_not_exist.pem"),
+                ("embedded_ca_ignored", {**witness, "trusted_ca_pem": ca_cert.read_text()}, manifest_sha, wrong_ca_cert),
+                ("tampered_expected_sha", witness, "f" * 64, ca_cert),
+                ("tampered_witness_sha", {**witness, "prereg_manifest_sha256": "f" * 64}, manifest_sha, ca_cert),
+                ("bad_schema", {**witness, "schema": "wrong_schema"}, manifest_sha, ca_cert),
+                ("bad_provider", {**witness, "provider": "git_commit"}, manifest_sha, ca_cert),
+                ("bad_base64_whitespace", {**witness, "tsr_base64": witness["tsr_base64"] + "\n"}, manifest_sha, ca_cert),
+                ("empty_base64", {**witness, "tsr_base64": ""}, manifest_sha, ca_cert),
+                ("corrupt_tsr", {**witness, "tsr_base64": base64.b64encode(b"not-a-tsr").decode("ascii")}, manifest_sha, ca_cert),
+                ("none_witness", None, manifest_sha, ca_cert),
+            ):
+                with self.subTest(case=label):
+                    res_ok, res_ts, _ = verify_rfc3161_witness(
+                        w_arg,
+                        expected_prereg_sha256=exp_sha,
+                        decision_start_ms=4_102_444_800_000,
+                        trusted_ca_path=ca_arg,
+                    )
+                    self.assertFalse(res_ok)
+                    self.assertIsNone(res_ts)
+
+    def test_rth_ant_gate_rfc3161_witness_go_and_fail_closed_variants(self) -> None:
+        now_et = datetime.now(timezone.utc).astimezone(ET_TZ)
+        next_mon = (now_et + timedelta(days=(7 - now_et.weekday()) % 7 or 7)).date()
+        prev_mon = (now_et - timedelta(days=now_et.weekday() or 7)).date()
+        fut_start_ms = int(datetime(next_mon.year, next_mon.month, next_mon.day, 7, 0, tzinfo=ET_TZ).timestamp() * 1000)
+        fut_end_ms = fut_start_ms + TEN_HOURS_MS
+        past_start_ms = int(datetime(prev_mon.year, prev_mon.month, prev_mon.day, 7, 0, tzinfo=ET_TZ).timestamp() * 1000)
+        past_end_ms = past_start_ms + TEN_HOURS_MS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ca_cert, ts_cnf = self._create_ephemeral_tsa(root, name="gate")
+            wrong_ca_cert, _ = self._create_ephemeral_tsa(root, name="gate_wrong")
+
+            fut_prereg = _sample_ant_prereg(
+                frozen_at_ms=fut_start_ms - 60_000,
+                decision_start_ms=fut_start_ms,
+                decision_end_ms=fut_end_ms,
+                expected_rth_date_et=next_mon.isoformat(),
+            )
+            fut_path = root / "fut_prereg.json"
+            fut_path.write_text(json.dumps(fut_prereg, sort_keys=True) + "\n", encoding="utf-8")
+            fut_sha = hashlib.sha256(fut_path.read_bytes()).hexdigest()
+            fut_tsq = root / "fut.tsq"
+            fut_tsr = root / "fut.tsr"
+            fut_wit_path = root / "fut_witness.json"
+            create_witness_query(prereg_manifest_path=fut_path, output=fut_tsq)
+            self._issue_tsr(ts_cnf, fut_tsq, fut_tsr)
+            wrap_witness_receipt(prereg_manifest_path=fut_path, tsr_path=fut_tsr, output=fut_wit_path)
+            fut_wit = json.loads(fut_wit_path.read_text(encoding="utf-8"))
+
+            good_fut = _sample_ant_window(start_ms=fut_start_ms, end_ms=fut_end_ms)
+            fut_seal = _sample_seal_receipt(
+                fut_sha,
+                sealed_at_ms=fut_end_ms + 60_000,
+                archive_first_rx_ns=fut_start_ms * 1_000_000,
+                archive_last_rx_ns=fut_end_ms * 1_000_000,
+            )
+
+            go_rep = evaluate_rth_ant_gate(
+                good_fut,
+                role="monday_rth_oos",
+                prereg_manifest=fut_prereg,
+                seal_receipt=fut_seal,
+                verified_prereg_sha256=fut_sha,
+                verified_segment_digests=_sample_seg_digests(),
+                verified_engine_digests=_sample_eng_digests(),
+                external_witness=fut_wit,
+                trusted_tsa_ca_path=ca_cert,
+            )
+            self.assertEqual(go_rep["verdict"], "GO")
+            self.assertTrue(go_rep["provenance"]["qualified"])
+            self.assertTrue(go_rep["provenance"]["checks"]["independent_preregistration_witness_verified"])
+            self.assertEqual(go_rep["provenance"]["pre_registration_clock_trust"], "verified_rfc3161_tsa_witness")
+            self.assertIsNotNone(go_rep["provenance"]["witness_time_ms"])
+            self.assertLessEqual(go_rep["provenance"]["witness_time_ms"], fut_start_ms)
+
+            # Wrong CA -> NO_GO
+            bad_ca_rep = evaluate_rth_ant_gate(
+                good_fut,
+                role="monday_rth_oos",
+                prereg_manifest=fut_prereg,
+                seal_receipt=fut_seal,
+                verified_prereg_sha256=fut_sha,
+                verified_segment_digests=_sample_seg_digests(),
+                verified_engine_digests=_sample_eng_digests(),
+                external_witness=fut_wit,
+                trusted_tsa_ca_path=wrong_ca_cert,
+            )
+            self.assertEqual(bad_ca_rep["verdict"], "NO_GO")
+            self.assertFalse(bad_ca_rep["provenance"]["qualified"])
+            self.assertFalse(bad_ca_rep["provenance"]["checks"]["independent_preregistration_witness_verified"])
+            self.assertIsNone(bad_ca_rep["provenance"]["witness_time_ms"])
+            self.assertEqual(
+                bad_ca_rep["provenance"]["pre_registration_clock_trust"],
+                "self_asserted_json_only_requires_external_witness",
+            )
+
+            # Tampered manifest digest -> NO_GO
+            tampered_sha = hashlib.sha256(b"tampered").hexdigest()
+            tampered_rep = evaluate_rth_ant_gate(
+                good_fut,
+                role="monday_rth_oos",
+                prereg_manifest=fut_prereg,
+                seal_receipt=_sample_seal_receipt(
+                    tampered_sha,
+                    sealed_at_ms=fut_end_ms + 60_000,
+                    archive_first_rx_ns=fut_start_ms * 1_000_000,
+                    archive_last_rx_ns=fut_end_ms * 1_000_000,
+                ),
+                verified_prereg_sha256=tampered_sha,
+                verified_segment_digests=_sample_seg_digests(),
+                verified_engine_digests=_sample_eng_digests(),
+                external_witness=fut_wit,
+                trusted_tsa_ca_path=ca_cert,
+            )
+            self.assertEqual(tampered_rep["verdict"], "NO_GO")
+            self.assertFalse(tampered_rep["provenance"]["checks"]["independent_preregistration_witness_verified"])
+            self.assertIsNone(tampered_rep["provenance"]["witness_time_ms"])
+
+            # Post-window TSA timestamp (witness_time > decision_start) -> NO_GO
+            past_prereg = _sample_ant_prereg(
+                frozen_at_ms=past_start_ms - 60_000,
+                decision_start_ms=past_start_ms,
+                decision_end_ms=past_end_ms,
+                expected_rth_date_et=prev_mon.isoformat(),
+            )
+            past_path = root / "past_prereg.json"
+            past_path.write_text(json.dumps(past_prereg, sort_keys=True) + "\n", encoding="utf-8")
+            past_sha = hashlib.sha256(past_path.read_bytes()).hexdigest()
+            past_tsq = root / "past.tsq"
+            past_tsr = root / "past.tsr"
+            past_wit_path = root / "past_witness.json"
+            create_witness_query(prereg_manifest_path=past_path, output=past_tsq)
+            self._issue_tsr(ts_cnf, past_tsq, past_tsr)
+            wrap_witness_receipt(prereg_manifest_path=past_path, tsr_path=past_tsr, output=past_wit_path)
+            past_wit = json.loads(past_wit_path.read_text(encoding="utf-8"))
+
+            late_rep = evaluate_rth_ant_gate(
+                _sample_ant_window(start_ms=past_start_ms, end_ms=past_end_ms),
+                role="monday_rth_oos",
+                prereg_manifest=past_prereg,
+                seal_receipt=_sample_seal_receipt(
+                    past_sha,
+                    sealed_at_ms=past_end_ms + 60_000,
+                    archive_first_rx_ns=past_start_ms * 1_000_000,
+                    archive_last_rx_ns=past_end_ms * 1_000_000,
+                ),
+                verified_prereg_sha256=past_sha,
+                verified_segment_digests=_sample_seg_digests(),
+                verified_engine_digests=_sample_eng_digests(),
+                external_witness=past_wit,
+                trusted_tsa_ca_path=ca_cert,
+            )
+            self.assertEqual(late_rep["verdict"], "NO_GO")
+            self.assertTrue(late_rep["provenance"]["structural_checks_passed"])
+            self.assertFalse(late_rep["provenance"]["qualified"])
+            self.assertFalse(late_rep["provenance"]["checks"]["independent_preregistration_witness_verified"])
+            self.assertIsNone(late_rep["provenance"]["witness_time_ms"])
+
+    def test_w15_rwa_formal_replay_receipt_end_to_end_and_tamper_checks(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        start_ms = MON_RTH_START_MS
+        end_ms = MON_RTH_END_MS
+        ms_ns = 1_000_000
+        start_ns = start_ms * ms_ns
+        end_ns = end_ms * ms_ns
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cap_dir = root / "capture_w15"
+            cap_dir.mkdir()
+            seg_path = cap_dir / "tokyo-research-w15.seg000.ndjson.gz"
+            events = [
+                # Pre-window SPY book that must be filtered out
+                {
+                    "event": "message",
+                    "source": "lighter",
+                    "capture_timing": {"available_wall_ns": start_ns - ms_ns, "connection_epoch": 1},
+                    "payload": {
+                        "channel": "order_book:128",
+                        "type": "subscribed/order_book",
+                        "order_book": {"bids": [{"price": "500.00", "size": "10"}], "asks": [{"price": "500.10", "size": "10"}]},
+                    },
+                },
+                # In-window SPY book
+                {
+                    "event": "message",
+                    "source": "lighter",
+                    "capture_timing": {"available_wall_ns": start_ns, "connection_epoch": 1},
+                    "payload": {
+                        "channel": "order_book:128",
+                        "type": "subscribed/order_book",
+                        "order_book": {"bids": [{"price": "500.00", "size": "10"}], "asks": [{"price": "500.10", "size": "10"}]},
+                    },
+                },
+                # Post-window boundary event at exact end_ns (half-open excludes end_ns)
+                {
+                    "event": "message",
+                    "source": "lighter",
+                    "capture_timing": {"available_wall_ns": end_ns, "connection_epoch": 1},
+                    "payload": {
+                        "channel": "order_book:128",
+                        "type": "update/order_book",
+                        "order_book": {"bids": [{"price": "500.01", "size": "10"}], "asks": [{"price": "500.11", "size": "10"}]},
+                    },
+                },
+            ]
+            with gzip.open(seg_path, "wt", encoding="utf-8") as handle:
+                for ev in events:
+                    handle.write(json.dumps(ev) + "\n")
+
+            sim_out = root / "sim_bounded.json"
+            with patch("sys.stdout", new_callable=io.StringIO):
+                sim_rc = sim_rwa_cli_main([
+                    "--input", str(seg_path),
+                    "--output", str(sim_out),
+                    "--decision-start-ms", str(start_ms),
+                    "--decision-end-ms", str(end_ms),
+                    "--emit-formal-receipt",
+                ])
+            self.assertEqual(sim_rc, 0)
+            sim_res = json.loads(sim_out.read_text(encoding="utf-8"))
+            self.assertEqual(sim_res["markets"]["SPY"]["core_books"], 1)
+            self.assertIn("formal_replay_receipt", sim_res)
+            self.assertEqual(sim_res["formal_replay_receipt"]["schema"], "aleph_tx_w15_rwa_replay_receipt_v1")
+
+            # Build gate-passing 6-market summary with real receipt bound to seg_path + seal_receipt
+            seg_sha = hashlib.sha256(seg_path.read_bytes()).hexdigest()
+            seal_path = root / "seal_receipt.json"
+            seal_path.write_text(
+                json.dumps({"segment_sha256": {f"{cap_dir.name}/{seg_path.name}": seg_sha}}, indent=2),
+                encoding="utf-8",
+            )
+
+            summary = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
+            summary["formal_replay_receipt"] = build_formal_replay_receipt(
+                summary,
+                input_path=seg_path,
+                decision_start_ms=start_ms,
+                decision_end_ms=end_ms,
+                repo_root=repo_root,
+            )
+            summary_path = root / "rwa_formal_summary.json"
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            gate_out = root / "gate_out.json"
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "w15-rwa",
+                    "--role",
+                    "formal",
+                    "--rwa-summary-json",
+                    str(summary_path),
+                    "--seal-receipt",
+                    str(seal_path),
+                    "--output",
+                    str(gate_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_ok = cli_main()
+            self.assertEqual(rc_ok, 0)
+            rep_ok = json.loads(gate_out.read_text(encoding="utf-8"))
+            self.assertEqual(rep_ok["verdict"], "GO_HEDGED")
+            self.assertIs(rep_ok["formal_admission"], True)
+            self.assertIs(rep_ok["receipt_verified"], True)
+            self.assertTrue(all(rep_ok["receipt_checks"].values()))
+
+            # Tamper payload, method hash, segment hash, and 10h window -> NO_GO (exit 1)
+            for label, mutator, failed_check in (
+                (
+                    "tampered_payload",
+                    lambda s: s["markets"]["SPY"]["arms"]["CORE_HEDGE_SELF_PULL05_C310"].update({"terminal_liq_cash_usd": 1.0}),
+                    "payload_sha256_verified",
+                ),
+                (
+                    "tampered_method_hash",
+                    lambda s: s["formal_replay_receipt"]["frozen_method_sha256"].update({"scripts/sim_lighter_core_rwa_maker.py": "0" * 64}),
+                    "frozen_method_hashes_verified",
+                ),
+                (
+                    "tampered_segment_hash",
+                    lambda s: s["formal_replay_receipt"]["sealed_input_sha256"].update({seg_path.name: "0" * 64}),
+                    "sealed_input_hashes_verified",
+                ),
+                (
+                    "tampered_window_span",
+                    lambda s: s["formal_replay_receipt"].update({"decision_end_ms": start_ms + 3_600_000}),
+                    "exact_10h_decision_window",
+                ),
+            ):
+                with self.subTest(case=label):
+                    tampered = json.loads(json.dumps(summary))
+                    mutator(tampered)
+                    t_path = root / f"{label}.json"
+                    t_path.write_text(json.dumps(tampered), encoding="utf-8")
+                    with patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "run_oos_validation_gate.py",
+                            "w15-rwa",
+                            "--role",
+                            "formal",
+                            "--rwa-summary-json",
+                            str(t_path),
+                            "--seal-receipt",
+                            str(seal_path),
+                            "--output",
+                            str(gate_out),
+                        ],
+                    ), patch("sys.stdout", new_callable=io.StringIO):
+                        rc_bad = cli_main()
+                    self.assertEqual(rc_bad, 1)
+                    rep_bad = json.loads(gate_out.read_text(encoding="utf-8"))
+                    self.assertEqual(rep_bad["verdict"], "NO_GO")
+                    self.assertIs(rep_bad["formal_admission"], False)
+                    self.assertEqual(rep_bad["reason"], "invalid_formal_replay_receipt")
+                    self.assertFalse(rep_bad["receipt_checks"][failed_check])
+
+            # Legacy summary without formal_replay_receipt -> FORMAL_WITHHELD (exit 2)
+            legacy = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
+            legacy_path = root / "legacy.json"
+            legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "w15-rwa",
+                    "--role",
+                    "formal",
+                    "--rwa-summary-json",
+                    str(legacy_path),
+                    "--seal-receipt",
+                    str(seal_path),
+                    "--output",
+                    str(gate_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_leg = cli_main()
+            self.assertEqual(rc_leg, 2)
+            rep_leg = json.loads(gate_out.read_text(encoding="utf-8"))
+            self.assertEqual(rep_leg["verdict"], "FORMAL_WITHHELD")
+            self.assertIs(rep_leg["formal_admission"], False)
+            self.assertEqual(rep_leg["reason"], "missing_registered_cost_replay_receipt")
+
+            # Valid formal receipt but threshold != 20.0 -> FORMAL_WITHHELD (exit 2)
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "w15-rwa",
+                    "--role",
+                    "formal",
+                    "--max-cost-per-million",
+                    "25.0",
+                    "--rwa-summary-json",
+                    str(summary_path),
+                    "--seal-receipt",
+                    str(seal_path),
+                    "--output",
+                    str(gate_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_thr = cli_main()
+            self.assertEqual(rc_thr, 2)
+            self.assertEqual(json.loads(gate_out.read_text(encoding="utf-8"))["reason"], "formal_threshold_must_be_20")
+
+            # Valid formal receipt with failing economics -> formal_admission=True, verdict=NO_GO, exit 1
+            nogo_summary = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-15.0)
+            nogo_summary["formal_replay_receipt"] = build_formal_replay_receipt(
+                nogo_summary,
+                input_path=seg_path,
+                decision_start_ms=start_ms,
+                decision_end_ms=end_ms,
+                repo_root=repo_root,
+            )
+            nogo_path = root / "rwa_formal_nogo.json"
+            nogo_path.write_text(json.dumps(nogo_summary), encoding="utf-8")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "w15-rwa",
+                    "--role",
+                    "formal",
+                    "--rwa-summary-json",
+                    str(nogo_path),
+                    "--seal-receipt",
+                    str(seal_path),
+                    "--output",
+                    str(gate_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_nogo = cli_main()
+            self.assertEqual(rc_nogo, 1)
+            rep_nogo = json.loads(gate_out.read_text(encoding="utf-8"))
+            self.assertEqual(rep_nogo["verdict"], "NO_GO")
+            self.assertIs(rep_nogo["formal_admission"], True)
+            self.assertIs(rep_nogo["receipt_verified"], True)
+
+            # Ambiguous basename across two sealed dirs -> invalid_formal_replay_receipt (exit 1)
+            ambig_seal = root / "ambig_seal.json"
+            ambig_seal.write_text(
+                json.dumps(
+                    {
+                        "segment_sha256": {
+                            f"dir_a/{seg_path.name}": seg_sha,
+                            f"dir_b/{seg_path.name}": seg_sha,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "w15-rwa",
+                    "--role",
+                    "formal",
+                    "--rwa-summary-json",
+                    str(summary_path),
+                    "--seal-receipt",
+                    str(ambig_seal),
+                    "--output",
+                    str(gate_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_ambig = cli_main()
+            self.assertEqual(rc_ambig, 1)
+            rep_ambig = json.loads(gate_out.read_text(encoding="utf-8"))
+            self.assertEqual(rep_ambig["reason"], "invalid_formal_replay_receipt")
+            self.assertFalse(rep_ambig["receipt_checks"]["sealed_input_hashes_verified"])
+
+            # --emit-formal-receipt without bounds fails CLI argument validation
+            for bad_args in (
+                ["--input", str(seg_path), "--output", str(sim_out), "--emit-formal-receipt"],
+                ["--input", str(seg_path), "--output", str(sim_out), "--decision-start-ms", str(start_ms)],
+            ):
+                with self.subTest(bad_args=bad_args), patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as ctx:
+                    sim_rwa_cli_main(bad_args)
+                self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":
