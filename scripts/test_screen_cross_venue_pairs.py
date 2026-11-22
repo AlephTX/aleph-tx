@@ -21,8 +21,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
+    from scripts.audit_account_fees import (
+        audit_account_fees,
+        build_embedded_self_test_fixtures as build_account_fee_fixtures,
+    )
     from scripts.screen_cross_venue_pairs import (
+        ACCOUNT_FEE_STATUS_PUBLIC_TIER0,
+        ACCOUNT_FEE_STATUS_PUBLIC_UNVERIFIED,
         ACCOUNT_FEE_STATUS_UNKNOWN,
+        ACCOUNT_FEE_STATUS_VERIFIED,
         DOMAIN_COIN_M,
         DOMAIN_CRYPTO_QUOTE,
         DOMAIN_U,
@@ -31,6 +38,7 @@ try:
         DOMAIN_USDH,
         DOMAIN_USDT,
         DOMAIN_USD_USDC,
+        EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA,
         SUPPORTED_VENUES,
         build_embedded_self_test_snapshot,
         canonicalize_market,
@@ -39,8 +47,15 @@ try:
         screen_pairs,
     )
 except ImportError:
+    from audit_account_fees import (
+        audit_account_fees,
+        build_embedded_self_test_fixtures as build_account_fee_fixtures,
+    )
     from screen_cross_venue_pairs import (
+        ACCOUNT_FEE_STATUS_PUBLIC_TIER0,
+        ACCOUNT_FEE_STATUS_PUBLIC_UNVERIFIED,
         ACCOUNT_FEE_STATUS_UNKNOWN,
+        ACCOUNT_FEE_STATUS_VERIFIED,
         DOMAIN_COIN_M,
         DOMAIN_CRYPTO_QUOTE,
         DOMAIN_U,
@@ -49,6 +64,7 @@ except ImportError:
         DOMAIN_USDH,
         DOMAIN_USDT,
         DOMAIN_USD_USDC,
+        EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA,
         SUPPORTED_VENUES,
         build_embedded_self_test_snapshot,
         canonicalize_market,
@@ -595,6 +611,316 @@ class ScreenCrossVenuePairsTests(unittest.TestCase):
                     if isinstance(node, ast.Attribute) and node.attr in ("environ", "environb", "getenv"):
                         env_refs.add(func.name)
         self.assertEqual(env_refs, {"_build_ssl_context", "__enter__", "__exit__"})
+
+    def test_account_fee_evidence_integration_growth_mode_standard_and_fail_closed_unverified(self) -> None:
+        snap = build_embedded_self_test_snapshot()
+        # Add xyz:NVDA (standard growthMode=disabled, scale=2) and Arcus NVDA-USD + HL SOL + xyz:SOL to test both legs verified
+        snap["venues"]["arcus"]["markets"].append(
+            {
+                "symbol": "NVDA-USD",
+                "tick_size": "0.01",
+                "step_size": "0.001",
+                "min_notional": "5",
+                "max_leverage": 10.0,
+                "public_fee_evidence": {
+                    "source": "/v1/markets/feeSchedules",
+                    "tiers": [{"level": 0, "maker_fee_bps": "0", "taker_fee_bps": "2.25"}],
+                },
+            }
+        )
+        snap["venues"]["trade_xyz"]["markets"].append(
+            {
+                "symbol": "xyz:NVDA",
+                "tick_size": "0.01",
+                "step_size": "0.001",
+                "min_notional": None,
+                "max_leverage": 10.0,
+                "public_fee_evidence": {
+                    "source": "perpDexs+metaAndAssetCtxs",
+                    "dex": "xyz",
+                    "collateral_token": 0,
+                    "deployer_fee_scale": "2",
+                    "growth_mode": "disabled",
+                    "is_delisted": False,
+                },
+            }
+        )
+        snap["venues"]["hyperliquid"]["markets"].append(
+            {
+                "symbol": "SOL",
+                "tick_size": "0.01",
+                "step_size": "0.01",
+                "min_notional": None,
+                "max_leverage": 20.0,
+                "public_fee_evidence": {"status": "not_exposed_in_public_endpoint"},
+            }
+        )
+        snap["venues"]["trade_xyz"]["markets"].append(
+            {
+                "symbol": "xyz:SOL",
+                "tick_size": "0.01",
+                "step_size": "0.01",
+                "min_notional": None,
+                "max_leverage": 20.0,
+                "public_fee_evidence": {
+                    "source": "perpDexs+metaAndAssetCtxs",
+                    "dex": "xyz",
+                    "collateral_token": 0,
+                    "deployer_fee_scale": "1",
+                    "growth_mode": "enabled",
+                    "is_delisted": False,
+                },
+            }
+        )
+
+        # Build realistic account fee evidence directly from audit_account_fees()
+        acct_fixtures = build_account_fee_fixtures()
+        acct_fixtures["trade_xyz"]["userFees"]["userAddRate"] = "0.000144"
+        acct_fixtures["trade_xyz"]["userFees"]["userCrossRate"] = "0.000432"
+        evidence = audit_account_fees(
+            SUPPORTED_VENUES,
+            live=False,
+            fixtures=acct_fixtures,
+            audited_at_utc="2026-11-22T00:00:00+00:00",
+        )
+
+        res = screen_pairs(snap, allow_usdt_cross_quote=True, account_fee_evidence=evidence)
+        self.assertEqual(res["options"]["account_fee_evidence_schema"], EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA)
+        self.assertEqual(res["summary"]["account_fee_status"], "partial_verified_account_tier")
+        self.assertEqual(res["summary"]["verified_account_fee_venues"], ["hyperliquid", "trade_xyz"])
+
+        # 1) Arcus BTC (1.5 / 4.5) + Hyperliquid verified BTC (1.44 / 4.32):
+        #    min MT = min(1.5 + 4.32, 1.44 + 4.5) = 5.82 -> RT = 11.64; DT = 4.5 + 4.32 = 8.82 -> RT = 17.64
+        btc_arc_hl = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "BTC" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "hyperliquid"}
+        )
+        self.assertEqual(btc_arc_hl["fee_completeness"], "mixed_verified_account_and_public_l0")
+        self.assertEqual(btc_arc_hl["round_trip_maker_taker_bps"], 11.64)
+        self.assertEqual(btc_arc_hl["round_trip_dual_taker_bps"], 17.64)
+        hl_leg = btc_arc_hl["leg_b"] if btc_arc_hl["leg_b"]["venue"] == "hyperliquid" else btc_arc_hl["leg_a"]
+        self.assertEqual(hl_leg["account_fee_status"], ACCOUNT_FEE_STATUS_VERIFIED)
+        self.assertEqual(hl_leg["fee_provenance"], "verified_account_fee_evidence")
+
+        # 2) Arcus ANT (0 / 1.12) + TradeXYZ xyz:ANT (growthMode=enabled, scale=1, base 1.44/4.32 -> 0.288 / 0.864)
+        ant_arc_xyz = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "ANT" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "trade_xyz"}
+        )
+        self.assertEqual(ant_arc_xyz["fee_completeness"], "mixed_verified_account_and_public_l0")
+        self.assertEqual(ant_arc_xyz["round_trip_maker_taker_bps"], 1.728)
+        self.assertEqual(ant_arc_xyz["round_trip_dual_taker_bps"], 3.968)
+        xyz_ant_leg = ant_arc_xyz["leg_b"] if ant_arc_xyz["leg_b"]["venue"] == "trade_xyz" else ant_arc_xyz["leg_a"]
+        self.assertEqual(xyz_ant_leg["maker_fee_bps"], "0.288")
+        self.assertEqual(xyz_ant_leg["taker_fee_bps"], "0.864")
+        self.assertEqual(xyz_ant_leg["account_fee_status"], ACCOUNT_FEE_STATUS_VERIFIED)
+
+        # 3) Arcus NVDA (0 / 2.25) + TradeXYZ xyz:NVDA (growthMode=disabled, scale=2 -> scale_factor=4 -> 5.76 / 17.28)
+        nvda_arc_xyz = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "NVDA" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "trade_xyz"}
+        )
+        xyz_nvda_leg = nvda_arc_xyz["leg_b"] if nvda_arc_xyz["leg_b"]["venue"] == "trade_xyz" else nvda_arc_xyz["leg_a"]
+        self.assertEqual(xyz_nvda_leg["maker_fee_bps"], "5.76")
+        self.assertEqual(xyz_nvda_leg["taker_fee_bps"], "17.28")
+        # min MT = min(0 + 17.28, 5.76 + 2.25) = 8.01 -> RT = 16.02 (maker_first_trade_xyz)
+        self.assertEqual(nvda_arc_xyz["recommended_topology"], "maker_first_trade_xyz")
+        self.assertEqual(nvda_arc_xyz["round_trip_maker_taker_bps"], 16.02)
+        self.assertEqual(nvda_arc_xyz["round_trip_dual_taker_bps"], 39.06)
+
+        # 4) Hyperliquid SOL (1.44 / 4.32) + TradeXYZ xyz:SOL (0.288 / 0.864) -> BOTH legs verified_account_tier!
+        sol_hl_xyz = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "SOL" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"hyperliquid", "trade_xyz"}
+        )
+        self.assertEqual(sol_hl_xyz["fee_completeness"], "verified_account_tier_both_legs")
+        # min MT = min(1.44 + 0.864, 0.288 + 4.32) = 2.304 -> RT = 4.608; DT = 4.32 + 0.864 = 5.184 -> RT = 10.368
+        self.assertEqual(sol_hl_xyz["round_trip_maker_taker_bps"], 4.608)
+        self.assertEqual(sol_hl_xyz["round_trip_dual_taker_bps"], 10.368)
+
+        # 5) Unverified Lighter (public_schedule_only_unverified_account_tier) & Binance stay None / unknown
+        for p in res["pairs"]:
+            legs = (p["leg_a"], p["leg_b"])
+            if any(leg["venue"] in ("lighter", "binance", "okx", "backpack", "extended", "bulk") for leg in legs):
+                self.assertIsNone(p["round_trip_maker_taker_bps"], msg=p["pair_id"])
+                self.assertIsNone(p["round_trip_dual_taker_bps"], msg=p["pair_id"])
+                for leg in legs:
+                    if leg["venue"] in ("lighter", "binance"):
+                        self.assertIsNone(leg["maker_fee_bps"], msg=leg)
+                        self.assertIsNone(leg["taker_fee_bps"], msg=leg)
+                        self.assertEqual(leg["account_fee_status"], ACCOUNT_FEE_STATUS_UNKNOWN)
+
+        # 6) When Lighter IS verified_account_tier, Lighter pairs compute round-trip fees cleanly
+        lgt_verified_ev = copy.deepcopy(evidence)
+        lgt_verified_ev["venues"]["lighter"] = {
+            "venue": "lighter",
+            "account_fee_status": ACCOUNT_FEE_STATUS_VERIFIED,
+            "maker_fee_bps": "0.4",
+            "taker_fee_bps": "2.8",
+        }
+        res_lgt = screen_pairs(snap, venues=["arcus", "lighter"], account_fee_evidence=lgt_verified_ev)
+        ant_arc_lgt = next(p for p in res_lgt["pairs"] if p["canonical_base"] == "ANT")
+        self.assertEqual(ant_arc_lgt["fee_completeness"], "mixed_verified_account_and_public_l0")
+        # Lighter is maker_first due to 300ms speed bump -> 0.4 + 1.12 = 1.52 -> RT = 3.04; DT = 2.8 + 1.12 = 3.92 -> RT = 7.84
+        self.assertEqual(ant_arc_lgt["round_trip_maker_taker_bps"], 3.04)
+        self.assertEqual(ant_arc_lgt["round_trip_dual_taker_bps"], 7.84)
+
+    def test_live_probe_carry_and_break_even_hours_with_account_fee_evidence(self) -> None:
+        snap = build_embedded_self_test_snapshot()
+        evidence = audit_account_fees(
+            SUPPORTED_VENUES,
+            live=False,
+            fixtures=build_account_fee_fixtures(),
+            audited_at_utc="2026-11-22T00:00:00+00:00",
+        )
+
+        def fake_fetcher(url: str, *, method: str = "GET", body: dict | None = None) -> bytes:
+            if url == "https://api.arcus.xyz/v1/markets":
+                return json.dumps(
+                    {
+                        "markets": [
+                            {"marketDisplayName": "ANT-USD", "markPrice": "100.0", "fundingRate": "0.00015"},
+                            {"marketDisplayName": "BTC-USD", "markPrice": "90000.0", "fundingRate": "0.00001"},
+                        ]
+                    }
+                ).encode("utf-8")
+            if url == "https://api.hyperliquid.xyz/info" and body == {"type": "metaAndAssetCtxs", "dex": "xyz"}:
+                return json.dumps(
+                    [
+                        {"universe": [{"name": "xyz:ANT", "isDelisted": False}]},
+                        [{"midPx": "100.1", "funding": "0.00002"}],
+                    ]
+                ).encode("utf-8")
+            if url == "https://api.hyperliquid.xyz/info" and body == {"type": "metaAndAssetCtxs"}:
+                return json.dumps(
+                    [
+                        {"universe": [{"name": "BTC"}]},
+                        [{"midPx": "90010.0", "funding": "0.00006"}],
+                    ]
+                ).encode("utf-8")
+            if url == "https://mainnet.zklighter.elliot.ai/api/v1/funding-rates":
+                return json.dumps(
+                    {
+                        "code": 200,
+                        "funding_rates": [
+                            {"market_id": 150, "exchange": "lighter", "symbol": "ANT", "rate": 0.0008},
+                        ],
+                    }
+                ).encode("utf-8")
+            if url == "https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails":
+                return json.dumps(
+                    {
+                        "code": 200,
+                        "order_book_details": [
+                            {"symbol": "ANT", "market_id": 150, "market_type": "perp", "status": "active", "last_trade_price": 100.0}
+                        ],
+                    }
+                ).encode("utf-8")
+            raise AssertionError(f"unexpected {url}")
+
+        res = screen_pairs(
+            snap,
+            venues=["arcus", "hyperliquid", "trade_xyz", "lighter"],
+            live_funding_probe=True,
+            probe_fetcher=fake_fetcher,
+            account_fee_evidence=evidence,
+        )
+        # Arcus ANT (0/1.12) + xyz:ANT (0.3/0.9): RT MT = 1.8, RT DT = 4.04; f_diff = |1.5 - 0.2| = 1.3 bps/hr
+        ant_arc_xyz = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "ANT" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "trade_xyz"}
+        )
+        lp = ant_arc_xyz["live_probe"]
+        self.assertAlmostEqual(lp["net_7d_carry_maker_taker_bps"], 216.6, places=4)
+        self.assertAlmostEqual(lp["net_7d_carry_dual_taker_bps"], 214.36, places=4)
+        self.assertAlmostEqual(lp["break_even_hours_maker_taker"], 1.8 / 1.3, places=3)
+        self.assertAlmostEqual(lp["break_even_hours_dual_taker"], 4.04 / 1.3, places=3)
+
+        # Arcus BTC (1.5/4.5) + HL BTC (1.44/4.32): RT MT = 11.64, RT DT = 17.64; f_diff = |0.1 - 0.6| = 0.5 bps/hr
+        btc_arc_hl = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "BTC" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "hyperliquid"}
+        )
+        lp_hl = btc_arc_hl["live_probe"]
+        self.assertAlmostEqual(lp_hl["net_7d_carry_maker_taker_bps"], 0.5 * 168.0 - 11.64, places=4)
+        self.assertAlmostEqual(lp_hl["break_even_hours_maker_taker"], 11.64 / 0.5, places=3)
+
+        # Unverified Lighter keeps break_even_hours and net_7d_carry = None
+        ant_arc_lgt = next(
+            p
+            for p in res["pairs"]
+            if p["canonical_base"] == "ANT" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "lighter"}
+        )
+        self.assertIsNone(ant_arc_lgt["live_probe"]["net_7d_carry_maker_taker_bps"])
+        self.assertIsNone(ant_arc_lgt["live_probe"]["break_even_hours_maker_taker"])
+
+    def test_cli_account_fee_evidence_and_rejects_malformed_or_wrong_schema(self) -> None:
+        snap = build_embedded_self_test_snapshot()
+        evidence = audit_account_fees(
+            SUPPORTED_VENUES,
+            live=False,
+            fixtures=build_account_fee_fixtures(),
+            audited_at_utc="2026-11-22T00:00:00+00:00",
+        )
+
+        # Reject malformed / wrong schema in screen_pairs
+        for bad_ev in (
+            [],
+            {},
+            {"schema_version": "wrong_v0", "venues": {}},
+            {"schema_version": EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA, "venues": {}},
+            {
+                "schema_version": EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA,
+                "venues": {"hyperliquid": {"account_fee_status": ACCOUNT_FEE_STATUS_VERIFIED, "maker_fee_bps": None}},
+            },
+            {
+                "schema_version": EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA,
+                "venues": {
+                    "trade_xyz": {
+                        "account_fee_status": ACCOUNT_FEE_STATUS_VERIFIED,
+                        "base_maker_fee_bps": "-0.1",
+                        "base_taker_fee_bps": "4.5",
+                    }
+                },
+            },
+        ):
+            with self.subTest(bad_ev=bad_ev):
+                with self.assertRaises(ValueError):
+                    screen_pairs(snap, account_fee_evidence=bad_ev)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            snap_path = tmp_path / "snap.json"
+            ev_path = tmp_path / "ev.json"
+            bad_ev_path = tmp_path / "bad_ev.json"
+            snap_path.write_text(json.dumps(snap), encoding="utf-8")
+            ev_path.write_text(json.dumps(evidence), encoding="utf-8")
+            bad_ev_path.write_text(json.dumps({"schema_version": "bad", "venues": {}}), encoding="utf-8")
+
+            code_ok, out_ok, err_ok = _run_cli(
+                ["--snapshot", str(snap_path), "--account-fee-evidence", str(ev_path)]
+            )
+            self.assertEqual(code_ok, 0, msg=err_ok)
+            doc = json.loads(out_ok)
+            self.assertEqual(doc["options"]["account_fee_evidence_schema"], EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA)
+
+            code_bad, _, err_bad = _run_cli(
+                ["--snapshot", str(snap_path), "--account-fee-evidence", str(bad_ev_path)]
+            )
+            self.assertEqual(code_bad, 2)
+            self.assertIn("schema_version", err_bad)
+
+            code_st_ev, _, err_st_ev = _run_cli(
+                ["--self-test", "--account-fee-evidence", str(ev_path)]
+            )
+            self.assertEqual(code_st_ev, 2)
+            self.assertIn("--account-fee-evidence", err_st_ev)
 
 
 if __name__ == "__main__":

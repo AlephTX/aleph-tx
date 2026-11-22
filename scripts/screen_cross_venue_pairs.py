@@ -29,7 +29,11 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 SCHEMA_VERSION = "cross_venue_pair_screener_v1"
 EXPECTED_INPUT_SCHEMA = "opt01_venue_spec_audit_v1"
+EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA = "aleph_account_fee_evidence_v1"
 ACCOUNT_FEE_STATUS_UNKNOWN = "unknown_requires_account_evidence"
+ACCOUNT_FEE_STATUS_VERIFIED = "verified_account_tier"
+ACCOUNT_FEE_STATUS_PUBLIC_TIER0 = "public_tier0_schedule_only"
+ACCOUNT_FEE_STATUS_PUBLIC_UNVERIFIED = "public_schedule_only_unverified_account_tier"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 15.0
 DEFAULT_TOP_N = 50
@@ -420,6 +424,198 @@ def _infer_asset_class_hint(
     if venue == "trade_xyz":
         return "equity"
     return "crypto"
+
+
+def _compute_hip3_fees_bps(
+    base_maker_bps: Decimal,
+    base_taker_bps: Decimal,
+    deployer_fee_scale: Decimal,
+    growth_mode_enabled: bool,
+) -> tuple[Decimal, Decimal]:
+    """Derive effective HIP-3 maker/taker bps matching `src/venues.rs::compute_hip3_execution_fees`."""
+    if base_maker_bps < Decimal("0") or base_taker_bps < Decimal("0"):
+        raise ValueError("HIP-3 base fees must be nonnegative")
+    if deployer_fee_scale < Decimal("0") or deployer_fee_scale > Decimal("5"):
+        raise ValueError("HIP-3 deployer_fee_scale must lie in [0, 5]")
+    scale_factor = (
+        Decimal("1") + deployer_fee_scale
+        if deployer_fee_scale < Decimal("1")
+        else Decimal("2") * deployer_fee_scale
+    )
+    growth_factor = Decimal("0.10") if growth_mode_enabled else Decimal("1")
+    return (
+        (base_maker_bps * scale_factor * growth_factor).normalize(),
+        (base_taker_bps * scale_factor * growth_factor).normalize(),
+    )
+
+
+def _validate_account_fee_evidence(evidence: Any) -> dict[str, dict[str, Any]]:
+    """Validate an `aleph_account_fee_evidence_v1` payload and return its venues map."""
+    if not isinstance(evidence, dict):
+        raise ValueError("account_fee_evidence must be a JSON object")
+    if evidence.get("schema_version") != EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA:
+        raise ValueError(
+            f"unsupported account_fee_evidence schema_version {evidence.get('schema_version')!r}; "
+            f"expected {EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA!r}"
+        )
+    venues_obj = evidence.get("venues")
+    if not isinstance(venues_obj, dict) or not venues_obj:
+        raise ValueError("account_fee_evidence missing non-empty 'venues' mapping")
+
+    validated: dict[str, dict[str, Any]] = {}
+    for venue_name, row in venues_obj.items():
+        if not isinstance(venue_name, str) or not isinstance(row, dict):
+            raise ValueError(f"invalid venue record in account_fee_evidence for {venue_name!r}")
+        status = row.get("account_fee_status")
+        if not isinstance(status, str) or not status.strip():
+            raise ValueError(f"missing account_fee_status for {venue_name!r} in account_fee_evidence")
+        if status == ACCOUNT_FEE_STATUS_VERIFIED:
+            if row.get("status") == "error":
+                raise ValueError(f"inconsistent error status with verified_account_tier for {venue_name!r}")
+            if venue_name == "trade_xyz":
+                base_m = _parse_optional_decimal(row.get("base_maker_fee_bps"))
+                base_t = _parse_optional_decimal(row.get("base_taker_fee_bps"))
+                has_base = base_m is not None and base_t is not None
+                if (base_m is None) != (base_t is None):
+                    raise ValueError("trade_xyz verified evidence requires both base_maker_fee_bps and base_taker_fee_bps")
+                if has_base and (base_m < Decimal("0") or base_t < Decimal("0")):  # type: ignore[operator]
+                    raise ValueError("trade_xyz base fees must be nonnegative")
+                if row.get("deployer_fee_scale") is not None:
+                    scale_dec = _parse_optional_decimal(row.get("deployer_fee_scale"))
+                    if scale_dec is None or scale_dec < Decimal("0") or scale_dec > Decimal("5"):
+                        raise ValueError("trade_xyz deployer_fee_scale must lie in [0, 5]")
+                std_m = _parse_optional_decimal(row.get("standard_maker_fee_bps"))
+                std_t = _parse_optional_decimal(row.get("standard_taker_fee_bps"))
+                gm_m = _parse_optional_decimal(row.get("growth_mode_maker_fee_bps"))
+                gm_t = _parse_optional_decimal(row.get("growth_mode_taker_fee_bps"))
+                def_m = _parse_optional_decimal(row.get("maker_fee_bps"))
+                def_t = _parse_optional_decimal(row.get("taker_fee_bps"))
+                has_split = all(v is not None for v in (std_m, std_t, gm_m, gm_t))
+                has_default = def_m is not None and def_t is not None
+                if not (has_base or has_split or has_default):
+                    raise ValueError(
+                        "trade_xyz verified account_fee_evidence requires base_* or standard_*/growth_mode_* or maker/taker fees"
+                    )
+            else:
+                m_dec = _parse_optional_decimal(row.get("maker_fee_bps"))
+                t_dec = _parse_optional_decimal(row.get("taker_fee_bps"))
+                if m_dec is None or t_dec is None:
+                    raise ValueError(
+                        f"verified_account_tier for {venue_name!r} requires numeric maker_fee_bps and taker_fee_bps"
+                    )
+        validated[venue_name] = row
+    return validated
+
+
+def _apply_account_fee_evidence(canon: dict[str, Any], venue_evidence: dict[str, Any] | None) -> None:
+    """Apply verified account fee-tier overrides or fail closed unverified account tiers."""
+    venue = canon["venue"]
+    ev = venue_evidence if isinstance(venue_evidence, dict) else {}
+    ev_status = ev.get("account_fee_status")
+
+    if ev_status == ACCOUNT_FEE_STATUS_VERIFIED:
+        if venue == "trade_xyz":
+            fe = canon.get("public_fee_evidence") if isinstance(canon.get("public_fee_evidence"), dict) else {}
+            growth_mode = fe.get("growth_mode")
+            if growth_mode not in (None, "enabled", "disabled"):
+                canon["maker_fee_bps"] = None
+                canon["taker_fee_bps"] = None
+                canon["fee_basis"] = "invalid_growth_mode"
+                canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+                canon["fee_provenance"] = "failed_closed_invalid_growth_mode"
+                return
+            growth_enabled = growth_mode == "enabled"
+            raw_scale = fe.get("deployer_fee_scale")
+            if raw_scale is None:
+                raw_scale = fe.get("dex_deployer_fee_scale")
+            if raw_scale is None:
+                raw_scale = ev.get("deployer_fee_scale")
+            market_scale = _parse_optional_decimal(raw_scale)
+            base_maker = _parse_optional_decimal(ev.get("base_maker_fee_bps"))
+            base_taker = _parse_optional_decimal(ev.get("base_taker_fee_bps"))
+
+            if (
+                base_maker is not None
+                and base_taker is not None
+                and base_maker >= Decimal("0")
+                and base_taker >= Decimal("0")
+                and market_scale is not None
+                and Decimal("0") <= market_scale <= Decimal("5")
+            ):
+                m_bps, t_bps = _compute_hip3_fees_bps(base_maker, base_taker, market_scale, growth_enabled)
+                canon["maker_fee_bps"] = _format_decimal(m_bps)
+                canon["taker_fee_bps"] = _format_decimal(t_bps)
+                canon["fee_basis"] = (
+                    "hip3_growth_mode_verified_account_tier"
+                    if growth_enabled
+                    else "hip3_standard_verified_account_tier"
+                )
+                canon["account_fee_status"] = ACCOUNT_FEE_STATUS_VERIFIED
+                canon["fee_provenance"] = "verified_account_fee_evidence"
+                return
+
+            ev_scale = _parse_optional_decimal(ev.get("deployer_fee_scale"))
+            if market_scale is None or ev_scale is None or market_scale == ev_scale:
+                if growth_enabled:
+                    m_bps = _parse_optional_decimal(ev.get("growth_mode_maker_fee_bps"))
+                    t_bps = _parse_optional_decimal(ev.get("growth_mode_taker_fee_bps"))
+                    basis = "hip3_growth_mode_verified_account_tier"
+                else:
+                    m_bps = _parse_optional_decimal(ev.get("standard_maker_fee_bps"))
+                    t_bps = _parse_optional_decimal(ev.get("standard_taker_fee_bps"))
+                    basis = "hip3_standard_verified_account_tier"
+                if m_bps is None or t_bps is None:
+                    m_bps = _parse_optional_decimal(ev.get("maker_fee_bps"))
+                    t_bps = _parse_optional_decimal(ev.get("taker_fee_bps"))
+                    basis = "verified_account_fee_evidence"
+                if m_bps is not None and t_bps is not None:
+                    canon["maker_fee_bps"] = _format_decimal(m_bps)
+                    canon["taker_fee_bps"] = _format_decimal(t_bps)
+                    canon["fee_basis"] = basis
+                    canon["account_fee_status"] = ACCOUNT_FEE_STATUS_VERIFIED
+                    canon["fee_provenance"] = "verified_account_fee_evidence"
+                    return
+
+            canon["maker_fee_bps"] = None
+            canon["taker_fee_bps"] = None
+            canon["fee_basis"] = "unverified_hip3_scale_or_missing_fees"
+            canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+            canon["fee_provenance"] = "failed_closed_unverified_hip3_evidence"
+            return
+
+        m_bps = _parse_optional_decimal(ev.get("maker_fee_bps"))
+        t_bps = _parse_optional_decimal(ev.get("taker_fee_bps"))
+        if m_bps is not None and t_bps is not None:
+            canon["maker_fee_bps"] = _format_decimal(m_bps)
+            canon["taker_fee_bps"] = _format_decimal(t_bps)
+            canon["fee_basis"] = "verified_account_fee_evidence"
+            canon["account_fee_status"] = ACCOUNT_FEE_STATUS_VERIFIED
+            canon["fee_provenance"] = "verified_account_fee_evidence"
+            return
+
+        canon["maker_fee_bps"] = None
+        canon["taker_fee_bps"] = None
+        canon["fee_basis"] = "missing_verified_fee_fields"
+        canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+        canon["fee_provenance"] = "failed_closed_missing_verified_fees"
+        return
+
+    if venue == "arcus" and (ev_status == ACCOUNT_FEE_STATUS_PUBLIC_TIER0 or venue_evidence is None):
+        canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+        canon["fee_provenance"] = ev_status or ACCOUNT_FEE_STATUS_PUBLIC_TIER0
+        return
+
+    if venue == "trade_xyz" and venue_evidence is None:
+        canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+        canon["fee_provenance"] = "public_hip3_l0_derived_only"
+        return
+
+    # Unverified venues (including Lighter when public_schedule_only_unverified_account_tier) fail closed.
+    canon["maker_fee_bps"] = None
+    canon["taker_fee_bps"] = None
+    canon["account_fee_status"] = ACCOUNT_FEE_STATUS_UNKNOWN
+    canon["fee_basis"] = ev_status or ACCOUNT_FEE_STATUS_UNKNOWN
+    canon["fee_provenance"] = ev_status or ACCOUNT_FEE_STATUS_UNKNOWN
 
 
 def _extract_public_fees(venue: str, fee_evidence: dict[str, Any] | None) -> dict[str, Any]:
@@ -869,9 +1065,13 @@ def _assess_pair_topology_and_costs(leg_a: dict[str, Any], leg_b: dict[str, Any]
 
         for v in (va, vb):
             if v not in _AUDITED_NO_SPEEDBUMP_VENUES:
-                reasons.append(f"{v}_latency_and_account_tier_unverified")
+                leg = leg_a if va == v else leg_b
+                if leg["account_fee_status"] == ACCOUNT_FEE_STATUS_VERIFIED:
+                    reasons.append(f"{v}_latency_unverified")
+                else:
+                    reasons.append(f"{v}_latency_and_account_tier_unverified")
 
-    # Compute exact round-trip fees ONLY when BOTH legs have verified public/derived L0 fees.
+    # Compute exact round-trip fees ONLY when BOTH legs have verified public/derived L0 or verified account fees.
     one_way_mt: Decimal | None = None
     rt_mt: Decimal | None = None
     one_way_dt: Decimal | None = None
@@ -888,7 +1088,14 @@ def _assess_pair_topology_and_costs(leg_a: dict[str, Any], leg_b: dict[str, Any]
         else:
             one_way_mt = min(maker_a + taker_b, maker_b + taker_a)
         rt_mt = one_way_mt * Decimal("2")
-        fee_completeness = "public_l0_both_legs"
+        status_a = leg_a["account_fee_status"]
+        status_b = leg_b["account_fee_status"]
+        if status_a == ACCOUNT_FEE_STATUS_VERIFIED and status_b == ACCOUNT_FEE_STATUS_VERIFIED:
+            fee_completeness = "verified_account_tier_both_legs"
+        elif ACCOUNT_FEE_STATUS_VERIFIED in (status_a, status_b):
+            fee_completeness = "mixed_verified_account_and_public_l0"
+        else:
+            fee_completeness = "public_l0_both_legs"
     elif (maker_a is not None and taker_a is not None) or (maker_b is not None and taker_b is not None):
         fee_completeness = "partial_unknown_requires_account_evidence"
     else:
@@ -1161,6 +1368,9 @@ def _build_live_probe_entry(
     leg_a: dict[str, Any],
     leg_b: dict[str, Any],
     live_data: dict[str, dict[str, dict[str, Any]]],
+    *,
+    round_trip_maker_taker_bps: Any = None,
+    round_trip_dual_taker_bps: Any = None,
 ) -> dict[str, Any]:
     probe_a = live_data.get(leg_a["venue"], {}).get(leg_a["symbol"]) or {}
     probe_b = live_data.get(leg_b["venue"], {}).get(leg_b["symbol"]) or {}
@@ -1182,6 +1392,27 @@ def _build_live_probe_entry(
         f_diff = abs(f_a - f_b)
         annualized = (f_diff * HOURS_PER_YEAR) / Decimal("100")
         annualized_pct = round(float(annualized), 4)
+
+    rt_mt_dec = _parse_optional_decimal(round_trip_maker_taker_bps)
+    rt_dt_dec = _parse_optional_decimal(round_trip_dual_taker_bps)
+    net_7d_mt: float | None = None
+    net_7d_dt: float | None = None
+    be_hours_mt: float | None = None
+    be_hours_dt: float | None = None
+    if f_diff is not None:
+        carry_7d_bps = f_diff * Decimal("168")
+        if rt_mt_dec is not None:
+            net_7d_mt = round(float(carry_7d_bps - rt_mt_dec), 6)
+            if rt_mt_dec <= Decimal("0"):
+                be_hours_mt = 0.0
+            elif f_diff > Decimal("0"):
+                be_hours_mt = round(float(rt_mt_dec / f_diff), 4)
+        if rt_dt_dec is not None:
+            net_7d_dt = round(float(carry_7d_bps - rt_dt_dec), 6)
+            if rt_dt_dec <= Decimal("0"):
+                be_hours_dt = 0.0
+            elif f_diff > Decimal("0"):
+                be_hours_dt = round(float(rt_dt_dec / f_diff), 4)
 
     def _activity_usd(probe: dict[str, Any]) -> float | None:
         val = probe.get("vol_24h_usd")
@@ -1210,6 +1441,10 @@ def _build_live_probe_entry(
         "funding_b_hourly_bps": round(float(f_b), 6) if f_b is not None else None,
         "funding_diff_hourly_bps": round(float(f_diff), 6) if f_diff is not None else None,
         "funding_annualized_pct": annualized_pct,
+        "net_7d_carry_maker_taker_bps": net_7d_mt,
+        "net_7d_carry_dual_taker_bps": net_7d_dt,
+        "break_even_hours_maker_taker": be_hours_mt,
+        "break_even_hours_dual_taker": be_hours_dt,
         "open_interest_or_vol_24h": activity_obj,
     }
 
@@ -1259,9 +1494,15 @@ def _classify_and_rank_pair(pair: dict[str, Any]) -> tuple[list[str], float, lis
         score += 5.0
 
     if rt_mt is not None:
-        # Reward explicit known L0/standard fees and penalize higher round-trip fees
+        # Reward explicit known L0/standard or verified account fees and penalize higher round-trip fees
         score += 60.0 - (rt_mt * 3.0)
-        reasons.append(f"known_l0_round_trip_maker_taker_bps={rt_mt}")
+        if pair.get("fee_completeness") in (
+            "verified_account_tier_both_legs",
+            "mixed_verified_account_and_public_l0",
+        ):
+            reasons.append(f"known_verified_round_trip_maker_taker_bps={rt_mt}")
+        else:
+            reasons.append(f"known_l0_round_trip_maker_taker_bps={rt_mt}")
         if rt_dt is not None:
             score -= rt_dt * 0.25
     else:
@@ -1320,6 +1561,7 @@ def screen_pairs(
     live_funding_probe: bool = False,
     top: int | None = None,
     probe_fetcher: Callable[..., bytes] | None = None,
+    account_fee_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Screen all eligible cross-venue pairs from an `opt01_venue_spec_audit_v1` snapshot."""
     venues_map = _extract_venues_map(snapshot)
@@ -1329,6 +1571,10 @@ def screen_pairs(
         raise ValueError(f"unsupported venue(s): {', '.join(unknown)}")
     if top is not None and top <= 0:
         raise ValueError("--top must be a positive integer")
+
+    evidence_venues: dict[str, dict[str, Any]] | None = None
+    if account_fee_evidence is not None:
+        evidence_venues = _validate_account_fee_evidence(account_fee_evidence)
 
     excluded_counts = {
         "inactive_or_delisted_or_disambiguated": 0,
@@ -1358,6 +1604,8 @@ def screen_pairs(
             if canon is None:
                 excluded_counts["inactive_or_delisted_or_disambiguated"] += 1
                 continue
+            if evidence_venues is not None:
+                _apply_account_fee_evidence(canon, evidence_venues.get(venue))
             tick_dec = _parse_positive_decimal(canon.get("tick_size"))
             step_dec = _parse_positive_decimal(canon.get("step_size"))
             if tick_dec is None or step_dec is None:
@@ -1459,7 +1707,7 @@ def screen_pairs(
                 topo_cost = _assess_pair_topology_and_costs(leg_a, leg_b)
 
                 def _public_leg_view(m: dict[str, Any]) -> dict[str, Any]:
-                    return {
+                    view = {
                         "venue": m["venue"],
                         "symbol": m["symbol"],
                         "quote_asset": m["quote_asset"],
@@ -1476,6 +1724,9 @@ def screen_pairs(
                         "fee_basis": m["fee_basis"],
                         "account_fee_status": m["account_fee_status"],
                     }
+                    if "fee_provenance" in m:
+                        view["fee_provenance"] = m["fee_provenance"]
+                    return view
 
                 pair_doc: dict[str, Any] = {
                     "pair_id": f"{leg_a['venue']}:{leg_a['symbol']}__vs__{leg_b['venue']}:{leg_b['symbol']}",
@@ -1499,7 +1750,13 @@ def screen_pairs(
                     "risk_flags": risk_flags,
                 }
                 if live_funding_probe:
-                    pair_doc["live_probe"] = _build_live_probe_entry(leg_a, leg_b, live_data)
+                    pair_doc["live_probe"] = _build_live_probe_entry(
+                        leg_a,
+                        leg_b,
+                        live_data,
+                        round_trip_maker_taker_bps=topo_cost["round_trip_maker_taker_bps"],
+                        round_trip_dual_taker_bps=topo_cost["round_trip_dual_taker_bps"],
+                    )
 
                 suitability, score, reasons = _classify_and_rank_pair(pair_doc)
                 pair_doc["suitability"] = suitability
@@ -1520,6 +1777,28 @@ def screen_pairs(
     basis_count = sum(1 for p in pairs if "basis_niche_candidate" in p["suitability"])
     carry_count = sum(1 for p in pairs if "carry_universe_candidate" in p["suitability"])
     both_fees_known_count = sum(1 for p in pairs if p["fee_completeness"] == "public_l0_both_legs")
+    both_verified_count = sum(1 for p in pairs if p["fee_completeness"] == "verified_account_tier_both_legs")
+    all_known_fees_count = sum(1 for p in pairs if p["round_trip_maker_taker_bps"] is not None)
+
+    if evidence_venues is None:
+        summary_account_fee_status = ACCOUNT_FEE_STATUS_UNKNOWN
+        verified_venues_list: list[str] = []
+    else:
+        verified_venues_list = [
+            v
+            for v in selected_venues
+            if evidence_venues.get(v, {}).get("account_fee_status") == ACCOUNT_FEE_STATUS_VERIFIED
+        ]
+        active_venues = [v for v, cnt in per_venue_active_counts.items() if cnt > 0]
+        if active_venues and all(
+            evidence_venues.get(v, {}).get("account_fee_status") == ACCOUNT_FEE_STATUS_VERIFIED
+            for v in active_venues
+        ):
+            summary_account_fee_status = ACCOUNT_FEE_STATUS_VERIFIED
+        elif verified_venues_list:
+            summary_account_fee_status = "partial_verified_account_tier"
+        else:
+            summary_account_fee_status = ACCOUNT_FEE_STATUS_UNKNOWN
 
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1531,6 +1810,9 @@ def screen_pairs(
             "allow_usdt_cross_quote": allow_usdt_cross_quote,
             "live_funding_probe": live_funding_probe,
             "top": top,
+            "account_fee_evidence_schema": (
+                account_fee_evidence.get("schema_version") if account_fee_evidence is not None else None
+            ),
         },
         "summary": {
             "requested_venues": len(selected_venues),
@@ -1542,7 +1824,10 @@ def screen_pairs(
             "basis_niche_candidates": basis_count,
             "carry_universe_candidates": carry_count,
             "both_legs_public_l0_fees_exposed": both_fees_known_count,
-            "account_fee_status": ACCOUNT_FEE_STATUS_UNKNOWN,
+            "both_legs_verified_account_fees": both_verified_count,
+            "both_legs_fees_known": all_known_fees_count,
+            "account_fee_status": summary_account_fee_status,
+            "verified_account_fee_venues": verified_venues_list,
         },
         "pairs": displayed_pairs,
     }
@@ -1934,6 +2219,51 @@ def run_self_test(venues: tuple[str, ...] | list[str] = SUPPORTED_VENUES) -> dic
             pepe_pairs = [p for p in usd_only["pairs"] if p["canonical_base"] == "1000PEPE"]
             assert len(pepe_pairs) >= 3
 
+        # Verify optional aleph_account_fee_evidence_v1 ingestion + fail-closed unverified preservation
+        sample_evidence = {
+            "schema_version": EXPECTED_ACCOUNT_FEE_EVIDENCE_SCHEMA,
+            "venues": {
+                "arcus": {"account_fee_status": ACCOUNT_FEE_STATUS_PUBLIC_TIER0, "maker_fee_bps": None, "taker_fee_bps": None},
+                "hyperliquid": {"account_fee_status": ACCOUNT_FEE_STATUS_VERIFIED, "maker_fee_bps": "1.44", "taker_fee_bps": "4.32"},
+                "trade_xyz": {
+                    "account_fee_status": ACCOUNT_FEE_STATUS_VERIFIED,
+                    "base_maker_fee_bps": "1.44",
+                    "base_taker_fee_bps": "4.32",
+                    "deployer_fee_scale": "1",
+                    "standard_maker_fee_bps": "2.88",
+                    "standard_taker_fee_bps": "8.64",
+                    "growth_mode_maker_fee_bps": "0.288",
+                    "growth_mode_taker_fee_bps": "0.864",
+                },
+                "lighter": {"account_fee_status": ACCOUNT_FEE_STATUS_PUBLIC_UNVERIFIED, "maker_fee_bps": None, "taker_fee_bps": None},
+                "binance": {"account_fee_status": ACCOUNT_FEE_STATUS_UNKNOWN, "maker_fee_bps": None, "taker_fee_bps": None},
+            },
+        }
+        with_ev = screen_pairs(
+            snap,
+            venues=venues,
+            allow_usdt_cross_quote=False,
+            live_funding_probe=False,
+            account_fee_evidence=sample_evidence,
+        )
+        if set(venues) >= {"arcus", "hyperliquid"}:
+            btc_arc_hl = next(
+                p
+                for p in with_ev["pairs"]
+                if p["canonical_base"] == "BTC" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "hyperliquid"}
+            )
+            # Arcus BTC (1.5 / 4.5) + HL verified (1.44 / 4.32): min MT = 1.5 + 4.32 = 5.82 -> RT = 11.64
+            assert btc_arc_hl["recommended_topology"] == "maker_first_arcus"
+            assert btc_arc_hl["round_trip_maker_taker_bps"] == 11.64
+            assert btc_arc_hl["round_trip_dual_taker_bps"] == 17.64
+        if set(venues) >= {"arcus", "lighter"}:
+            ant_arc_lgt = next(
+                p
+                for p in with_ev["pairs"]
+                if p["canonical_base"] == "ANT" and {p["leg_a"]["venue"], p["leg_b"]["venue"]} == {"arcus", "lighter"}
+            )
+            assert ant_arc_lgt["round_trip_maker_taker_bps"] is None
+
     return {
         "self_test": "passed",
         "venues_tested": list(venues),
@@ -1943,6 +2273,7 @@ def run_self_test(venues: tuple[str, ...] | list[str] = SUPPORTED_VENUES) -> dic
         "step_lcm_verified": True,
         "lighter_speed_bump_guard_verified": True,
         "unknown_fee_preservation_verified": True,
+        "account_fee_evidence_verified": True,
         "zero_secret_env_reads_verified": True,
     }
 
@@ -1989,6 +2320,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Opt-in: query public Arcus/Hyperliquid/TradeXYZ/Lighter endpoints for live mark/funding spreads",
     )
     parser.add_argument(
+        "--account-fee-evidence",
+        type=Path,
+        default=None,
+        help="Optional path to aleph_account_fee_evidence_v1 JSON output from audit_account_fees.py",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -2006,6 +2343,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test and args.live_funding_probe:
         print(
             "Error: --self-test is strictly offline and cannot be combined with --live-funding-probe",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.self_test and args.account_fee_evidence is not None:
+        print(
+            "Error: --self-test uses embedded fixtures and cannot be combined with --account-fee-evidence",
             file=sys.stderr,
         )
         return 2
@@ -2042,6 +2386,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error reading --snapshot {args.snapshot}: {exc}", file=sys.stderr)
         return 2
 
+    account_fee_evidence: dict[str, Any] | None = None
+    if args.account_fee_evidence is not None:
+        try:
+            account_fee_evidence = json.loads(args.account_fee_evidence.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"Error reading --account-fee-evidence {args.account_fee_evidence}: {exc}", file=sys.stderr)
+            return 2
+
     try:
         report = screen_pairs(
             snapshot,
@@ -2049,6 +2401,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_usdt_cross_quote=args.allow_usdt_cross_quote,
             live_funding_probe=args.live_funding_probe,
             top=args.top,
+            account_fee_evidence=account_fee_evidence,
         )
     except (ValueError, KeyError, TypeError) as exc:
         print(f"Error screening snapshot: {exc}", file=sys.stderr)
