@@ -41,7 +41,9 @@ class ClockAudit:
             if self.allow_segment_offset and t['sequence'] > 1:
                 self.sequence = t['sequence'] - 1
             self.first_sequence = t['sequence']
-        key = row['source'], row.get('market')
+        # The auxiliary Lighter socket has its own reconnect epoch.
+        auxiliary = row['source'] in ('lighter', 'lighter_robinhood') and row.get('event') == 'clock_probe'
+        key = row['source'], row.get('market'), auxiliary
         if (t['run_id'] != self.run_id or t['sequence'] != self.sequence + 1
                 or t['available_wall_ns'] < self.last_wall
                 or t['available_monotonic_ns'] < self.last_mono

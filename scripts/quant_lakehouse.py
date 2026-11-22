@@ -42,7 +42,14 @@ import subprocess
 import tarfile
 from tempfile import TemporaryDirectory
 
-from archive_public_capture import MAX_ROW, open_capture, records as archive_records, rows as stream_rows
+from archive_public_capture import (
+    MAX_ROW,
+    PUBLIC_EVENTS,
+    open_capture,
+    records as archive_records,
+    rows as stream_rows,
+    validate_clock_probe,
+)
 from capture_timing import ClockAudit, precise_available_ms
 from inventory_public_sources import PRIVATE_NAME
 
@@ -316,10 +323,12 @@ def seal_bronze_capture(
                 raise ValueError("capture violated receipt/availability order or wrote past collector/end")
             raw_source = row.get("source", "")
             event = row.get("event", "")
-            if event not in ("message", "connected", "subscribed", "disconnect", "clock_refresh", "segment_start", "segment_end", "end"):
+            if event not in PUBLIC_EVENTS:
                 raise ValueError(f"unsupported public event: {event!r}")
             if (raw_source == "collector") != (event in ("segment_start", "segment_end", "end")):
                 raise ValueError("invalid collector lifecycle/footer record")
+            if event == "clock_probe":
+                validate_clock_probe(row)
 
             if event == "segment_start":
                 payload = row.get("payload")
@@ -862,7 +871,9 @@ def normalize_capture(
                 )
                 continue
 
-            if event in ("connected", "disconnect", "clock_refresh", "subscribed"):
+            if event in ("connected", "disconnect", "clock_refresh", "clock_probe", "subscribed"):
+                if event == "clock_probe":
+                    validate_clock_probe(row)
                 sub_market = market
                 if event == "subscribed" and isinstance(payload, dict):
                     sub_market = sub_market or payload.get("coin") or payload.get("id")
@@ -1871,6 +1882,7 @@ SELECT
     MAX(available_at_ms) AS last_lifecycle_ms,
     COUNT(*) FILTER (WHERE raw_source = 'arcus_trades' AND event = 'subscribed') AS arcus_trade_subscriptions
 FROM v_feed_lifecycle
+WHERE event <> 'clock_probe'
 GROUP BY campaign_id, collector_region, venue, domain, market;
 """
 

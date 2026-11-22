@@ -17,6 +17,8 @@ from tempfile import TemporaryDirectory
 
 HOUR_MS = 3_600_000
 MAX_ROW = 2 * 1024 * 1024
+PUBLIC_EVENTS = ('message', 'connected', 'subscribed', 'disconnect', 'clock_refresh',
+                 'clock_probe', 'segment_start', 'segment_end', 'end')
 SOURCES = {
     'binance': ('binance', 'usdm'),
     'lighter': ('lighter', 'core'), 'lighter_trades': ('lighter', 'core'),
@@ -30,6 +32,16 @@ SOURCES = {
     **{source: ('hyperliquid', 'core') for source in
        ('hyperliquid', 'hyperliquid_snapshot', 'hyperliquid_trades', 'hyperliquid_funding')},
 }
+
+
+def validate_clock_probe(row):
+    sent = row.get('request_sent_at_ms')
+    if row.get('source') not in ('lighter', 'lighter_robinhood'):
+        raise ValueError('unexpected clock probe source')
+    if not isinstance(row.get('payload'), dict):
+        raise ValueError('missing clock probe payload')
+    if sent is not None and (type(sent) is not int or not 0 < sent <= row['received_at_ms']):
+        raise ValueError('invalid clock probe request bracket')
 
 
 @contextmanager
@@ -108,10 +120,12 @@ def ingest(source, root):
                 raise ValueError('invalid capture order or footer')
             venue, domain, channel = route(row)
             event = row['event']
-            if event not in ('message', 'connected', 'subscribed', 'disconnect', 'clock_refresh', 'segment_start', 'segment_end', 'end'):
+            if event not in PUBLIC_EVENTS:
                 raise ValueError('unsupported public event')
             if (venue == 'collector') != (event in ('segment_start', 'segment_end', 'end')):
                 raise ValueError('invalid collector footer')
+            if event == 'clock_probe':
+                validate_clock_probe(row)
             ended = event == 'end'
             previous = at
             bucket = at // HOUR_MS

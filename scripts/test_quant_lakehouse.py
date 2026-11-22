@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from archive_public_capture import ingest, records
 from quant_lakehouse import (
     WithheldBookScope,
     ZeroSizeTradeScope,
@@ -84,6 +85,79 @@ class QuantLakehouseTests(unittest.TestCase):
             for item in rows:
                 handle.write(json.dumps(item, separators=(",", ":")) + "\n")
         return out
+
+    def test_lighter_clock_probe_preserves_archive_and_primary_book_continuity(self) -> None:
+        row = self._timed_row
+
+        def book(offset, nonce, begin_nonce):
+            return {
+                "type": "subscribed/order_book" if begin_nonce == 0 else "update/order_book",
+                "channel": "order_book:0",
+                "timestamp": self.t0 + offset,
+                "order_book": {
+                    "nonce": nonce,
+                    "begin_nonce": begin_nonce,
+                    "last_updated_at": (self.t0 + offset) * 1000,
+                    "bids": [{"price": "1999.90", "size": "4"}],
+                    "asks": [{"price": "2000.10", "size": "5"}],
+                },
+            }
+
+        probe = {"type": "subscribed/market_stats", "channel": "market_stats:0",
+                 "timestamp": self.t0 + 10, "market_stats": {"market_id": 0}}
+        rows = [
+            row(1, "lighter", "connected", 0),
+            row(2, "lighter", "message", 10, payload=book(10, 10, 0)),
+            row(3, "lighter", "clock_probe", 20, payload=probe, request_sent_at_ms=self.t0 + 18),
+            row(4, "lighter", "clock_probe", 40, epoch=2, payload=probe),
+            row(5, "lighter", "message", 60, payload=book(60, 11, 10)),
+            row(6, "collector", "end", 70),
+        ]
+        source = self._write_gz_capture("clock-probe.ndjson.gz", rows)
+        metadata = {"campaign_id": "clock-probe", "collector_region": "tokyo"}
+        bronze = seal_bronze_capture(source, split_role="selection_dev", **metadata)
+        self.assertEqual(bronze["records"], 6)
+        archive = self.root / "archive"
+        self.assertEqual(ingest(source, archive)["records"], 6)
+        with gzip.open(source, "rb") as stream:
+            self.assertEqual(b"".join(records(archive)), stream.read())
+        silver = self.root / "silver"
+        tables = normalize_capture(archive, silver, precise_times=True, **metadata)["tables"]
+        self.assertEqual([tables[name]["rows"] for name in (
+            "bbo_quotes", "public_trades", "funding_and_ctx", "feed_lifecycle")], [2, 0, 0, 4])
+        lifecycle = _read_gz_ndjson(silver / "feed_lifecycle.ndjson.gz")
+        probes = [item for item in lifecycle if item["event"] == "clock_probe"]
+        self.assertEqual([(item["connection_epoch"], item["request_sent_at_ms"]) for item in probes],
+                         [(1, self.t0 + 18), (2, None)])
+
+        for label, replacement, error in (
+            ("wrong-source", dict(rows[3], source="binance"), "unexpected clock probe source"),
+            ("missing-payload", {k: v for k, v in rows[3].items() if k != "payload"}, "missing clock probe payload"),
+            ("future-send", dict(rows[3], request_sent_at_ms=self.t0 + 41), "invalid clock probe request bracket"),
+        ):
+            with self.subTest(label=label):
+                bad = self._write_gz_capture(f"{label}.ndjson.gz", [*rows[:3], replacement, *rows[4:]])
+                with self.assertRaisesRegex(ValueError, error):
+                    seal_bronze_capture(bad, split_role="selection_dev", **metadata)
+                with self.assertRaisesRegex(ValueError, error):
+                    ingest(bad, self.root / f"archive-{label}")
+                with self.assertRaisesRegex(ValueError, error):
+                    normalize_capture(bad, self.root / f"silver-{label}", precise_times=True, **metadata)
+
+        for label, first_epoch, last_epoch, index in (
+            ("primary-regression", 2, 1, (1, 4)),
+            ("probe-regression", 2, 1, (2, 3)),
+        ):
+            with self.subTest(label=label):
+                bad_rows = [dict(item, capture_timing=dict(item["capture_timing"])) for item in rows]
+                first, last = index
+                bad_rows[first]["capture_timing"]["connection_epoch"] = first_epoch
+                bad_rows[last]["capture_timing"]["connection_epoch"] = last_epoch
+                bad = self._write_gz_capture(f"{label}.ndjson.gz", bad_rows)
+                with self.assertRaisesRegex(ValueError, "epoch or clock continuity failed"):
+                    seal_bronze_capture(bad, split_role="selection_dev", **metadata)
+                with self.assertRaisesRegex(ValueError, "epoch or clock continuity failed"):
+                    normalize_capture(bad, self.root / f"silver-{label}", precise_times=True, **metadata)
 
     def test_duckdb_checks_digest_of_zero_row_table_before_writing(self) -> None:
         capture = self._write_gz_capture("public-empty.ndjson.gz", [self._timed_row(1, "collector", "end", 10)])
