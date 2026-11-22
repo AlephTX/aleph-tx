@@ -551,6 +551,22 @@ impl<'a> Compiler<'a> {
                     self.coinbase = None;
                 }
             }
+            ("clock_probe", Some(raw_payload)) => {
+                ensure!(
+                    matches!(row.source.as_str(), "lighter" | "lighter_robinhood"),
+                    "unexpected clock probe source"
+                );
+                let payload: serde_json::Value = serde_json::from_str(raw_payload.get())?;
+                self.coverage.lighter_clock_refreshes += 1;
+                for leg in &mut self.legs {
+                    leg.observe_clock_probe(
+                        &row.source,
+                        &payload,
+                        row.request_sent_at_ms,
+                        row.received_at_ms,
+                    )?;
+                }
+            }
             ("message", Some(raw_payload)) => {
                 if row.source == "extended_index" {
                     let payload: serde_json::Value = serde_json::from_str(raw_payload.get())?;
@@ -887,10 +903,19 @@ pub fn compile_with_options(
                 .with_context(|| {
                     format!("capture timing line {}", compiler.coverage.records + 1)
                 })?;
+            let timing_source = if row.event == "clock_probe" {
+                match row.source.as_str() {
+                    "lighter" => "lighter_clock_probe",
+                    "lighter_robinhood" => "lighter_robinhood_clock_probe",
+                    other => other,
+                }
+            } else {
+                row.source.as_str()
+            };
             row.available_at_ms = audit
                 .observe(
                     stamp,
-                    &row.source,
+                    timing_source,
                     row.market.as_deref(),
                     row.received_at_ms,
                     row.available_at_ms,
@@ -907,10 +932,10 @@ pub fn compile_with_options(
                 && now >= group
                 && row.request_sent_at_ms.is_none_or(|sent| {
                     matches!(
-                        row.source.as_str(),
-                        "lighter" | "lighter_robinhood" | "hyperliquid_funding"
-                    ) && row.event == "message"
-                        && sent > 0
+                        (row.source.as_str(), row.event.as_str()),
+                        ("lighter" | "lighter_robinhood", "message" | "clock_probe")
+                            | ("hyperliquid_funding", "message")
+                    ) && sent > 0
                         && sent <= row.received_at_ms
                 }),
             "invalid capture arrival order"
@@ -956,3 +981,254 @@ pub fn compile_with_options(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod clock_probe_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    const T: u64 = 1_800_000_000_000;
+
+    fn probe_config() -> CaptureConfig {
+        let mut config: CaptureConfig =
+            serde_json::from_str(include_str!("../examples/eth_capture.json")).unwrap();
+        config.sample_ms = 100;
+        config.legs[0].lighter_clock = Some(LighterClockPolicy {
+            max_rtt_ms: 50,
+            valid_for_ms: 250,
+            drift_margin_ms: 2,
+        });
+        config
+    }
+
+    fn lighter_msg(
+        source: &str,
+        at: u64,
+        source_at: u64,
+        published_at: u64,
+        (nonce, previous): (u64, u64),
+        request_sent: Option<u64>,
+    ) -> Value {
+        let snapshot = previous == 0;
+        let mut row = json!({
+            "source": source,
+            "event": "message",
+            "received_at_ms": at,
+            "available_at_ms": at,
+            "payload": {
+                "type": if snapshot { "subscribed/order_book" } else { "update/order_book" },
+                "channel": "order_book:0",
+                "timestamp": published_at,
+                "order_book": {
+                    "nonce": nonce,
+                    "begin_nonce": previous,
+                    "last_updated_at": source_at * 1000,
+                    "bids": [{"price": "1999.9", "size": "4"}],
+                    "asks": [{"price": "2000.1", "size": "5"}]
+                }
+            }
+        });
+        if let Some(sent) = request_sent {
+            row["request_sent_at_ms"] = json!(sent);
+        }
+        row
+    }
+
+    fn clock_probe_row(source: &str, sent: u64, received: u64, published: u64) -> Value {
+        json!({
+            "source": source,
+            "event": "clock_probe",
+            "received_at_ms": received,
+            "available_at_ms": received,
+            "request_sent_at_ms": sent,
+            "payload": {
+                "type": "subscribed/market_stats",
+                "channel": "market_stats:0",
+                "timestamp": published,
+                "market_stats": {
+                    "market_id": 0,
+                    "symbol": "ETH",
+                    "index_price": "2000.0"
+                }
+            }
+        })
+    }
+
+    fn footer_row(at: u64) -> Value {
+        json!({"source":"collector","event":"end","received_at_ms":at,"available_at_ms":at})
+    }
+
+    fn replay_rows(config: &CaptureConfig, rows: &[Value]) -> (Coverage, Vec<Value>) {
+        let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        let mut out = Vec::new();
+        let coverage =
+            compile(config, text.as_bytes(), &mut out, &VenueRegistry::default()).unwrap();
+        let frames = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (coverage, frames)
+    }
+
+    #[test]
+    fn clock_probe_renews_lighter_clock_without_gap() {
+        let cfg = probe_config();
+        let rows = [
+            lighter_msg("lighter", T, T + 10, T + 20, (10, 0), Some(T - 20)),
+            lighter_msg("lighter", T + 100, T + 110, T + 120, (11, 10), None),
+            clock_probe_row("lighter", T + 180, T + 200, T + 220),
+            lighter_msg("lighter", T + 300, T + 310, T + 320, (12, 11), None),
+            lighter_msg("lighter", T + 400, T + 410, T + 420, (13, 12), None),
+            footer_row(T + 500),
+        ];
+        let (coverage, frames) = replay_rows(&cfg, &rows);
+        assert_eq!(coverage.lighter_clock_refreshes, 1);
+        assert_eq!(coverage.clock_unavailable, [0, 0]);
+        assert_eq!(coverage.lighter_nonce_gaps, [0, 0]);
+        assert!(coverage.disconnects.is_empty());
+        assert_eq!(frames.len(), 5);
+        for frame in &frames {
+            assert!(
+                frame["legs"][0]["book"]["timestamp_ms"].as_u64().unwrap() > 0,
+                "expected continuous calibrated book timestamp across clock probe renewal: {frame}"
+            );
+            assert_eq!(frame["legs"][0]["book"]["tradable"], true);
+        }
+        let audit = coverage.lighter_clock[0].unwrap();
+        assert_eq!(audit.probes, 2);
+        assert_eq!(audit.first_received_at_ms, Some(T + 200));
+        assert!(!audit.conflicting);
+    }
+
+    #[test]
+    fn conflicting_clock_probe_fails_closed_and_clears_book() {
+        let cfg = probe_config();
+        let rows = [
+            lighter_msg("lighter", T, T + 10, T + 20, (10, 0), Some(T - 20)),
+            clock_probe_row("lighter", T + 80, T + 100, T + 160),
+            lighter_msg("lighter", T + 200, T + 210, T + 220, (11, 10), None),
+            footer_row(T + 300),
+        ];
+        let (coverage, frames) = replay_rows(&cfg, &rows);
+        assert_eq!(coverage.lighter_clock_refreshes, 1);
+        assert_eq!(coverage.clock_unavailable, [1, 0]);
+        assert!(
+            frames[0]["legs"][0]["book"]["timestamp_ms"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(frames[1]["legs"][0]["book"]["timestamp_ms"], 0);
+        assert_eq!(frames[1]["legs"][0]["book"]["tradable"], false);
+        assert_eq!(frames[2]["legs"][0]["book"]["timestamp_ms"], 0);
+        assert_eq!(frames[2]["legs"][0]["book"]["tradable"], false);
+        let audit = coverage.lighter_clock[0].unwrap();
+        assert!(audit.conflicting);
+        assert!(audit.interval.is_none());
+    }
+
+    #[test]
+    fn clock_probe_preserves_domain_isolation_and_precise_epochs() {
+        let mut cfg = probe_config();
+        cfg.pair.legs[0].venue = "lighter_robinhood".into();
+        let run_id = "0123456789abcdef0123456789abcdef";
+        let stamp = |seq: u64, epoch: u64, dt_ms: u64| {
+            let at = T + dt_ms;
+            json!({
+                "run_id": run_id,
+                "sequence": seq,
+                "connection_epoch": epoch,
+                "receipt_wall_ns": at * 1_000_000 + 100_000,
+                "receipt_monotonic_ns": dt_ms * 1_000_000 + 10_100_000,
+                "available_wall_ns": at * 1_000_000 + 200_000,
+                "available_monotonic_ns": dt_ms * 1_000_000 + 10_200_000,
+            })
+        };
+
+        let mut init = lighter_msg(
+            "lighter_robinhood",
+            T,
+            T + 10,
+            T + 20,
+            (10, 0),
+            Some(T - 20),
+        );
+        init["capture_timing"] = stamp(1, 1, 0);
+
+        let mut core_probe = clock_probe_row("lighter", T + 30, T + 50, T + 150);
+        core_probe["capture_timing"] = stamp(2, 1, 50);
+
+        let mut rh_probe1 = clock_probe_row("lighter_robinhood", T + 80, T + 100, T + 120);
+        rh_probe1["capture_timing"] = stamp(3, 1, 100);
+
+        let mut rh_probe2 = clock_probe_row("lighter_robinhood", T + 180, T + 200, T + 220);
+        rh_probe2["capture_timing"] = stamp(4, 2, 200);
+
+        let mut update = lighter_msg(
+            "lighter_robinhood",
+            T + 300,
+            T + 310,
+            T + 320,
+            (11, 10),
+            None,
+        );
+        update["capture_timing"] = stamp(5, 1, 300);
+
+        let mut end = footer_row(T + 400);
+        end["capture_timing"] = stamp(6, 0, 400);
+
+        let text: String = [init, core_probe, rh_probe1, rh_probe2, update, end]
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect();
+        let mut out = Vec::new();
+        let coverage = compile_with_options(
+            &cfg,
+            true,
+            text.as_bytes(),
+            &mut out,
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(coverage.precise_records, Some(6));
+        assert_eq!(coverage.lighter_clock_refreshes, 3);
+        assert_eq!(coverage.clock_unavailable, [0, 0]);
+        let audit = coverage.lighter_clock[0].unwrap();
+        assert!(!audit.conflicting);
+        assert_eq!(audit.probes, 3);
+
+        // Non-Lighter clock_probe source must fail closed.
+        let mut bad_probe = clock_probe_row("hyperliquid", T + 80, T + 100, T + 120);
+        bad_probe
+            .as_object_mut()
+            .unwrap()
+            .remove("request_sent_at_ms");
+        let bad_text: String = [
+            lighter_msg(
+                "lighter_robinhood",
+                T,
+                T + 10,
+                T + 20,
+                (10, 0),
+                Some(T - 20),
+            ),
+            bad_probe,
+            footer_row(T + 200),
+        ]
+        .iter()
+        .map(|row| format!("{row}\n"))
+        .collect();
+        let mut bad_out = Vec::new();
+        assert!(
+            compile(
+                &cfg,
+                bad_text.as_bytes(),
+                &mut bad_out,
+                &VenueRegistry::default()
+            )
+            .is_err()
+        );
+    }
+}

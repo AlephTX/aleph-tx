@@ -129,6 +129,62 @@ impl<'a> LegFeed<'a> {
         self.config.lighter_clock.map(|_| self.lighter_clock)
     }
 
+    pub fn observe_clock_probe(
+        &mut self,
+        source: &str,
+        payload: &Value,
+        request_sent: Option<u64>,
+        received: u64,
+    ) -> Result<()> {
+        if !self.accepts(source) {
+            return Ok(());
+        }
+        if let (Some(policy), Some(sent)) = (self.config.lighter_clock, request_sent) {
+            let kind = payload["type"].as_str().unwrap_or_default();
+            ensure!(
+                matches!(kind, "subscribed/market_stats" | "subscribed/order_book"),
+                "unexpected Lighter clock probe type"
+            );
+            let published = payload["timestamp"]
+                .as_u64()
+                .context("missing Lighter clock probe timestamp")?;
+            if self.lighter_clock.conflicting {
+                self.book = None;
+                self.context = None;
+                return Ok(());
+            }
+            let mut single = LighterClockAudit::default();
+            single.observe(policy, sent, received, published);
+            if single.probes == 0 {
+                return Ok(());
+            }
+            let expired = self
+                .lighter_clock
+                .first_received_at_ms
+                .is_some_and(|first| received.abs_diff(first) > policy.valid_for_ms);
+            if expired {
+                // Prior calibration expired; start a fresh epoch without clearing
+                // depth state while preserving accumulated probe count.
+                self.lighter_clock.first_received_at_ms = None;
+                self.lighter_clock.interval = None;
+            }
+            let prev_probes = self.lighter_clock.probes;
+            self.lighter_clock
+                .observe(policy, sent, received, published);
+            if self.lighter_clock.conflicting {
+                self.book = None;
+                self.context = None;
+            } else if self.lighter_clock.probes > prev_probes {
+                // Renew calibration lifetime and advance the active interval so
+                // continuous multi-hour captures track gradual clock drift without
+                // tripping cumulative intersection conflicts.
+                self.lighter_clock.first_received_at_ms = Some(received);
+                self.lighter_clock.interval = single.interval;
+            }
+        }
+        Ok(())
+    }
+
     /// Fast zero-DOM market pre-filter over a validated `RawValue` JSON slice.
     /// Returns `false` only when the payload positively identifies an unrelated market;
     /// any matching or structurally ambiguous payload returns `true` so `apply()` runs

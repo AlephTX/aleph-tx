@@ -54,6 +54,7 @@ type subscription struct {
 	interval          time.Duration
 	clockRefresh      time.Duration
 	firstClockRefresh time.Time
+	clockProbe        bool
 	readTimeout       time.Duration
 	snapshotURL       string
 }
@@ -479,9 +480,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			if sent, ok := subscriptionSends[channel]; ok {
 				delete(subscriptionSends, channel)
 				// A clock step between send and receive invalidates the bracket.
-				wallElapsed := received.UnixMilli() - sent.UnixMilli()
-				monotonicElapsed := received.Sub(sent).Milliseconds()
-				if wallElapsed >= 0 && wallElapsed >= monotonicElapsed-1 && wallElapsed <= monotonicElapsed+1 {
+				if validClockBracket(sent, received) {
 					row.RequestSentAt = sent.UnixMilli()
 				}
 			}
@@ -557,6 +556,12 @@ func captureWithRotation(ctx context.Context, sources []subscription, out syncWr
 	}
 	var workers sync.WaitGroup
 	for _, source := range sources {
+		if source.clockProbe {
+			workers.Go(func() {
+				runLighterClockProbeLoop(ctx, source, emit)
+			})
+			continue
+		}
 		workers.Go(func() {
 			backoff := time.Second
 			var epoch uint64
@@ -688,6 +693,9 @@ func captureWithRotation(ctx context.Context, sources []subscription, out syncWr
 		return err
 	}
 	for _, source := range sources {
+		if source.clockProbe {
+			continue
+		}
 		market := source.market
 		if source.source == "hyperliquid" || source.source == "hyperliquid_funding" ||
 			source.source == "hyperliquid_trades" || source.source == "arcus_trades" {
@@ -756,6 +764,7 @@ func run() error {
 	hlFastBook := flag.Bool("hl-fast-book", false, "request Hyperliquid's fast five-level WebSocket book")
 	clockRefresh := flag.Duration("lighter-clock-refresh", 0, "renew the Lighter connection and clock evidence periodically")
 	staggerRefresh := flag.Bool("stagger-lighter-clock-refresh", false, "offset Robinhood book refreshes by half the Core interval")
+	clockProbe := flag.Bool("lighter-clock-probe", false, "probe Lighter clock evidence on an auxiliary WebSocket without disconnecting the primary stream")
 	idleReadTimeout := flag.Duration("idle-read-timeout", 30*time.Second, "per-message WebSocket read timeout for non-trade streams (0 disables app timeout while 15s Ping/Pong keepalive remains active)")
 	duration := flag.Duration("duration", time.Minute, "recording duration")
 	segmentDuration := flag.Duration("segment-duration", 0, "optional in-process rolling segment duration (e.g. 1h); 0 writes a single file")
@@ -771,11 +780,8 @@ func run() error {
 	if *idleReadTimeout < 0 || *idleReadTimeout > time.Hour {
 		return errors.New("-idle-read-timeout must be 0 or up to 1h")
 	}
-	if *clockRefresh != 0 && ((*lighter == "" && *rh == "") || *clockRefresh < 30*time.Second || *clockRefresh > 9*time.Minute) {
-		return errors.New("clock refresh needs Lighter markets and an interval from 30s to 9m")
-	}
-	if *staggerRefresh && (*clockRefresh == 0 || *lighter == "" || *rh == "") {
-		return errors.New("-stagger-lighter-clock-refresh requires Core and Robinhood markets and -lighter-clock-refresh")
+	if err := validateLighterClockOptions(*lighter, *rh, *clockRefresh, *staggerRefresh, *clockProbe); err != nil {
+		return err
 	}
 	if *hlFastBook && *hl == "" {
 		return errors.New("fast books need Hyperliquid markets")
@@ -837,6 +843,12 @@ func run() error {
 	sources = append(sources, extraBinance...)
 	if len(sources) == 0 {
 		return errors.New("configure at least one public market")
+	}
+	if *clockProbe {
+		sources, err = enableLighterClockProbes(sources, *clockRefresh)
+		if err != nil {
+			return err
+		}
 	}
 	resolvedReadTimeout := *idleReadTimeout
 	if resolvedReadTimeout == 0 {
