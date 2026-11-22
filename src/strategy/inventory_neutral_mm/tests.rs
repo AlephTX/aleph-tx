@@ -3209,6 +3209,65 @@ fn utilization_floor_cap_causal_l1_depth_cap_and_cancel_reasons_work() {
         (flat_target.ask_size - round_down_to_step(40.0 / 2001.0, strategy.config.step_size)).abs()
             < 1e-9
     );
+    // S17-1: the depth-cap zeroing is labelled for cancel attribution only (no economic effect).
+    assert_eq!(
+        strategy.last_side_withdrawal_reason,
+        [CancelReason::DepthCapDepleted, CancelReason::SideWithdrawn],
+        "thin bid L1 without touch improvement is a depleted-depth withdrawal; quotable ask keeps default"
+    );
+    strategy.local_touch_improved = [true, false];
+    let improved_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &capped_risk, 0.0)
+        .unwrap();
+    assert_eq!(improved_target.bid_size, flat_target.bid_size);
+    assert_eq!(improved_target.ask_size, flat_target.ask_size);
+    assert_eq!(
+        strategy.last_side_withdrawal_reason[0],
+        CancelReason::DepthCapPriceImproved,
+        "a new, thinner, better-priced touch level is labelled as price-improved depth withdrawal"
+    );
+    let resting_bid = active_order(21, 2101, OrderSide::Buy, 1999.0, 0.025, 0);
+    let labelled = execution::build_side_execution_plan_with_withdrawal_reason(
+        &strategy.config,
+        std::slice::from_ref(&resting_bid),
+        OrderType::PostOnly,
+        Side::Buy,
+        1999.0,
+        improved_target.bid_size,
+        0.5,
+        0.1,
+        1,
+        None,
+        None,
+        false,
+        None,
+        None,
+        false,
+        None,
+        strategy.last_side_withdrawal_reason[0],
+    );
+    assert_eq!(labelled.to_cancel, vec![2101]);
+    assert_eq!(
+        labelled.cancel_reasons,
+        vec![(2101, CancelReason::DepthCapPriceImproved)]
+    );
+    strategy.local_touch_improved = [false; 2];
+    // S18-2: a missing/stale local L1 also zeroes the entry side under the depth cap, but it
+    // is not evidence of same-level depletion and gets its own label.
+    let saved_l1 = strategy.last_local_l1_notional.take();
+    let blind_target = strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &capped_risk, 0.0)
+        .unwrap();
+    assert_eq!(blind_target.bid_size, 0.0);
+    assert_eq!(blind_target.ask_size, 0.0);
+    assert_eq!(
+        strategy.last_side_withdrawal_reason,
+        [CancelReason::DepthCapL1Unavailable; 2]
+    );
+    strategy.last_local_l1_notional = saved_l1;
+    strategy
+        .build_quote_target(1999.0, 2001.0, 2000.0, &capped_risk, 0.0)
+        .unwrap();
 
     // Long inventory: Bid (entry) stays capped to 0, while Ask (reducing) ignores small Ask L1 cap!
     apply_test_fill(&tracker, 1, 1);
@@ -3528,5 +3587,61 @@ async fn risk_budgeted_gamma_and_markout_quantile_floor_scale_quotes_by_actual_r
         "reducing bid ({exit_bid}) must remain closer to touch than toxic entry bid ({entry_bid})"
     );
 
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "research-replay")]
+#[test]
+fn bound_guard_production_pricing_preserves_cancel_threshold_and_other_side() {
+    use replay::recorded::bound_guard;
+    let (mut strategy, _tracker, directory) = wake_test_strategy(250, 50);
+    strategy.config.min_profit_bps = 16.0;
+    strategy.config.maker_fee_bps = 0.0;
+    strategy.config.quote_hysteresis = Some(crate::config::QuoteHysteresisConfig {
+        cancel_min_profit_bps: 4.8,
+        flatten_min_profit_bps: 0.5,
+        per_side_bound_cancel: true,
+        ..Default::default()
+    });
+    let inputs = PricingInputs {
+        mid: 2000.0,
+        pricing_mid: 2000.0,
+        bid_touch: 1999.9,
+        ask_touch: 2000.1,
+        vol_bps: 1.5,
+        sigma_per_sqrt_sec: 0.00015,
+        as_score: 0.0,
+        using_external_fair_value: false,
+        order_flow_bps: 0.0,
+        local_ofi_bps: 0.0,
+        cancel_bump_bps: 0.0,
+        cross_market_bps: 0.0,
+        volatility_pressure: 0.0,
+        participation_bbo: None,
+    };
+    for position in [-0.01, 0.0, 0.01] {
+        bound_guard::reset(None);
+        let base = strategy
+            .calculate_optimal_quotes(&inputs, position)
+            .unwrap();
+        bound_guard::reset(Some(10.0));
+        let protected = strategy
+            .calculate_optimal_quotes(&inputs, position)
+            .unwrap();
+        bound_guard::reset(None);
+        assert_eq!(
+            (base.2.max_bid, base.2.min_ask),
+            (protected.2.max_bid, protected.2.min_ask)
+        );
+        if position < 0.0 {
+            assert!(protected.0 < base.0);
+            assert_eq!(protected.1, base.1);
+        } else if position > 0.0 {
+            assert!(protected.1 > base.1);
+            assert_eq!(protected.0, base.0);
+        } else {
+            assert_eq!((protected.0, protected.1), (base.0, base.1));
+        }
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }

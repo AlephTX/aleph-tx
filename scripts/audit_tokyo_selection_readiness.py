@@ -107,16 +107,19 @@ def _is_usable_market_data(source: str, event: str, payload: dict | None) -> boo
     if event != "message" or not isinstance(payload, dict):
         return False
     if source in ("lighter", "lighter_robinhood"):
-        return payload.get("type") in ("subscribed/order_book", "update/order_book") and isinstance(
-            payload.get("order_book"), dict
+        book = payload.get("order_book")
+        nonce = book.get("nonce") if isinstance(book, dict) else None
+        return (
+            payload.get("type") in ("subscribed/order_book", "update/order_book")
+            and type(nonce) is int
+            and nonce > 0
         )
     if source == "hyperliquid":
         return payload.get("channel") == "l2Book" and isinstance(payload.get("data"), dict)
     if source == "arcus":
         return (
-            payload.get("channel") == "l2Orderbook"
-            and payload.get("type") in ("subscribed", "channel_data")
-            and isinstance(payload.get("contents"), dict)
+            payload.get("type") in ("subscribed", "channel_data")
+            and _extract_source_ms(source, payload) is not None
         )
     if source == "binance":
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload

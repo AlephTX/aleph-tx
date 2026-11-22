@@ -12,6 +12,7 @@ mod costs;
 mod entry_book;
 mod entry_flow;
 mod funding;
+mod paired_cash_exit;
 mod posture;
 use basis_reversion::BasisReversionState;
 pub use basis_reversion::{BasisReversionReport, MakerBasisReversion};
@@ -23,6 +24,7 @@ use entry_flow::EntryFlowState;
 pub use entry_flow::{EntryFlowFilter, EntryFlowReport};
 pub use funding::{FlatAtFunding, FundingFlatReport};
 use funding::{FundingState, TimerKind};
+pub use paired_cash_exit::{PairedCashExit, PairedCashExitReport};
 use posture::PostureState;
 pub use posture::{TurnoverControl, TurnoverPosture, TurnoverPosturePolicy, TurnoverPostureReport};
 
@@ -95,9 +97,24 @@ pub struct MakerFirstConfig {
     /// Separate waiting budget and economics for an already hedged position.
     #[serde(default)]
     pub hedged_exit: Option<HedgedExit>,
+    /// Offline experiment: request the ordinary cancel-and-drain sequence when
+    /// both displayed full exits cover this cycle's fees and explicit costs.
+    /// A quote-based trigger is not a fill or a guaranteed profitable exit.
+    #[serde(default)]
+    pub paired_cash_exit: Option<PairedCashExit>,
     /// Offline diagnostics only; never changes admission or execution.
     #[serde(default)]
     pub diagnose_cycles: bool,
+    /// Offline read-only diagnostics for the opening-maker-fill to hedge-complete phase
+    /// (first available hedge touch, wait/miss breakdown, and exact ms split; `S14-1`).
+    /// Never changes admission or execution; omitted from report JSON when `false`.
+    #[serde(default)]
+    pub diagnose_entry_hedge: bool,
+    /// Optional execution policy for hedge/unwind IOCs (`submit_ioc`), decoupling protective
+    /// limit-price cushion, max depth impact, and retry cadence from opening admission (`S14-1`).
+    /// `None` preserves existing behavior byte-identically.
+    #[serde(default)]
+    pub hedge_ioc_policy: Option<HedgeIocPolicy>,
     #[serde(with = "rust_decimal::serde::str")]
     pub maker_fee_bps: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -222,6 +239,261 @@ pub struct EntryMarkoutGateReport {
     pub labels_completed: usize,
     pub missing_hedge_anchor: usize,
     pub pending_labels: usize,
+}
+
+/// Optional execution policy scoped strictly to hedge/unwind IOC submissions (`submit_ioc`).
+/// Never loosens opening/closing maker admission, `book.in_bounds`, `participation`,
+/// `max_single_leg`, `min_order_base`, or venue `taker_delay_ms` (`S14-1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HedgeIocPolicy {
+    /// Protective limit-price cushion (bps) applied to hedge/unwind IOCs (`0..=100`).
+    #[serde(with = "rust_decimal::serde::str")]
+    pub limit_buffer_bps: Decimal,
+    /// Optional max depth impact cap (bps) for hedge/unwind IOCs (`None` inherits
+    /// `pair.max_depth_impact_bps`). Must be in `0.01..=1000` and strictly `> limit_buffer_bps`
+    /// whenever `limit_buffer_bps > 0` (leaving headroom for tick alignment).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub max_depth_impact_bps: Option<Decimal>,
+    /// Optional IOC retry cadence (ms) after a miss/partial/wait while unhedged
+    /// (`None` inherits `reprice_ms`). Bounded `1..=2_000`.
+    #[serde(default)]
+    pub retry_ms: Option<u64>,
+    /// When `true`, apply the decoupled buffer/impact/retry policy ONLY to opening entry-hedge
+    /// IOCs (`!unwind && !closing_hedge`), keeping paired closing hedges and forced drains on
+    /// the conservative `pair.limit_buffer_bps` / `pair.max_depth_impact_bps` / `reprice_ms`
+    /// (`S15-2`). Default `false` preserves Sprint 14 behavior byte-identically.
+    #[serde(default)]
+    pub entry_only: bool,
+}
+
+impl HedgeIocPolicy {
+    fn validate(&self, pair: &PairConfig) -> Result<()> {
+        let max_impact_bps = match self.max_depth_impact_bps {
+            Some(bps) => bps,
+            None => dec(pair.max_depth_impact_bps)?,
+        };
+        ensure!(
+            (Decimal::ZERO..=Decimal::from(100)).contains(&self.limit_buffer_bps)
+                && (Decimal::new(1, 2)..=Decimal::from(1_000)).contains(&max_impact_bps)
+                && (self.limit_buffer_bps.is_zero() || self.limit_buffer_bps < max_impact_bps)
+                && self.retry_ms.is_none_or(|ms| (1..=2_000).contains(&ms)),
+            "invalid hedge IOC policy"
+        );
+        Ok(())
+    }
+
+    fn apply_to_rules(&self, mut rules: Rules) -> Rules {
+        rules.limit_buffer = self.limit_buffer_bps / BPS;
+        if let Some(max_impact_bps) = self.max_depth_impact_bps {
+            rules.max_impact = max_impact_bps / BPS;
+        }
+        rules
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryHedgeEpisode {
+    pub cycle_id: usize,
+    pub opening_maker_leg: usize,
+    pub hedge_leg: usize,
+    pub hedge_side: HedgeSide,
+    pub opening_fill_ms: u64,
+    pub first_notice_ms: Option<u64>,
+    pub first_ioc_submit_ms: Option<u64>,
+    pub first_ioc_arrival_ms: Option<u64>,
+    pub first_hedge_fill_ms: Option<u64>,
+    pub first_hedge_book_ms: Option<u64>,
+    pub fully_hedged_ms: Option<u64>,
+    pub forced_drain_triggered_ms: Option<u64>,
+    pub risk_resolved_ms: Option<u64>,
+    pub censored_unhedged_ms: Option<u64>,
+    pub entry_unhedged_ms: Option<u64>,
+    pub notice_wait_ms: Option<u64>,
+    pub submit_wait_ms: Option<u64>,
+    pub ioc_flight_and_retry_ms: Option<u64>,
+    pub outcome: &'static str,
+    pub opening_maker_fills: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub opening_maker_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub opening_maker_notional: Decimal,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub first_available_hedge_touch_at_fill: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub first_available_hedge_mid_at_fill: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub first_available_hedge_touch_at_notice: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub first_ioc_submit_touch: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub first_ioc_limit: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub entry_hedge_base: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub entry_hedge_notional: Decimal,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub entry_hedge_vwap: Option<Decimal>,
+    pub ioc_submitted: usize,
+    pub ioc_fills: usize,
+    pub ioc_partial: usize,
+    pub ioc_price_misses: usize,
+    pub ioc_depth_misses: usize,
+    pub ioc_expired: usize,
+    pub stale_book_waits: usize,
+    pub depth_unavailable_waits: usize,
+    pub below_minimum_waits: usize,
+    pub reprice_throttle_waits: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EntryHedgeDiagnostics {
+    pub episodes: Vec<EntryHedgeEpisode>,
+    pub total_entry_unhedged_ms: u64,
+    pub total_censored_unhedged_ms: u64,
+    pub total_notice_wait_ms: u64,
+    pub total_submit_wait_ms: u64,
+    pub total_ioc_flight_and_retry_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct EntryHedgeDiagState {
+    episodes: Vec<EntryHedgeEpisode>,
+    active: Option<EntryHedgeEpisode>,
+}
+
+impl EntryHedgeDiagState {
+    #[allow(clippy::too_many_arguments)]
+    fn on_opening_fill(
+        &mut self,
+        now: u64,
+        maker_leg: usize,
+        hedge_side: HedgeSide,
+        base: Decimal,
+        notional: Decimal,
+        hedge_touch_at_fill: Option<Decimal>,
+        hedge_mid_at_fill: Option<Decimal>,
+    ) {
+        if let Some(ep) = &mut self.active {
+            ep.opening_maker_fills += 1;
+            ep.opening_maker_base += base;
+            ep.opening_maker_notional += notional;
+            return;
+        }
+        let cycle_id = self.episodes.len();
+        self.active = Some(EntryHedgeEpisode {
+            cycle_id,
+            opening_maker_leg: maker_leg,
+            hedge_leg: 1 - maker_leg,
+            hedge_side,
+            opening_fill_ms: now,
+            first_notice_ms: None,
+            first_ioc_submit_ms: None,
+            first_ioc_arrival_ms: None,
+            first_hedge_fill_ms: None,
+            first_hedge_book_ms: None,
+            fully_hedged_ms: None,
+            forced_drain_triggered_ms: None,
+            risk_resolved_ms: None,
+            censored_unhedged_ms: None,
+            entry_unhedged_ms: None,
+            notice_wait_ms: None,
+            submit_wait_ms: None,
+            ioc_flight_and_retry_ms: None,
+            outcome: "open",
+            opening_maker_fills: 1,
+            opening_maker_base: base,
+            opening_maker_notional: notional,
+            first_available_hedge_touch_at_fill: hedge_touch_at_fill,
+            first_available_hedge_mid_at_fill: hedge_mid_at_fill,
+            first_available_hedge_touch_at_notice: None,
+            first_ioc_submit_touch: None,
+            first_ioc_limit: None,
+            entry_hedge_base: Decimal::ZERO,
+            entry_hedge_notional: Decimal::ZERO,
+            entry_hedge_vwap: None,
+            ioc_submitted: 0,
+            ioc_fills: 0,
+            ioc_partial: 0,
+            ioc_price_misses: 0,
+            ioc_depth_misses: 0,
+            ioc_expired: 0,
+            stale_book_waits: 0,
+            depth_unavailable_waits: 0,
+            below_minimum_waits: 0,
+            reprice_throttle_waits: 0,
+        });
+    }
+
+    fn on_notice(&mut self, now: u64, hedge_touch_at_notice: Option<Decimal>) {
+        if let Some(ep) = &mut self.active
+            && ep.first_notice_ms.is_none()
+        {
+            ep.first_notice_ms = Some(now);
+            ep.first_available_hedge_touch_at_notice = hedge_touch_at_notice;
+        }
+    }
+
+    fn close_active(&mut self, now: u64, outcome: &'static str) {
+        let Some(mut ep) = self.active.take() else {
+            return;
+        };
+        ep.outcome = outcome;
+        let elapsed = now - ep.opening_fill_ms;
+        if outcome == "open_at_cutoff" {
+            ep.censored_unhedged_ms = Some(elapsed);
+        } else {
+            ep.risk_resolved_ms = Some(now);
+            ep.entry_unhedged_ms = Some(elapsed);
+        }
+        if outcome == "hedged" {
+            ep.fully_hedged_ms = Some(now);
+        }
+        if let Some(notice) = ep.first_notice_ms {
+            ep.notice_wait_ms = Some(notice - ep.opening_fill_ms);
+            if let Some(submit) = ep.first_ioc_submit_ms {
+                ep.submit_wait_ms = Some(submit.saturating_sub(notice));
+                if matches!(outcome, "hedged" | "hedged_within_deadband") {
+                    ep.ioc_flight_and_retry_ms = Some(now - submit);
+                }
+            }
+        }
+        if !ep.entry_hedge_base.is_zero() {
+            ep.entry_hedge_vwap = Some(ep.entry_hedge_notional / ep.entry_hedge_base);
+        }
+        self.episodes.push(ep);
+    }
+
+    fn finish(mut self, cutoff: u64) -> EntryHedgeDiagnostics {
+        self.close_active(cutoff, "open_at_cutoff");
+        let total_censored_unhedged_ms = self
+            .episodes
+            .last()
+            .and_then(|ep| ep.censored_unhedged_ms)
+            .unwrap_or(0);
+        let mut total_entry_unhedged_ms = 0u64;
+        let mut total_notice_wait_ms = 0u64;
+        let mut total_submit_wait_ms = 0u64;
+        let mut total_ioc_flight_and_retry_ms = 0u64;
+        for ep in &self.episodes {
+            total_entry_unhedged_ms =
+                total_entry_unhedged_ms.saturating_add(ep.entry_unhedged_ms.unwrap_or(0));
+            total_notice_wait_ms =
+                total_notice_wait_ms.saturating_add(ep.notice_wait_ms.unwrap_or(0));
+            total_submit_wait_ms =
+                total_submit_wait_ms.saturating_add(ep.submit_wait_ms.unwrap_or(0));
+            total_ioc_flight_and_retry_ms = total_ioc_flight_and_retry_ms
+                .saturating_add(ep.ioc_flight_and_retry_ms.unwrap_or(0));
+        }
+        EntryHedgeDiagnostics {
+            episodes: self.episodes,
+            total_entry_unhedged_ms,
+            total_censored_unhedged_ms,
+            total_notice_wait_ms,
+            total_submit_wait_ms,
+            total_ioc_flight_and_retry_ms,
+        }
+    }
 }
 
 fn default_initial_ahead_fraction() -> Decimal {
@@ -548,6 +820,10 @@ pub struct MakerFirstReport {
     pub queue_model: Option<QueueModelReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_markout_gate: Option<EntryMarkoutGateReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_hedge_diagnostics: Option<EntryHedgeDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_cash_exit: Option<PairedCashExitReport>,
 }
 
 /// Explicit four-denominator turnover separation (`VMM-01` / `OPT-01`) so target-venue,
@@ -744,6 +1020,7 @@ struct Cycle {
     sub_min_top_up_attempts: usize,
     sub_min_recovery_pending_base: Decimal,
     used_partner_step_deadband: bool,
+    cash_exit_triggered: bool,
 }
 
 struct Replay<'a> {
@@ -767,6 +1044,7 @@ struct Replay<'a> {
     cycle: Option<Cycle>,
     next_quote_ms: u64,
     next_ioc_ms: u64,
+    next_entry_ioc_ms: u64,
     notices: VecDeque<(u64, Decimal)>,
     unhedged_since: Option<u64>,
     cost_feedback: CostFeedback,
@@ -775,6 +1053,7 @@ struct Replay<'a> {
     entry_flow: EntryFlowState,
     entry_book: EntryBookState,
     entry_markout: EntryMarkoutState,
+    entry_hedge_diag: Option<EntryHedgeDiagState>,
     posture: PostureState,
     funding: Option<FundingState>,
     report: MakerFirstReport,
@@ -1086,6 +1365,9 @@ impl MakerFirstConfig {
         if let Some(gate) = self.entry_markout_gate {
             gate.validate()?;
         }
+        if let Some(policy) = self.hedge_ioc_policy {
+            policy.validate(&self.pair)?;
+        }
         ensure!(
             (self.pair.asset_class == AssetClass::Crypto || self.flat_at_funding.is_some())
                 && (self.pair.mode.is_pair_hedge() || self.require_net_edge)
@@ -1182,6 +1464,9 @@ impl MakerFirstConfig {
                         .is_none_or(|v| v >= Decimal::ZERO && v <= Decimal::from(10_000)),
                 "invalid maker-first turnover feedback"
             );
+        }
+        if let Some(policy) = self.paired_cash_exit {
+            policy.validate(self)?;
         }
         if let Some(policy) = self.hedged_exit {
             let max_bps = Decimal::from(1_000);
@@ -1904,6 +2189,7 @@ impl Replay<'_> {
                 sub_min_top_up_attempts: 0,
                 sub_min_recovery_pending_base: Decimal::ZERO,
                 used_partner_step_deadband: false,
+                cash_exit_triggered: false,
             }
         });
         cycle.maker_turnover += notional;
@@ -1958,6 +2244,24 @@ impl Replay<'_> {
             }
         }
         let signed_base = if side == HedgeSide::Buy { base } else { -base };
+        if !closing {
+            let hedge_side = direction(signed_base);
+            let hedge_touch_at_fill = self
+                .fresh(1 - i, now)
+                .and_then(|book| book.side(hedge_side).first())
+                .map(|level| level.price);
+            if let Some(diag) = &mut self.entry_hedge_diag {
+                diag.on_opening_fill(
+                    now,
+                    i,
+                    hedge_side,
+                    base,
+                    notional,
+                    hedge_touch_at_fill,
+                    reference_mids[1 - i],
+                );
+            }
+        }
         self.notices
             .push_back((now + self.config.fill_notice_ms, signed_base));
         Ok(())
@@ -1967,8 +2271,17 @@ impl Replay<'_> {
         let Some(order) = self.ioc.take() else {
             return Ok(());
         };
+        let is_entry_hedge = !order.unwind && !order.closing_hedge;
         if now >= order.expires_ms {
             self.report.ioc_expired += 1;
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.ioc_expired += 1;
+            }
             self.report.cycle_attribution.sub_min_top_up_failures +=
                 usize::from(order.sub_min_top_up);
             return Ok(());
@@ -1981,6 +2294,14 @@ impl Replay<'_> {
         };
         let Some(touch) = book.side(order.side).first().map(|l| l.price) else {
             self.report.ioc_depth_misses += 1;
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.ioc_depth_misses += 1;
+            }
             self.report.cycle_attribution.sub_min_top_up_failures +=
                 usize::from(order.sub_min_top_up);
             return Ok(());
@@ -1989,6 +2310,14 @@ impl Replay<'_> {
             || signed_cost(order.side, touch, order.limit) > Decimal::ZERO
         {
             self.report.ioc_price_misses += 1;
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.ioc_price_misses += 1;
+            }
             self.report.cycle_attribution.sub_min_top_up_failures +=
                 usize::from(order.sub_min_top_up);
             return Ok(());
@@ -2049,6 +2378,14 @@ impl Replay<'_> {
         )?;
         if fill.base.is_zero() || (order.sub_min_top_up && fill.base < order.quantity) {
             self.report.ioc_depth_misses += 1;
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.ioc_depth_misses += 1;
+            }
             self.report.cycle_attribution.sub_min_top_up_failures +=
                 usize::from(order.sub_min_top_up);
             return Ok(());
@@ -2058,6 +2395,21 @@ impl Replay<'_> {
         self.consumed_ms[order.leg] = fill_time;
         self.report.ioc_fills += 1;
         self.report.ioc_partial += usize::from(fill.base < order.quantity);
+        if is_entry_hedge
+            && let Some(ep) = self
+                .entry_hedge_diag
+                .as_mut()
+                .and_then(|d| d.active.as_mut())
+        {
+            ep.ioc_fills += 1;
+            ep.ioc_partial += usize::from(fill.base < order.quantity);
+            if ep.first_hedge_fill_ms.is_none() {
+                ep.first_hedge_fill_ms = Some(now);
+                ep.first_hedge_book_ms = Some(fill_time);
+            }
+            ep.entry_hedge_base += fill.base;
+            ep.entry_hedge_notional += fill.notional;
+        }
         self.report.ioc_slippage += signed_cost(order.side, fill.notional, fill.base * order.touch);
         self.report.ioc_submit_touch_turnover += fill.base * order.touch;
         self.report.ioc_depth_impact += signed_cost(order.side, fill.notional, fill.base * touch);
@@ -2150,6 +2502,14 @@ impl Replay<'_> {
                 .as_mut()
                 .expect("opening hedge has an active cycle")
                 .hedge_fill_at_ms = Some(now);
+            if let Some(diag) = &mut self.entry_hedge_diag {
+                let outcome = if self.ledger.positions[0] == -self.ledger.positions[1] {
+                    "hedged"
+                } else {
+                    "hedged_within_deadband"
+                };
+                diag.close_active(now, outcome);
+            }
         }
         Ok(())
     }
@@ -2175,22 +2535,96 @@ impl Replay<'_> {
         }
     }
 
+    fn ioc_rules(&self, is_entry_hedge: bool) -> Rules {
+        self.config
+            .hedge_ioc_policy
+            .filter(|policy| is_entry_hedge || !policy.entry_only)
+            .map_or(self.rules, |policy| policy.apply_to_rules(self.rules))
+    }
+
+    fn hedge_retry_ms(&self, is_entry_hedge: bool) -> u64 {
+        self.config
+            .hedge_ioc_policy
+            .filter(|policy| is_entry_hedge || !policy.entry_only)
+            .and_then(|policy| policy.retry_ms)
+            .unwrap_or(self.config.reprice_ms)
+    }
+
+    fn next_ioc_ready_ms(&self, is_entry_hedge: bool) -> u64 {
+        if is_entry_hedge
+            && self
+                .config
+                .hedge_ioc_policy
+                .is_some_and(|policy| policy.entry_only)
+        {
+            self.next_entry_ioc_ms
+        } else {
+            self.next_ioc_ms
+        }
+    }
+
+    fn record_ioc_pacing(&mut self, now: u64, is_entry_hedge: bool) {
+        if self
+            .config
+            .hedge_ioc_policy
+            .is_some_and(|policy| policy.entry_only)
+        {
+            // Keep entry retry pacing isolated from closing/forced-drain pacing (`S16-1`) while
+            // still enforcing conservative `reprice_ms` spacing from every IOC submission.
+            self.next_entry_ioc_ms = now + self.hedge_retry_ms(true);
+            self.next_ioc_ms = now + self.config.reprice_ms;
+        } else {
+            let next = now + self.hedge_retry_ms(is_entry_hedge);
+            self.next_ioc_ms = next;
+            self.next_entry_ioc_ms = next;
+        }
+    }
+
     fn submit_ioc(&mut self, now: u64, i: usize, position: Decimal, unwind: bool) -> Result<()> {
-        if self.ioc.is_some() || position.is_zero() || now < self.next_ioc_ms {
+        let closing_hedge = !unwind && self.cycle.as_ref().is_some_and(|c| c.closing_maker_filled);
+        let is_entry_hedge = !unwind && !closing_hedge;
+        if self.ioc.is_some() || position.is_zero() {
             return Ok(());
         }
-        self.next_ioc_ms = now + self.config.reprice_ms;
+        if now < self.next_ioc_ready_ms(is_entry_hedge) {
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.reprice_throttle_waits += 1;
+            }
+            return Ok(());
+        }
+        self.record_ioc_pacing(now, is_entry_hedge);
         let Some(book) = self.fresh(i, now) else {
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.stale_book_waits += 1;
+            }
             return Ok(());
         };
         let available_notional = book.available_notional;
         let terms = &self.config.pair.legs[i];
         let side = direction(position);
-        let curve = Depth::build(book, terms, side, self.rules);
+        let ioc_rules = self.ioc_rules(is_entry_hedge);
+        let curve = Depth::build(book, terms, side, ioc_rules);
         let Ok(last) = curve.last() else {
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.depth_unavailable_waits += 1;
+            }
             return Ok(());
         };
-        let closing_hedge = !unwind && self.cycle.as_ref().is_some_and(|c| c.closing_maker_filled);
         let mut target = position.abs();
         if closing_hedge && self.config.hedged_exit.is_some() {
             let leg = self.ledger.positions[i];
@@ -2203,6 +2637,14 @@ impl Replay<'_> {
         let leg = self.ledger.positions[i];
         let reduces_leg = !leg.is_zero() && direction(leg) == side && quantity <= leg.abs();
         let Some(touch) = book.side(side).first().map(|l| l.price) else {
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.depth_unavailable_waits += 1;
+            }
             return Ok(());
         };
         let mut dust_avoided = false;
@@ -2221,6 +2663,14 @@ impl Replay<'_> {
             quantity = adjusted;
         }
         let Ok(mut limit) = curve.limit(quantity) else {
+            if is_entry_hedge
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                ep.depth_unavailable_waits += 1;
+            }
             return Ok(());
         };
         let mut min_ioc_base = if reduces_leg {
@@ -2252,7 +2702,7 @@ impl Replay<'_> {
             let leg1_arrival_ms = now + self.config.transport_ms + self.config.taker_delay_ms[i];
             let leg1_expires_ms =
                 (leg1_arrival_ms + self.config.pair.execution_window_ms).min(self.config.end_ms);
-            let leg2_submit_ms = leg1_arrival_ms.max(now + self.config.reprice_ms);
+            let leg2_submit_ms = leg1_arrival_ms.max(now + self.hedge_retry_ms(false));
             let leg2_arrival_ms =
                 leg2_submit_ms + self.config.transport_ms + self.config.taker_delay_ms[i];
             let flat_deadline_ms = self
@@ -2290,6 +2740,14 @@ impl Replay<'_> {
                 self.report.below_minimum_unwind += 1;
             } else {
                 self.report.below_minimum_hedge += 1;
+                if is_entry_hedge
+                    && let Some(ep) = self
+                        .entry_hedge_diag
+                        .as_mut()
+                        .and_then(|d| d.active.as_mut())
+                {
+                    ep.below_minimum_waits += 1;
+                }
             }
             self.report.cycle_attribution.reduce_ioc_dust_avoided += usize::from(dust_avoided);
             return Ok(());
@@ -2312,6 +2770,20 @@ impl Replay<'_> {
             closing_hedge,
             sub_min_top_up,
         });
+        if is_entry_hedge
+            && let Some(ep) = self
+                .entry_hedge_diag
+                .as_mut()
+                .and_then(|d| d.active.as_mut())
+        {
+            ep.ioc_submitted += 1;
+            if ep.first_ioc_submit_ms.is_none() {
+                ep.first_ioc_submit_ms = Some(now);
+                ep.first_ioc_arrival_ms = Some(arrival_ms);
+                ep.first_ioc_submit_touch = Some(touch);
+                ep.first_ioc_limit = Some(limit);
+            }
+        }
         self.report.cycle_attribution.reduce_ioc_dust_avoided += usize::from(dust_avoided);
         self.report.ioc_submitted += 1;
         Ok(())
@@ -3740,6 +4212,25 @@ impl Replay<'_> {
             self.notices.pop_front();
             confirmed = true;
         }
+        if confirmed
+            && let Some((hedge_leg, hedge_side)) = self
+                .entry_hedge_diag
+                .as_ref()
+                .and_then(|d| d.active.as_ref())
+                .filter(|ep| {
+                    ep.first_notice_ms.is_none()
+                        && now - ep.opening_fill_ms >= self.config.fill_notice_ms
+                })
+                .map(|ep| (ep.hedge_leg, ep.hedge_side))
+        {
+            let hedge_touch_at_notice = self
+                .fresh(hedge_leg, now)
+                .and_then(|book| book.side(hedge_side).first())
+                .map(|level| level.price);
+            if let Some(diag) = &mut self.entry_hedge_diag {
+                diag.on_notice(now, hedge_touch_at_notice);
+            }
+        }
         let retain_sub_min_opening = self.config.aggregate_sub_minimum_fills
             && self
                 .quote
@@ -3759,6 +4250,18 @@ impl Replay<'_> {
             self.cancel(now, "fill_confirmed");
         }
         self.update_paired_state(now);
+        let cash_exit = self.paired_cash_exit_value(now);
+        if let Some(value) = cash_exit {
+            let stats = self
+                .report
+                .paired_cash_exit
+                .as_mut()
+                .expect("cash exit requires an enabled report");
+            stats.triggers += 1;
+            stats.with_pending_maker_quote += usize::from(self.quote.is_some());
+            stats.first_trigger_ms.get_or_insert(now);
+            stats.quoted_stress_cash += value;
+        }
         let (paired_time, paired_basis, paired_book) = self.paired_stop(now);
         if let Some(cycle) = &mut self.cycle {
             let exposure_stop = self
@@ -3774,6 +4277,7 @@ impl Replay<'_> {
                 || cycle.paired_at_ms.is_none())
                 && now >= cycle.started_ms + self.config.hold_ms;
             cycle.draining |= opening_timeout
+                || cash_exit.is_some()
                 || funding_pause
                 || paired_time
                 || paired_basis
@@ -3781,6 +4285,16 @@ impl Replay<'_> {
                 || now >= self.config.end_ms - self.config.drain_ms
                 || self.report.incomplete.is_some()
                 || exposure_stop;
+            cycle.cash_exit_triggered |= cash_exit.is_some();
+            if cycle.draining
+                && let Some(ep) = self
+                    .entry_hedge_diag
+                    .as_mut()
+                    .and_then(|d| d.active.as_mut())
+            {
+                // A drain request can precede an unwind fill by several book frames.
+                ep.forced_drain_triggered_ms.get_or_insert(now);
+            }
         }
         if self.cycle.as_ref().is_some_and(|cycle| cycle.draining) {
             self.cancel(now, "drain");
@@ -3817,7 +4331,7 @@ impl Replay<'_> {
                         }
                         if close.is_zero() {
                             self.report.cycle_attribution.paired_drain_blocked += 1;
-                            self.next_ioc_ms = now + self.config.reprice_ms;
+                            self.record_ioc_pacing(now, false);
                         } else {
                             self.submit_ioc(now, target_leg, close, true)?;
                         }
@@ -3873,6 +4387,18 @@ impl Replay<'_> {
             && let Some(cycle) = self.cycle.take()
         {
             let pnl = self.ledger.cash - cycle.initial_cash;
+            if cycle.cash_exit_triggered {
+                let policy = self.config.paired_cash_exit.expect("cash exit policy");
+                let turnover = self.ledger.turnover - cycle.initial_turnover;
+                let stats = self
+                    .report
+                    .paired_cash_exit
+                    .as_mut()
+                    .expect("cash exit report");
+                stats.settled_cycles += 1;
+                stats.realized_stress_cash +=
+                    pnl - policy.cost(turnover, turnover - cycle.maker_turnover);
+            }
             self.record_completed_cycle(&cycle, now, pnl);
             let eligible = std::mem::take(&mut self.ledger.cycle_eligible_turnover);
             if let Some(policy) = self.config.turnover_feedback {
@@ -3958,6 +4484,18 @@ impl Replay<'_> {
             self.report.max_net_notional = self.report.max_net_notional.max(net * book.mid());
         }
         if net.is_zero() || self.within_partner_hedge_deadband(now) {
+            if let Some(diag) = &mut self.entry_hedge_diag
+                && let Some(ep) = &diag.active
+            {
+                let outcome = if ep.forced_drain_triggered_ms.is_some() {
+                    "forced_drain"
+                } else if a.is_zero() && b.is_zero() {
+                    "passive_offset_flat"
+                } else {
+                    "net_within_risk_limit"
+                };
+                diag.close_active(now, outcome);
+            }
             if let Some(start) = self.unhedged_since.take() {
                 let elapsed = now - start;
                 self.report.total_unhedged_ms += elapsed;
@@ -4300,6 +4838,10 @@ impl Replay<'_> {
             .config
             .entry_book_filter
             .map(|policy| self.entry_book.report(policy));
+        self.report.entry_hedge_diagnostics = self
+            .entry_hedge_diag
+            .take()
+            .map(|d| d.finish(self.config.end_ms));
         Ok(self.report)
     }
 }
@@ -4336,6 +4878,7 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         cycle: None,
         next_quote_ms: 0,
         next_ioc_ms: 0,
+        next_entry_ioc_ms: 0,
         notices: VecDeque::new(),
         unhedged_since: None,
         cost_feedback: CostFeedback::default(),
@@ -4344,6 +4887,9 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         entry_flow: EntryFlowState::default(),
         entry_book: EntryBookState::default(),
         entry_markout: EntryMarkoutState::default(),
+        entry_hedge_diag: config
+            .diagnose_entry_hedge
+            .then(EntryHedgeDiagState::default),
         posture: PostureState::new(config.turnover_posture),
         funding: FundingState::new(config)?,
         report: MakerFirstReport {
@@ -4352,6 +4898,9 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
             trade_from_ms: config.trade_from_ms.unwrap_or(config.start_ms),
             end_ms: config.end_ms,
             execution_costs: config.diagnose_cycles.then(costs::Costs::new),
+            paired_cash_exit: config
+                .paired_cash_exit
+                .map(|_| PairedCashExitReport::default()),
             queue_model: config.queue_model.map(|qm| QueueModelReport {
                 initial_ahead_fraction: qm.initial_ahead_fraction,
                 cancel_progress_power: qm.cancel_progress_power,
@@ -4372,6 +4921,10 @@ mod tests {
 
     mod funding_tests {
         include!("maker_first/funding_tests.rs");
+    }
+
+    mod paired_cash_exit_tests {
+        include!("maker_first/paired_cash_exit_tests.rs");
     }
 
     fn config() -> MakerFirstConfig {
@@ -4406,7 +4959,10 @@ mod tests {
             passive_offset: None,
             turnover_feedback: None,
             hedged_exit: None,
+            paired_cash_exit: None,
             diagnose_cycles: false,
+            diagnose_entry_hedge: false,
+            hedge_ioc_policy: None,
             maker_fee_bps: Decimal::ONE,
             quote_notional: Decimal::from(100),
             latency_reserve_bps: Decimal::ZERO,
@@ -5003,7 +5559,8 @@ mod tests {
     #[test]
     fn passive_offset_closes_a_long_or_short_without_a_taker_order() {
         for opening in [HedgeSide::Buy, HedgeSide::Sell] {
-            let cfg = passive_config(opening);
+            let mut cfg = passive_config(opening);
+            cfg.diagnose_entry_hedge = true;
             let t = cfg.start_ms;
             let (entry, exit) = match opening {
                 HedgeSide::Buy => ("999.7", "1000.3"),
@@ -5032,6 +5589,11 @@ mod tests {
             assert_eq!([result.maker_buy_fills, result.maker_sell_fills], [1, 1]);
             assert_eq!(result.ioc_submitted, 0);
             assert_eq!(result.max_unhedged_ms, 210);
+            let ep = &result.entry_hedge_diagnostics.as_ref().unwrap().episodes[0];
+            assert_eq!(ep.outcome, "passive_offset_flat");
+            assert_eq!(ep.entry_unhedged_ms, Some(210));
+            assert_eq!(ep.risk_resolved_ms, Some(ep.opening_fill_ms + 210));
+            assert_eq!(ep.fully_hedged_ms, None);
             assert_eq!(result.passive_cycles_started[side_index(opening)], 1);
             assert_eq!(result.passive_cycles_completed[side_index(opening)], 1);
         }
@@ -8148,6 +8710,7 @@ mod tests {
                 sub_min_top_up_attempts: 0,
                 sub_min_recovery_pending_base: Decimal::ZERO,
                 used_partner_step_deadband: true,
+                cash_exit_triggered: false,
             });
             let at = start + 100;
             assert!(replay.fresh(0, at).is_none() && replay.fresh(1, at).is_none());
@@ -8365,5 +8928,537 @@ mod tests {
                 .entry_blocked
                 .contains_key("entry_markout_quote_distance")
         );
+    }
+
+    #[test]
+    fn entry_hedge_diagnostics_is_read_only_and_attributes_price_miss_retries() {
+        let registry = VenueRegistry::default();
+        let make_books = |cfg: &MakerFirstConfig, at: u64, hedge_bid: &str| {
+            let level = |price: &str, contracts: &str| Level {
+                price: d(price),
+                contracts: d(contracts),
+            };
+            MakerFirstEvent::Book {
+                at_ms: at,
+                books: [0, 1].map(|i| Book {
+                    market: cfg.pair.legs[i].market.clone(),
+                    timestamp_ms: at,
+                    tradable: true,
+                    bids: vec![level(if i == 0 { "1000.0" } else { hedge_bid }, "1")],
+                    asks: vec![level(if i == 0 { "1000.2" } else { "1000.4" }, "1")],
+                    bounds: None,
+                    available_notional: Decimal::from(500),
+                }),
+                reference: None,
+                equity_session: None,
+                leg_oracles: None,
+            }
+        };
+        let mut base = config();
+        base.entry_side = Some(HedgeSide::Buy);
+        base.pair.limit_buffer_bps = 0.0;
+        base.pair.max_depth_impact_bps = 3.0;
+        base.transport_ms = 10;
+        base.fill_notice_ms = 100;
+        base.taker_delay_ms = [300, 300];
+        base.reprice_ms = 400;
+        base.hold_ms = 5_000;
+        base.unhedged_timeout_ms = 4_000;
+        base.end_ms = base.start_ms + 15_000;
+
+        let t0 = base.start_ms;
+        let events = |cfg: &MakerFirstConfig| {
+            vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t0,
+                    leg: 0,
+                    online: true,
+                },
+                make_books(cfg, t0, "1000.2"),
+                // Quote activates on the book frame at t0 + 20 (>= t0 + transport_ms = t0 + 10).
+                make_books(cfg, t0 + 20, "1000.2"),
+                // Maker buy fill at t0 + 200 (notice arrives at t0 + 300).
+                make_books(cfg, t0 + 200, "1000.2"),
+                partial(t0 + 200, t0 + 200, "1.1"),
+                // Notice arrives at t0 + 300 -> IOC #1 submits with limit 1000.2, arrives at t0 + 610.
+                make_books(cfg, t0 + 300, "1000.2"),
+                // At t0 + 610 hedge bid drops 4 bps to 999.8 -> IOC #1 price-misses!
+                // Because reprice_ms = 400 (next_ioc_ms = t0 + 700), t0 + 610 & t0 + 650 are throttled.
+                make_books(cfg, t0 + 610, "999.8"),
+                make_books(cfg, t0 + 650, "999.8"),
+                // At t0 + 700 IOC #2 submits with limit 999.8, arrives at t0 + 1010 and fills!
+                make_books(cfg, t0 + 700, "999.8"),
+                make_books(cfg, t0 + 1_010, "999.8"),
+                // Drain at hold_ms and flatten cleanly.
+                make_books(cfg, t0 + 5_500, "999.8"),
+                make_books(cfg, t0 + 6_000, "999.8"),
+                make_books(cfg, t0 + 6_600, "999.8"),
+                make_books(cfg, t0 + 7_200, "999.8"),
+                make_books(cfg, t0 + 8_000, "999.8"),
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ]
+        };
+
+        let silent = run_maker_first(&base, events(&base).into_iter().map(Ok), &registry).unwrap();
+        assert!(silent.entry_hedge_diagnostics.is_none());
+        let silent_json = serde_json::to_string(&silent).unwrap();
+        assert!(!silent_json.contains("entry_hedge_diagnostics"));
+
+        let mut diag_cfg = config();
+        diag_cfg.entry_side = base.entry_side;
+        diag_cfg.pair.limit_buffer_bps = base.pair.limit_buffer_bps;
+        diag_cfg.pair.max_depth_impact_bps = base.pair.max_depth_impact_bps;
+        diag_cfg.transport_ms = base.transport_ms;
+        diag_cfg.fill_notice_ms = base.fill_notice_ms;
+        diag_cfg.taker_delay_ms = base.taker_delay_ms;
+        diag_cfg.reprice_ms = base.reprice_ms;
+        diag_cfg.hold_ms = base.hold_ms;
+        diag_cfg.unhedged_timeout_ms = base.unhedged_timeout_ms;
+        diag_cfg.end_ms = base.end_ms;
+        diag_cfg.diagnose_entry_hedge = true;
+
+        let diag =
+            run_maker_first(&diag_cfg, events(&diag_cfg).into_iter().map(Ok), &registry).unwrap();
+        // Purely read-only: identical cash, fills, misses, and unhedged time.
+        assert_eq!(diag.net_pnl, silent.net_pnl);
+        assert_eq!(diag.maker_fills, silent.maker_fills);
+        assert_eq!(diag.ioc_fills, silent.ioc_fills);
+        assert_eq!(diag.ioc_price_misses, silent.ioc_price_misses);
+        assert_eq!(diag.total_unhedged_ms, silent.total_unhedged_ms);
+
+        let report = diag
+            .entry_hedge_diagnostics
+            .as_ref()
+            .expect("entry hedge diagnostics enabled");
+        assert_eq!(report.episodes.len(), 1);
+        let ep = &report.episodes[0];
+        assert_eq!(ep.outcome, "hedged");
+        assert_eq!(ep.opening_fill_ms, t0 + 200);
+        assert_eq!(ep.first_notice_ms, Some(t0 + 300));
+        assert_eq!(ep.first_ioc_submit_ms, Some(t0 + 300));
+        assert_eq!(ep.first_hedge_fill_ms, Some(t0 + 1_010));
+        assert_eq!(ep.fully_hedged_ms, Some(t0 + 1_010));
+        assert_eq!(ep.first_available_hedge_touch_at_fill, Some(d("1000.2")));
+        assert_eq!(ep.first_available_hedge_touch_at_notice, Some(d("1000.2")));
+        assert_eq!(ep.first_ioc_submit_touch, Some(d("1000.2")));
+        assert_eq!(ep.first_ioc_limit, Some(d("1000.2")));
+        assert_eq!(ep.entry_hedge_vwap, Some(d("999.8")));
+        assert_eq!(ep.ioc_price_misses, 1);
+        assert_eq!(ep.ioc_submitted, 2);
+        assert_eq!(ep.ioc_fills, 1);
+        assert!(ep.reprice_throttle_waits >= 1);
+        assert_eq!(ep.entry_unhedged_ms, Some(810));
+        assert_eq!(
+            ep.notice_wait_ms.unwrap()
+                + ep.submit_wait_ms.unwrap()
+                + ep.ioc_flight_and_retry_ms.unwrap(),
+            ep.entry_unhedged_ms.unwrap()
+        );
+        assert_eq!(report.total_entry_unhedged_ms, 810);
+        assert_eq!(ep.risk_resolved_ms, ep.fully_hedged_ms);
+        assert_eq!(ep.forced_drain_triggered_ms, None);
+
+        // The same opening fill can instead time out before any partner IOC.
+        diag_cfg.unhedged_timeout_ms = 100;
+        let drained =
+            run_maker_first(&diag_cfg, events(&diag_cfg).into_iter().map(Ok), &registry).unwrap();
+        let report = drained.entry_hedge_diagnostics.as_ref().unwrap();
+        let ep = &report.episodes[0];
+        assert_eq!(ep.outcome, "forced_drain");
+        assert_eq!(ep.forced_drain_triggered_ms, Some(t0 + 300));
+        assert_eq!(ep.risk_resolved_ms, Some(t0 + 610));
+        assert_eq!(ep.entry_unhedged_ms, Some(410));
+        assert_eq!(report.total_entry_unhedged_ms, drained.total_unhedged_ms);
+        assert_eq!(ep.entry_hedge_base, Decimal::ZERO);
+        assert_eq!(ep.fully_hedged_ms, None);
+        assert_eq!(ep.ioc_flight_and_retry_ms, None);
+
+        let no_unwind_book = events(&diag_cfg)
+            .into_iter()
+            .filter(|e| e.time() <= t0 + 300 || matches!(e, MakerFirstEvent::End { .. }));
+        let open = run_maker_first(&diag_cfg, no_unwind_book.map(Ok), &registry).unwrap();
+        let report = open.entry_hedge_diagnostics.as_ref().unwrap();
+        let ep = &report.episodes[0];
+        assert_eq!(ep.outcome, "open_at_cutoff");
+        assert_eq!(ep.forced_drain_triggered_ms, Some(t0 + 300));
+        assert_eq!(ep.fully_hedged_ms, None);
+        assert_eq!(ep.risk_resolved_ms, None);
+        assert_eq!(ep.entry_unhedged_ms, None);
+        assert_eq!(
+            ep.censored_unhedged_ms,
+            Some(diag_cfg.end_ms - ep.opening_fill_ms)
+        );
+        assert_eq!(report.total_censored_unhedged_ms, open.total_unhedged_ms);
+        assert_eq!(report.total_entry_unhedged_ms, 0);
+    }
+
+    #[test]
+    fn hedge_ioc_policy_avoids_price_miss_and_cuts_unhedged_lag() {
+        let registry = VenueRegistry::default();
+        let make_books = |cfg: &MakerFirstConfig, at: u64, hedge_bid: &str| {
+            let level = |price: &str, contracts: &str| Level {
+                price: d(price),
+                contracts: d(contracts),
+            };
+            MakerFirstEvent::Book {
+                at_ms: at,
+                books: [0, 1].map(|i| Book {
+                    market: cfg.pair.legs[i].market.clone(),
+                    timestamp_ms: at,
+                    tradable: true,
+                    bids: vec![level(if i == 0 { "1000.0" } else { hedge_bid }, "1")],
+                    asks: vec![level(if i == 0 { "1000.2" } else { "1000.4" }, "1")],
+                    bounds: None,
+                    available_notional: Decimal::from(500),
+                }),
+                reference: None,
+                equity_session: None,
+                leg_oracles: None,
+            }
+        };
+        let mut cfg = config();
+        cfg.entry_side = Some(HedgeSide::Buy);
+        cfg.pair.limit_buffer_bps = 0.0;
+        cfg.pair.max_depth_impact_bps = 3.0;
+        cfg.transport_ms = 10;
+        cfg.fill_notice_ms = 100;
+        cfg.taker_delay_ms = [300, 300];
+        cfg.reprice_ms = 400;
+        cfg.hold_ms = 5_000;
+        cfg.unhedged_timeout_ms = 4_000;
+        cfg.end_ms = cfg.start_ms + 15_000;
+        cfg.diagnose_entry_hedge = true;
+        cfg.hedge_ioc_policy = Some(HedgeIocPolicy {
+            limit_buffer_bps: d("10"),
+            max_depth_impact_bps: Some(d("15")),
+            retry_ms: Some(25),
+            entry_only: false,
+        });
+
+        let t0 = cfg.start_ms;
+        let events = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            make_books(&cfg, t0, "1000.2"),
+            make_books(&cfg, t0 + 20, "1000.2"),
+            make_books(&cfg, t0 + 200, "1000.2"),
+            partial(t0 + 200, t0 + 200, "1.1"),
+            make_books(&cfg, t0 + 300, "1000.2"),
+            // Hedge bid drops 4 bps during 310 ms flight; 10 bps hedge IOC buffer absorbs it on IOC #1.
+            make_books(&cfg, t0 + 610, "999.8"),
+            make_books(&cfg, t0 + 5_500, "999.8"),
+            make_books(&cfg, t0 + 6_000, "999.8"),
+            make_books(&cfg, t0 + 6_600, "999.8"),
+            make_books(&cfg, t0 + 7_200, "999.8"),
+            MakerFirstEvent::End { at_ms: cfg.end_ms },
+        ];
+
+        let res = run_maker_first(&cfg, events.into_iter().map(Ok), &registry).unwrap();
+        let diag = res.entry_hedge_diagnostics.as_ref().unwrap();
+        assert_eq!(diag.episodes.len(), 1);
+        let ep = &diag.episodes[0];
+        assert_eq!(ep.outcome, "hedged");
+        assert_eq!(ep.ioc_price_misses, 0);
+        assert_eq!(ep.ioc_submitted, 1);
+        assert_eq!(ep.ioc_fills, 1);
+        assert_eq!(ep.entry_unhedged_ms, Some(410));
+        assert_eq!(ep.entry_hedge_vwap, Some(d("999.8")));
+        assert!(ep.first_ioc_limit.unwrap() < d("1000.2"));
+    }
+
+    #[test]
+    fn hedge_ioc_policy_validation_rejects_invalid_bounds() {
+        let registry = VenueRegistry::default();
+        let bad_cases = [
+            // limit_buffer > inherited pair.max_depth_impact_bps (5 > 3)
+            HedgeIocPolicy {
+                limit_buffer_bps: d("5"),
+                max_depth_impact_bps: None,
+                retry_ms: None,
+                entry_only: false,
+            },
+            // limit_buffer == explicit max_depth_impact_bps (nonzero buffer needs tick headroom)
+            HedgeIocPolicy {
+                limit_buffer_bps: d("10"),
+                max_depth_impact_bps: Some(d("10")),
+                retry_ms: Some(50),
+                entry_only: false,
+            },
+            // limit_buffer > explicit max_depth_impact_bps
+            HedgeIocPolicy {
+                limit_buffer_bps: d("15"),
+                max_depth_impact_bps: Some(d("10")),
+                retry_ms: Some(50),
+                entry_only: false,
+            },
+            // negative buffer
+            HedgeIocPolicy {
+                limit_buffer_bps: d("-1"),
+                max_depth_impact_bps: Some(d("10")),
+                retry_ms: Some(50),
+                entry_only: false,
+            },
+            // retry_ms == 0
+            HedgeIocPolicy {
+                limit_buffer_bps: d("5"),
+                max_depth_impact_bps: Some(d("10")),
+                retry_ms: Some(0),
+                entry_only: false,
+            },
+            // retry_ms > 2000
+            HedgeIocPolicy {
+                limit_buffer_bps: d("5"),
+                max_depth_impact_bps: Some(d("10")),
+                retry_ms: Some(2_001),
+                entry_only: false,
+            },
+        ];
+        for policy in bad_cases {
+            let mut cfg = config();
+            cfg.pair.max_depth_impact_bps = 3.0;
+            cfg.hedge_ioc_policy = Some(policy);
+            assert!(
+                cfg.validate(&registry).is_err(),
+                "expected invalid hedge IOC policy to fail validation: {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hedge_ioc_policy_entry_only_widens_entry_without_widening_unwind_ioc() {
+        let registry = VenueRegistry::default();
+        let make_books = |cfg: &MakerFirstConfig, at: u64, maker_bid: &str, hedge_bid: &str| {
+            let level = |price: &str, contracts: &str| Level {
+                price: d(price),
+                contracts: d(contracts),
+            };
+            MakerFirstEvent::Book {
+                at_ms: at,
+                books: [0, 1].map(|i| Book {
+                    market: cfg.pair.legs[i].market.clone(),
+                    timestamp_ms: at,
+                    tradable: true,
+                    bids: vec![level(if i == 0 { maker_bid } else { hedge_bid }, "1")],
+                    asks: vec![level(if i == 0 { "1000.2" } else { "1000.4" }, "1")],
+                    bounds: None,
+                    available_notional: Decimal::from(500),
+                }),
+                reference: None,
+                equity_session: None,
+                leg_oracles: None,
+            }
+        };
+        let run_case = |entry_only: bool| {
+            let mut cfg = config();
+            cfg.entry_side = Some(HedgeSide::Buy);
+            cfg.pair.limit_buffer_bps = 0.0;
+            cfg.pair.max_depth_impact_bps = 3.0;
+            cfg.transport_ms = 10;
+            cfg.fill_notice_ms = 100;
+            cfg.taker_delay_ms = [300, 300];
+            cfg.reprice_ms = 100;
+            cfg.hold_ms = 5_000;
+            cfg.unhedged_timeout_ms = 4_000;
+            cfg.end_ms = cfg.start_ms + 15_000;
+            cfg.diagnose_entry_hedge = true;
+            cfg.hedge_ioc_policy = Some(HedgeIocPolicy {
+                limit_buffer_bps: d("10"),
+                max_depth_impact_bps: Some(d("15")),
+                retry_ms: Some(25),
+                entry_only,
+            });
+            let t0 = cfg.start_ms;
+            let events = vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t0,
+                    leg: 0,
+                    online: true,
+                },
+                make_books(&cfg, t0, "1000.0", "1000.2"),
+                make_books(&cfg, t0 + 20, "1000.0", "1000.2"),
+                make_books(&cfg, t0 + 200, "1000.0", "1000.2"),
+                partial(t0 + 200, t0 + 200, "1.1"),
+                make_books(&cfg, t0 + 300, "1000.0", "1000.2"),
+                // Entry hedge adverse move (-4 bps): absorbed in BOTH entry_only=false and entry_only=true.
+                make_books(&cfg, t0 + 610, "1000.0", "999.8"),
+                // Drain triggers at t0 + 5_500 (opening_timeout): unwind sells leg 0 bid @ 1000.0,
+                // arrives at t0 + 5_810 when leg 0 bid drops 4 bps to 999.6.
+                make_books(&cfg, t0 + 5_500, "1000.0", "999.8"),
+                make_books(&cfg, t0 + 5_810, "999.6", "999.8"),
+                // Subsequent frames let both cases finish flattening cleanly.
+                make_books(&cfg, t0 + 6_200, "999.6", "999.8"),
+                make_books(&cfg, t0 + 6_600, "999.6", "999.8"),
+                make_books(&cfg, t0 + 7_000, "999.6", "999.8"),
+                make_books(&cfg, t0 + 7_500, "999.6", "999.8"),
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ];
+            run_maker_first(&cfg, events.into_iter().map(Ok), &registry).unwrap()
+        };
+
+        let all_ioc = run_case(false);
+        let entry_only = run_case(true);
+
+        // Both absorb the entry-hedge adverse move on IOC #1 with zero entry misses.
+        assert_eq!(
+            all_ioc.entry_hedge_diagnostics.as_ref().unwrap().episodes[0].ioc_price_misses,
+            0
+        );
+        assert_eq!(
+            entry_only
+                .entry_hedge_diagnostics
+                .as_ref()
+                .unwrap()
+                .episodes[0]
+                .ioc_price_misses,
+            0
+        );
+        assert_eq!(
+            entry_only
+                .entry_hedge_diagnostics
+                .as_ref()
+                .unwrap()
+                .episodes[0]
+                .entry_unhedged_ms,
+            Some(410)
+        );
+        // Unwind IOC under entry_only=false widens and absorbs the 4 bps unwind move (0 total misses);
+        // under entry_only=true unwind retains conservative pair.limit_buffer_bps=0 and records 1 miss.
+        assert_eq!(all_ioc.ioc_price_misses, 0);
+        assert_eq!(entry_only.ioc_price_misses, 1);
+    }
+
+    #[test]
+    fn entry_only_retry_clock_never_delays_forced_drain_and_preserves_reprice_spacing() {
+        let registry = VenueRegistry::default();
+        let make_books = |cfg: &MakerFirstConfig, at: u64, maker_bid: &str, hedge_bid: &str| {
+            let level = |price: &str, contracts: &str| Level {
+                price: d(price),
+                contracts: d(contracts),
+            };
+            MakerFirstEvent::Book {
+                at_ms: at,
+                books: [0, 1].map(|i| Book {
+                    market: cfg.pair.legs[i].market.clone(),
+                    timestamp_ms: at,
+                    tradable: true,
+                    bids: vec![level(if i == 0 { maker_bid } else { hedge_bid }, "1")],
+                    asks: vec![level(if i == 0 { "1000.2" } else { "1000.4" }, "1")],
+                    bounds: None,
+                    available_notional: Decimal::from(500),
+                }),
+                reference: None,
+                equity_session: None,
+                leg_oracles: None,
+            }
+        };
+        // 1) Codex `15:36 CST` counterexample: entry_only retry_ms=2000 must NOT delay forced
+        // drain triggered at t0+1000 after an entry IOC submitted at t0+300 misses.
+        let run_drain_case = |retry_ms: u64| {
+            let mut cfg = config();
+            cfg.entry_side = Some(HedgeSide::Buy);
+            cfg.transport_ms = 10;
+            cfg.fill_notice_ms = 100;
+            cfg.taker_delay_ms = [300, 300];
+            cfg.reprice_ms = 100;
+            cfg.hold_ms = 1_300;
+            cfg.unhedged_timeout_ms = 700;
+            cfg.end_ms = cfg.start_ms + 15_000;
+            cfg.diagnose_entry_hedge = true;
+            cfg.hedge_ioc_policy = Some(HedgeIocPolicy {
+                limit_buffer_bps: Decimal::ZERO,
+                max_depth_impact_bps: None,
+                retry_ms: Some(retry_ms),
+                entry_only: true,
+            });
+            let t0 = cfg.start_ms;
+            let mut events = vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t0,
+                    leg: 0,
+                    online: true,
+                },
+                make_books(&cfg, t0, "1000.0", "1000.2"),
+                make_books(&cfg, t0 + 20, "1000.0", "1000.2"),
+                make_books(&cfg, t0 + 200, "1000.0", "1000.2"),
+                partial(t0 + 200, t0 + 200, "1.1"),
+                make_books(&cfg, t0 + 300, "1000.0", "1000.2"),
+            ];
+            for ms in [
+                1_000, 1_010, 1_310, 1_400, 1_600, 2_000, 2_300, 2_610, 2_800, 3_200, 4_000, 6_000,
+            ] {
+                events.push(make_books(&cfg, t0 + ms, "1000.0", "998.0"));
+            }
+            events.push(MakerFirstEvent::End { at_ms: cfg.end_ms });
+            let out = run_maker_first(&cfg, events.into_iter().map(Ok), &registry).unwrap();
+            let ep = &out.entry_hedge_diagnostics.as_ref().unwrap().episodes[0];
+            (
+                ep.first_ioc_submit_ms.unwrap() - t0,
+                ep.forced_drain_triggered_ms.unwrap() - t0,
+                ep.risk_resolved_ms.unwrap() - t0,
+                ep.ioc_price_misses,
+                out.forced_closes,
+            )
+        };
+        let base = run_drain_case(100);
+        let slow = run_drain_case(2_000);
+        assert_eq!(base, (300, 1_000, 1_310, 1, 1));
+        assert_eq!(
+            slow, base,
+            "entry_only retry_ms=2000 must not delay forced drain beyond reprice_ms"
+        );
+
+        // 2) Within the entry phase (not draining), entry_only retry_ms=2000 STILL throttles
+        // subsequent entry retries while preserving reprice_ms for non-entry phases.
+        let mut entry_cfg = config();
+        entry_cfg.entry_side = Some(HedgeSide::Buy);
+        entry_cfg.transport_ms = 10;
+        entry_cfg.fill_notice_ms = 100;
+        entry_cfg.taker_delay_ms = [300, 300];
+        entry_cfg.reprice_ms = 100;
+        entry_cfg.hold_ms = 5_000;
+        entry_cfg.unhedged_timeout_ms = 4_000;
+        entry_cfg.end_ms = entry_cfg.start_ms + 15_000;
+        entry_cfg.diagnose_entry_hedge = true;
+        entry_cfg.hedge_ioc_policy = Some(HedgeIocPolicy {
+            limit_buffer_bps: Decimal::ZERO,
+            max_depth_impact_bps: None,
+            retry_ms: Some(2_000),
+            entry_only: true,
+        });
+        let t0 = entry_cfg.start_ms;
+        let mut entry_events = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            make_books(&entry_cfg, t0, "1000.0", "1000.2"),
+            make_books(&entry_cfg, t0 + 20, "1000.0", "1000.2"),
+            make_books(&entry_cfg, t0 + 200, "1000.0", "1000.2"),
+            partial(t0 + 200, t0 + 200, "1.1"),
+            make_books(&entry_cfg, t0 + 300, "1000.0", "1000.2"),
+            // IOC #1 misses at t0+610; t0+700 & t0+1500 must be throttled by next_entry_ioc_ms=2300.
+            make_books(&entry_cfg, t0 + 610, "1000.0", "998.0"),
+            make_books(&entry_cfg, t0 + 700, "1000.0", "998.0"),
+            make_books(&entry_cfg, t0 + 1_500, "1000.0", "998.0"),
+            // IOC #2 submits at t0+2300 and fills at t0+2610.
+            make_books(&entry_cfg, t0 + 2_300, "1000.0", "998.0"),
+            make_books(&entry_cfg, t0 + 2_610, "1000.0", "998.0"),
+        ];
+        for ms in [5_500, 6_000, 6_600, 7_200] {
+            entry_events.push(make_books(&entry_cfg, t0 + ms, "1000.0", "998.0"));
+        }
+        entry_events.push(MakerFirstEvent::End {
+            at_ms: entry_cfg.end_ms,
+        });
+        let entry_out =
+            run_maker_first(&entry_cfg, entry_events.into_iter().map(Ok), &registry).unwrap();
+        let entry_ep = &entry_out.entry_hedge_diagnostics.as_ref().unwrap().episodes[0];
+        assert_eq!(entry_ep.outcome, "hedged");
+        assert!(entry_ep.reprice_throttle_waits >= 2);
+        assert_eq!(entry_ep.fully_hedged_ms, Some(t0 + 2_610));
     }
 }

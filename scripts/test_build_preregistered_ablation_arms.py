@@ -4,7 +4,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_preregistered_ablation_arms import build_arb_arms, build_mm_arms, write_arms
+from build_preregistered_ablation_arms import (
+    CRASH_PAUSE_ARMS,
+    CRASH_PAUSE_ARM_B_TOXICITY,
+    CRASH_PAUSE_ARM_C_POLICY_V1,
+    build_arb_arms,
+    build_crash_pause_arms,
+    build_mm_arms,
+    crash_pause_method_sha256,
+    crash_pause_method_spec,
+    write_arms,
+)
 
 OVERLAY = {
     "as_kappa": 4000.0,
@@ -76,6 +86,54 @@ class BuildArmsTest(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(payload).hexdigest(), entry["sha256"])
         with self.assertRaises(ValueError):
             build_arb_arms({"x": 1}, gate)
+
+    def test_crash_pause_abc_arms_and_frozen_method_hash(self):
+        base = _mm_base()
+        base["local_reversal_filter"] = {"stale": True}
+        base["strategy"]["local_toxicity"]["vol_pause_bps"] = 99.0
+        arms, ablated = build_crash_pause_arms(base)
+        self.assertEqual(tuple(arms.keys()), CRASH_PAUSE_ARMS)
+        a = arms["arm_a_baseline"]
+        b = arms["arm_b_vol_pause"]
+        c = arms["arm_c_crash_pause"]
+        c_shadow = arms["arm_c_shadow_control"]
+        for cfg in arms.values():
+            self.assertTrue(cfg["core_only"])
+            self.assertTrue(cfg["diagnose_cross_market"] and cfg["calibration_telemetry"])
+            self.assertNotIn("local_reversal_filter", cfg)
+            self.assertTrue(cfg["strategy"]["local_toxicity"]["enable_local_markout"])
+        self.assertNotIn("crash_pause_filter", a)
+        self.assertNotIn("vol_pause_bps", a["strategy"]["local_toxicity"])
+        self.assertNotIn("crash_pause_filter", b)
+        for key, val in CRASH_PAUSE_ARM_B_TOXICITY.items():
+            self.assertEqual(b["strategy"]["local_toxicity"][key], val)
+        self.assertNotIn("vol_pause_bps", c["strategy"]["local_toxicity"])
+        self.assertEqual(c["crash_pause_filter"], dict(CRASH_PAUSE_ARM_C_POLICY_V1) | {"enabled": True})
+        self.assertEqual(c_shadow["crash_pause_filter"], dict(CRASH_PAUSE_ARM_C_POLICY_V1) | {"enabled": False})
+        self.assertIn("crash_pause_filter", ablated)
+        with tempfile.TemporaryDirectory() as tmp:
+            base_path = Path(tmp) / "base.json"
+            base_path.write_text(json.dumps(base))
+            manifest = write_arms(
+                arms,
+                ablated,
+                Path(tmp) / "cp",
+                kind="crash_pause",
+                base_path=base_path,
+                extra_inputs=[],
+                extra_manifest={
+                    "method_spec": crash_pause_method_spec(),
+                    "method_sha256": crash_pause_method_sha256(),
+                },
+            )
+            self.assertEqual(manifest["method_sha256"], crash_pause_method_sha256())
+            for entry in manifest["arms"]:
+                payload = (Path(tmp) / "cp" / entry["path"]).read_bytes()
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), entry["sha256"])
+        non_core = _mm_base()
+        non_core["core_only"] = False
+        with self.assertRaises(ValueError):
+            build_crash_pause_arms(non_core)
 
 
 if __name__ == "__main__":

@@ -40,11 +40,11 @@ use components::{
 use execution::{
     BatchFailureAction, InventoryContext, SideExecutionPlan,
     URGENT_SIDE_REQUOTE_REPLACEMENTS_PER_CYCLE, apply_batch_success,
-    build_side_execution_plan_full, cancels_are_strictly_passive, classify_batch_failure,
-    effective_resting_orders_for_micro_refresh, max_side_requote_replacements_per_cycle,
-    resolve_cancel_client_order_ids, should_defer_cancel_only_refresh, should_defer_micro_refresh,
-    should_defer_one_sided_requote, should_defer_post_fill_replenishment,
-    size_tolerance_ratio_for_requote,
+    build_side_execution_plan_with_withdrawal_reason, cancels_are_strictly_passive,
+    classify_batch_failure, effective_resting_orders_for_micro_refresh,
+    max_side_requote_replacements_per_cycle, resolve_cancel_client_order_ids,
+    should_defer_cancel_only_refresh, should_defer_micro_refresh, should_defer_one_sided_requote,
+    should_defer_post_fill_replenishment, size_tolerance_ratio_for_requote,
 };
 use housekeeping::{TelemetrySync, reconcile_interval, sync_telemetry_snapshot};
 use market_state::{
@@ -548,6 +548,9 @@ pub struct InventoryNeutralMM {
     local_order_flow: OrderFlow,
     last_local_ofi_norm: f64,
     last_local_l1_notional: Option<[f64; 2]>,
+    last_local_touch_px: Option<[f64; 2]>,
+    local_touch_improved: [bool; 2],
+    last_side_withdrawal_reason: [CancelReason; 2],
     cross_market_pressure: CrossMarketPressure,
     volatility_regime: volatility_regime::VolatilityRegime,
     defense: defense::DefenseStateMachine,
@@ -564,6 +567,8 @@ pub struct InventoryNeutralMM {
     local_participation: Option<replay::recorded::local_signal::LocalParticipation>,
     #[cfg(feature = "research-replay")]
     binance_participation: Option<replay::recorded::binance_signal::Participation>,
+    #[cfg(feature = "research-replay")]
+    crash_pause_participation: Option<replay::recorded::crash_pause::Participation>,
     /// Last per-sample microstructure update; keeps its calibration at the
     /// poll cadence even when event-driven cycles run faster.
     last_micro_sample: Option<Instant>,
@@ -665,6 +670,9 @@ impl InventoryNeutralMM {
             local_order_flow: OrderFlow::default(),
             last_local_ofi_norm: 0.0,
             last_local_l1_notional: None,
+            last_local_touch_px: None,
+            local_touch_improved: [false; 2],
+            last_side_withdrawal_reason: [CancelReason::SideWithdrawn; 2],
             cross_market_pressure: CrossMarketPressure::default(),
             volatility_regime: volatility_regime::VolatilityRegime::default(),
             defense: defense::DefenseStateMachine::default(),
@@ -680,6 +688,8 @@ impl InventoryNeutralMM {
             local_participation: None,
             #[cfg(feature = "research-replay")]
             binance_participation: None,
+            #[cfg(feature = "research-replay")]
+            crash_pause_participation: None,
             last_micro_sample: None,
             price_evidence: None,
             cycle_fill_baseline: 0,
@@ -997,7 +1007,11 @@ impl InventoryNeutralMM {
                 self.execute_timeout_flatten(inputs.mid).await;
             }
         } else {
-            let quote = self.calculate_optimal_quotes(&inputs, quoting_position);
+            let quote = {
+                #[cfg(feature = "research-replay")]
+                let _diagnostic_scope = replay::recorded::quote_constraints::Evaluation::open();
+                self.calculate_optimal_quotes(&inputs, quoting_position)
+            };
             #[cfg(feature = "research-replay")]
             let changed_sides =
                 replay::recorded::attribute_quote(self, &inputs, quoting_position, quote);
@@ -1325,10 +1339,12 @@ impl InventoryNeutralMM {
             self.config.step_size,
         );
         let half_step = (self.config.step_size * 0.5).max(components::FLOAT_EPSILON);
+        let min_bid = components::min_quotable_size(&self.config, our_bid);
+        let min_ask = components::min_quotable_size(&self.config, our_ask);
+        self.last_side_withdrawal_reason = [CancelReason::SideWithdrawn; 2];
         if let Some(depth_frac) = self.config.max_top_book_depth_fraction {
-            let min_bid = components::min_quotable_size(&self.config, our_bid);
-            let min_ask = components::min_quotable_size(&self.config, our_ask);
             if position >= -half_step {
+                let was_quotable = bid_size + components::FLOAT_EPSILON >= min_bid;
                 let cap_sz = match self.last_local_l1_notional {
                     Some([bid_l1_usd, _]) if our_bid > 0.0 => components::round_down_to_step(
                         (depth_frac * bid_l1_usd) / our_bid,
@@ -1339,9 +1355,20 @@ impl InventoryNeutralMM {
                 bid_size = bid_size.min(cap_sz);
                 if bid_size + components::FLOAT_EPSILON < min_bid {
                     bid_size = 0.0;
+                    if was_quotable {
+                        self.last_side_withdrawal_reason[0] =
+                            if self.last_local_l1_notional.is_none() {
+                                CancelReason::DepthCapL1Unavailable
+                            } else if self.local_touch_improved[0] {
+                                CancelReason::DepthCapPriceImproved
+                            } else {
+                                CancelReason::DepthCapDepleted
+                            };
+                    }
                 }
             }
             if position <= half_step {
+                let was_quotable = ask_size + components::FLOAT_EPSILON >= min_ask;
                 let cap_sz = match self.last_local_l1_notional {
                     Some([_, ask_l1_usd]) if our_ask > 0.0 => components::round_down_to_step(
                         (depth_frac * ask_l1_usd) / our_ask,
@@ -1352,9 +1379,21 @@ impl InventoryNeutralMM {
                 ask_size = ask_size.min(cap_sz);
                 if ask_size + components::FLOAT_EPSILON < min_ask {
                     ask_size = 0.0;
+                    if was_quotable {
+                        self.last_side_withdrawal_reason[1] =
+                            if self.last_local_l1_notional.is_none() {
+                                CancelReason::DepthCapL1Unavailable
+                            } else if self.local_touch_improved[1] {
+                                CancelReason::DepthCapPriceImproved
+                            } else {
+                                CancelReason::DepthCapDepleted
+                            };
+                    }
                 }
             }
         }
+        let bid_quotable_before_tox = bid_size + components::FLOAT_EPSILON >= min_bid;
+        let ask_quotable_before_tox = ask_size + components::FLOAT_EPSILON >= min_ask;
         if let Some(max_mom) = hysteresis.and_then(|policy| policy.max_local_momentum_bps) {
             let mom = self.micro.momentum_bps();
             if mom < -max_mom && position >= -half_step {
@@ -1438,6 +1477,12 @@ impl InventoryNeutralMM {
                     }
                 }
             }
+        }
+        if bid_quotable_before_tox && bid_size + components::FLOAT_EPSILON < min_bid {
+            self.last_side_withdrawal_reason[0] = CancelReason::ToxicityWithdrawn;
+        }
+        if ask_quotable_before_tox && ask_size + components::FLOAT_EPSILON < min_ask {
+            self.last_side_withdrawal_reason[1] = CancelReason::ToxicityWithdrawn;
         }
         match self.defense.regime() {
             defense::DefenseRegime::Normal => {}
@@ -2290,6 +2335,19 @@ impl InventoryNeutralMM {
                 now_ns,
                 self.config.local_staleness_ms,
             );
+        self.local_touch_improved = if fresh_local_l1 {
+            let improved = self.last_local_touch_px.map_or([false; 2], |[pb, pa]| {
+                [
+                    bid_touch > pb + components::FLOAT_EPSILON,
+                    ask_touch < pa - components::FLOAT_EPSILON,
+                ]
+            });
+            self.last_local_touch_px = Some([bid_touch, ask_touch]);
+            improved
+        } else {
+            self.last_local_touch_px = None;
+            [false; 2]
+        };
         self.last_local_l1_notional =
             fresh_local_l1.then_some([bid_touch * bbo.bid_size, ask_touch * bbo.ask_size]);
         let external_fair = if self.use_external_fair_value {
@@ -2942,6 +3000,16 @@ impl InventoryNeutralMM {
             placement_bounds
         };
 
+        // Research-only headroom is applied after computing cancellation bounds.
+        // It must never loosen their risk protection or alter pending exposure.
+        #[cfg(feature = "research-replay")]
+        let placement_bounds = replay::recorded::bound_guard::placement(
+            placement_bounds,
+            q,
+            inputs.pricing_mid,
+            self.config.tick_size,
+        );
+
         // Spread logic: use config kappa directly (no fill-rate scaling)
         let kappa = self.config.as_kappa;
         let gamma_safe = gamma.max(1e-6);
@@ -2965,6 +3033,8 @@ impl InventoryNeutralMM {
             self.micro.momentum_bps(),
             self.config.momentum_skew_scale,
         );
+        #[cfg(feature = "research-replay")]
+        let mut diagnostic_reducing_spread = [None; 2];
         if bid_flatten > 0.0 {
             let floor_bps = (2.0 * self.config.maker_fee_bps + bid_profit_bps).max(0.0);
             let reducing_base = fee_aware_half_spread(
@@ -2973,6 +3043,14 @@ impl InventoryNeutralMM {
                 floor_bps,
                 vol_cap_bps.max(floor_bps),
             )?;
+            #[cfg(feature = "research-replay")]
+            {
+                diagnostic_reducing_spread[0] = Some([
+                    half_spread_raw * toxicity_spread_mult,
+                    inputs.pricing_mid * floor_bps / 20_000.0,
+                    inputs.pricing_mid * vol_cap_bps.max(floor_bps) / 20_000.0,
+                ]);
+            }
             let (mut reducing_bid, _) = momentum_half_spreads(
                 reducing_base,
                 self.micro.momentum_bps(),
@@ -2990,6 +3068,14 @@ impl InventoryNeutralMM {
                 floor_bps,
                 vol_cap_bps.max(floor_bps),
             )?;
+            #[cfg(feature = "research-replay")]
+            {
+                diagnostic_reducing_spread[1] = Some([
+                    half_spread_raw * toxicity_spread_mult,
+                    inputs.pricing_mid * floor_bps / 20_000.0,
+                    inputs.pricing_mid * vol_cap_bps.max(floor_bps) / 20_000.0,
+                ]);
+            }
             let (_, mut reducing_ask) = momentum_half_spreads(
                 reducing_base,
                 self.micro.momentum_bps(),
@@ -3171,6 +3257,21 @@ impl InventoryNeutralMM {
                         }
                     }
                 }
+                #[cfg(feature = "research-replay")]
+                replay::recorded::quote_constraints::record(
+                    replay::recorded::quote_constraints::Sample {
+                        position: q,
+                        tick: self.config.tick_size,
+                        base_raw_half_spread: half_spread_raw * toxicity_spread_mult,
+                        base_floor_half_spread: inputs.pricing_mid * fee_floor_bps / 20_000.0,
+                        base_cap_half_spread: inputs.pricing_mid * vol_cap_bps / 20_000.0,
+                        reducing_spread: diagnostic_reducing_spread,
+                        raw: [raw_bid, raw_ask],
+                        stable: [stable_bid, stable_ask],
+                        placement: [placement_bounds.max_bid, placement_bounds.min_ask],
+                        final_price: [bid, ask],
+                    },
+                );
                 Some((bid, ask, effective_cancel_bounds))
             }
             None => {
@@ -3193,6 +3294,8 @@ impl InventoryNeutralMM {
         shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
         #[cfg(feature = "research-replay")] changed_sides: [bool; 2],
     ) {
+        #[cfg(feature = "research-replay")]
+        let _quote_provenance = replay::recorded::quote_constraints::Submission::open();
         let mid = inputs.mid;
         self.reconcile_after_new_fill_if_needed().await;
         if shutdown_requested(shutdown) {
@@ -3352,7 +3455,7 @@ impl InventoryNeutralMM {
         };
 
         #[cfg(feature = "research-replay")]
-        let mut plan = if let Some(policy) = &mut self.binance_participation {
+        let plan = if let Some(policy) = &mut self.binance_participation {
             let mut plan = plan;
             policy.apply(
                 &mut plan.target,
@@ -3366,8 +3469,14 @@ impl InventoryNeutralMM {
         } else {
             plan
         };
-        #[cfg(not(feature = "research-replay"))]
         let mut plan = plan;
+        #[cfg(feature = "research-replay")]
+        let crash_pause_bid_reducing_cap = self
+            .crash_pause_participation
+            .as_mut()
+            .and_then(|policy| policy.apply(&mut plan.target, positions, &runtime_config));
+        #[cfg(not(feature = "research-replay"))]
+        let crash_pause_bid_reducing_cap = None;
 
         let closable = components::closable_reducing_sizes(positions, self.config.step_size);
         if passive_touch_sides[0] {
@@ -3406,7 +3515,8 @@ impl InventoryNeutralMM {
         let bid_reducing_cap = (local_exit_sides[0]
             || passive_touch_sides[0]
             || (enforce_ro && closable[0] >= half_step))
-            .then_some(closable[0]);
+            .then_some(closable[0])
+            .or(crash_pause_bid_reducing_cap);
         let ask_reducing_cap = (local_exit_sides[1]
             || passive_touch_sides[1]
             || (enforce_ro && closable[1] >= half_step))
@@ -3536,7 +3646,7 @@ impl InventoryNeutralMM {
         let ask_in_cooldown = cooldown_ms > 0
             && !ask_reducing_now
             && self.adverse_retreat_cooldown_until[1].is_some_and(|until| now_cooldown < until);
-        let mut bid_plan = build_side_execution_plan_full(
+        let mut bid_plan = build_side_execution_plan_with_withdrawal_reason(
             &runtime_config,
             &self.active_orders,
             self.trading.limit_order_type(),
@@ -3557,8 +3667,9 @@ impl InventoryNeutralMM {
             bid_reducing_cap,
             bid_in_cooldown && hold_safe_during_cooldown,
             bid_max_places,
+            self.last_side_withdrawal_reason[0],
         );
-        let mut ask_plan = build_side_execution_plan_full(
+        let mut ask_plan = build_side_execution_plan_with_withdrawal_reason(
             &runtime_config,
             &self.active_orders,
             self.trading.limit_order_type(),
@@ -3579,6 +3690,7 @@ impl InventoryNeutralMM {
             ask_reducing_cap,
             ask_in_cooldown && hold_safe_during_cooldown,
             ask_max_places,
+            self.last_side_withdrawal_reason[1],
         );
         let bid_cancels_passive = isolate_cooldown_cancel_churn
             && cancels_are_strictly_passive(
@@ -3614,9 +3726,10 @@ impl InventoryNeutralMM {
             && (!bid_plan.to_cancel.is_empty() || !bid_plan.to_place.is_empty()))
             || (ask_fast_reducing
                 && (!ask_plan.to_cancel.is_empty() || !ask_plan.to_place.is_empty()));
-        let ro_protection_cancel = enforce_ro
-            && ((bid_reducing_cap.is_some() && !bid_plan.to_cancel.is_empty())
-                || (ask_reducing_cap.is_some() && !ask_plan.to_cancel.is_empty()));
+        let ro_protection_cancel = ((enforce_ro || crash_pause_bid_reducing_cap.is_some())
+            && bid_reducing_cap.is_some()
+            && !bid_plan.to_cancel.is_empty())
+            || (enforce_ro && ask_reducing_cap.is_some() && !ask_plan.to_cancel.is_empty());
         let shared_risk_reducing = (breaching_any && !per_side_bound_cancel)
             || reducing_activity
             || ro_protection_cancel
@@ -3701,6 +3814,10 @@ impl InventoryNeutralMM {
                         | CancelReason::AdverseRetreat
                         | CancelReason::ReducingCapOrNonRo
                         | CancelReason::SideWithdrawn
+                        | CancelReason::DepthCapPriceImproved
+                        | CancelReason::DepthCapDepleted
+                        | CancelReason::DepthCapL1Unavailable
+                        | CancelReason::ToxicityWithdrawn
                 )
             })
         };

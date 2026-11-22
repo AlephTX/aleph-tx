@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Pre-register frozen Sprint 9 holdout manifest for untouched `W08-W16` windows (`S9-5`).
+"""Pre-register Sprint 9 forward windows `W08-W16` (`S9-5`).
 
 Strictly respects active `W07` frozen runs (`OPT-02`), enforces `frozen_at_ms < decision_start_ms`,
 hashes all calibrated configurations, and blocks standalone cross-sectional directional promotion
 unless retrospective `DSR >= 0.95` and `CSCV PBO <= 0.25`.
+
+Tokyo sources are selection_dev. A pre-start freeze proves prospective timing,
+not untouched source custody. The legacy filename/function are kept for callers;
+new v2 manifests record that distinction. Existing frozen artifacts are not rewritten.
 """
 import argparse
 import hashlib
@@ -27,9 +31,9 @@ def build_sprint9_holdout_manifest(
     quant_audit_pbo=None,
     admit_standalone_quant=False,
 ):
-    """Construct and fail-closed validate an untouched `W08-W16` prospective holdout manifest."""
+    """Validate a preregistered forward window, without claiming an untouched holdout."""
     if window_id not in ELIGIBLE_HOLDOUT_WINDOWS:
-        raise ValueError(f"window_id {window_id!r} not in untouched W08-W16 holdout set")
+        raise ValueError(f"window_id {window_id!r} not in W08-W16 forward window set")
     if any(type(ms) is not int or ms <= 0 for ms in (frozen_at_ms, decision_start_ms)):
         raise ValueError("freeze and decision times must be positive integer milliseconds")
     if frozen_at_ms >= decision_start_ms:
@@ -61,7 +65,10 @@ def build_sprint9_holdout_manifest(
         cfg_entry("multiday_carry_isolated", multiday_carry_config),
     ]
     payload = {
-        "schema_version": "sprint9_holdout_manifest.v1",
+        "schema_version": "sprint9_forward_manifest.v2",
+        "evidence_class": "preregistered_forward",
+        "source_role": "selection_dev",
+        "untouched_holdout": False,
         "window_id": window_id,
         "frozen_at_ms": frozen_at_ms,
         "decision_start_ms": decision_start_ms,

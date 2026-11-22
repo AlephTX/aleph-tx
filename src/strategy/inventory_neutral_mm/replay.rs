@@ -423,6 +423,17 @@ impl SimVenue {
             let mut ledger = self.ledger.lock();
             let notional = price * size;
             let sign = if order.is_ask { -1 } else { 1 };
+            #[cfg(feature = "research-replay")]
+            if self.recorded.is_some() {
+                recorded::inventory_cycles::fill(
+                    ledger.position_e8,
+                    sign * e8(size),
+                    price,
+                    fee,
+                    taker,
+                    order.reduce_only,
+                );
+            }
             ledger.position_e8 += sign * e8(size);
             ledger.cash -= sign as f64 * notional + fee;
             if taker {

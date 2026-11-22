@@ -9,6 +9,7 @@
 use anyhow::{Result, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 const UNIT_MS: u64 = 36_000_000;
@@ -53,6 +54,14 @@ pub struct MultiDayCarryConfig {
     pub maker_entry_fee_bps: Decimal,
     #[serde(default, with = "rust_decimal::serde::str")]
     pub maker_exit_fee_bps: Decimal,
+    /// Optional per-leg `[leg0, leg1]` entry fee rates in bps (positive = fee, negative = rebate).
+    /// When absent, falls back symmetrically to `[maker_entry_fee_bps; 2]`.
+    #[serde(default)]
+    pub leg_entry_fee_bps: Option<[Decimal; 2]>,
+    /// Optional per-leg `[leg0, leg1]` exit fee rates in bps (positive = fee, negative = rebate).
+    /// When absent, falls back symmetrically to `[maker_exit_fee_bps; 2]`.
+    #[serde(default)]
+    pub leg_exit_fee_bps: Option<[Decimal; 2]>,
     #[serde(default, with = "rust_decimal::serde::str")]
     pub fixed_overhead_usd_per_day: Decimal,
     #[serde(default)]
@@ -60,6 +69,16 @@ pub struct MultiDayCarryConfig {
 }
 
 impl MultiDayCarryConfig {
+    pub fn resolved_entry_fee_bps(&self) -> [Decimal; 2] {
+        self.leg_entry_fee_bps
+            .unwrap_or([self.maker_entry_fee_bps; 2])
+    }
+
+    pub fn resolved_exit_fee_bps(&self) -> [Decimal; 2] {
+        self.leg_exit_fee_bps
+            .unwrap_or([self.maker_exit_fee_bps; 2])
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.market.is_empty()
@@ -90,6 +109,14 @@ impl MultiDayCarryConfig {
                 && self.max_basis_drawdown_bps > Decimal::ZERO
                 && self.fixed_overhead_usd_per_day >= Decimal::ZERO,
             "invalid multi-day carry capital, loss budget, or distance parameters"
+        );
+        ensure!(
+            !(self.leg_entry_fee_bps.is_some() && self.maker_entry_fee_bps != Decimal::ZERO),
+            "specify either maker_entry_fee_bps or leg_entry_fee_bps, not both"
+        );
+        ensure!(
+            !(self.leg_exit_fee_bps.is_some() && self.maker_exit_fee_bps != Decimal::ZERO),
+            "specify either maker_exit_fee_bps or leg_exit_fee_bps, not both"
         );
         Ok(())
     }
@@ -201,6 +228,81 @@ pub struct MultiDayCarryReport {
 }
 
 impl MultiDayCarryScenario {
+    fn cash_components_reconcile(report: &MultiDayCarryReport) -> bool {
+        if report.capital_usd <= Decimal::ZERO || report.fixed_infra_usd < Decimal::ZERO {
+            return false;
+        }
+        let Some(magnitude) = report
+            .capital_usd
+            .abs()
+            .checked_add(report.price_pnl_usd.abs())
+            .and_then(|v| v.checked_add(report.witnessed_funding_cash_usd.abs()))
+            .and_then(|v| v.checked_add(report.fees_usd.abs()))
+            .and_then(|v| v.checked_add(report.fixed_infra_usd.abs()))
+        else {
+            return false;
+        };
+        let adjusted = if magnitude.is_zero() {
+            0_i32
+        } else {
+            magnitude.mantissa().unsigned_abs().ilog10() as i32 - (magnitude.scale() as i32)
+        };
+        let raw_exp = (adjusted - 27).max(-28);
+        let max_tol = Decimal::new(1, 12);
+        let tolerance = if raw_exp > -12 {
+            max_tol
+        } else {
+            Decimal::new(4, raw_exp.unsigned_abs()).min(max_tol)
+        };
+        let Some(expected_var) = report
+            .price_pnl_usd
+            .checked_add(report.witnessed_funding_cash_usd)
+            .and_then(|v| v.checked_sub(report.fees_usd))
+        else {
+            return false;
+        };
+        let Some(expected_equity) = report.capital_usd.checked_add(report.net_variable_pnl_usd)
+        else {
+            return false;
+        };
+        let Some(expected_all_in) = report
+            .net_variable_pnl_usd
+            .checked_sub(report.fixed_infra_usd)
+        else {
+            return false;
+        };
+        let Some(var_diff) = expected_var.checked_sub(report.net_variable_pnl_usd) else {
+            return false;
+        };
+        let Some(eq_diff) = expected_equity.checked_sub(report.terminal_equity_usd) else {
+            return false;
+        };
+        let Some(all_in_diff) = expected_all_in.checked_sub(report.net_all_in_pnl_usd) else {
+            return false;
+        };
+        if var_diff.abs() > tolerance || eq_diff.abs() > tolerance || all_in_diff.abs() > tolerance
+        {
+            return false;
+        }
+        if let Some(cp) = report.ten_hour_checkpoints.last().filter(|cp| !cp.open) {
+            let checks = [
+                cp.mark_equity_usd.checked_sub(report.terminal_equity_usd),
+                cp.cumulative_funding_usd
+                    .checked_sub(report.witnessed_funding_cash_usd),
+                cp.cumulative_fees_usd.checked_sub(report.fees_usd),
+                cp.cumulative_price_pnl_usd
+                    .checked_sub(report.price_pnl_usd),
+            ];
+            if checks
+                .into_iter()
+                .any(|diff| diff.is_none_or(|d| d.abs() > tolerance))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn evaluate(&self) -> Result<MultiDayCarryReport> {
         self.config.validate()?;
         ensure!(!self.frames.is_empty(), "multi-day carry frames empty");
@@ -209,17 +311,26 @@ impl MultiDayCarryScenario {
             .config
             .decision_start_ms
             .saturating_sub(self.config.min_publication_lag_ms);
-        let causal_prior: Vec<_> = self
+        let mut causal_prior = BTreeMap::new();
+        for settlement in self
             .prior_settlements
             .iter()
             .filter(|s| s.settled_at_ms <= decision_cutoff)
-            .collect();
+        {
+            let rate = causal_prior
+                .entry(settlement.settled_at_ms)
+                .or_insert(settlement.rate_diff);
+            ensure!(
+                *rate == settlement.rate_diff,
+                "conflicting rate differentials for a causal prior settlement"
+            );
+        }
         ensure!(
             !causal_prior.is_empty(),
             "need at least one causal pre-window funding settlement before decision_start_ms - lag"
         );
-        let mean_diff = causal_prior.iter().map(|s| s.rate_diff).sum::<Decimal>()
-            / Decimal::from(causal_prior.len());
+        let mean_diff =
+            causal_prior.values().copied().sum::<Decimal>() / Decimal::from(causal_prior.len());
         let interval = self.config.funding_interval_ms;
         let offset = self.config.funding_offset_ms;
         // Difference counts every contractual settlement in (previous, current],
@@ -309,9 +420,12 @@ impl MultiDayCarryScenario {
         let base_qty = self.config.target_leg_notional_usd / avg_px;
         let q0 = base_qty * Decimal::from(frozen_leg0_sign);
         let q1 = -q0;
-        let entry_fee =
-            (entry.leg0_price + entry.leg1_price) * base_qty * self.config.maker_entry_fee_bps
-                / BPS;
+        let entry_fee_rates = self.config.resolved_entry_fee_bps();
+        let exit_fee_rates = self.config.resolved_exit_fee_bps();
+        let entry_fee = (entry.leg0_price * entry_fee_rates[0]
+            + entry.leg1_price * entry_fee_rates[1])
+            * base_qty
+            / BPS;
         let mut fees_usd = entry_fee;
         let mut funding_cash_usd = Decimal::ZERO;
         let mut realized_price_pnl_usd = Decimal::ZERO;
@@ -389,9 +503,9 @@ impl MultiDayCarryScenario {
             }
             if was_open && !open {
                 realized_price_pnl_usd = cur_price_pnl;
-                fees_usd += (frame.leg0_price + frame.leg1_price)
+                fees_usd += (frame.leg0_price * exit_fee_rates[0]
+                    + frame.leg1_price * exit_fee_rates[1])
                     * base_qty
-                    * self.config.maker_exit_fee_bps
                     / BPS;
             }
             let marked_equity =
@@ -420,10 +534,7 @@ impl MultiDayCarryScenario {
         let terminal_equity_usd =
             self.config.capital_usd + realized_price_pnl_usd + funding_cash_usd - fees_usd;
         let net_variable_pnl_usd = terminal_equity_usd - self.config.capital_usd;
-        let cash_identity_reconciled = (terminal_equity_usd
-            - (self.config.capital_usd + realized_price_pnl_usd + funding_cash_usd - fees_usd))
-            .abs()
-            == Decimal::ZERO;
+        let net_all_in_pnl_usd = net_variable_pnl_usd - fixed_infra_usd;
         let funding_witness_complete = missing_slots == 0;
         let expected_checkpoints = campaign_ms / UNIT_MS;
         let missing_checkpoints = expected_checkpoints - u64::try_from(checkpoints.len())?;
@@ -435,7 +546,7 @@ impl MultiDayCarryScenario {
             "settled_witnessed"
         };
 
-        Ok(MultiDayCarryReport {
+        let mut report = MultiDayCarryReport {
             subtrack: "multiday_funding_carry_isolated",
             market: self.config.market.clone(),
             legs: self.config.legs.clone(),
@@ -454,17 +565,19 @@ impl MultiDayCarryScenario {
             terminal_equity_usd,
             net_variable_pnl_usd,
             fixed_infra_usd,
-            net_all_in_pnl_usd: net_variable_pnl_usd - fixed_infra_usd,
+            net_all_in_pnl_usd,
             max_drawdown_usd,
             expected_funding_slots: expected_slots,
             witnessed_funding_slots: witnessed_slots,
             missing_witness_slots: missing_slots,
             funding_witness_complete,
-            cash_identity_reconciled,
+            cash_identity_reconciled: false,
             expected_checkpoints,
             missing_checkpoints,
             ten_hour_checkpoints: checkpoints,
-        })
+        };
+        report.cash_identity_reconciled = Self::cash_components_reconcile(&report);
+        Ok(report)
     }
 }
 
@@ -499,6 +612,8 @@ mod tests {
             max_basis_drawdown_bps: d("25"),
             maker_entry_fee_bps: d("0"),
             maker_exit_fee_bps: d("0"),
+            leg_entry_fee_bps: None,
+            leg_exit_fee_bps: None,
             fixed_overhead_usd_per_day: d("1.6666666667"),
             exit_on_missing_witness: false,
         };
@@ -583,6 +698,32 @@ mod tests {
     }
 
     #[test]
+    fn repeated_prior_funding_slots_never_change_the_frozen_signal() {
+        let mut input = scenario("1.5");
+        let start = input.config.decision_start_ms;
+        input.prior_settlements.push(PriorSettlement {
+            settled_at_ms: start - 4 * hourly_interval_ms(),
+            rate_diff: d("-0.0002"),
+        });
+        let baseline = input.evaluate().unwrap();
+        assert_eq!(baseline.pre_window_ten_hour_forecast_bps, d("-5"));
+        assert_eq!(baseline.frozen_leg0_sign, 1);
+
+        input
+            .prior_settlements
+            .push(input.prior_settlements[0].clone());
+        let repeated = input.evaluate().unwrap();
+        assert_eq!(
+            repeated.pre_window_ten_hour_forecast_bps,
+            baseline.pre_window_ten_hour_forecast_bps
+        );
+        assert_eq!(repeated.frozen_leg0_sign, baseline.frozen_leg0_sign);
+
+        input.prior_settlements.last_mut().unwrap().rate_diff = d("0.0003");
+        assert!(input.evaluate().is_err());
+    }
+
+    #[test]
     fn terminal_close_and_grid_are_required_for_settled_carry() {
         let mut data = scenario("1.5");
         data.config.maker_exit_fee_bps = d("5");
@@ -631,5 +772,101 @@ mod tests {
         assert_eq!(gap_rep.status, "incomplete_missing_witness");
         assert_eq!(gap_rep.missing_witness_slots, 1);
         assert!(!gap_rep.funding_witness_complete);
+    }
+
+    #[test]
+    fn asymmetric_per_leg_wave2b_rwa_fees_and_dual_spec_validation() {
+        let start = 1_800_000_000_000_u64;
+        let hour = hourly_interval_ms();
+        let frames: Vec<serde_json::Value> = (0..=30_u64)
+            .map(|h| {
+                serde_json::json!({
+                    "at_ms": start + h * hour,
+                    "leg0_price": "100",
+                    "leg1_price": "100",
+                    "funding_slot_expected": h > 0,
+                    "witnessed_rates": if h > 0 { Some(["0.000005", "0.000070"]) } else { None },
+                    "observed_entry_quote_distance_bps": "5.0"
+                })
+            })
+            .collect();
+        // Long Arcus RWA (0 maker entry, 2.25 taker exit) + Short Lighter Core RWA (0 maker / 0 taker).
+        let json_payload = serde_json::json!({
+            "config": {
+                "market": "NVDA",
+                "legs": ["arcus", "lighter"],
+                "decision_start_ms": start,
+                "end_ms": start + 30 * hour,
+                "min_publication_lag_ms": hour,
+                "capital_usd": "1000",
+                "max_loss_budget_usd": "100",
+                "target_leg_notional_usd": "500",
+                "min_forecast_bps": "3.0",
+                "trailing_exit_threshold_bps": "0.1",
+                "partner_fee_bps": "2.25",
+                "conditional_markout_bps": "1.0",
+                "min_entry_profit_bps": "0.5",
+                "max_basis_drawdown_bps": "25",
+                "leg_entry_fee_bps": ["0", "0"],
+                "leg_exit_fee_bps": ["2.25", "0"],
+                "fixed_overhead_usd_per_day": "1.6"
+            },
+            "prior_settlements": [{
+                "settled_at_ms": start - 2 * hour,
+                "rate_diff": "-0.000065"
+            }],
+            "frames": frames
+        });
+        let scenario: MultiDayCarryScenario = serde_json::from_value(json_payload).unwrap();
+        let rep = scenario.evaluate().unwrap();
+        assert_eq!(rep.frozen_leg0_sign, 1); // Long Arcus (+1), Short Lighter Core (-1)
+        assert_eq!(rep.status, "settled_witnessed");
+        assert!(rep.cash_identity_reconciled);
+        // 30h * $500 * (0.000070 - 0.000005) = $0.975 funding; exit fee on leg0 only: $500 * 2.25 bp = $0.1125.
+        assert_eq!(rep.witnessed_funding_cash_usd, d("0.975"));
+        assert_eq!(rep.fees_usd, d("0.1125"));
+        assert_eq!(rep.net_variable_pnl_usd, d("0.8625"));
+        assert_eq!(rep.terminal_equity_usd, d("1000.8625"));
+        assert_eq!(rep.fixed_infra_usd, d("2"));
+        assert_eq!(rep.net_all_in_pnl_usd, d("-1.1375"));
+
+        let mut ambiguous = scenario;
+        ambiguous.config.maker_entry_fee_bps = d("0.5");
+        assert!(ambiguous.evaluate().is_err());
+    }
+
+    #[test]
+    fn cash_components_reconcile_handles_decimal_rounding_and_detects_tampering() {
+        let mut sc = scenario("2.0");
+        sc.config.capital_usd = d("100000");
+        sc.config.target_leg_notional_usd = d("333.3333");
+        for f in &mut sc.frames {
+            f.leg0_price = d("103.17");
+            f.leg1_price = d("103.29");
+        }
+        let rep = sc.evaluate().unwrap();
+        assert!(rep.cash_identity_reconciled);
+        assert!(MultiDayCarryScenario::cash_components_reconcile(&rep));
+
+        let mut rounded = rep.clone();
+        rounded.witnessed_funding_cash_usd += d("0.000000000000000000000001");
+        assert!(MultiDayCarryScenario::cash_components_reconcile(&rounded));
+
+        for mutate in [
+            |r: &mut MultiDayCarryReport| r.witnessed_funding_cash_usd -= d("0.01"),
+            |r: &mut MultiDayCarryReport| r.terminal_equity_usd += d("0.01"),
+            |r: &mut MultiDayCarryReport| r.net_all_in_pnl_usd += d("0.01"),
+            |r: &mut MultiDayCarryReport| r.fixed_infra_usd = d("-1"),
+            |r: &mut MultiDayCarryReport| {
+                r.ten_hour_checkpoints
+                    .last_mut()
+                    .unwrap()
+                    .cumulative_fees_usd += d("0.01");
+            },
+        ] {
+            let mut tampered = rep.clone();
+            mutate(&mut tampered);
+            assert!(!MultiDayCarryScenario::cash_components_reconcile(&tampered));
+        }
     }
 }

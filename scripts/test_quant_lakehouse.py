@@ -2,6 +2,7 @@ import gzip
 from hashlib import sha256
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -11,6 +12,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from quant_lakehouse import (
+    WithheldBookScope,
+    ZeroSizeTradeScope,
     build_duckdb_lakehouse,
     bundle_directory_tar,
     evict_local_capture,
@@ -151,6 +154,180 @@ class QuantLakehouseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ambiguous Arcus market"):
             normalize_capture(ambiguous, self.root / "ambiguous",
                               withheld_arcus_trade_markets=frozenset({"SPY-USD"}), **args)
+
+    def test_withhold_lighter_book_preserves_other_books_and_checks_exact_count(self) -> None:
+        def book(seq, source, market, nonce):
+            return self._timed_row(seq, source, "message", seq * 10, request_sent_at_ms=self.t0, payload={
+                "type": "subscribed/order_book", "channel": f"order_book:{market}",
+                "order_book": {"nonce": nonce, "last_updated_at": self.t0 * 1000,
+                               "bids": [{"price": "10", "size": "2"}], "asks": [{"price": "11", "size": "1"}]},
+            })
+
+        capture = self._write_gz_capture("public-books.ndjson.gz", [
+            book(1, "lighter", 139, 0), book(2, "lighter", 139, 7),
+            book(3, "lighter_robinhood", 139, 8), book(4, "lighter", 26, 10),
+            self._timed_row(5, "collector", "end", 60),
+        ])
+        args = dict(campaign_id="book-review", collector_region="tokyo", precise_times=True)
+        for i, rule in enumerate((None, WithheldBookScope("lighter_robinhood", "139", 1),
+                                  WithheldBookScope("lighter", "26", 1))):
+            with self.assertRaisesRegex(ValueError, "nonce must be positive"):
+                normalize_capture(capture, self.root / f"strict-{i}", withheld_book=rule, **args)
+        stage = self.root / "partial"
+        with self.assertRaisesRegex(ValueError, "count differs"):
+            normalize_capture(capture, stage, withheld_book=WithheldBookScope("lighter", "139", 2), **args)
+        self.assertFalse(stage.exists())
+        result = normalize_capture(capture, stage, withheld_book=WithheldBookScope("lighter", "139", 1), **args)
+        scope = {"source": "lighter", "market": "139", "invalid_nonces": 1, "snapshots": 2, "updates": 0}
+        self.assertEqual(result["withheld_lighter_book"], scope)
+        for table in ("bbo_quotes", "feed_lifecycle"):
+            rows = _read_gz_ndjson(stage / f"{table}.ndjson.gz")
+            self.assertEqual([(r["raw_source"], r["market"], r["sequence"]) for r in rows
+                              if r["raw_source"] != "collector"], [("lighter_robinhood", "139", 2), ("lighter", "26", 3)])
+        dest = self.root / "isolated"
+        with self.assertRaisesRegex(ValueError, "--allow-partial-projection"):
+            build_duckdb_lakehouse(stage, dest / "parquet", dest / "lake.duckdb")
+        self.assertFalse(dest.exists())
+        checked = build_duckdb_lakehouse(stage, dest / "parquet", dest / "lake.duckdb", allow_partial_projection=True)
+        self.assertEqual(checked["withheld_lighter_book"], scope)
+        result["withheld_lighter_book"]["updates"] = -1
+        (stage / "silver_manifest.json").write_text(json.dumps(result))
+        with self.assertRaisesRegex(ValueError, "invalid partial Silver book counts"):
+            build_duckdb_lakehouse(stage, dest / "parquet", dest / "new.duckdb", allow_partial_projection=True)
+
+    def _lighter_trade_message(self, seq, market, trades=(), *, source="lighter_robinhood_trades",
+                               kind="update/trade"):
+        return self._timed_row(seq, source, "message", seq * 10, payload={
+            "type": kind,
+            "channel": f"trade:{market}",
+            "trades": [
+                {"trade_id": tid, "market_id": market, "timestamp": self.t0, "price": price,
+                 "size": size, "is_maker_ask": True}
+                for tid, price, size in trades
+            ],
+        })
+
+    def test_book_scope_retains_same_market_trades_and_funding_through_cli(self) -> None:
+        source, market = "lighter", 139
+        payload = {"type": "subscribed/order_book", "channel": "order_book/139",
+                   "order_book": {"nonce": 0, "last_updated_at": 0, "asks": [], "bids": []}}
+        rows = [self._timed_row(1, source, "message", 10, payload=payload),
+                self._lighter_trade_message(2, market, source="lighter_trades", kind="subscribed/trade"),
+                self._lighter_trade_message(3, market, [("1", "100", "2")], source="lighter_trades"),
+                self._timed_row(4, source, "message", 40, payload={
+                    "type": "update/market_stats", "channel": "market_stats:139",
+                    "market_stats": {"index_price": "100", "mark_price": "101", "current_funding_rate": "0.0012"},
+                }),
+                self._timed_row(5, "collector", "end", 50)]
+        capture = self._write_gz_capture("public-scope.ndjson.gz", rows)
+        stage = self.root / "isolated"
+        subprocess.run([sys.executable, str(Path(__file__).with_name("quant_lakehouse.py")), "normalize",
+                        str(capture), "--output-dir", str(stage), "--campaign-id", "book-scope-cli",
+                        "--collector-region", "tokyo", "--precise-times", "--withhold-lighter-book",
+                        source, str(market), "1"], check=True, capture_output=True)
+        trades = _read_gz_ndjson(stage / "public_trades.ndjson.gz")
+        funding = _read_gz_ndjson(stage / "funding_and_ctx.ndjson.gz")
+        self.assertEqual([(r["market"], r["raw_source"], r["sequence"]) for r in trades],
+                         [("139", "lighter_trades", 2)])
+        self.assertEqual([(r["market"], r["raw_source"], r["sequence"]) for r in funding],
+                         [("139", "lighter", 3)])
+        self.assertEqual(_read_gz_ndjson(stage / "bbo_quotes.ndjson.gz"), [])
+
+    def test_zero_quantity_projection_preserves_observations_identity_and_other_markets(self) -> None:
+        message = self._lighter_trade_message
+        zero = ("1", "100", "0")
+        rows = [message(1, 32, kind="subscribed/trade"),
+                message(2, 32, [zero, ("2", "0", "5"), ("3", "10", "2")]),
+                message(3, 32, [zero]), message(4, 25, kind="subscribed/trade"),
+                message(5, 25, [("1", "5", "3")]), self._timed_row(6, "collector", "end", 80)]
+        capture = self._write_gz_capture("public-scope.ndjson.gz", rows)
+        for combined in (False, True):
+            stage = self.root / f"silver-{combined}"
+            cmd = [sys.executable, str(Path(__file__).with_name("quant_lakehouse.py")), "normalize",
+                   str(capture), "--output-dir", str(stage), "--campaign-id", "test-projection",
+                   "--collector-region", "tokyo", "--precise-times", "--quarantine-zero-size-trade",
+                   "lighter_robinhood_trades", "32", "2"]
+            if combined:
+                cmd.extend(["--withhold-arcus-trade-market", "GOOGL-USD"])
+            subprocess.run(cmd, capture_output=True, check=True)
+            manifest_path = stage / "silver_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            expected = {"source": "lighter_robinhood_trades", "market": "32", "observations": 2}
+            self.assertEqual(manifest["quarantined_zero_quantity"], expected)
+            trades = _read_gz_ndjson(stage / "public_trades.ndjson.gz")
+            self.assertEqual([(t["market"], t["trade_id"], t["size"], t["is_zero_price_transfer"]) for t in trades],
+                             [("32", "2", "5", True), ("32", "3", "2", False), ("25", "1", "3", False)])
+            database = self.root / f"catalog-{combined}" / "lake.duckdb"
+            parquet = database.parent / "parquet"
+            with self.assertRaisesRegex(ValueError, "--allow-partial-projection"):
+                build_duckdb_lakehouse(stage, parquet, database)
+            self.assertFalse(database.parent.exists())
+            receipt = build_duckdb_lakehouse(stage, parquet, database, allow_partial_projection=True)
+            self.assertEqual(receipt["artifact_kind"], "silver_partial_market_projection")
+            self.assertEqual(receipt["quarantined_zero_quantity"], expected)
+            if combined:
+                self.assertEqual(receipt["withheld_arcus_trade_messages"], {"GOOGL-USD": 0})
+            if receipt["engine"] == "python_duckdb":
+                import duckdb
+
+                with duckdb.connect(str(database), read_only=True) as conn:
+                    self.assertEqual(conn.execute(
+                        "SELECT COUNT(*), SUM(size_f64), MIN(size_f64) FROM v_public_trades"
+                    ).fetchone(), (3, 10, 2))
+            manifest["quarantined_zero_quantity"]["observations"] = True
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "positive count"):
+                build_duckdb_lakehouse(stage, parquet, database, allow_partial_projection=True)
+            manifest["quarantined_zero_quantity"] = None
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "invalid partial Silver"):
+                build_duckdb_lakehouse(stage, parquet, database, allow_partial_projection=True)
+
+    def test_zero_quantity_exceptions_are_scoped_and_counted_before_publication(self) -> None:
+        source = "lighter_robinhood_trades"
+        scope = ZeroSizeTradeScope(source, "32", 1)
+        zero = ("1", "100", "0")
+        message = self._lighter_trade_message
+        cases = [
+            (None, [], [zero], "non-positive"),
+            (ZeroSizeTradeScope(source, "25", 1), [], [zero], "non-positive"),
+            (ZeroSizeTradeScope("lighter_trades", "32", 1), [], [zero], "non-positive"),
+            (ZeroSizeTradeScope(source, "32", 2), [], [zero], "observation count"),
+            (scope, [], [], "observation count"), (scope, [zero], [], "non-positive"),
+            (scope, [], [("1", "0", "0")], "non-positive"),
+            (scope, [], [("1", "100", "-1")], "non-positive"),
+            (scope, [], [zero, ("1", "100", "1")], "conflicting duplicate"),
+            (scope, [("1", "100", "1")], [zero], "conflicting duplicate"),
+        ]
+        for n, (rule, initial, updates, error) in enumerate(cases):
+            with self.subTest(n=n):
+                rows = [message(1, 32, initial, kind="subscribed/trade"), message(2, 32, updates),
+                        self._timed_row(3, "collector", "end", 40)]
+                capture = self._write_gz_capture(f"case-{n}.ndjson.gz", rows)
+                stage = self.root / f"case-{n}"
+                with self.assertRaisesRegex(ValueError, error):
+                    normalize_capture(capture, stage, campaign_id="test-scope", collector_region="tokyo",
+                                      zero_size_trade_scope=rule)
+                self.assertFalse((stage / "silver_manifest.json").exists())
+
+    def test_zero_quantity_count_mismatch_allows_retry_in_same_directory(self) -> None:
+        source = "lighter_robinhood_trades"
+        capture = self._write_gz_capture("retry.ndjson.gz", [
+            self._lighter_trade_message(1, 32, [], kind="subscribed/trade"),
+            self._lighter_trade_message(2, 32, [("1", "100", "0"), ("2", "100", "1")]),
+            self._timed_row(3, "collector", "end", 40),
+        ])
+        stage = self.root / "retry"
+        args = {"campaign_id": "test-scope", "collector_region": "tokyo"}
+        with self.assertRaisesRegex(ValueError, "observation count"):
+            normalize_capture(capture, stage, zero_size_trade_scope=ZeroSizeTradeScope(source, "32", 2), **args)
+        self.assertFalse(stage.exists())
+        scope = ZeroSizeTradeScope(source, "32", 1)
+        manifest = normalize_capture(capture, stage, zero_size_trade_scope=scope, **args)
+        self.assertEqual(manifest["tables"]["public_trades"]["rows"], 1)
+        with self.assertRaises(FileExistsError):
+            normalize_capture(capture, stage, zero_size_trade_scope=scope, **args)
+        self.assertEqual(json.loads((stage / "silver_manifest.json").read_text()), manifest)
 
     def test_seal_and_normalize_priority_venues_preserve_causality_and_fees(self) -> None:
         rows = [
@@ -524,6 +701,15 @@ class QuantLakehouseTests(unittest.TestCase):
         def evict():
             return evict_local_capture(capture, manifest_path=manifest_path, remote_receipt_path=receipt_path)
 
+        for invalid in ({"remote_uri": "gdrive://"}, {"remote_uri": "rclone://   "},
+                        {"bytes": float(len(payload))}):
+            with self.subTest(invalid=invalid):
+                receipt_path.write_text(json.dumps({**receipt, **invalid}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "refusing eviction"):
+                    evict()
+                self.assertTrue(capture.exists())
+                self.assertFalse(capture.with_name(f"{capture.name}.evicted.json").exists())
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         unlink = Path.unlink
 
         def interrupt_capture_unlink(path, *args, **kwargs):

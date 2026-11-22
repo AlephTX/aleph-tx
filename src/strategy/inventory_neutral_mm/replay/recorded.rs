@@ -12,13 +12,17 @@ use std::io::BufRead;
 use tokio::sync::watch;
 
 pub(in crate::strategy::inventory_neutral_mm) mod binance_signal;
+pub(in crate::strategy::inventory_neutral_mm) mod bound_guard;
 mod calibration;
 mod cancel_timing;
 #[cfg(test)]
 mod cancel_timing_tests;
 mod continuous;
+pub(in crate::strategy::inventory_neutral_mm) mod crash_pause;
+pub(in crate::strategy::inventory_neutral_mm::replay) mod inventory_cycles;
 pub(in crate::strategy::inventory_neutral_mm) mod local_fair_value;
 pub(in crate::strategy::inventory_neutral_mm) mod local_signal;
+pub(in crate::strategy::inventory_neutral_mm) mod quote_constraints;
 
 const HOUR_MS: u64 = 3_600_000;
 const NS_PER_MS: u64 = 1_000_000;
@@ -173,6 +177,9 @@ impl Drop for ReplayClock {
         ATTRIBUTION.replace(None);
         CANCEL_REASON.set(None);
         BATCH_CANCEL_REASONS.replace(Vec::new());
+        quote_constraints::reset(false, false);
+        bound_guard::reset(None);
+        inventory_cycles::reset(false);
     }
 }
 
@@ -373,6 +380,17 @@ pub struct RecordedMakerConfig {
     diagnose_cross_market: bool,
     #[serde(default)]
     diagnose_cancel_attribution: bool,
+    /// Read-only pricing-stage counters; independent of markout attribution.
+    #[serde(default)]
+    diagnose_quote_constraints: bool,
+    /// Join decision-time quote constraints to accepted maker fills and labels.
+    #[serde(default)]
+    diagnose_quote_fill_linkage: bool,
+    /// Offline-only, externally frozen one-way placement reserve toward flat.
+    #[serde(default)]
+    bound_breach_guard_bps: Option<f64>,
+    #[serde(default)]
+    diagnose_inventory_cycles: bool,
     /// Opt-in `S10-1` calibration telemetry (distance exposure, markout
     /// histograms, realized sigma). Requires `diagnose_cross_market` labels.
     #[serde(default)]
@@ -387,6 +405,8 @@ pub struct RecordedMakerConfig {
     local_reversal_filter: Option<local_signal::LocalReversalFilter>,
     #[serde(default)]
     binance_risk_filter: Option<binance_signal::Policy>,
+    #[serde(default)]
+    crash_pause_filter: Option<crash_pause::Policy>,
     /// Research-only Core data ablation; external books are not published.
     #[serde(default)]
     core_only: bool,
@@ -565,6 +585,19 @@ impl RecordedMakerConfig {
                 "compare local and reference filters in separate experiments"
             );
         }
+        if let Some(policy) = self.crash_pause_filter {
+            policy.validate()?;
+            ensure!(
+                self.local_reversal_filter.is_none()
+                    && self.binance_risk_filter.is_none()
+                    && self.hyperliquid_obi_filter.is_none()
+                    && self.local_obi_filter.is_none()
+                    && self.strategy.local_toxicity.is_none_or(|tox| {
+                        tox.vol_pause_bps.is_none() && tox.ofi_withdraw_threshold.is_none()
+                    }),
+                "compare crash pause filter in a separate experiment"
+            );
+        }
         if self.core_only {
             ensure!(
                 self.hyperliquid_obi_filter.is_none()
@@ -585,6 +618,32 @@ impl RecordedMakerConfig {
         if let Some(qm) = self.queue_model {
             qm.validate()?;
         }
+        ensure!(
+            !self.diagnose_inventory_cycles || self.diagnose_quote_fill_linkage,
+            "inventory cycles require quote fill linkage"
+        );
+        if let Some(reserve) = self.bound_breach_guard_bps {
+            ensure!(
+                reserve.is_finite() && reserve > 0.0 && reserve <= 10.0,
+                "bound_breach_guard_bps must be in (0, 10]"
+            );
+            ensure!(
+                self.core_only
+                    && self
+                        .strategy
+                        .quote_hysteresis
+                        .is_some_and(|p| p.per_side_bound_cancel
+                            && p.passive_touch_flatten_age_fraction.is_none()),
+                "bound_breach_guard_bps requires Core-only per-side bounds without passive-touch override"
+            );
+        }
+        ensure!(
+            !self.diagnose_quote_fill_linkage
+                || (self.diagnose_quote_constraints
+                    && self.diagnose_cross_market
+                    && self.diagnose_cancel_attribution),
+            "diagnose_quote_fill_linkage requires quote constraints, cross-market and cancel attribution"
+        );
         ensure!(
             !self.calibration_telemetry || self.diagnose_cross_market,
             "calibration_telemetry requires diagnose_cross_market markout labels"
@@ -716,7 +775,9 @@ struct Queue {
     changed_side: bool,
     cancel_requested: bool,
     cancel_attr_recorded: bool,
+    cancel_attr_reason: Option<CancelReason>,
     cancel_window: Option<cancel_timing::CancelWindow>,
+    quote_tag: Option<quote_constraints::OrderTag>,
 }
 
 struct CancelledOrder {
@@ -768,6 +829,9 @@ struct PendingMarkout {
     changed_side: bool,
     cancel_pending: bool,
     cancel_source_timing: cancel_timing::SourceTiming,
+    /// First attributed cancel reason (`diagnose_cancel_attribution` only).
+    cancel_reason: Option<CancelReason>,
+    quote_cohort: Option<usize>,
 }
 
 #[derive(Default, Serialize)]
@@ -840,6 +904,23 @@ struct CancelReasonAccum {
     requests: u64,
     total_queue_age_ms: u64,
     histogram: CancelQueueHistogram,
+    cancel_pending_fills: u64,
+    cancel_pending_turnover_quote: f64,
+    cancel_pending_markouts: [ReasonMarkout; 3],
+}
+
+/// Per-reason markout of cancel-pending maker fills at one horizon. Uses the same
+/// fresh-publication rule and mid as `HorizonMarkout`. Per-reason `marked_fills` and
+/// non-negative `marked_turnover` sum to at most the global values; signed
+/// `markout_quote` equals the global `cancel_pending_markout_quote` when all
+/// cancel-pending fills carry an attributed reason, and may be larger or smaller
+/// when some fills lack an attributed reason.
+#[derive(Default, Clone, Copy, Serialize)]
+struct ReasonMarkout {
+    horizon_ms: u64,
+    marked_fills: u64,
+    marked_turnover: f64,
+    markout_quote: f64,
 }
 
 impl CancelReasonAccum {
@@ -847,6 +928,11 @@ impl CancelReasonAccum {
         self.requests += 1;
         self.total_queue_age_ms += age_ms;
         self.histogram.record(age_ms);
+    }
+
+    fn record_cancel_pending_fill(&mut self, notional_quote: f64) {
+        self.cancel_pending_fills += 1;
+        self.cancel_pending_turnover_quote += notional_quote;
     }
 
     fn report(self) -> CancelReasonReport {
@@ -859,6 +945,15 @@ impl CancelReasonAccum {
                 0.0
             },
             histogram: self.histogram,
+            cancel_pending_fills: self.cancel_pending_fills,
+            cancel_pending_turnover_quote: self.cancel_pending_turnover_quote,
+            cancel_pending_markouts: {
+                let mut marks = self.cancel_pending_markouts;
+                for (mark, horizon_ms) in marks.iter_mut().zip(MARKOUT_HORIZONS_MS) {
+                    mark.horizon_ms = horizon_ms;
+                }
+                marks
+            },
         }
     }
 }
@@ -869,6 +964,9 @@ struct CancelReasonReport {
     total_queue_age_ms: u64,
     mean_queue_age_ms: f64,
     histogram: CancelQueueHistogram,
+    cancel_pending_fills: u64,
+    cancel_pending_turnover_quote: f64,
+    cancel_pending_markouts: [ReasonMarkout; 3],
 }
 
 #[derive(Default)]
@@ -894,14 +992,45 @@ impl CancelAttributionAccum {
             .record(queue_age_ms);
     }
 
+    fn mark_cancel_pending(
+        &mut self,
+        reason: CancelReason,
+        horizon: usize,
+        fill: &PendingMarkout,
+        mid: f64,
+    ) {
+        let mark = &mut self
+            .by_reason
+            .entry(reason)
+            .or_default()
+            .cancel_pending_markouts[horizon];
+        mark.marked_fills += 1;
+        mark.marked_turnover += fill.signed_quantity.abs() * fill.price;
+        mark.markout_quote += fill.signed_quantity * (mid - fill.price);
+    }
+
     fn record_reduce_only_auto_cancel(&mut self, queue_age_ms: u64) {
         self.reduce_only_auto_cancels.record(queue_age_ms);
     }
 
-    fn record_fill(&mut self, queue_age_ms: u64, cancel_pending: bool) {
+    fn record_fill(
+        &mut self,
+        queue_age_ms: u64,
+        cancel_pending: bool,
+        cancel_reason: Option<CancelReason>,
+        notional_quote: f64,
+    ) {
         self.maker_fills += 1;
         self.total_filled_queue_age_ms += queue_age_ms;
-        self.cancel_pending_fills += u64::from(cancel_pending);
+        if cancel_pending {
+            self.cancel_pending_fills += 1;
+            if let Some(reason) = cancel_reason {
+                self.by_reason
+                    .entry(reason)
+                    .or_default()
+                    .record_cancel_pending_fill(notional_quote);
+            }
+        }
     }
 
     fn finish(self) -> CancelAttribution {
@@ -1078,6 +1207,10 @@ impl Matching {
     }
 
     fn on_book(&self, book: Book) {
+        inventory_cycles::book(
+            book.timestamp_ms,
+            book.touch().map(|(b, a)| 0.5 * b[0] + 0.5 * a[0]),
+        );
         let mut state = self.market.lock();
         if state.calibration.is_some() {
             let at = now_ms();
@@ -1100,6 +1233,7 @@ impl Matching {
             let Market {
                 calibration,
                 attribution,
+                cancel_attribution,
                 ..
             } = &mut *state;
             if let Some(stats) = attribution {
@@ -1118,8 +1252,15 @@ impl Matching {
                             if let Some(cal) = calibration.as_mut() {
                                 cal.on_mark(index, fill.signed_quantity, fill.price, mid);
                             }
+                            quote_constraints::mark(&fill, index, Some(mid), false);
                             stats.maker_markouts[index].mark(&fill, mid);
                             stats.cancel_timing.mark(index, &fill, mid);
+                            if fill.cancel_pending
+                                && let (Some(reason), Some(cancel_stats)) =
+                                    (fill.cancel_reason, cancel_attribution.as_mut())
+                            {
+                                cancel_stats.mark_cancel_pending(reason, index, &fill, mid);
+                            }
                             if index == 0 {
                                 stats.all_maker_fills.mark(&fill, mid);
                                 if fill.changed_side {
@@ -1127,6 +1268,7 @@ impl Matching {
                                 }
                             }
                         } else {
+                            quote_constraints::mark(&fill, index, None, false);
                             stats.maker_markouts[index].expired_fills += 1;
                             stats.cancel_timing.expire(index, fill.cancel_source_timing);
                         }
@@ -1247,6 +1389,7 @@ impl Matching {
                                     .map(|(_, reason)| *reason)
                             })
                             .unwrap_or(fallback_reason);
+                        order.cancel_attr_reason = Some(reason);
                         cancel_stats
                             .record_cancel(reason, requested_ms.saturating_sub(order.activated_ms));
                     }
@@ -1355,7 +1498,14 @@ impl Matching {
         Ok(())
     }
 
-    fn admit(&self, venue: &SimVenue, order: Resting, ioc: bool, changed_side: bool) -> bool {
+    fn admit(
+        &self,
+        venue: &SimVenue,
+        order: Resting,
+        ioc: bool,
+        changed_side: bool,
+        quote_tag: Option<quote_constraints::OrderTag>,
+    ) -> bool {
         let now = now_ms();
         let mut state = self.market.lock();
         let size = order.remaining;
@@ -1428,9 +1578,12 @@ impl Matching {
                     changed_side,
                     cancel_requested: false,
                     cancel_attr_recorded: false,
+                    cancel_attr_reason: None,
                     cancel_window: None,
+                    quote_tag,
                 },
             );
+            quote_constraints::accepted(quote_tag);
             state.first_maker_ms.get_or_insert(now);
             if let Some(stats) = &mut state.attribution {
                 stats.maker_accepted += 1;
@@ -1545,7 +1698,15 @@ impl Matching {
             } else {
                 None
             };
-            let (activated_ms, changed_side, cancel_requested, cancel_attr_recorded, cancel_window) = {
+            let (
+                activated_ms,
+                changed_side,
+                cancel_requested,
+                cancel_attr_recorded,
+                cancel_attr_reason,
+                cancel_window,
+                quote_tag,
+            ) = {
                 let mut state = self.market.lock();
                 let observed_effective_ms =
                     state.cancelled.get(&id).map(|order| order.cancelled_ms);
@@ -1569,6 +1730,7 @@ impl Matching {
                     queue.changed_side,
                     queue.cancel_requested,
                     queue.cancel_attr_recorded,
+                    queue.cancel_attr_reason,
                     queue.cancel_window.map(|mut window| {
                         // Once a simulated cancellation has executed, use its
                         // observed local effect time instead of the deadline.
@@ -1577,6 +1739,7 @@ impl Matching {
                         }
                         window
                     }),
+                    queue.quote_tag,
                 )
             };
             let max_order_qty = reducible.map_or(order.remaining, |cap| order.remaining.min(cap));
@@ -1586,6 +1749,8 @@ impl Matching {
                     cancel_stats.record_fill(
                         at.saturating_sub(activated_ms),
                         cancel_requested || cancel_attr_recorded,
+                        cancel_attr_reason,
+                        qty * order.price,
                     );
                 }
                 if let Some(stats) = &mut self.market.lock().attribution {
@@ -1595,6 +1760,17 @@ impl Matching {
                         at,
                         activated_ms,
                         cancel_window,
+                        qty * order.price,
+                        venue.fee_bps,
+                    );
+                    let quote_cohort = quote_constraints::fill(
+                        quote_tag,
+                        order.reduce_only,
+                        cancel_requested,
+                        cancel_attr_reason,
+                        cancel_source_timing,
+                        activated_ms,
+                        source,
                         qty * order.price,
                         venue.fee_bps,
                     );
@@ -1624,6 +1800,8 @@ impl Matching {
                             changed_side,
                             cancel_pending: cancel_requested,
                             cancel_source_timing,
+                            cancel_reason: cancel_attr_reason,
+                            quote_cohort,
                         });
                     }
                 }
@@ -1639,6 +1817,14 @@ impl Matching {
                         cal.on_fill(order.price, order.is_ask, qty, mid);
                     }
                 }
+                let _inventory_fill =
+                    inventory_cycles::FillScope::open(inventory_cycles::Context {
+                        pending: cancel_requested,
+                        reason: cancel_attr_reason.map(CancelReason::as_str),
+                        toward_flat_at_decision: quote_tag
+                            .map(quote_constraints::OrderTag::toward_flat),
+                        source_ms: Some(source),
+                    });
                 venue.fill(order, order.price, qty, false);
                 {
                     let mut state = self.market.lock();
@@ -1760,6 +1946,18 @@ impl Matching {
                 BatchAction::Place(_) => {}
             }
         }
+        let quote_tags: Vec<_> = {
+            let book_source_ms = self.market.lock().book.timestamp_ms;
+            actions
+                .iter()
+                .map(|a| match a {
+                    BatchAction::Place(p) if p.order_type != OrderType::Ioc => {
+                        quote_constraints::submitted(p.side == Side::Sell, book_source_ms, p.price)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         let reservations: Vec<_> = actions
             .iter()
             .map(|action| match action {
@@ -1775,7 +1973,9 @@ impl Matching {
             .collect();
         tokio::time::sleep(batch_delay).await;
         let mut places = Vec::new();
-        for (action, reservation) in actions.into_iter().zip(reservations) {
+        for ((action, reservation), quote_tag) in
+            actions.into_iter().zip(reservations).zip(quote_tags)
+        {
             match action {
                 BatchAction::Cancel(id) => venue.cancel(id),
                 BatchAction::Place(params) => {
@@ -1797,7 +1997,13 @@ impl Matching {
                     if allowed
                         && warmed
                         && online
-                        && self.admit(venue, order, ioc, changed_sides[usize::from(order.is_ask)])
+                        && self.admit(
+                            venue,
+                            order,
+                            ioc,
+                            changed_sides[usize::from(order.is_ask)],
+                            quote_tag,
+                        )
                     {
                         venue.activate(order);
                         if ioc {
@@ -1903,6 +2109,12 @@ pub struct RecordedMakerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     cancel_attribution: Option<CancelAttribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    quote_constraints: Option<quote_constraints::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_cycles: Option<inventory_cycles::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound_breach_guard_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     calibration: Option<calibration::CalibrationReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_participation: Option<QuoteParticipation>,
@@ -1910,6 +2122,8 @@ pub struct RecordedMakerReport {
     local_participation: Option<local_signal::LocalParticipation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binance_participation: Option<binance_signal::Participation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crash_pause_participation: Option<crash_pause::Participation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     queue_model: Option<QueueModelReport>,
 }
@@ -1982,6 +2196,12 @@ async fn drive(
     mut input: impl BufRead,
 ) -> Result<RecordedMakerReport> {
     let _clock = ReplayClock::open(config.start_ms, config.diagnose_cross_market);
+    quote_constraints::reset(
+        config.diagnose_quote_constraints,
+        config.diagnose_quote_fill_linkage,
+    );
+    bound_guard::reset(config.bound_breach_guard_bps);
+    inventory_cycles::reset(config.diagnose_inventory_cycles);
     let start = Instant::now();
     let mut files = ShmFiles::for_symbol(config.strategy.symbol_id)?;
     let tracker = Arc::new(OrderTracker::new());
@@ -2034,6 +2254,19 @@ async fn drive(
             Arc::clone(binance_signal.as_ref().expect("configured reference")),
         )
     });
+    let crash_pause_signal = config
+        .crash_pause_filter
+        .map(|policy| Arc::new(PlMutex::new(crash_pause::Signal::new(policy))));
+    strategy.crash_pause_participation = config.crash_pause_filter.map(|policy| {
+        crash_pause::Participation::new(
+            policy,
+            Arc::clone(
+                crash_pause_signal
+                    .as_ref()
+                    .expect("configured crash pause signal"),
+            ),
+        )
+    });
     let local_fair_value = config
         .local_fair_value
         .clone()
@@ -2074,6 +2307,12 @@ async fn drive(
                 }
                 if let Some(signal) = &local_signal {
                     signal.lock().book(now_ms(), lighter);
+                }
+                if let Some(signal) = &crash_pause_signal {
+                    let now = now_ms();
+                    let mut guard = signal.lock();
+                    guard.book(now, lighter);
+                    guard.observe(now);
                 }
                 let mut shm = files.borrow_mut();
                 lighter.write_bbo(&shm, LIGHTER);
@@ -2129,10 +2368,20 @@ async fn drive(
                                 .lock()
                                 .update(at, observed_ms, epoch, mid, update_id)?;
                         }
+                        if let Some(signal) = &crash_pause_signal {
+                            let mut guard = signal.lock();
+                            guard.update_external(at, observed_ms, epoch, mid, update_id)?;
+                            guard.observe(now_ms());
+                        }
                     }
                     Event::TradeFeed { online, .. } => {
                         if let Some(signal) = &local_signal {
                             signal.lock().feed(at, online);
+                        }
+                        if let Some(signal) = &crash_pause_signal {
+                            let mut guard = signal.lock();
+                            guard.feed(at, online);
+                            guard.observe(now_ms());
                         }
                         let mut state = matching.market.lock();
                         if !online && state.trade_feed_online != Some(false) {
@@ -2192,6 +2441,16 @@ async fn drive(
                                 price * size,
                                 matches!(aggressor, Aggressor::Buy),
                             );
+                        }
+                        if let Some(signal) = &crash_pause_signal {
+                            let mut guard = signal.lock();
+                            guard.trade(
+                                at,
+                                source_ms,
+                                price * size,
+                                matches!(aggressor, Aggressor::Buy),
+                            );
+                            guard.observe(now_ms());
                         }
                         trades += 1;
                     }
@@ -2290,6 +2549,7 @@ async fn drive(
         }
         for (horizon, pending) in execution.pending_marks.iter().enumerate() {
             for fill in pending {
+                quote_constraints::mark(fill, horizon, None, true);
                 execution
                     .cancel_timing
                     .pending_at_cutoff(horizon, fill.cancel_source_timing);
@@ -2381,6 +2641,9 @@ async fn drive(
             .cancel_attribution
             .take()
             .map(CancelAttributionAccum::finish),
+        quote_constraints: quote_constraints::take(),
+        inventory_cycles: inventory_cycles::take(),
+        bound_breach_guard_bps: config.bound_breach_guard_bps,
         calibration: market
             .calibration
             .as_ref()
@@ -2388,6 +2651,7 @@ async fn drive(
         quote_participation: strategy.quote_participation,
         local_participation: strategy.local_participation,
         binance_participation: strategy.binance_participation,
+        crash_pause_participation: strategy.crash_pause_participation,
         queue_model: market.queue_model_report,
     })
 }
@@ -2433,12 +2697,17 @@ mod tests {
             taker_transport_ms: None,
             diagnose_cross_market: false,
             diagnose_cancel_attribution: false,
+            diagnose_quote_constraints: false,
+            diagnose_quote_fill_linkage: false,
+            bound_breach_guard_bps: None,
+            diagnose_inventory_cycles: false,
             calibration_telemetry: false,
             hyperliquid_obi_filter: None,
             local_obi_filter: None,
             local_fair_value: None,
             local_reversal_filter: None,
             binance_risk_filter: None,
+            crash_pause_filter: None,
             core_only: false,
             order_response_ms: 0,
             trade_clock_guard_ms: 100,
@@ -2470,6 +2739,8 @@ mod tests {
                     changed_side: false,
                     cancel_pending: true,
                     cancel_source_timing: cancel_timing::SourceTiming::DuringCancelWindow,
+                    cancel_reason: None,
+                    quote_cohort: None,
                 });
             }
         }
@@ -2779,6 +3050,154 @@ mod tests {
             .unwrap()
             .remove("binance_participation");
         assert_eq!(control, monitored);
+    }
+
+    fn crash_pause_tape(config: &RecordedMakerConfig) -> String {
+        let mut data = format!(
+            "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+            config.start_ms
+        );
+        let shock_start = config.start_ms + 10_000;
+        let shock_end = config.start_ms + 12_000;
+        for (seq, at) in (1_u64..).zip((config.start_ms..config.drain_until_ms).step_by(250)) {
+            let (local_mid, bid_qty, ext_mid) = if at >= shock_start && at < shock_end {
+                (999.2, 20.0, 999.9)
+            } else if at >= shock_end {
+                (999.7, 80.0, 999.95)
+            } else {
+                (1_000.0, 100.0, 1_000.0)
+            };
+            let book = serde_json::json!({
+                "timestamp_ms": at,
+                "bids": [[local_mid - 0.05, bid_qty]],
+                "asks": [[local_mid + 0.05, bid_qty]],
+            });
+            let book_ev = serde_json::json!({
+                "kind": "book",
+                "at_ms": at,
+                "lighter": book,
+                "hyperliquid": book,
+            });
+            let binance_ev = serde_json::json!({
+                "kind": "binance",
+                "at_ms": at,
+                "observed_ms": at,
+                "epoch": 1,
+                "mid": ext_mid,
+                "update_id": seq,
+            });
+            data.push_str(&book_ev.to_string());
+            data.push('\n');
+            data.push_str(&binance_ev.to_string());
+            data.push('\n');
+            if at == shock_start || at == shock_start + 1_250 {
+                let trade_ev = serde_json::json!({
+                    "kind": "trade",
+                    "at_ms": at + 50,
+                    "source_ms": at + 40,
+                    "price": 999.85,
+                    "size": 20.0,
+                    "aggressor": "sell",
+                });
+                data.push_str(&trade_ev.to_string());
+                data.push('\n');
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn crash_pause_record_only_preserves_complete_control_ledger() {
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.diagnose_cross_market = true;
+        cfg.strategy.poll_interval_ms = 500;
+        let data = crash_pause_tape(&cfg);
+        let control =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.diagnose_cross_market = true;
+        cfg.strategy.poll_interval_ms = 500;
+        cfg.crash_pause_filter = Some(crash_pause::Policy::frozen_v1(false));
+        let mut monitored =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        let part = &monitored["crash_pause_participation"];
+        assert!(
+            part["triggered_local_sell_pressure"].as_u64().unwrap() >= 1,
+            "shadow mode must still detect frozen local sell pressure episode"
+        );
+        assert_eq!(part["withdrawn_bid_targets"].as_u64(), Some(0));
+        monitored
+            .as_object_mut()
+            .unwrap()
+            .remove("crash_pause_participation");
+        assert_eq!(control, monitored);
+    }
+
+    #[test]
+    fn crash_pause_arm_c_pauses_buy_on_local_sell_pressure_and_resumes() {
+        let mut cfg = continuous_config(125);
+        cfg.core_only = true;
+        cfg.diagnose_cross_market = true;
+        cfg.strategy.poll_interval_ms = 500;
+        cfg.crash_pause_filter = Some(crash_pause::Policy::frozen_v1(true));
+        let data = crash_pause_tape(&cfg);
+        let report =
+            serde_json::to_value(run_recorded_maker(cfg, data.as_bytes()).unwrap()).unwrap();
+        let part = &report["crash_pause_participation"];
+        assert!(
+            part["triggered_local_sell_pressure"].as_u64().unwrap() >= 1,
+            "expected local sell pressure trigger, got {part}"
+        );
+        assert!(
+            part["withdrawn_bid_by_local_sell_pressure"]
+                .as_u64()
+                .unwrap()
+                >= 1,
+            "expected buy withdrawal during pause, got {part}"
+        );
+        assert!(
+            part["resumed_episodes"].as_u64().unwrap() >= 1,
+            "expected safe resume after calm flow and depth recovery, got {part}"
+        );
+    }
+
+    #[test]
+    fn crash_pause_preregistered_abc_configs_validate() {
+        use crate::config::LocalToxicityConfig;
+
+        let make_base = || {
+            let mut cfg = continuous_config(125);
+            cfg.core_only = true;
+            cfg.diagnose_cross_market = true;
+            cfg.calibration_telemetry = true;
+            cfg
+        };
+        let arm_a = make_base();
+        arm_a.validate().unwrap();
+
+        let mut arm_b = make_base();
+        arm_b.strategy.local_toxicity = Some(LocalToxicityConfig {
+            vol_pause_bps: Some(15.0),
+            withdraw_cooldown_ms: 1_500,
+            withdraw_clear_ratio: Some(0.6),
+            ..Default::default()
+        });
+        arm_b.validate().unwrap();
+
+        let mut arm_c = make_base();
+        arm_c.crash_pause_filter = Some(crash_pause::Policy::frozen_v1(true));
+        arm_c.validate().unwrap();
+
+        let mut arm_c_shadow = make_base();
+        arm_c_shadow.crash_pause_filter = Some(crash_pause::Policy::frozen_v1(false));
+        arm_c_shadow.validate().unwrap();
+
+        // Pure A/B/C isolation: stacking Arm B volatility pause inside Arm C must fail validation.
+        let mut contaminated = arm_b;
+        contaminated.crash_pause_filter = Some(crash_pause::Policy::frozen_v1(true));
+        assert!(contaminated.validate().is_err());
     }
 
     #[test]
@@ -3508,6 +3927,208 @@ mod tests {
     }
 
     #[test]
+    fn bound_guard_config_requires_supported_core_policy_and_finite_positive_reserve() {
+        let mut cfg = continuous_config(15);
+        cfg.core_only = true;
+        cfg.strategy.require_external_fair_value = false;
+        cfg.strategy.quote_hysteresis = Some(crate::config::QuoteHysteresisConfig {
+            per_side_bound_cancel: true,
+            ..Default::default()
+        });
+        cfg.bound_breach_guard_bps = Some(0.7);
+        cfg.validate().unwrap();
+        for invalid in [0.0, -1.0, 10.1, f64::NAN, f64::INFINITY] {
+            cfg.bound_breach_guard_bps = Some(invalid);
+            assert!(cfg.validate().is_err());
+        }
+        cfg.bound_breach_guard_bps = Some(0.7);
+        cfg.strategy
+            .quote_hysteresis
+            .as_mut()
+            .unwrap()
+            .passive_touch_flatten_age_fraction = Some(0.5);
+        assert!(cfg.validate().is_err());
+        cfg.strategy
+            .quote_hysteresis
+            .as_mut()
+            .unwrap()
+            .passive_touch_flatten_age_fraction = None;
+        cfg.core_only = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn quote_constraints_preserve_fills_cash_and_other_diagnostics() {
+        let make_cfg = |diagnose_quote_constraints: bool| {
+            let mut cfg = continuous_config(15);
+            cfg.strategy.grid_levels = 2;
+            cfg.strategy.base_order_size = 0.01;
+            cfg.diagnose_cross_market = true;
+            cfg.calibration_telemetry = true;
+            cfg.diagnose_cancel_attribution = true;
+            cfg.diagnose_quote_constraints = diagnose_quote_constraints;
+            cfg.diagnose_quote_fill_linkage = diagnose_quote_constraints;
+            cfg.diagnose_inventory_cycles = diagnose_quote_constraints;
+            cfg
+        };
+        let base_cfg = make_cfg(false);
+        // Wide 99/101 book with periodic sweep-through prints on both sides so
+        // inside-spread quotes are filled and markouts are labelled.
+        let mut input_tape = format!(
+            "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+            base_cfg.start_ms
+        );
+        for at in (base_cfg.start_ms..base_cfg.drain_until_ms).step_by(500) {
+            let book =
+                serde_json::json!({"timestamp_ms":at,"bids":[[99.0,1.0]],"asks":[[101.0,1.0]]});
+            let event =
+                serde_json::json!({"kind":"book","at_ms":at,"lighter":book,"hyperliquid":book});
+            input_tape.push_str(&event.to_string());
+            input_tape.push('\n');
+            let rel = at - base_cfg.start_ms;
+            if rel >= 3_000 && at < base_cfg.end_ms && rel % 2_000 == 0 {
+                let (aggressor, price) = if rel % 4_000 == 0 {
+                    ("sell", 98.0)
+                } else {
+                    ("buy", 102.0)
+                };
+                let trade = serde_json::json!({
+                    "kind":"trade","at_ms":at + 100,"source_ms":at + 100,
+                    "price":price,"size":5.0,"aggressor":aggressor
+                });
+                input_tape.push_str(&trade.to_string());
+                input_tape.push('\n');
+            }
+        }
+        let baseline = run_recorded_maker(base_cfg, input_tape.as_bytes()).unwrap();
+        assert!(
+            baseline.maker_fills > 0,
+            "must exercise real order/fill transitions"
+        );
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+        assert!(baseline_json.get("quote_constraints").is_none());
+        let enabled = run_recorded_maker(make_cfg(true), input_tape.as_bytes()).unwrap();
+        let mut enabled_json = serde_json::to_value(&enabled).unwrap();
+        let diagnostic = enabled_json
+            .as_object_mut()
+            .unwrap()
+            .remove("quote_constraints")
+            .unwrap();
+        let cycles = enabled_json
+            .as_object_mut()
+            .unwrap()
+            .remove("inventory_cycles")
+            .unwrap();
+        assert_eq!(cycles["position_mismatches"], 0);
+        assert!(cycles["fifo_cash_residual"].as_f64().unwrap().abs() < 1e-8);
+        assert!(
+            cycles["receipt_book_equity_residual"]
+                .as_f64()
+                .unwrap()
+                .abs()
+                < 1e-8
+        );
+        let cs = cycles["cohorts"].as_array().unwrap();
+        for (taker, count) in [(false, baseline.maker_fills), (true, baseline.taker_fills)] {
+            assert_eq!(
+                cs.iter()
+                    .filter(|c| c["key"]["taker"] == taker)
+                    .map(|c| c["fills"].as_u64().unwrap())
+                    .sum::<u64>(),
+                count
+            );
+        }
+        for h in 0..3 {
+            let all = &baseline_json["cross_market_attribution"]["maker_markouts"][h];
+            for field in [
+                "marked_fills",
+                "marked_turnover",
+                "markout_quote",
+                "expired_fills",
+                "pending_at_cutoff",
+            ] {
+                let sum = cs
+                    .iter()
+                    .filter(|c| c["key"]["taker"] == false)
+                    .map(|c| c["markouts"][h][field].as_f64().unwrap())
+                    .sum::<f64>();
+                assert!((sum - all[field].as_f64().unwrap()).abs() < 1e-8);
+            }
+        }
+        assert_eq!(enabled_json, baseline_json);
+        let linkage = &diagnostic["fill_linkage"];
+        assert_eq!(linkage["maker_submitted"], linkage["submitted_with_tag"]);
+        assert_eq!(linkage["maker_accepted"], linkage["accepted_with_tag"]);
+        let cohorts = linkage["cohorts"].as_array().unwrap();
+        assert!(!cohorts.is_empty());
+        assert!(cohorts.iter().all(|c| !c["key"]["quote"].is_null()));
+        assert_eq!(
+            cohorts
+                .iter()
+                .map(|c| c["fills"].as_u64().unwrap())
+                .sum::<u64>(),
+            baseline.maker_fills
+        );
+        for h in 0..3 {
+            let global = &baseline_json["cross_market_attribution"]["maker_markouts"][h];
+            for field in ["marked_fills", "expired_fills", "pending_at_cutoff"] {
+                assert_eq!(
+                    cohorts
+                        .iter()
+                        .map(|c| c["markouts"][h][field].as_u64().unwrap())
+                        .sum::<u64>(),
+                    global[field].as_u64().unwrap()
+                );
+            }
+            let value = cohorts
+                .iter()
+                .map(|c| c["markouts"][h]["markout_quote"].as_f64().unwrap())
+                .sum::<f64>();
+            assert!((value - global["markout_quote"].as_f64().unwrap()).abs() < 1e-9);
+        }
+        let evaluated = diagnostic["evaluated"].as_u64().unwrap();
+        let quoted = diagnostic["quoted"].as_u64().unwrap();
+        assert!(quoted > 0);
+        assert_eq!(evaluated, quoted + diagnostic["unquoted"].as_u64().unwrap());
+        assert_eq!(
+            evaluated,
+            diagnostic_count(&enabled_json["cross_market_attribution"], "evaluated")
+        );
+        assert_eq!(
+            diagnostic["base_spread"]
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>(),
+            quoted
+        );
+        for side in ["bid", "ask"] {
+            let mut total = 0;
+            for role in ["entry_or_flat", "toward_flat"] {
+                let c = &diagnostic[side][role];
+                let n = diagnostic_count(c, "evaluated");
+                total += n;
+                assert_eq!(
+                    n,
+                    diagnostic_count(c, "placement_tightened")
+                        + diagnostic_count(c, "placement_equal")
+                        + diagnostic_count(c, "placement_slack")
+                );
+                assert!(diagnostic_count(c, "final_at_placement_bound") <= n);
+            }
+            assert_eq!(total, quoted);
+        }
+        // A following disabled replay on the same thread must not inherit counters.
+        let again = run_recorded_maker(make_cfg(false), input_tape.as_bytes()).unwrap();
+        assert_eq!(serde_json::to_value(again).unwrap(), baseline_json);
+
+        fn diagnostic_count(v: &serde_json::Value, field: &str) -> u64 {
+            v[field].as_u64().unwrap()
+        }
+    }
+
+    #[test]
     fn calibration_telemetry_preserves_baseline_json_and_reconciles_fill_counts() {
         let make_cfg = |calibration_telemetry: bool| {
             let mut cfg = continuous_config(15);
@@ -3773,6 +4394,40 @@ mod tests {
             .map(|entry| entry["requests"].as_u64().unwrap())
             .sum();
         assert_eq!(reason_sum, reqs);
+        // S17-1: per-reason cancel-pending fills never exceed the global count, and their
+        // turnover is non-negative and finite.
+        let reason_pending: u64 = by_reason
+            .values()
+            .map(|entry| entry["cancel_pending_fills"].as_u64().unwrap())
+            .sum();
+        assert!(reason_pending <= cancel_attr["cancel_pending_fills"].as_u64().unwrap());
+        assert!(by_reason.values().all(|entry| {
+            let t = entry["cancel_pending_turnover_quote"].as_f64().unwrap();
+            t.is_finite() && t >= 0.0
+        }));
+        // S18-1: per-reason cancel-pending markouts use the global horizons and never mark
+        // more fills than the global cancel-pending markout at the same horizon.
+        let global = &attributed_json["cross_market_attribution"]["maker_markouts"];
+        for (index, horizon_ms) in MARKOUT_HORIZONS_MS.iter().enumerate() {
+            let mut fills = 0;
+            let mut value = 0.0;
+            for entry in by_reason.values() {
+                let mark = &entry["cancel_pending_markouts"][index];
+                assert_eq!(mark["horizon_ms"].as_u64().unwrap(), *horizon_ms);
+                fills += mark["marked_fills"].as_u64().unwrap();
+                value += mark["markout_quote"].as_f64().unwrap();
+            }
+            let global_fills = global[index]["cancel_pending_marked_fills"]
+                .as_u64()
+                .unwrap();
+            assert!(fills <= global_fills);
+            if fills == global_fills {
+                let global_value = global[index]["cancel_pending_markout_quote"]
+                    .as_f64()
+                    .unwrap();
+                assert!((value - global_value).abs() < 1e-9);
+            }
+        }
 
         // Compare naive max_initial_placements_per_cycle=1 vs staged_reentry_only=true across a 2-level grid drift tape.
         let make_drift_tape = |cfg: &RecordedMakerConfig| {

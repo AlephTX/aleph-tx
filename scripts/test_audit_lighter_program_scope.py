@@ -1,6 +1,9 @@
-import unittest
 from decimal import Decimal
+from pathlib import Path
+import re
+import unittest
 from audit_lighter_program_scope import (
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
     cost_per_million_eligible_maker,
     decompose_execution_friction,
     multi_venue_program_scope,
@@ -77,7 +80,7 @@ class ProgramScopeTest(unittest.TestCase):
         )
         self.assertEqual(arcus_l4["tier_30d_volume_requirement_usd"], "200000000")
 
-        # HIP-3 growth mode excludes core crypto and cuts non-crypto fees/volume credit by 90% (0.30 bps = $30/M floor).
+        # At a deployer scale of 1, growth mode reduces the maker fee to 0.30 bp.
         hip3_crypto = multi_venue_program_scope(
             venue="trade_xyz", liquidity_domain="trade_xyz", asset_class="crypto",
             account_tier="tier_0", maker_turnover="10000", growth_mode=True,
@@ -148,3 +151,188 @@ class ProgramScopeTest(unittest.TestCase):
         self.assertEqual(Decimal(hip3["eligible_score_units"]), Decimal("0.1"))
         self.assertEqual(Decimal(hip3["usd_cost_per_eligible_score_unit"]), Decimal("300"))
         self.assertAlmostEqual(float(hip3["eligible_score_per_usd_cost"]), 0.1 / 30.0)
+
+    def test_lighter_core_and_rh_plus_premium_fees_do_not_conflate_and_fail_closed(self):
+        core_plus = multi_venue_program_scope(
+            venue="lighter", liquidity_domain="lighter", asset_class="crypto",
+            account_tier="plus", maker_turnover="10000",
+        )
+        rh_plus = multi_venue_program_scope(
+            venue="lighter_robinhood", liquidity_domain="lighter:robinhood", asset_class="equity",
+            account_tier="plus", maker_turnover="10000",
+        )
+        self.assertEqual((core_plus["maker_fee_bps"], core_plus["taker_fee_bps"]), ("0.50", "0.50"))
+        self.assertEqual((rh_plus["maker_fee_bps"], rh_plus["taker_fee_bps"]), ("1.50", "1.50"))
+
+        core_prem = multi_venue_program_scope(
+            venue="lighter", liquidity_domain="lighter", asset_class="crypto",
+            account_tier="premium", maker_turnover="10000",
+        )
+        rh_prem = multi_venue_program_scope(
+            venue="lighter_robinhood", liquidity_domain="lighter:robinhood", asset_class="equity",
+            account_tier="premium", maker_turnover="10000",
+        )
+        self.assertEqual((core_prem["maker_fee_bps"], core_prem["taker_fee_bps"]), ("0.4", "2.8"))
+        self.assertEqual((rh_prem["maker_fee_bps"], rh_prem["taker_fee_bps"]), ("1.20", "3.50"))
+        self.assertNotEqual(core_prem["taker_fee_bps"], rh_prem["taker_fee_bps"])
+
+        for venue, dom, expected_status in (
+            ("lighter", "lighter", "unverified_lighter_account_tier"),
+            ("lighter_robinhood", "lighter:robinhood", "unverified_rh_account_tier"),
+        ):
+            unknown = multi_venue_program_scope(
+                venue=venue, liquidity_domain=dom, asset_class="equity",
+                account_tier="vip_unknown", maker_turnover="10000",
+            )
+            self.assertIsNone(unknown["maker_fee_bps"])
+            self.assertIsNone(unknown["taker_fee_bps"])
+            self.assertIsNone(unknown["eligible_target_maker_ceiling_quote"])
+            self.assertEqual(unknown["program_status"], expected_status)
+
+        plus_scope = program_scope(core_turnover="0", rh_turnover="50", account_tier="plus")
+        self.assertEqual(plus_scope["lpp_status"], "plus_tier_lpp_eligibility_unverified")
+
+    def test_arcus_unknown_tier_and_hip3_vs_native_hl_separation(self):
+        arcus_unknown = multi_venue_program_scope(
+            venue="arcus",
+            liquidity_domain="arcus",
+            asset_class="equity",
+            account_tier="vip_unknown",
+            maker_turnover="10000",
+        )
+        self.assertIsNone(arcus_unknown["eligible_target_maker_ceiling_quote"])
+        self.assertIsNone(arcus_unknown["confirmed_eligible_maker_quote"])
+        self.assertIsNone(arcus_unknown["maker_fee_bps"])
+        self.assertIsNone(arcus_unknown["taker_fee_bps"])
+        self.assertEqual(arcus_unknown["program_status"], "unverified_arcus_tier")
+
+        with self.assertRaises(ValueError):
+            multi_venue_program_scope(
+                venue="hyperliquid",
+                liquidity_domain="hyperliquid:core",
+                asset_class="equity",
+                account_tier="base",
+                maker_turnover="10000",
+                growth_mode=True,
+            )
+
+        hl_rebate = multi_venue_program_scope(
+            venue="hyperliquid",
+            liquidity_domain="hyperliquid:core",
+            asset_class="crypto",
+            account_tier="base",
+            maker_turnover="10000",
+            maker_14d_share="0.016",
+        )
+        self.assertEqual((hl_rebate["maker_fee_bps"], hl_rebate["taker_fee_bps"]), ("1.50", "4.50"))
+        self.assertEqual(hl_rebate["maker_rebate_bps"], "0.2")
+
+        for venue, dom in (
+            ("trade_xyz", "hyperliquid:hip3-xyz"),
+            ("entropy", "hyperliquid:hip3-io"),
+        ):
+            non_growth = multi_venue_program_scope(
+                venue=venue,
+                liquidity_domain=dom,
+                asset_class="equity",
+                account_tier="tier_0",
+                maker_turnover="10000",
+                growth_mode=False,
+                maker_14d_share="0.05",
+            )
+            self.assertEqual((non_growth["maker_fee_bps"], non_growth["taker_fee_bps"]), ("3.00", "9.00"))
+            self.assertEqual(non_growth["maker_rebate_bps"], "0")
+            self.assertEqual(non_growth["volume_tier_credit_multiplier"], "1")
+
+            scaled_non_growth = multi_venue_program_scope(
+                venue=venue,
+                liquidity_domain=dom,
+                asset_class="equity",
+                account_tier="tier_0",
+                maker_turnover="10000",
+                growth_mode=False,
+                deployer_fee_scale="0.5",
+            )
+            self.assertEqual(
+                (scaled_non_growth["maker_fee_bps"], scaled_non_growth["taker_fee_bps"]),
+                ("2.25", "6.75"),
+            )
+            high_scale_non_growth = multi_venue_program_scope(
+                venue=venue,
+                liquidity_domain=dom,
+                asset_class="equity",
+                account_tier="tier_0",
+                maker_turnover="10000",
+                deployer_fee_scale="2",
+            )
+            self.assertEqual(
+                (high_scale_non_growth["maker_fee_bps"], high_scale_non_growth["taker_fee_bps"]),
+                ("6.00", "18.00"),
+            )
+
+            scaled_growth = multi_venue_program_scope(
+                venue=venue,
+                liquidity_domain=dom,
+                asset_class="equity",
+                account_tier="tier_0",
+                maker_turnover="10000",
+                growth_mode=True,
+                deployer_fee_scale="0.5",
+            )
+            self.assertEqual(
+                (scaled_growth["maker_fee_bps"], scaled_growth["taker_fee_bps"]),
+                ("0.225", "0.675"),
+            )
+            self.assertEqual(scaled_growth["volume_tier_credit_multiplier"], "0.10")
+
+            zero_scale_growth = multi_venue_program_scope(
+                venue=venue,
+                liquidity_domain=dom,
+                asset_class="equity",
+                account_tier="tier_0",
+                maker_turnover="10000",
+                growth_mode=True,
+                deployer_fee_scale="0",
+            )
+            self.assertEqual(zero_scale_growth["maker_fee_bps"], "0.15")
+            self.assertEqual(zero_scale_growth["program_status"], "hip3_growth_mode_90pct_fee_and_volume_cut")
+
+            with self.assertRaises(ValueError):
+                multi_venue_program_scope(
+                    venue=venue,
+                    liquidity_domain=dom,
+                    asset_class="equity",
+                    account_tier="tier_0",
+                    maker_turnover="10000",
+                    deployer_fee_scale="6",
+                )
+
+    def test_rust_venues_rs_capability_parity(self):
+        venues_rs = (Path(__file__).resolve().parent.parent / "src/venues.rs").read_text(encoding="utf-8")
+        fn_match = re.search(
+            r"pub fn audited_execution_capabilities\(\)\s*->\s*Vec<VenueExecutionCapability>\s*\{(.*?)\n\}",
+            venues_rs,
+            flags=re.S,
+        )
+        self.assertIsNotNone(fn_match)
+        blocks = re.findall(r"VenueExecutionCapability\s*\{(.*?)\n\s*\}", fn_match.group(1), flags=re.S)
+        self.assertGreaterEqual(len(blocks), 11)
+        scope_map = {"All": ("crypto", "equity"), "Crypto": ("crypto",), "Equity": ("equity",)}
+        for block in blocks:
+            venue_id = re.search(r'venue_id:\s*"([^"]+)"', block).group(1)
+            domain = re.search(r'liquidity_domain:\s*"([^"]+)"', block).group(1)
+            tier = re.search(r'tier:\s*"([^"]+)"', block).group(1)
+            asset_scope = re.search(r'asset_scope:\s*(All|Crypto|Equity)', block).group(1)
+            rust_maker = Decimal(re.search(r'maker_fee_bps:\s*dec\("([^"]+)"\)', block).group(1))
+            rust_taker = Decimal(re.search(r'taker_fee_bps:\s*dec\("([^"]+)"\)', block).group(1))
+            for asset_class in scope_map[asset_scope]:
+                py_scope = multi_venue_program_scope(
+                    venue=venue_id,
+                    liquidity_domain=domain,
+                    asset_class=asset_class,
+                    account_tier=tier,
+                    maker_turnover="1000",
+                )
+                self.assertEqual(py_scope["capability_snapshot_version"], VENUE_CAPABILITY_SNAPSHOT_VERSION)
+                self.assertEqual(Decimal(py_scope["maker_fee_bps"]), rust_maker)
+                self.assertEqual(Decimal(py_scope["taker_fee_bps"]), rust_taker)

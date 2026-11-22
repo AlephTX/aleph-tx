@@ -39,6 +39,7 @@ fn cycle(at: u64) -> Cycle {
         sub_min_top_up_attempts: 0,
         sub_min_recovery_pending_base: Decimal::ZERO,
         used_partner_step_deadband: false,
+        cash_exit_triggered: false,
     }
 }
 

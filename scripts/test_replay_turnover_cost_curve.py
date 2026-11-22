@@ -1,8 +1,21 @@
+import re
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from replay_turnover_cost_curve import (COST_CAPS, TIGHT_002_COST_CAPS, point, serialized_sum_matches,
                                        reward_eligibility, basis_risk_variants)
 from replay_ten_hour_scenarios import summarize_quant, turnover_policies
+
+
+def _venue_capability_snapshot_version() -> str:
+    venues_rs = (Path(__file__).resolve().parent.parent / "src/venues.rs").read_text(encoding="utf-8")
+    match = re.search(r'pub const VENUE_CAPABILITY_SNAPSHOT_VERSION:\s*&str\s*=\s*"([^"]+)";', venues_rs)
+    if not match:
+        raise AssertionError("Missing VENUE_CAPABILITY_SNAPSHOT_VERSION in src/venues.rs")
+    return match.group(1)
+
+
+VENUE_CAPABILITY_SNAPSHOT_VERSION = _venue_capability_snapshot_version()
 
 
 class CostCurveTests(unittest.TestCase):
@@ -259,7 +272,7 @@ class CostCurveTests(unittest.TestCase):
             "open_positions_base": ["0", "0"],
             "turnover_feedback": None,
             "turnover_breakdown": {
-                "capability_snapshot_version": "2026-11-17.v1",
+                "capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
                 "target_venue_turnover_quote": "1000",
                 "dual_venue_gross_turnover_quote": "2000",
                 "rule_window_candidate_turnover_quote": "1000",
@@ -294,7 +307,7 @@ class CostCurveTests(unittest.TestCase):
         self.assertEqual(p0["dual_venue_gross_turnover"], "2000")
         self.assertEqual(p0["partner_venue_turnover"], "1000")
         self.assertEqual(p0["excluded_recovery_turnover"], "25.5")
-        self.assertEqual(p0["capability_snapshot_version"], "2026-11-17.v1")
+        self.assertEqual(p0["capability_snapshot_version"], VENUE_CAPABILITY_SNAPSHOT_VERSION)
         self.assertEqual(p0["net_after_overhead"], "-0.3")
         self.assertEqual(p0["modeled_overhead_quote"], "0")
         self.assertEqual(Decimal(p0["realized_cost_bps_per_target_turnover"]), Decimal("3"))
@@ -323,7 +336,7 @@ class CostCurveTests(unittest.TestCase):
                 "overhead_quote": "0",
             },
             "turnover_breakdown": {
-                "capability_snapshot_version": "2026-11-17.v1",
+                "capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
                 "target_venue_turnover_quote": exact_target,
                 "dual_venue_gross_turnover_quote": "7913.9588249600000000000000000",
                 "rule_window_candidate_turnover_quote": exact_target,
@@ -371,6 +384,9 @@ class CostCurveTests(unittest.TestCase):
         self.assertEqual(Decimal(d["all_in_cost_per_million_target_observed_pace"]), Decimal("1300"))
         # $2.4/day * 30d / $50M = $1.44/M fixed at $50M/30d target pace
         self.assertEqual(Decimal(d["all_in_cost_per_million_target_50m_30d_pace"]), Decimal("301.44"))
+
+    def test_capability_snapshot_version_matches_rust_source(self):
+        self.assertEqual(VENUE_CAPABILITY_SNAPSHOT_VERSION, "2026-11-22.v2")
 
 
 if __name__ == "__main__":

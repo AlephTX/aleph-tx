@@ -44,6 +44,7 @@ from quant_lakehouse import (
     evict_local_capture,
     reject_unsafe_path,
     seal_bronze_capture,
+    verified_bronze_receipt_uri,
     write_immutable_json,
 )
 
@@ -121,6 +122,24 @@ def _discover_closed_public_captures(capture_dir: Path) -> list[Path]:
             continue
         _scan_one_dir(sub)
     return candidates
+
+
+def _previously_backed_eviction_order(
+    captures: list[Path], *, now: float, min_age: float
+) -> list[Path]:
+    candidates = []
+    for capture in captures:
+        manifest = capture.with_name(f"{capture.name}.bronze_manifest.json")
+        receipt = capture.with_name(f"{capture.name}.upload_receipt.json")
+        if not manifest.is_file() or not receipt.is_file():
+            continue
+        try:
+            modified = capture.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if max(0.0, now - modified) >= min_age:
+            candidates.append((modified, capture.name, capture))
+    return [capture for _, _, capture in sorted(candidates)]
 
 
 def _verify_remote_rclone_object(
@@ -205,7 +224,18 @@ def ship_public_bronze(
 
     with (resolved_root / ".flywheel_public.lock").open("a+", encoding="utf-8") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        for cap_path in _discover_closed_public_captures(resolved_root):
+        captures = _discover_closed_public_captures(resolved_root)
+        cleanup_first: set[Path] = set()
+        if min_free_bytes is not None and disk_free_bytes_fn(resolved_root) < min_free_bytes:
+            # Closed files with existing receipts can release space even if a
+            # newly sealed archive takes hours to scan. Eviction still rehashes.
+            priority = _previously_backed_eviction_order(
+                captures, now=now_ts, min_age=min_evict_age_secs
+            )
+            cleanup_first.update(priority)
+            captures = priority + [capture for capture in captures if capture not in cleanup_first]
+
+        for cap_path in captures:
             cid = campaign_id or _infer_campaign_id(cap_path.name)
             manifest_path = cap_path.with_name(f"{cap_path.name}.bronze_manifest.json")
             receipt_path = cap_path.with_name(f"{cap_path.name}.upload_receipt.json")
@@ -279,13 +309,21 @@ def ship_public_bronze(
                     except FileExistsError:
                         pass
 
+                # A Mac Drive receipt or an earlier rclone directory can attest to
+                # the archived bytes without identifying today's configured path.
+                stored = json.loads(reject_unsafe_path(receipt_path).read_text(encoding="utf-8"))
+                uri = verified_bronze_receipt_uri(stored, manifest["capture_sha256"], manifest["capture_bytes"])
+                if uri is None:
+                    raise ValueError(f"upload receipt does not verify the sealed capture: {cap_path.name}")
+                matches_destination = uri == f"rclone://{remote_cap}"
                 shipped.append(
                     {
                         "capture": cap_path.name,
                         "campaign_id": manifest["campaign_id"],
                         "sha256": manifest["capture_sha256"],
                         "bytes": manifest["capture_bytes"],
-                        "remote_uri": f"rclone://{remote_cap}",
+                        "remote_uri": uri if matches_destination else None,
+                        "configured_uri_matches_receipt": matches_destination,
                     }
                 )
 
@@ -295,7 +333,12 @@ def ship_public_bronze(
                 mtime = cap_path.stat().st_mtime
                 age_secs = max(0.0, now_ts - mtime)
                 if age_secs >= min_evict_age_secs:
-                    if eager_evict:
+                    reclaim_now = (
+                        cap_path in cleanup_first
+                        and min_free_bytes is not None
+                        and disk_free_bytes_fn(resolved_root) < min_free_bytes
+                    )
+                    if eager_evict or reclaim_now:
                         tombstone = evict_local_capture(
                             cap_path,
                             manifest_path=manifest_path,

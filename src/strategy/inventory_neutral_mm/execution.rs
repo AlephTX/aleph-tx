@@ -184,6 +184,7 @@ pub(super) fn build_side_execution_plan_with_options(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_side_execution_plan_full(
     config: &InventoryNeutralMMConfig,
@@ -203,6 +204,47 @@ pub(super) fn build_side_execution_plan_full(
     suppress_normal_cancels: bool,
     max_placements_cap: Option<usize>,
 ) -> SideExecutionPlan {
+    build_side_execution_plan_with_withdrawal_reason(
+        config,
+        active_orders,
+        order_type,
+        side,
+        target_px,
+        total_sz,
+        threshold,
+        size_tolerance_ratio,
+        max_replacements_per_cycle,
+        cancel_bounds,
+        min_lifetime_override,
+        fast_reducing,
+        entry_ratchet,
+        reducing_cap,
+        suppress_normal_cancels,
+        max_placements_cap,
+        CancelReason::SideWithdrawn,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_side_execution_plan_with_withdrawal_reason(
+    config: &InventoryNeutralMMConfig,
+    active_orders: &[ActiveOrder],
+    order_type: OrderType,
+    side: Side,
+    target_px: f64,
+    total_sz: f64,
+    threshold: f64,
+    size_tolerance_ratio: f64,
+    max_replacements_per_cycle: usize,
+    cancel_bounds: Option<MakerPriceBounds>,
+    min_lifetime_override: Option<Duration>,
+    fast_reducing: bool,
+    entry_ratchet: Option<EntryRatchetPolicy>,
+    reducing_cap: Option<f64>,
+    suppress_normal_cancels: bool,
+    max_placements_cap: Option<usize>,
+    side_withdrawn_reason: CancelReason,
+) -> SideExecutionPlan {
     let order_side = match side {
         Side::Buy => OrderSide::Buy,
         Side::Sell => OrderSide::Sell,
@@ -219,6 +261,11 @@ pub(super) fn build_side_execution_plan_full(
     {
         // Zero budget / urgency is a risk withdrawal, not a queue refresh.
         // Cancel immediately even if the resting order was just submitted.
+        let reason = if total_sz + FLOAT_EPSILON < min_size {
+            side_withdrawn_reason
+        } else {
+            CancelReason::SideWithdrawn
+        };
         let to_cancel: Vec<i64> = side_orders
             .iter()
             .filter(|order| {
@@ -226,10 +273,7 @@ pub(super) fn build_side_execution_plan_full(
             })
             .filter_map(|order| order.order_index)
             .collect();
-        let cancel_reasons = to_cancel
-            .iter()
-            .map(|oid| (*oid, CancelReason::SideWithdrawn))
-            .collect();
+        let cancel_reasons = to_cancel.iter().map(|oid| (*oid, reason)).collect();
         return SideExecutionPlan {
             to_cancel,
             cancel_reasons,
@@ -515,8 +559,18 @@ pub(super) fn should_defer_micro_refresh(
     let total_cancels = bid_plan.to_cancel.len() + ask_plan.to_cancel.len();
     let one_sided_activity = (bid_plan.to_place.is_empty() && bid_plan.to_cancel.is_empty())
         ^ (ask_plan.to_place.is_empty() && ask_plan.to_cancel.is_empty());
+    // Single-level grids (`grid_levels == 1`) can have at most 2 resting orders (1 bid + 1 ask),
+    // so requiring `MICRO_REFRESH_MIN_RESTING_ORDERS` (3) made micro-refresh deferral unreachable
+    // on single-level ladders (`S15-1`). Cap the threshold at `2 * grid_levels` AND require
+    // `total_cancels > 0` for `grid_levels == 1` (so a pure missing-side placement can never be
+    // deferred even if the opposite side transiently holds 2 orders), while `grid_levels >= 2`
+    // stays identically `3`.
+    let min_resting_orders = MICRO_REFRESH_MIN_RESTING_ORDERS
+        .min(usize::from(ctx.config.grid_levels.max(1)).saturating_mul(2));
+    let single_level_place_only = ctx.config.grid_levels <= 1 && total_cancels == 0;
 
-    resting_orders >= MICRO_REFRESH_MIN_RESTING_ORDERS
+    resting_orders >= min_resting_orders
+        && !single_level_place_only
         && one_sided_activity
         && total_places <= 1
         && total_cancels <= 1
@@ -1145,6 +1199,92 @@ mod tests {
             &ask_plan,
             Some(Instant::now() - Duration::from_secs(2)),
             Instant::now(),
+            3,
+        ));
+    }
+
+    #[test]
+    fn defer_micro_refresh_activates_for_full_two_sided_single_level_grid_only() {
+        let mut single = config();
+        single.grid_levels = 1;
+        let bid_plan = side_plan(
+            vec![101],
+            vec![OrderParams {
+                size: 0.0132,
+                price: 2234.72,
+                side: Side::Buy,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        );
+        let ask_plan = side_plan(Vec::new(), Vec::new());
+        let now = Instant::now();
+        let recent = Some(now - Duration::from_secs(2));
+
+        // Full two-sided single-level book (1 bid + 1 ask = 2 resting) defers 1-sided micro-refresh.
+        assert!(should_defer_micro_refresh(
+            &inv_ctx(&single, 0.0, 2232.0),
+            &bid_plan,
+            &ask_plan,
+            recent,
+            now,
+            2,
+        ));
+        // Missing side (1 resting) or empty book (0 resting) must never defer replenishment.
+        assert!(!should_defer_micro_refresh(
+            &inv_ctx(&single, 0.0, 2232.0),
+            &bid_plan,
+            &ask_plan,
+            recent,
+            now,
+            1,
+        ));
+        // Empty book (0 resting) or pure missing-side placement (even if resting == 2 transiently)
+        // must never defer on a single-level grid.
+        assert!(!should_defer_micro_refresh(
+            &inv_ctx(&single, 0.0, 2232.0),
+            &bid_plan,
+            &ask_plan,
+            recent,
+            now,
+            0,
+        ));
+        let pure_place_ask = side_plan(
+            Vec::new(),
+            vec![OrderParams {
+                size: 0.0132,
+                price: 2237.12,
+                side: Side::Sell,
+                order_type: OrderType::PostOnly,
+                reduce_only: false,
+            }],
+        );
+        assert!(!should_defer_micro_refresh(
+            &inv_ctx(&single, 0.0, 2232.0),
+            &SideExecutionPlan::empty(),
+            &pure_place_ask,
+            recent,
+            now,
+            2,
+        ));
+
+        // Multi-level grids (`grid_levels >= 2`) keep the exact historical threshold of 3.
+        let mut two_level = config();
+        two_level.grid_levels = 2;
+        assert!(!should_defer_micro_refresh(
+            &inv_ctx(&two_level, 0.0, 2232.0),
+            &bid_plan,
+            &ask_plan,
+            recent,
+            now,
+            2,
+        ));
+        assert!(should_defer_micro_refresh(
+            &inv_ctx(&two_level, 0.0, 2232.0),
+            &bid_plan,
+            &ask_plan,
+            recent,
+            now,
             3,
         ));
     }

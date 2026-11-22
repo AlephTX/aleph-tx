@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Attribute simulated activity to the documented scope of Lighter's two incentives."""
 from decimal import Decimal
+from pathlib import Path
+import re
 
 RH_POINTS_RULE = "https://docs.lighter.xyz/programs/lighter-on-robinhood-chain-points.md"
 LPP_RULE = "https://docs.lighter.xyz/programs/liquidity-partner-program.md"
@@ -8,6 +10,17 @@ ARCUS_TERMS_RULE = "https://arcus.xyz/legal/protocol-terms"
 ARCUS_FEES_RULE = "https://docs.arcus.xyz/concepts/perpetuals/fees.md"
 HYPERLIQUID_FEES_URL = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees"
 HIP3_GROWTH_MODE_URL = "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals"
+
+
+def _venue_capability_snapshot_version() -> str:
+    venues_rs = (Path(__file__).resolve().parent.parent / "src/venues.rs").read_text(encoding="utf-8")
+    match = re.search(r'pub const VENUE_CAPABILITY_SNAPSHOT_VERSION:\s*&str\s*=\s*"([^"]+)";', venues_rs)
+    if not match:
+        raise AssertionError("Missing VENUE_CAPABILITY_SNAPSHOT_VERSION in src/venues.rs")
+    return match.group(1)
+
+
+VENUE_CAPABILITY_SNAPSHOT_VERSION = _venue_capability_snapshot_version()
 
 
 def _nonnegative_amount(value, *, allow_none=False):
@@ -32,6 +45,11 @@ def cost_per_million_eligible_maker(net_cash, eligible_maker_turnover):
     return str(-cash * Decimal(1_000_000) / elig)
 
 
+def _fmt_bps(value: Decimal) -> str:
+    two_dp = value.quantize(Decimal("0.01"))
+    return str(two_dp if value == two_dp else value.normalize())
+
+
 def multi_venue_program_scope(
     *,
     venue,
@@ -44,6 +62,7 @@ def multi_venue_program_scope(
     strategy_posture="directional_or_unhedged",
     growth_mode=False,
     maker_14d_share=None,
+    deployer_fee_scale="1",
 ):
     """Evaluate primary-rule program eligibility & fee-floor constraints across supported venues (`S8-2`)."""
     maker = _nonnegative_amount(maker_turnover)
@@ -71,9 +90,16 @@ def multi_venue_program_scope(
         if account_tier == "standard":
             maker_fee_bps, taker_fee_bps = "0", "0"
             program_status = "ineligible_core_domain_and_lpp_standard_tier"
-        else:
+        elif account_tier == "plus":
+            maker_fee_bps, taker_fee_bps = "0.50", "0.50"
+            program_status = "ineligible_core_domain_for_rh_points_lpp_plus_unverified"
+        elif account_tier in ("premium", "advanced"):
             maker_fee_bps, taker_fee_bps = "0.4", "2.8"
             program_status = "ineligible_core_domain_for_rh_points_lpp_snapshot_unverified"
+        else:
+            ceiling_eligible = None
+            confirmed_eligible = None
+            program_status = "unverified_lighter_account_tier"
     elif venue == "lighter_robinhood" and liquidity_domain == "lighter:robinhood":
         source = RH_POINTS_RULE
         if account_tier == "standard":
@@ -87,14 +113,24 @@ def multi_venue_program_scope(
                 ceiling_eligible = str(maker)
                 program_status = "unverified_counterparty_tier_ceiling_only"
                 disqualification_risks.append("standard_to_standard_activity_unrewarded")
-        else:
-            maker_fee_bps, taker_fee_bps = "0.4", "2.8"
+        elif account_tier == "plus":
+            # RH Plus base fee is 1.50/1.50 bps (not mainnet Plus 0.50/0.50 bps).
+            maker_fee_bps, taker_fee_bps = "1.50", "1.50"
+            ceiling_eligible = str(maker)
+            program_status = "plus_tier_requires_program_statement"
+        elif account_tier in ("premium", "advanced"):
+            # RH base Premium (<$1M 14d volume) is 1.20/3.50 bps, scaling down to 0.84/2.45 bps.
+            maker_fee_bps, taker_fee_bps = "1.20", "3.50"
             ceiling_eligible = str(maker)
             program_status = "premium_tier_requires_program_statement"
+        else:
+            ceiling_eligible = None
+            confirmed_eligible = None
+            program_status = "unverified_rh_account_tier"
     elif venue == "arcus" and liquidity_domain == "arcus":
         source = f"{ARCUS_FEES_RULE} | {ARCUS_TERMS_RULE}"
-        ceiling_eligible = str(maker)
         if account_tier == "level_0":
+            ceiling_eligible = str(maker)
             if asset_class == "equity":
                 maker_fee_bps, taker_fee_bps = "0.00", "2.25"
                 program_status = "eligible_rwa_l0_zero_maker_fee_subject_to_annex_c"
@@ -102,17 +138,47 @@ def multi_venue_program_scope(
                 maker_fee_bps, taker_fee_bps = "1.50", "4.50"
                 program_status = "fee_dominated_crypto_l0_150usd_per_m"
         elif account_tier == "level_4":
+            ceiling_eligible = str(maker)
             tier_req_usd = "200000000"
             maker_fee_bps = "0.00"
             taker_fee_bps = "1.15" if asset_class == "equity" else "2.30"
             program_status = "requires_200m_30d_volume_for_l4"
         else:
+            ceiling_eligible = None
+            confirmed_eligible = None
             program_status = "unverified_arcus_tier"
         if strategy_posture in ("delta_neutral_hedged", "looped_turnover", "wash_or_self_offset"):
             disqualification_risks.append("arcus_annex_c_neutral_hedged_or_looped_volume_disqualifiable")
             confirmed_eligible = None
-    elif venue in ("hyperliquid", "trade_xyz", "entropy"):
+    elif venue == "hyperliquid" and liquidity_domain in ("hyperliquid", "hyperliquid:core"):
+        if growth_mode:
+            raise ValueError("native hyperliquid does not use HIP-3 growth mode")
+        source = HYPERLIQUID_FEES_URL
+        ceiling_eligible = str(maker)
+        maker_fee_bps, taker_fee_bps = "1.50", "4.50"
+        share = Decimal(str(maker_14d_share)) if maker_14d_share is not None else Decimal(0)
+        if share > Decimal("0.030"):
+            rebate_bps = "0.3"
+        elif share > Decimal("0.015"):
+            rebate_bps = "0.2"
+        elif share > Decimal("0.005"):
+            rebate_bps = "0.1"
+        else:
+            disqualification_risks.append("hl_maker_rebate_requires_above_0_5pct_14d_maker_share")
+        program_status = (
+            "hl_maker_rebate_active"
+            if rebate_bps != "0"
+            else "fee_dominated_hl_tier0_150usd_per_m_without_0_5pct_share"
+        )
+    elif (
+        (venue == "trade_xyz" and liquidity_domain in ("trade_xyz", "hip3-xyz", "hyperliquid:hip3-xyz"))
+        or (venue == "entropy" and liquidity_domain in ("entropy", "hip3-io", "hyperliquid:hip3-io"))
+    ):
         source = f"{HYPERLIQUID_FEES_URL} | {HIP3_GROWTH_MODE_URL}"
+        fee_scale = _nonnegative_amount(deployer_fee_scale)
+        if fee_scale > Decimal("5"):
+            raise ValueError("HIP-3 deployer_fee_scale must lie in [0, 5]")
+        scale_factor = 1 + fee_scale if fee_scale < 1 else 2 * fee_scale
         if growth_mode and asset_class == "crypto":
             ceiling_eligible = "0"
             confirmed_eligible = "0"
@@ -120,32 +186,22 @@ def multi_venue_program_scope(
             disqualification_risks.append("hip3_growth_mode_core_crypto_asset_disjointness")
         elif growth_mode:
             ceiling_eligible = str(maker)
-            maker_fee_bps = "0.30"
-            taker_fee_bps = "0.90"
+            maker_fee_bps = _fmt_bps(Decimal("1.50") * scale_factor * Decimal("0.10"))
+            taker_fee_bps = _fmt_bps(Decimal("4.50") * scale_factor * Decimal("0.10"))
             volume_tier_credit_mult = "0.10"
-            program_status = "fee_dominated_hip3_growth_mode_30usd_per_m_min_90pct_volume_cut"
+            program_status = "hip3_growth_mode_90pct_fee_and_volume_cut"
             disqualification_risks.append("hip3_growth_mode_cuts_tier_volume_and_rebates_90pct")
         else:
             ceiling_eligible = str(maker)
-            maker_fee_bps, taker_fee_bps = "1.50", "4.50"
-            share = Decimal(str(maker_14d_share)) if maker_14d_share is not None else Decimal(0)
-            if share > Decimal("0.030"):
-                rebate_bps = "0.3"
-            elif share > Decimal("0.015"):
-                rebate_bps = "0.2"
-            elif share > Decimal("0.005"):
-                rebate_bps = "0.1"
-            else:
-                disqualification_risks.append("hl_maker_rebate_requires_above_0_5pct_14d_maker_share")
-            program_status = (
-                "hl_maker_rebate_active"
-                if rebate_bps != "0"
-                else "fee_dominated_hl_tier0_150usd_per_m_without_0_5pct_share"
-            )
+            maker_fee_bps = _fmt_bps(Decimal("1.50") * scale_factor)
+            taker_fee_bps = _fmt_bps(Decimal("4.50") * scale_factor)
+            program_status = "hip3_non_growth_deployer_fee_scale"
+            disqualification_risks.append("hip3_maker_rebate_not_modeled")
     else:
         raise ValueError(f"unsupported venue/liquidity_domain: {venue}/{liquidity_domain}")
 
     return {
+        "capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
         "venue": venue,
         "liquidity_domain": liquidity_domain,
         "asset_class": asset_class,
@@ -182,10 +238,12 @@ def program_scope(*, core_turnover, rh_turnover, account_tier):
 
     core = amount(core_turnover)
     rh = amount(rh_turnover)
-    if account_tier not in ("standard", "premium", "advanced", "unknown"):
+    if account_tier not in ("standard", "plus", "premium", "advanced", "unknown"):
         raise ValueError("unsupported account tier")
     if account_tier == "standard":
         lpp_status = "ineligible_account_tier"
+    elif account_tier == "plus":
+        lpp_status = "plus_tier_lpp_eligibility_unverified"
     elif account_tier == "unknown":
         lpp_status = "account_tier_unknown"
     else:

@@ -1,9 +1,28 @@
+import hashlib
+import json
 import unittest
 
 from freeze_sprint9_w08_holdout_manifest import build_sprint9_holdout_manifest
 
 
 class FreezeSprint9HoldoutManifestTest(unittest.TestCase):
+    def test_forward_evidence_label_is_hash_bound_and_does_not_relabel_source(self):
+        config = {"as_kappa": 2000}
+        m = build_sprint9_holdout_manifest(
+            window_id="w10", frozen_at_ms=10, decision_start_ms=20,
+            mm_calibrated_config=config, passive_arb_config={}, multiday_carry_config={},
+        )
+        self.assertEqual(m["schema_version"], "sprint9_forward_manifest.v2")
+        self.assertEqual(m["evidence_class"], "preregistered_forward")
+        self.assertEqual(m["source_role"], "selection_dev")
+        self.assertIs(m["untouched_holdout"], False)
+        digest = m.pop("manifest_sha256")
+        canonical = lambda obj: json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(digest, hashlib.sha256(canonical(m)).hexdigest())
+        self.assertEqual(m["arms"][0]["sha256"], hashlib.sha256(canonical(config)).hexdigest())
+        m["untouched_holdout"] = True
+        self.assertNotEqual(digest, hashlib.sha256(canonical(m)).hexdigest())
+
     def test_probability_gate_and_manifest_require_finite_evidence(self):
         args = dict(window_id="w09", frozen_at_ms=10, decision_start_ms=20,
                     mm_calibrated_config={}, passive_arb_config={}, multiday_carry_config={},

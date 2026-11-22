@@ -195,6 +195,37 @@ class FlywheelSyncTests(unittest.TestCase):
         self.assertTrue(seg2.exists())
         self.assertFalse((cap_dir / f"{seg2.name}.upload_receipt.json").exists())
 
+    def test_reused_receipt_must_support_the_reported_destination(self) -> None:
+        root = self.root / "public_captures"
+        root.mkdir()
+        cap = self._write_closed_segment(root, "tokyo-bulk-w09.ndjson.gz")
+        args = dict(collector_region="tokyo", split_role="selection_dev")
+        ship_public_bronze(root, **args)
+        receipt_path = root / (cap.name + ".upload_receipt.json")
+        digest = sha256(cap.read_bytes()).hexdigest()
+        expected = "rclone://fixture:current/" + cap.name
+        for uri in ("rclone://fixture:previous/" + cap.name, "gdrive://fixture-object", expected):
+            receipt = {"sha256": digest, "bytes": cap.stat().st_size, "remote_uri": uri}
+            receipt_path.write_text(json.dumps(receipt))
+            runner = mock.Mock(side_effect=AssertionError("valid receipt already exists"))
+            result = ship_public_bronze(root, remote_dir="fixture:current", runner=runner, **args)
+            runner.assert_not_called()
+            self.assertEqual(result["shipped_count"], 1)
+            item, = result["shipped"]
+            matched = uri == expected
+            self.assertEqual(item["remote_uri"], expected if matched else None)
+            self.assertIs(item["configured_uri_matches_receipt"], matched)
+            if not matched:
+                self.assertNotIn(uri, json.dumps(result))
+
+        for change in ({"sha256": "0" * 64}, {"bytes": cap.stat().st_size + 1},
+                       {"remote_uri": "unknown://fixture"}, {"remote_uri": "gdrive://"}):
+            with self.subTest(change=change):
+                receipt_path.write_text(json.dumps({**receipt, **change}))
+                with self.assertRaisesRegex(ValueError, "receipt"):
+                    ship_public_bronze(root, remote_dir="fixture:current", **args)
+                self.assertTrue(cap.exists())
+
     def test_backup_private_telemetry_isolates_paths_online_wal_and_completed_sessions(self) -> None:
         for forbidden in (
             "gdrive:AlephTX-Quant-Lakehouse/10_bronze_raw/tokyo",
@@ -493,6 +524,59 @@ class FlywheelSyncTests(unittest.TestCase):
         self.assertEqual(res["sealed_count"], 1)
         self.assertTrue(c2.with_name(f"{c2.name}.bronze_manifest.json").exists())
 
+
+    def _blocked_scan_fixture(self) -> tuple[Path, Path, Path]:
+        cap_dir = self.root / "blocked_scan"
+        (cap_dir / "bulk").mkdir(parents=True)
+        (cap_dir / "crypto").mkdir()
+        slow = self._write_closed_segment(cap_dir / "bulk", "tokyo-bulk-20261121T000000Z-w13.ndjson.gz")
+        backed = self._write_closed_segment(cap_dir / "crypto", "tokyo-crypto-20261120T060000Z-w12.ndjson.gz")
+        manifest_path = backed.with_name(f"{backed.name}.bronze_manifest.json")
+        manifest = quant_lakehouse.seal_bronze_capture(
+            backed,
+            campaign_id="tokyo-crypto-fixture-w12",
+            collector_region="tokyo",
+            split_role="selection_dev",
+            manifest_out=manifest_path,
+        )
+        receipt_path = backed.with_name(f"{backed.name}.upload_receipt.json")
+        receipt_path.write_text(json.dumps({
+            "schema_version": 1, "remote_uri": "gdrive://synthetic-verified-object",
+            "sha256": manifest["capture_sha256"], "bytes": manifest["capture_bytes"],
+        }))
+        os.utime(backed, (1_700_000_100, 1_700_000_100))
+        return cap_dir, slow, backed
+
+    def test_low_water_reclaims_verified_old_bytes_before_a_slow_new_scan(self) -> None:
+        cap_dir, slow, backed = self._blocked_scan_fixture()
+        with mock.patch.object(flywheel_sync, "seal_bronze_capture", side_effect=TimeoutError("synthetic scan")) as scan:
+            with self.assertRaisesRegex(TimeoutError, "synthetic scan"):
+                ship_public_bronze(
+                    cap_dir, collector_region="tokyo", split_role="selection_dev",
+                    evict_below_free_gib=16, min_evict_age_secs=600, now_epoch=1_700_010_000,
+                    disk_free_bytes_fn=lambda _: (14 if backed.exists() else 17) << 30,
+                )
+        self.assertEqual(scan.call_args.args[0], slow)
+        self.assertFalse(backed.exists())
+        self.assertTrue(backed.with_name(f"{backed.name}.evicted.json").is_file())
+        self.assertTrue(slow.exists())
+
+    def test_low_water_priority_still_rehashes_old_archive_before_unlink(self) -> None:
+        cap_dir, slow, backed = self._blocked_scan_fixture()
+        original = backed.read_bytes()
+        backed.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        os.utime(backed, (1_700_000_100, 1_700_000_100))
+        with mock.patch.object(flywheel_sync, "seal_bronze_capture") as scan:
+            with self.assertRaisesRegex(ValueError, "refusing eviction"):
+                ship_public_bronze(
+                    cap_dir, collector_region="tokyo", split_role="selection_dev",
+                    evict_below_free_gib=16, min_evict_age_secs=600, now_epoch=1_700_010_000,
+                    disk_free_bytes_fn=lambda _: 14 << 30,
+                )
+        scan.assert_not_called()
+        self.assertTrue(backed.exists())
+        self.assertTrue(slow.exists())
+        self.assertFalse(backed.with_name(f"{backed.name}.evicted.json").exists())
 
 if __name__ == "__main__":
     unittest.main()

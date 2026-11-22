@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import gzip
@@ -539,6 +540,25 @@ def seal_bronze_segment_chain(
     return chain_manifest
 
 
+def verified_bronze_receipt_uri(receipt: object, expected_sha256: str, expected_bytes: int) -> str | None:
+    """Return the recorded object URI when its receipt identifies the sealed bytes."""
+    if (
+        not isinstance(receipt, dict)
+        or not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or receipt.get("sha256") != expected_sha256
+        or type(receipt.get("bytes")) is not int
+        or receipt["bytes"] != expected_bytes
+    ):
+        return None
+    uri = receipt.get("remote_uri")
+    if isinstance(uri, str):
+        scheme, separator, location = uri.partition("://")
+        if separator and scheme in ("rclone", "gdrive") and location.strip():
+            return uri
+    return None
+
+
 def evict_local_capture(
     capture_path: Path,
     *,
@@ -557,15 +577,8 @@ def evict_local_capture(
     if local_sha != manifest.get("capture_sha256") or local_bytes != manifest.get("capture_bytes"):
         raise ValueError("local capture does not match sealed Bronze manifest; refusing eviction")
 
-    remote_sha = receipt.get("sha256")
-    remote_bytes = receipt.get("bytes")
-    remote_uri = receipt.get("remote_uri", "")
-    if (
-        remote_sha != local_sha
-        or remote_bytes != local_bytes
-        or not isinstance(remote_uri, str)
-        or not remote_uri.startswith(("gdrive://", "rclone://"))
-    ):
+    remote_uri = verified_bronze_receipt_uri(receipt, local_sha, local_bytes)
+    if remote_uri is None:
         raise ValueError("remote Drive receipt failed SHA-256, size, or URI verification; refusing eviction")
 
     tombstone_path = resolved_capture.with_name(f"{resolved_capture.name}.evicted.json")
@@ -695,6 +708,36 @@ def _emit_bbo_row(
     )
 
 
+@dataclass(frozen=True)
+class ZeroSizeTradeScope:
+    source: str
+    market: str
+    observations: int
+
+    def __post_init__(self) -> None:
+        if self.source not in ("lighter_trades", "lighter_robinhood_trades"):
+            raise ValueError("expected a Lighter Core or Robinhood public trade source")
+        if not isinstance(self.market, str) or not re.fullmatch(r"0|[1-9][0-9]*", self.market):
+            raise ValueError("expected a numeric Lighter market ID")
+        if type(self.observations) is not int or self.observations <= 0:
+            raise ValueError("expected a positive count of zero-size observations")
+
+
+@dataclass(frozen=True)
+class WithheldBookScope:
+    source: str
+    market: str
+    invalid_nonces: int
+
+    def __post_init__(self) -> None:
+        if self.source not in ("lighter", "lighter_robinhood"):
+            raise ValueError("expected a Lighter public book source")
+        if not isinstance(self.market, str) or not re.fullmatch(r"0|[1-9][0-9]*", self.market):
+            raise ValueError("expected a numeric Lighter book market ID")
+        if type(self.invalid_nonces) is not int or self.invalid_nonces <= 0:
+            raise ValueError("expected a positive count of nonpositive book nonces")
+
+
 def normalize_capture(
     input_path: Path,
     output_dir: Path,
@@ -703,6 +746,8 @@ def normalize_capture(
     collector_region: str,
     precise_times: bool = False,
     withheld_arcus_trade_markets: frozenset[str] = frozenset(),
+    zero_size_trade_scope: ZeroSizeTradeScope | None = None,
+    withheld_book: WithheldBookScope | None = None,
 ) -> dict:
     """Normalize a sealed capture or partitioned archive into 4 receipt-causal Silver tables."""
     if collector_region not in VALID_REGIONS:
@@ -719,6 +764,8 @@ def normalize_capture(
     trade_online_since: dict[tuple[str, str], int | None] = {}
     trade_seen: dict[tuple[str, str], dict] = {}
     withheld_messages = {market: 0 for market in sorted(withheld_arcus_trade_markets)}
+    omitted_books = {"snapshots": 0, "updates": 0, "invalid_nonces": 0}
+    zero_size_observations = 0
     ended = False
     previous_at = 0
     clock_audit = ClockAudit() if precise_times else None
@@ -998,6 +1045,16 @@ def normalize_capture(
                 _, mkt_id = re.split(r"[:/]", chan, maxsplit=1)
                 venue, domain = classify_venue_domain(raw_source, mkt_id)
                 msg_type = payload.get("type", "")
+                if (withheld_book and raw_source == withheld_book.source and mkt_id == withheld_book.market
+                        and msg_type in ("subscribed/order_book", "update/order_book")):
+                    if chan not in (f"order_book:{mkt_id}", f"order_book/{mkt_id}"):
+                        raise ValueError("ambiguous channel in withheld Lighter book")
+                    nonce = payload["order_book"]["nonce"]
+                    if type(nonce) is not int:
+                        raise ValueError("expected an integer nonce in withheld Lighter book")
+                    omitted_books["invalid_nonces"] += int(nonce <= 0)
+                    omitted_books["snapshots" if msg_type == "subscribed/order_book" else "updates"] += 1
+                    continue
                 if req_sent_ms is not None and msg_type in ("subscribed/order_book", "subscribed/market_stats"):
                     emit(
                         "feed_lifecycle",
@@ -1508,14 +1565,24 @@ def normalize_capture(
                         stamp = int(trd["timestamp"])
                         side = "buy" if trd["is_maker_ask"] else "sell"
                         px_dec = parse_positive_dec(trd["price"], allow_zero=True)
-                        sz_dec = parse_positive_dec(trd["size"], allow_zero=False)
+                        allow_zero_size = (
+                            zero_size_trade_scope is not None
+                            and raw_source == zero_size_trade_scope.source
+                            and mkt == zero_size_trade_scope.market
+                            and payload.get("type") == "update/trade"
+                            and px_dec > 0
+                        )
+                        sz_dec = parse_positive_dec(trd["size"], allow_zero=allow_zero_size)
+                        if sz_dec == 0:
+                            zero_size_observations += 1
                         dedup_val = (stamp, format_dec(px_dec), format_dec(sz_dec), side)
                         if tid in seen:
                             if seen[tid] != dedup_val:
                                 raise ValueError("conflicting duplicate Lighter trade")
                             continue
                         seen[tid] = dedup_val
-                        if is_sub:
+                        # Keep identities in the duplicate check even for omitted observations.
+                        if is_sub or sz_dec == 0:
                             continue
                         emit(
                             "public_trades",
@@ -1551,6 +1618,15 @@ def normalize_capture(
         shutil.rmtree(output_dir, ignore_errors=True)
         raise ValueError("capture stream lacked terminal collector/end footer")
 
+    if withheld_book and omitted_books["invalid_nonces"] != withheld_book.invalid_nonces:
+        shutil.rmtree(output_dir)
+        raise ValueError("nonpositive book nonce count differs from the audited scope")
+
+    if zero_size_trade_scope is not None and zero_size_observations != zero_size_trade_scope.observations:
+        # This invocation exclusively created the staging directory and has closed its writers.
+        shutil.rmtree(output_dir)
+        raise ValueError("zero-size observation count differs from the audited scope")
+
     tables_meta = {}
     for name in TABLES:
         gz_path = output_dir / f"{name}.ndjson.gz"
@@ -1572,6 +1648,12 @@ def normalize_capture(
         "causal_ordering_key": ["venue", "domain", "market", "available_at_ms", "sequence"],
         "tables": tables_meta,
     }
+    if zero_size_trade_scope is not None:
+        summary["artifact_kind"] = "silver_partial_market_projection"
+        summary["quarantined_zero_quantity"] = asdict(zero_size_trade_scope)
+    if withheld_book:
+        summary["artifact_kind"] = "silver_partial_market_projection"
+        summary["withheld_lighter_book"] = {**asdict(withheld_book), **omitted_books}
     if withheld_messages:
         summary["artifact_kind"] = "silver_partial_market_projection"
         summary["withheld_arcus_trade_messages"] = withheld_messages
@@ -1808,8 +1890,22 @@ def build_duckdb_lakehouse(
     partial = manifest.get("artifact_kind") == "silver_partial_market_projection"
     if partial and not allow_partial_projection:
         raise ValueError("partial Silver requires --allow-partial-projection and separate Parquet and DuckDB destinations")
-    if partial and not manifest.get("withheld_arcus_trade_messages"):
-        raise ValueError("partial Silver manifest must identify its withheld Arcus markets")
+    zero_scope = manifest.get("quarantined_zero_quantity")
+    if "quarantined_zero_quantity" in manifest:
+        if not partial or not isinstance(zero_scope, dict) or set(zero_scope) != {"source", "market", "observations"}:
+            raise ValueError("invalid partial Silver zero-size trade scope")
+        ZeroSizeTradeScope(**zero_scope)
+    omitted_book = manifest.get("withheld_lighter_book")
+    if "withheld_lighter_book" in manifest:
+        if (not partial or not isinstance(omitted_book, dict)
+                or set(omitted_book) != {"source", "market", "invalid_nonces", "snapshots", "updates"}):
+            raise ValueError("invalid partial Silver book scope")
+        WithheldBookScope(omitted_book["source"], omitted_book["market"], omitted_book["invalid_nonces"])
+        counts = (omitted_book["updates"], omitted_book["snapshots"])
+        if any(type(n) is not int or n < 0 for n in counts) or sum(counts) < omitted_book["invalid_nonces"]:
+            raise ValueError("invalid partial Silver book counts")
+    if partial and not (manifest.get("withheld_arcus_trade_messages") or zero_scope or omitted_book):
+        raise ValueError("partial Silver manifest must identify its omissions")
     for name, info in manifest["tables"].items():
         sha, size = digest_unchanged(resolved_staging / info["file"])
         if sha != info["compressed_sha256"] or size != info["compressed_bytes"]:
@@ -1864,7 +1960,9 @@ def build_duckdb_lakehouse(
     }
     if partial:
         result["artifact_kind"] = manifest["artifact_kind"]
-        result["withheld_arcus_trade_messages"] = manifest["withheld_arcus_trade_messages"]
+        for key in ("withheld_arcus_trade_messages", "quarantined_zero_quantity", "withheld_lighter_book"):
+            if key in manifest:
+                result[key] = manifest[key]
     return result
 
 
@@ -1992,6 +2090,14 @@ def main() -> None:
         help="Produce a partial Silver projection without trade subscriptions or prints for this market",
     )
 
+    p_norm.add_argument(
+        "--withhold-lighter-book", nargs=3, metavar=("SOURCE", "MARKET_ID", "INVALID_NONCES"),
+        help="Withhold all book snapshots and updates of one audited Lighter venue and market",
+    )
+    p_norm.add_argument(
+        "--quarantine-zero-size-trade", nargs=3, metavar=("SOURCE", "MARKET_ID", "OBSERVATIONS"),
+        help="Omit an audited number of positive-price, zero-size Lighter updates in a partial projection",
+    )
     p_duck = sub.add_parser("build-duckdb", help="Compile Silver staging tables into Zstd Parquet + DuckDB views")
     p_duck.add_argument("--staging-dir", type=Path, required=True)
     p_duck.add_argument("--parquet-root", type=Path, required=True)
@@ -2042,6 +2148,20 @@ def main() -> None:
             remote_receipt_path=args.remote_receipt,
         )
     elif args.command == "normalize":
+        book_scope = None
+        if args.withhold_lighter_book:
+            source, market, count = args.withhold_lighter_book
+            try:
+                book_scope = WithheldBookScope(source, market, int(count))
+            except ValueError as exc:
+                parser.error(str(exc))
+        zero_scope = None
+        if args.quarantine_zero_size_trade:
+            source, market, count = args.quarantine_zero_size_trade
+            try:
+                zero_scope = ZeroSizeTradeScope(source, market, int(count))
+            except ValueError as exc:
+                parser.error(str(exc))
         result = normalize_capture(
             args.input,
             args.output_dir,
@@ -2049,6 +2169,8 @@ def main() -> None:
             collector_region=args.collector_region,
             precise_times=args.precise_times,
             withheld_arcus_trade_markets=frozenset(args.withhold_arcus_trade_market),
+            zero_size_trade_scope=zero_scope,
+            withheld_book=book_scope,
         )
     elif args.command == "build-duckdb":
         result = build_duckdb_lakehouse(

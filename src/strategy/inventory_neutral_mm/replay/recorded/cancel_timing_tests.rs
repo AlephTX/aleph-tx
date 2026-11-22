@@ -167,6 +167,8 @@ async fn source_cohort_markouts_preserve_missing_labels() {
                 changed_side: false,
                 cancel_pending: true,
                 cancel_source_timing: timing,
+                cancel_reason: None,
+                quote_cohort: None,
             });
         }
     }

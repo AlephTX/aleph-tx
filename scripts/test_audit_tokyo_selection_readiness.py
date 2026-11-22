@@ -309,6 +309,54 @@ class TokyoSelectionReadinessTests(unittest.TestCase):
             "ready_with_causal_reconnect_barriers",
         )
 
+    def test_arcus_subscription_ack_does_not_end_usable_data_recovery(self):
+        book = {"channel": "l2Orderbook", "id": "SNDK-USD"}
+        depth = {"bids": [["160", "1"]], "asks": [["161", "1"]]}
+        frames = [
+            self._row("arcus", self.t0, {}, event="disconnect"),
+            self._row("arcus", self.t0 + 25, dict(book, type="subscribed", contents={})),
+            self._row("arcus", self.t0 + 100, dict(book, type="channel_data", contents=depth)),
+            self._row(
+                "arcus",
+                self.t0 + 150,
+                dict(book, type="channel_data", contents=dict(depth, timestamp=(self.t0 + 149) * 1000)),
+            ),
+        ]
+        capture = self.root / "arcus_reconnect.ndjson"
+        capture.write_text("".join(json.dumps(frame) + "\n" for frame in frames), encoding="utf-8")
+
+        source = audit_readiness(capture)["sources"]["arcus"]
+        self.assertEqual(source["reconnect_confirm_p50_ms"], 25.0)
+        self.assertEqual(source["reconnect_usable_p50_ms"], 150.0)
+
+    def test_lighter_nonpositive_sequence_does_not_end_usable_data_recovery(self):
+        for source in ("lighter", "lighter_robinhood"):
+            with self.subTest(source=source):
+                def frame(offset, message_type, nonce):
+                    return self._row(
+                        source,
+                        self.t0 + offset,
+                        {
+                            "type": message_type,
+                            "channel": "order_book:139",
+                            "order_book": {"nonce": nonce, "bids": [], "asks": []},
+                        },
+                    )
+
+                rows = [
+                    self._row(source, self.t0, {}, event="disconnect"),
+                    frame(25, "subscribed/order_book", 0),
+                    frame(40, "update/order_book", -1),
+                    frame(70, "update/order_book", True),
+                    frame(150, "subscribed/order_book", 12),
+                ]
+                capture = self.root / (source + "-reconnect.ndjson")
+                capture.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+                report = audit_readiness(capture)["sources"][source]
+                self.assertEqual(report["reconnect_confirm_p50_ms"], 25.0)
+                self.assertEqual(report["reconnect_usable_p50_ms"], 150.0)
+
     def test_binds_sidecar_bronze_manifest_sha256_and_rejects_size_mismatch(self):
         from archive_public_capture import digest
 
