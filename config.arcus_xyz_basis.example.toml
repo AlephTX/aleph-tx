@@ -1,0 +1,41 @@
+# Dedicate Arcus ANT-USD <-> Hyperliquid xyz:ANT Basis Arbitrage Canary Profile (`Step 1–Step 3`)
+# Synthetic example only: keep `dry_run = true` for `--check` and `--shadow`.
+# Only set `dry_run = false` on the live host AFTER Monday RTH Step 2 Gate passes
+# AND you explicitly pass `--canary --confirm-live-canary`.
+
+network = "mainnet"
+arcus_symbol = "ANT-USD"
+hl_dex = "xyz"
+hl_coin = "xyz:ANT"
+
+# Pre-registered EXP-ARB-A2 + Leung-Li parameters (ZERO post-freeze tweaking)
+entry_bp = 10.0
+exit_bp = 0.0
+max_entry_bp = 35.0
+persist_ms = 100
+post_trade_refresh_lock = true
+
+# Tight Canary sizing caps ($50 single clip, $100 max inventory)
+clip_usd = 50.0
+max_notional_usd = 100.0
+ladder_floor_frac = 0.25
+ladder_scale_bps = 2.0
+ladder_convex_power = 1.0
+
+max_hold_ms = 7200000
+max_arcus_book_age_ms = 250
+max_hl_book_age_ms = 30000
+slippage_bps = 8.0
+
+# CRASH-IMP-01 real-time progressive drawdown brake anchored at 5% of allocated Canary capital
+allocated_capital_usd = 500.0
+daily_loss_limit_pct = 0.05
+canary_max_order_usd = 50.0
+canary_max_total_notional_usd = 100.0
+
+require_arcus_cancel_lease = true
+dry_run = true
+poll_interval_ms = 250
+
+journal_path = "state/arcus_xyz_basis_journal.ndjson"
+daily_loss_state_path = "state/arcus_xyz_basis_daily_loss.json"

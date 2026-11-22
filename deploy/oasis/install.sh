@@ -29,7 +29,7 @@ sudo -n install -d -m 0755 "$root/releases" /etc/aleph-tx
 sudo -n mkdir -m 0755 "$dest"
 sudo -n install -d -m 0755 "$dest/bin" "$dest/lib" "$dest/dashboard" "$dest/examples" "$dest/scripts"
 sudo -n install -m 0755 feeder/feeder-app feeder/perp-capture \
-  target/release/{cross_venue,lighter_inventory_mm} "$dest/bin/"
+  target/release/{arcus_xyz_basis,cross_venue,lighter_inventory_mm} "$dest/bin/"
 sudo -n install -m 0644 src/native/lighter-signer-linux-amd64.so "$dest/lib/"
 sudo -n install -m 0644 examples/{crypto_funding_paper,equity_basis_paper}.json "$dest/examples/"
 sudo -n install -m 0644 deploy/oasis/{monitor,telemetry_store,alerts}.py "$dest/"

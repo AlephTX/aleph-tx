@@ -56,6 +56,10 @@ name = "maker_replay"
 path = "src/bin/maker_replay.rs"
 required-features = ["research-replay"]
 
+[[bin]]
+name = "arcus_xyz_basis"
+path = "src/bin/arcus_xyz_basis.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
