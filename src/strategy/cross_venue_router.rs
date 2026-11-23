@@ -314,6 +314,7 @@ struct ActiveRouteContext {
     hedge_tick: Decimal,
     hedge_base_per_contract: Decimal,
     planned_hedge_limit_price: Decimal,
+    hedge_intent_emitted: bool,
 }
 
 /// Stateful cross-venue execution router enforcing speed-bump causality,
@@ -555,6 +556,7 @@ impl CrossVenueExecutionRouter {
             hedge_tick: params.price_ticks[hedge_leg_index],
             hedge_base_per_contract: params.base_per_contract[hedge_leg_index],
             planned_hedge_limit_price: leg_orders[hedge_leg_index].limit_price,
+            hedge_intent_emitted: false,
         });
 
         let [leg0_order, leg1_order] = leg_orders;
@@ -610,7 +612,8 @@ impl CrossVenueExecutionRouter {
     /// - Positive confirmed fill dispatches a fast `ProtectedIoc` hedge tagged
     ///   [`OrderIntentClass::EmergencyHedge`] (never blocked by 429 cooldown/halt)
     ///   while keeping the WAL reservation active until [`Self::confirm_hedge_settled`].
-    /// - Mismatched IDs, overfills, or non-sequential topologies fail closed.
+    /// - Mismatched IDs, overfills, duplicate or conflicting outcomes after hedge
+    ///   intent emission, or non-sequential topologies fail closed.
     pub fn on_first_leg_terminal(
         &mut self,
         now_ms: u64,
@@ -626,6 +629,15 @@ impl CrossVenueExecutionRouter {
             || res.reservation_id != reservation_id
             || res.topology == ExecutionTopology::ConcurrentProtectedIoc
         {
+            return FollowupPlan::RejectUnverifiedTerminalState;
+        }
+
+        let Some(ctx) = self.active_context.as_mut() else {
+            return FollowupPlan::RejectUnverifiedTerminalState;
+        };
+        // After emitting a hedge intent, duplicate or conflicting first-leg
+        // evidence cannot emit another intent or release possible exposure.
+        if ctx.hedge_intent_emitted {
             return FollowupPlan::RejectUnverifiedTerminalState;
         }
 
@@ -648,11 +660,8 @@ impl CrossVenueExecutionRouter {
                     return FollowupPlan::NoFillReleaseWal { reservation_id };
                 }
 
-                let Some(ctx) = self.active_context.as_ref() else {
-                    return FollowupPlan::RejectUnverifiedTerminalState;
-                };
-
-                let hedge_limit_price = match self.compute_followup_hedge_limit(
+                let hedge_limit_price = match Self::compute_followup_hedge_limit(
+                    self.config.ioc_slippage_bps,
                     res.hedge_is_buy,
                     filled_base,
                     current_hedge_book,
@@ -671,6 +680,7 @@ impl CrossVenueExecutionRouter {
                     return FollowupPlan::RejectUnverifiedTerminalState;
                 }
                 hedge_budget.record_dispatch(now_ms, 1);
+                ctx.hedge_intent_emitted = true;
 
                 FollowupPlan::DispatchFastHedgeIoc {
                     reservation_id,
@@ -700,6 +710,17 @@ impl CrossVenueExecutionRouter {
         if !res.is_active() || res.reservation_id != reservation_id {
             self.active_reservation = Some(res);
             bail!("WAL reservation mismatch for id {reservation_id}");
+        }
+        if res.topology != ExecutionTopology::ConcurrentProtectedIoc
+            && !self
+                .active_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.hedge_intent_emitted)
+        {
+            self.active_reservation = Some(res);
+            bail!(
+                "sequential WAL reservation {reservation_id} cannot settle before hedge intent is emitted"
+            );
         }
         res.settled_or_released = true;
         self.active_context = None;
@@ -832,7 +853,7 @@ impl CrossVenueExecutionRouter {
     }
 
     fn compute_followup_hedge_limit(
-        &self,
+        ioc_slippage_bps: Decimal,
         hedge_is_buy: bool,
         filled_base: Decimal,
         current_hedge_book: Option<&Book>,
@@ -849,12 +870,7 @@ impl CrossVenueExecutionRouter {
             return Ok(ctx.planned_hedge_limit_price);
         }
         let worst_px = sweep_worst_level_price(levels, ctx.hedge_base_per_contract, filled_base)?;
-        apply_ioc_protection(
-            hedge_is_buy,
-            worst_px,
-            self.config.ioc_slippage_bps,
-            ctx.hedge_tick,
-        )
+        apply_ioc_protection(hedge_is_buy, worst_px, ioc_slippage_bps, ctx.hedge_tick)
     }
 }
 
@@ -2439,5 +2455,142 @@ mod tests {
             panic!("expected MakerFirst with rebate, got {plan:?}");
         };
         assert_eq!(maker_order.size_base, dec("2.0"));
+    }
+
+    #[test]
+    fn sequential_hedge_intent_is_unique_and_preserves_reservation() {
+        let registry = VenueRegistry::default();
+        let hl = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+        let lighter = registry
+            .resolve_execution_capability("lighter", "standard", "crypto")
+            .unwrap();
+        let hl_book = book_with_levels(
+            "ETH-HL",
+            vec![("100.18", "10")],
+            vec![("100.20", "10")],
+            "5000",
+        );
+        let lt_book = book_with_levels(
+            "ETH-LT",
+            vec![("99.98", "10")],
+            vec![("100.00", "10")],
+            "5000",
+        );
+
+        for dual_taker_required in [false, true] {
+            let [mut b0, mut b1] = default_budgets();
+            let mut router = CrossVenueExecutionRouter::new(CrossVenueRouterConfig {
+                dual_taker_required,
+                ..default_cfg()
+            })
+            .unwrap();
+            let params = RouteEntryParams {
+                now_ms: NOW_MS,
+                direction: RouteDirection::SellLeg0BuyLeg1,
+                legs: [&hl, &lighter],
+                books: [&hl_book, &lt_book],
+                base_step: dec("0.1"),
+                base_per_contract: [Decimal::ONE, Decimal::ONE],
+                price_ticks: [dec("0.01"), dec("0.01")],
+                portfolio_leg_cap_usd: None,
+                tail_risk: RouterTailRiskInput::default(),
+            };
+
+            let reservation = match router.plan_entry(params, [&mut b0, &mut b1]) {
+                RouterEntryPlan::MakerFirst { reservation, .. } if !dual_taker_required => {
+                    reservation
+                }
+                RouterEntryPlan::SlowLegFirst { reservation, .. } if dual_taker_required => {
+                    reservation
+                }
+                result => panic!("unexpected sequential entry plan: {result:?}"),
+            };
+            assert_eq!(reservation.hedge_leg_index, 0);
+            let res_id = reservation.reservation_id;
+
+            // Cannot settle sequential WAL before hedge intent is emitted.
+            assert!(router.confirm_hedge_settled(res_id).is_err());
+            assert_eq!(
+                router
+                    .active_reservation()
+                    .map(|active| active.reservation_id),
+                Some(res_id)
+            );
+
+            let weight_before = b0.used_weight(NOW_MS + 10);
+            let terminal = SlowLegTerminalOutcome::Confirmed {
+                filled_base: dec("2.0"),
+                avg_fill_price: Some(dec("100")),
+            };
+            let first_plan = router.on_first_leg_terminal(
+                NOW_MS + 10,
+                res_id,
+                terminal.clone(),
+                Some(&hl_book),
+                &mut b0,
+            );
+            assert!(matches!(
+                first_plan,
+                FollowupPlan::DispatchFastHedgeIoc {
+                    reservation_id,
+                    ref hedge_order,
+                } if reservation_id == res_id && hedge_order.size_base == dec("2.0")
+            ));
+            let weight_after_first = b0.used_weight(NOW_MS + 10);
+            assert_eq!(weight_after_first - weight_before, 1);
+            assert!(router.active_reservation().is_some());
+
+            // Duplicate confirmation fails closed without charging budget or releasing WAL.
+            let duplicate_plan = router.on_first_leg_terminal(
+                NOW_MS + 11,
+                res_id,
+                terminal,
+                Some(&hl_book),
+                &mut b0,
+            );
+            assert_eq!(duplicate_plan, FollowupPlan::RejectUnverifiedTerminalState);
+            assert_eq!(b0.used_weight(NOW_MS + 11), weight_after_first);
+            assert!(router.active_reservation().is_some());
+
+            // Contradictory zero-fill terminal outcomes also fail closed and keep WAL active.
+            let contradictory_cancel = router.on_first_leg_terminal(
+                NOW_MS + 12,
+                res_id,
+                SlowLegTerminalOutcome::RejectedOrCancelledZeroFill,
+                Some(&hl_book),
+                &mut b0,
+            );
+            assert_eq!(
+                contradictory_cancel,
+                FollowupPlan::RejectUnverifiedTerminalState
+            );
+            assert_eq!(b0.used_weight(NOW_MS + 12), weight_after_first);
+            assert!(router.active_reservation().is_some());
+
+            let contradictory_zero_confirm = router.on_first_leg_terminal(
+                NOW_MS + 13,
+                res_id,
+                SlowLegTerminalOutcome::Confirmed {
+                    filled_base: Decimal::ZERO,
+                    avg_fill_price: None,
+                },
+                Some(&hl_book),
+                &mut b0,
+            );
+            assert_eq!(
+                contradictory_zero_confirm,
+                FollowupPlan::RejectUnverifiedTerminalState
+            );
+            assert_eq!(b0.used_weight(NOW_MS + 13), weight_after_first);
+            assert!(router.active_reservation().is_some());
+
+            // Authoritative hedge settlement succeeds cleanly and clears active_reservation().
+            let settled = router.confirm_hedge_settled(res_id).unwrap();
+            assert!(!settled.is_active());
+            assert_eq!(settled.reservation_id, res_id);
+            assert!(router.active_reservation().is_none());
+        }
     }
 }
