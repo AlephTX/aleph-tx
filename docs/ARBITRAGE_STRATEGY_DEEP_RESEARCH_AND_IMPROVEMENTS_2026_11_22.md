@@ -296,6 +296,8 @@ flowchart TB
 - **验证与验收门槛**：构建单边极端拉升触发保证金不均衡、模拟 ADL 报警、模拟 `USDG` 脱锚 `50 bp` 的离线单元测试与合成全链路演练，确保均在秒级进入受控降仓/熔断状态。
 - **红线约束**：继续严格执行 **Core（`USDC`）与 Robinhood Chain（`USDG`）绝对物理账本与策略隔离**，禁止未经独立外汇对冲的跨稳定币净值合并。
 
+> **组合层防崩盘配套改进（`CRASH-IMP-01` ~ `CRASH-IMP-04`）**：针对上述跨所微观执行之外的中频慢瀑布、渐进式风险预算回撤刹车、20–50 标的 Carry 逆波动率分配 / 经验 Expected Shortfall 上限，以及美股 RWA 宏观压力只收紧护栏与永续崩盘压测套件，已单独整理于 [`CRASH_PROTECTION_DEEP_RESEARCH_AND_IMPROVEMENTS_2026_11_22.md`](./CRASH_PROTECTION_DEEP_RESEARCH_AND_IMPROVEMENTS_2026_11_22.md#L66-L128)。
+
 ---
 
 ## §6. 预注册 Wave 2B 消融实验矩阵与验收门禁
@@ -331,7 +333,7 @@ flowchart TB
 
 ### 7.4 AlephTX 内部源码与相关研究文档
 - 系统总览与策略合同：[README](../README.md) · [十小时研究合同](./TEN_HOUR_RESEARCH.md) · [独立策略研究](./INDEPENDENT_STRATEGY_RESEARCH.md) · [实盘交易与恢复手册](./LIVE_TRADING.md) · [相对价值回放指南](./PERP_RELATIVE_VALUE.md) · [跨所能力矩阵](./CROSS_VENUE.md)
-- 前序战略路线图：[战略错位与战术微结构优化路线图（2026-11-21）](./STRATEGIC_AND_TACTICAL_OPTIMIZATION_ROADMAP_2026_11_21.md)
+- 前序战略与防崩盘关联研究：[战略错位与战术微结构优化路线图（2026-11-21）](./STRATEGIC_AND_TACTICAL_OPTIMIZATION_ROADMAP_2026_11_21.md) · [宏观防崩盘与组合风控改进方案（2026-11-22）](./CRASH_PROTECTION_DEEP_RESEARCH_AND_IMPROVEMENTS_2026_11_22.md) · [`hft.md/crash` 原文快照](./HFT_MD_CRASH_LLMS_SOURCE_2026_11_22.md)
 - 核心关联源码：
   - 场所能力与减速带档案：[`src/venues.rs`](../src/venues.rs)
   - 跨所相对价值与基差引擎：[`src/strategy/relative_value.rs`](../src/strategy/relative_value.rs) · [`maker_first.rs`](../src/strategy/relative_value/paper/maker_first.rs) · [`basis_reversion.rs`](../src/strategy/relative_value/paper/maker_first/basis_reversion.rs) · [`basis_risk.rs`](../src/strategy/relative_value/paper/maker_first/basis_risk.rs)
