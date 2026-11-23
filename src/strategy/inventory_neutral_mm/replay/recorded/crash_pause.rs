@@ -163,6 +163,7 @@ enum Regime {
         blocked_resume_recorded: bool,
     },
     CommonInfoShock {
+        entered_ms: u64,
         min_bid_usd: f64,
         stable_ref_ext_mid: f64,
         stable_since_ms: Option<u64>,
@@ -176,6 +177,82 @@ enum PermitOutcome {
     PausedLocalSell,
     CommonShock,
     StaleOrMissing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommonShockReason {
+    EntryExternalConfirmed,
+    EntryLocalCriteriaUnmet,
+    LocalPauseExtReprice,
+    LocalPauseTtlHandover,
+    RecoveryRetriggerOrExtSliding,
+    RecoveryFlowOrDepthBlocked,
+    RecoveryCalmCountdown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(in crate::strategy::inventory_neutral_mm) struct CommonShockReasonCounts {
+    entry_external_confirmed: u64,
+    entry_local_criteria_unmet: u64,
+    local_pause_ext_reprice: u64,
+    local_pause_ttl_handover: u64,
+    recovery_retrigger_or_ext_sliding: u64,
+    recovery_flow_or_depth_blocked: u64,
+    recovery_calm_countdown: u64,
+}
+
+impl CommonShockReasonCounts {
+    fn record(&mut self, reason: CommonShockReason) {
+        match reason {
+            CommonShockReason::EntryExternalConfirmed => self.entry_external_confirmed += 1,
+            CommonShockReason::EntryLocalCriteriaUnmet => self.entry_local_criteria_unmet += 1,
+            CommonShockReason::LocalPauseExtReprice => self.local_pause_ext_reprice += 1,
+            CommonShockReason::LocalPauseTtlHandover => self.local_pause_ttl_handover += 1,
+            CommonShockReason::RecoveryRetriggerOrExtSliding => {
+                self.recovery_retrigger_or_ext_sliding += 1;
+            }
+            CommonShockReason::RecoveryFlowOrDepthBlocked => {
+                self.recovery_flow_or_depth_blocked += 1;
+            }
+            CommonShockReason::RecoveryCalmCountdown => self.recovery_calm_countdown += 1,
+        }
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.entry_external_confirmed
+            + self.entry_local_criteria_unmet
+            + self.local_pause_ext_reprice
+            + self.local_pause_ttl_handover
+            + self.recovery_retrigger_or_ext_sliding
+            + self.recovery_flow_or_depth_blocked
+            + self.recovery_calm_countdown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(in crate::strategy::inventory_neutral_mm) struct CommonShockAttribution {
+    signal_entries_external_confirmed: u64,
+    signal_entries_local_criteria_unmet: u64,
+    signal_entries_unmet_sell_notional: u64,
+    signal_entries_unmet_sell_imbalance: u64,
+    signal_entries_unmet_divergence: u64,
+    signal_entries_from_ttl_handover: u64,
+    episodes_started: u64,
+    episodes_completed: u64,
+    episodes_completed_to_normal: u64,
+    episodes_completed_to_local_sell: u64,
+    completed_duration_ms_total: u64,
+    completed_duration_ms_max: u64,
+    active_at_last_eval: bool,
+    active_elapsed_ms_at_last_eval: u64,
+    decisions_by_reason: CommonShockReasonCounts,
+    withdrawn_targets_by_reason: CommonShockReasonCounts,
+    would_withdraw_targets_by_reason: CommonShockReasonCounts,
+    rejected_target_reduced_to_zero: u64,
+    rejected_target_reduced_retaining_reducing_bid: u64,
+    rejected_target_retained_full_reducing_bid: u64,
+    rejected_target_sub_min_or_zero: u64,
 }
 
 pub(super) struct Signal {
@@ -201,6 +278,19 @@ pub(super) struct Signal {
     pub stale_or_missing_fail_closed_episodes: u64,
     pub resumed_episodes: u64,
     pub ttl_expired_episodes: u64,
+    pub signal_entries_external_confirmed: u64,
+    pub signal_entries_local_criteria_unmet: u64,
+    pub signal_entries_unmet_sell_notional: u64,
+    pub signal_entries_unmet_sell_imbalance: u64,
+    pub signal_entries_unmet_divergence: u64,
+    pub signal_entries_from_ttl_handover: u64,
+    pub common_shock_episodes_started: u64,
+    pub common_shock_episodes_completed_to_normal: u64,
+    pub common_shock_episodes_completed_to_local_sell: u64,
+    pub common_shock_completed_duration_ms_total: u64,
+    pub common_shock_completed_duration_ms_max: u64,
+    pub common_shock_active_at_last_eval: bool,
+    pub common_shock_active_elapsed_ms_at_last_eval: u64,
 }
 
 impl Signal {
@@ -227,6 +317,19 @@ impl Signal {
             stale_or_missing_fail_closed_episodes: 0,
             resumed_episodes: 0,
             ttl_expired_episodes: 0,
+            signal_entries_external_confirmed: 0,
+            signal_entries_local_criteria_unmet: 0,
+            signal_entries_unmet_sell_notional: 0,
+            signal_entries_unmet_sell_imbalance: 0,
+            signal_entries_unmet_divergence: 0,
+            signal_entries_from_ttl_handover: 0,
+            common_shock_episodes_started: 0,
+            common_shock_episodes_completed_to_normal: 0,
+            common_shock_episodes_completed_to_local_sell: 0,
+            common_shock_completed_duration_ms_total: 0,
+            common_shock_completed_duration_ms_max: 0,
+            common_shock_active_at_last_eval: false,
+            common_shock_active_elapsed_ms_at_last_eval: 0,
         }
     }
 
@@ -442,7 +545,7 @@ impl Signal {
     }
 
     pub(super) fn observe(&mut self, at_ms: u64) {
-        let _ = self.evaluate(at_ms);
+        let _ = self.evaluate_detailed(at_ms);
     }
 
     fn reset_common_shock_stability(&mut self) {
@@ -454,7 +557,56 @@ impl Signal {
         }
     }
 
+    fn start_common_shock_episode(
+        &mut self,
+        at_ms: u64,
+        min_bid_usd: f64,
+        stable_ref_ext_mid: f64,
+    ) {
+        self.common_shock_episodes_started += 1;
+        self.regime = Regime::CommonInfoShock {
+            entered_ms: at_ms,
+            min_bid_usd,
+            stable_ref_ext_mid,
+            stable_since_ms: None,
+        };
+        self.sync_active_episode_clock();
+    }
+
+    fn complete_common_shock_episode(&mut self, at_ms: u64, entered_ms: u64, to_normal: bool) {
+        let dur = at_ms.saturating_sub(entered_ms);
+        if to_normal {
+            self.common_shock_episodes_completed_to_normal += 1;
+        } else {
+            self.common_shock_episodes_completed_to_local_sell += 1;
+        }
+        self.common_shock_completed_duration_ms_total += dur;
+        self.common_shock_completed_duration_ms_max =
+            self.common_shock_completed_duration_ms_max.max(dur);
+    }
+
+    fn sync_active_episode_clock(&mut self) {
+        match self.regime {
+            Regime::CommonInfoShock { entered_ms, .. } => {
+                self.common_shock_active_at_last_eval = true;
+                self.common_shock_active_elapsed_ms_at_last_eval = self
+                    .last_eval_ms
+                    .unwrap_or(entered_ms)
+                    .saturating_sub(entered_ms);
+            }
+            Regime::Normal | Regime::PausedLocalSell { .. } => {
+                self.common_shock_active_at_last_eval = false;
+                self.common_shock_active_elapsed_ms_at_last_eval = 0;
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn evaluate(&mut self, at_ms: u64) -> PermitOutcome {
+        self.evaluate_detailed(at_ms).0
+    }
+
+    fn evaluate_detailed(&mut self, at_ms: u64) -> (PermitOutcome, Option<CommonShockReason>) {
         if self.last_eval_ms.is_some_and(|prev| at_ms < prev) {
             if !self.in_stale_fail_closed {
                 self.in_stale_fail_closed = true;
@@ -462,7 +614,8 @@ impl Signal {
             }
             self.near_miss_active = false;
             self.reset_common_shock_stability();
-            return PermitOutcome::StaleOrMissing;
+            self.sync_active_episode_clock();
+            return (PermitOutcome::StaleOrMissing, None);
         }
         self.last_eval_ms = Some(at_ms);
 
@@ -480,7 +633,8 @@ impl Signal {
             }
             self.near_miss_active = false;
             self.reset_common_shock_stability();
-            return PermitOutcome::StaleOrMissing;
+            self.sync_active_episode_clock();
+            return (PermitOutcome::StaleOrMissing, None);
         };
         let Some((ext_cur, ext_past)) = self.fresh_external_pair(at_ms) else {
             if !self.in_stale_fail_closed {
@@ -489,7 +643,8 @@ impl Signal {
             }
             self.near_miss_active = false;
             self.reset_common_shock_stability();
-            return PermitOutcome::StaleOrMissing;
+            self.sync_active_episode_clock();
+            return (PermitOutcome::StaleOrMissing, None);
         };
         self.in_stale_fail_closed = false;
 
@@ -530,18 +685,31 @@ impl Signal {
                         pre_shock_bid_usd,
                         blocked_resume_recorded: false,
                     };
-                    return PermitOutcome::PausedLocalSell;
+                    self.sync_active_episode_clock();
+                    return (PermitOutcome::PausedLocalSell, None);
                 }
                 if common_shock_hit {
                     self.near_miss_active = false;
                     self.common_shock_triggers += 1;
                     self.common_shock_kept_paused_or_blocked_resume += 1;
-                    self.regime = Regime::CommonInfoShock {
-                        min_bid_usd: pre_shock_bid_usd,
-                        stable_ref_ext_mid: ext_cur.mid,
-                        stable_since_ms: None,
+                    let reason = if ext_ret_bps <= self.policy.ext_common_shock_bps {
+                        self.signal_entries_external_confirmed += 1;
+                        CommonShockReason::EntryExternalConfirmed
+                    } else {
+                        self.signal_entries_local_criteria_unmet += 1;
+                        if sell_w < self.policy.min_sell_notional_usd {
+                            self.signal_entries_unmet_sell_notional += 1;
+                        }
+                        if !flow_imb.is_some_and(|imb| imb <= self.policy.sell_imbalance_max) {
+                            self.signal_entries_unmet_sell_imbalance += 1;
+                        }
+                        if div_bps > self.policy.min_divergence_bps {
+                            self.signal_entries_unmet_divergence += 1;
+                        }
+                        CommonShockReason::EntryLocalCriteriaUnmet
                     };
-                    return PermitOutcome::CommonShock;
+                    self.start_common_shock_episode(at_ms, pre_shock_bid_usd, ext_cur.mid);
+                    return (PermitOutcome::CommonShock, Some(reason));
                 }
                 let is_near_miss = local_ret_bps <= self.policy.local_ret_shock_bps * 0.5;
                 if is_near_miss {
@@ -549,10 +717,12 @@ impl Signal {
                         self.near_miss_below_threshold += 1;
                         self.near_miss_active = true;
                     }
-                    return PermitOutcome::NearMissAllowed;
+                    self.sync_active_episode_clock();
+                    return (PermitOutcome::NearMissAllowed, None);
                 }
                 self.near_miss_active = false;
-                PermitOutcome::Allowed
+                self.sync_active_episode_clock();
+                (PermitOutcome::Allowed, None)
             }
             Regime::PausedLocalSell {
                 trigger_ms,
@@ -580,7 +750,8 @@ impl Signal {
                 if all_resume_ok {
                     self.resumed_episodes += 1;
                     self.regime = Regime::Normal;
-                    return PermitOutcome::Allowed;
+                    self.sync_active_episode_clock();
+                    return (PermitOutcome::Allowed, None);
                 }
                 // Never bypass resume safety criteria on TTL expiry: either re-arm
                 // if active local sell pressure continues, or hand over to
@@ -595,7 +766,8 @@ impl Signal {
                             pre_shock_bid_usd,
                             blocked_resume_recorded: false,
                         };
-                        return PermitOutcome::PausedLocalSell;
+                        self.sync_active_episode_clock();
+                        return (PermitOutcome::PausedLocalSell, None);
                     }
                     if (common_shock_hit
                         || ext_repriced_down
@@ -604,12 +776,12 @@ impl Signal {
                     {
                         self.common_shock_kept_paused_or_blocked_resume += 1;
                     }
-                    self.regime = Regime::CommonInfoShock {
-                        min_bid_usd: pre_shock_bid_usd,
-                        stable_ref_ext_mid: ext_cur.mid,
-                        stable_since_ms: None,
-                    };
-                    return PermitOutcome::CommonShock;
+                    self.signal_entries_from_ttl_handover += 1;
+                    self.start_common_shock_episode(at_ms, pre_shock_bid_usd, ext_cur.mid);
+                    return (
+                        PermitOutcome::CommonShock,
+                        Some(CommonShockReason::LocalPauseTtlHandover),
+                    );
                 }
                 self.regime = Regime::PausedLocalSell {
                     trigger_ms,
@@ -617,19 +789,25 @@ impl Signal {
                     pre_shock_bid_usd,
                     blocked_resume_recorded,
                 };
+                self.sync_active_episode_clock();
                 if ext_repriced_down {
-                    PermitOutcome::CommonShock
+                    (
+                        PermitOutcome::CommonShock,
+                        Some(CommonShockReason::LocalPauseExtReprice),
+                    )
                 } else {
-                    PermitOutcome::PausedLocalSell
+                    (PermitOutcome::PausedLocalSell, None)
                 }
             }
             Regime::CommonInfoShock {
+                entered_ms,
                 min_bid_usd,
                 mut stable_ref_ext_mid,
                 mut stable_since_ms,
             } => {
                 self.near_miss_active = false;
                 if local_sell_hit {
+                    self.complete_common_shock_episode(at_ms, entered_ms, false);
                     self.triggered_local_sell_pressure += 1;
                     self.regime = Regime::PausedLocalSell {
                         trigger_ms: at_ms,
@@ -637,32 +815,35 @@ impl Signal {
                         pre_shock_bid_usd: min_bid_usd.max(pre_shock_bid_usd),
                         blocked_resume_recorded: false,
                     };
-                    return PermitOutcome::PausedLocalSell;
+                    self.sync_active_episode_clock();
+                    return (PermitOutcome::PausedLocalSell, None);
                 }
                 let depth_ok = local_cur.bid_usd
                     >= min_bid_usd.max(1.0) * self.policy.resume_l1_bid_depth_ratio_min;
                 let ext_since_stable_bps = (ext_cur.mid / stable_ref_ext_mid - 1.0) * 10_000.0;
                 let ext_sliding_down =
                     ext_since_stable_bps < self.policy.resume_external_reprice_min_bps;
-                if common_shock_hit
+                let ext_slide_or_retrigger = common_shock_hit
                     || ext_ret_bps <= self.policy.ext_common_shock_bps
-                    || ext_sliding_down
-                    || !flow_calm
-                    || !depth_ok
-                {
+                    || ext_sliding_down;
+                if ext_slide_or_retrigger || !flow_calm || !depth_ok {
                     stable_since_ms = None;
-                    if ext_sliding_down
-                        || ext_ret_bps <= self.policy.ext_common_shock_bps
-                        || common_shock_hit
-                    {
+                    if ext_slide_or_retrigger {
                         stable_ref_ext_mid = ext_cur.mid;
                     }
                     self.regime = Regime::CommonInfoShock {
+                        entered_ms,
                         min_bid_usd,
                         stable_ref_ext_mid,
                         stable_since_ms,
                     };
-                    return PermitOutcome::CommonShock;
+                    self.sync_active_episode_clock();
+                    let reason = if ext_slide_or_retrigger {
+                        CommonShockReason::RecoveryRetriggerOrExtSliding
+                    } else {
+                        CommonShockReason::RecoveryFlowOrDepthBlocked
+                    };
+                    return (PermitOutcome::CommonShock, Some(reason));
                 }
                 if stable_since_ms.is_none() {
                     stable_ref_ext_mid = ext_cur.mid;
@@ -670,15 +851,22 @@ impl Signal {
                 let since = stable_since_ms.unwrap_or(at_ms);
                 if at_ms.saturating_sub(since) >= self.policy.resume_calm_window_ms {
                     self.resumed_episodes += 1;
+                    self.complete_common_shock_episode(at_ms, entered_ms, true);
                     self.regime = Regime::Normal;
-                    return PermitOutcome::Allowed;
+                    self.sync_active_episode_clock();
+                    return (PermitOutcome::Allowed, None);
                 }
                 self.regime = Regime::CommonInfoShock {
+                    entered_ms,
                     min_bid_usd,
                     stable_ref_ext_mid,
                     stable_since_ms: Some(since),
                 };
-                PermitOutcome::CommonShock
+                self.sync_active_episode_clock();
+                (
+                    PermitOutcome::CommonShock,
+                    Some(CommonShockReason::RecoveryCalmCountdown),
+                )
             }
         }
     }
@@ -705,6 +893,7 @@ pub(in crate::strategy::inventory_neutral_mm) struct Participation {
     rejected_ext_updates: u64,
     ext_resets: u64,
     rejected_trade_times: u64,
+    common_shock_attribution: CommonShockAttribution,
 }
 
 impl Participation {
@@ -728,7 +917,40 @@ impl Participation {
             rejected_ext_updates: 0,
             ext_resets: 0,
             rejected_trade_times: 0,
+            common_shock_attribution: CommonShockAttribution::default(),
         }
+    }
+
+    fn sync_signal_counters(&mut self, signal: &Signal) {
+        self.triggered_local_sell_pressure = signal.triggered_local_sell_pressure;
+        self.near_miss_below_threshold = signal.near_miss_below_threshold;
+        self.common_shock_triggers = signal.common_shock_triggers;
+        self.common_shock_kept_paused_or_blocked_resume =
+            signal.common_shock_kept_paused_or_blocked_resume;
+        self.stale_or_missing_fail_closed_episodes = signal.stale_or_missing_fail_closed_episodes;
+        self.resumed_episodes = signal.resumed_episodes;
+        self.ttl_expired_episodes = signal.ttl_expired_episodes;
+        self.rejected_ext_updates = signal.rejected_ext_updates;
+        self.ext_resets = signal.ext_resets;
+        self.rejected_trade_times = signal.rejected_trade_times;
+
+        let attr = &mut self.common_shock_attribution;
+        attr.signal_entries_external_confirmed = signal.signal_entries_external_confirmed;
+        attr.signal_entries_local_criteria_unmet = signal.signal_entries_local_criteria_unmet;
+        attr.signal_entries_unmet_sell_notional = signal.signal_entries_unmet_sell_notional;
+        attr.signal_entries_unmet_sell_imbalance = signal.signal_entries_unmet_sell_imbalance;
+        attr.signal_entries_unmet_divergence = signal.signal_entries_unmet_divergence;
+        attr.signal_entries_from_ttl_handover = signal.signal_entries_from_ttl_handover;
+        attr.episodes_started = signal.common_shock_episodes_started;
+        attr.episodes_completed = signal.common_shock_episodes_completed_to_normal
+            + signal.common_shock_episodes_completed_to_local_sell;
+        attr.episodes_completed_to_normal = signal.common_shock_episodes_completed_to_normal;
+        attr.episodes_completed_to_local_sell =
+            signal.common_shock_episodes_completed_to_local_sell;
+        attr.completed_duration_ms_total = signal.common_shock_completed_duration_ms_total;
+        attr.completed_duration_ms_max = signal.common_shock_completed_duration_ms_max;
+        attr.active_at_last_eval = signal.common_shock_active_at_last_eval;
+        attr.active_elapsed_ms_at_last_eval = signal.common_shock_active_elapsed_ms_at_last_eval;
     }
 
     pub(in crate::strategy::inventory_neutral_mm) fn apply(
@@ -738,35 +960,28 @@ impl Participation {
         config: &InventoryNeutralMMConfig,
     ) -> Option<f64> {
         self.decisions += 1;
-        let outcome = {
-            let mut signal = self.signal.lock();
-            let out = signal.evaluate(now_ms());
-            self.triggered_local_sell_pressure = signal.triggered_local_sell_pressure;
-            self.near_miss_below_threshold = signal.near_miss_below_threshold;
-            self.common_shock_triggers = signal.common_shock_triggers;
-            self.common_shock_kept_paused_or_blocked_resume =
-                signal.common_shock_kept_paused_or_blocked_resume;
-            self.stale_or_missing_fail_closed_episodes =
-                signal.stale_or_missing_fail_closed_episodes;
-            self.resumed_episodes = signal.resumed_episodes;
-            self.ttl_expired_episodes = signal.ttl_expired_episodes;
-            self.rejected_ext_updates = signal.rejected_ext_updates;
-            self.ext_resets = signal.ext_resets;
-            self.rejected_trade_times = signal.rejected_trade_times;
-            out
+        let signal_arc = Arc::clone(&self.signal);
+        let (outcome, shock_reason) = {
+            let mut signal = signal_arc.lock();
+            let evaluated = signal.evaluate_detailed(now_ms());
+            self.sync_signal_counters(&signal);
+            evaluated
         };
+        if let Some(reason) = shock_reason {
+            self.common_shock_attribution
+                .decisions_by_reason
+                .record(reason);
+        }
         let allowed = matches!(
             outcome,
             PermitOutcome::Allowed | PermitOutcome::NearMissAllowed
         );
         if allowed {
             self.admitted_decisions += 1;
-        }
-        if allowed || !self.policy.enabled {
             return None;
         }
-        // Give execution the same aggregate cap used for reduction ladders. It
-        // also replaces any resting non-reduce-only bids during the pause.
+        // Compute pure reducing cap diagnostics for both active and shadow arms
+        // without mutating `target.bid_size` or active withdrawal counters in shadow mode.
         let [closable_bid, _] = components::closable_reducing_sizes(positions, config.step_size);
         let min_size = components::min_quotable_size(config, target.bid_price);
         let capped_size = target.bid_size.min(closable_bid);
@@ -775,11 +990,44 @@ impl Participation {
         } else {
             0.0
         };
-        if capped_size < target.bid_size && target.bid_size >= min_size {
+        let would_withdraw = capped_size < target.bid_size && target.bid_size >= min_size;
+        if target.bid_size.is_nan() || target.bid_size < min_size {
+            self.common_shock_attribution
+                .rejected_target_sub_min_or_zero += 1;
+        } else if would_withdraw {
+            if capped_size <= 0.0 {
+                self.common_shock_attribution
+                    .rejected_target_reduced_to_zero += 1;
+            } else {
+                self.common_shock_attribution
+                    .rejected_target_reduced_retaining_reducing_bid += 1;
+            }
+            if let Some(reason) = shock_reason {
+                self.common_shock_attribution
+                    .would_withdraw_targets_by_reason
+                    .record(reason);
+            }
+        } else {
+            self.common_shock_attribution
+                .rejected_target_retained_full_reducing_bid += 1;
+        }
+        if !self.policy.enabled {
+            return None;
+        }
+        // Give execution the same aggregate cap used for reduction ladders. It
+        // also replaces any resting non-reduce-only bids during the pause.
+        if would_withdraw {
             self.withdrawn_bid_targets += 1;
             match outcome {
                 PermitOutcome::PausedLocalSell => self.withdrawn_bid_by_local_sell_pressure += 1,
-                PermitOutcome::CommonShock => self.withdrawn_bid_by_common_shock += 1,
+                PermitOutcome::CommonShock => {
+                    self.withdrawn_bid_by_common_shock += 1;
+                    if let Some(reason) = shock_reason {
+                        self.common_shock_attribution
+                            .withdrawn_targets_by_reason
+                            .record(reason);
+                    }
+                }
                 PermitOutcome::StaleOrMissing => self.withdrawn_bid_by_stale_or_missing += 1,
                 PermitOutcome::Allowed | PermitOutcome::NearMissAllowed => {}
             }
@@ -1108,5 +1356,385 @@ mod tests {
             .unwrap();
         assert_eq!(s.evaluate(24_500), PermitOutcome::Allowed);
         assert_eq!(s.resumed_episodes, 1);
+    }
+
+    #[test]
+    fn common_shock_attribution_splits_external_confirmed_local_unmet_and_recovery_stages() {
+        let mut s = Signal::new(Policy::frozen_v1(true));
+        s.feed(1_000, true);
+        for t in (1_000..=3_000).step_by(500) {
+            s.book(t, &mk_book(t, 1_000.0, 100.0));
+            s.update_external(t, t, 1, Some(1_000.0), Some(t)).unwrap();
+        }
+        assert_eq!(s.evaluate(3_000), PermitOutcome::Allowed);
+
+        // Episode 1: Local-criteria-unmet entry — local drops -7 bp while external stays flat (0 bp),
+        // sell flow is small ($5k < $15k) and balanced (+$5k buy vs -$5k sell -> imb 0.0), div = -7 bp.
+        s.trade(3_400, 3_400, 5_000.0, true);
+        s.trade(3_450, 3_450, 5_000.0, false);
+        s.book(3_500, &mk_book(3_500, 999.3, 80.0));
+        s.update_external(3_500, 3_500, 1, Some(1_000.0), Some(3_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(3_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::EntryLocalCriteriaUnmet)
+            )
+        );
+        assert_eq!(s.signal_entries_local_criteria_unmet, 1);
+        assert_eq!(s.signal_entries_external_confirmed, 0);
+        assert_eq!(s.signal_entries_unmet_sell_notional, 1);
+        assert_eq!(s.signal_entries_unmet_sell_imbalance, 1);
+        assert_eq!(s.signal_entries_unmet_divergence, 0);
+        assert_eq!(s.common_shock_episodes_started, 1);
+        assert!(s.common_shock_active_at_last_eval);
+        assert_eq!(s.common_shock_active_elapsed_ms_at_last_eval, 0);
+
+        // Recovery stage 1: RecoveryFlowOrDepthBlocked (depth drops to $20k < $50k while ext stays flat).
+        s.book(4_000, &mk_book(4_000, 999.6, 20.0));
+        s.update_external(4_000, 4_000, 1, Some(1_000.0), Some(4_000))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(4_000),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::RecoveryFlowOrDepthBlocked)
+            )
+        );
+        assert_eq!(s.common_shock_active_elapsed_ms_at_last_eval, 500);
+
+        // Recovery stage 2: RecoveryRetriggerOrExtSliding (external drops -3 bp -> ext_sliding_down).
+        s.book(4_500, &mk_book(4_500, 999.4, 80.0));
+        s.update_external(4_500, 4_500, 1, Some(999.7), Some(4_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(4_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::RecoveryRetriggerOrExtSliding)
+            )
+        );
+
+        // Recovery stage 3: RecoveryCalmCountdown (for 5_500..7_000; note 4_500 trades aged out by 5_500).
+        s.book(5_500, &mk_book(5_500, 999.65, 80.0));
+        s.update_external(5_500, 5_500, 1, Some(999.7), Some(5_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(5_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::RecoveryCalmCountdown)
+            )
+        );
+        for t in [6_000, 6_500, 7_000] {
+            s.book(t, &mk_book(t, 999.65, 80.0));
+            s.update_external(t, t, 1, Some(999.7), Some(t)).unwrap();
+            assert_eq!(
+                s.evaluate_detailed(t),
+                (
+                    PermitOutcome::CommonShock,
+                    Some(CommonShockReason::RecoveryCalmCountdown)
+                )
+            );
+        }
+        // Recovery completes at t=7_500 (7_500 - 5_500 = 2_000 ms calm). Duration = 7_500 - 3_500 = 4_000 ms.
+        s.book(7_500, &mk_book(7_500, 999.65, 80.0));
+        s.update_external(7_500, 7_500, 1, Some(999.7), Some(7_500))
+            .unwrap();
+        assert_eq!(s.evaluate_detailed(7_500), (PermitOutcome::Allowed, None));
+        assert!(!s.common_shock_active_at_last_eval);
+        assert_eq!(s.common_shock_active_elapsed_ms_at_last_eval, 0);
+        assert_eq!(s.common_shock_episodes_completed_to_normal, 1);
+        assert_eq!(s.common_shock_completed_duration_ms_total, 4_000);
+        assert_eq!(s.common_shock_completed_duration_ms_max, 4_000);
+
+        // Warm 2s calm base up to t=10_000, then Episode 2: ExternalConfirmed (-7 bp local AND -5 bp ext).
+        for t in (8_000..=10_000).step_by(500) {
+            s.book(t, &mk_book(t, 999.7, 80.0));
+            s.update_external(t, t, 1, Some(999.7), Some(t)).unwrap();
+        }
+        assert_eq!(s.evaluate(10_000), PermitOutcome::Allowed);
+        s.book(10_500, &mk_book(10_500, 999.0, 80.0));
+        s.update_external(10_500, 10_500, 1, Some(999.2), Some(10_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(10_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::EntryExternalConfirmed)
+            )
+        );
+        assert_eq!(s.signal_entries_external_confirmed, 1);
+        assert_eq!(s.common_shock_episodes_started, 2);
+        assert!(s.common_shock_active_at_last_eval);
+
+        // Also test unmet divergence specifically: first recover Ep2, warm 2s, then heavy sell ($20k)
+        // where local -6.5 bp AND ext -5 bp? No, keep ext -3.8 bp (> -4.0 bp) and div = -6.5 - (-3.8) = -2.7 <= -2.5;
+        // instead use ext = -4.5 bp -> external confirmed; to hit unmet_divergence keep ext = -3.9 bp (> -4.0 bp),
+        // local = -6.1 bp (div = -2.2 > -2.5) with heavy sell ($20k).
+        for t in (11_500..=14_500).step_by(500) {
+            s.book(t, &mk_book(t, 999.2, 80.0));
+            s.update_external(t, t, 1, Some(999.2), Some(t)).unwrap();
+            let _ = s.evaluate_detailed(t);
+        }
+        assert_eq!(s.common_shock_episodes_completed_to_normal, 2);
+        for t in (15_000..=17_000).step_by(500) {
+            s.book(t, &mk_book(t, 1_000.0, 100.0));
+            s.update_external(t, t, 1, Some(1_000.0), Some(t)).unwrap();
+        }
+        assert_eq!(s.evaluate(17_000), PermitOutcome::Allowed);
+        s.trade(17_400, 17_400, 20_000.0, false);
+        s.book(17_500, &mk_book(17_500, 999.39, 80.0));
+        s.update_external(17_500, 17_500, 1, Some(999.61), Some(17_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(17_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::EntryLocalCriteriaUnmet)
+            )
+        );
+        assert_eq!(s.signal_entries_local_criteria_unmet, 2);
+        assert_eq!(s.signal_entries_unmet_sell_notional, 1);
+        assert_eq!(s.signal_entries_unmet_sell_imbalance, 1);
+        assert_eq!(s.signal_entries_unmet_divergence, 1);
+    }
+
+    #[test]
+    fn common_shock_attribution_tracks_local_pause_ext_reprice_ttl_handover_and_reentry() {
+        let mut s = Signal::new(Policy::frozen_v1(true));
+        s.feed(1_000, true);
+        for t in (1_000..=3_000).step_by(500) {
+            s.book(t, &mk_book(t, 1_000.0, 100.0));
+            s.update_external(t, t, 1, Some(1_000.0), Some(t)).unwrap();
+        }
+        assert_eq!(s.evaluate(3_000), PermitOutcome::Allowed);
+
+        // Local sell pressure triggers at t=3_500 (trigger_ext_mid = 999.9).
+        s.book(3_500, &mk_book(3_500, 999.2, 20.0));
+        s.update_external(3_500, 3_500, 1, Some(999.9), Some(3_500))
+            .unwrap();
+        s.trade(3_500, 3_495, 20_000.0, false);
+        assert_eq!(
+            s.evaluate_detailed(3_500),
+            (PermitOutcome::PausedLocalSell, None)
+        );
+
+        // At t=4_500 (<15s TTL), external reprices down -3.0 bp -> LocalPauseExtReprice (does not start CommonInfoShock episode).
+        s.book(4_500, &mk_book(4_500, 999.4, 80.0));
+        s.update_external(4_500, 4_500, 1, Some(999.6), Some(4_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(4_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::LocalPauseExtReprice)
+            )
+        );
+        assert_eq!(s.common_shock_episodes_started, 0);
+
+        // Hold external repriced & low depth through TTL (t=18_500) -> LocalPauseTtlHandover starts episode!
+        for t in (5_000..=18_000).step_by(500) {
+            s.book(t, &mk_book(t, 999.4, 25.0));
+            s.update_external(t, t, 1, Some(999.6), Some(t)).unwrap();
+            let _ = s.evaluate_detailed(t);
+        }
+        s.book(18_500, &mk_book(18_500, 999.4, 25.0));
+        s.update_external(18_500, 18_500, 1, Some(999.6), Some(18_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(18_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::LocalPauseTtlHandover)
+            )
+        );
+        assert_eq!(s.signal_entries_from_ttl_handover, 1);
+        assert_eq!(s.common_shock_episodes_started, 1);
+        assert!(s.common_shock_active_at_last_eval);
+
+        // Fresh local sell pressure hits inside CommonInfoShock at t=21_000 -> completes episode to local_sell (dur=2_500).
+        s.book(19_500, &mk_book(19_500, 999.5, 80.0));
+        s.update_external(19_500, 19_500, 1, Some(999.6), Some(19_500))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(19_500),
+            (
+                PermitOutcome::CommonShock,
+                Some(CommonShockReason::RecoveryCalmCountdown)
+            )
+        );
+        s.trade(20_900, 20_900, 25_000.0, false);
+        s.book(21_000, &mk_book(21_000, 998.7, 30.0));
+        s.update_external(21_000, 21_000, 1, Some(999.5), Some(21_000))
+            .unwrap();
+        assert_eq!(
+            s.evaluate_detailed(21_000),
+            (PermitOutcome::PausedLocalSell, None)
+        );
+        assert!(!s.common_shock_active_at_last_eval);
+        assert_eq!(s.common_shock_episodes_completed_to_local_sell, 1);
+        assert_eq!(s.common_shock_episodes_completed_to_normal, 0);
+        assert_eq!(s.common_shock_completed_duration_ms_total, 2_500);
+        assert_eq!(s.common_shock_completed_duration_ms_max, 2_500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn participation_attribution_partitions_shadow_and_active_reducing_bid_dispositions() {
+        let config = InventoryNeutralMMConfig::default();
+
+        for enabled in [false, true] {
+            let _clock = ReplayClock::open(1_000, false);
+            let policy = Policy::frozen_v1(enabled);
+            let sig = Arc::new(PlMutex::new(Signal::new(policy)));
+            let mut part = Participation::new(policy, Arc::clone(&sig));
+            sig.lock().feed(1_000, true);
+            for t in (1_000..=3_000).step_by(500) {
+                sig.lock().book(t, &mk_book(t, 1_000.0, 100.0));
+                sig.lock()
+                    .update_external(t, t, 1, Some(1_000.0), Some(t))
+                    .unwrap();
+            }
+            // Advance replay clock to t=3_000: Admitted normal decision.
+            tokio::time::advance(Duration::from_millis(2_000)).await;
+            let mut t0 = QuoteTarget {
+                bid_price: 999.0,
+                ask_price: 1_001.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+            };
+            assert_eq!(part.apply(&mut t0, [0.0, 0.0], &config), None);
+
+            // Advance to t=3_500: External-confirmed CommonShock entry (flat -> reduced_to_zero).
+            tokio::time::advance(Duration::from_millis(500)).await;
+            sig.lock().book(3_500, &mk_book(3_500, 999.0, 80.0));
+            sig.lock()
+                .update_external(3_500, 3_500, 1, Some(999.4), Some(3_500))
+                .unwrap();
+            let mut t1 = QuoteTarget {
+                bid_price: 999.0,
+                ask_price: 1_001.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+            };
+            let res1 = part.apply(&mut t1, [0.0, 0.0], &config);
+            assert_eq!(res1, if enabled { Some(0.0) } else { None });
+            assert_eq!(t1.bid_size, if enabled { 0.0 } else { 1.0 });
+
+            // Advance to t=3_600: RecoveryRetriggerOrExtSliding (2s rolling ext return is still -6 bp),
+            // partial short [-0.7, -0.5] -> reduced retaining 0.5 reducing bid.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            sig.lock().book(3_600, &mk_book(3_600, 999.1, 80.0));
+            sig.lock()
+                .update_external(3_600, 3_600, 1, Some(999.4), Some(3_600))
+                .unwrap();
+            let mut t2 = QuoteTarget {
+                bid_price: 999.0,
+                ask_price: 1_001.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+            };
+            let res2 = part.apply(&mut t2, [-0.7, -0.5], &config);
+            assert_eq!(res2, if enabled { Some(0.5) } else { None });
+            assert_eq!(t2.bid_size, if enabled { 0.5 } else { 1.0 });
+
+            // Advance with signal.observe() across 4_000..=5_500 while anchor holds steady at 999.4.
+            // observe() must not inflate Participation's decision or target attribution counts.
+            for t in (4_000..=5_500).step_by(500) {
+                tokio::time::advance(Duration::from_millis(
+                    t - if t == 4_000 { 3_600 } else { t - 500 },
+                ))
+                .await;
+                sig.lock().book(t, &mk_book(t, 999.2, 80.0));
+                sig.lock()
+                    .update_external(t, t, 1, Some(999.4), Some(t))
+                    .unwrap();
+                sig.lock().observe(t);
+            }
+
+            // Advance to t=5_600: RecoveryCalmCountdown (stable_since_ms = 5_500, elapsed 100ms < 2_000ms),
+            // full short [-2.0, -2.0] -> retained full 1.0 reducing bid.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            sig.lock().book(5_600, &mk_book(5_600, 999.2, 80.0));
+            sig.lock()
+                .update_external(5_600, 5_600, 1, Some(999.4), Some(5_600))
+                .unwrap();
+            let mut t3 = QuoteTarget {
+                bid_price: 999.0,
+                ask_price: 1_001.0,
+                bid_size: 1.0,
+                ask_size: 1.0,
+            };
+            let res3 = part.apply(&mut t3, [-2.0, -2.0], &config);
+            assert_eq!(res3, if enabled { Some(2.0) } else { None });
+            assert_eq!(t3.bid_size, 1.0);
+
+            // Advance to t=5_700: RecoveryCalmCountdown, sub-min bid_size (0.005 < min_size ~0.013) -> sub_min_or_zero.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            sig.lock().book(5_700, &mk_book(5_700, 999.2, 80.0));
+            sig.lock()
+                .update_external(5_700, 5_700, 1, Some(999.4), Some(5_700))
+                .unwrap();
+            let mut t4 = QuoteTarget {
+                bid_price: 999.0,
+                ask_price: 1_001.0,
+                bid_size: 0.005,
+                ask_size: 1.0,
+            };
+            let res4 = part.apply(&mut t4, [0.0, 0.0], &config);
+            assert_eq!(res4, if enabled { Some(0.0) } else { None });
+            assert_eq!(t4.bid_size, if enabled { 0.0 } else { 0.005 });
+
+            let attr = &part.common_shock_attribution;
+            assert_eq!(part.decisions, 5);
+            assert_eq!(part.admitted_decisions, 1);
+            assert_eq!(attr.signal_entries_external_confirmed, 1);
+            assert_eq!(attr.decisions_by_reason.entry_external_confirmed, 1);
+            assert_eq!(
+                attr.decisions_by_reason.recovery_retrigger_or_ext_sliding,
+                1
+            );
+            assert_eq!(attr.decisions_by_reason.recovery_calm_countdown, 2);
+            assert_eq!(attr.decisions_by_reason.total(), 4);
+            assert_eq!(attr.rejected_target_reduced_to_zero, 1);
+            assert_eq!(attr.rejected_target_reduced_retaining_reducing_bid, 1);
+            assert_eq!(attr.rejected_target_retained_full_reducing_bid, 1);
+            assert_eq!(attr.rejected_target_sub_min_or_zero, 1);
+            assert_eq!(
+                attr.rejected_target_reduced_to_zero
+                    + attr.rejected_target_reduced_retaining_reducing_bid
+                    + attr.rejected_target_retained_full_reducing_bid
+                    + attr.rejected_target_sub_min_or_zero,
+                part.decisions - part.admitted_decisions
+            );
+            assert_eq!(
+                attr.would_withdraw_targets_by_reason
+                    .entry_external_confirmed,
+                1
+            );
+            assert_eq!(
+                attr.would_withdraw_targets_by_reason
+                    .recovery_retrigger_or_ext_sliding,
+                1
+            );
+            assert_eq!(attr.would_withdraw_targets_by_reason.total(), 2);
+            if enabled {
+                assert_eq!(part.withdrawn_bid_targets, 2);
+                assert_eq!(part.withdrawn_bid_by_common_shock, 2);
+                assert_eq!(
+                    attr.withdrawn_targets_by_reason,
+                    attr.would_withdraw_targets_by_reason
+                );
+                assert_eq!(
+                    attr.withdrawn_targets_by_reason.total(),
+                    part.withdrawn_bid_by_common_shock
+                );
+            } else {
+                assert_eq!(part.withdrawn_bid_targets, 0);
+                assert_eq!(part.withdrawn_bid_by_common_shock, 0);
+                assert_eq!(attr.withdrawn_targets_by_reason.total(), 0);
+            }
+        }
     }
 }
