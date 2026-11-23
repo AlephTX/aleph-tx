@@ -88,6 +88,11 @@ impl ArcusTrading {
         })
     }
 
+    /// Warm the dedicated order-execution HTTP/TLS connection pool before first submission.
+    pub async fn warm_http(&self) -> Result<()> {
+        self.info.warm_http().await
+    }
+
     pub async fn place_limit(
         &self,
         market: &Market,

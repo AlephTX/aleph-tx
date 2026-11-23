@@ -115,6 +115,12 @@ impl ArcusInfo {
             .await?
             .markets)
     }
+
+    /// Lightweight read to keep the HTTP/TLS connection pool warm before the first live order.
+    pub async fn warm_http(&self) -> Result<()> {
+        let _ = self.markets().await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

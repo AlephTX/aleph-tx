@@ -19,6 +19,7 @@ use aleph_tx::exchanges::hyperliquid::{
     self, ExecutionStatus as HlExecutionStatus, HyperliquidInfo, HyperliquidSigner,
     HyperliquidTrading, Network as HlNetwork, OrderAction, OrderWire, PerpMarket, PerpOrder,
     SharedNoncePool, TimeInForce as HlTif, aggregate_multi_dex_equity,
+    aggregate_multi_dex_margin_used,
 };
 use aleph_tx::order_budget::{
     BudgetDecision, OrderIntentClass, VenueOrderBudget, looks_like_rate_limit_error,
@@ -27,10 +28,12 @@ use aleph_tx::strategy::arcus_xyz_basis::{
     ArcusBookSnapshot, ArcusLegIntent, ArcusLegPnlTracker, ArcusSubmitOutcome, ArcusXyzBasisConfig,
     ArcusXyzBasisEngine, BasisAction, BasisJournal, BasisJournalEvent, HL_MIN_ORDER_NOTIONAL_USD,
     HlLegIntent, HlSubmitOutcome, ShutdownDisposition, VenueOrderConstraints, VerifiedLegTerminal,
-    classify_arcus_submit, classify_hl_submit, classify_shutdown, parse_hl_market_position,
+    classify_arcus_submit, classify_hl_submit, classify_shutdown, evaluate_hl_basis_tail_risk,
+    liquidation_distance_bps, parse_hl_market_liquidation_px, parse_hl_market_position,
     quantize_arcus_limit_price, quantize_hl_base_qty, quantize_shared_base_qty,
     verify_arcus_leg_terminal, verify_hl_leg_terminal,
 };
+use aleph_tx::strategy::tail_risk::TailRiskAction;
 use aleph_tx::telemetry_sink::{HedgeFillRecord, SessionInfo, StrategySnapshot, TelemetrySink};
 use aleph_tx::venues::{
     CapabilityAssetScope, audited_execution_capabilities, select_execution_topology,
@@ -306,6 +309,7 @@ fn run_check(config_path: &Path) -> Result<()> {
             "canary_max_order_usd": cfg.canary_max_order_usd,
             "canary_max_total_notional_usd": cfg.canary_max_total_notional_usd,
             "order_budget": cfg.order_budget,
+            "tail_risk": cfg.tail_risk,
             "topology": topology,
         }))?
     );
@@ -801,6 +805,7 @@ async fn load_and_preflight(
         arc_net,
         ArcusSigner::new(SigningKey::from_bytes(&arc_key_bytes), arc_addr, arc_idx)?,
     )?;
+    let _ = arc_trading.warm_http().await;
     let hl_info = HyperliquidInfo::new(hl_net)?;
     hl_info.validate_agent(&hl_signer, &hl_master).await?;
     let _ = hl_info.warm_http().await;
@@ -898,6 +903,8 @@ struct VenueSnapshot {
     inv_arc: Decimal,
     inv_xyz: Decimal,
     hl_equity: Decimal,
+    hl_margin_used: Decimal,
+    hl_liq_px: Option<Decimal>,
     hl_account_time_ms: u64,
 }
 
@@ -963,11 +970,16 @@ async fn reconcile_both_venues(
         .unwrap_or(Decimal::ZERO);
     let inv_xyz = parse_hl_market_position(&dex_state, &cfg.hl_coin)?;
     let hl_equity = aggregate_multi_dex_equity(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
+    let hl_margin_used =
+        aggregate_multi_dex_margin_used(&core_state, &[(&cfg.hl_dex, &dex_state)])?;
+    let hl_liq_px = parse_hl_market_liquidation_px(&dex_state, &cfg.hl_coin)?;
     Ok(VenueSnapshot {
         core_time: core_state.time,
         inv_arc,
         inv_xyz,
         hl_equity,
+        hl_margin_used,
+        hl_liq_px,
         hl_account_time_ms: dex_state.time,
     })
 }
@@ -2354,7 +2366,95 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
             bail!("aborting canary: unhedgeable residual ({reason})");
         }
 
-        let skip_for_budget = if let Some(intent_class) = classify_intent(&action) {
+        let skip_for_tail_risk = match evaluate_hl_basis_tail_risk(
+            eval_now_ms,
+            v.account.hl_equity.to_f64().unwrap_or(f64::NAN),
+            v.account.hl_margin_used.to_f64().unwrap_or(f64::NAN),
+            liquidation_distance_bps(v.account.inv_xyz, v.mid(), v.account.hl_liq_px),
+            &cfg.tail_risk,
+        ) {
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "mode": "canary_error",
+                        "event": "tail_risk_halt",
+                        "ms": eval_now_ms,
+                        "error": err.to_string(),
+                    })
+                );
+                return Err(halt_canary_on_budget(
+                    "tail_risk_halt",
+                    &handles,
+                    &cfg,
+                    &journal,
+                    telemetry.as_ref(),
+                    Some(&v.arc),
+                    session_eq,
+                    session_start_equity,
+                    &daily_loss,
+                    &engine,
+                    lease_ok,
+                )
+                .await);
+            }
+            Ok(assess) if assess.action == TailRiskAction::HaltAndFlatten => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "mode": "canary_error",
+                        "event": "tail_risk_halt",
+                        "ms": eval_now_ms,
+                        "reasons": assess.reasons,
+                        "max_margin_util": assess.max_margin_util,
+                        "min_liq_buffer_bps": assess.min_liq_buffer_bps,
+                    })
+                );
+                return Err(halt_canary_on_budget(
+                    "tail_risk_halt",
+                    &handles,
+                    &cfg,
+                    &journal,
+                    telemetry.as_ref(),
+                    Some(&v.arc),
+                    session_eq,
+                    session_start_equity,
+                    &daily_loss,
+                    &engine,
+                    lease_ok,
+                )
+                .await);
+            }
+            Ok(assess)
+                if assess.action == TailRiskAction::ReduceOnly
+                    && matches!(action, BasisAction::EnterPairIoc { .. }) =>
+            {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "mode": "canary_warn",
+                        "event": "entry_tail_risk_blocked",
+                        "ms": eval_now_ms,
+                        "reasons": assess.reasons,
+                        "max_margin_util": assess.max_margin_util,
+                        "min_liq_buffer_bps": assess.min_liq_buffer_bps,
+                    })
+                );
+                engine.reconcile_positions(
+                    v.account.inv_arc,
+                    v.account.inv_xyz,
+                    v.arc.receipt_ms,
+                    v.hl_rx,
+                    eval_now_ms,
+                );
+                true
+            }
+            Ok(_) => false,
+        };
+
+        let skip_for_budget = if skip_for_tail_risk {
+            true
+        } else if let Some(intent_class) = classify_intent(&action) {
             match admit_dual_venue_intent(
                 &mut arcus_budget,
                 &mut hl_budget,
@@ -3129,6 +3229,8 @@ mod tests {
                 core_time: now,
                 hl_account_time_ms: now,
                 hl_equity: 100.into(),
+                hl_margin_used: Decimal::ZERO,
+                hl_liq_px: None,
                 inv_arc: Decimal::ZERO,
                 inv_xyz: Decimal::ZERO,
             },
@@ -3417,6 +3519,8 @@ mod tests {
                 inv_arc: Decimal::ZERO,
                 inv_xyz: Decimal::ZERO,
                 hl_equity: 100.into(),
+                hl_margin_used: Decimal::ZERO,
+                hl_liq_px: None,
                 hl_account_time_ms: now - cfg.account_refresh_interval_ms,
             },
         };

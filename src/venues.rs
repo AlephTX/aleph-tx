@@ -1,9 +1,15 @@
 //! Venue discovery and validation outside the fixed-size SHM matrix.
 use crate::strategy::cross_venue::{QuoteKind, VenueSnapshot};
+use crate::strategy::tail_risk::{
+    StablecoinPegSample, TailRiskAction, TailRiskConfig, VenueMarginSnapshot, evaluate_tail_risk,
+};
 use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 /// Versioned snapshot identifier for audited venue latency, fee, and quota semantics.
 pub const VENUE_CAPABILITY_SNAPSHOT_VERSION: &str = "2026-11-22.v2";
@@ -419,6 +425,9 @@ pub fn audited_onboarding_profiles() -> Vec<VenueOnboardingProfile> {
 
 const ASYMMETRIC_TAKER_DELAY_MS: u64 = 100;
 const CONCURRENT_MAX_TAKER_DELAY_MS: u64 = 20;
+pub const MAX_CROSS_STABLECOIN_DEPEG_REDUCE_ONLY_BPS: f64 = 30.0;
+pub const MAX_CROSS_STABLECOIN_DEPEG_HALT_BPS: f64 = 75.0;
+pub const MIN_CROSS_STABLECOIN_PEG_SOURCES: usize = 2;
 
 /// Latency-driven execution topology for a two-leg cross-venue strategy (`ARB-IMP-07`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,26 +438,11 @@ pub enum ExecutionTopology {
     ConcurrentProtectedIoc,
 }
 
-/// Selects a causal execution topology from venue speed-bump and settlement contracts.
-/// Rejects identical liquidity domains, mismatched settlement assets (`USDC` vs `USDG`),
-/// and dual-slow pairs with no fast IOC hedge leg.
-pub fn select_execution_topology(
+fn select_execution_topology_by_latency(
     leg_a: &VenueExecutionCapability,
     leg_b: &VenueExecutionCapability,
     dual_taker_required: bool,
 ) -> Result<ExecutionTopology> {
-    ensure!(
-        leg_a.settlement_currency == leg_b.settlement_currency,
-        "settlement currency mismatch ({} != {}): cross-stablecoin hedge requires explicit FX ledger",
-        leg_a.settlement_currency,
-        leg_b.settlement_currency
-    );
-    ensure!(
-        leg_a.liquidity_domain != leg_b.liquidity_domain,
-        "legs share liquidity domain {}",
-        leg_a.liquidity_domain
-    );
-
     let a_delay = leg_a.taker_delay_ms;
     let b_delay = leg_b.taker_delay_ms;
     let (slower_idx, faster_idx, slower_delay, faster_delay) = if a_delay >= b_delay {
@@ -511,6 +505,174 @@ pub fn select_execution_topology(
     Ok(ExecutionTopology::MakerFirst {
         maker_leg: slower_idx,
         hedge_leg: faster_idx,
+    })
+}
+
+/// Selects a causal execution topology from venue speed-bump and settlement contracts.
+/// Rejects identical liquidity domains, mismatched settlement assets (`USDC` vs `USDG`),
+/// and dual-slow pairs with no fast IOC hedge leg.
+pub fn select_execution_topology(
+    leg_a: &VenueExecutionCapability,
+    leg_b: &VenueExecutionCapability,
+    dual_taker_required: bool,
+) -> Result<ExecutionTopology> {
+    ensure!(
+        leg_a.settlement_currency == leg_b.settlement_currency,
+        "settlement currency mismatch ({} != {}): cross-stablecoin hedge requires explicit FX ledger",
+        leg_a.settlement_currency,
+        leg_b.settlement_currency
+    );
+    ensure!(
+        leg_a.liquidity_domain != leg_b.liquidity_domain,
+        "legs share liquidity domain {}",
+        leg_a.liquidity_domain
+    );
+    select_execution_topology_by_latency(leg_a, leg_b, dual_taker_required)
+}
+
+/// Explicit opt-in policy authorizing cross-stablecoin hedges (e.g. `USDC` vs `USDG`)
+/// only when bounded by strict multi-source depeg circuit breakers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrossStablecoinHedgePolicy {
+    pub allowed_pairs: Vec<(String, String)>,
+    pub tail_risk: TailRiskConfig,
+    pub min_fresh_peg_sources_per_asset: usize,
+}
+
+impl Default for CrossStablecoinHedgePolicy {
+    fn default() -> Self {
+        Self {
+            allowed_pairs: Vec::new(),
+            tail_risk: TailRiskConfig::default(),
+            min_fresh_peg_sources_per_asset: MIN_CROSS_STABLECOIN_PEG_SOURCES,
+        }
+    }
+}
+
+fn normalize_currency_code(raw: &str) -> String {
+    raw.trim().to_ascii_uppercase()
+}
+
+fn canonical_currency_pair(a: &str, b: &str) -> (String, String) {
+    let na = normalize_currency_code(a);
+    let nb = normalize_currency_code(b);
+    if na <= nb { (na, nb) } else { (nb, na) }
+}
+
+impl CrossStablecoinHedgePolicy {
+    pub fn validate(&self) -> Result<()> {
+        self.tail_risk.validate()?;
+        ensure!(
+            self.tail_risk.depeg_reduce_only_bps <= MAX_CROSS_STABLECOIN_DEPEG_REDUCE_ONLY_BPS,
+            "cross-stablecoin depeg_reduce_only_bps ({}) exceeds max {} bps",
+            self.tail_risk.depeg_reduce_only_bps,
+            MAX_CROSS_STABLECOIN_DEPEG_REDUCE_ONLY_BPS
+        );
+        ensure!(
+            self.tail_risk.depeg_halt_bps <= MAX_CROSS_STABLECOIN_DEPEG_HALT_BPS,
+            "cross-stablecoin depeg_halt_bps ({}) exceeds max {} bps",
+            self.tail_risk.depeg_halt_bps,
+            MAX_CROSS_STABLECOIN_DEPEG_HALT_BPS
+        );
+        ensure!(
+            self.min_fresh_peg_sources_per_asset >= MIN_CROSS_STABLECOIN_PEG_SOURCES,
+            "min_fresh_peg_sources_per_asset must be >= {}",
+            MIN_CROSS_STABLECOIN_PEG_SOURCES
+        );
+        for (idx, (a, b)) in self.allowed_pairs.iter().enumerate() {
+            let na = normalize_currency_code(a);
+            let nb = normalize_currency_code(b);
+            ensure!(
+                !na.is_empty() && !nb.is_empty() && na != nb,
+                "allowed_pairs[{idx}] must name two distinct non-empty settlement currencies"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn allows_pair(&self, a: &str, b: &str) -> bool {
+        let target = canonical_currency_pair(a, b);
+        self.allowed_pairs
+            .iter()
+            .any(|(x, y)| canonical_currency_pair(x, y) == target)
+    }
+}
+
+/// Combined topology and cross-stablecoin tail-risk supervisory verdict.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CrossStablecoinTopologyEvaluation {
+    pub topology: ExecutionTopology,
+    pub action: TailRiskAction,
+    pub reasons: Vec<String>,
+    pub max_depeg_bps: f64,
+}
+
+impl CrossStablecoinTopologyEvaluation {
+    pub fn allows_new_entry(&self) -> bool {
+        self.action == TailRiskAction::Normal
+    }
+}
+
+/// Selects a cross-venue topology while allowing explicitly whitelisted cross-stablecoin pairs
+/// only under fresh multi-source peg quorum and bounded depeg / venue-health circuit breakers.
+pub fn select_execution_topology_with_policy(
+    leg_a: &VenueExecutionCapability,
+    leg_b: &VenueExecutionCapability,
+    dual_taker_required: bool,
+    now_ms: u64,
+    venues: &[VenueMarginSnapshot],
+    pegs: &[StablecoinPegSample],
+    policy: &CrossStablecoinHedgePolicy,
+) -> Result<CrossStablecoinTopologyEvaluation> {
+    policy.validate()?;
+    ensure!(
+        leg_a.liquidity_domain != leg_b.liquidity_domain,
+        "legs share liquidity domain {}",
+        leg_a.liquidity_domain
+    );
+
+    let asset_a = normalize_currency_code(leg_a.settlement_currency);
+    let asset_b = normalize_currency_code(leg_b.settlement_currency);
+    let cross_stablecoin = asset_a != asset_b;
+    if cross_stablecoin {
+        ensure!(
+            policy.allows_pair(&asset_a, &asset_b),
+            "settlement currency mismatch ({} != {}) is not authorized by CrossStablecoinHedgePolicy",
+            leg_a.settlement_currency,
+            leg_b.settlement_currency
+        );
+    }
+
+    let topology = select_execution_topology_by_latency(leg_a, leg_b, dual_taker_required)?;
+    let assessment = evaluate_tail_risk(now_ms, venues, pegs, &policy.tail_risk)?;
+    let mut action = assessment.action;
+    let mut reasons: BTreeSet<String> = assessment.reasons.into_iter().collect();
+
+    if cross_stablecoin {
+        let future_limit_ms = now_ms.saturating_add(policy.tail_risk.max_future_skew_ms);
+        for asset in [asset_a, asset_b] {
+            let fresh_sources = pegs
+                .iter()
+                .filter(|sample| {
+                    normalize_currency_code(&sample.asset) == asset
+                        && sample.available_at_ms <= future_limit_ms
+                        && now_ms.saturating_sub(sample.available_at_ms)
+                            <= policy.tail_risk.max_peg_age_ms
+                })
+                .count();
+            if fresh_sources < policy.min_fresh_peg_sources_per_asset {
+                action = action.max(TailRiskAction::ReduceOnly);
+                reasons.insert(format!("insufficient_peg_quorum:{asset}"));
+            }
+        }
+    }
+
+    Ok(CrossStablecoinTopologyEvaluation {
+        topology,
+        action,
+        reasons: reasons.into_iter().collect(),
+        max_depeg_bps: assessment.max_depeg_bps,
     })
 }
 
@@ -1157,6 +1319,226 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&CapabilityAuditStatus::AccountEvidenceRequired).unwrap(),
             "\"account_evidence_required\""
+        );
+    }
+
+    #[test]
+    fn cross_stablecoin_policy_enforces_explicit_pair_quorum_depeg_breaker_and_fast_hedge_leg() {
+        use crate::strategy::tail_risk::AdlRiskLevel;
+
+        let registry = VenueRegistry::default();
+        let core_std = registry
+            .resolve_execution_capability("lighter", "standard", "equity")
+            .unwrap();
+        let rh_std = registry
+            .resolve_execution_capability("lighter_robinhood", "standard", "equity")
+            .unwrap();
+        let arcus_eq = registry
+            .resolve_execution_capability("arcus", "level_0", "equity")
+            .unwrap();
+
+        let now_ms = 1_795_200_000_000_u64;
+        let venues = [
+            VenueMarginSnapshot {
+                venue: "lighter_robinhood".into(),
+                collateral_asset: "USDG".into(),
+                equity_usd: 1_000.0,
+                margin_used_usd: 200.0,
+                liquidation_distance_bps: Some(1_000.0),
+                adl_level: AdlRiskLevel::Low,
+            },
+            VenueMarginSnapshot {
+                venue: "arcus".into(),
+                collateral_asset: "USDC".into(),
+                equity_usd: 1_000.0,
+                margin_used_usd: 200.0,
+                liquidation_distance_bps: Some(1_000.0),
+                adl_level: AdlRiskLevel::Low,
+            },
+        ];
+        let peg = |asset: &str, price_usd: f64, at_ms: u64| StablecoinPegSample {
+            asset: asset.into(),
+            price_usd,
+            available_at_ms: at_ms,
+        };
+        let healthy_pegs = [
+            peg("USDC", 1.0001, now_ms - 1_000),
+            peg("USDC", 0.9999, now_ms - 500),
+            peg("USDG", 1.0002, now_ms - 1_000),
+            peg("USDG", 0.9998, now_ms - 500),
+        ];
+        let policy = CrossStablecoinHedgePolicy {
+            allowed_pairs: vec![("USDC".into(), "USDG".into())],
+            tail_risk: TailRiskConfig::default(),
+            min_fresh_peg_sources_per_asset: 2,
+        };
+
+        // 1. Unauthorized pair (e.g. USDG/USDT) rejected fail-closed.
+        let mut usdt_leg = arcus_eq.clone();
+        usdt_leg.settlement_currency = "USDT";
+        assert!(
+            select_execution_topology_with_policy(
+                &rh_std,
+                &usdt_leg,
+                false,
+                now_ms,
+                &venues,
+                &healthy_pegs,
+                &policy,
+            )
+            .is_err()
+        );
+
+        // 2. Weak thresholds or insufficient quorum rejected in policy validation.
+        let mut loose_ro = policy.clone();
+        loose_ro.tail_risk.depeg_reduce_only_bps = 35.0;
+        assert!(
+            select_execution_topology_with_policy(
+                &rh_std,
+                &arcus_eq,
+                false,
+                now_ms,
+                &venues,
+                &healthy_pegs,
+                &loose_ro,
+            )
+            .is_err()
+        );
+        let mut loose_halt = policy.clone();
+        loose_halt.tail_risk.depeg_halt_bps = 80.0;
+        assert!(
+            select_execution_topology_with_policy(
+                &rh_std,
+                &arcus_eq,
+                false,
+                now_ms,
+                &venues,
+                &healthy_pegs,
+                &loose_halt,
+            )
+            .is_err()
+        );
+        let mut single_source = policy.clone();
+        single_source.min_fresh_peg_sources_per_asset = 1;
+        assert!(
+            select_execution_topology_with_policy(
+                &rh_std,
+                &arcus_eq,
+                false,
+                now_ms,
+                &venues,
+                &healthy_pegs,
+                &single_source,
+            )
+            .is_err()
+        );
+
+        // 3. Dual-slow Core (300ms) <-> RH (300ms) STILL fails closed even when cross-stablecoin authorized.
+        assert!(
+            select_execution_topology_with_policy(
+                &core_std,
+                &rh_std,
+                false,
+                now_ms,
+                &venues,
+                &healthy_pegs,
+                &policy,
+            )
+            .is_err()
+        );
+
+        // 4. RH (USDG, 300ms) <-> Arcus (USDC, 0ms) resolves MakerFirst and checks quorum + depeg.
+        let one_usdg_source = [
+            peg("USDC", 1.0, now_ms - 500),
+            peg("USDC", 1.0, now_ms - 100),
+            peg("USDG", 1.0, now_ms - 500),
+        ];
+        let quorum_eval = select_execution_topology_with_policy(
+            &rh_std,
+            &arcus_eq,
+            false,
+            now_ms,
+            &venues,
+            &one_usdg_source,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            quorum_eval.topology,
+            ExecutionTopology::MakerFirst {
+                maker_leg: 0,
+                hedge_leg: 1,
+            }
+        );
+        assert_eq!(quorum_eval.action, TailRiskAction::ReduceOnly);
+        assert!(!quorum_eval.allows_new_entry());
+        assert!(
+            quorum_eval
+                .reasons
+                .contains(&"insufficient_peg_quorum:USDG".to_string())
+        );
+
+        // Healthy dual-source quorum opens entries.
+        let ok_eval = select_execution_topology_with_policy(
+            &rh_std,
+            &arcus_eq,
+            false,
+            now_ms,
+            &venues,
+            &healthy_pegs,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(ok_eval.action, TailRiskAction::Normal);
+        assert!(ok_eval.allows_new_entry());
+
+        // 32 bps USDG depeg escalates to ReduceOnly.
+        let mild_depeg = [
+            peg("USDC", 1.0, now_ms - 500),
+            peg("USDC", 1.0, now_ms - 100),
+            peg("USDG", 0.9968, now_ms - 500),
+            peg("USDG", 1.0, now_ms - 100),
+        ];
+        let ro_eval = select_execution_topology_with_policy(
+            &rh_std,
+            &arcus_eq,
+            false,
+            now_ms,
+            &venues,
+            &mild_depeg,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(ro_eval.action, TailRiskAction::ReduceOnly);
+        assert!(!ro_eval.allows_new_entry());
+        assert!(
+            ro_eval
+                .reasons
+                .contains(&"stablecoin_depeg_reduce_only:USDG".to_string())
+        );
+
+        // 80 bps USDG depeg escalates to HaltAndFlatten.
+        let severe_depeg = [
+            peg("USDC", 1.0, now_ms - 500),
+            peg("USDC", 1.0, now_ms - 100),
+            peg("USDG", 0.9920, now_ms - 500),
+            peg("USDG", 0.9999, now_ms - 100),
+        ];
+        let halt_eval = select_execution_topology_with_policy(
+            &rh_std,
+            &arcus_eq,
+            false,
+            now_ms,
+            &venues,
+            &severe_depeg,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(halt_eval.action, TailRiskAction::HaltAndFlatten);
+        assert!(
+            halt_eval
+                .reasons
+                .contains(&"stablecoin_depeg_halt:USDG".to_string())
         );
     }
 }

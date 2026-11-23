@@ -1288,6 +1288,7 @@ struct Replay<'a> {
     books: Option<[Book; 2]>,
     last_reference: Option<Oracle>,
     last_equity_session: Option<EquitySession>,
+    equity_session_uncertain: bool,
     rwa_session: RwaSessionAttribution,
     saw_rwa_metadata: bool,
     usable: [bool; 2],
@@ -4694,13 +4695,48 @@ impl Replay<'_> {
         }
     }
 
+    fn admit_equity_session(&mut self, now: u64, observation: EquitySession) -> bool {
+        if !self.config.enforce_equity_session_gate
+            || self.config.pair.asset_class != AssetClass::Equity
+        {
+            self.last_equity_session = Some(observation);
+            return true;
+        }
+        if observation.observed_at_ms == 0
+            || observation.observed_at_ms > now
+            || observation.opens_at_ms >= observation.closes_at_ms
+            || observation.clear_until_ms <= observation.opens_at_ms
+        {
+            self.equity_session_uncertain = true;
+            return false;
+        }
+        if let Some(prev) = self.last_equity_session {
+            if observation.observed_at_ms < prev.observed_at_ms {
+                return false;
+            }
+            if observation.observed_at_ms == prev.observed_at_ms {
+                if observation.opens_at_ms != prev.opens_at_ms
+                    || observation.closes_at_ms != prev.closes_at_ms
+                    || observation.clear_until_ms != prev.clear_until_ms
+                    || observation.halted != prev.halted
+                {
+                    self.equity_session_uncertain = true;
+                }
+                return !self.equity_session_uncertain;
+            }
+        }
+        self.last_equity_session = Some(observation);
+        self.equity_session_uncertain = false;
+        true
+    }
+
     fn observe_rwa_frame(
         &mut self,
         now: u64,
         reference: Option<Oracle>,
         equity_session: Option<EquitySession>,
         leg_oracles: Option<[Oracle; 2]>,
-    ) {
+    ) -> Option<EquitySession> {
         if reference.is_some()
             || equity_session.is_some()
             || leg_oracles.is_some()
@@ -4711,11 +4747,14 @@ impl Replay<'_> {
         if let Some(r) = reference {
             self.last_reference = Some(r);
         }
-        if let Some(s) = equity_session {
-            self.last_equity_session = Some(s);
-        }
+        let received_session = equity_session.is_some();
+        let equity_session = equity_session.filter(|s| self.admit_equity_session(now, *s));
         if !self.saw_rwa_metadata {
-            return;
+            return if self.equity_session_uncertain {
+                None
+            } else {
+                equity_session
+            };
         }
         let any_internal = reference
             .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
@@ -4737,6 +4776,9 @@ impl Replay<'_> {
             Some(_) => {
                 self.rwa_session.extended_external_frames += 1;
             }
+            None if received_session => {
+                self.rwa_session.halted_or_uncovered_frames += 1;
+            }
             None if any_internal => {
                 self.rwa_session.off_hours_internal_or_close_frames += 1;
             }
@@ -4749,9 +4791,17 @@ impl Replay<'_> {
         {
             self.cancel(now, reason);
         }
+        if self.equity_session_uncertain {
+            None
+        } else {
+            equity_session
+        }
     }
 
     fn equity_entry_block_reason(&self, now: u64) -> Option<&'static str> {
+        if self.equity_session_uncertain {
+            return Some("equity_halt_or_ca_boundary");
+        }
         if let Some(session) = self.last_equity_session
             && (session.halted || now < session.observed_at_ms || now >= session.clear_until_ms)
         {
@@ -5576,8 +5626,9 @@ impl Replay<'_> {
                     ..
                 } => {
                     self.set_books(books, now)?;
-                    self.observe_rwa_frame(now, reference, equity_session, leg_oracles);
-                    self.observe_kalman_basis(now, reference, equity_session, leg_oracles);
+                    let admitted_session =
+                        self.observe_rwa_frame(now, reference, equity_session, leg_oracles);
+                    self.observe_kalman_basis(now, reference, admitted_session, leg_oracles);
                     book_evidence = self.classify_persistence_book(now);
                     book_frame = true;
                 }
@@ -5973,6 +6024,7 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         books: None,
         last_reference: None,
         last_equity_session: None,
+        equity_session_uncertain: false,
         rwa_session: RwaSessionAttribution::default(),
         saw_rwa_metadata: config.pair.asset_class == AssetClass::Equity,
         usable: [false; 2],

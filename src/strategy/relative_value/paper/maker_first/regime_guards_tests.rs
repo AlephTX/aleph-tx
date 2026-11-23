@@ -53,7 +53,10 @@ fn slow_cascade_throttles_opening_bid_halts_severe_drop_and_never_touches_closin
         cfg.pair.planner.max_quote_skew_ms = 5_000;
         cfg.quote_lifetime_ms = 5_000;
         cfg.hold_ms = 1_000;
-        cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+        cfg.pair
+            .legs
+            .iter_mut()
+            .for_each(|leg| leg.tick = d("0.0001"));
         cfg.slow_cascade = Some(SlowCascadeConfig {
             bar_ms,
             window_bars: 10,
@@ -114,7 +117,10 @@ fn slow_cascade_throttles_opening_bid_halts_severe_drop_and_never_touches_closin
     assert_eq!(sc_buy.active_side, CascadeSide::Downward);
     assert!(sc_buy.scaled_opening_entries > 0, "{sc_buy:?}");
     assert!(sc_buy.blocked_opening_entries > 0, "{sc_buy:?}");
-    assert_eq!(buy_rep.entry_blocked.get("slow_cascade_halt").copied(), Some(sc_buy.blocked_opening_entries));
+    assert_eq!(
+        buy_rep.entry_blocked.get("slow_cascade_halt").copied(),
+        Some(sc_buy.blocked_opening_entries)
+    );
 
     // 2. Opening Sell during the exact same downward cascade stays at 1.0x (never blocked or scaled).
     let sell_cfg = base_cfg(HedgeSide::Sell);
@@ -280,7 +286,10 @@ fn kalman_basis_gates_opening_cancels_resting_on_regime_shift_and_triggers_time_
         cfg.pair.planner.max_quote_age_ms = 5_000;
         cfg.pair.planner.max_quote_skew_ms = 5_000;
         cfg.quote_lifetime_ms = 5_000;
-        cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+        cfg.pair
+            .legs
+            .iter_mut()
+            .for_each(|leg| leg.tick = d("0.0001"));
         cfg.hedged_exit = Some(HedgedExit {
             max_hold_ms: 180_000,
             min_saving_bps: Decimal::ZERO,
@@ -362,7 +371,11 @@ fn kalman_basis_gates_opening_cancels_resting_on_regime_shift_and_triggers_time_
     sell_replay.next_quote_ms = disloc_at;
     sell_replay.quote(disloc_at).unwrap();
     let sell_kb = sell_replay.kalman_basis.as_ref().unwrap();
-    assert!(sell_kb.blocked_warmup_or_invalid > 0, "{:?}", sell_kb.report());
+    assert!(
+        sell_kb.blocked_warmup_or_invalid > 0,
+        "{:?}",
+        sell_kb.report()
+    );
     assert!(sell_kb.blocked_side_mismatch > 0, "{:?}", sell_kb.report());
 
     // 3. With Buy permitted: admits opening quote, cancels resting Buy on NonStationary trend,
@@ -385,7 +398,12 @@ fn kalman_basis_gates_opening_cancels_resting_on_regime_shift_and_triggers_time_
             buy_replay.observe_kalman_basis(at, reference, equity_session, leg_oracles);
         }
     }
-    let buy_snap_before = buy_replay.kalman_basis.as_ref().unwrap().last_snapshot.unwrap();
+    let buy_snap_before = buy_replay
+        .kalman_basis
+        .as_ref()
+        .unwrap()
+        .last_snapshot
+        .unwrap();
     assert_eq!(buy_snap_before.stationarity, StationarityStatus::Stationary);
 
     if let MakerFirstEvent::Book {
@@ -557,7 +575,10 @@ fn peer_0259_candidate_kalman_deduplicates_without_change_at_equal_cutoffs() {
     });
     cfg.pair.planner.max_quote_age_ms = 5_000;
     cfg.pair.planner.max_quote_skew_ms = 5_000;
-    cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
     let t0 = cfg.start_ms;
     let template = pair_book(&cfg, t0, 1000.5, 1000.0);
     let MakerFirstEvent::Book { books, .. } = template else {
@@ -616,7 +637,10 @@ fn peer_0259_candidate_kalman_validates_each_leg_and_preserves_gap_boundary() {
     cfg.kalman_basis = Some(KalmanBasisConfig::default());
     cfg.pair.planner.max_quote_age_ms = 500;
     cfg.pair.planner.max_quote_skew_ms = 1_000;
-    cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
     let t0 = cfg.start_ms;
     let pair = |offset| {
         let MakerFirstEvent::Book { books, .. } = pair_book(&cfg, t0 + offset, 1000.2, 1000.0)
@@ -676,7 +700,10 @@ fn peer_0259_candidate_new_session_waits_for_source_update_on_equal_stamps() {
     let mut cfg = config();
     cfg.kalman_basis = Some(KalmanBasisConfig::default());
     cfg.pair.asset_class = AssetClass::Equity;
-    cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
     let t0 = cfg.start_ms;
     let MakerFirstEvent::Book { books: first, .. } = pair_book(&cfg, t0, 1000.2, 1000.0) else {
         panic!("fixture must be a book");
@@ -704,7 +731,14 @@ fn peer_0259_candidate_new_session_waits_for_source_update_on_equal_stamps() {
     };
     replay.set_books(first, t0 + 1).unwrap();
     replay.observe_kalman_basis(t0 + 1, None, Some(session), None);
-    assert!(replay.kalman_basis.as_ref().unwrap().last_snapshot.is_none());
+    assert!(
+        replay
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .is_none()
+    );
     let MakerFirstEvent::Book { books: next, .. } = pair_book(&cfg, t0 + 2, 1000.2, 1000.0) else {
         panic!("fixture must be a book");
     };
@@ -732,7 +766,10 @@ fn slow_cascade_ignores_duplicate_source_books_and_fails_closed_on_same_ms_ambig
     });
     cfg.pair.planner.max_quote_age_ms = 200_000;
     cfg.pair.planner.max_quote_skew_ms = 200_000;
-    cfg.pair.legs.iter_mut().for_each(|leg| leg.tick = d("0.0001"));
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
 
     let t0 = cfg.start_ms;
     let MakerFirstEvent::Book { books: first, .. } = pair_book(&cfg, t0, 1000.0, 1000.0) else {
@@ -768,4 +805,211 @@ fn slow_cascade_ignores_duplicate_source_books_and_fails_closed_on_same_ms_ambig
     ambiguous[1].bids[0].price -= d("0.1");
     r.set_books(ambiguous, t0 + 160_300).unwrap();
     assert!(r.slow_cascade.as_ref().unwrap().last_decision.is_none());
+}
+
+#[test]
+fn equity_session_guard_rejects_older_conflicting_and_future_observations_and_protects_kalman() {
+    let mut cfg = config();
+    cfg.kalman_basis = Some(KalmanBasisConfig::default());
+    cfg.pair.asset_class = AssetClass::Equity;
+    cfg.enforce_equity_session_gate = true;
+    cfg.pair.oracle_max_age_ms = 60_000;
+    cfg.pair.equity_close_buffer_ms = 5_000;
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
+
+    let t0 = cfg.start_ms;
+    let oracle_at = |at_ms: u64| {
+        Some(Oracle {
+            price: d("1000"),
+            timestamp_ms: at_ms,
+            mode: OracleMode::LiveExternal,
+        })
+    };
+    let make_session = |observed_at_ms: u64, halted: bool| EquitySession {
+        observed_at_ms,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 500_000,
+        clear_until_ms: t0 + 500_000,
+        halted,
+    };
+
+    let mut replay = new_replay(&cfg).unwrap();
+    replay.feed_online = true;
+
+    // 5. Missing session initially stays blocked with equity_missing_session.
+    let MakerFirstEvent::Book { books: b0, .. } = pair_book(&cfg, t0, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b0, t0).unwrap();
+    let s0 = replay.observe_rwa_frame(t0, oracle_at(t0), None, None);
+    replay.observe_kalman_basis(t0, oracle_at(t0), s0, None);
+    assert_eq!(
+        replay.equity_entry_block_reason(t0),
+        Some("equity_missing_session")
+    );
+
+    // Admit initial halted session at t0 + 110.
+    let MakerFirstEvent::Book { books: b1, .. } = pair_book(&cfg, t0 + 110, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b1, t0 + 110).unwrap();
+    let s1 = replay.observe_rwa_frame(
+        t0 + 110,
+        oracle_at(t0 + 110),
+        Some(make_session(t0 + 110, true)),
+        None,
+    );
+    replay.observe_kalman_basis(t0 + 110, oracle_at(t0 + 110), s1, None);
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 110),
+        Some("equity_halt_or_ca_boundary")
+    );
+    assert_eq!(
+        replay
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .unwrap()
+            .regime,
+        SessionRegime::OffHours
+    );
+
+    // 1. Older non-halted observation (observed_at = t0 + 109) arriving at t0 + 111 must not clear halt or flip Kalman.
+    let MakerFirstEvent::Book { books: b2, .. } = pair_book(&cfg, t0 + 111, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b2, t0 + 111).unwrap();
+    let s2 = replay.observe_rwa_frame(
+        t0 + 111,
+        oracle_at(t0 + 111),
+        Some(make_session(t0 + 109, false)),
+        None,
+    );
+    assert!(s2.is_none());
+    replay.observe_kalman_basis(t0 + 111, oracle_at(t0 + 111), s2, None);
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 111),
+        Some("equity_halt_or_ca_boundary")
+    );
+    assert_eq!(
+        replay
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .unwrap()
+            .regime,
+        SessionRegime::OffHours
+    );
+
+    // 2. Conflicting same-timestamp observation (t0 + 110, halted=false) marks state uncertain and blocks even on duplicate replay.
+    let MakerFirstEvent::Book { books: b3, .. } = pair_book(&cfg, t0 + 112, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b3.clone(), t0 + 112).unwrap();
+    let s3 = replay.observe_rwa_frame(
+        t0 + 112,
+        oracle_at(t0 + 112),
+        Some(make_session(t0 + 110, false)),
+        None,
+    );
+    assert!(s3.is_none());
+    assert!(replay.equity_session_uncertain);
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 112),
+        Some("equity_halt_or_ca_boundary")
+    );
+
+    // 3. Future non-halted observation (t0 + 150) arriving at t0 + 113 stays blocked both at t0 + 113 and at t0 + 150 on a plain book frame.
+    let MakerFirstEvent::Book { books: b4, .. } = pair_book(&cfg, t0 + 113, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b4, t0 + 113).unwrap();
+    let s4 = replay.observe_rwa_frame(
+        t0 + 113,
+        oracle_at(t0 + 113),
+        Some(make_session(t0 + 150, false)),
+        None,
+    );
+    assert!(s4.is_none());
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 113),
+        Some("equity_halt_or_ca_boundary")
+    );
+    let MakerFirstEvent::Book { books: b5, .. } = pair_book(&cfg, t0 + 150, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b5, t0 + 150).unwrap();
+    let s5 = replay.observe_rwa_frame(t0 + 150, oracle_at(t0 + 150), None, None);
+    assert!(s5.is_none());
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 150),
+        Some("equity_halt_or_ca_boundary")
+    );
+
+    // 4. Causal valid session arriving at t0 + 151 clears uncertainty, admits RTH, and duplicate replay remains admitted.
+    let valid_150 = make_session(t0 + 150, false);
+    let MakerFirstEvent::Book { books: b6, .. } = pair_book(&cfg, t0 + 151, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b6, t0 + 151).unwrap();
+    let s6 = replay.observe_rwa_frame(t0 + 151, oracle_at(t0 + 151), Some(valid_150), None);
+    let admitted_s6 = s6.expect("valid session should be admitted");
+    assert_eq!(
+        (
+            admitted_s6.observed_at_ms,
+            admitted_s6.opens_at_ms,
+            admitted_s6.closes_at_ms,
+            admitted_s6.clear_until_ms,
+            admitted_s6.halted
+        ),
+        (
+            valid_150.observed_at_ms,
+            valid_150.opens_at_ms,
+            valid_150.closes_at_ms,
+            valid_150.clear_until_ms,
+            valid_150.halted
+        )
+    );
+    assert!(!replay.equity_session_uncertain);
+    assert_eq!(replay.equity_entry_block_reason(t0 + 151), None);
+    replay.observe_kalman_basis(t0 + 151, oracle_at(t0 + 151), s6, None);
+    assert_eq!(
+        replay
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .unwrap()
+            .regime,
+        SessionRegime::UsRth
+    );
+
+    let MakerFirstEvent::Book { books: b7, .. } = pair_book(&cfg, t0 + 152, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(b7, t0 + 152).unwrap();
+    let s7 = replay.observe_rwa_frame(t0 + 152, oracle_at(t0 + 152), Some(valid_150), None);
+    let admitted_s7 = s7.expect("duplicate valid session should stay admitted");
+    assert_eq!(
+        (
+            admitted_s7.observed_at_ms,
+            admitted_s7.opens_at_ms,
+            admitted_s7.closes_at_ms,
+            admitted_s7.clear_until_ms,
+            admitted_s7.halted
+        ),
+        (
+            valid_150.observed_at_ms,
+            valid_150.opens_at_ms,
+            valid_150.closes_at_ms,
+            valid_150.clear_until_ms,
+            valid_150.halted
+        )
+    );
+    assert_eq!(replay.equity_entry_block_reason(t0 + 152), None);
 }

@@ -189,6 +189,8 @@ pub struct Position {
     pub szi: String,
     pub entry_px: Option<String>,
     pub unrealized_pnl: String,
+    #[serde(default)]
+    pub liquidation_px: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,21 +249,37 @@ impl SharedNoncePool {
     }
 }
 
-/// Deduplicates Core collateral when aggregating isolated HIP-3 DEX states.
-pub fn aggregate_multi_dex_equity(
+fn aggregate_multi_dex_summary_field(
     core_state: &AccountState,
     dex_states: &[(&str, &AccountState)],
+    select: impl Fn(&MarginSummary) -> &str,
 ) -> Result<Decimal> {
-    let mut total: Decimal = core_state.margin_summary.account_value.parse()?;
+    let mut total: Decimal = select(&core_state.margin_summary).parse()?;
     let mut seen = HashSet::new();
     for (dex, state) in dex_states {
         let key = dex.trim().to_ascii_lowercase();
         if key.is_empty() || key == "core" || !seen.insert(key) {
             continue;
         }
-        total += state.margin_summary.account_value.parse::<Decimal>()?;
+        total += select(&state.margin_summary).parse::<Decimal>()?;
     }
     Ok(total)
+}
+
+/// Deduplicates Core collateral when aggregating isolated HIP-3 DEX states.
+pub fn aggregate_multi_dex_equity(
+    core_state: &AccountState,
+    dex_states: &[(&str, &AccountState)],
+) -> Result<Decimal> {
+    aggregate_multi_dex_summary_field(core_state, dex_states, |m| &m.account_value)
+}
+
+/// Deduplicates Core margin usage when aggregating isolated HIP-3 DEX states.
+pub fn aggregate_multi_dex_margin_used(
+    core_state: &AccountState,
+    dex_states: &[(&str, &AccountState)],
+) -> Result<Decimal> {
+    aggregate_multi_dex_summary_field(core_state, dex_states, |m| &m.total_margin_used)
 }
 
 /// A client instance owns or shares one approved API key's nonce sequence. Do

@@ -496,6 +496,67 @@ fn aggregate_multi_dex_equity_deduplicates_core_and_duplicate_dex_keys() {
     assert_eq!(total, decimal("1376.50"));
 }
 
+#[test]
+fn aggregate_multi_dex_margin_and_position_liquidation_px_deserialize_cleanly() {
+    let core: AccountState = serde_json::from_value(serde_json::json!({
+        "marginSummary": {
+            "accountValue": "1000.0",
+            "totalNtlPos": "500.0",
+            "totalMarginUsed": "120.5"
+        },
+        "assetPositions": [{
+            "position": {
+                "coin": "ETH",
+                "szi": "0.25",
+                "entryPx": "2000.0",
+                "unrealizedPnl": "5.0"
+            }
+        }],
+        "withdrawable": "879.5",
+        "time": 1_795_200_000_000_u64
+    }))
+    .unwrap();
+    let xyz_dex: AccountState = serde_json::from_value(serde_json::json!({
+        "marginSummary": {
+            "accountValue": "300.0",
+            "totalNtlPos": "200.0",
+            "totalMarginUsed": "45.25"
+        },
+        "assetPositions": [{
+            "position": {
+                "coin": "xyz:ANT",
+                "szi": "-10.0",
+                "entryPx": "20.0",
+                "unrealizedPnl": "1.0",
+                "liquidationPx": "35.5"
+            }
+        }],
+        "withdrawable": "254.75",
+        "time": 1_795_200_000_100_u64
+    }))
+    .unwrap();
+
+    assert_eq!(core.asset_positions[0].position.liquidation_px, None);
+    assert_eq!(
+        xyz_dex.asset_positions[0]
+            .position
+            .liquidation_px
+            .as_deref(),
+        Some("35.5")
+    );
+    let total_margin = aggregate_multi_dex_margin_used(
+        &core,
+        &[
+            ("", &core),
+            ("Core", &core),
+            ("xyz", &xyz_dex),
+            ("XYZ", &xyz_dex),
+        ],
+    )
+    .unwrap();
+    assert_eq!(total_margin, decimal("165.75"));
+}
+
 #[tokio::test]
 async fn shared_nonce_pool_and_warm_http_and_expiry_counter_work() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

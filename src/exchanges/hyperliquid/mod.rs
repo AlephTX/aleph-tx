@@ -12,6 +12,7 @@ mod signing;
 pub use client::{
     AccountState, AssetPosition, HyperliquidInfo, HyperliquidTrading, LocatedOrder, MarginSummary,
     OpenOrder, OrderLookup, Position, SharedNoncePool, aggregate_multi_dex_equity,
+    aggregate_multi_dex_margin_used,
 };
 pub use model::*;
 pub use signing::{HyperliquidSigner, L1Signature, action_hash};

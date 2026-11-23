@@ -19,6 +19,9 @@ use crate::live_hedge::{
     IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill, classify_lookup,
 };
 use crate::order_budget::OrderBudgetConfig;
+use crate::strategy::tail_risk::{
+    AdlRiskLevel, TailRiskAssessment, TailRiskConfig, VenueMarginSnapshot, evaluate_tail_risk,
+};
 use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -124,6 +127,8 @@ pub struct ArcusXyzBasisConfig {
     pub account_refresh_interval_ms: u64,
     #[serde(default)]
     pub order_budget: OrderBudgetConfig,
+    #[serde(default)]
+    pub tail_risk: TailRiskConfig,
     pub journal_path: PathBuf,
     pub daily_loss_state_path: PathBuf,
 }
@@ -274,6 +279,7 @@ impl ArcusXyzBasisConfig {
             "journal_path and daily_loss_state_path must be non-empty"
         );
         self.order_budget.validate()?;
+        self.tail_risk.validate()?;
         Ok(())
     }
 
@@ -1204,14 +1210,15 @@ fn arcus_sides_match(a: ArcusSide, b: ArcusSide) -> bool {
     )
 }
 
-/// Strict Hyperliquid HIP-3/Core position parser: fails closed on stale timestamp,
-/// duplicate coin entries, or malformed `szi` rather than defaulting to zero.
-pub fn parse_hl_market_position(state: &HlAccountState, coin: &str) -> Result<Decimal> {
+fn find_unique_hl_position<'a>(
+    state: &'a HlAccountState,
+    coin: &str,
+) -> Result<Option<(&'a crate::exchanges::hyperliquid::Position, Decimal)>> {
     ensure!(
         state.time > 0,
         "Hyperliquid clearinghouse state missing positive watermark time for {coin}"
     );
-    let mut found: Option<Decimal> = None;
+    let mut found = None;
     for entry in &state.asset_positions {
         if entry.position.coin == coin {
             let size = Decimal::from_str_exact(entry.position.szi.trim()).with_context(|| {
@@ -1221,12 +1228,88 @@ pub fn parse_hl_market_position(state: &HlAccountState, coin: &str) -> Result<De
                 )
             })?;
             ensure!(
-                found.replace(size).is_none(),
+                found.replace((&entry.position, size)).is_none(),
                 "duplicate Hyperliquid position entry for {coin}"
             );
         }
     }
-    Ok(found.unwrap_or(Decimal::ZERO))
+    Ok(found)
+}
+
+/// Strict Hyperliquid HIP-3/Core position parser: fails closed on stale timestamp,
+/// duplicate coin entries, or malformed `szi` rather than defaulting to zero.
+pub fn parse_hl_market_position(state: &HlAccountState, coin: &str) -> Result<Decimal> {
+    Ok(find_unique_hl_position(state, coin)?.map_or(Decimal::ZERO, |(_, size)| size))
+}
+
+/// Parses reported Hyperliquid liquidation price for `coin` when non-flat, leaving
+/// absent or null exchange values explicitly unknown (`Ok(None)`).
+pub fn parse_hl_market_liquidation_px(
+    state: &HlAccountState,
+    coin: &str,
+) -> Result<Option<Decimal>> {
+    let Some((pos, size)) = find_unique_hl_position(state, coin)? else {
+        return Ok(None);
+    };
+    if size.is_zero() {
+        return Ok(None);
+    }
+    let Some(raw) = pos.liquidation_px.as_deref() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    let px: Decimal = trimmed
+        .parse()
+        .with_context(|| format!("malformed Hyperliquid liquidationPx {raw:?} for {coin}"))?;
+    ensure!(
+        px > Decimal::ZERO,
+        "non-positive Hyperliquid liquidationPx {px} for {coin}"
+    );
+    Ok(Some(px))
+}
+
+/// Computes unsigned buffer in bps between `mid` and `liq_px`, returning `Some(0.0)`
+/// if already across liquidation and `None` when flat or `liq_px` is unknown.
+pub fn liquidation_distance_bps(
+    position: Decimal,
+    mid: Decimal,
+    liq_px: Option<Decimal>,
+) -> Option<f64> {
+    if position.is_zero() || mid <= Decimal::ZERO {
+        return None;
+    }
+    let liq = liq_px?;
+    if liq <= Decimal::ZERO {
+        return None;
+    }
+    if (position.is_sign_positive() && mid <= liq) || (position.is_sign_negative() && mid >= liq) {
+        return Some(0.0);
+    }
+    let dist = ((mid - liq).abs() / mid) * Decimal::from(10_000_u32);
+    dist.to_f64().filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Evaluates `ARB-IMP-10` tail risk for the live Hyperliquid hedge leg using
+/// authoritative clearinghouse equity, margin used, and liquidation buffer distance.
+pub fn evaluate_hl_basis_tail_risk(
+    now_ms: u64,
+    hl_equity_usd: f64,
+    hl_margin_used_usd: f64,
+    hl_liq_distance_bps: Option<f64>,
+    cfg: &TailRiskConfig,
+) -> Result<TailRiskAssessment> {
+    let snapshot = VenueMarginSnapshot {
+        venue: "hyperliquid".into(),
+        collateral_asset: "USDC".into(),
+        equity_usd: hl_equity_usd,
+        margin_used_usd: hl_margin_used_usd,
+        liquidation_distance_bps: hl_liq_distance_bps,
+        adl_level: AdlRiskLevel::Low,
+    };
+    evaluate_tail_risk(now_ms, &[snapshot], &[], cfg)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2198,6 +2281,7 @@ mod tests {
             poll_interval_ms: 250,
             account_refresh_interval_ms: 1_000,
             order_budget: OrderBudgetConfig::default(),
+            tail_risk: TailRiskConfig::default(),
             journal_path: PathBuf::from("state/test-journal.ndjson"),
             daily_loss_state_path: PathBuf::from("state/test-daily-loss.json"),
         }
@@ -2615,6 +2699,7 @@ mod tests {
                         szi: szi.into(),
                         entry_px: Some("100".into()),
                         unrealized_pnl: "0".into(),
+                        liquidation_px: None,
                     },
                 }]
             },
@@ -3648,5 +3733,88 @@ mod tests {
 
         let unknown_field = format!("{without_budget}\n[order_budget]\nunknown_key = 1\n");
         assert!(toml::from_str::<ArcusXyzBasisConfig>(&unknown_field).is_err());
+    }
+
+    #[test]
+    fn config_validates_tail_risk_defaults_and_bounds() {
+        let base_toml = include_str!("../../config.arcus_xyz_basis.example.toml");
+        let parsed: ArcusXyzBasisConfig = toml::from_str(base_toml).unwrap();
+        assert_eq!(parsed.tail_risk, TailRiskConfig::default());
+        assert!(parsed.validate().is_ok());
+
+        let without_tail = base_toml.split("[tail_risk]").next().unwrap();
+        let omitted: ArcusXyzBasisConfig = toml::from_str(without_tail).unwrap();
+        assert_eq!(omitted.tail_risk, TailRiskConfig::default());
+        assert!(omitted.validate().is_ok());
+
+        let mut bad = test_config();
+        bad.tail_risk.halt_margin_util = bad.tail_risk.reduce_only_margin_util;
+        assert!(bad.validate().is_err());
+
+        let unknown_field = format!("{without_tail}\n[tail_risk]\nunknown_key = 1\n");
+        assert!(toml::from_str::<ArcusXyzBasisConfig>(&unknown_field).is_err());
+    }
+
+    #[test]
+    fn tail_risk_supervisor_escalates_margin_and_liquidation_distance_fail_closed() {
+        use crate::strategy::tail_risk::TailRiskAction;
+
+        let cfg = TailRiskConfig::default();
+
+        // Unknown / flat liquidation_px keeps liquidation distance as None and stays Normal when margin is healthy.
+        let mut flat_state = hl_state("xyz:ANT", "0", 1_700_000_000_000);
+        assert_eq!(
+            parse_hl_market_liquidation_px(&flat_state, "xyz:ANT").unwrap(),
+            None
+        );
+        assert_eq!(
+            liquidation_distance_bps(Decimal::ZERO, d("100"), Some(d("80"))),
+            None
+        );
+        let healthy =
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, 1000.0, 200.0, None, &cfg).unwrap();
+        assert_eq!(healthy.action, TailRiskAction::Normal);
+
+        // Authoritative liquidationPx present on non-zero short position.
+        flat_state.asset_positions[0].position.szi = "-10".into();
+        flat_state.asset_positions[0].position.liquidation_px = Some("102.5".into());
+        let liq_px = parse_hl_market_liquidation_px(&flat_state, "xyz:ANT").unwrap();
+        assert_eq!(liq_px, Some(d("102.5")));
+        let dist_bps = liquidation_distance_bps(d("-10"), d("100"), liq_px).unwrap();
+        assert!((dist_bps - 250.0).abs() < 1e-6);
+
+        // <= 300 bps liquidation distance -> ReduceOnly.
+        let liq_reduce =
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, 1000.0, 200.0, Some(dist_bps), &cfg)
+                .unwrap();
+        assert_eq!(liq_reduce.action, TailRiskAction::ReduceOnly);
+        assert!(
+            liq_reduce
+                .reasons
+                .contains(&"liq_buffer_reduce_only:hyperliquid".to_string())
+        );
+
+        // >= 70% margin utilization -> ReduceOnly.
+        let margin_reduce =
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, 1000.0, 700.0, None, &cfg).unwrap();
+        assert_eq!(margin_reduce.action, TailRiskAction::ReduceOnly);
+
+        // >= 85% margin utilization -> HaltAndFlatten.
+        let margin_halt =
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, 1000.0, 850.0, None, &cfg).unwrap();
+        assert_eq!(margin_halt.action, TailRiskAction::HaltAndFlatten);
+
+        // <= 120 bps or crossed liquidation price -> 0.0 bps -> HaltAndFlatten.
+        let crossed_bps = liquidation_distance_bps(d("5"), d("99"), Some(d("100"))).unwrap();
+        assert_eq!(crossed_bps, 0.0);
+        let liq_halt =
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, 1000.0, 200.0, Some(crossed_bps), &cfg)
+                .unwrap();
+        assert_eq!(liq_halt.action, TailRiskAction::HaltAndFlatten);
+
+        // NaN inputs fail closed with Err.
+        assert!(
+            evaluate_hl_basis_tail_risk(1_700_000_000_000, f64::NAN, 200.0, None, &cfg).is_err()
+        );
     }
 }

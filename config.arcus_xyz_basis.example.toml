@@ -49,3 +49,16 @@ max_weight_per_window = 60
 entry_soft_cap_pct = 80
 cooldown_ms_on_rate_limit = 15000
 max_consecutive_rate_limits_before_halt = 5
+
+# ARB-IMP-10 cross-venue tail-risk supervisor on authoritative reported HL margin & liquidation distance.
+# Triggers ReduceOnly (blocks new entries while allowing exits/hedges) or HaltAndFlatten conservatively.
+[tail_risk]
+reduce_only_margin_util = 0.70
+halt_margin_util = 0.85
+min_liq_buffer_bps = 300.0
+halt_liq_buffer_bps = 120.0
+max_venue_equity_imbalance_ratio = 0.75
+depeg_reduce_only_bps = 30.0
+depeg_halt_bps = 75.0
+max_peg_age_ms = 60000
+max_future_skew_ms = 5000
