@@ -9,6 +9,7 @@ use aleph_tx::{
     strategy::cross_venue::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
+    strategy::cross_venue_router::simulate_midflight_jump_comparison,
     strategy::matched_settlement::MatchedSettlement,
     strategy::multiday_carry::{
         MultiDayCarryPortfolioRequest, MultiDayCarryScenario, evaluate_multiday_carry_portfolio,
@@ -361,6 +362,13 @@ async fn main() -> Result<()> {
         }
         [command] if command == "venues" => print(&registry.iter().collect::<Vec<_>>()),
         [command] if command == "capabilities" => print(&audited_execution_capabilities()),
+        [command] if command == "router-fault-bench" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&simulate_midflight_jump_comparison()?)?
+            );
+            Ok(())
+        }
         [command, venue, tier, asset_class] if command == "capability-check" => {
             print(&registry.resolve_execution_capability(venue, tier, asset_class)?)
         }
@@ -584,7 +592,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | router-fault-bench | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -781,5 +789,35 @@ mod tests {
         let mut non_unit_diag = scenario;
         non_unit_diag.corr[0][0] = 0.8;
         assert!(evaluate_portfolio_risk_scenario(&non_unit_diag).is_err());
+    }
+
+    #[test]
+    fn router_fault_bench_matches_causal_protection_invariants() {
+        use aleph_tx::venues::ExecutionTopology;
+
+        let cmp = simulate_midflight_jump_comparison().unwrap();
+        assert_eq!(
+            cmp.naive_topology,
+            ExecutionTopology::ConcurrentProtectedIoc
+        );
+        assert_eq!(
+            cmp.router_maker_topology,
+            ExecutionTopology::MakerFirst {
+                maker_leg: 1,
+                hedge_leg: 0,
+            }
+        );
+        assert_eq!(
+            cmp.router_dual_taker_topology,
+            ExecutionTopology::SlowLegFirst {
+                first_leg: 1,
+                second_leg: 0,
+            }
+        );
+        assert_eq!(cmp.naive_hl_fill_base, Decimal::from(5));
+        assert_eq!(cmp.naive_lighter_fill_base, Decimal::ZERO);
+        assert!(cmp.naive_legged_out_pnl_usd < Decimal::ZERO);
+        assert_eq!(cmp.router_maker_legged_out_pnl_usd, Decimal::ZERO);
+        assert_eq!(cmp.router_dual_taker_legged_out_pnl_usd, Decimal::ZERO);
     }
 }
