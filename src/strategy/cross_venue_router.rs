@@ -314,6 +314,7 @@ struct ActiveRouteContext {
     hedge_tick: Decimal,
     hedge_base_per_contract: Decimal,
     planned_hedge_limit_price: Decimal,
+    first_leg_filled_base: Option<Decimal>,
     hedge_intent_emitted: bool,
 }
 
@@ -556,6 +557,7 @@ impl CrossVenueExecutionRouter {
             hedge_tick: params.price_ticks[hedge_leg_index],
             hedge_base_per_contract: params.base_per_contract[hedge_leg_index],
             planned_hedge_limit_price: leg_orders[hedge_leg_index].limit_price,
+            first_leg_filled_base: None,
             hedge_intent_emitted: false,
         });
 
@@ -608,7 +610,8 @@ impl CrossVenueExecutionRouter {
     /// Process the authoritative terminal outcome of the first leg in a `MakerFirst`
     /// or `SlowLegFirst` reservation.
     ///
-    /// - Zero-fill or clean rejection releases the WAL reservation immediately.
+    /// - Zero-fill or clean rejection releases the WAL reservation before any positive fill.
+    /// - After a valid positive fill, only the exact same base quantity can retry before intent emission.
     /// - Positive confirmed fill dispatches a fast `ProtectedIoc` hedge tagged
     ///   [`OrderIntentClass::EmergencyHedge`] (never blocked by 429 cooldown/halt)
     ///   while keeping the WAL reservation active until [`Self::confirm_hedge_settled`].
@@ -641,6 +644,15 @@ impl CrossVenueExecutionRouter {
             return FollowupPlan::RejectUnverifiedTerminalState;
         }
 
+        if let Some(observed_base) = ctx.first_leg_filled_base
+            && !matches!(
+                &outcome,
+                SlowLegTerminalOutcome::Confirmed { filled_base, .. } if *filled_base == observed_base
+            )
+        {
+            return FollowupPlan::RejectUnverifiedTerminalState;
+        }
+
         match outcome {
             SlowLegTerminalOutcome::RejectedOrCancelledZeroFill => {
                 self.active_reservation = None;
@@ -659,6 +671,9 @@ impl CrossVenueExecutionRouter {
                     self.active_context = None;
                     return FollowupPlan::NoFillReleaseWal { reservation_id };
                 }
+
+                // A confirmed fill is evidence of exposure even when the hedge cannot be priced.
+                ctx.first_leg_filled_base = Some(filled_base);
 
                 let hedge_limit_price = match Self::compute_followup_hedge_limit(
                     self.config.ioc_slippage_bps,
@@ -2591,6 +2606,161 @@ mod tests {
             assert!(!settled.is_active());
             assert_eq!(settled.reservation_id, res_id);
             assert!(router.active_reservation().is_none());
+        }
+    }
+
+    #[test]
+    fn peer_first_positive_fill_preserves_wal_until_valid_same_quantity_retry() {
+        let registry = VenueRegistry::default();
+        let first = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+        let second = registry
+            .resolve_execution_capability("lighter", "standard", "crypto")
+            .unwrap();
+        let book0 = book_with_levels(
+            "SYNTH-0",
+            vec![("100.18", "10")],
+            vec![("100.20", "10")],
+            "5000",
+        );
+        let book1 = book_with_levels(
+            "SYNTH-1",
+            vec![("99.98", "10")],
+            vec![("100.00", "10")],
+            "5000",
+        );
+        let invalid = book_with_levels(
+            "SYNTH-0",
+            vec![("100.18", "0")],
+            vec![("100.20", "0.1")],
+            "10",
+        );
+
+        for dual_taker_required in [false, true] {
+            for zero_confirmed in [false, true] {
+                let [mut b0, mut b1] = default_budgets();
+                let mut router = CrossVenueExecutionRouter::new(CrossVenueRouterConfig {
+                    dual_taker_required,
+                    ..default_cfg()
+                })
+                .unwrap();
+                let params = RouteEntryParams {
+                    now_ms: NOW_MS,
+                    direction: RouteDirection::SellLeg0BuyLeg1,
+                    legs: [&first, &second],
+                    books: [&book0, &book1],
+                    base_step: dec("0.1"),
+                    base_per_contract: [Decimal::ONE, Decimal::ONE],
+                    price_ticks: [dec("0.01"), dec("0.01")],
+                    portfolio_leg_cap_usd: None,
+                    tail_risk: RouterTailRiskInput::default(),
+                };
+                let reservation = match router.plan_entry(params, [&mut b0, &mut b1]) {
+                    RouterEntryPlan::MakerFirst { reservation, .. } if !dual_taker_required => {
+                        reservation
+                    }
+                    RouterEntryPlan::SlowLegFirst { reservation, .. } if dual_taker_required => {
+                        reservation
+                    }
+                    result => panic!("expected a sequential test plan: {result:?}"),
+                };
+                let id = reservation.reservation_id;
+                let positive = SlowLegTerminalOutcome::Confirmed {
+                    filled_base: dec("2.0"),
+                    avg_fill_price: Some(dec("100")),
+                };
+                assert!(reservation.reserved_base_qty >= dec("2.0"));
+                let before = b0.used_weight(NOW_MS + 10);
+                assert_eq!(
+                    router.on_first_leg_terminal(
+                        NOW_MS + 10,
+                        id,
+                        positive.clone(),
+                        Some(&invalid),
+                        &mut b0,
+                    ),
+                    FollowupPlan::RejectUnverifiedTerminalState
+                );
+                assert_eq!(b0.used_weight(NOW_MS + 10), before);
+                assert!(router.active_reservation().is_some());
+                assert!(router.confirm_hedge_settled(id).is_err());
+
+                for conflicting in [
+                    SlowLegTerminalOutcome::RejectedOrCancelledZeroFill,
+                    SlowLegTerminalOutcome::Confirmed {
+                        filled_base: Decimal::ZERO,
+                        avg_fill_price: None,
+                    },
+                    SlowLegTerminalOutcome::Confirmed {
+                        filled_base: dec("1.5"),
+                        avg_fill_price: Some(dec("100")),
+                    },
+                    SlowLegTerminalOutcome::Confirmed {
+                        filled_base: dec("2.1"),
+                        avg_fill_price: Some(dec("100")),
+                    },
+                ] {
+                    assert_eq!(
+                        router.on_first_leg_terminal(
+                            NOW_MS + 11,
+                            id,
+                            conflicting,
+                            Some(&book0),
+                            &mut b0
+                        ),
+                        FollowupPlan::RejectUnverifiedTerminalState,
+                    );
+                    assert_eq!(router.active_reservation().unwrap().reservation_id, id);
+                    assert_eq!(b0.used_weight(NOW_MS + 11), before);
+                }
+
+                assert!(matches!(
+                    router.on_first_leg_terminal(NOW_MS + 12, id, positive.clone(), Some(&book0), &mut b0),
+                    FollowupPlan::DispatchFastHedgeIoc { hedge_order, .. } if hedge_order.size_base == dec("2.0")
+                ));
+                assert_eq!(router.active_reservation().unwrap().reservation_id, id);
+                assert_eq!(b0.used_weight(NOW_MS + 12), before + 1);
+                assert_eq!(
+                    router.on_first_leg_terminal(NOW_MS + 13, id, positive, Some(&book0), &mut b0),
+                    FollowupPlan::RejectUnverifiedTerminalState,
+                );
+                assert_eq!(b0.used_weight(NOW_MS + 13), before + 1);
+                assert!(router.confirm_hedge_settled(id + 99).is_err());
+                assert!(router.active_reservation().is_some());
+                assert!(!router.confirm_hedge_settled(id).unwrap().is_active());
+
+                let clean_id = match router.plan_entry(params, [&mut b0, &mut b1]) {
+                    RouterEntryPlan::MakerFirst { reservation, .. }
+                    | RouterEntryPlan::SlowLegFirst { reservation, .. } => {
+                        reservation.reservation_id
+                    }
+                    other => panic!("expected clean next route: {other:?}"),
+                };
+                let before_clean = b0.used_weight(NOW_MS + 14);
+                let clean = if zero_confirmed {
+                    SlowLegTerminalOutcome::Confirmed {
+                        filled_base: Decimal::ZERO,
+                        avg_fill_price: None,
+                    }
+                } else {
+                    SlowLegTerminalOutcome::RejectedOrCancelledZeroFill
+                };
+                assert_eq!(
+                    router.on_first_leg_terminal(
+                        NOW_MS + 14,
+                        clean_id,
+                        clean,
+                        Some(&book0),
+                        &mut b0
+                    ),
+                    FollowupPlan::NoFillReleaseWal {
+                        reservation_id: clean_id
+                    },
+                );
+                assert!(router.active_reservation().is_none());
+                assert_eq!(b0.used_weight(NOW_MS + 14), before_clean);
+            }
         }
     }
 }
