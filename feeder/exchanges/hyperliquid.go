@@ -1,14 +1,15 @@
 package exchanges
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -107,27 +108,356 @@ func (h *Hyperliquid) ErrorFrames() uint64 {
 	return h.errorFrames.Load()
 }
 
-type hlEnvelope struct {
-	Channel string          `json:"channel"`
-	Data    json.RawMessage `json:"data"`
+// jsonRawBorrowed aliases the raw input slice without copying; callers MUST clear
+// it to nil before returning the parent struct to a sync.Pool.
+type jsonRawBorrowed []byte
+
+func (r *jsonRawBorrowed) UnmarshalJSON(b []byte) error {
+	*r = b
+	return nil
 }
 
-type hlL2Book struct {
-	Coin   string      `json:"coin"`
-	Time   int64       `json:"time"`
-	Levels [][]hlLevel `json:"levels"`
+type hlEnvelopeBorrowed struct {
+	Channel jsonScratchString `json:"channel"`
+	Data    jsonRawBorrowed   `json:"data"`
 }
 
-type hlBBO struct {
-	Coin string     `json:"coin"`
-	Time int64      `json:"time"`
-	BBO  []*hlLevel `json:"bbo"`
+func (e *hlEnvelopeBorrowed) reset() {
+	e.Channel.reset()
+	e.Data = nil
 }
 
-type hlLevel struct {
-	Px string `json:"px"`
-	Sz string `json:"sz"`
+type hlDepthSide struct {
+	descending bool
+	count      int
+	valid      bool
+	levels     [shm.DepthLevels]shm.PriceLevel
 }
+
+func (s *hlDepthSide) reset() {
+	s.count = 0
+	s.valid = true
+	s.levels = [shm.DepthLevels]shm.PriceLevel{}
+}
+
+type hlL2Levels struct {
+	sideCount int
+	sides     [2]hlDepthSide
+	scratchPx []byte
+	scratchSz []byte
+	scratchK  []byte
+	scratchV  []byte
+}
+
+func (l *hlL2Levels) reset() {
+	l.sideCount = 0
+	l.sides[0].descending = true
+	l.sides[0].reset()
+	l.sides[1].descending = false
+	l.sides[1].reset()
+	l.scratchPx = l.scratchPx[:0]
+	l.scratchSz = l.scratchSz[:0]
+	l.scratchK = l.scratchK[:0]
+	l.scratchV = l.scratchV[:0]
+}
+
+func (l *hlL2Levels) parseObjectLevel(b []byte, i int, pxOut, szOut *[]byte, hasPx, hasSz *bool) (int, bool, bool) {
+	i = skipJSONSpace(b, i)
+	if i >= len(b) {
+		return i, false, false
+	}
+	if b[i] == 'n' && i+4 <= len(b) && string(b[i:i+4]) == "null" {
+		return i + 4, false, true
+	}
+	if b[i] != '{' {
+		return i, false, false
+	}
+	i = skipJSONSpace(b, i+1)
+	if i < len(b) && b[i] == '}' {
+		return i + 1, true, false
+	}
+	for i < len(b) {
+		key, next, ok, wrong := parseJSONStringOrNull(b, i, &l.scratchK)
+		if !ok || wrong || key == nil {
+			return i, false, false
+		}
+		i = skipJSONSpace(b, next)
+		if i >= len(b) || b[i] != ':' {
+			return i, false, false
+		}
+		i = skipJSONSpace(b, i+1)
+		if bytes.Equal(key, []byte("px")) || bytes.EqualFold(key, []byte("px")) {
+			val, nextV, okV, wrongV := parseJSONStringOrNull(b, i, &l.scratchV)
+			if !okV || wrongV {
+				return i, false, false
+			}
+			*pxOut = append((*pxOut)[:0], val...)
+			*hasPx = val != nil
+			i = nextV
+		} else if bytes.Equal(key, []byte("sz")) || bytes.EqualFold(key, []byte("sz")) {
+			val, nextV, okV, wrongV := parseJSONStringOrNull(b, i, &l.scratchV)
+			if !okV || wrongV {
+				return i, false, false
+			}
+			*szOut = append((*szOut)[:0], val...)
+			*hasSz = val != nil
+			i = nextV
+		} else {
+			nextV, okV := skipJSONValue(b, i)
+			if !okV {
+				return i, false, false
+			}
+			i = nextV
+		}
+		i = skipJSONSpace(b, i)
+		if i < len(b) && b[i] == ',' {
+			i = skipJSONSpace(b, i+1)
+			continue
+		}
+		if i < len(b) && b[i] == '}' {
+			return i + 1, true, false
+		}
+		return i, false, false
+	}
+	return i, false, false
+}
+
+func (l *hlL2Levels) UnmarshalJSON(b []byte) error {
+	l.reset()
+	b = trimJSONSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	if len(b) == 0 || b[0] != '[' {
+		return errJSONWrongType
+	}
+	i := skipJSONSpace(b, 1)
+	if i < len(b) && b[i] == ']' {
+		return nil
+	}
+	for i < len(b) {
+		i = skipJSONSpace(b, i)
+		if i >= len(b) {
+			return errJSONWrongType
+		}
+		sideIdx := l.sideCount
+		l.sideCount++
+		if sideIdx >= 2 {
+			next, ok := skipJSONValue(b, i)
+			if !ok {
+				return errJSONWrongType
+			}
+			i = next
+			goto nextSide
+		}
+		if b[i] == 'n' && i+4 <= len(b) && string(b[i:i+4]) == "null" {
+			i += 4
+			goto nextSide
+		}
+		if b[i] != '[' {
+			return errJSONWrongType
+		}
+		i = skipJSONSpace(b, i+1)
+		if i < len(b) && b[i] == ']' {
+			i++
+			goto nextSide
+		}
+		for i < len(b) {
+			var hasPx, hasSz bool
+			l.scratchPx = l.scratchPx[:0]
+			l.scratchSz = l.scratchSz[:0]
+			next, ok, isNull := l.parseObjectLevel(b, i, &l.scratchPx, &l.scratchSz, &hasPx, &hasSz)
+			if isNull {
+				l.sides[sideIdx].valid = false
+				l.sides[sideIdx].count = 0
+			} else if !ok {
+				return errJSONWrongType
+			} else if l.sides[sideIdx].valid && l.sides[sideIdx].count < shm.DepthLevels {
+				side := &l.sides[sideIdx]
+				px, errPx := parseFloatBytes(l.scratchPx)
+				sz, errSz := parseFloatBytes(l.scratchSz)
+				if !hasPx || !hasSz || errPx != nil || errSz != nil ||
+					math.IsNaN(px) || math.IsInf(px, 0) ||
+					math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz < 0 {
+					side.valid = false
+					side.count = 0
+				} else if sz > 0 {
+					if side.count > 0 {
+						prev := side.levels[side.count-1].Price
+						if (side.descending && px >= prev) || (!side.descending && px <= prev) {
+							side.valid = false
+							side.count = 0
+							goto nextLevel
+						}
+					}
+					side.levels[side.count] = shm.PriceLevel{Price: px, Size: sz}
+					side.count++
+				}
+			}
+		nextLevel:
+			i = skipJSONSpace(b, next)
+			if i < len(b) && b[i] == ',' {
+				i = skipJSONSpace(b, i+1)
+				continue
+			}
+			if i < len(b) && b[i] == ']' {
+				i++
+				break
+			}
+			return errJSONWrongType
+		}
+
+	nextSide:
+		i = skipJSONSpace(b, i)
+		if i < len(b) && b[i] == ',' {
+			i = skipJSONSpace(b, i+1)
+			continue
+		}
+		if i < len(b) && b[i] == ']' {
+			return nil
+		}
+		return errJSONWrongType
+	}
+	return errJSONWrongType
+}
+
+type hlL2BookPooled struct {
+	Coin   jsonScratchString `json:"coin"`
+	Time   int64             `json:"time"`
+	Levels hlL2Levels        `json:"levels"`
+}
+
+func (b *hlL2BookPooled) reset() {
+	b.Coin.reset()
+	b.Time = 0
+	b.Levels.reset()
+}
+
+type hlBBOArray struct {
+	len       int
+	present   [2]bool
+	px        [2][]byte
+	sz        [2][]byte
+	scratchK  []byte
+	scratchV  []byte
+	levelHelp hlL2Levels
+}
+
+func (a *hlBBOArray) reset() {
+	a.len = 0
+	a.present = [2]bool{}
+	a.px[0] = a.px[0][:0]
+	a.px[1] = a.px[1][:0]
+	a.sz[0] = a.sz[0][:0]
+	a.sz[1] = a.sz[1][:0]
+	a.scratchK = a.scratchK[:0]
+	a.scratchV = a.scratchV[:0]
+}
+
+func (a *hlBBOArray) UnmarshalJSON(b []byte) error {
+	a.reset()
+	b = trimJSONSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	if len(b) == 0 || b[0] != '[' {
+		return errJSONWrongType
+	}
+	i := skipJSONSpace(b, 1)
+	if i < len(b) && b[i] == ']' {
+		return nil
+	}
+	for i < len(b) {
+		i = skipJSONSpace(b, i)
+		if i >= len(b) {
+			return errJSONWrongType
+		}
+		idx := a.len
+		a.len++
+		if idx < 2 {
+			var hasPx, hasSz bool
+			next, ok, isNull := a.levelHelp.parseObjectLevel(b, i, &a.px[idx], &a.sz[idx], &hasPx, &hasSz)
+			if isNull {
+				a.present[idx] = false
+			} else if !ok {
+				return errJSONWrongType
+			} else {
+				a.present[idx] = true
+			}
+			i = next
+		} else {
+			next, ok := skipJSONValue(b, i)
+			if !ok {
+				return errJSONWrongType
+			}
+			i = next
+		}
+		i = skipJSONSpace(b, i)
+		if i < len(b) && b[i] == ',' {
+			i = skipJSONSpace(b, i+1)
+			continue
+		}
+		if i < len(b) && b[i] == ']' {
+			return nil
+		}
+		return errJSONWrongType
+	}
+	return errJSONWrongType
+}
+
+type hlBBOPooled struct {
+	Coin jsonScratchString `json:"coin"`
+	Time int64             `json:"time"`
+	BBO  hlBBOArray        `json:"bbo"`
+}
+
+func (e *hlBBOPooled) reset() {
+	e.Coin.reset()
+	e.Time = 0
+	e.BBO.reset()
+}
+
+var (
+	hlEnvPool = sync.Pool{
+		New: func() any {
+			return &hlEnvelopeBorrowed{
+				Channel: make([]byte, 0, 24),
+			}
+		},
+	}
+	hlL2Pool = sync.Pool{
+		New: func() any {
+			b := &hlL2BookPooled{
+				Coin: make([]byte, 0, 24),
+			}
+			b.Levels.scratchPx = make([]byte, 0, 32)
+			b.Levels.scratchSz = make([]byte, 0, 32)
+			b.Levels.scratchK = make([]byte, 0, 16)
+			b.Levels.scratchV = make([]byte, 0, 32)
+			b.Levels.reset()
+			return b
+		},
+	}
+	hlBBOPool = sync.Pool{
+		New: func() any {
+			ev := &hlBBOPooled{
+				Coin: make([]byte, 0, 24),
+			}
+			ev.BBO.px[0] = make([]byte, 0, 32)
+			ev.BBO.px[1] = make([]byte, 0, 32)
+			ev.BBO.sz[0] = make([]byte, 0, 32)
+			ev.BBO.sz[1] = make([]byte, 0, 32)
+			ev.BBO.scratchK = make([]byte, 0, 16)
+			ev.BBO.scratchV = make([]byte, 0, 32)
+			ev.BBO.levelHelp.scratchK = make([]byte, 0, 16)
+			ev.BBO.levelHelp.scratchV = make([]byte, 0, 32)
+			return ev
+		},
+	}
+	hlChannelL2Book = []byte("l2Book")
+	hlChannelBBO    = []byte("bbo")
+	hlChannelError  = []byte("error")
+)
 
 func (h *Hyperliquid) invalidateBBO(target hlTarget) {
 	if h.matrix != nil {
@@ -208,12 +538,21 @@ func (h *Hyperliquid) connect(ctx context.Context, lastBboPub, lastDepthPub map[
 	stopKeepalive := wsutil.StartKeepalive(ctx, "hyperliquid", c, 15*time.Second, []byte(`{"method":"ping"}`))
 	defer stopKeepalive()
 
+	var frameBuf bytes.Buffer
+	frameBuf.Grow(4096)
 	for {
-		var raw json.RawMessage
-		if err := wsjson.Read(ctx, c, &raw); err != nil {
+		msgType, r, err := c.Reader(ctx)
+		if err != nil {
 			return err
 		}
-		if err := h.handleMessageWithDepth(raw, time.Now(), lastBboPub, lastDepthPub); err != nil {
+		if msgType != websocket.MessageText && msgType != websocket.MessageBinary {
+			continue
+		}
+		frameBuf.Reset()
+		if _, err := frameBuf.ReadFrom(r); err != nil {
+			return err
+		}
+		if err := h.handleMessageWithDepth(frameBuf.Bytes(), time.Now(), lastBboPub, lastDepthPub); err != nil {
 			return err
 		}
 	}
@@ -228,16 +567,22 @@ func (h *Hyperliquid) handleMessageWithDepth(
 	now time.Time,
 	lastBboPub, lastDepthPub map[hlTarget]int64,
 ) error {
-	var env hlEnvelope
-	if json.Unmarshal(raw, &env) != nil {
+	env := hlEnvPool.Get().(*hlEnvelopeBorrowed)
+	env.reset()
+	defer func() {
+		env.reset()
+		hlEnvPool.Put(env)
+	}()
+
+	if json.Unmarshal(raw, env) != nil {
 		return nil
 	}
-	switch env.Channel {
-	case "l2Book":
+	switch {
+	case bytes.Equal(env.Channel, hlChannelL2Book):
 		return h.handleL2Book(env.Data, now, lastBboPub, lastDepthPub)
-	case "bbo":
+	case bytes.Equal(env.Channel, hlChannelBBO):
 		return h.handleBBO(env.Data, now, lastBboPub)
-	case "error":
+	case bytes.Equal(env.Channel, hlChannelError):
 		count := h.errorFrames.Add(1)
 		log.Printf("hyperliquid: server error frame (count=%d): %s", count, sanitizeHyperliquidErrorData(env.Data))
 		return nil
@@ -246,7 +591,7 @@ func (h *Hyperliquid) handleMessageWithDepth(
 	}
 }
 
-func sanitizeHyperliquidErrorData(raw json.RawMessage) string {
+func sanitizeHyperliquidErrorData(raw []byte) string {
 	var msg string
 	if json.Unmarshal(raw, &msg) != nil {
 		msg = string(raw)
@@ -264,21 +609,27 @@ func sanitizeHyperliquidErrorData(raw json.RawMessage) string {
 }
 
 func (h *Hyperliquid) handleL2Book(
-	data json.RawMessage,
+	data []byte,
 	now time.Time,
 	lastBboPub, lastDepthPub map[hlTarget]int64,
 ) error {
-	var book hlL2Book
-	if json.Unmarshal(data, &book) != nil {
+	book := hlL2Pool.Get().(*hlL2BookPooled)
+	book.reset()
+	defer func() {
+		book.reset()
+		hlL2Pool.Put(book)
+	}()
+
+	if json.Unmarshal(data, book) != nil {
 		return nil
 	}
 
-	target, ok := h.symMap[book.Coin]
-	if !ok || len(book.Levels) < 2 || book.Time <= 0 {
+	target, ok := h.symMap[book.Coin.asString()]
+	if !ok || book.Levels.sideCount < 2 || book.Time <= 0 {
 		return nil
 	}
 	if book.Time > now.Add(time.Second).UnixMilli() {
-		return fmt.Errorf("market %s: future book timestamp", book.Coin)
+		return fmt.Errorf("market %s: future book timestamp", string(book.Coin))
 	}
 	// Evaluate both streams before updating so aliased test maps work consistently.
 	bboFresh := book.Time > lastBboPub[target]
@@ -288,9 +639,11 @@ func (h *Hyperliquid) handleL2Book(
 		return nil
 	}
 
-	bids, bidCount, bidOK := parseHyperliquidDepth(book.Levels[0], true)
-	asks, askCount, askOK := parseHyperliquidDepth(book.Levels[1], false)
-	if !bidOK || !askOK || bidCount == 0 || askCount == 0 || bids[0].Price >= asks[0].Price {
+	bidSide := &book.Levels.sides[0]
+	askSide := &book.Levels.sides[1]
+	bids := bidSide.levels
+	asks := askSide.levels
+	if !bidSide.valid || !askSide.valid || bidSide.count == 0 || askSide.count == 0 || bids[0].Price >= asks[0].Price {
 		// Explicit invalid/crossed book at the same or newer source ms must still
 		// fail-closed clear Matrix BBO regardless of l2Book vs bbo delivery order.
 		if bboEqualOrNewer {
@@ -322,28 +675,34 @@ func (h *Hyperliquid) handleL2Book(
 }
 
 func (h *Hyperliquid) handleBBO(
-	data json.RawMessage,
+	data []byte,
 	now time.Time,
 	lastBboPub map[hlTarget]int64,
 ) error {
-	var ev hlBBO
-	if json.Unmarshal(data, &ev) != nil {
+	ev := hlBBOPool.Get().(*hlBBOPooled)
+	ev.reset()
+	defer func() {
+		ev.reset()
+		hlBBOPool.Put(ev)
+	}()
+
+	if json.Unmarshal(data, ev) != nil {
 		return nil
 	}
-	target, ok := h.symMap[ev.Coin]
-	if !ok || len(ev.BBO) != 2 || ev.Time <= 0 || ev.Time < lastBboPub[target] {
+	target, ok := h.symMap[ev.Coin.asString()]
+	if !ok || ev.BBO.len != 2 || ev.Time <= 0 || ev.Time < lastBboPub[target] {
 		return nil
 	}
 	if ev.Time > now.Add(time.Second).UnixMilli() {
-		return fmt.Errorf("market %s: future bbo timestamp", ev.Coin)
+		return fmt.Errorf("market %s: future bbo timestamp", string(ev.Coin))
 	}
-	if ev.BBO[0] == nil || ev.BBO[1] == nil {
+	if !ev.BBO.present[0] || !ev.BBO.present[1] {
 		h.invalidateBBO(target)
 		lastBboPub[target] = ev.Time
 		return nil
 	}
-	bidPx, bidSz, bidOK := parsePositiveLevel(*ev.BBO[0])
-	askPx, askSz, askOK := parsePositiveLevel(*ev.BBO[1])
+	bidPx, bidSz, bidOK := parsePositiveLevelBytes(ev.BBO.px[0], ev.BBO.sz[0])
+	askPx, askSz, askOK := parsePositiveLevelBytes(ev.BBO.px[1], ev.BBO.sz[1])
 	if !bidOK || !askOK || bidPx >= askPx {
 		h.invalidateBBO(target)
 		lastBboPub[target] = ev.Time
@@ -362,42 +721,12 @@ func (h *Hyperliquid) handleBBO(
 	return nil
 }
 
-func parsePositiveLevel(lv hlLevel) (float64, float64, bool) {
-	px, errPx := strconv.ParseFloat(lv.Px, 64)
-	sz, errSz := strconv.ParseFloat(lv.Sz, 64)
+func parsePositiveLevelBytes(pxBytes, szBytes []byte) (float64, float64, bool) {
+	px, errPx := parseFloatBytes(pxBytes)
+	sz, errSz := parseFloatBytes(szBytes)
 	if errPx != nil || errSz != nil || math.IsNaN(px) || math.IsInf(px, 0) ||
 		math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz <= 0 {
 		return 0, 0, false
 	}
 	return px, sz, true
-}
-
-func parseHyperliquidDepth(raw []hlLevel, descending bool) ([shm.DepthLevels]shm.PriceLevel, int, bool) {
-	var out [shm.DepthLevels]shm.PriceLevel
-	count := 0
-	for _, lv := range raw {
-		if count >= shm.DepthLevels {
-			break
-		}
-		px, errPx := strconv.ParseFloat(lv.Px, 64)
-		sz, errSz := strconv.ParseFloat(lv.Sz, 64)
-		if errPx != nil || errSz != nil || math.IsNaN(px) || math.IsInf(px, 0) ||
-			math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz < 0 {
-			return out, 0, false
-		}
-		if sz == 0 {
-			continue
-		}
-		if count > 0 {
-			if descending && px >= out[count-1].Price {
-				return out, 0, false
-			}
-			if !descending && px <= out[count-1].Price {
-				return out, 0, false
-			}
-		}
-		out[count] = shm.PriceLevel{Price: px, Size: sz}
-		count++
-	}
-	return out, count, true
 }

@@ -1,14 +1,18 @@
 package exchanges
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
 	"github.com/AlephTX/aleph-tx/feeder/internal/wsutil"
@@ -35,17 +39,300 @@ func NewArcus(cfg config.ExchangeConfig, matrix *shm.Matrix, depthWriter *shm.De
 	}
 }
 
+var errJSONWrongType = errors.New("unexpected JSON token type")
+
+// jsonScratchString decodes JSON strings into a reusable byte buffer to avoid
+// per-message heap string allocations on pooled message structs.
+type jsonScratchString []byte
+
+func (s *jsonScratchString) reset() {
+	*s = (*s)[:0]
+}
+
+func (s *jsonScratchString) asString() string {
+	if len(*s) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(*s), len(*s))
+}
+
+func (s *jsonScratchString) UnmarshalJSON(b []byte) error {
+	b = trimJSONSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		*s = (*s)[:0]
+		return nil
+	}
+	if len(b) < 2 || b[0] != '"' || b[len(b)-1] != '"' {
+		return errJSONWrongType
+	}
+	inner := b[1 : len(b)-1]
+	if bytes.IndexByte(inner, '\\') < 0 {
+		*s = append((*s)[:0], inner...)
+		return nil
+	}
+	var decoded string
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		return err
+	}
+	*s = append((*s)[:0], decoded...)
+	return nil
+}
+
+func parseFloatBytes(b []byte) (float64, error) {
+	if len(b) == 0 {
+		return 0, strconv.ErrSyntax
+	}
+	return strconv.ParseFloat(unsafe.String(unsafe.SliceData(b), len(b)), 64)
+}
+
+func trimJSONSpace(b []byte) []byte {
+	start := 0
+	for start < len(b) && isJSONSpace(b[start]) {
+		start++
+	}
+	end := len(b)
+	for end > start && isJSONSpace(b[end-1]) {
+		end--
+	}
+	return b[start:end]
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+func skipJSONSpace(b []byte, i int) int {
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	return i
+}
+
+func scanJSONStringEnd(b []byte, start int) (int, bool, bool) {
+	hasEscape := false
+	for i := start + 1; i < len(b); i++ {
+		if b[i] == '\\' {
+			hasEscape = true
+			i++
+			continue
+		}
+		if b[i] == '"' {
+			return i, hasEscape, true
+		}
+	}
+	return 0, false, false
+}
+
+func parseJSONStringOrNull(b []byte, i int, scratch *[]byte) ([]byte, int, bool, bool) {
+	i = skipJSONSpace(b, i)
+	if i >= len(b) {
+		return nil, i, false, false
+	}
+	if b[i] == 'n' && i+4 <= len(b) && string(b[i:i+4]) == "null" {
+		return nil, i + 4, true, false
+	}
+	if b[i] != '"' {
+		return nil, i, false, true
+	}
+	end, hasEscape, ok := scanJSONStringEnd(b, i)
+	if !ok {
+		return nil, i, false, true
+	}
+	if !hasEscape {
+		return b[i+1 : end], end + 1, true, false
+	}
+	var decoded string
+	if err := json.Unmarshal(b[i:end+1], &decoded); err != nil {
+		return nil, i, false, true
+	}
+	*scratch = append((*scratch)[:0], decoded...)
+	return *scratch, end + 1, true, false
+}
+
+func skipJSONValue(b []byte, i int) (int, bool) {
+	i = skipJSONSpace(b, i)
+	if i >= len(b) {
+		return i, false
+	}
+	switch b[i] {
+	case '"':
+		end, _, ok := scanJSONStringEnd(b, i)
+		if !ok {
+			return i, false
+		}
+		return end + 1, true
+	case '{', '[':
+		depth := 0
+		for i < len(b) {
+			switch b[i] {
+			case '"':
+				end, _, ok := scanJSONStringEnd(b, i)
+				if !ok {
+					return i, false
+				}
+				i = end + 1
+				continue
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+			i++
+		}
+		return i, false
+	default:
+		start := i
+		for i < len(b) && !isJSONSpace(b[i]) && b[i] != ',' && b[i] != ']' && b[i] != '}' {
+			i++
+		}
+		return i, i > start
+	}
+}
+
+type arcusDepthSide struct {
+	descending bool
+	rawLen     int
+	count      int
+	valid      bool
+	levels     [shm.DepthLevels]shm.PriceLevel
+	scratchPx  []byte
+	scratchSz  []byte
+}
+
+func (s *arcusDepthSide) reset() {
+	s.rawLen = 0
+	s.count = 0
+	s.valid = true
+	s.levels = [shm.DepthLevels]shm.PriceLevel{}
+	s.scratchPx = s.scratchPx[:0]
+	s.scratchSz = s.scratchSz[:0]
+}
+
+func (s *arcusDepthSide) UnmarshalJSON(b []byte) error {
+	s.reset()
+	b = trimJSONSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	if len(b) == 0 || b[0] != '[' {
+		return errJSONWrongType
+	}
+	i := skipJSONSpace(b, 1)
+	if i < len(b) && b[i] == ']' {
+		return nil
+	}
+	for i < len(b) {
+		i = skipJSONSpace(b, i)
+		if i >= len(b) {
+			return errJSONWrongType
+		}
+		if b[i] != '[' {
+			return errJSONWrongType
+		}
+		s.rawLen++
+		j := skipJSONSpace(b, i+1)
+		var pxBytes, szBytes []byte
+		if j < len(b) && b[j] != ']' {
+			var ok, wrong bool
+			pxBytes, j, ok, wrong = parseJSONStringOrNull(b, j, &s.scratchPx)
+			if wrong || !ok {
+				return errJSONWrongType
+			}
+			j = skipJSONSpace(b, j)
+			if j < len(b) && b[j] == ',' {
+				j = skipJSONSpace(b, j+1)
+				szBytes, j, ok, wrong = parseJSONStringOrNull(b, j, &s.scratchSz)
+				if wrong || !ok {
+					return errJSONWrongType
+				}
+				j = skipJSONSpace(b, j)
+				for j < len(b) && b[j] == ',' {
+					j = skipJSONSpace(b, j+1)
+					j, ok = skipJSONValue(b, j)
+					if !ok {
+						return errJSONWrongType
+					}
+					j = skipJSONSpace(b, j)
+				}
+			}
+		}
+		if j >= len(b) || b[j] != ']' {
+			return errJSONWrongType
+		}
+		i = j + 1
+
+		if s.valid && s.count < shm.DepthLevels {
+			px, errPx := parseFloatBytes(pxBytes)
+			sz, errSz := parseFloatBytes(szBytes)
+			if errPx != nil || errSz != nil || math.IsNaN(px) || math.IsInf(px, 0) ||
+				math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz < 0 {
+				s.valid = false
+				s.count = 0
+			} else if sz > 0 {
+				if s.count > 0 {
+					prev := s.levels[s.count-1].Price
+					if (s.descending && px >= prev) || (!s.descending && px <= prev) {
+						s.valid = false
+						s.count = 0
+						goto nextElem
+					}
+				}
+				s.levels[s.count] = shm.PriceLevel{Price: px, Size: sz}
+				s.count++
+			}
+		}
+
+	nextElem:
+		i = skipJSONSpace(b, i)
+		if i < len(b) && b[i] == ',' {
+			i++
+			continue
+		}
+		if i < len(b) && b[i] == ']' {
+			return nil
+		}
+		return errJSONWrongType
+	}
+	return errJSONWrongType
+}
+
 type arcusEnvelope struct {
-	Type     string        `json:"type"`
-	Channel  string        `json:"channel"`
-	ID       string        `json:"id"`
-	Contents arcusBookBody `json:"contents"`
+	Type     jsonScratchString `json:"type"`
+	Channel  jsonScratchString `json:"channel"`
+	ID       jsonScratchString `json:"id"`
+	Contents arcusBookBody     `json:"contents"`
 }
 
 type arcusBookBody struct {
-	Timestamp int64       `json:"timestamp"`
-	Bids      [][2]string `json:"bids"`
-	Asks      [][2]string `json:"asks"`
+	Timestamp int64          `json:"timestamp"`
+	Bids      arcusDepthSide `json:"bids"`
+	Asks      arcusDepthSide `json:"asks"`
+}
+
+func (e *arcusEnvelope) reset() {
+	e.Type.reset()
+	e.Channel.reset()
+	e.ID.reset()
+	e.Contents.Timestamp = 0
+	e.Contents.Bids.reset()
+	e.Contents.Asks.reset()
+}
+
+var arcusEnvelopePool = sync.Pool{
+	New: func() any {
+		return &arcusEnvelope{
+			Type:    make([]byte, 0, 24),
+			Channel: make([]byte, 0, 24),
+			ID:      make([]byte, 0, 24),
+			Contents: arcusBookBody{
+				Bids: arcusDepthSide{descending: true, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
+				Asks: arcusDepthSide{descending: false, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
+			},
+		}
+	},
 }
 
 func (a *Arcus) Run(ctx context.Context) error {
@@ -104,26 +391,48 @@ func (a *Arcus) connect(ctx context.Context, lastPublicationUs map[uint16]int64)
 	stopKeepalive := wsutil.StartKeepalive(ctx, "arcus", c, 15*time.Second, nil)
 	defer stopKeepalive()
 
+	var frameBuf bytes.Buffer
+	frameBuf.Grow(4096)
 	for {
-		var raw json.RawMessage
-		if err := wsjson.Read(ctx, c, &raw); err != nil {
+		msgType, r, err := c.Reader(ctx)
+		if err != nil {
 			return err
 		}
-		if err := a.handleMessage(raw, time.Now(), lastPublicationUs); err != nil {
+		if msgType != websocket.MessageText && msgType != websocket.MessageBinary {
+			continue
+		}
+		frameBuf.Reset()
+		if _, err := frameBuf.ReadFrom(r); err != nil {
+			return err
+		}
+		if err := a.handleMessage(frameBuf.Bytes(), time.Now(), lastPublicationUs); err != nil {
 			return err
 		}
 	}
 }
 
+var (
+	arcusChannelBytes    = []byte("l2Orderbook")
+	arcusTypeSubscribed  = []byte("subscribed")
+	arcusTypeChannelData = []byte("channel_data")
+)
+
 func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[uint16]int64) error {
-	var env arcusEnvelope
-	if json.Unmarshal(raw, &env) != nil {
+	env := arcusEnvelopePool.Get().(*arcusEnvelope)
+	env.reset()
+	defer func() {
+		env.reset()
+		arcusEnvelopePool.Put(env)
+	}()
+
+	if json.Unmarshal(raw, env) != nil {
 		return nil
 	}
-	if env.Channel != "l2Orderbook" || (env.Type != "subscribed" && env.Type != "channel_data") {
+	if !bytes.Equal(env.Channel, arcusChannelBytes) ||
+		(!bytes.Equal(env.Type, arcusTypeSubscribed) && !bytes.Equal(env.Type, arcusTypeChannelData)) {
 		return nil
 	}
-	symID, ok := a.symMap[env.ID]
+	symID, ok := a.symMap[env.ID.asString()]
 	if !ok {
 		return nil
 	}
@@ -132,26 +441,29 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[u
 		return nil
 	}
 	if tsUs > now.Add(time.Second).UnixMicro() {
-		return fmt.Errorf("market %s: future book timestamp %d", env.ID, tsUs)
+		return fmt.Errorf("market %s: future book timestamp %d", string(env.ID), tsUs)
 	}
-	if len(env.Contents.Bids) == 0 || len(env.Contents.Asks) == 0 {
+	if env.Contents.Bids.rawLen == 0 || env.Contents.Asks.rawLen == 0 {
 		a.invalidateBook(symID)
 		return nil
 	}
 
-	bids, bidCount, ok := parseArcusDepth(env.Contents.Bids, true)
-	if !ok {
+	if !env.Contents.Bids.valid {
 		a.invalidateBook(symID)
-		return fmt.Errorf("market %s: malformed bid ladder", env.ID)
+		return fmt.Errorf("market %s: malformed bid ladder", string(env.ID))
 	}
-	asks, askCount, ok := parseArcusDepth(env.Contents.Asks, false)
-	if !ok {
+	if !env.Contents.Asks.valid {
 		a.invalidateBook(symID)
-		return fmt.Errorf("market %s: malformed ask ladder", env.ID)
+		return fmt.Errorf("market %s: malformed ask ladder", string(env.ID))
 	}
+
+	bids := env.Contents.Bids.levels
+	asks := env.Contents.Asks.levels
+	bidCount := env.Contents.Bids.count
+	askCount := env.Contents.Asks.count
 	if bidCount == 0 || askCount == 0 || bids[0].Price >= asks[0].Price {
 		a.invalidateBook(symID)
-		return fmt.Errorf("market %s: crossed or empty top-of-book", env.ID)
+		return fmt.Errorf("market %s: crossed or empty top-of-book", string(env.ID))
 	}
 
 	tsNs := uint64(tsUs) * 1_000 // us -> ns
@@ -163,34 +475,4 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[u
 	}
 	lastPublicationUs[symID] = tsUs
 	return nil
-}
-
-func parseArcusDepth(raw [][2]string, descending bool) ([shm.DepthLevels]shm.PriceLevel, int, bool) {
-	var out [shm.DepthLevels]shm.PriceLevel
-	count := 0
-	for _, pair := range raw {
-		if count >= shm.DepthLevels {
-			break
-		}
-		px, errPx := strconv.ParseFloat(pair[0], 64)
-		sz, errSz := strconv.ParseFloat(pair[1], 64)
-		if errPx != nil || errSz != nil || math.IsNaN(px) || math.IsInf(px, 0) ||
-			math.IsNaN(sz) || math.IsInf(sz, 0) || px <= 0 || sz < 0 {
-			return out, 0, false
-		}
-		if sz == 0 {
-			continue
-		}
-		if count > 0 {
-			if descending && px >= out[count-1].Price {
-				return out, 0, false
-			}
-			if !descending && px <= out[count-1].Price {
-				return out, 0, false
-			}
-		}
-		out[count] = shm.PriceLevel{Price: px, Size: sz}
-		count++
-	}
-	return out, count, true
 }
