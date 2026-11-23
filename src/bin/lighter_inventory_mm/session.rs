@@ -640,7 +640,8 @@ pub(super) async fn launch(
         .filter(|val| !val.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/dev/shm"));
-    let mut session = Session::new(Path::new("pids"), &ipc_root)?;
+    let state_dir = Path::new("pids");
+    let mut session = Session::new(state_dir, &ipc_root)?;
     let feeder_config = session.ipc.join("config.toml");
     if let Err(error) = fs::write(&feeder_config, profile.feeder_config) {
         session.discard_unstarted()?;
@@ -663,7 +664,9 @@ pub(super) async fn launch(
         async {
             let symbol = profile.symbol.as_str();
             let mut trading =
-                LighterTrading::with_credentials(profile.strategy.market_id, credentials).await?;
+                LighterTrading::with_credentials(profile.strategy.market_id, credentials)
+                    .await?
+                    .with_nonce_high_water_dir(state_dir)?;
             trading.validate_symbol(symbol)?;
             trading.validate_precision(profile.strategy.tick_size, profile.strategy.step_size)?;
             trading.set_supervised_quote_expiry();

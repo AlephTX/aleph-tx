@@ -568,7 +568,9 @@ pub fn cancel_order_intent_digest(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NonceHighWaterRecord {
+    chain_id: i32,
     api_key_index: i64,
     highest_committed_nonce: i64,
 }
@@ -578,6 +580,7 @@ struct NonceHighWaterRecord {
 #[derive(Debug)]
 pub struct NonceReuseWatchdog {
     lane_name: &'static str,
+    chain_id: i32,
     api_key_index: i64,
     highest_committed_nonce: Option<i64>,
     pending: BTreeMap<i64, [u8; 32]>,
@@ -588,8 +591,13 @@ pub struct NonceReuseWatchdog {
 
 impl NonceReuseWatchdog {
     pub fn new(lane_name: &'static str, api_key_index: i64) -> Self {
+        Self::new_for_chain(lane_name, 304, api_key_index)
+    }
+
+    pub fn new_for_chain(lane_name: &'static str, chain_id: i32, api_key_index: i64) -> Self {
         Self {
             lane_name,
+            chain_id,
             api_key_index,
             highest_committed_nonce: None,
             pending: BTreeMap::new(),
@@ -597,6 +605,11 @@ impl NonceReuseWatchdog {
             high_water_path: None,
             released_unconsumed_count: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_chain_id(&mut self, chain_id: i32) {
+        self.chain_id = chain_id;
     }
 
     pub fn attach_high_water_path(&mut self, path: PathBuf) -> Result<()> {
@@ -610,6 +623,13 @@ impl NonceReuseWatchdog {
             Ok(contents) => {
                 let record: NonceHighWaterRecord = serde_json::from_str(&contents)
                     .map_err(|e| anyhow::anyhow!("Corrupt nonce high-water file: {e}"))?;
+                anyhow::ensure!(
+                    record.chain_id == self.chain_id,
+                    "Nonce high-water file chain_id={} mismatches {} lane chain_id={}",
+                    record.chain_id,
+                    self.lane_name,
+                    self.chain_id
+                );
                 anyhow::ensure!(
                     record.api_key_index == self.api_key_index,
                     "Nonce high-water file api_key_index={} mismatches {} lane api_key_index={}",
@@ -640,7 +660,7 @@ impl NonceReuseWatchdog {
         if let Some(hw) = self.highest_committed_nonce
             && disk_hw.is_none_or(|d| hw > d)
         {
-            Self::persist_high_water(&path, self.api_key_index, hw)?;
+            Self::persist_high_water(&path, self.chain_id, self.api_key_index, hw)?;
         }
         self.high_water_path = Some(path);
         Ok(())
@@ -648,9 +668,13 @@ impl NonceReuseWatchdog {
 
     fn persist_high_water(
         path: &Path,
+        chain_id: i32,
         api_key_index: i64,
         highest_committed_nonce: i64,
     ) -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -667,19 +691,22 @@ impl NonceReuseWatchdog {
             uuid::Uuid::new_v4()
         ));
         let payload = serde_json::to_vec(&NonceHighWaterRecord {
+            chain_id,
             api_key_index,
             highest_committed_nonce,
         })?;
         let write_res = (|| -> Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
+            let mut open_opts = std::fs::OpenOptions::new();
+            open_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            open_opts.mode(0o600);
+            let mut file = open_opts.open(&tmp_path)?;
             file.write_all(&payload)?;
             file.flush()?;
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp_path, path)?;
+            std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })();
         if write_res.is_err() {
@@ -793,8 +820,9 @@ impl NonceReuseWatchdog {
         let advanced = self.highest_committed_nonce != Some(next_hw);
         self.highest_committed_nonce = Some(next_hw);
         if advanced && let Some(ref path) = self.high_water_path {
-            Self::persist_high_water(path, self.api_key_index, next_hw)?;
+            Self::persist_high_water(path, self.chain_id, self.api_key_index, next_hw)?;
         }
+        self.pending.retain(|&n, _| n > next_hw);
         Ok(())
     }
 
@@ -842,6 +870,7 @@ impl SigningLane {
     fn new(
         lane_name: &'static str,
         signer: Arc<super::ffi::LighterSigner>,
+        chain_id: i32,
         api_key_index: i64,
         quota: Arc<QuotaTracker>,
     ) -> Self {
@@ -853,7 +882,11 @@ impl SigningLane {
             nonce: AtomicI64::new(0),
             nonce_init: TokioMutex::new(false),
             quota,
-            nonce_watchdog: StdMutex::new(NonceReuseWatchdog::new(lane_name, api_key_index)),
+            nonce_watchdog: StdMutex::new(NonceReuseWatchdog::new_for_chain(
+                lane_name,
+                chain_id,
+                api_key_index,
+            )),
         }
     }
 
@@ -1129,6 +1162,7 @@ pub struct LighterTrading {
     base_url: String,
     send_tx_url: String,
     send_tx_batch_url: String,
+    chain_id: i32,
     account_index: i64,
     market_id: i64,
     market_symbol: String,
@@ -1267,13 +1301,13 @@ impl LighterTrading {
     }
 
     /// Attach an atomic per-lane nonce high-water directory for restart-safe
-    /// regression protection (`lighter_nonce_hw_acct_<account>_key_<idx>.json`).
+    /// regression protection (`lighter_nonce_hw_chain_<chain>_acct_<account>_key_<idx>.json`).
     pub fn with_nonce_high_water_dir(self, dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         let attach_lane = |lane: &SigningLane| -> Result<()> {
             let path = dir.join(format!(
-                "lighter_nonce_hw_acct_{}_key_{}.json",
-                self.account_index, lane.api_key_index
+                "lighter_nonce_hw_chain_{}_acct_{}_key_{}.json",
+                self.chain_id, self.account_index, lane.api_key_index
             ));
             lane.lock_watchdog()?.attach_high_water_path(path)
         };
@@ -1294,6 +1328,29 @@ impl LighterTrading {
         self
     }
 
+    /// Test builds only: switch Lighter `chain_id` and update each lane's nonce watchdog.
+    #[cfg(test)]
+    pub(crate) fn with_test_chain_id(mut self, chain_id: i32) -> Self {
+        self.chain_id = chain_id;
+        self.maker_lane
+            .lock_watchdog()
+            .expect("maker watchdog mutex poisoned")
+            .set_chain_id(chain_id);
+        if let Some(ref cancel_lane) = self.cancel_lane {
+            cancel_lane
+                .lock_watchdog()
+                .expect("cancel watchdog mutex poisoned")
+                .set_chain_id(chain_id);
+        }
+        if let Some(ref taker_lane) = self.taker_lane {
+            taker_lane
+                .lock_watchdog()
+                .expect("taker watchdog mutex poisoned")
+                .set_chain_id(chain_id);
+        }
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn offline_test_client(base_url: &str) -> Self {
         let quota = Arc::new(QuotaTracker::new());
@@ -1301,6 +1358,7 @@ impl LighterTrading {
             maker_lane: SigningLane::new(
                 "maker",
                 Arc::new(super::ffi::LighterSigner::offline_for_test()),
+                304,
                 0,
                 Arc::clone(&quota),
             ),
@@ -1314,6 +1372,7 @@ impl LighterTrading {
             base_url: base_url.to_owned(),
             send_tx_url: format!("{base_url}/api/v1/sendTx"),
             send_tx_batch_url: format!("{base_url}/api/v1/sendTxBatch"),
+            chain_id: 304,
             account_index: 0,
             market_id: 0,
             market_symbol: "ETH".into(),
@@ -1348,6 +1407,7 @@ impl LighterTrading {
                     key_idx,
                     account_index,
                 )),
+                304,
                 key_idx,
                 Arc::clone(&quota),
             )
@@ -1364,6 +1424,7 @@ impl LighterTrading {
             base_url: base_url.to_owned(),
             send_tx_url: format!("{base_url}/api/v1/sendTx"),
             send_tx_batch_url: format!("{base_url}/api/v1/sendTxBatch"),
+            chain_id: 304,
             account_index,
             market_id: 0,
             market_symbol: "ETH".into(),
@@ -1428,6 +1489,7 @@ impl LighterTrading {
                 Ok(SigningLane::new(
                     lane_name,
                     signer,
+                    chain_id,
                     key.api_key_index,
                     Arc::clone(&quota),
                 ))
@@ -1488,6 +1550,7 @@ impl LighterTrading {
             base_url,
             send_tx_url,
             send_tx_batch_url,
+            chain_id,
             account_index,
             market_id,
             market_symbol,
@@ -4958,14 +5021,40 @@ mod tests {
             trading1.cancel_order(901).await.unwrap();
         }
 
-        let maker_hw_file = temp_dir.0.join("lighter_nonce_hw_acct_10_key_7.json");
-        let cancel_hw_file = temp_dir.0.join("lighter_nonce_hw_acct_10_key_8.json");
+        let maker_hw_file = temp_dir
+            .0
+            .join("lighter_nonce_hw_chain_304_acct_10_key_7.json");
+        let cancel_hw_file = temp_dir
+            .0
+            .join("lighter_nonce_hw_chain_304_acct_10_key_8.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&maker_hw_file)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&cancel_hw_file)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let maker_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&maker_hw_file).unwrap()).unwrap();
+        assert_eq!(maker_disk["chain_id"], 304);
         assert_eq!(maker_disk["api_key_index"], 7);
         assert_eq!(maker_disk["highest_committed_nonce"], 52);
         let cancel_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cancel_hw_file).unwrap()).unwrap();
+        assert_eq!(cancel_disk["chain_id"], 304);
         assert_eq!(cancel_disk["api_key_index"], 8);
         assert_eq!(cancel_disk["highest_committed_nonce"], 200);
 
@@ -5001,9 +5090,10 @@ mod tests {
         trading2.place_order(order).await.unwrap();
         let maker_disk2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&maker_hw_file).unwrap()).unwrap();
+        assert_eq!(maker_disk2["chain_id"], 304);
         assert_eq!(maker_disk2["highest_committed_nonce"], 53);
 
-        // Corrupt / mismatched / negative / unwritable high-water state fails closed.
+        // Corrupt / mismatched / unknown-field / negative / unwritable high-water state fails closed.
         let mut corrupt_wd = NonceReuseWatchdog::new("maker", 7);
         let corrupt_path = temp_dir.0.join("corrupt.json");
         std::fs::write(&corrupt_path, "{bad json").unwrap();
@@ -5012,15 +5102,76 @@ mod tests {
         let mismatch_path = temp_dir.0.join("mismatch.json");
         std::fs::write(
             &mismatch_path,
-            serde_json::json!({"api_key_index": 99, "highest_committed_nonce": 1}).to_string(),
+            serde_json::json!({
+                "chain_id": 304,
+                "api_key_index": 99,
+                "highest_committed_nonce": 1
+            })
+            .to_string(),
         )
         .unwrap();
         assert!(corrupt_wd.attach_high_water_path(mismatch_path).is_err());
 
+        let chain_mismatch_path = temp_dir.0.join("chain_mismatch.json");
+        std::fs::write(
+            &chain_mismatch_path,
+            serde_json::json!({
+                "chain_id": 300,
+                "api_key_index": 7,
+                "highest_committed_nonce": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            corrupt_wd
+                .attach_high_water_path(chain_mismatch_path)
+                .is_err()
+        );
+
+        let legacy_missing_chain_path = temp_dir.0.join("legacy_missing_chain.json");
+        std::fs::write(
+            &legacy_missing_chain_path,
+            serde_json::json!({
+                "api_key_index": 7,
+                "highest_committed_nonce": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            corrupt_wd
+                .attach_high_water_path(legacy_missing_chain_path)
+                .is_err()
+        );
+
+        let unknown_field_path = temp_dir.0.join("unknown_field.json");
+        std::fs::write(
+            &unknown_field_path,
+            serde_json::json!({
+                "chain_id": 304,
+                "api_key_index": 7,
+                "highest_committed_nonce": 1,
+                "extra": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            corrupt_wd
+                .attach_high_water_path(unknown_field_path)
+                .is_err()
+        );
+
         let negative_path = temp_dir.0.join("negative.json");
         std::fs::write(
             &negative_path,
-            serde_json::json!({"api_key_index": 7, "highest_committed_nonce": -1}).to_string(),
+            serde_json::json!({
+                "chain_id": 304,
+                "api_key_index": 7,
+                "highest_committed_nonce": -1
+            })
+            .to_string(),
         )
         .unwrap();
         assert!(corrupt_wd.attach_high_water_path(negative_path).is_err());
@@ -5042,6 +5193,258 @@ mod tests {
         let d = create_order_intent_digest(7, 0, 1, 100, 200, false, 0, 2, false, 0, 0);
         fail_persist_wd.guard_before_sign(1, d).unwrap();
         assert!(fail_persist_wd.mark_committed(1).is_err());
+
+        server.abort();
+    }
+
+    #[test]
+    fn nonce_watchdog_prunes_stale_uncertain_pending_entries_when_high_water_advances() {
+        let mut wd = NonceReuseWatchdog::new("maker", 7);
+
+        // Record several uncertain (never explicitly committed/released) nonces 10..=14.
+        for n in 10..=14 {
+            let d = create_order_intent_digest(7, 0, n, 1_000, 200_000, false, 0, 2, false, 0, 0);
+            wd.guard_before_sign(n, d).unwrap();
+        }
+        assert_eq!(wd.pending_len(), 5);
+
+        // Sign and commit nonce 15 -> high-water advances to 15 and prunes all entries <= 15.
+        let d15 = create_order_intent_digest(7, 0, 15, 1_000, 200_000, false, 0, 2, false, 0, 0);
+        wd.guard_before_sign(15, d15).unwrap();
+        wd.mark_committed(15).unwrap();
+        assert_eq!(wd.highest_committed_nonce(), Some(15));
+        assert_eq!(wd.pending_len(), 0);
+        for n in 10..=15 {
+            assert!(!wd.has_pending(n));
+            let same_digest =
+                create_order_intent_digest(7, 0, n, 1_000, 200_000, false, 0, 2, false, 0, 0);
+            assert!(
+                wd.guard_before_sign(n, same_digest).is_err(),
+                "pruned nonce {n} <= high-water 15 must still be rejected"
+            );
+        }
+
+        // Entries strictly above next_hw are preserved across commits.
+        let d20 = create_order_intent_digest(7, 0, 20, 1_000, 200_000, false, 0, 2, false, 0, 0);
+        let d22 = create_order_intent_digest(7, 0, 22, 1_000, 200_000, false, 0, 2, false, 0, 0);
+        let d25 = create_order_intent_digest(7, 0, 25, 1_000, 200_000, false, 0, 2, false, 0, 0);
+        wd.guard_before_sign(20, d20).unwrap();
+        wd.guard_before_sign(22, d22).unwrap();
+        wd.guard_before_sign(25, d25).unwrap();
+        wd.mark_committed_batch(21, 2).unwrap(); // commits 21..=22
+        assert_eq!(wd.highest_committed_nonce(), Some(22));
+        assert!(!wd.has_pending(20));
+        assert!(!wd.has_pending(22));
+        assert!(wd.has_pending(25));
+        assert_eq!(wd.pending_len(), 1);
+
+        // Repeating uncertain + higher-nonce commit > MAX_PENDING_NONCE_WATCHDOG times never fills pending.
+        let mut next = 30_i64;
+        for _ in 0..(MAX_PENDING_NONCE_WATCHDOG + 200) {
+            let uncertain = next;
+            let committed = next + 1;
+            next += 2;
+            let du = create_order_intent_digest(
+                7, 0, uncertain, 1_000, 200_000, false, 0, 2, false, 0, 0,
+            );
+            let dc = create_order_intent_digest(
+                7, 0, committed, 1_000, 200_000, false, 0, 2, false, 0, 0,
+            );
+            wd.guard_before_sign(uncertain, du).unwrap();
+            wd.guard_before_sign(committed, dc).unwrap();
+            wd.mark_committed(committed).unwrap();
+            assert_eq!(wd.pending_len(), 0);
+        }
+        assert_eq!(wd.highest_committed_nonce(), Some(next - 1));
+    }
+
+    #[tokio::test]
+    async fn nonce_watchdog_isolates_high_water_by_chain_id() {
+        let temp_dir = TestTempDir::new("aleph-tx-nonce-chain-iso");
+
+        // Direct watchdog file rejection across chain_ids for identical api_key_index.
+        let chain_304_file = temp_dir.0.join("direct_chain_304.json");
+        let mut wd_mainnet = NonceReuseWatchdog::new_for_chain("maker", 304, 7);
+        wd_mainnet
+            .attach_high_water_path(chain_304_file.clone())
+            .unwrap();
+        let d = create_order_intent_digest(7, 0, 1, 1_000, 200_000, false, 0, 2, false, 0, 0);
+        wd_mainnet.guard_before_sign(50, d).unwrap();
+        wd_mainnet.mark_committed(50).unwrap();
+
+        let mut wd_testnet = NonceReuseWatchdog::new_for_chain("maker", 300, 7);
+        let mismatch_err = wd_testnet
+            .attach_high_water_path(chain_304_file)
+            .unwrap_err();
+        assert!(
+            mismatch_err.to_string().contains("chain_id=304 mismatches"),
+            "{mismatch_err}"
+        );
+
+        // End-to-end LighterTrading sharing same directory, account_index=10, and api_key_index=7/8
+        // across Mainnet (304) and RobinhoodMainnet (466324).
+        let server_maker_nonce = Arc::new(AtomicI64::new(50));
+        let server_maker_nonce_srv = Arc::clone(&server_maker_nonce);
+        let server_cancel_nonce = Arc::new(AtomicI64::new(200));
+        let server_cancel_nonce_srv = Arc::clone(&server_cancel_nonce);
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let send_calls_srv = Arc::clone(&send_calls);
+
+        let (url, server) = spawn_watchdog_test_server(move |path, _body| {
+            if path.starts_with("/api/v1/nextNonce") {
+                let nonce = if path.contains("api_key_index=8") {
+                    server_cancel_nonce_srv.load(Ordering::Acquire)
+                } else {
+                    server_maker_nonce_srv.load(Ordering::Acquire)
+                };
+                (200, serde_json::json!({"nonce": nonce}).to_string())
+            } else if path == "/api/v1/sendTx" {
+                let n = send_calls_srv.fetch_add(1, Ordering::AcqRel);
+                (
+                    200,
+                    serde_json::json!({"code": 200, "tx_hash": format!("tx-{n}")}).to_string(),
+                )
+            } else {
+                panic!("unexpected path {path}");
+            }
+        })
+        .await;
+
+        let order = OrderParams {
+            size: 0.01,
+            price: 2000.0,
+            side: Side::Buy,
+            order_type: OrderType::PostOnly,
+            reduce_only: false,
+        };
+
+        // Chain 304 commits maker nonce 50 and cancel nonce 200.
+        {
+            let mainnet =
+                LighterTrading::mock_multi_lane_test_client(&url, 10, 7, Some(8), Some(9))
+                    .with_test_chain_id(304)
+                    .with_nonce_high_water_dir(&temp_dir.0)
+                    .unwrap();
+            assert_eq!(mainnet.chain_id, 304);
+            assert_eq!(
+                mainnet
+                    .taker_lane
+                    .as_ref()
+                    .unwrap()
+                    .lock_watchdog()
+                    .unwrap()
+                    .chain_id,
+                304
+            );
+            mainnet.place_order(order.clone()).await.unwrap();
+            mainnet.cancel_order(101).await.unwrap();
+        }
+
+        // Chain 466324 in the SAME directory starts with clean high-water = None and can commit
+        // lower nonces (10 on maker, 20 on cancel) without colliding with chain 304's 50/200.
+        server_maker_nonce.store(10, Ordering::Release);
+        server_cancel_nonce.store(20, Ordering::Release);
+        {
+            let robinhood =
+                LighterTrading::mock_multi_lane_test_client(&url, 10, 7, Some(8), Some(9))
+                    .with_test_chain_id(466324)
+                    .with_nonce_high_water_dir(&temp_dir.0)
+                    .unwrap();
+            assert_eq!(robinhood.chain_id, 466324);
+            assert_eq!(
+                robinhood
+                    .maker_lane
+                    .lock_watchdog()
+                    .unwrap()
+                    .highest_committed_nonce(),
+                None
+            );
+            assert_eq!(
+                robinhood
+                    .cancel_lane
+                    .as_ref()
+                    .unwrap()
+                    .lock_watchdog()
+                    .unwrap()
+                    .highest_committed_nonce(),
+                None
+            );
+            assert_eq!(
+                robinhood
+                    .taker_lane
+                    .as_ref()
+                    .unwrap()
+                    .lock_watchdog()
+                    .unwrap()
+                    .chain_id,
+                466324
+            );
+            robinhood.place_order(order.clone()).await.unwrap();
+            robinhood.cancel_order(202).await.unwrap();
+        }
+
+        let mainnet_file = temp_dir
+            .0
+            .join("lighter_nonce_hw_chain_304_acct_10_key_7.json");
+        let robinhood_file = temp_dir
+            .0
+            .join("lighter_nonce_hw_chain_466324_acct_10_key_7.json");
+        let mainnet_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mainnet_file).unwrap()).unwrap();
+        assert_eq!(mainnet_disk["chain_id"], 304);
+        assert_eq!(mainnet_disk["highest_committed_nonce"], 50);
+        let robinhood_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&robinhood_file).unwrap()).unwrap();
+        assert_eq!(robinhood_disk["chain_id"], 466324);
+        assert_eq!(robinhood_disk["highest_committed_nonce"], 10);
+
+        // Restarting chain 304 still enforces its own high-water = 50 while chain 466324 enforces 10.
+        let mainnet_restarted =
+            LighterTrading::mock_multi_lane_test_client(&url, 10, 7, Some(8), None)
+                .with_test_chain_id(304)
+                .with_nonce_high_water_dir(&temp_dir.0)
+                .unwrap();
+        assert_eq!(
+            mainnet_restarted
+                .maker_lane
+                .lock_watchdog()
+                .unwrap()
+                .highest_committed_nonce(),
+            Some(50)
+        );
+        server_maker_nonce.store(50, Ordering::Release);
+        let err_304 = mainnet_restarted
+            .place_order(order.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err_304
+                .to_string()
+                .contains("regressed or already-committed"),
+            "{err_304}"
+        );
+
+        let robinhood_restarted =
+            LighterTrading::mock_multi_lane_test_client(&url, 10, 7, Some(8), None)
+                .with_test_chain_id(466324)
+                .with_nonce_high_water_dir(&temp_dir.0)
+                .unwrap();
+        assert_eq!(
+            robinhood_restarted
+                .maker_lane
+                .lock_watchdog()
+                .unwrap()
+                .highest_committed_nonce(),
+            Some(10)
+        );
+        server_maker_nonce.store(10, Ordering::Release);
+        let err_466324 = robinhood_restarted.place_order(order).await.unwrap_err();
+        assert!(
+            err_466324
+                .to_string()
+                .contains("regressed or already-committed"),
+            "{err_466324}"
+        );
 
         server.abort();
     }
