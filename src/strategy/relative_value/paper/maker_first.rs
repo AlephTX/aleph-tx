@@ -1287,6 +1287,7 @@ struct Replay<'a> {
     leg_turnover: [Decimal; 2],
     books: Option<[Book; 2]>,
     last_reference: Option<Oracle>,
+    equity_reference_uncertain: bool,
     last_equity_session: Option<EquitySession>,
     equity_session_uncertain: bool,
     rwa_session: RwaSessionAttribution,
@@ -4640,19 +4641,19 @@ impl Replay<'_> {
         let regime = if self.config.pair.asset_class != AssetClass::Equity {
             SessionRegime::UsRth
         } else {
-            let effective_ref = reference.or(self.last_reference);
-            let any_internal = effective_ref
-                .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
-                || leg_oracles.is_some_and(|oracles| {
-                    oracles
-                        .iter()
-                        .any(|o| matches!(o.mode, OracleMode::Internal | OracleMode::LastClose))
-                });
-            let effective_session = if self.equity_session_uncertain {
-                None
-            } else {
-                equity_session.or_else(|| self.effective_equity_session(now))
-            };
+            let is_internal =
+                |r: Oracle| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose);
+            let incoming_internal = reference.is_some_and(is_internal);
+            let cached_internal = self.last_reference.is_some_and(is_internal);
+            let leg_internal =
+                leg_oracles.is_some_and(|oracles| oracles.iter().copied().any(is_internal));
+            let any_internal = incoming_internal || cached_internal || leg_internal;
+            let effective_session =
+                if self.equity_session_uncertain || self.equity_reference_uncertain {
+                    None
+                } else {
+                    equity_session.or_else(|| self.effective_equity_session(now))
+                };
             match effective_session {
                 Some(s)
                     if !s.halted
@@ -4744,6 +4745,33 @@ impl Replay<'_> {
         true
     }
 
+    fn admit_reference(&mut self, now: u64, observation: Oracle) -> bool {
+        if !self.config.enforce_equity_session_gate
+            || self.config.pair.asset_class != AssetClass::Equity
+        {
+            self.last_reference = Some(observation);
+            return true;
+        }
+        if observation.timestamp_ms == 0 || observation.timestamp_ms > now {
+            self.equity_reference_uncertain = true;
+            return false;
+        }
+        if let Some(prev) = self.last_reference {
+            if observation.timestamp_ms < prev.timestamp_ms {
+                return false;
+            }
+            if observation.timestamp_ms == prev.timestamp_ms {
+                if observation.price != prev.price || observation.mode != prev.mode {
+                    self.equity_reference_uncertain = true;
+                }
+                return !self.equity_reference_uncertain;
+            }
+        }
+        self.last_reference = Some(observation);
+        self.equity_reference_uncertain = false;
+        true
+    }
+
     fn observe_rwa_frame(
         &mut self,
         now: u64,
@@ -4759,7 +4787,7 @@ impl Replay<'_> {
             self.saw_rwa_metadata = true;
         }
         if let Some(r) = reference {
-            self.last_reference = Some(r);
+            let _ = self.admit_reference(now, r);
         }
         let received_session = equity_session.is_some();
         let equity_session = equity_session.filter(|s| self.admit_equity_session(now, *s));
@@ -4826,6 +4854,9 @@ impl Replay<'_> {
         }
         if now < session.opens_at_ms || end_needed > session.closes_at_ms {
             return Some("equity_outside_session");
+        }
+        if self.equity_reference_uncertain {
+            return Some("equity_stale_reference");
         }
         let Some(reference) = self.last_reference else {
             return Some("equity_missing_reference");
@@ -6026,6 +6057,7 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         leg_turnover: [Decimal::ZERO; 2],
         books: None,
         last_reference: None,
+        equity_reference_uncertain: false,
         last_equity_session: None,
         equity_session_uncertain: false,
         rwa_session: RwaSessionAttribution::default(),

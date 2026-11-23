@@ -1389,7 +1389,10 @@ fn conflict_future_halt_expiry_and_internal_oracle_still_reset_kalman_to_off_hou
             2,
         )
     );
-    assert_eq!(expired.kalman_basis.as_ref().unwrap().filter.gap_resets(), 0);
+    assert_eq!(
+        expired.kalman_basis.as_ref().unwrap().filter.gap_resets(),
+        0
+    );
 
     // 5. Internal oracle followed by sparse reference: None stays OffHours until LiveExternal.
     let mut internal_oracle = new_replay(&cfg).unwrap();
@@ -1572,5 +1575,406 @@ fn genuine_premarket_to_rth_to_postmarket_transitions_reset_kalman_cleanly() {
             missing_session_metadata_frames: 4,
             ..RwaSessionAttribution::default()
         }
+    );
+}
+
+#[test]
+fn future_external_reference_never_caches_or_matures_without_causal_receipt() {
+    let cfg = equity_kalman_config();
+    let t0 = cfg.start_ms;
+    let valid = EquitySession {
+        observed_at_ms: t0 + 110,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 500_000,
+        clear_until_ms: t0 + 500_000,
+        halted: false,
+    };
+
+    // Exact reproducer matching equity_kalman_release_peer_20261123/fixture.rs:
+    // future reference at t0 + 110 (timestamp_ms = t0 + 150) must never cache
+    // into last_reference or auto-mature once wall-clock replay reaches t0 + 150.
+    let mut replay = new_replay(&cfg).unwrap();
+    replay.feed_online = true;
+
+    let early = observe_equity_frame(
+        &mut replay,
+        t0 + 110,
+        live_oracle(t0 + 150, OracleMode::LiveExternal),
+        Some(valid),
+    );
+    assert_eq!(
+        early,
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            0,
+            1
+        )
+    );
+    assert!(replay.equity_reference_uncertain);
+    assert!(replay.last_reference.is_none());
+
+    assert_eq!(
+        observe_equity_frame(&mut replay, t0 + 149, None, None),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            0,
+            2
+        )
+    );
+    assert!(replay.equity_reference_uncertain);
+    assert!(replay.last_reference.is_none());
+
+    assert_eq!(
+        observe_equity_frame(&mut replay, t0 + 150, None, None),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            0,
+            3
+        )
+    );
+    assert!(replay.equity_reference_uncertain);
+    assert!(replay.last_reference.is_none());
+
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 151,
+            live_oracle(t0 + 150, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 1, 1)
+    );
+    assert!(!replay.equity_reference_uncertain);
+    assert_eq!(replay.last_reference.unwrap().timestamp_ms, t0 + 150);
+
+    // Control replay without future oracle stays blocked with equity_missing_reference
+    // until causal receipt at t0 + 151.
+    let mut control = new_replay(&cfg).unwrap();
+    control.feed_online = true;
+    assert_eq!(
+        observe_equity_frame(&mut control, t0 + 110, None, Some(valid)).1,
+        Some("equity_missing_reference")
+    );
+    assert_eq!(
+        observe_equity_frame(&mut control, t0 + 150, None, None).1,
+        Some("equity_missing_reference")
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut control,
+            t0 + 151,
+            live_oracle(t0 + 150, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 0, 3)
+    );
+    assert!(!control.equity_reference_uncertain);
+    assert_eq!(control.last_reference.unwrap().timestamp_ms, t0 + 150);
+
+    // Future reference arriving after a previously admitted causal reference also
+    // fails closed without overwriting the cached causal reference.
+    let mut prior_cached = new_replay(&cfg).unwrap();
+    prior_cached.feed_online = true;
+    assert_eq!(
+        observe_equity_frame(
+            &mut prior_cached,
+            t0 + 100,
+            live_oracle(t0 + 100, OracleMode::LiveExternal),
+            Some(EquitySession {
+                observed_at_ms: t0 + 100,
+                ..valid
+            }),
+        ),
+        (true, None, SessionRegime::UsRth, 0, 1)
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut prior_cached,
+            t0 + 110,
+            live_oracle(t0 + 150, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            1,
+            1,
+        )
+    );
+    assert!(prior_cached.equity_reference_uncertain);
+    assert_eq!(prior_cached.last_reference.unwrap().timestamp_ms, t0 + 100);
+    assert_eq!(
+        observe_equity_frame(&mut prior_cached, t0 + 150, None, None),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            1,
+            2,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut prior_cached,
+            t0 + 151,
+            live_oracle(t0 + 150, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 2, 1)
+    );
+    assert!(!prior_cached.equity_reference_uncertain);
+    assert_eq!(prior_cached.last_reference.unwrap().timestamp_ms, t0 + 150);
+}
+
+#[test]
+fn stale_and_conflicting_equity_references_preserve_causality_and_fail_closed() {
+    let cfg = equity_kalman_config();
+    let t0 = cfg.start_ms;
+    let valid = EquitySession {
+        observed_at_ms: t0 + 100,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 500_000,
+        clear_until_ms: t0 + 500_000,
+        halted: false,
+    };
+
+    let mut replay = new_replay(&cfg).unwrap();
+    replay.feed_online = true;
+
+    // 1. Admit causal LiveExternal reference at t0 + 110.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 110,
+            live_oracle(t0 + 110, OracleMode::LiveExternal),
+            Some(valid),
+        ),
+        (true, None, SessionRegime::UsRth, 0, 1)
+    );
+
+    // 2. Stale older external reference neither overwrites newer last_reference
+    // nor sets uncertainty nor corrupts the causal entry gate / UsRth Kalman state.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 111,
+            Some(Oracle {
+                price: d("995"),
+                timestamp_ms: t0 + 105,
+                mode: OracleMode::LiveExternal,
+            }),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 0, 2)
+    );
+    assert!(!replay.equity_reference_uncertain);
+    let cached = replay.last_reference.unwrap();
+    assert_eq!(cached.timestamp_ms, t0 + 110);
+    assert_eq!(cached.price, d("1000"));
+    assert_eq!(cached.mode, OracleMode::LiveExternal);
+
+    // Identical same-timestamp duplicate remains admitted cleanly.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 112,
+            live_oracle(t0 + 110, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 0, 3)
+    );
+    assert!(!replay.equity_reference_uncertain);
+
+    // 3. Same-timestamp conflicting price sets uncertain, preserves last_reference,
+    // blocks entry with equity_stale_reference, and resets Kalman to OffHours.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 113,
+            Some(Oracle {
+                price: d("1001"),
+                timestamp_ms: t0 + 110,
+                mode: OracleMode::LiveExternal,
+            }),
+            None,
+        ),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            1,
+            1,
+        )
+    );
+    assert!(replay.equity_reference_uncertain);
+    assert_eq!(replay.last_reference.unwrap().price, d("1000"));
+
+    // Repeating the original reference or sending None cannot clear uncertainty.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 114,
+            live_oracle(t0 + 110, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            1,
+            2,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(&mut replay, t0 + 115, None, None),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            1,
+            3,
+        )
+    );
+
+    // 4. Strictly newer causal reference restores UsRth and clears uncertainty.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 116,
+            Some(Oracle {
+                price: d("1001"),
+                timestamp_ms: t0 + 116,
+                mode: OracleMode::LiveExternal,
+            }),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 2, 1)
+    );
+    assert!(!replay.equity_reference_uncertain);
+    assert_eq!(replay.last_reference.unwrap().timestamp_ms, t0 + 116);
+    assert_eq!(replay.last_reference.unwrap().price, d("1001"));
+
+    // 5. Same-timestamp mode conflict on a cached book replay fails closed immediately
+    // via last_snapshot = None before transitioning Kalman to OffHours on the next book,
+    // and recovers only on a strictly newer causal LiveExternal reference.
+    let MakerFirstEvent::Book {
+        books: cached_116, ..
+    } = pair_book(&cfg, t0 + 116, 1000.2, 1000.0)
+    else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(cached_116, t0 + 117).unwrap();
+    let conflict_ref = Some(Oracle {
+        price: d("1001"),
+        timestamp_ms: t0 + 116,
+        mode: OracleMode::Internal,
+    });
+    let s_conflict = replay.observe_rwa_frame(t0 + 117, conflict_ref, None, None);
+    replay.observe_kalman_basis(t0 + 117, conflict_ref, s_conflict, None);
+    assert!(replay.equity_reference_uncertain);
+    assert_eq!(
+        replay.equity_entry_block_reason(t0 + 117),
+        Some("equity_stale_reference")
+    );
+    assert!(
+        replay
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .is_none()
+    );
+    assert_eq!(
+        observe_equity_frame(&mut replay, t0 + 118, None, None),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            3,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 119,
+            live_oracle(t0 + 119, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 4, 1)
+    );
+    assert!(!replay.equity_reference_uncertain);
+
+    // 6. Zero timestamp_ms fails closed; cached Internal oracle stays OffHours even if a
+    // stale LiveExternal reference arrives.
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 120,
+            Some(Oracle {
+                price: d("1000"),
+                timestamp_ms: 0,
+                mode: OracleMode::LiveExternal,
+            }),
+            None,
+        ),
+        (
+            true,
+            Some("equity_stale_reference"),
+            SessionRegime::OffHours,
+            5,
+            1,
+        )
+    );
+    assert!(replay.equity_reference_uncertain);
+    assert_eq!(replay.last_reference.unwrap().timestamp_ms, t0 + 119);
+
+    let mut internal_cached = new_replay(&cfg).unwrap();
+    internal_cached.feed_online = true;
+    assert_eq!(
+        observe_equity_frame(
+            &mut internal_cached,
+            t0 + 100,
+            live_oracle(t0 + 100, OracleMode::Internal),
+            Some(valid),
+        ),
+        (
+            true,
+            Some("equity_non_external_reference"),
+            SessionRegime::OffHours,
+            0,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut internal_cached,
+            t0 + 101,
+            live_oracle(t0 + 99, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            true,
+            Some("equity_non_external_reference"),
+            SessionRegime::OffHours,
+            0,
+            2,
+        )
+    );
+    assert!(!internal_cached.equity_reference_uncertain);
+    assert_eq!(
+        internal_cached.last_reference.unwrap().mode,
+        OracleMode::Internal
+    );
+    assert_eq!(
+        internal_cached.last_reference.unwrap().timestamp_ms,
+        t0 + 100
     );
 }
