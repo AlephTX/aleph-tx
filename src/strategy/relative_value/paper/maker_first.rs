@@ -4640,14 +4640,20 @@ impl Replay<'_> {
         let regime = if self.config.pair.asset_class != AssetClass::Equity {
             SessionRegime::UsRth
         } else {
-            let any_internal = reference
+            let effective_ref = reference.or(self.last_reference);
+            let any_internal = effective_ref
                 .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
                 || leg_oracles.is_some_and(|oracles| {
                     oracles
                         .iter()
                         .any(|o| matches!(o.mode, OracleMode::Internal | OracleMode::LastClose))
                 });
-            match equity_session {
+            let effective_session = if self.equity_session_uncertain {
+                None
+            } else {
+                equity_session.or_else(|| self.effective_equity_session(now))
+            };
+            match effective_session {
                 Some(s)
                     if !s.halted
                         && now >= s.observed_at_ms
@@ -4693,6 +4699,14 @@ impl Replay<'_> {
                     .observe(now, basis_bps, combined_spread_bps, regime),
             );
         }
+    }
+
+    fn effective_equity_session(&self, now: u64) -> Option<EquitySession> {
+        if self.equity_session_uncertain {
+            return None;
+        }
+        self.last_equity_session
+            .filter(|s| !s.halted && now >= s.observed_at_ms && now < s.clear_until_ms)
     }
 
     fn admit_equity_session(&mut self, now: u64, observation: EquitySession) -> bool {
@@ -4750,11 +4764,7 @@ impl Replay<'_> {
         let received_session = equity_session.is_some();
         let equity_session = equity_session.filter(|s| self.admit_equity_session(now, *s));
         if !self.saw_rwa_metadata {
-            return if self.equity_session_uncertain {
-                None
-            } else {
-                equity_session
-            };
+            return self.effective_equity_session(now);
         }
         let any_internal = reference
             .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
@@ -4791,30 +4801,23 @@ impl Replay<'_> {
         {
             self.cancel(now, reason);
         }
-        if self.equity_session_uncertain {
-            None
-        } else {
-            equity_session
-        }
+        self.effective_equity_session(now)
     }
 
     fn equity_entry_block_reason(&self, now: u64) -> Option<&'static str> {
-        if self.equity_session_uncertain {
-            return Some("equity_halt_or_ca_boundary");
-        }
-        if let Some(session) = self.last_equity_session
-            && (session.halted || now < session.observed_at_ms || now >= session.clear_until_ms)
-        {
-            return Some("equity_halt_or_ca_boundary");
-        }
+        let Some(session) = self.effective_equity_session(now) else {
+            if self.equity_session_uncertain || self.last_equity_session.is_some() {
+                return Some("equity_halt_or_ca_boundary");
+            }
+            return (self.config.enforce_equity_session_gate
+                && self.config.pair.asset_class == AssetClass::Equity)
+                .then_some("equity_missing_session");
+        };
         if !self.config.enforce_equity_session_gate
             || self.config.pair.asset_class != AssetClass::Equity
         {
             return None;
         }
-        let Some(session) = self.last_equity_session else {
-            return Some("equity_missing_session");
-        };
         let end_needed = now
             .saturating_add(self.config.entry_horizon_ms())
             .saturating_add(self.config.pair.equity_close_buffer_ms);

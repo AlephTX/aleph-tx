@@ -1013,3 +1013,564 @@ fn equity_session_guard_rejects_older_conflicting_and_future_observations_and_pr
     );
     assert_eq!(replay.equity_entry_block_reason(t0 + 152), None);
 }
+
+fn equity_kalman_config() -> MakerFirstConfig {
+    let mut cfg = config();
+    cfg.kalman_basis = Some(KalmanBasisConfig::default());
+    cfg.pair.asset_class = AssetClass::Equity;
+    cfg.enforce_equity_session_gate = true;
+    cfg.pair.oracle_max_age_ms = 60_000;
+    cfg.pair.equity_close_buffer_ms = 5_000;
+    cfg.pair
+        .legs
+        .iter_mut()
+        .for_each(|leg| leg.tick = d("0.0001"));
+    cfg
+}
+
+fn live_oracle(at: u64, mode: OracleMode) -> Option<Oracle> {
+    Some(Oracle {
+        price: d("1000"),
+        timestamp_ms: at,
+        mode,
+    })
+}
+
+fn observe_equity_frame(
+    replay: &mut Replay<'_>,
+    at: u64,
+    reference: Option<Oracle>,
+    session: Option<EquitySession>,
+) -> (bool, Option<&'static str>, SessionRegime, u64, usize) {
+    let MakerFirstEvent::Book { books, .. } = pair_book(replay.config, at, 1000.2, 1000.0) else {
+        panic!("fixture must be a book");
+    };
+    replay.set_books(books, at).unwrap();
+    let admitted = replay.observe_rwa_frame(at, reference, session, None);
+    replay.observe_kalman_basis(at, reference, admitted, None);
+    let kb = replay.kalman_basis.as_ref().unwrap();
+    let snap = kb.last_snapshot.unwrap();
+    (
+        admitted.is_some(),
+        replay.equity_entry_block_reason(at),
+        snap.regime,
+        kb.filter.regime_resets(),
+        snap.sample_count,
+    )
+}
+
+#[test]
+fn stale_and_blank_equity_frames_preserve_cached_rth_regime_without_spurious_kalman_reset() {
+    let cfg = equity_kalman_config();
+    let t0 = cfg.start_ms;
+    let valid = EquitySession {
+        observed_at_ms: t0 + 110,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 500_000,
+        clear_until_ms: t0 + 500_000,
+        halted: false,
+    };
+    let cases = [
+        (
+            Some(EquitySession {
+                observed_at_ms: t0 + 109,
+                ..valid
+            }),
+            RwaSessionAttribution {
+                regular_cash_frames: 2,
+                halted_or_uncovered_frames: 1,
+                ..RwaSessionAttribution::default()
+            },
+        ),
+        (
+            None,
+            RwaSessionAttribution {
+                regular_cash_frames: 2,
+                missing_session_metadata_frames: 1,
+                ..RwaSessionAttribution::default()
+            },
+        ),
+    ];
+    for (intermittent, expected_rwa) in cases {
+        let mut replay = new_replay(&cfg).unwrap();
+        replay.feed_online = true;
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                t0 + 110,
+                live_oracle(t0 + 110, OracleMode::LiveExternal),
+                Some(valid),
+            ),
+            (true, None, SessionRegime::UsRth, 0, 1)
+        );
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                t0 + 111,
+                live_oracle(t0 + 111, OracleMode::LiveExternal),
+                intermittent,
+            ),
+            (true, None, SessionRegime::UsRth, 0, 2)
+        );
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                t0 + 112,
+                live_oracle(t0 + 112, OracleMode::LiveExternal),
+                Some(valid),
+            ),
+            (true, None, SessionRegime::UsRth, 0, 3)
+        );
+        assert_eq!(replay.rwa_session, expected_rwa);
+
+        let mut run_cfg = equity_kalman_config();
+        run_cfg.pair.oracle_max_age_ms = 5_000;
+        run_cfg.pair.equity_close_buffer_ms = 1_000;
+        run_cfg.flat_at_funding = Some(FlatAtFunding {
+            settlement_guard_ms: 2_000,
+        });
+        run_cfg.trade_from_ms = Some(t0 + 110);
+        run_cfg.quote_lifetime_ms = 500;
+        run_cfg.hold_ms = 500;
+        run_cfg.drain_ms = 1_000;
+        run_cfg.end_ms = t0 + 4_000;
+        let mk_book = |at: u64, observation: Option<EquitySession>| {
+            let MakerFirstEvent::Book { books, .. } = pair_book(&run_cfg, at, 1000.2, 1000.0)
+            else {
+                panic!("fixture must be a book");
+            };
+            MakerFirstEvent::Book {
+                at_ms: at,
+                books,
+                reference: live_oracle(at, OracleMode::LiveExternal),
+                equity_session: observation,
+                leg_oracles: None,
+            }
+        };
+        let rep = run_maker_first(
+            &run_cfg,
+            vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t0,
+                    leg: 0,
+                    online: true,
+                },
+                mk_book(t0 + 110, Some(valid)),
+                mk_book(t0 + 111, intermittent),
+                mk_book(t0 + 112, Some(valid)),
+                MakerFirstEvent::End {
+                    at_ms: run_cfg.end_ms,
+                },
+            ]
+            .into_iter()
+            .map(Ok),
+            &VenueRegistry::default(),
+        )
+        .unwrap();
+        let kb_rep = rep.kalman_basis.as_ref().unwrap();
+        assert!(kb_rep.initialized);
+        assert_eq!(kb_rep.current_regime, Some(SessionRegime::UsRth));
+        assert_eq!(kb_rep.regime_resets, 0);
+        assert_eq!(kb_rep.gap_resets, 0);
+        assert_eq!(rep.rwa_session, Some(expected_rwa));
+    }
+}
+
+#[test]
+fn conflict_future_halt_expiry_and_internal_oracle_still_reset_kalman_to_off_hours() {
+    let cfg = equity_kalman_config();
+    let t0 = cfg.start_ms;
+    let valid = EquitySession {
+        observed_at_ms: t0 + 100,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 50_000,
+        clear_until_ms: t0 + 50_000,
+        halted: false,
+    };
+
+    // 1. Conflicting same-observed_at_ms, 2. Future observed_at_ms > now, 3. Explicit halted: true.
+    for (bad_at, bad_session, follow_at) in [
+        (
+            t0 + 101,
+            EquitySession {
+                observed_at_ms: t0 + 100,
+                halted: true,
+                ..valid
+            },
+            t0 + 102,
+        ),
+        (
+            t0 + 101,
+            EquitySession {
+                observed_at_ms: t0 + 150,
+                ..valid
+            },
+            t0 + 155,
+        ),
+        (
+            t0 + 101,
+            EquitySession {
+                observed_at_ms: t0 + 101,
+                halted: true,
+                ..valid
+            },
+            t0 + 102,
+        ),
+    ] {
+        let mut replay = new_replay(&cfg).unwrap();
+        replay.feed_online = true;
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                t0 + 100,
+                live_oracle(t0 + 100, OracleMode::LiveExternal),
+                Some(valid),
+            ),
+            (true, None, SessionRegime::UsRth, 0, 1)
+        );
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                bad_at,
+                live_oracle(bad_at, OracleMode::LiveExternal),
+                Some(bad_session),
+            ),
+            (
+                false,
+                Some("equity_halt_or_ca_boundary"),
+                SessionRegime::OffHours,
+                1,
+                1,
+            )
+        );
+        assert_eq!(
+            observe_equity_frame(
+                &mut replay,
+                follow_at,
+                live_oracle(follow_at, OracleMode::LiveExternal),
+                None,
+            ),
+            (
+                false,
+                Some("equity_halt_or_ca_boundary"),
+                SessionRegime::OffHours,
+                1,
+                2,
+            )
+        );
+    }
+
+    // Same-source_ms conflicting session fails closed immediately via last_snapshot = None
+    // before transitioning the filter to OffHours on the next fresh book update.
+    let mut same_source_conflict = new_replay(&cfg).unwrap();
+    same_source_conflict.feed_online = true;
+    let MakerFirstEvent::Book { books: cached, .. } = pair_book(&cfg, t0 + 100, 1000.2, 1000.0)
+    else {
+        panic!("fixture must be a book");
+    };
+    same_source_conflict
+        .set_books(cached.clone(), t0 + 100)
+        .unwrap();
+    let s_init = same_source_conflict.observe_rwa_frame(
+        t0 + 100,
+        live_oracle(t0 + 100, OracleMode::LiveExternal),
+        Some(valid),
+        None,
+    );
+    same_source_conflict.observe_kalman_basis(
+        t0 + 100,
+        live_oracle(t0 + 100, OracleMode::LiveExternal),
+        s_init,
+        None,
+    );
+    assert_eq!(
+        same_source_conflict
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .unwrap()
+            .regime,
+        SessionRegime::UsRth
+    );
+    same_source_conflict.set_books(cached, t0 + 101).unwrap();
+    let s_conflict = same_source_conflict.observe_rwa_frame(
+        t0 + 101,
+        live_oracle(t0 + 101, OracleMode::LiveExternal),
+        Some(EquitySession {
+            observed_at_ms: t0 + 100,
+            halted: true,
+            ..valid
+        }),
+        None,
+    );
+    assert!(s_conflict.is_none());
+    same_source_conflict.observe_kalman_basis(
+        t0 + 101,
+        live_oracle(t0 + 101, OracleMode::LiveExternal),
+        s_conflict,
+        None,
+    );
+    assert!(same_source_conflict.equity_session_uncertain);
+    assert_eq!(
+        same_source_conflict.equity_entry_block_reason(t0 + 101),
+        Some("equity_halt_or_ca_boundary")
+    );
+    assert!(
+        same_source_conflict
+            .kalman_basis
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .is_none()
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut same_source_conflict,
+            t0 + 102,
+            live_oracle(t0 + 102, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            false,
+            Some("equity_halt_or_ca_boundary"),
+            SessionRegime::OffHours,
+            1,
+            1,
+        )
+    );
+
+    // 4. Expired session (now >= clear_until_ms) resets Kalman to OffHours without a gap reset.
+    let mut expired = new_replay(&cfg).unwrap();
+    expired.feed_online = true;
+    let short_valid = EquitySession {
+        observed_at_ms: t0 + 100,
+        opens_at_ms: t0 + 50,
+        closes_at_ms: t0 + 15_000,
+        clear_until_ms: t0 + 15_000,
+        halted: false,
+    };
+    assert_eq!(
+        observe_equity_frame(
+            &mut expired,
+            t0 + 100,
+            live_oracle(t0 + 100, OracleMode::LiveExternal),
+            Some(short_valid),
+        ),
+        (true, None, SessionRegime::UsRth, 0, 1)
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut expired,
+            t0 + 15_000,
+            live_oracle(t0 + 15_000, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            false,
+            Some("equity_halt_or_ca_boundary"),
+            SessionRegime::OffHours,
+            1,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut expired,
+            t0 + 15_001,
+            live_oracle(t0 + 15_001, OracleMode::LiveExternal),
+            Some(short_valid),
+        ),
+        (
+            false,
+            Some("equity_halt_or_ca_boundary"),
+            SessionRegime::OffHours,
+            1,
+            2,
+        )
+    );
+    assert_eq!(expired.kalman_basis.as_ref().unwrap().filter.gap_resets(), 0);
+
+    // 5. Internal oracle followed by sparse reference: None stays OffHours until LiveExternal.
+    let mut internal_oracle = new_replay(&cfg).unwrap();
+    internal_oracle.feed_online = true;
+    assert_eq!(
+        observe_equity_frame(
+            &mut internal_oracle,
+            t0 + 100,
+            live_oracle(t0 + 100, OracleMode::LiveExternal),
+            Some(valid),
+        ),
+        (true, None, SessionRegime::UsRth, 0, 1)
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut internal_oracle,
+            t0 + 101,
+            live_oracle(t0 + 101, OracleMode::Internal),
+            Some(valid),
+        ),
+        (
+            true,
+            Some("equity_non_external_reference"),
+            SessionRegime::OffHours,
+            1,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(&mut internal_oracle, t0 + 102, None, None),
+        (
+            true,
+            Some("equity_non_external_reference"),
+            SessionRegime::OffHours,
+            1,
+            2,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(&mut internal_oracle, t0 + 103, None, Some(valid)),
+        (
+            true,
+            Some("equity_non_external_reference"),
+            SessionRegime::OffHours,
+            1,
+            3,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut internal_oracle,
+            t0 + 104,
+            live_oracle(t0 + 104, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 2, 1)
+    );
+}
+
+#[test]
+fn genuine_premarket_to_rth_to_postmarket_transitions_reset_kalman_cleanly() {
+    let cfg = equity_kalman_config();
+    let t0 = cfg.start_ms;
+    let session = EquitySession {
+        observed_at_ms: t0 + 100,
+        opens_at_ms: t0 + 5_000,
+        closes_at_ms: t0 + 20_000,
+        clear_until_ms: t0 + 40_000,
+        halted: false,
+    };
+    let mut replay = new_replay(&cfg).unwrap();
+    replay.feed_online = true;
+
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 100,
+            live_oracle(t0 + 100, OracleMode::LiveExternal),
+            Some(session),
+        ),
+        (
+            true,
+            Some("equity_outside_session"),
+            SessionRegime::PreMarket,
+            0,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 1_000,
+            live_oracle(t0 + 1_000, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            true,
+            Some("equity_outside_session"),
+            SessionRegime::PreMarket,
+            0,
+            2,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 5_000,
+            live_oracle(t0 + 5_000, OracleMode::LiveExternal),
+            Some(EquitySession {
+                observed_at_ms: t0 + 5_000,
+                ..session
+            }),
+        ),
+        (true, None, SessionRegime::UsRth, 1, 1)
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 6_000,
+            live_oracle(t0 + 6_000, OracleMode::LiveExternal),
+            None,
+        ),
+        (true, None, SessionRegime::UsRth, 1, 2)
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 20_000,
+            live_oracle(t0 + 20_000, OracleMode::LiveExternal),
+            Some(EquitySession {
+                observed_at_ms: t0 + 20_000,
+                ..session
+            }),
+        ),
+        (
+            true,
+            Some("equity_outside_session"),
+            SessionRegime::PostMarket,
+            2,
+            1,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 21_000,
+            live_oracle(t0 + 21_000, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            true,
+            Some("equity_outside_session"),
+            SessionRegime::PostMarket,
+            2,
+            2,
+        )
+    );
+    assert_eq!(
+        observe_equity_frame(
+            &mut replay,
+            t0 + 40_000,
+            live_oracle(t0 + 40_000, OracleMode::LiveExternal),
+            None,
+        ),
+        (
+            false,
+            Some("equity_halt_or_ca_boundary"),
+            SessionRegime::OffHours,
+            3,
+            1,
+        )
+    );
+
+    assert_eq!(replay.kalman_basis.as_ref().unwrap().filter.gap_resets(), 0);
+    assert_eq!(
+        replay.rwa_session,
+        RwaSessionAttribution {
+            regular_cash_frames: 1,
+            extended_external_frames: 2,
+            missing_session_metadata_frames: 4,
+            ..RwaSessionAttribution::default()
+        }
+    );
+}
