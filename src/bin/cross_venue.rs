@@ -10,6 +10,7 @@ use aleph_tx::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
     strategy::cross_venue_router::simulate_midflight_jump_comparison,
+    strategy::glft::run_glft_benchmark,
     strategy::matched_settlement::MatchedSettlement,
     strategy::multiday_carry::{
         MultiDayCarryPortfolioRequest, MultiDayCarryScenario, evaluate_multiday_carry_portfolio,
@@ -369,6 +370,10 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [command] if command == "glft-bench" => {
+            println!("{}", serde_json::to_string_pretty(&run_glft_benchmark()?)?);
+            Ok(())
+        }
         [command, venue, tier, asset_class] if command == "capability-check" => {
             print(&registry.resolve_execution_capability(venue, tier, asset_class)?)
         }
@@ -592,7 +597,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | router-fault-bench | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | router-fault-bench | glft-bench | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -819,5 +824,20 @@ mod tests {
         assert!(cmp.naive_legged_out_pnl_usd < Decimal::ZERO);
         assert_eq!(cmp.router_maker_legged_out_pnl_usd, Decimal::ZERO);
         assert_eq!(cmp.router_dual_taker_legged_out_pnl_usd, Decimal::ZERO);
+    }
+
+    #[test]
+    fn glft_bench_matches_barbell_formula_and_shallow_calibration() {
+        let report = run_glft_benchmark().unwrap();
+        assert!((report.reference_2_2.c1_bps - 1.124).abs() < 0.001);
+        assert!((report.reference_2_2.c2 - 0.212).abs() < 0.001);
+        assert!((report.reference_2_2.raw_half_spread_bps - 1.266).abs() < 0.001);
+        assert!((report.reference_2_2.skew_per_unit_bps - 0.283).abs() < 0.001);
+        assert!(!report.reference_2_2.clamped_by_fee_floor);
+        assert!(report.clamping_trap_demo.clamped_by_fee_floor);
+        assert!(!report.shallow_calibration.used_fallback);
+        assert_eq!(report.shallow_calibration.discarded_deep_buckets, 3);
+        assert!((report.shallow_calibration.intensity_a - 2.98).abs() < 1e-6);
+        assert!((report.shallow_calibration.decay_k - 0.85).abs() < 1e-6);
     }
 }
