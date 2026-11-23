@@ -430,4 +430,184 @@ mod tests {
 
         assert!(signer.is_ok());
     }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_signer_v1_0_13_concurrent_create_cancel_and_auth_stress() {
+        use std::collections::HashSet;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let synthetic_key = "11".repeat(40);
+        let api_key_index = 2_i64;
+        let account_index = 999_999_i64;
+
+        let signer = LighterSigner::new(
+            "http://127.0.0.1:1",
+            &synthetic_key,
+            304,
+            api_key_index,
+            account_index,
+        )
+        .expect("synthetic mainnet client creation against v1.0.13 .so must succeed");
+
+        let now_secs = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let base_deadline = now_secs + 600;
+
+        let results: Vec<(String, String, String, i64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4_i64)
+                .map(|thread_idx| {
+                    let signer_ref = &signer;
+                    scope.spawn(move || -> Vec<(String, String, String, i64)> {
+                        let mut out = Vec::with_capacity(25);
+                        for step in 0..25_i64 {
+                            let nonce = thread_idx * 100 + step + 1;
+                            let client_order_index = 50_000 + nonce;
+                            let created = signer_ref
+                                .sign_create_order(
+                                    0i64,
+                                    client_order_index,
+                                    1_000,
+                                    200_000,
+                                    thread_idx % 2 == 0,
+                                    0,
+                                    0,
+                                    false,
+                                    0,
+                                    0,
+                                    nonce,
+                                )
+                                .expect("native sign_create_order must succeed");
+                            assert!(!created.tx_info.is_empty());
+                            assert!(!created.tx_hash.is_empty());
+                            let create_json: serde_json::Value =
+                                serde_json::from_str(&created.tx_info).unwrap();
+                            assert_eq!(create_json["AccountIndex"], account_index);
+                            assert_eq!(create_json["ApiKeyIndex"], api_key_index);
+                            assert_eq!(create_json["MarketIndex"], 0);
+                            assert_eq!(create_json["ClientOrderIndex"], client_order_index);
+                            assert_eq!(create_json["Nonce"], nonce);
+
+                            let order_index = (1i64 << 48) + nonce;
+                            let canceled = signer_ref
+                                .sign_cancel_order(0i64, order_index, nonce)
+                                .expect("native sign_cancel_order must succeed");
+                            assert!(!canceled.tx_info.is_empty());
+                            assert!(!canceled.tx_hash.is_empty());
+                            let cancel_json: serde_json::Value =
+                                serde_json::from_str(&canceled.tx_info).unwrap();
+                            assert_eq!(cancel_json["AccountIndex"], account_index);
+                            assert_eq!(cancel_json["ApiKeyIndex"], api_key_index);
+                            assert_eq!(cancel_json["MarketIndex"], 0);
+                            assert_eq!(cancel_json["Index"], order_index);
+                            assert_eq!(cancel_json["Nonce"], nonce);
+
+                            let deadline = base_deadline + nonce;
+                            let token = signer_ref
+                                .create_auth_token(deadline)
+                                .expect("native create_auth_token must succeed");
+                            out.push((created.tx_hash, canceled.tx_hash, token, deadline));
+                        }
+                        out
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("worker thread must not panic"))
+                .collect()
+        });
+
+        assert_eq!(results.len(), 100);
+        let mut create_hashes = HashSet::with_capacity(100);
+        let mut cancel_hashes = HashSet::with_capacity(100);
+        for (create_hash, cancel_hash, token, deadline) in results {
+            assert!(
+                create_hashes.insert(create_hash),
+                "duplicate create tx_hash"
+            );
+            assert!(
+                cancel_hashes.insert(cancel_hash),
+                "duplicate cancel tx_hash"
+            );
+            assert!(!token.is_empty());
+            let parts: Vec<&str> = token.split(':').collect();
+            assert_eq!(parts.len(), 4, "unexpected auth token format: {token}");
+            assert_eq!(parts[0], deadline.to_string());
+            assert_eq!(parts[1], account_index.to_string());
+            assert_eq!(parts[2], api_key_index.to_string());
+            assert!(!parts[3].is_empty());
+        }
+        assert_eq!(create_hashes.len(), 100);
+        assert_eq!(cancel_hashes.len(), 100);
+        assert!(create_hashes.is_disjoint(&cancel_hashes));
+
+        let bad_non_hex = "zz-synthetic-invalid-key-do-not-leak-0123456789abcdef0123456789abcdef";
+        let err_non_hex = LighterSigner::new(
+            "http://127.0.0.1:1",
+            bad_non_hex,
+            304,
+            api_key_index,
+            account_index,
+        )
+        .err()
+        .expect("non-hex key must fail");
+        assert!(!err_non_hex.contains(bad_non_hex));
+        assert!(!err_non_hex.contains("zz-synthetic-invalid-key"));
+        assert!(!err_non_hex.contains(&synthetic_key));
+
+        let bad_short = "22".repeat(10);
+        let err_short = LighterSigner::new(
+            "http://127.0.0.1:1",
+            &bad_short,
+            304,
+            api_key_index,
+            account_index,
+        )
+        .err()
+        .expect("short key must fail");
+        assert!(!err_short.contains(&bad_short));
+        assert!(!err_short.contains(&synthetic_key));
+
+        let bad_nul = format!("{}\0{}", "33".repeat(20), "44".repeat(19));
+        let err_nul = LighterSigner::new(
+            "http://127.0.0.1:1",
+            &bad_nul,
+            304,
+            api_key_index,
+            account_index,
+        )
+        .err()
+        .expect("embedded NUL key must fail");
+        assert!(!err_nul.contains(&"33".repeat(20)));
+        assert!(!err_nul.contains(&"44".repeat(19)));
+
+        let uninit = LighterSigner {
+            api_key_index: 251,
+            account_index: 999_998,
+            mock_only: false,
+        };
+        for err in [
+            uninit
+                .sign_create_order(0i64, 1, 100, 200_000, false, 0, 0, false, 0, 0, 1)
+                .err()
+                .expect("uninitialized create must fail"),
+            uninit
+                .sign_cancel_order(0i64, 1, 1)
+                .err()
+                .expect("uninitialized cancel must fail"),
+            uninit
+                .create_auth_token(base_deadline)
+                .err()
+                .expect("uninitialized auth token must fail"),
+        ] {
+            assert!(!err.contains(&synthetic_key));
+        }
+    }
 }
