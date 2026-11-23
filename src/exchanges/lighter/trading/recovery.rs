@@ -239,28 +239,32 @@ impl LighterTrading {
             orders.iter().all(|&id| id > 0),
             "Lighter recovery found an order without a client ID"
         );
-        let auth = self.create_auth_token().await?;
         let orders: Vec<_> = orders.iter().copied().collect();
         let mut watermark = 0;
         for chunk in orders.chunks(20) {
+            let auth = self.create_auth_token().await?;
             let ids = chunk
                 .iter()
                 .map(i64::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            let response: OrderHistory = self
+            let resp = self
                 .client
                 .get(format!("{}/api/v1/accountOrders", self.base_url))
                 .query(&[
                     ("account_index", self.account_index.to_string()),
                     ("client_order_indexes", ids),
                 ])
-                .header("Authorization", &auth)
+                .header("Authorization", auth.as_str())
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                self.invalidate_auth_token_cache();
+            }
+            let response: OrderHistory = resp.error_for_status()?.json().await?;
             ensure!(
                 response.code == 200,
                 "Lighter order reconciliation failed with code {}",
@@ -516,6 +520,105 @@ mod tests {
             served.load(std::sync::atomic::Ordering::Acquire),
             tracker.needs_reconciliation(),
         )
+    }
+
+    #[tokio::test]
+    async fn terminal_fill_time_refreshes_expired_auth_token_between_chunks() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let trading = Arc::new(LighterTrading::mock_multi_lane_test_client(
+            &url, 1801, 7, None, None,
+        ));
+        let now_wall = LighterTrading::unix_now_secs().unwrap();
+        *trading.auth_token_cache.lock() = AuthTokenCacheState {
+            generation: 0,
+            entry: Some(CachedAuthToken {
+                token: Zeroizing::new("stale-chunk1-token".to_owned()),
+                refresh_after: Instant::now() + Duration::from_secs(540),
+                deadline_secs: now_wall + AUTH_TOKEN_TTL_SECS,
+            }),
+        };
+
+        let seen_auths: Arc<SyncMutex<Vec<String>>> = Arc::new(SyncMutex::new(Vec::new()));
+        let seen_auths_srv = Arc::clone(&seen_auths);
+        let trading_srv = Arc::clone(&trading);
+        let server = tokio::spawn(async move {
+            for call_idx in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).await.unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(val) = header
+                        .strip_prefix("authorization:")
+                        .or_else(|| header.strip_prefix("Authorization:"))
+                    {
+                        seen_auths_srv.lock().push(val.trim().to_owned());
+                    }
+                }
+                if call_idx == 0 {
+                    // Simulate wall-clock passing the signed deadline margin before chunk 2,
+                    // while leaving monotonic `refresh_after` unelapsed.
+                    if let Some(entry) = trading_srv.auth_token_cache.lock().entry.as_mut() {
+                        entry.deadline_secs = 0;
+                    }
+                }
+                let ids_query = path
+                    .split("client_order_indexes=")
+                    .nth(1)
+                    .unwrap()
+                    .split('&')
+                    .next()
+                    .unwrap();
+                let orders_json: Vec<_> = ids_query
+                    .split("%2C")
+                    .flat_map(|seg| seg.split(','))
+                    .map(|id| {
+                        serde_json::json!({
+                            "client_order_index": id.parse::<i64>().unwrap(),
+                            "market_index": 0,
+                            "owner_account_index": 1801,
+                            "status": "canceled",
+                            "filled_base_amount": "0",
+                            "transaction_time": 0
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({ "code": 200, "orders": orders_json }).to_string();
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let order_ids: BTreeSet<i64> = (1..=21).collect();
+        let wm = trading.terminal_fill_time(&order_ids).await.unwrap();
+        assert_eq!(wm, Some(0));
+        server.await.unwrap();
+
+        let headers = seen_auths.lock().clone();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], "stale-chunk1-token");
+        assert!(headers[1].ends_with(":1801:7:mock"), "got {}", headers[1]);
+        assert_ne!(headers[1], headers[0]);
     }
 
     /// The real recovery loop, without signing: a flat account older than

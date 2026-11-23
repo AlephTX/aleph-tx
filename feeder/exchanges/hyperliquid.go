@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlephTX/aleph-tx/feeder/config"
@@ -23,6 +24,11 @@ type hlTarget struct {
 	symbolID   uint16
 }
 
+type hlSubOptions struct {
+	fastBook   bool
+	bboChannel bool
+}
+
 // Hyperliquid connects to the Hyperliquid L2/BBO WebSocket and routes native
 // core coins (ExchangeHyperliquid), Entropy io:* coins (ExchangeEntropy), and
 // TradeXYZ xyz:* coins (ExchangeTradeXYZ) into isolated SHM matrix and depth slots.
@@ -31,8 +37,8 @@ type Hyperliquid struct {
 	matrix      *shm.Matrix
 	depthWriter *shm.DepthWriter
 	symMap      map[string]hlTarget
-	fastBook    bool
-	bboChannel  bool
+	subOpts     map[string]hlSubOptions
+	errorFrames atomic.Uint64
 }
 
 func classifyHyperliquidExchange(rawCoin string) (uint8, bool) {
@@ -67,15 +73,8 @@ func NewHyperliquidGroupWithDepth(
 	depthWriter *shm.DepthWriter,
 ) *Hyperliquid {
 	symMap := make(map[string]hlTarget)
-	fastBook := false
-	bboChannel := false
+	subOpts := make(map[string]hlSubOptions)
 	for _, sec := range sections {
-		if sec.FastBook {
-			fastBook = true
-		}
-		if sec.BBOChannel {
-			bboChannel = true
-		}
 		for localSym, rawCoin := range sec.AllPublicSymbols() {
 			symID, ok := SymbolNameToID[localSym]
 			if !ok {
@@ -88,6 +87,10 @@ func NewHyperliquidGroupWithDepth(
 				continue
 			}
 			symMap[rawCoin] = hlTarget{exchangeID: exchID, symbolID: symID}
+			opts := subOpts[rawCoin]
+			opts.fastBook = opts.fastBook || sec.FastBook
+			opts.bboChannel = opts.bboChannel || sec.BBOChannel
+			subOpts[rawCoin] = opts
 		}
 	}
 	return &Hyperliquid{
@@ -95,9 +98,13 @@ func NewHyperliquidGroupWithDepth(
 		matrix:      matrix,
 		depthWriter: depthWriter,
 		symMap:      symMap,
-		fastBook:    fastBook,
-		bboChannel:  bboChannel,
+		subOpts:     subOpts,
 	}
+}
+
+// ErrorFrames reports the total number of server "error" frames observed.
+func (h *Hyperliquid) ErrorFrames() uint64 {
+	return h.errorFrames.Load()
 }
 
 type hlEnvelope struct {
@@ -168,11 +175,12 @@ func (h *Hyperliquid) connect(ctx context.Context, lastBboPub, lastDepthPub map[
 
 	// Subscribe to l2Book (optionally fast top-5) and optional block-driven bbo channel.
 	for _, rawCoin := range coins {
+		opts := h.subOpts[rawCoin]
 		subReq := map[string]any{
 			"type": "l2Book",
 			"coin": rawCoin,
 		}
-		if h.fastBook {
+		if opts.fastBook {
 			subReq["fast"] = true
 		}
 		sub := map[string]any{
@@ -182,7 +190,7 @@ func (h *Hyperliquid) connect(ctx context.Context, lastBboPub, lastDepthPub map[
 		if err := wsjson.Write(ctx, c, sub); err != nil {
 			return fmt.Errorf("subscribe l2Book %s: %w", rawCoin, err)
 		}
-		if h.bboChannel {
+		if opts.bboChannel {
 			bboSub := map[string]any{
 				"method": "subscribe",
 				"subscription": map[string]any{
@@ -194,7 +202,7 @@ func (h *Hyperliquid) connect(ctx context.Context, lastBboPub, lastDepthPub map[
 				return fmt.Errorf("subscribe bbo %s: %w", rawCoin, err)
 			}
 		}
-		log.Printf("hyperliquid: subscribed to %s (fast=%v, bbo=%v)", rawCoin, h.fastBook, h.bboChannel)
+		log.Printf("hyperliquid: subscribed to %s (fast=%v, bbo=%v)", rawCoin, opts.fastBook, opts.bboChannel)
 	}
 
 	stopKeepalive := wsutil.StartKeepalive(ctx, "hyperliquid", c, 15*time.Second, []byte(`{"method":"ping"}`))
@@ -229,9 +237,30 @@ func (h *Hyperliquid) handleMessageWithDepth(
 		return h.handleL2Book(env.Data, now, lastBboPub, lastDepthPub)
 	case "bbo":
 		return h.handleBBO(env.Data, now, lastBboPub)
+	case "error":
+		count := h.errorFrames.Add(1)
+		log.Printf("hyperliquid: server error frame (count=%d): %s", count, sanitizeHyperliquidErrorData(env.Data))
+		return nil
 	default:
 		return nil
 	}
+}
+
+func sanitizeHyperliquidErrorData(raw json.RawMessage) string {
+	var msg string
+	if json.Unmarshal(raw, &msg) != nil {
+		msg = string(raw)
+	}
+	msg = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(msg))
+	if len(msg) > 256 {
+		return msg[:256] + "..."
+	}
+	return msg
 }
 
 func (h *Hyperliquid) handleL2Book(
@@ -253,16 +282,18 @@ func (h *Hyperliquid) handleL2Book(
 	}
 	// Evaluate both streams before updating so aliased test maps work consistently.
 	bboFresh := book.Time > lastBboPub[target]
+	bboEqualOrNewer := book.Time >= lastBboPub[target]
 	depthFresh := book.Time > lastDepthPub[target]
-	if !bboFresh && !depthFresh {
+	if !bboEqualOrNewer && !depthFresh {
 		return nil
 	}
 
 	bids, bidCount, bidOK := parseHyperliquidDepth(book.Levels[0], true)
 	asks, askCount, askOK := parseHyperliquidDepth(book.Levels[1], false)
 	if !bidOK || !askOK || bidCount == 0 || askCount == 0 || bids[0].Price >= asks[0].Price {
-		// The bbo channel may have already published a newer top of book.
-		if bboFresh {
+		// Explicit invalid/crossed book at the same or newer source ms must still
+		// fail-closed clear Matrix BBO regardless of l2Book vs bbo delivery order.
+		if bboEqualOrNewer {
 			h.invalidateBBO(target)
 			lastBboPub[target] = book.Time
 		}
@@ -272,6 +303,9 @@ func (h *Hyperliquid) handleL2Book(
 			}
 			lastDepthPub[target] = book.Time
 		}
+		return nil
+	}
+	if !bboFresh && !depthFresh {
 		return nil
 	}
 
@@ -297,7 +331,7 @@ func (h *Hyperliquid) handleBBO(
 		return nil
 	}
 	target, ok := h.symMap[ev.Coin]
-	if !ok || len(ev.BBO) != 2 || ev.Time <= 0 || ev.Time <= lastBboPub[target] {
+	if !ok || len(ev.BBO) != 2 || ev.Time <= 0 || ev.Time < lastBboPub[target] {
 		return nil
 	}
 	if ev.Time > now.Add(time.Second).UnixMilli() {
@@ -313,6 +347,11 @@ func (h *Hyperliquid) handleBBO(
 	if !bidOK || !askOK || bidPx >= askPx {
 		h.invalidateBBO(target)
 		lastBboPub[target] = ev.Time
+		return nil
+	}
+	// Require strictly newer source ms for valid quotes so a valid update never
+	// resurrects a BBO cleared in the same source millisecond or churns ties.
+	if ev.Time <= lastBboPub[target] {
 		return nil
 	}
 	if h.matrix != nil {

@@ -5,6 +5,7 @@
 //!
 //! Architecture: Rust → FFI → Go CGO → Poseidon2/Schnorr → Signed TX
 
+use k256::elliptic_curve::zeroize::Zeroizing;
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::{c_char, c_int, c_longlong};
 
@@ -48,7 +49,7 @@ pub struct StrOrErr {
     pub err: *mut c_char,
 }
 
-// Signatures from lighter-signer-linux-amd64.h in lighter-go v1.0.12.
+// Signatures from lighter-signer-linux-amd64.h in lighter-go v1.0.13.
 unsafe extern "C" {
     /// Create a new client instance
     pub fn CreateClient(
@@ -201,13 +202,15 @@ impl LighterSigner {
         if api_key_index < 0 || api_key_index > u8::MAX as i64 || account_index < 0 {
             return Err("Invalid signer account or API key index".into());
         }
-        let url_cstr = CString::new(base_url).map_err(|e| e.to_string())?;
-        let key_cstr = CString::new(private_key).map_err(|e| e.to_string())?;
+        let url_cstr =
+            CString::new(base_url).map_err(|_| "Invalid Lighter base URL".to_string())?;
+        let key_bytes: Zeroizing<Vec<u8>> =
+            super::super::nul_terminated_secret_bytes(private_key).map_err(str::to_string)?;
 
         unsafe {
             let err_ptr = CreateClient(
                 url_cstr.as_ptr(),
-                key_cstr.as_ptr(),
+                key_bytes.as_ptr().cast::<c_char>(),
                 chain_id,
                 api_key_index as c_int,
                 account_index as c_longlong,
@@ -279,7 +282,7 @@ impl LighterSigner {
                 ),
             });
         }
-        // SAFETY: argument widths and order match the v1.0.12 release header.
+        // SAFETY: argument widths and order match the v1.0.13 release header.
         unsafe {
             let response = SignCreateOrder(
                 market_index,
@@ -334,7 +337,7 @@ impl LighterSigner {
                 tx_hash: format!("mock-cancel-{}-{nonce}-{order_index}", self.api_key_index),
             });
         }
-        // SAFETY: argument widths and order match the v1.0.12 release header.
+        // SAFETY: argument widths and order match the v1.0.13 release header.
         unsafe {
             let response = SignCancelOrder(
                 market_index,

@@ -114,3 +114,32 @@ func TestRepositoryConfigsLoad(t *testing.T) {
 		}
 	}
 }
+
+func TestOasisFeederConfigEnablesHyperliquidLowLatency(t *testing.T) {
+	c, err := Load("../../deploy/oasis/feeder.toml")
+	if err != nil {
+		t.Fatalf("load oasis feeder.toml: %v", err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate oasis feeder.toml: %v", err)
+	}
+	for name, sec := range map[string]ExchangeSection{
+		"hyperliquid": c.Hyperliquid,
+		"entropy":     c.Entropy,
+		"tradexyz":    c.TradeXYZ,
+	} {
+		if !sec.FeederFastBook {
+			t.Fatalf("%s: expected feeder_fast_book = true", name)
+		}
+		if !sec.FeederBBOChannel {
+			t.Fatalf("%s: expected feeder_bbo_channel = true", name)
+		}
+	}
+	exMap := c.ToExchangeMap()
+	for _, name := range []string{"hyperliquid", "entropy", "tradexyz"} {
+		cfg := exMap[name]
+		if !cfg.FastBook || !cfg.BBOChannel {
+			t.Fatalf("%s: ToExchangeMap FastBook=%v BBOChannel=%v, want true/true", name, cfg.FastBook, cfg.BBOChannel)
+		}
+	}
+}

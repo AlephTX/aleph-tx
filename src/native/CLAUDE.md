@@ -9,12 +9,12 @@ This directory contains native shared libraries loaded by Rust via FFI.
 
 ## Lighter DEX Signing Library
 
-- `lighter-signer-linux-amd64.so` — official Linux x86-64 asset from [lighter-go v1.0.12](https://github.com/elliottech/lighter-go/releases/tag/v1.0.12)
+- `lighter-signer-linux-amd64.so` — official Linux x86-64 asset from [lighter-go v1.0.13](https://github.com/elliottech/lighter-go/releases/tag/v1.0.13)
 - `liblighter-signer-linux-amd64.so` — symlink to `lighter-signer-linux-amd64.so`
 
 Published SHA-256 digests:
-- Shared library: `7f107a0e2240aa40c9f0ae8aba396380fe62892fe199dd3691e3103fc9a6fd8e`
-- Linux x86-64 C header: `e060d6a15e9e5ca79b5a03c22c192f26a2182346d359b6f1d2d24a1046847302`
+- Shared library: `e4f0355e499c8608db4eae26824b81105b0d6a9fb91374661e61c1b4c70cc72c`
+- Linux x86-64 C header: `fcbe90e05378e51f6cb2370db6836badc3e65f7dd87b5363ce8cf131a9fbc743`
 
 Runtime loader setup on Linux x86-64:
 

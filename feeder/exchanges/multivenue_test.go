@@ -415,3 +415,228 @@ func TestHyperliquidSubscribesFastBookAndBBO(t *testing.T) {
 		t.Fatalf("expected both l2Book fast=true and bbo subscriptions, got fast=%v bbo=%v", gotFast, gotBBO)
 	}
 }
+
+func TestHyperliquidGroupIsolatesFastBookAndBBOBySection(t *testing.T) {
+	t.Setenv("ALEPH_SHM_DIR", t.TempDir())
+	matrix, err := shm.NewMatrix("hl-group-iso-unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer matrix.Close()
+
+	subs := make(chan map[string]any, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		for range 3 {
+			var sub map[string]any
+			if wsjson.Read(r.Context(), c, &sub) != nil {
+				return
+			}
+			subs <- sub
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	SetSymbolRegistry(map[string]uint16{"ETH": 0, "NVDA": 1003})
+	hl := NewHyperliquidGroupWithDepth(wsURL, []config.ExchangeConfig{
+		{
+			Enabled:    true,
+			WSURL:      wsURL,
+			Symbols:    map[string]string{"ETH": "ETH"},
+			FastBook:   false,
+			BBOChannel: false,
+		},
+		{
+			Enabled:    true,
+			WSURL:      wsURL,
+			Symbols:    map[string]string{"NVDA": "xyz:NVDA"},
+			FastBook:   true,
+			BBOChannel: true,
+		},
+	}, matrix, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- hl.connect(ctx, make(map[hlTarget]int64), make(map[hlTarget]int64))
+	}()
+
+	var ethL2, nvdaFastL2, nvdaBBO int
+	var ethUnexpectedFast, ethUnexpectedBBO bool
+	for range 3 {
+		select {
+		case sub := <-subs:
+			req, _ := sub["subscription"].(map[string]any)
+			switch req["coin"] {
+			case "ETH":
+				if req["type"] == "l2Book" {
+					ethL2++
+					if fast, ok := req["fast"].(bool); ok && fast {
+						ethUnexpectedFast = true
+					}
+				} else if req["type"] == "bbo" {
+					ethUnexpectedBBO = true
+				}
+			case "xyz:NVDA":
+				if req["type"] == "l2Book" && req["fast"] == true {
+					nvdaFastL2++
+				} else if req["type"] == "bbo" {
+					nvdaBBO++
+				}
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for grouped HL subscriptions")
+		}
+	}
+	cancel()
+	<-done
+
+	if ethL2 != 1 || nvdaFastL2 != 1 || nvdaBBO != 1 || ethUnexpectedFast || ethUnexpectedBBO {
+		t.Fatalf("unexpected per-section subscription isolation: ethL2=%d nvdaFastL2=%d nvdaBBO=%d ethUnexpectedFast=%v ethUnexpectedBBO=%v",
+			ethL2, nvdaFastL2, nvdaBBO, ethUnexpectedFast, ethUnexpectedBBO)
+	}
+}
+
+func TestHyperliquidSurfacesServerErrorFrameWithoutDroppingHealthyBooks(t *testing.T) {
+	t.Setenv("ALEPH_SHM_DIR", t.TempDir())
+	tmp := t.TempDir()
+	matrix, err := shm.NewMatrix("hl-err-unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer matrix.Close()
+
+	depth, err := shm.NewDepthWriter(filepath.Join(tmp, "aleph-depth"), shm.NumSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer depth.Close()
+
+	SetSymbolRegistry(map[string]uint16{"NVDA": 1003})
+	hl := NewHyperliquidWithDepth(config.ExchangeConfig{
+		Enabled:    true,
+		WSURL:      "wss://api.hyperliquid.xyz/ws",
+		Symbols:    map[string]string{"NVDA": "xyz:NVDA"},
+		FastBook:   true,
+		BBOChannel: true,
+	}, matrix, depth)
+
+	lastBbo := make(map[hlTarget]int64)
+	lastDepth := make(map[hlTarget]int64)
+	now := time.UnixMilli(1_794_712_730_000)
+
+	l2 := []byte(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1794712726000,"levels":[
+		[{"px":"145.00","sz":"1.0"}],
+		[{"px":"145.10","sz":"1.5"}]
+	]}}`)
+	if err := hl.handleMessageWithDepth(l2, now, lastBbo, lastDepth); err != nil {
+		t.Fatal(err)
+	}
+
+	errFrame := []byte(`{"channel":"error","data":"Invalid subscription: io:DELISTED"}`)
+	if err := hl.handleMessageWithDepth(errFrame, now, lastBbo, lastDepth); err != nil {
+		t.Fatalf("expected server error frame to be surfaced without crash-looping, got %v", err)
+	}
+	if hl.ErrorFrames() != 1 {
+		t.Fatalf("expected ErrorFrames() == 1, got %d", hl.ErrorFrames())
+	}
+
+	bboMsg := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726200,"bbo":[{"px":"145.02","sz":"2.2","n":1},{"px":"145.09","sz":"1.8","n":2}]}}`)
+	if err := hl.handleMessageWithDepth(bboMsg, now, lastBbo, lastDepth); err != nil {
+		t.Fatal(err)
+	}
+	bSnap, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003)
+	if !ok || bSnap.BidPrice != 145.02 || bSnap.AskPrice != 145.09 {
+		t.Fatalf("healthy BBO was dropped or not updated after server error frame: ok=%v %+v", ok, bSnap)
+	}
+	dSnap, ok := depth.ReadDepth(1003, ExchangeTradeXYZ)
+	if !ok || dSnap.Bids[0].Price != 145.00 || dSnap.Asks[0].Price != 145.10 {
+		t.Fatalf("healthy depth was dropped after server error frame: ok=%v %+v", ok, dSnap)
+	}
+}
+
+func TestHyperliquidSameTimestampInvalidationIsOrderIndependent(t *testing.T) {
+	SetSymbolRegistry(map[string]uint16{"NVDA": 1003})
+	const symbolID = uint16(1003)
+	now := time.UnixMilli(1_794_712_726_010)
+
+	l2Valid := []byte(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1794712726000,"levels":[[{"px":"145.00","sz":"1.0"}],[{"px":"145.10","sz":"1.5"}]]}}`)
+	l2Crossed := []byte(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1794712726000,"levels":[[{"px":"145.20","sz":"1.0"}],[{"px":"145.10","sz":"1.5"}]]}}`)
+	bboValid := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726000,"bbo":[{"px":"145.00","sz":"1.0"},{"px":"145.10","sz":"1.5"}]}}`)
+	bboNull := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726000,"bbo":[null,{"px":"145.10","sz":"1.5"}]}}`)
+	bboCrossed := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726000,"bbo":[{"px":"145.20","sz":"1.0"},{"px":"145.10","sz":"1.5"}]}}`)
+	bboOlderNull := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712725999,"bbo":[null,{"px":"145.10","sz":"1.5"}]}}`)
+	bboNewer := []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726001,"bbo":[{"px":"145.01","sz":"1.2"},{"px":"145.09","sz":"1.4"}]}}`)
+
+	cases := []struct {
+		name      string
+		frames    [][]byte
+		wantDepth bool
+	}{
+		{"valid L2 then null BBO", [][]byte{l2Valid, bboNull}, true},
+		{"null BBO then valid L2", [][]byte{bboNull, l2Valid}, true},
+		{"valid L2 then crossed BBO", [][]byte{l2Valid, bboCrossed}, true},
+		{"valid BBO then crossed L2", [][]byte{bboValid, l2Crossed}, false},
+		{"crossed L2 then valid BBO", [][]byte{l2Crossed, bboValid}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("ALEPH_SHM_DIR", tmp)
+			matrix, err := shm.NewMatrix("hl-same-ms-order")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer matrix.Close()
+			depth, err := shm.NewDepthWriter(filepath.Join(tmp, "aleph-depth"), shm.NumSymbols)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer depth.Close()
+
+			hl := NewHyperliquidWithDepth(config.ExchangeConfig{
+				Enabled: true, Symbols: map[string]string{"NVDA": "xyz:NVDA"},
+				FastBook: true, BBOChannel: true,
+			}, matrix, depth)
+			lastBBO := map[hlTarget]int64{}
+			lastDepth := map[hlTarget]int64{}
+
+			for i, frame := range tc.frames {
+				if err := hl.handleMessageWithDepth(frame, now.Add(time.Duration(i)*time.Millisecond), lastBBO, lastDepth); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, symbolID); ok {
+				t.Fatalf("expected fail-closed BBO invalidation on equal-timestamp mismatch")
+			}
+			_, gotDepth := depth.ReadDepth(symbolID, ExchangeTradeXYZ)
+			if gotDepth != tc.wantDepth {
+				t.Fatalf("unexpected depth readable=%v, want %v", gotDepth, tc.wantDepth)
+			}
+
+			// A strictly newer (+1ms) valid BBO recovers Matrix BBO cleanly.
+			if err := hl.handleMessageWithDepth(bboNewer, now.Add(2*time.Millisecond), lastBBO, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if snap, ok := matrix.ReadBBO(ExchangeTradeXYZ, symbolID); !ok || snap.BidPrice != 145.01 {
+				t.Fatalf("expected +1ms recovery BBO, got ok=%v %+v", ok, snap)
+			}
+
+			// A strictly older (-1ms) null BBO must never erase the newer valid BBO.
+			if err := hl.handleMessageWithDepth(bboOlderNull, now.Add(3*time.Millisecond), lastBBO, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if snap, ok := matrix.ReadBBO(ExchangeTradeXYZ, symbolID); !ok || snap.BidPrice != 145.01 {
+				t.Fatalf("older null BBO erased newer BBO: ok=%v %+v", ok, snap)
+			}
+		})
+	}
+}

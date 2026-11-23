@@ -24,6 +24,22 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
+const PRIVATE_EVENT_BACKOFF_MIN: Duration = Duration::from_micros(100);
+const PRIVATE_EVENT_BACKOFF_MAX: Duration = Duration::from_millis(1);
+
+/// Nominal adaptive idle backoff (`100 µs -> 1 ms`) for the private V2 event ring consumer
+/// (`P0-B` / `T1`). Tokio's ~1 ms timer wheel rounds sub-millisecond requests to the next tick,
+/// replacing the legacy 10 ms sleep ceiling with ~1 ms cadence when idle.
+fn next_private_event_backoff(current: Duration, processed: bool) -> Duration {
+    if processed {
+        PRIVATE_EVENT_BACKOFF_MIN
+    } else {
+        current
+            .saturating_mul(2)
+            .clamp(PRIVATE_EVENT_BACKOFF_MIN, PRIVATE_EVENT_BACKOFF_MAX)
+    }
+}
+
 async fn wait_for_resource<T>(path: &Path, open: impl Fn(&str) -> Result<T>) -> Result<T> {
     let start = std::time::Instant::now();
     let path = path.to_str().context("Shared-memory path must be UTF-8")?;
@@ -76,6 +92,7 @@ async fn connect_strategy(
     let event_sink = telemetry.clone();
     let (exchange_id, symbol_id) = (config.exchange_id, config.symbol_id);
     tokio::spawn(async move {
+        let mut idle_backoff = PRIVATE_EVENT_BACKOFF_MIN;
         loop {
             if event_reader.write_idx() < event_reader.local_read_idx() {
                 event_reader.skip_to_end();
@@ -106,8 +123,11 @@ async fn connect_strategy(
             if event_reader.take_integrity_loss() {
                 event_tracker.require_reconciliation();
             }
-            if !processed {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            if processed {
+                idle_backoff = next_private_event_backoff(idle_backoff, true);
+            } else {
+                tokio::time::sleep(idle_backoff).await;
+                idle_backoff = next_private_event_backoff(idle_backoff, false);
             }
         }
     });
@@ -421,4 +441,32 @@ async fn run_existing_feeder() -> Result<()> {
     let (mut strategy, _) =
         connect_strategy(config, trading, domain, &shm_dir(), telemetry).await?;
     strategy.run(Some(shutdown)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_event_backoff_scales_and_resets_within_bounds() {
+        let mut backoff = next_private_event_backoff(Duration::ZERO, false);
+        assert_eq!(backoff, PRIVATE_EVENT_BACKOFF_MIN);
+
+        let expected = [
+            Duration::from_micros(200),
+            Duration::from_micros(400),
+            Duration::from_micros(800),
+            PRIVATE_EVENT_BACKOFF_MAX,
+            PRIVATE_EVENT_BACKOFF_MAX,
+        ];
+        for want in expected {
+            backoff = next_private_event_backoff(backoff, false);
+            assert_eq!(backoff, want);
+        }
+
+        assert_eq!(
+            next_private_event_backoff(backoff, true),
+            PRIVATE_EVENT_BACKOFF_MIN
+        );
+    }
 }

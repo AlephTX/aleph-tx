@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elliottech/lighter-go/signer"
@@ -14,6 +15,7 @@ import (
 
 // LighterAuth handles Lighter authentication using Poseidon2 + Schnorr signatures
 type LighterAuth struct {
+	mu             sync.Mutex
 	keyManager     signer.KeyManager
 	accountIndex   int64
 	apiKeyIndex    uint8
@@ -33,6 +35,7 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid Lighter private key encoding")
 	}
+	defer clear(privKeyBytes)
 
 	if len(privKeyBytes) != 40 {
 		return nil, fmt.Errorf("API_KEY_PRIVATE_KEY must be 40 bytes, got %d", len(privKeyBytes))
@@ -85,6 +88,9 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 // CreateAuthToken generates a new authentication token
 // Format: "{deadline_unix}:{account_index}:{api_key_index}:{signature_hex}"
 func (la *LighterAuth) CreateAuthToken() (string, error) {
+	la.mu.Lock()
+	defer la.mu.Unlock()
+
 	// Reuse cached token if still valid (with 1 minute buffer)
 	if time.Now().Before(la.lastAuthExpiry.Add(-1 * time.Minute)) {
 		return la.lastAuthToken, nil

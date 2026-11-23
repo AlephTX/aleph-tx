@@ -3,6 +3,8 @@ package exchanges
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -142,6 +144,67 @@ func TestLighterAuthRejectsReservedKey157OnRobinhoodChain(t *testing.T) {
 	t.Setenv("LIGHTER_API_KEY_INDEX", "7")
 	if _, err := LoadLighterAuthFromEnv(); err != nil {
 		t.Fatalf("rejected valid Robinhood API key index 7: %v", err)
+	}
+}
+
+func TestLighterAuthCreateAuthTokenConcurrentCacheAndNoKeyLeak(t *testing.T) {
+	sentinel := "zz-secret-sentinel-key-do-not-leak-0123456789"
+	t.Setenv("LIGHTER_PRIVATE_KEY", sentinel)
+	t.Setenv("LIGHTER_ACCOUNT_INDEX", "42")
+	t.Setenv("LIGHTER_API_KEY_INDEX", "7")
+	if _, err := LoadLighterAuthFromEnv(); err == nil {
+		t.Fatal("expected invalid private key error")
+	} else if strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("private key leaked into error: %v", err)
+	}
+
+	t.Setenv("LIGHTER_PRIVATE_KEY", strings.Repeat("01", 40))
+	t.Setenv("LIGHTER_CHAIN_ID", "466324")
+	auth, err := LoadLighterAuthFromEnv()
+	if err != nil {
+		t.Fatalf("failed to load synthetic Lighter auth: %v", err)
+	}
+
+	const workers = 8
+	tokens := make(chan string, workers*4)
+	errs := make(chan error, workers*4)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 4; j++ {
+				tok, err := auth.CreateAuthToken()
+				if err != nil {
+					errs <- err
+					return
+				}
+				tokens <- tok
+			}
+		}()
+	}
+	wg.Wait()
+	close(tokens)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("CreateAuthToken returned error: %v", err)
+	}
+	var first string
+	count := 0
+	for tok := range tokens {
+		if !strings.Contains(tok, ":42:7:") {
+			t.Fatalf("unexpected auth token format: %q", tok)
+		}
+		if first == "" {
+			first = tok
+		} else if tok != first {
+			t.Fatalf("expected cached token reuse, got %q != %q", tok, first)
+		}
+		count++
+	}
+	if count != workers*4 {
+		t.Fatalf("expected %d tokens, got %d", workers*4, count)
 	}
 }
 

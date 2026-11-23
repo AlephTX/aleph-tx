@@ -22,16 +22,22 @@ feeder_symbols = { ETH = "0", BTC = "1" }
 feeder_enabled = true
 feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
 feeder_symbols = { ETH = "ETH", BTC = "BTC" }
+feeder_fast_book = true
+feeder_bbo_channel = true
 
 [entropy]
 feeder_enabled = true
 feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
 feeder_symbols = { NVDA = "io:NVDA", SNDK = "io:SNDK" }
+feeder_fast_book = true
+feeder_bbo_channel = true
 
 [tradexyz]
 feeder_enabled = true
 feeder_ws_url = "wss://api.hyperliquid.xyz/ws"
 feeder_symbols = { NVDA = "xyz:NVDA", SNDK = "xyz:SNDK" }
+feeder_fast_book = true
+feeder_bbo_channel = true
 
 [arcus]
 feeder_enabled = true

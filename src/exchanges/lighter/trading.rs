@@ -14,6 +14,8 @@ use crate::error::TradingError;
 use crate::order_tracker::{OrderSide as TrackerSide, OrderTracker};
 
 use anyhow::Result;
+use k256::elliptic_curve::zeroize::Zeroizing;
+use parking_lot::Mutex as SyncMutex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -244,9 +246,8 @@ impl LighterDomain {
     }
 }
 
-#[derive(Clone)]
 struct ApiKeyCredentials {
-    private_key: String,
+    private_key: Zeroizing<String>,
     api_key_index: i64,
 }
 
@@ -295,7 +296,7 @@ impl LighterCredentials {
             "Invalid Lighter {label} API key index"
         );
         Ok(ApiKeyCredentials {
-            private_key: private_key.to_owned(),
+            private_key: Zeroizing::new(private_key.to_owned()),
             api_key_index,
         })
     }
@@ -307,11 +308,16 @@ impl LighterCredentials {
         chain_id: i32,
         label: &str,
     ) -> Result<Option<ApiKeyCredentials>> {
-        let key = get(key_env).filter(|s| !s.is_empty());
+        let key = get(key_env).filter(|s| !s.is_empty()).map(Zeroizing::new);
         let index = get(index_env).filter(|s| !s.is_empty());
         match (key, index) {
             (None, None) => Ok(None),
-            (Some(k), Some(idx)) => Ok(Some(Self::parse_api_key(&k, &idx, chain_id, label)?)),
+            (Some(k), Some(idx)) => Ok(Some(Self::parse_api_key(
+                k.as_str(),
+                &idx,
+                chain_id,
+                label,
+            )?)),
             _ => anyhow::bail!("{key_env} and {index_env} must be configured together"),
         }
     }
@@ -329,10 +335,12 @@ impl LighterCredentials {
         let account_index: i64 = required("LIGHTER_ACCOUNT_INDEX")?.parse()?;
         anyhow::ensure!(account_index > 0, "Invalid Lighter account index");
 
-        let primary_key =
-            required("LIGHTER_PRIVATE_KEY").or_else(|_| required("API_KEY_PRIVATE_KEY"))?;
+        let primary_key = Zeroizing::new(
+            required("LIGHTER_PRIVATE_KEY").or_else(|_| required("API_KEY_PRIVATE_KEY"))?,
+        );
         let primary_index = required("LIGHTER_API_KEY_INDEX")?;
-        let maker_key = Self::parse_api_key(&primary_key, &primary_index, chain_id, "maker")?;
+        let maker_key =
+            Self::parse_api_key(primary_key.as_str(), &primary_index, chain_id, "maker")?;
         let cancel_key = Self::parse_optional_lane(
             &get,
             "LIGHTER_CANCEL_PRIVATE_KEY",
@@ -679,6 +687,35 @@ impl SigningLane {
 
 /// Sentinel bit pattern (`f64` quiet negative NaN) indicating no cap is set yet.
 const UNSET_POSITION_CAP_BITS: u64 = u64::MAX;
+const AUTH_TOKEN_TTL_SECS: i64 = 600;
+const AUTH_TOKEN_REFRESH_BUFFER_SECS: i64 = 60;
+const AUTH_TOKEN_CACHE_TTL: Duration =
+    Duration::from_secs((AUTH_TOKEN_TTL_SECS - AUTH_TOKEN_REFRESH_BUFFER_SECS) as u64);
+
+#[derive(Clone)]
+struct CachedAuthToken {
+    token: Zeroizing<String>,
+    /// Monotonic refresh cutoff anchored at mint start (`mint_started_at + AUTH_TOKEN_CACHE_TTL`).
+    refresh_after: Instant,
+    /// Signed UNIX-epoch deadline passed to the signer (`mint_started_wall_secs + AUTH_TOKEN_TTL_SECS`).
+    deadline_secs: i64,
+}
+
+impl CachedAuthToken {
+    fn is_fresh_at(&self, mono_now: Instant, wall_now_secs: i64) -> bool {
+        mono_now < self.refresh_after
+            && wall_now_secs
+                < self
+                    .deadline_secs
+                    .saturating_sub(AUTH_TOKEN_REFRESH_BUFFER_SECS)
+    }
+}
+
+#[derive(Default)]
+struct AuthTokenCacheState {
+    generation: u64,
+    entry: Option<CachedAuthToken>,
+}
 
 /// Lighter 交易客户端（币种无关，支持 Maker / Cancel / Taker 多 API Key 隔离）
 pub struct LighterTrading {
@@ -707,6 +744,7 @@ pub struct LighterTrading {
     /// Default order type for limit orders (Limit or LimitPostOnly)
     limit_order_type: OrderType,
     quote_expiry: Option<Duration>,
+    auth_token_cache: SyncMutex<AuthTokenCacheState>,
     /// Test builds only: a fixed read-auth token for loopback fixtures, so
     /// REST reads run without the platform signer. Absent in production.
     #[cfg(test)]
@@ -864,6 +902,7 @@ impl LighterTrading {
             quota,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
+            auth_token_cache: SyncMutex::new(AuthTokenCacheState::default()),
             test_auth_token: None,
         }
     }
@@ -912,6 +951,7 @@ impl LighterTrading {
             quota,
             limit_order_type: OrderType::PostOnly,
             quote_expiry: None,
+            auth_token_cache: SyncMutex::new(AuthTokenCacheState::default()),
             test_auth_token: None,
         }
     }
@@ -1029,6 +1069,7 @@ impl LighterTrading {
             quota,
             limit_order_type: OrderType::Limit,
             quote_expiry: None,
+            auth_token_cache: SyncMutex::new(AuthTokenCacheState::default()),
             #[cfg(test)]
             test_auth_token: None,
         })
@@ -1151,22 +1192,83 @@ impl LighterTrading {
     // ─── Auth Token ──────────────────────────────────────────────────────
 
     /// 创建认证 token（用于查询需要认证的 API）
-    /// Go feeder 用 deadline.Unix()（秒级绝对时间戳）
-    async fn create_auth_token(&self) -> Result<String> {
-        #[cfg(test)]
-        if let Some(token) = self.test_auth_token {
-            return Ok(token.to_owned());
-        }
-        let deadline_secs = SystemTime::now()
+    /// Go feeder 用 deadline.Unix()（秒级绝对时间戳）；在单调与墙钟双时钟均留出 1 分钟安全余量时复用缓存，并按 generation 防并发失效回写竞态。
+    fn unix_now_secs() -> Result<i64> {
+        let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("System clock error: {}", e))?
-            .as_secs() as i64
-            + 600;
+            .as_secs();
+        i64::try_from(secs).map_err(|_| anyhow::anyhow!("System clock seconds overflow i64"))
+    }
+
+    async fn create_auth_token(&self) -> Result<Zeroizing<String>> {
+        self.create_auth_token_with_clocks(|| (Instant::now(), Self::unix_now_secs()))
+            .await
+    }
+
+    async fn create_auth_token_with_clocks<F>(&self, mut clocks: F) -> Result<Zeroizing<String>>
+    where
+        F: FnMut() -> (Instant, Result<i64>),
+    {
+        #[cfg(test)]
+        if let Some(token) = self.test_auth_token {
+            return Ok(Zeroizing::new(token.to_owned()));
+        }
+        let (mint_started_mono, start_wall_res) = clocks();
+        let mint_started_wall_secs = start_wall_res?;
+        let start_gen = {
+            let cache = self.auth_token_cache.lock();
+            if let Some(cached) = cache.entry.as_ref()
+                && cached.is_fresh_at(mint_started_mono, mint_started_wall_secs)
+            {
+                return Ok(cached.token.clone());
+            }
+            cache.generation
+        };
+        let deadline_secs = mint_started_wall_secs
+            .checked_add(AUTH_TOKEN_TTL_SECS)
+            .ok_or_else(|| anyhow::anyhow!("Auth token expiry timestamp overflow"))?;
         // Phase 3: Direct FFI call (<100us, no spawn_blocking needed)
-        self.maker_lane
-            .signer
-            .create_auth_token(deadline_secs)
-            .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))
+        let token = Zeroizing::new(
+            self.maker_lane
+                .signer
+                .create_auth_token(deadline_secs)
+                .map_err(|e| anyhow::anyhow!("Auth token failed: {}", e))?,
+        );
+        let (after_mono, after_wall_res) = clocks();
+        let after_wall_secs = after_wall_res?;
+        let hard_deadline_mono = mint_started_mono
+            .checked_add(Duration::from_secs(AUTH_TOKEN_TTL_SECS as u64))
+            .ok_or_else(|| anyhow::anyhow!("Auth token monotonic deadline overflow"))?;
+        anyhow::ensure!(
+            after_mono < hard_deadline_mono && after_wall_secs < deadline_secs,
+            "Lighter auth token expired during minting"
+        );
+        let entry = CachedAuthToken {
+            token: token.clone(),
+            refresh_after: mint_started_mono + AUTH_TOKEN_CACHE_TTL,
+            deadline_secs,
+        };
+        if entry.is_fresh_at(after_mono, after_wall_secs) {
+            let mut cache = self.auth_token_cache.lock();
+            // Do not repopulate if invalidated concurrently or superseded by a fresher entry.
+            if cache.generation == start_gen
+                && cache.entry.as_ref().is_none_or(|cur| {
+                    !cur.is_fresh_at(after_mono, after_wall_secs)
+                        || cur.deadline_secs < entry.deadline_secs
+                        || cur.refresh_after < entry.refresh_after
+                })
+            {
+                cache.entry = Some(entry);
+            }
+        }
+        Ok(token)
+    }
+
+    pub(super) fn invalidate_auth_token_cache(&self) {
+        let mut cache = self.auth_token_cache.lock();
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.entry = None;
     }
 
     // ─── 签名 + 发送 ─────────────────────────────────────────────────────
@@ -2067,12 +2169,18 @@ impl LighterTrading {
         let resp = self
             .client
             .get(&url)
-            .header("Authorization", &auth)
+            .header("Authorization", auth.as_str())
             .send()
             .await?;
 
         let status = resp.status();
         if !status.is_success() {
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                self.invalidate_auth_token_cache();
+            }
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("get_active_orders HTTP {}: {}", status, body);
         }
@@ -3619,5 +3727,273 @@ mod tests {
         assert_eq!(trading.volume_quota_snapshot().unwrap().remaining, Some(42));
 
         server.abort();
+    }
+
+    #[test]
+    fn lighter_credentials_errors_never_leak_private_key() {
+        let non_hex_sentinel =
+            "zz-secret-sentinel-key-do-not-leak-0123456789abcdef0123456789abcdef0123456789";
+        let short_sentinel = "secret-sentinel-too-short";
+        let valid_hex = "01".repeat(40);
+
+        for (priv_key, idx, chain_id) in [
+            (non_hex_sentinel, "7", "304"),
+            (short_sentinel, "7", "304"),
+            (valid_hex.as_str(), "255", "304"),
+            (valid_hex.as_str(), "157", "466324"),
+        ] {
+            let err = LighterCredentials::from_env(|key| match key {
+                "LIGHTER_PRIVATE_KEY" => Some(priv_key.to_owned()),
+                "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+                "LIGHTER_API_KEY_INDEX" => Some(idx.to_owned()),
+                "LIGHTER_CHAIN_ID" => Some(chain_id.to_owned()),
+                _ => None,
+            })
+            .err()
+            .expect("invalid credentials must fail");
+            let msg = format!("{err:#}");
+            assert!(!msg.contains(priv_key), "error leaked private key: {msg}");
+        }
+
+        // Optional lane mismatch/invalid format must not leak secret material either.
+        let lane_err = LighterCredentials::from_env(|key| match key {
+            "LIGHTER_PRIVATE_KEY" => Some(valid_hex.clone()),
+            "LIGHTER_ACCOUNT_INDEX" => Some("42".into()),
+            "LIGHTER_API_KEY_INDEX" => Some("7".into()),
+            "LIGHTER_CANCEL_PRIVATE_KEY" => Some(non_hex_sentinel.to_owned()),
+            "LIGHTER_CANCEL_API_KEY_INDEX" => Some("8".into()),
+            _ => None,
+        })
+        .err()
+        .expect("invalid cancel key must fail");
+        assert!(!format!("{lane_err:#}").contains(non_hex_sentinel));
+    }
+
+    #[tokio::test]
+    async fn auth_token_cache_reuses_token_and_clears_on_401_or_invalidation() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let seen_auth: Arc<SyncMutex<Option<String>>> = Arc::new(SyncMutex::new(None));
+        let seen_auth_srv = Arc::clone(&seen_auth);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let seen_auth_srv = Arc::clone(&seen_auth_srv);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut lines = BufReader::new(reader);
+                    let mut line = String::new();
+                    while let Ok(n) = lines.read_line(&mut line).await {
+                        if n == 0 || line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some(val) = line
+                            .strip_prefix("authorization:")
+                            .or_else(|| line.strip_prefix("Authorization:"))
+                        {
+                            *seen_auth_srv.lock() = Some(val.trim().to_owned());
+                        }
+                        line.clear();
+                    }
+                    let body = "unauthorized";
+                    let _ = writer
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let trading = LighterTrading::mock_multi_lane_test_client(&url, 1, 10, None, None);
+        assert!(trading.auth_token_cache.lock().entry.is_none());
+
+        let t1 = trading.create_auth_token().await.unwrap();
+        assert_eq!(t1.as_str().matches(":1:10:mock").count(), 1);
+        let first_refresh = trading
+            .auth_token_cache
+            .lock()
+            .entry
+            .as_ref()
+            .expect("cache populated")
+            .refresh_after;
+
+        let t2 = trading.create_auth_token().await.unwrap();
+        assert_eq!(t2.as_str(), t1.as_str());
+        assert_eq!(
+            trading
+                .auth_token_cache
+                .lock()
+                .entry
+                .as_ref()
+                .unwrap()
+                .refresh_after,
+            first_refresh
+        );
+
+        trading.invalidate_auth_token_cache();
+        assert!(trading.auth_token_cache.lock().entry.is_none());
+        assert_eq!(trading.auth_token_cache.lock().generation, 1);
+
+        let t3 = trading.create_auth_token().await.unwrap();
+        assert!(trading.auth_token_cache.lock().entry.is_some());
+
+        let err = trading.get_active_orders().await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+        assert_eq!(seen_auth.lock().as_deref(), Some(t3.as_str()));
+        assert!(trading.auth_token_cache.lock().entry.is_none());
+        assert_eq!(trading.auth_token_cache.lock().generation, 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_auth_token_requires_a_valid_deadline_after_minting() {
+        let trading =
+            LighterTrading::mock_multi_lane_test_client("http://127.0.0.1:9", 1, 10, None, None);
+        let start = Instant::now();
+        let unix_start = 10_000;
+
+        for (elapsed, wall_elapsed, returns_token, caches_token) in [
+            (539, Some(539), true, true),
+            (540, Some(540), true, false),
+            (599, Some(599), true, false),
+            (600, Some(600), false, false),
+            (601, Some(601), false, false),
+            (100, Some(600), false, false),
+            (600, Some(500), false, false),
+            (0, None, false, false),
+        ] {
+            trading.invalidate_auth_token_cache();
+            let after_wall = wall_elapsed
+                .map(|secs| unix_start + secs)
+                .ok_or_else(|| anyhow::anyhow!("synthetic clock unavailable"));
+            let mut clocks = [
+                (start, Ok(unix_start)),
+                (start + Duration::from_secs(elapsed), after_wall),
+            ]
+            .into_iter();
+            let result = trading
+                .create_auth_token_with_clocks(|| clocks.next().expect("two clock samples"))
+                .await;
+
+            assert_eq!(result.is_ok(), returns_token, "{elapsed}, {wall_elapsed:?}");
+            assert_eq!(
+                trading.auth_token_cache.lock().entry.is_some(),
+                caches_token,
+                "{elapsed}, {wall_elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_token_cache_enforces_dual_clocks_mint_start_and_generation_guard() {
+        let trading =
+            LighterTrading::mock_multi_lane_test_client("http://127.0.0.1:9", 1, 10, None, None);
+        let base_mono = Instant::now();
+        let start_wall = 1_000_i64;
+
+        // Mint at (mono=0, wall=1000) -> signed deadline = 1600, refresh_after = +540s.
+        let t1 = trading
+            .create_auth_token_with_clocks(|| (base_mono, Ok(start_wall)))
+            .await
+            .unwrap();
+        assert_eq!(t1.as_str(), "1600:1:10:mock");
+
+        // At +539s mono and wall=1539 (< 1600 - 60): cached token is reused.
+        let hit = trading
+            .create_auth_token_with_clocks(|| {
+                (base_mono + Duration::from_secs(539), Ok(start_wall + 539))
+            })
+            .await
+            .unwrap();
+        assert_eq!(hit.as_str(), t1.as_str());
+
+        // Forward UTC clock correction at +530s mono (wall=1605 > 1540) must NOT reuse expired deadline.
+        let wall_refreshed = trading
+            .create_auth_token_with_clocks(|| {
+                (base_mono + Duration::from_secs(530), Ok(start_wall + 605))
+            })
+            .await
+            .unwrap();
+        assert_eq!(wall_refreshed.as_str(), "2205:1:10:mock");
+
+        // Backward wall-clock jump at +1070s mono (540s since second mint at +530s) still expires on monotonic bound.
+        let mono_refreshed = trading
+            .create_auth_token_with_clocks(|| {
+                (base_mono + Duration::from_secs(1070), Ok(start_wall + 100))
+            })
+            .await
+            .unwrap();
+        assert_eq!(mono_refreshed.as_str(), "1700:1:10:mock");
+
+        // Slow mint/pause (90s between mint start and store): refresh_after stays anchored at mint start, not store time.
+        trading.invalidate_auth_token_cache();
+        let mut step = 0usize;
+        let slow_mint = trading
+            .create_auth_token_with_clocks(|| {
+                let tick = step;
+                step += 1;
+                if tick == 0 {
+                    (base_mono + Duration::from_secs(2_000), Ok(2_000))
+                } else {
+                    (base_mono + Duration::from_secs(2_090), Ok(2_090))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(slow_mint.as_str(), "2600:1:10:mock");
+        // Still valid at +539s from mint start (2539s), rejected at +540s from mint start (2540s).
+        let slow_hit = trading
+            .create_auth_token_with_clocks(|| (base_mono + Duration::from_secs(2_539), Ok(2_539)))
+            .await
+            .unwrap();
+        assert_eq!(slow_hit.as_str(), slow_mint.as_str());
+        let slow_expired = trading
+            .create_auth_token_with_clocks(|| (base_mono + Duration::from_secs(2_540), Ok(2_539)))
+            .await
+            .unwrap();
+        assert_eq!(slow_expired.as_str(), "3139:1:10:mock");
+
+        // Stale mint stalled >= 540s returns the token once without caching it.
+        trading.invalidate_auth_token_cache();
+        let mut stall_step = 0usize;
+        let _ = trading
+            .create_auth_token_with_clocks(|| {
+                let tick = stall_step;
+                stall_step += 1;
+                if tick == 0 {
+                    (base_mono + Duration::from_secs(4_000), Ok(4_000))
+                } else {
+                    (base_mono + Duration::from_secs(4_540), Ok(4_540))
+                }
+            })
+            .await
+            .unwrap();
+        assert!(trading.auth_token_cache.lock().entry.is_none());
+
+        // Concurrent invalidation between mint start and commit blocks stale cache repopulation.
+        let gen_before = trading.auth_token_cache.lock().generation;
+        let mut race_step = 0usize;
+        let _ = trading
+            .create_auth_token_with_clocks(|| {
+                let tick = race_step;
+                race_step += 1;
+                if tick == 1 {
+                    trading.invalidate_auth_token_cache();
+                }
+                (base_mono + Duration::from_secs(5_000), Ok(5_000))
+            })
+            .await
+            .unwrap();
+        assert_eq!(trading.auth_token_cache.lock().generation, gen_before + 1);
+        assert!(trading.auth_token_cache.lock().entry.is_none());
     }
 }

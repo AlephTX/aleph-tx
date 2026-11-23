@@ -7,6 +7,7 @@ use aleph_tx::live_hedge::journal::{JOURNAL_SCHEMA, JournalRecord, StartRecord};
 use aleph_tx::live_hedge::{HedgeLimits, LiveInventoryHedge};
 use aleph_tx::telemetry_sink::{SessionInfo, TelemetrySink};
 use anyhow::{Context, Result, ensure};
+use k256::elliptic_curve::zeroize::Zeroizing;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -372,7 +373,7 @@ struct HedgeSetup {
 // Use the non-mutating API so neither dotenv nor a failed profile can change
 // environment variables in an already multithreaded runtime.
 #[allow(deprecated)]
-fn read_env(path: &Path) -> Result<HashMap<String, String>> {
+fn read_env(path: &Path) -> Result<HashMap<String, Zeroizing<String>>> {
     let mut values = HashMap::new();
     let known = |k: &str| {
         LIGHTER_FEEDER_ENV.contains(&k)
@@ -389,7 +390,7 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
                 .map_err(|_| anyhow::anyhow!("Invalid dotenv syntax in {}", path.display()))?;
             if known(&key) {
                 ensure!(
-                    values.insert(key, value).is_none(),
+                    values.insert(key, Zeroizing::new(value)).is_none(),
                     "Duplicate trading credential in {}",
                     path.display()
                 );
@@ -405,7 +406,7 @@ fn read_env(path: &Path) -> Result<HashMap<String, String>> {
         if !values.contains_key(key)
             && let Ok(value) = std::env::var(key)
         {
-            values.insert(key.to_owned(), value);
+            values.insert(key.to_owned(), Zeroizing::new(value));
         }
     }
     Ok(values)
@@ -537,6 +538,49 @@ impl Drop for Session {
     }
 }
 
+fn build_feeder_command(
+    feeder_bin: &Path,
+    feeder_config: &Path,
+    ipc_dir: &Path,
+    env: &HashMap<String, Zeroizing<String>>,
+) -> Command {
+    let mut feeder = Command::new(feeder_bin);
+    for key in LIGHTER_FEEDER_ENV {
+        if let Some(value) = env.get(*key) {
+            feeder.env(key, value.as_str());
+        }
+    }
+    for key in LIGHTER_EXTRA_LANE_ENV {
+        feeder.env_remove(key);
+    }
+    feeder
+        .env("ALEPH_FEEDER_CONFIG", feeder_config)
+        .env("ALEPH_SHM_DIR", ipc_dir)
+        .env_remove("ALEPH_SHM")
+        .env_remove("ALEPH_FEEDER_PUBLIC_ONLY")
+        .env_remove(HEDGE_KEY)
+        .env_remove(HEDGE_ACCOUNT)
+        .process_group(0)
+        .kill_on_drop(true);
+    feeder
+}
+
+fn spawn_feeder_process(
+    feeder_bin: &Path,
+    feeder_config: &Path,
+    ipc_dir: &Path,
+    env: HashMap<String, Zeroizing<String>>,
+) -> Result<Child> {
+    // Drop the Command builder and zeroized env map right after spawn() so
+    // stdlib-copied environment strings do not outlive child creation across supervise().
+    let spawn_result = {
+        let mut cmd = build_feeder_command(feeder_bin, feeder_config, ipc_dir, &env);
+        cmd.spawn()
+    };
+    drop(env);
+    spawn_result.with_context(|| format!("Start feeder {}", feeder_bin.display()))
+}
+
 pub(super) async fn launch(
     profile: Profile,
     expected: Network,
@@ -546,7 +590,8 @@ pub(super) async fn launch(
     profile.require_network(expected)?;
     require_platform()?;
     let env = read_env(dotenv)?;
-    let credentials = LighterCredentials::from_env(|key| env.get(key).cloned())?;
+    let credentials =
+        LighterCredentials::from_env(|key| env.get(key).map(|v| v.as_str().to_owned()))?;
     let domain = credentials.domain()?;
     let network = domain.network();
     ensure!(
@@ -561,11 +606,13 @@ pub(super) async fn launch(
             let account = env
                 .get(HEDGE_ACCOUNT)
                 .context("Missing HYPERLIQUID_ACCOUNT_ADDRESS")?
-                .clone();
+                .as_str()
+                .to_owned();
             validate_hex(&account, 20)?;
             let signer = HyperliquidSigner::from_private_key(
                 env.get(HEDGE_KEY)
-                    .context("Missing HYPERLIQUID_AGENT_PRIVATE_KEY")?,
+                    .context("Missing HYPERLIQUID_AGENT_PRIVATE_KEY")?
+                    .as_str(),
             )
             .map_err(|_| anyhow::anyhow!("Invalid HYPERLIQUID_AGENT_PRIVATE_KEY"))?;
             Ok(HedgeSetup {
@@ -599,27 +646,7 @@ pub(super) async fn launch(
         session.discard_unstarted()?;
         return Err(error.into());
     }
-    let mut feeder = Command::new(feeder_bin);
-    for key in LIGHTER_FEEDER_ENV {
-        if let Some(value) = env.get(*key) {
-            feeder.env(key, value);
-        }
-    }
-    for key in LIGHTER_EXTRA_LANE_ENV {
-        feeder.env_remove(key);
-    }
-    let feeder = feeder
-        .env("ALEPH_FEEDER_CONFIG", &feeder_config)
-        .env("ALEPH_SHM_DIR", &session.ipc)
-        .env_remove("ALEPH_SHM")
-        .env_remove("ALEPH_FEEDER_PUBLIC_ONLY")
-        .env_remove(HEDGE_KEY)
-        .env_remove(HEDGE_ACCOUNT)
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("Start feeder {}", feeder_bin.display()));
-    let mut feeder = match feeder {
+    let mut feeder = match spawn_feeder_process(feeder_bin, &feeder_config, &session.ipc, env) {
         Ok(child) => child,
         Err(error) => {
             session.discard_unstarted()?;
@@ -1043,5 +1070,61 @@ taker_fee_bps = 4.5
         assert!(Profile::load(&rh_hedged_path).is_err());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn build_feeder_command_filters_secrets_and_extra_lanes() {
+        let mut env = HashMap::new();
+        env.insert(
+            "LIGHTER_PRIVATE_KEY".into(),
+            Zeroizing::new("synthetic-lighter-key".into()),
+        );
+        env.insert(
+            "LIGHTER_CANCEL_PRIVATE_KEY".into(),
+            Zeroizing::new("synthetic-cancel-key".into()),
+        );
+        env.insert(HEDGE_KEY.into(), Zeroizing::new("synthetic-hl-key".into()));
+        env.insert(
+            HEDGE_ACCOUNT.into(),
+            Zeroizing::new("0x0000000000000000000000000000000000000001".into()),
+        );
+
+        let cmd = build_feeder_command(
+            Path::new("true"),
+            Path::new("/tmp/config.toml"),
+            Path::new("/tmp/ipc"),
+            &env,
+        );
+        let envs: BTreeMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.is_some()))
+            .collect();
+        assert_eq!(envs.get("LIGHTER_PRIVATE_KEY"), Some(&true));
+        assert_eq!(envs.get("ALEPH_FEEDER_CONFIG"), Some(&true));
+        assert_eq!(envs.get("ALEPH_SHM_DIR"), Some(&true));
+        assert_eq!(envs.get("LIGHTER_CANCEL_PRIVATE_KEY"), Some(&false));
+        assert_eq!(envs.get(HEDGE_KEY), Some(&false));
+        assert_eq!(envs.get(HEDGE_ACCOUNT), Some(&false));
+        assert_eq!(envs.get("ALEPH_SHM"), Some(&false));
+        assert_eq!(envs.get("ALEPH_FEEDER_PUBLIC_ONLY"), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn spawn_feeder_process_drops_builder_and_spawns_cleanly() {
+        let mut env = HashMap::new();
+        env.insert(
+            "LIGHTER_PRIVATE_KEY".into(),
+            Zeroizing::new("synthetic-lighter-key".into()),
+        );
+        let mut child = spawn_feeder_process(
+            Path::new("true"),
+            Path::new("/tmp/config.toml"),
+            Path::new("/tmp/ipc"),
+            env,
+        )
+        .unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
     }
 }
