@@ -758,6 +758,23 @@ impl CarryDriftState {
         Ok(adj)
     }
 
+    pub fn next_stale_at(&self, policy: CarryDriftAdjustment) -> Option<u64> {
+        if !policy.require_fresh_rates {
+            return None;
+        }
+        match self.leg_states {
+            [
+                LegRateState::Valid { source_ms: s0, .. },
+                LegRateState::Valid { source_ms: s1, .. },
+            ] => Some(
+                s0.min(s1)
+                    .saturating_add(policy.max_rate_age_ms)
+                    .saturating_add(1),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn record_adjustment(&mut self, adj: Decimal) {
         if adj < Decimal::ZERO {
             self.report.adverse_adjustments += 1;

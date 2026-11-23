@@ -116,7 +116,7 @@ fn l1_imbalance(book: &Book, terms: &MarketTerms) -> Option<Decimal> {
 
 impl EntryBookState {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn check_entry(
+    pub(super) fn eval_entry(
         &self,
         policy: EntryBookFilter,
         maker_book: &Book,
@@ -127,7 +127,6 @@ impl EntryBookState {
         quote_notional: Decimal,
         maker_fee_bps: Decimal,
     ) -> std::result::Result<(), &'static str> {
-        self.checked_sides.set(self.checked_sides.get() + 1);
         let Some(maker_spread_bps) = l1_spread_bps(maker_book) else {
             return Err("invalid_book_touch");
         };
@@ -137,28 +136,20 @@ impl EntryBookState {
         if let Some(min_sp) = policy.min_maker_spread_bps
             && maker_spread_bps < min_sp
         {
-            self.blocked_maker_spread
-                .set(self.blocked_maker_spread.get() + 1);
             return Err("maker_spread_too_tight");
         }
         if let Some(max_sp) = policy.max_hedge_spread_bps
             && hedge_spread_bps > max_sp
         {
-            self.blocked_hedge_spread
-                .set(self.blocked_hedge_spread.get() + 1);
             return Err("hedge_spread_too_wide");
         }
         if let Some(min_mult) = policy.min_hedge_touch_notional_mult {
             // Maker Buy hedges via Sell IOC (hits hedge bids[0]); Maker Sell via Buy IOC (asks[0]).
             let Some(level) = hedge_book.side(opposite(side)).first() else {
-                self.blocked_hedge_touch_depth
-                    .set(self.blocked_hedge_touch_depth.get() + 1);
                 return Err("hedge_touch_depth_thin");
             };
             let touch_notional = level.contracts * hedge_terms.base_per_contract * level.price;
             if touch_notional < min_mult * quote_notional {
-                self.blocked_hedge_touch_depth
-                    .set(self.blocked_hedge_touch_depth.get() + 1);
                 return Err("hedge_touch_depth_thin");
             }
         }
@@ -170,8 +161,6 @@ impl EntryBookState {
                         HedgeSide::Sell => imb > max_imb,
                     };
                     if adverse {
-                        self.blocked_adverse_imbalance
-                            .set(self.blocked_adverse_imbalance.get() + 1);
                         return Err("adverse_book_imbalance");
                     }
                 }
@@ -197,25 +186,66 @@ impl EntryBookState {
             let net_open_bps =
                 signed_spread / hedge_mid * BPS - maker_fee_bps - hedge_terms.taker_fee_bps;
             if net_open_bps < min_edge {
-                self.blocked_hedged_opening_edge
-                    .set(self.blocked_hedged_opening_edge.get() + 1);
                 return Err("adverse_hedged_opening_edge");
             }
         }
         if let Some(max_mult) = policy.max_maker_queue_notional_mult {
             let Some(level) = maker_book.side(opposite(side)).first() else {
-                self.blocked_maker_queue_depth
-                    .set(self.blocked_maker_queue_depth.get() + 1);
                 return Err("maker_queue_too_deep");
             };
             let queue_notional = level.contracts * maker_terms.base_per_contract * level.price;
             if queue_notional > max_mult * quote_notional {
-                self.blocked_maker_queue_depth
-                    .set(self.blocked_maker_queue_depth.get() + 1);
                 return Err("maker_queue_too_deep");
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn check_entry(
+        &self,
+        policy: EntryBookFilter,
+        maker_book: &Book,
+        maker_terms: &MarketTerms,
+        hedge_book: &Book,
+        hedge_terms: &MarketTerms,
+        side: HedgeSide,
+        quote_notional: Decimal,
+        maker_fee_bps: Decimal,
+    ) -> std::result::Result<(), &'static str> {
+        self.checked_sides.set(self.checked_sides.get() + 1);
+        let result = self.eval_entry(
+            policy,
+            maker_book,
+            maker_terms,
+            hedge_book,
+            hedge_terms,
+            side,
+            quote_notional,
+            maker_fee_bps,
+        );
+        match result {
+            Err("maker_spread_too_tight") => self
+                .blocked_maker_spread
+                .set(self.blocked_maker_spread.get() + 1),
+            Err("hedge_spread_too_wide") => self
+                .blocked_hedge_spread
+                .set(self.blocked_hedge_spread.get() + 1),
+            Err("hedge_touch_depth_thin") => self
+                .blocked_hedge_touch_depth
+                .set(self.blocked_hedge_touch_depth.get() + 1),
+            Err("adverse_book_imbalance") => self
+                .blocked_adverse_imbalance
+                .set(self.blocked_adverse_imbalance.get() + 1),
+            Err("adverse_hedged_opening_edge") => self
+                .blocked_hedged_opening_edge
+                .set(self.blocked_hedged_opening_edge.get() + 1),
+            Err("maker_queue_too_deep") => self
+                .blocked_maker_queue_depth
+                .set(self.blocked_maker_queue_depth.get() + 1),
+            _ => {}
+        }
+        result
     }
 
     pub(super) fn report(&self, policy: EntryBookFilter) -> EntryBookReport {

@@ -2,8 +2,15 @@
 //! shared with the sequential IOC simulator.
 
 use super::{Fill, IncentiveTurnoverReport, Ledger, sweep};
+use crate::strategy::kalman_basis::{
+    KalmanBasisConfig, KalmanBasisFilter, KalmanBasisSnapshot, MakerEntrySide, SessionRegime,
+    StationarityStatus,
+};
 use crate::strategy::relative_value::*;
 use crate::strategy::replay_queue_depth::ReplayQueueDepth;
+use crate::strategy::slow_cascade::{
+    CascadeSide, SlowCascadeConfig, SlowCascadeDecision, SlowCascadeGuard,
+};
 use std::collections::{BTreeMap, VecDeque};
 
 mod basis_reversion;
@@ -11,6 +18,7 @@ mod basis_risk;
 mod costs;
 mod entry_book;
 mod entry_flow;
+mod entry_guards;
 mod funding;
 mod paired_cash_exit;
 mod posture;
@@ -22,6 +30,14 @@ use entry_book::EntryBookState;
 pub use entry_book::{EntryBookFilter, EntryBookReport};
 use entry_flow::EntryFlowState;
 pub use entry_flow::{EntryFlowFilter, EntryFlowReport};
+use entry_guards::{
+    BookEvidence, EntryEdgePersistState, InventoryLadderState, PostFillRefreshState,
+    fingerprint_leg_book,
+};
+pub use entry_guards::{
+    EntryEdgePersistReport, EntryEdgePersistence, InventoryLadderConfig, InventoryLadderReport,
+    PostFillRefreshMode, PostFillRefreshReport,
+};
 pub use funding::{
     CarryDriftAdjustment, CarryDriftReport, FlatAtFunding, FundingFlatReport,
     FundingLifecycleReport, FundingSettlementPolicy,
@@ -178,6 +194,21 @@ pub struct MakerFirstConfig {
     /// Optional hourly carry-drift basis threshold adjustment (`ARB-IMP-05`).
     #[serde(default)]
     pub carry_drift_adjustment: Option<CarryDriftAdjustment>,
+    /// Optional causal slow-cascade asymmetric opening entry throttle (`CRASH-IMP-02`).
+    #[serde(default)]
+    pub slow_cascade: Option<SlowCascadeConfig>,
+    /// Optional causal Kalman + OU stationarity basis filter (`ARB-IMP-04`).
+    #[serde(default)]
+    pub kalman_basis: Option<KalmanBasisConfig>,
+    /// Optional convex exposure-based opening threshold surcharge (`ARB-IMP-02`).
+    #[serde(default)]
+    pub inventory_ladder: Option<InventoryLadderConfig>,
+    /// Optional causal opening-edge persistence gate (`ARB-IMP-03`).
+    #[serde(default)]
+    pub entry_edge_persistence: Option<EntryEdgePersistence>,
+    /// Optional post-fill book refresh barrier before next opening quote (`ARB-IMP-03`).
+    #[serde(default)]
+    pub post_fill_book_refresh: Option<PostFillRefreshMode>,
 }
 
 fn default_entry_markout_quantile_p() -> f64 {
@@ -852,6 +883,49 @@ pub struct MakerFirstReport {
     pub entry_hedge_diagnostics: Option<EntryHedgeDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired_cash_exit: Option<PairedCashExitReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_cascade: Option<SlowCascadeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kalman_basis: Option<KalmanBasisReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_ladder: Option<InventoryLadderReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_edge_persistence: Option<EntryEdgePersistReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_fill_book_refresh: Option<PostFillRefreshReport>,
+}
+
+/// Telemetry emitted when [`MakerFirstConfig::slow_cascade`] is enabled (`CRASH-IMP-02`).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SlowCascadeReport {
+    pub active_side: CascadeSide,
+    pub completed_bars: usize,
+    pub gap_resets: u64,
+    pub rejected_inputs: u64,
+    pub blocked_opening_entries: usize,
+    pub scaled_opening_entries: usize,
+    pub cancelled_resting_entries: usize,
+}
+
+/// Telemetry emitted when [`MakerFirstConfig::kalman_basis`] is enabled (`ARB-IMP-04`).
+#[derive(Debug, Clone, Serialize)]
+pub struct KalmanBasisReport {
+    pub initialized: bool,
+    pub current_regime: Option<SessionRegime>,
+    pub alpha_bps: f64,
+    pub variance_p: f64,
+    pub last_stationarity: Option<StationarityStatus>,
+    pub last_dislocation_bps: Option<f64>,
+    pub last_half_life_ms: Option<f64>,
+    pub regime_resets: u64,
+    pub gap_resets: u64,
+    pub rejected_inputs: u64,
+    pub blocked_warmup_or_invalid: usize,
+    pub blocked_non_stationary: usize,
+    pub blocked_dislocation_band: usize,
+    pub blocked_side_mismatch: usize,
+    pub cancelled_resting_entries: usize,
+    pub time_stop_triggers: usize,
 }
 
 /// Explicit four-denominator turnover separation (`VMM-01` / `OPT-01`) so target-venue,
@@ -1064,6 +1138,147 @@ struct ClosedCycleSummary {
     recorded_in_attribution: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HedgeBookObservation {
+    source_ms: u64,
+    touch: [Decimal; 2],
+}
+
+struct SlowCascadeState {
+    guard: SlowCascadeGuard,
+    last_decision: Option<SlowCascadeDecision>,
+    last_observation: Option<HedgeBookObservation>,
+    blocked_opening_entries: usize,
+    scaled_opening_entries: usize,
+    cancelled_resting_entries: usize,
+}
+
+impl SlowCascadeState {
+    fn new(config: SlowCascadeConfig) -> Result<Self> {
+        Ok(Self {
+            guard: SlowCascadeGuard::new(config)?,
+            last_decision: None,
+            last_observation: None,
+            blocked_opening_entries: 0,
+            scaled_opening_entries: 0,
+            cancelled_resting_entries: 0,
+        })
+    }
+
+    fn scale_for(&self, side: HedgeSide) -> f64 {
+        let Some(decision) = self.last_decision.filter(|d| d.data_healthy) else {
+            return 0.0;
+        };
+        match side {
+            HedgeSide::Buy => decision.bid_entry_scale,
+            HedgeSide::Sell => decision.ask_entry_scale,
+        }
+    }
+
+    fn report(&self) -> SlowCascadeReport {
+        SlowCascadeReport {
+            active_side: self.guard.side(),
+            completed_bars: self.guard.completed_bars(),
+            gap_resets: self.guard.gap_resets(),
+            rejected_inputs: self.guard.rejected_inputs(),
+            blocked_opening_entries: self.blocked_opening_entries,
+            scaled_opening_entries: self.scaled_opening_entries,
+            cancelled_resting_entries: self.cancelled_resting_entries,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KalmanBookObservation {
+    source_ms: [u64; 2],
+    touch: [[Decimal; 2]; 2],
+    regime: SessionRegime,
+}
+
+struct KalmanBasisState {
+    filter: KalmanBasisFilter,
+    last_snapshot: Option<KalmanBasisSnapshot>,
+    last_observation: Option<KalmanBookObservation>,
+    blocked_warmup_or_invalid: usize,
+    blocked_non_stationary: usize,
+    blocked_dislocation_band: usize,
+    blocked_side_mismatch: usize,
+    cancelled_resting_entries: usize,
+    time_stop_triggers: usize,
+}
+
+impl KalmanBasisState {
+    fn new(config: KalmanBasisConfig) -> Result<Self> {
+        Ok(Self {
+            filter: KalmanBasisFilter::new(config)?,
+            last_snapshot: None,
+            last_observation: None,
+            blocked_warmup_or_invalid: 0,
+            blocked_non_stationary: 0,
+            blocked_dislocation_band: 0,
+            blocked_side_mismatch: 0,
+            cancelled_resting_entries: 0,
+            time_stop_triggers: 0,
+        })
+    }
+
+    fn check_entry(&self, side: HedgeSide) -> std::result::Result<(), &'static str> {
+        let Some(snap) = self.last_snapshot else {
+            return Err("kalman_basis_warmup_or_invalid");
+        };
+        if !snap.valid_observation || snap.stationarity == StationarityStatus::WarmingUp {
+            return Err("kalman_basis_warmup_or_invalid");
+        }
+        if snap.stationarity == StationarityStatus::NonStationary {
+            return Err("kalman_basis_non_stationary");
+        }
+        let eval = self.filter.evaluate_entry(&snap);
+        if !eval.allowed {
+            return Err("kalman_basis_band");
+        }
+        let side_ok = matches!(
+            (eval.preferred_side, side),
+            (Some(MakerEntrySide::Buy), HedgeSide::Buy)
+                | (Some(MakerEntrySide::Sell), HedgeSide::Sell)
+        );
+        if !side_ok {
+            return Err("kalman_basis_side");
+        }
+        Ok(())
+    }
+
+    fn record_block(&mut self, reason: &'static str) {
+        match reason {
+            "kalman_basis_warmup_or_invalid" => self.blocked_warmup_or_invalid += 1,
+            "kalman_basis_non_stationary" => self.blocked_non_stationary += 1,
+            "kalman_basis_band" => self.blocked_dislocation_band += 1,
+            "kalman_basis_side" => self.blocked_side_mismatch += 1,
+            _ => {}
+        }
+    }
+
+    fn report(&self) -> KalmanBasisReport {
+        KalmanBasisReport {
+            initialized: self.filter.is_initialized(),
+            current_regime: self.filter.current_regime(),
+            alpha_bps: self.filter.alpha_bps(),
+            variance_p: self.filter.variance_p(),
+            last_stationarity: self.last_snapshot.map(|s| s.stationarity),
+            last_dislocation_bps: self.last_snapshot.map(|s| s.dislocation_bps),
+            last_half_life_ms: self.last_snapshot.and_then(|s| s.half_life_ms),
+            regime_resets: self.filter.regime_resets(),
+            gap_resets: self.filter.gap_resets(),
+            rejected_inputs: self.filter.rejected_inputs(),
+            blocked_warmup_or_invalid: self.blocked_warmup_or_invalid,
+            blocked_non_stationary: self.blocked_non_stationary,
+            blocked_dislocation_band: self.blocked_dislocation_band,
+            blocked_side_mismatch: self.blocked_side_mismatch,
+            cancelled_resting_entries: self.cancelled_resting_entries,
+            time_stop_triggers: self.time_stop_triggers,
+        }
+    }
+}
+
 struct Replay<'a> {
     config: &'a MakerFirstConfig,
     rules: Rules,
@@ -1101,6 +1316,11 @@ struct Replay<'a> {
     funding: Option<FundingState>,
     funding_lifecycle: Option<FundingLifecycleState>,
     carry_drift: CarryDriftState,
+    slow_cascade: Option<SlowCascadeState>,
+    kalman_basis: Option<KalmanBasisState>,
+    inventory_ladder: InventoryLadderState,
+    entry_edge_persist: EntryEdgePersistState,
+    post_fill_refresh: PostFillRefreshState,
     report: MakerFirstReport,
 }
 
@@ -1562,6 +1782,26 @@ impl MakerFirstConfig {
         if let Some(policy) = self.carry_drift_adjustment {
             policy.validate(self)?;
         }
+        if let Some(policy) = self.slow_cascade {
+            policy.validate()?;
+        }
+        if let Some(policy) = self.kalman_basis {
+            policy.validate()?;
+            ensure!(
+                self.pair.mode.is_pair_hedge(),
+                "kalman_basis requires PairHedge mode"
+            );
+            ensure!(
+                self.basis_reversion.is_none(),
+                "cannot enable both basis_reversion and kalman_basis"
+            );
+        }
+        if let Some(policy) = self.inventory_ladder {
+            policy.validate(self)?;
+        }
+        if let Some(policy) = self.entry_edge_persistence {
+            policy.validate(self)?;
+        }
         let mut slots = [0; 2];
         let mut first = [None; 2];
         for (i, leg) in self.pair.legs.iter().enumerate() {
@@ -1735,26 +1975,78 @@ impl Replay<'_> {
         }
     }
 
-    fn funding_lifecycle_timers(&mut self, until: u64) -> Result<()> {
+    fn next_carry_drift_stale_at(&self) -> Option<u64> {
+        let policy = self.config.carry_drift_adjustment?;
+        let quote = self
+            .quote
+            .as_ref()
+            .filter(|q| !q.closing && q.cancelled_ms.is_none())?;
+        let _ = quote;
+        self.carry_drift.next_stale_at(policy)
+    }
+
+    fn advance_timers(&mut self, until: u64, mut min_now: u64) -> Result<()> {
         loop {
-            let next = self
+            let funding_at = self
+                .funding
+                .as_ref()
+                .and_then(|s| s.timers.front().map(|(at, _)| *at))
+                .filter(|at| *at <= until);
+            let lifecycle_at = self
                 .funding_lifecycle
-                .as_mut()
-                .and_then(|s| s.pop_timer_due(until));
-            let Some(now) = next else {
+                .as_ref()
+                .and_then(|s| s.next_timer_due(until));
+            let carry_stale_at = self
+                .next_carry_drift_stale_at()
+                .map(|at| at.max(min_now))
+                .filter(|at| *at <= until);
+            let next_at = [funding_at, lifecycle_at, carry_stale_at]
+                .into_iter()
+                .flatten()
+                .min();
+            let Some(fired_at) = next_at else {
                 return Ok(());
             };
-            if self.posture.expire(now) {
-                self.report.turnover_posture.controls_expired += 1;
-                self.posture_changed(now);
+            min_now = min_now.max(fired_at);
+            if funding_at == Some(fired_at) {
+                let (now, kind) = self
+                    .funding
+                    .as_mut()
+                    .and_then(|s| s.timers.pop_front())
+                    .expect("funding timer inspected above");
+                self.step_funding_timer(now, kind)?;
+            } else if lifecycle_at == Some(fired_at) {
+                let now = self
+                    .funding_lifecycle
+                    .as_mut()
+                    .and_then(|s| s.pop_timer_due(until))
+                    .expect("lifecycle timer inspected above");
+                self.step_funding_lifecycle_timer(now)?;
+            } else {
+                if self.posture.expire(fired_at) {
+                    self.report.turnover_posture.controls_expired += 1;
+                    self.posture_changed(fired_at);
+                }
+                self.risk(fired_at);
+                self.advance_quote(fired_at, false);
+                self.advance(fired_at)?;
+                self.risk(fired_at);
             }
-            self.resolve_funding_settlements(now, false);
-            self.risk(now);
-            self.advance_quote(now, false);
-            self.advance(now)?;
-            self.resolve_funding_settlements(now, false);
-            self.risk(now);
         }
+    }
+
+    fn step_funding_lifecycle_timer(&mut self, now: u64) -> Result<()> {
+        if self.posture.expire(now) {
+            self.report.turnover_posture.controls_expired += 1;
+            self.posture_changed(now);
+        }
+        self.resolve_funding_settlements(now, false);
+        self.risk(now);
+        self.advance_quote(now, false);
+        self.advance(now)?;
+        self.resolve_funding_settlements(now, false);
+        self.risk(now);
+        Ok(())
     }
 
     fn funding_flat(&self) -> bool {
@@ -1765,6 +2057,43 @@ impl Replay<'_> {
             && self.cycle.is_none()
     }
 
+    fn step_funding_timer(&mut self, now: u64, kind: TimerKind) -> Result<()> {
+        if self.posture.expire(now) {
+            self.report.turnover_posture.controls_expired += 1;
+            self.posture_changed(now);
+        }
+        if matches!(kind, TimerKind::Resume) {
+            // A book received before the guard cannot authorize resumption.
+            self.usable = [false; 2];
+            self.last_usable_at_ms = [None; 2];
+            self.funding
+                .as_mut()
+                .expect("funding timer owns state")
+                .resume_after_ms = now;
+        }
+        self.risk(now);
+        self.advance_quote(now, false);
+        self.advance(now)?;
+        self.risk(now);
+        if matches!(kind, TimerKind::Check | TimerKind::Slot(_)) {
+            if !self.funding_flat() {
+                self.funding_failure("funding_boundary_not_flat_and_resolved");
+            }
+            let state = self.funding.as_mut().expect("funding timer owns state");
+            state.report.boundary_checks += 1;
+            if let TimerKind::Slot(legs) = kind
+                && state.report.failure.is_none()
+                && self.report.incomplete.is_none()
+            {
+                for (i, paid) in legs.into_iter().enumerate() {
+                    state.report.verified_slots_by_leg[i] += u64::from(paid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn funding_timers(&mut self, until: u64) -> Result<()> {
         loop {
             let timer = self.funding.as_mut().and_then(|state| {
@@ -1774,38 +2103,7 @@ impl Replay<'_> {
             let Some((now, kind)) = timer else {
                 return Ok(());
             };
-            if self.posture.expire(now) {
-                self.report.turnover_posture.controls_expired += 1;
-                self.posture_changed(now);
-            }
-            if matches!(kind, TimerKind::Resume) {
-                // A book received before the guard cannot authorize resumption.
-                self.usable = [false; 2];
-                self.last_usable_at_ms = [None; 2];
-                self.funding
-                    .as_mut()
-                    .expect("funding timer owns state")
-                    .resume_after_ms = now;
-            }
-            self.risk(now);
-            self.advance_quote(now, false);
-            self.advance(now)?;
-            self.risk(now);
-            if matches!(kind, TimerKind::Check | TimerKind::Slot(_)) {
-                if !self.funding_flat() {
-                    self.funding_failure("funding_boundary_not_flat_and_resolved");
-                }
-                let state = self.funding.as_mut().expect("funding timer owns state");
-                state.report.boundary_checks += 1;
-                if let TimerKind::Slot(legs) = kind
-                    && state.report.failure.is_none()
-                    && self.report.incomplete.is_none()
-                {
-                    for (i, paid) in legs.into_iter().enumerate() {
-                        state.report.verified_slots_by_leg[i] += u64::from(paid);
-                    }
-                }
-            }
+            self.step_funding_timer(now, kind)?;
         }
     }
 
@@ -1923,6 +2221,10 @@ impl Replay<'_> {
             }
         }
         self.books = Some(books);
+        if let Some(mode) = self.config.post_fill_book_refresh {
+            self.post_fill_refresh
+                .observe_books(mode, self.usable, self.last_source_ms);
+        }
         if let Some(policy) = self.config.basis_risk_reserve {
             let observation = self.pair_books(now).filter(|_| self.feed_online).map(|b| {
                 let maker = b[self.maker()].mid();
@@ -1975,6 +2277,40 @@ impl Replay<'_> {
                     .observe(policy, now, Some((b.mid(), b.timestamp_ms)));
             } else if self.entry_flow.exceeds_gap(policy, now) {
                 self.entry_flow.observe(policy, now, None);
+            }
+        }
+        if self.slow_cascade.is_some() {
+            let hedge_leg = 1 - self.maker();
+            let obs = if self.feed_online && self.usable[hedge_leg] {
+                self.fresh(hedge_leg, now).and_then(|b| {
+                    b.mid().to_f64().map(|px| {
+                        (
+                            HedgeBookObservation {
+                                source_ms: b.timestamp_ms,
+                                touch: [b.bids[0].price, b.asks[0].price],
+                            },
+                            px,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            if let Some(sc) = &mut self.slow_cascade {
+                if let Some((observation, px)) = obs {
+                    if let Some(previous) = sc.last_observation
+                        && previous.source_ms == observation.source_ms
+                    {
+                        if previous != observation {
+                            sc.last_decision = None;
+                        }
+                    } else {
+                        sc.last_observation = Some(observation);
+                        sc.last_decision = Some(sc.guard.observe(now, px));
+                    }
+                } else {
+                    sc.last_decision = None;
+                }
             }
         }
         let mark = self
@@ -2214,6 +2550,27 @@ impl Replay<'_> {
             && self.config.entry_flow_filter.is_some_and(|p| {
                 p.cancel_resting_entries && !self.entry_flow.permits_resting(p, quote.side, now)
             });
+        let carry_drift_cancel = if !quote.closing
+            && let Some(policy) = self.config.carry_drift_adjustment
+        {
+            self.carry_drift
+                .adjustment_bps(policy, self.maker(), quote.side, now)
+                .err()
+        } else {
+            None
+        };
+        let slow_cascade_cancel = book_frame
+            && !quote.closing
+            && self
+                .slow_cascade
+                .as_ref()
+                .is_some_and(|sc| sc.scale_for(quote.side) <= 0.0);
+        let kalman_basis_cancel = book_frame
+            && !quote.closing
+            && self
+                .kalman_basis
+                .as_ref()
+                .is_some_and(|kb| kb.check_entry(quote.side).is_err());
         let lifetime_ms = self.quote_lifetime_ms(quote.closing);
         let cancel_reason = if expired {
             Some(if quote.expires_ms < quote.arrival_ms + lifetime_ms {
@@ -2232,8 +2589,22 @@ impl Replay<'_> {
                 self.entry_flow.cancelled_resting_entries += 1;
             }
             Some("entry_flow_toxicity")
+        } else if slow_cascade_cancel {
+            if quote.cancelled_ms.is_none()
+                && let Some(sc) = &mut self.slow_cascade
+            {
+                sc.cancelled_resting_entries += 1;
+            }
+            Some("slow_cascade_halt")
+        } else if kalman_basis_cancel {
+            if quote.cancelled_ms.is_none()
+                && let Some(kb) = &mut self.kalman_basis
+            {
+                kb.cancelled_resting_entries += 1;
+            }
+            Some("kalman_basis_regime")
         } else {
-            None
+            carry_drift_cancel
         };
         self.quote = Some(quote);
         if let Some(reason) = cancel_reason {
@@ -2460,6 +2831,9 @@ impl Replay<'_> {
         }
         self.notices
             .push_back((now + self.config.fill_notice_ms, signed_base));
+        if self.config.post_fill_book_refresh.is_some() {
+            self.post_fill_refresh.arm(self.last_source_ms);
+        }
         Ok(())
     }
 
@@ -2589,6 +2963,9 @@ impl Replay<'_> {
         let fill_time = book.timestamp_ms;
         let fill_mid = book.mid();
         self.consumed_ms[order.leg] = fill_time;
+        if self.config.post_fill_book_refresh.is_some() {
+            self.post_fill_refresh.arm(self.last_source_ms);
+        }
         self.report.ioc_fills += 1;
         self.report.ioc_partial += usize::from(fill.base < order.quantity);
         if is_entry_hedge
@@ -3113,9 +3490,10 @@ impl Replay<'_> {
         closing: bool,
         level: &Level,
     ) -> Result<Option<Candidate>> {
-        self.candidate_with_dislocation(books, side, closing, level, None, None)
+        self.candidate_with_dislocation(books, side, closing, level, None, None, Decimal::ONE)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn candidate_with_dislocation(
         &self,
         books: [&Book; 2],
@@ -3124,6 +3502,7 @@ impl Replay<'_> {
         level: &Level,
         dislocation_bps: Option<Decimal>,
         carry_adj_bps: Option<Decimal>,
+        opening_scale: Decimal,
     ) -> Result<Option<Candidate>> {
         let i = self.maker();
         let j = 1 - i;
@@ -3134,9 +3513,13 @@ impl Replay<'_> {
         let quantity = if closing {
             self.ledger.positions[i].abs()
         } else {
+            let scaled_notional = if opening_scale < Decimal::ONE {
+                (self.config.quote_notional * opening_scale).min(self.rules.max_single_leg)
+            } else {
+                self.config.quote_notional.min(self.rules.max_single_leg)
+            };
             let full_target = floor_step(
-                (self.config.quote_notional.min(self.rules.max_single_leg) / mark)
-                    .min(self.rules.max_base),
+                (scaled_notional / mark).min(self.rules.max_base),
                 self.common_step,
             )?;
             let existing = self.ledger.positions[i].abs();
@@ -3505,17 +3888,48 @@ impl Replay<'_> {
             .is_ok()
     }
 
+    fn classify_persistence_book(&mut self, now: u64) -> BookEvidence {
+        if self.config.entry_edge_persistence.is_none() {
+            return BookEvidence::None;
+        }
+        let legs =
+            [self.fresh(0, now), self.fresh(1, now)].map(|book| book.map(fingerprint_leg_book));
+        let pair_usable = self.feed_online && self.pair_books(now).is_some();
+        self.entry_edge_persist
+            .classify_fingerprints(legs, pair_usable)
+    }
+
+    #[cfg(test)]
     fn quote(&mut self, now: u64) -> Result<()> {
-        if self.quote.is_some()
-            || self.ioc.is_some()
-            || now < self.next_quote_ms
-            || self.report.incomplete.is_some()
-            || self.funding_paused(now)
+        self.evaluate_quote(now, BookEvidence::New)
+    }
+
+    fn evaluate_quote(&mut self, now: u64, book_evidence: BookEvidence) -> Result<()> {
+        let sub_min_opening = self.sub_min_opening_active(now);
+        let closing = self.cycle.is_some() && !sub_min_opening;
+        let throttled = now < self.next_quote_ms;
+        let active_opening_quote = self.quote.as_ref().is_some_and(|q| !q.closing);
+        let observe_persistence_only = !closing
+            && self.config.entry_edge_persistence.is_some()
+            && self.ioc.is_none()
+            && self.report.incomplete.is_none()
+            && (throttled || active_opening_quote)
+            && (self.quote.is_none() || active_opening_quote);
+        if !observe_persistence_only
+            && (self.quote.is_some()
+                || self.ioc.is_some()
+                || throttled
+                || self.report.incomplete.is_some())
         {
             return Ok(());
         }
-        let sub_min_opening = self.sub_min_opening_active(now);
-        let closing = self.cycle.is_some() && !sub_min_opening;
+        if self.funding_paused(now) {
+            if !closing {
+                self.entry_edge_persist.reset_all();
+            }
+            return Ok(());
+        }
+        let record_stats = !observe_persistence_only;
         if !closing && self.config.trade_from_ms.is_some_and(|at| now < at) {
             return Ok(());
         }
@@ -3527,31 +3941,66 @@ impl Replay<'_> {
                 .and_then(|s| s.next_pause(now))
                 .is_some_and(|at| now + horizon >= at)
         {
-            self.report.blocked("funding_entry_horizon");
+            self.entry_edge_persist.reset_all();
+            if record_stats {
+                self.report.blocked("funding_entry_horizon");
+            }
             return Ok(());
         }
         if !closing && now + horizon >= self.config.end_ms {
+            self.entry_edge_persist.reset_all();
             return Ok(());
         }
         if !closing && let Some(reason) = self.equity_entry_block_reason(now) {
-            self.rwa_session.session_blocked_entries += 1;
-            self.report.blocked(reason);
+            self.entry_edge_persist.reset_all();
+            if record_stats {
+                self.rwa_session.session_blocked_entries += 1;
+                self.report.blocked(reason);
+            }
             return Ok(());
         }
-        self.report.entry_checks += usize::from(!closing);
+        if record_stats {
+            self.report.entry_checks += usize::from(!closing);
+        }
         if !self.feed_online {
-            self.report.blocked("trade_feed");
+            if !closing {
+                self.entry_edge_persist.reset_all();
+            }
+            if record_stats {
+                self.report.blocked("trade_feed");
+            }
             return Ok(());
         }
         let Some(books) = self.pair_books(now) else {
-            self.report.blocked("book_age_or_skew");
+            if !closing {
+                self.entry_edge_persist.reset_all();
+            }
+            if record_stats {
+                self.report.blocked("book_age_or_skew");
+            }
             return Ok(());
         };
         if self.funding_lifecycle_blocks_quote(now) {
-            if let Some(lifecycle) = &mut self.funding_lifecycle {
-                lifecycle.report.boundary_guard_blocks += 1;
+            if !closing {
+                self.entry_edge_persist.reset_all();
             }
-            self.report.blocked("funding_boundary_guard");
+            if record_stats {
+                if let Some(lifecycle) = &mut self.funding_lifecycle {
+                    lifecycle.report.boundary_guard_blocks += 1;
+                }
+                self.report.blocked("funding_boundary_guard");
+            }
+            return Ok(());
+        }
+        if !closing
+            && self.config.post_fill_book_refresh.is_some()
+            && self.post_fill_refresh.is_locked()
+        {
+            self.entry_edge_persist.reset_all();
+            if record_stats {
+                self.post_fill_refresh.record_block();
+                self.report.blocked("post_fill_book_refresh");
+            }
             return Ok(());
         }
         let mode = self.config.pair.mode;
@@ -3560,7 +4009,10 @@ impl Replay<'_> {
         if !closing
             && incentive.is_some_and(|p| !p.active_at(now) || now + horizon >= p.eligible_until_ms)
         {
-            self.report.blocked("turnover_eligibility");
+            self.entry_edge_persist.reset_all();
+            if record_stats {
+                self.report.blocked("turnover_eligibility");
+            }
             return Ok(());
         }
         let (base_turnover, base_fees, base_cash) = self.settled_opening_ledger();
@@ -3575,7 +4027,10 @@ impl Replay<'_> {
             && (mode.realized_loss_exhausted(cash)
                 || worst_partial_cash.is_some_and(|wc| mode.realized_loss_exhausted(wc)))
         {
-            self.report.blocked("turnover_loss_limit");
+            self.entry_edge_persist.reset_all();
+            if record_stats {
+                self.report.blocked("turnover_loss_limit");
+            }
             return Ok(());
         }
         let hedged_exit = self.config.hedged_exit.filter(|_| closing);
@@ -3588,10 +4043,13 @@ impl Replay<'_> {
             })
         });
         let budget = mode.remaining_budget(base_turnover, base_fees, cash);
-        let mut best: Option<(Decimal, Decimal, Candidate)> = None;
+        let mut best: Option<(Decimal, Decimal, Candidate, bool)> = None;
         let mut blocked = None;
         let mut best_edge = self.report.best_modeled_edge_bps;
         let mut best_cost = self.report.best_projected_turnover_cost_bps;
+        let mut kalman_frame_block: Option<&'static str> = None;
+        let mut kalman_side_blocks = 0usize;
+        let mut slow_cascade_blocks = 0usize;
         let mut carry_observations: [Option<std::result::Result<Decimal, &'static str>>; 2] =
             [None; 2];
         for side in [HedgeSide::Buy, HedgeSide::Sell] {
@@ -3608,30 +4066,77 @@ impl Replay<'_> {
             if !permitted {
                 continue;
             }
-            if !closing
-                && let Some(policy) = self.config.entry_flow_filter
-                && let Err(reason) = self.entry_flow.check_entry(policy, side, now)
-            {
-                blocked = Some(reason);
-                continue;
-            }
-            if !closing && let Some(policy) = self.config.entry_book_filter {
-                let i = self.maker();
-                let j = 1 - i;
-                if let Err(reason) = self.entry_book.check_entry(
-                    policy,
-                    books[i],
-                    &self.config.pair.legs[i],
-                    books[j],
-                    &self.config.pair.legs[j],
-                    side,
-                    self.config.quote_notional,
-                    self.config.maker_fee_bps,
-                ) {
+            if !closing && let Some(policy) = self.config.entry_flow_filter {
+                let flow_res = if record_stats {
+                    self.entry_flow.check_entry(policy, side, now)
+                } else {
+                    self.entry_flow.eval_entry(policy, side, now)
+                };
+                if let Err(reason) = flow_res {
                     blocked = Some(reason);
                     continue;
                 }
             }
+            if !closing && let Some(policy) = self.config.entry_book_filter {
+                let i = self.maker();
+                let j = 1 - i;
+                let book_res = if record_stats {
+                    self.entry_book.check_entry(
+                        policy,
+                        books[i],
+                        &self.config.pair.legs[i],
+                        books[j],
+                        &self.config.pair.legs[j],
+                        side,
+                        self.config.quote_notional,
+                        self.config.maker_fee_bps,
+                    )
+                } else {
+                    self.entry_book.eval_entry(
+                        policy,
+                        books[i],
+                        &self.config.pair.legs[i],
+                        books[j],
+                        &self.config.pair.legs[j],
+                        side,
+                        self.config.quote_notional,
+                        self.config.maker_fee_bps,
+                    )
+                };
+                if let Err(reason) = book_res {
+                    blocked = Some(reason);
+                    continue;
+                }
+            }
+            if !closing
+                && let Some(kb) = &self.kalman_basis
+                && let Err(reason) = kb.check_entry(side)
+            {
+                if reason == "kalman_basis_side" {
+                    kalman_side_blocks += 1;
+                } else {
+                    kalman_frame_block.get_or_insert(reason);
+                }
+                blocked = Some(reason);
+                continue;
+            }
+            let (entry_scale, entry_scaled) = if !closing && let Some(sc) = &self.slow_cascade {
+                let raw = sc.scale_for(side);
+                let scaled_dec = if raw > 0.0 {
+                    Decimal::from_f64_retain(raw)
+                        .filter(|d| *d > Decimal::ZERO && *d <= Decimal::ONE)
+                } else {
+                    None
+                };
+                let Some(scaled_dec) = scaled_dec else {
+                    slow_cascade_blocks += 1;
+                    blocked = Some("slow_cascade_halt");
+                    continue;
+                };
+                (scaled_dec, scaled_dec < Decimal::ONE)
+            } else {
+                (Decimal::ONE, false)
+            };
             let mid_dislocation_bps = if !closing && let Some(policy) = self.config.basis_reversion
             {
                 if policy.use_quote_level_dislocation {
@@ -3724,7 +4229,9 @@ impl Replay<'_> {
                         self.config.maker_fee_bps
                     };
                     if quote_dist_bps < self.entry_markout.required_distance_bps(policy, fee_term) {
-                        self.entry_markout.record_block();
+                        if record_stats {
+                            self.entry_markout.record_block();
+                        }
                         blocked = Some("entry_markout_quote_distance");
                         continue;
                     }
@@ -3736,6 +4243,7 @@ impl Replay<'_> {
                     level,
                     mid_dislocation_bps,
                     carry_adj_bps,
+                    entry_scale,
                 )?
                 else {
                     continue;
@@ -3763,49 +4271,108 @@ impl Replay<'_> {
                 }
                 if best
                     .as_ref()
-                    .is_none_or(|(prior_distance, prior_rank, prior)| {
+                    .is_none_or(|(prior_distance, prior_rank, prior, _)| {
                         (distance, -rank, candidate.queue_ahead)
                             < (*prior_distance, -*prior_rank, prior.queue_ahead)
                     })
                 {
-                    best = Some((distance, rank, candidate));
+                    best = Some((distance, rank, candidate, entry_scaled));
                 }
                 // The nearest passing level preserves price priority.
                 break;
             }
         }
-        for obs in carry_observations.into_iter().flatten() {
-            match obs {
-                Ok(adj) => self.carry_drift.record_adjustment(adj),
-                Err("carry_rate_conflict") => self.carry_drift.record_conflict_block(),
-                Err(_) => self.carry_drift.record_stale_block(),
+        if record_stats {
+            if let Some(kb) = &mut self.kalman_basis {
+                if let Some(reason) = kalman_frame_block {
+                    kb.record_block(reason);
+                }
+                kb.blocked_side_mismatch += kalman_side_blocks;
             }
+            if let Some(sc) = &mut self.slow_cascade {
+                sc.blocked_opening_entries += slow_cascade_blocks;
+            }
+            for obs in carry_observations.into_iter().flatten() {
+                match obs {
+                    Ok(adj) => self.carry_drift.record_adjustment(adj),
+                    Err("carry_rate_conflict") => self.carry_drift.record_conflict_block(),
+                    Err(_) => self.carry_drift.record_stale_block(),
+                }
+            }
+            self.report.best_modeled_edge_bps = best_edge;
+            self.report.best_projected_turnover_cost_bps = best_cost;
+            self.next_quote_ms = now + self.config.reprice_ms;
         }
-        self.report.best_modeled_edge_bps = best_edge;
-        self.report.best_projected_turnover_cost_bps = best_cost;
-        self.next_quote_ms = now + self.config.reprice_ms;
-        let Some((distance, _, best)) = best else {
-            self.report
-                .blocked(blocked.unwrap_or("size_or_hedge_depth"));
+        let Some((distance, _, best, best_scaled)) = best else {
+            if !closing {
+                self.entry_edge_persist.reset_all();
+            }
+            if record_stats {
+                self.report
+                    .blocked(blocked.unwrap_or("size_or_hedge_depth"));
+            }
             return Ok(());
         };
+        let ladder_extra = if !closing && let Some(ladder) = self.config.inventory_ladder {
+            let projected =
+                (self.ledger.positions[self.maker()].abs() + best.quantity) * best.price;
+            let extra = ladder.extra_edge_bps(projected, true);
+            if record_stats {
+                self.inventory_ladder.record_eval(extra);
+            }
+            extra
+        } else {
+            Decimal::ZERO
+        };
+        let required_edge = self.rules.min_edge + ladder_extra;
         if self.config.require_net_edge
             && incentive.is_none()
             && hedged_exit.is_none()
-            && best.edge_bps < self.rules.min_edge
+            && best.edge_bps < required_edge
         {
-            if !closing
-                && best
-                    .raw_edge_bps_before_carry
-                    .is_some_and(|raw| raw >= self.rules.min_edge)
-            {
-                self.carry_drift.record_adverse_block();
+            if !closing {
+                self.entry_edge_persist.reset_all();
             }
-            self.report.blocked(if closing {
-                "exit_net_edge"
-            } else {
-                "entry_net_edge"
-            });
+            if record_stats {
+                if !closing && best.edge_bps >= self.rules.min_edge && ladder_extra > Decimal::ZERO
+                {
+                    self.inventory_ladder.record_block();
+                    self.report.blocked("inventory_ladder_edge");
+                    return Ok(());
+                }
+                if !closing
+                    && best
+                        .raw_edge_bps_before_carry
+                        .is_some_and(|raw| raw >= self.rules.min_edge)
+                {
+                    self.carry_drift.record_adverse_block();
+                }
+                self.report.blocked(if closing {
+                    "exit_net_edge"
+                } else {
+                    "entry_net_edge"
+                });
+            }
+            return Ok(());
+        }
+        if !closing && let Some(persist) = self.config.entry_edge_persistence {
+            let new_book = book_evidence == BookEvidence::New;
+            if observe_persistence_only {
+                if new_book {
+                    self.entry_edge_persist
+                        .observe_passing(persist, best.side, now);
+                }
+                return Ok(());
+            }
+            if !self
+                .entry_edge_persist
+                .check_and_advance(persist, best.side, now, new_book)
+            {
+                self.report.blocked("entry_edge_persist");
+                return Ok(());
+            }
+        }
+        if observe_persistence_only {
             return Ok(());
         }
         if feedback.is_some() && distance > Decimal::ZERO {
@@ -3827,6 +4394,9 @@ impl Replay<'_> {
             )
         });
         if now + self.config.maker_arrival_delay_ms() < cancel_by {
+            if best_scaled && let Some(sc) = &mut self.slow_cascade {
+                sc.scaled_opening_entries += 1;
+            }
             self.post(now, best, cancel_by);
         }
         Ok(())
@@ -4018,6 +4588,110 @@ impl Replay<'_> {
                 };
                 qty < min_ioc
             })
+    }
+
+    fn observe_kalman_basis(
+        &mut self,
+        now: u64,
+        reference: Option<Oracle>,
+        equity_session: Option<EquitySession>,
+        leg_oracles: Option<[Oracle; 2]>,
+    ) {
+        if self.kalman_basis.is_none() {
+            return;
+        }
+        let obs = if self.feed_online
+            && self.usable[0]
+            && self.usable[1]
+            && let Some(b) = self.pair_books(now)
+        {
+            let maker_book = b[self.maker()];
+            let hedge_book = b[1 - self.maker()];
+            let maker_mid = maker_book.mid();
+            let hedge_mid = hedge_book.mid();
+            if maker_mid > Decimal::ZERO && hedge_mid > Decimal::ZERO {
+                ((maker_mid - hedge_mid) / hedge_mid * BPS)
+                    .to_f64()
+                    .map(|basis_bps| {
+                        let maker_spread_bps =
+                            ((maker_book.asks[0].price - maker_book.bids[0].price) / maker_mid
+                                * BPS)
+                                .to_f64()
+                                .unwrap_or(f64::NAN);
+                        let hedge_spread_bps =
+                            ((hedge_book.asks[0].price - hedge_book.bids[0].price) / hedge_mid
+                                * BPS)
+                                .to_f64()
+                                .unwrap_or(f64::NAN);
+                        (
+                            b.map(|book| book.timestamp_ms),
+                            b.map(|book| [book.bids[0].price, book.asks[0].price]),
+                            basis_bps,
+                            maker_spread_bps + hedge_spread_bps,
+                        )
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let regime = if self.config.pair.asset_class != AssetClass::Equity {
+            SessionRegime::UsRth
+        } else {
+            let any_internal = reference
+                .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
+                || leg_oracles.is_some_and(|oracles| {
+                    oracles
+                        .iter()
+                        .any(|o| matches!(o.mode, OracleMode::Internal | OracleMode::LastClose))
+                });
+            match equity_session {
+                Some(s)
+                    if !s.halted
+                        && now >= s.observed_at_ms
+                        && now < s.clear_until_ms
+                        && !any_internal =>
+                {
+                    if now < s.opens_at_ms {
+                        SessionRegime::PreMarket
+                    } else if now < s.closes_at_ms {
+                        SessionRegime::UsRth
+                    } else {
+                        SessionRegime::PostMarket
+                    }
+                }
+                _ => SessionRegime::OffHours,
+            }
+        };
+        if let Some(kb) = &mut self.kalman_basis {
+            let Some((source_ms, touch, basis_bps, combined_spread_bps)) = obs else {
+                kb.last_snapshot = None;
+                return;
+            };
+            let observation = KalmanBookObservation {
+                source_ms,
+                touch,
+                regime,
+            };
+            // Fixed leg markets, freshness, and per-leg timestamp order were
+            // checked above. A repeated frame contains no new observation.
+            if let Some(previous) = kb.last_observation
+                && previous.source_ms == observation.source_ms
+            {
+                // Same-millisecond price ambiguity or a session transition needs
+                // another source update. A cached replay cannot clear this block.
+                if previous != observation {
+                    kb.last_snapshot = None;
+                }
+                return;
+            }
+            kb.last_observation = Some(observation);
+            kb.last_snapshot = Some(
+                kb.filter
+                    .observe(now, basis_bps, combined_spread_bps, regime),
+            );
+        }
     }
 
     fn observe_rwa_frame(
@@ -4483,6 +5157,10 @@ impl Replay<'_> {
     }
 
     fn advance(&mut self, now: u64) -> Result<()> {
+        self.advance_with_frame(now, BookEvidence::None)
+    }
+
+    fn advance_with_frame(&mut self, now: u64, book_evidence: BookEvidence) -> Result<()> {
         if let Some(policy) = self.config.entry_markout_gate {
             let hedge_mark = self
                 .fresh(1 - self.maker(), now)
@@ -4553,6 +5231,17 @@ impl Replay<'_> {
             stats.quoted_stress_cash += value;
         }
         let (paired_time, paired_basis, paired_book) = self.paired_stop(now);
+        let kalman_time_stop = self
+            .cycle
+            .as_ref()
+            .and_then(|c| c.paired_at_ms)
+            .zip(self.kalman_basis.as_ref())
+            .is_some_and(|(paired_at, kb)| {
+                kb.last_snapshot.is_some_and(|snap| {
+                    kb.filter
+                        .should_time_stop(&snap, now.saturating_sub(paired_at))
+                })
+            });
         if let Some(cycle) = &mut self.cycle {
             let exposure_stop = self
                 .unhedged_since
@@ -4562,6 +5251,9 @@ impl Replay<'_> {
                 self.report.cycle_attribution.hedged_time_stops += usize::from(paired_time);
                 self.report.cycle_attribution.hedged_basis_stops += usize::from(paired_basis);
                 self.report.cycle_attribution.hedged_book_stops += usize::from(paired_book);
+                if kalman_time_stop && let Some(kb) = &mut self.kalman_basis {
+                    kb.time_stop_triggers += 1;
+                }
             }
             let opening_timeout = (self.config.hedged_exit.is_none()
                 || cycle.paired_at_ms.is_none())
@@ -4572,6 +5264,7 @@ impl Replay<'_> {
                 || paired_time
                 || paired_basis
                 || paired_book
+                || kalman_time_stop
                 || now >= self.config.end_ms - self.config.drain_ms
                 || self.report.incomplete.is_some()
                 || exposure_stop;
@@ -4748,7 +5441,7 @@ impl Replay<'_> {
                 || (self.config.passive_offset.is_none() && self.config.hedged_exit.is_none()))
             && self.cycle.as_ref().is_none_or(|cycle| !cycle.draining)
         {
-            self.quote(now)?;
+            self.evaluate_quote(now, book_evidence)?;
         }
         Ok(())
     }
@@ -4865,14 +5558,15 @@ impl Replay<'_> {
                 !ended && (previous..=self.config.end_ms).contains(&now),
                 "unordered maker-first tape"
             );
+            let prev_event = previous;
             previous = now;
-            self.funding_timers(now)?;
-            self.funding_lifecycle_timers(now)?;
+            self.advance_timers(now, prev_event)?;
             if self.posture.expire(now) {
                 self.report.turnover_posture.controls_expired += 1;
                 self.posture_changed(now);
             }
             let mut book_frame = false;
+            let mut book_evidence = BookEvidence::None;
             match event {
                 MakerFirstEvent::Book {
                     books,
@@ -4883,6 +5577,8 @@ impl Replay<'_> {
                 } => {
                     self.set_books(books, now)?;
                     self.observe_rwa_frame(now, reference, equity_session, leg_oracles);
+                    self.observe_kalman_basis(now, reference, equity_session, leg_oracles);
+                    book_evidence = self.classify_persistence_book(now);
                     book_frame = true;
                 }
                 MakerFirstEvent::Trade {
@@ -4953,6 +5649,13 @@ impl Replay<'_> {
                             self.basis_risk.feed_offline();
                             self.basis_reversion.feed_offline();
                             self.entry_flow.feed_offline();
+                            if let Some(sc) = &mut self.slow_cascade {
+                                sc.last_decision = None;
+                            }
+                            if let Some(kb) = &mut self.kalman_basis {
+                                kb.last_snapshot = None;
+                            }
+                            self.entry_edge_persist.reset_all();
                             if self
                                 .quote
                                 .as_ref()
@@ -5018,6 +5721,16 @@ impl Replay<'_> {
                         rate_per_settlement,
                         self.config.pair.legs[leg].funding.interval_ms,
                     )?;
+                    if let Some(policy) = self.config.carry_drift_adjustment
+                        && let Some(quote) = self.quote.as_ref().filter(|quote| !quote.closing)
+                        && matches!(
+                            self.carry_drift
+                                .adjustment_bps(policy, self.maker(), quote.side, now),
+                            Err("carry_rate_conflict")
+                        )
+                    {
+                        self.cancel(now, "carry_rate_conflict");
+                    }
                 }
                 MakerFirstEvent::End { .. } => {
                     ensure!(
@@ -5041,7 +5754,7 @@ impl Replay<'_> {
             {
                 self.advance_quote(now, book_frame);
             }
-            self.advance(now)?;
+            self.advance_with_frame(now, book_evidence)?;
             self.risk(now);
         }
         ensure!(
@@ -5222,6 +5935,20 @@ impl Replay<'_> {
             .entry_hedge_diag
             .take()
             .map(|d| d.finish(self.config.end_ms));
+        self.report.slow_cascade = self.slow_cascade.as_ref().map(SlowCascadeState::report);
+        self.report.kalman_basis = self.kalman_basis.as_ref().map(KalmanBasisState::report);
+        self.report.inventory_ladder = self
+            .config
+            .inventory_ladder
+            .map(|_| self.inventory_ladder.report());
+        self.report.entry_edge_persistence = self
+            .config
+            .entry_edge_persistence
+            .map(|policy| self.entry_edge_persist.report(policy));
+        self.report.post_fill_book_refresh = self
+            .config
+            .post_fill_book_refresh
+            .map(|mode| self.post_fill_refresh.report(mode));
         Ok(self.report)
     }
 }
@@ -5276,6 +6003,11 @@ fn new_replay(config: &MakerFirstConfig) -> Result<Replay<'_>> {
         funding: FundingState::new(config)?,
         funding_lifecycle: FundingLifecycleState::new(config)?,
         carry_drift: CarryDriftState::default(),
+        slow_cascade: config.slow_cascade.map(SlowCascadeState::new).transpose()?,
+        kalman_basis: config.kalman_basis.map(KalmanBasisState::new).transpose()?,
+        inventory_ladder: InventoryLadderState::default(),
+        entry_edge_persist: EntryEdgePersistState::default(),
+        post_fill_refresh: PostFillRefreshState::default(),
         report: MakerFirstReport {
             conservative_cancel_guard: config.conservative_cancel_guard,
             start_ms: config.start_ms,
@@ -5309,6 +6041,14 @@ mod tests {
 
     mod paired_cash_exit_tests {
         include!("maker_first/paired_cash_exit_tests.rs");
+    }
+
+    mod regime_guards_tests {
+        include!("maker_first/regime_guards_tests.rs");
+    }
+
+    mod entry_guards_tests {
+        include!("maker_first/entry_guards_tests.rs");
     }
 
     fn config() -> MakerFirstConfig {
@@ -5364,6 +6104,11 @@ mod tests {
             entry_markout_gate: None,
             funding_settlement: None,
             carry_drift_adjustment: None,
+            slow_cascade: None,
+            kalman_basis: None,
+            inventory_ladder: None,
+            entry_edge_persistence: None,
+            post_fill_book_refresh: None,
         }
     }
 

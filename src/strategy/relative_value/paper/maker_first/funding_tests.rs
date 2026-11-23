@@ -1257,3 +1257,454 @@ fn funding_lifecycle_multi_slot_and_concurrent_cross_cycle_attribution() {
     assert_eq!(p3[0].high, d("-0.018"));
     assert_eq!(lc.report.unattributed_cross_cycle_payments, 1);
 }
+
+#[test]
+fn carry_drift_conflict_cancels_resting_opening_quote_preserving_inflight_fill() {
+    let mut cfg = config();
+    cfg.maker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+        expected_hold_ms: HOUR,
+        max_rate_age_ms: 60_000,
+        favorable_credit_fraction: Decimal::ONE,
+        max_favorable_credit_bps: d("100"),
+        max_adverse_penalty_bps: d("100"),
+        require_fresh_rates: true,
+    });
+    let t0 = cfg.start_ms;
+    let rate = |receipt_ms, leg, value| MakerFirstEvent::FundingRate {
+        at_ms: receipt_ms,
+        source_ms: t0,
+        leg,
+        rate_per_settlement: d(value),
+    };
+    let cancel_bound_ms = cfg.transport_ms + cfg.maker_cancel_delay_ms;
+    assert!(t0 + 200 + cancel_bound_ms < t0 + 500);
+
+    for (conflict_at, trade_at, expected_fills, expected_cancels) in [
+        (t0, t0 + 500, 0, 0),
+        (t0 + 200, t0 + 500, 0, 1),
+        (t0 + 200, t0 + 350, 1, 1),
+    ] {
+        let rows = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            rate(t0, 0, "-0.0005"),
+            rate(t0, 1, "0"),
+            rate(conflict_at, 0, "0.0005"),
+            books(&cfg, t0, "1000"),
+            books(&cfg, t0 + 150, "1000"),
+            partial(trade_at, trade_at, "0.14"),
+            books(&cfg, t0 + 550, "1000"),
+            books(&cfg, t0 + 650, "1000"),
+            books(&cfg, t0 + 750, "1000"),
+            books(&cfg, t0 + 950, "1000"),
+            books(&cfg, t0 + 2_500, "1000"),
+            books(&cfg, t0 + 2_700, "1000"),
+            books(&cfg, t0 + 2_900, "1000"),
+        ];
+        let report = run(&cfg, rows);
+        let drift = report.carry_drift.as_ref().unwrap();
+        assert_eq!(drift.conflicting_rate_events, 1);
+        assert_eq!(report.maker_fills, expected_fills);
+        assert_eq!(report.maker_fills_after_cancel_request, expected_fills);
+        assert_eq!(
+            report
+                .opening_cancel_requested
+                .get("carry_rate_conflict")
+                .copied()
+                .unwrap_or(0),
+            expected_cancels
+        );
+    }
+}
+
+#[test]
+fn carry_drift_require_fresh_rates_cancels_resting_opening_quote_on_stale_rate() {
+    let make_cfg = |require_fresh_rates: bool| {
+        let mut cfg = config();
+        cfg.maker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.entry_side = Some(HedgeSide::Buy);
+        cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+            expected_hold_ms: HOUR,
+            max_rate_age_ms: 200,
+            favorable_credit_fraction: Decimal::ONE,
+            max_favorable_credit_bps: d("100"),
+            max_adverse_penalty_bps: d("100"),
+            require_fresh_rates,
+        });
+        cfg
+    };
+
+    let build_rows = |cfg: &MakerFirstConfig, trade_at: u64| {
+        let t0 = cfg.start_ms;
+        vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 0,
+                source_ms: t0,
+                rate_per_settlement: d("-0.0005"),
+            },
+            MakerFirstEvent::FundingRate {
+                at_ms: t0,
+                leg: 1,
+                source_ms: t0,
+                rate_per_settlement: Decimal::ZERO,
+            },
+            books(cfg, t0, "1000"),
+            books(cfg, t0 + 150, "1000"),
+            books(cfg, t0 + 250, "1000"),
+            partial(trade_at, trade_at, "0.14"),
+            books(cfg, t0 + 550, "1000"),
+            books(cfg, t0 + 650, "1000"),
+            books(cfg, t0 + 750, "1000"),
+            books(cfg, t0 + 950, "1000"),
+            books(cfg, t0 + 2_500, "1000"),
+            books(cfg, t0 + 2_700, "1000"),
+            books(cfg, t0 + 2_900, "1000"),
+        ]
+    };
+
+    // Strict freshness cancels via exact timer at +201 ms (`age = 201 > 200`, `cancelled_ms = +401 ms`),
+    // blocking +500 ms fill while preserving in-flight fill at +350 ms (`< 201 + 200 ms`).
+    let strict_cfg = make_cfg(true);
+    let t0 = strict_cfg.start_ms;
+    let strict_blocked = run(&strict_cfg, build_rows(&strict_cfg, t0 + 500));
+    assert_eq!(strict_blocked.maker_fills, 0);
+    assert_eq!(
+        strict_blocked
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+
+    let strict_inflight = run(&strict_cfg, build_rows(&strict_cfg, t0 + 350));
+    assert_eq!(strict_inflight.maker_fills, 1);
+    assert_eq!(strict_inflight.maker_fills_after_cancel_request, 1);
+    assert_eq!(
+        strict_inflight
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+
+    // Permissive fallback (`require_fresh_rates = false`) does not cancel resting opening quote on staleness.
+    let relaxed_cfg = make_cfg(false);
+    let relaxed = run(&relaxed_cfg, build_rows(&relaxed_cfg, relaxed_cfg.start_ms + 500));
+    assert_eq!(relaxed.maker_fills, 1);
+    assert_eq!(
+        relaxed
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        None
+    );
+}
+
+#[test]
+fn carry_drift_conflict_and_stale_never_cancel_closing_quote() {
+    let mut cfg = config();
+    cfg.maker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+    cfg.hold_ms = 20_000;
+    cfg.drain_ms = 10_000;
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.passive_offset = Some(PassiveOffset {
+        max_net_notional: d("100"),
+        max_wait_ms: 5_000,
+        close_probability: None,
+        min_passive_edge_bps: None,
+        min_offset_edge_bps: None,
+        max_adverse_move_bps: None,
+        offset_max_levels: 1,
+        offset_quote_lifetime_ms: None,
+        passive_loop_only: false,
+    });
+    cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+        expected_hold_ms: HOUR,
+        max_rate_age_ms: 200,
+        favorable_credit_fraction: Decimal::ONE,
+        max_favorable_credit_bps: d("100"),
+        max_adverse_penalty_bps: d("100"),
+        require_fresh_rates: true,
+    });
+
+    let t0 = cfg.start_ms;
+    let mut r = new_replay(&cfg).unwrap();
+    r.feed_online = true;
+    r.ledger.positions = [d("0.04"), Decimal::ZERO];
+    r.cycle = Some(cycle(t0));
+    if let MakerFirstEvent::Book { books, .. } = books(&cfg, t0, "1000") {
+        r.set_books(books, t0).unwrap();
+    }
+    r.quote = Some(Quote {
+        posture: TurnoverPosture::Neutral,
+        side: HedgeSide::Sell,
+        price: d("1001"),
+        left: d("0.04"),
+        ahead: Decimal::ZERO,
+        queue_depth: None,
+        arrival_ms: t0,
+        activated_ms: Some(t0),
+        expires_ms: t0 + 10_000,
+        cancelled_ms: None,
+        hedge_limit: None,
+        passive_entry: false,
+        closing: true,
+        closing_touched: false,
+        closing_filled: false,
+    });
+
+    // 1. Resting closing quote stays intact when funding rate goes stale.
+    r.carry_drift
+        .observe_rate(0, t0, t0, d("-0.0005"), HOUR)
+        .unwrap();
+    r.carry_drift
+        .observe_rate(1, t0, t0, Decimal::ZERO, HOUR)
+        .unwrap();
+    if let MakerFirstEvent::Book { books, .. } = books(&cfg, t0 + 250, "1000") {
+        r.set_books(books, t0 + 250).unwrap();
+    }
+    r.advance_quote(t0 + 250, true);
+    assert!(
+        r.quote
+            .as_ref()
+            .is_some_and(|q| q.closing && q.cancelled_ms.is_none())
+    );
+
+    // 2. Resting closing quote stays intact when same-source_ms funding rate conflicts.
+    r.carry_drift
+        .observe_rate(0, t0, t0 + 300, d("0.0005"), HOUR)
+        .unwrap();
+    r.advance_quote(t0 + 300, false);
+    assert!(
+        r.quote
+            .as_ref()
+            .is_some_and(|q| q.closing && q.cancelled_ms.is_none())
+    );
+    assert!(r.report.cycle_attribution.closing_quotes.cancel_requested.is_empty());
+}
+
+#[test]
+fn carry_drift_quiet_tape_cancels_at_exact_staleness_boundary_without_book_events() {
+    let make_cfg = |require_fresh_rates: bool| {
+        let mut cfg = config();
+        cfg.maker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[0].taker_fee_bps = Decimal::ZERO;
+        cfg.pair.legs[1].taker_fee_bps = Decimal::ZERO;
+        cfg.entry_side = Some(HedgeSide::Buy);
+        // Ensure quote TTL / book staleness outlast the quiet gap so only carry staleness can fire.
+        cfg.quote_lifetime_ms = 2_000;
+        cfg.pair.planner.max_quote_age_ms = 2_000;
+        cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+            expected_hold_ms: HOUR,
+            max_rate_age_ms: 200,
+            favorable_credit_fraction: Decimal::ONE,
+            max_favorable_credit_bps: d("100"),
+            max_adverse_penalty_bps: d("100"),
+            require_fresh_rates,
+        });
+        cfg
+    };
+
+    let build_quiet_rows =
+        |cfg: &MakerFirstConfig, trade_at: u64, refresh_leg0_at_150: bool, refresh_leg1_at_150: bool| {
+            let t0 = cfg.start_ms;
+            let mut rows = vec![
+                MakerFirstEvent::TradeFeed {
+                    at_ms: t0,
+                    leg: 0,
+                    online: true,
+                },
+                MakerFirstEvent::FundingRate {
+                    at_ms: t0,
+                    leg: 0,
+                    source_ms: t0,
+                    rate_per_settlement: d("-0.0005"),
+                },
+                MakerFirstEvent::FundingRate {
+                    at_ms: t0,
+                    leg: 1,
+                    source_ms: t0,
+                    rate_per_settlement: Decimal::ZERO,
+                },
+                books(cfg, t0, "1000"),
+                books(cfg, t0 + 150, "1000"),
+            ];
+            if refresh_leg0_at_150 {
+                rows.push(MakerFirstEvent::FundingRate {
+                    at_ms: t0 + 150,
+                    leg: 0,
+                    source_ms: t0 + 150,
+                    rate_per_settlement: d("-0.0005"),
+                });
+            }
+            if refresh_leg1_at_150 {
+                rows.push(MakerFirstEvent::FundingRate {
+                    at_ms: t0 + 150,
+                    leg: 1,
+                    source_ms: t0 + 150,
+                    rate_per_settlement: Decimal::ZERO,
+                });
+            }
+            rows.extend([
+                // Quiet tape between +150 and `trade_at`: NO intermediate book events.
+                partial(trade_at, trade_at, "0.14"),
+                books(cfg, t0 + 700, "1000"),
+                books(cfg, t0 + 950, "1000"),
+                books(cfg, t0 + 2_500, "1000"),
+                books(cfg, t0 + 2_700, "1000"),
+                books(cfg, t0 + 2_900, "1000"),
+            ]);
+            rows
+        };
+
+    // Rates sampled at t0 with max_rate_age_ms=200 expire at +201 ms; cancel arrives at +401 ms.
+    let strict_cfg = make_cfg(true);
+    let t0 = strict_cfg.start_ms;
+    let blocked_boundary = run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 401, false, false));
+    assert_eq!(blocked_boundary.maker_fills, 0);
+    assert_eq!(
+        blocked_boundary
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+
+    let inflight_before_cancel =
+        run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 400, false, false));
+    assert_eq!(inflight_before_cancel.maker_fills, 1);
+    assert_eq!(inflight_before_cancel.maker_fills_after_cancel_request, 1);
+    assert_eq!(
+        inflight_before_cancel
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+
+    // Permissive fallback (`require_fresh_rates = false`) must not arm a quiet-tape staleness cancel.
+    let relaxed_cfg = make_cfg(false);
+    let relaxed = run(&relaxed_cfg, build_quiet_rows(&relaxed_cfg, t0 + 500, false, false));
+    assert_eq!(relaxed.maker_fills, 1);
+    assert_eq!(
+        relaxed
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        None
+    );
+
+    // Refreshing ONLY leg 0 at +150 still leaves leg 1 at t0 -> expires at +201 ms -> +401 blocked.
+    let one_leg_only = run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 401, true, false));
+    assert_eq!(one_leg_only.maker_fills, 0);
+    assert_eq!(
+        one_leg_only
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+
+    // Refreshing BOTH legs at +150 advances expiry to +351 ms (`cancelled_ms = +551 ms`):
+    // - before +351 ms (+350 ms): still valid, fills cleanly with zero carry cancel requested;
+    // - in cancel flight [+351, +551) (+401 ms): cancel requested at +351, print arrives in-flight;
+    // - at/after +551 ms (+551 ms): blocked after cancel completes.
+    let both_legs_before_expiry =
+        run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 350, true, true));
+    assert_eq!(both_legs_before_expiry.maker_fills, 1);
+    assert_eq!(both_legs_before_expiry.maker_fills_after_cancel_request, 0);
+    assert_eq!(
+        both_legs_before_expiry
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        None
+    );
+    let both_legs_inflight =
+        run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 401, true, true));
+    assert_eq!(both_legs_inflight.maker_fills, 1);
+    assert_eq!(both_legs_inflight.maker_fills_after_cancel_request, 1);
+    assert_eq!(
+        both_legs_inflight
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+    let both_legs_later_blocked =
+        run(&strict_cfg, build_quiet_rows(&strict_cfg, t0 + 551, true, true));
+    assert_eq!(both_legs_later_blocked.maker_fills, 0);
+    assert_eq!(
+        both_legs_later_blocked
+            .opening_cancel_requested
+            .get("carry_rate_missing_or_stale"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn peer_0259_quiet_tape_uses_trade_source_and_cancels_before_equal_time_refresh() {
+    let mut cfg = config();
+    cfg.maker_fee_bps = Decimal::ZERO;
+    cfg.pair.legs.iter_mut().for_each(|leg| leg.taker_fee_bps = Decimal::ZERO);
+    cfg.entry_side = Some(HedgeSide::Buy);
+    cfg.carry_drift_adjustment = Some(CarryDriftAdjustment {
+        expected_hold_ms: HOUR,
+        max_rate_age_ms: 200,
+        favorable_credit_fraction: Decimal::ONE,
+        max_favorable_credit_bps: d("100"),
+        max_adverse_penalty_bps: d("100"),
+        require_fresh_rates: true,
+    });
+    let t0 = cfg.start_ms;
+    let update = |offset, leg, value| MakerFirstEvent::FundingRate {
+        at_ms: t0 + offset,
+        source_ms: t0 + offset,
+        leg,
+        rate_per_settlement: d(value),
+    };
+    let replay = |source_offset, refresh| {
+        let mut rows = vec![
+            MakerFirstEvent::TradeFeed {
+                at_ms: t0,
+                leg: 0,
+                online: true,
+            },
+            update(0, 0, "-0.0005"),
+            update(0, 1, "0"),
+            books(&cfg, t0, "1000"),
+            books(&cfg, t0 + 150, "1000"),
+            partial(t0 + 500, t0 + source_offset, "0.14"),
+            books(&cfg, t0 + 550, "1000"),
+            books(&cfg, t0 + 650, "1000"),
+            books(&cfg, t0 + 750, "1000"),
+        ];
+        if let Some(offset) = refresh {
+            rows.extend([update(offset, 0, "-0.0005"), update(offset, 1, "0")]);
+        }
+        run(&cfg, rows)
+    };
+    for (source, refresh, expected) in [
+        (400, None, 1),
+        (401, None, 0),
+        (450, None, 0),
+        (500, Some(200), 1),
+        (500, Some(201), 0),
+    ] {
+        let rep = replay(source, refresh);
+        assert_eq!(rep.maker_fills, expected);
+        assert_eq!(rep.maker_fills_after_cancel_request, expected);
+        assert_eq!(
+            rep.opening_cancel_requested.get("carry_rate_missing_or_stale"),
+            Some(&1)
+        );
+    }
+}

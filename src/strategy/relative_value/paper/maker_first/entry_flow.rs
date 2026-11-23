@@ -149,7 +149,7 @@ impl EntryFlowState {
         self.ready
     }
 
-    pub(super) fn check_entry(
+    pub(super) fn eval_entry(
         &self,
         policy: EntryFlowFilter,
         side: HedgeSide,
@@ -159,23 +159,42 @@ impl EntryFlowState {
             return Err("entry_flow_warmup_or_gap");
         };
         if range_bps > policy.max_range_bps {
-            self.blocked_range_entries
-                .set(self.blocked_range_entries.get() + 1);
             return Err("entry_flow_range");
         }
         match side {
             HedgeSide::Buy if move_bps <= -policy.max_adverse_move_bps => {
-                self.blocked_buy_entries
-                    .set(self.blocked_buy_entries.get() + 1);
                 Err("entry_flow_adverse_move")
             }
             HedgeSide::Sell if move_bps >= policy.max_adverse_move_bps => {
-                self.blocked_sell_entries
-                    .set(self.blocked_sell_entries.get() + 1);
                 Err("entry_flow_adverse_move")
             }
             _ => Ok(()),
         }
+    }
+
+    pub(super) fn check_entry(
+        &self,
+        policy: EntryFlowFilter,
+        side: HedgeSide,
+        now: u64,
+    ) -> std::result::Result<(), &'static str> {
+        let result = self.eval_entry(policy, side, now);
+        match result {
+            Err("entry_flow_range") => {
+                self.blocked_range_entries
+                    .set(self.blocked_range_entries.get() + 1);
+            }
+            Err("entry_flow_adverse_move") => match side {
+                HedgeSide::Buy => self
+                    .blocked_buy_entries
+                    .set(self.blocked_buy_entries.get() + 1),
+                HedgeSide::Sell => self
+                    .blocked_sell_entries
+                    .set(self.blocked_sell_entries.get() + 1),
+            },
+            _ => {}
+        }
+        result
     }
 
     pub(super) fn permits_resting(
