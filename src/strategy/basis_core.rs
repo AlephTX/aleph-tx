@@ -486,6 +486,9 @@ pub struct BasisCoreConfig {
     pub multi_oracle: Option<MultiOraclePolicy>,
     #[serde(default)]
     pub latency_budget: LatencyBudgetConfig,
+    /// Optional entry hurdle surcharge proportional to simultaneous top-of-book spread sum (`>= 0.0`).
+    #[serde(default)]
+    pub spread_cost_entry_coeff: f64,
 }
 
 impl BasisCoreConfig {
@@ -556,6 +559,12 @@ impl BasisCoreConfig {
                 self.slippage_bps
             );
         }
+        ensure!(
+            self.spread_cost_entry_coeff.is_finite()
+                && self.spread_cost_entry_coeff >= 0.0
+                && self.spread_cost_entry_coeff <= 5.0,
+            "spread_cost_entry_coeff must be finite and in [0.0, 5.0]"
+        );
         Ok(())
     }
 
@@ -1056,10 +1065,10 @@ impl BasisCoreEngine {
             };
         }
 
+        let combined_spread_bps = (((pa - pb) / pm + (ha - hb) / hm) * 1e4).max(0.0);
         let kalman_snap = if let Some(kalman) = self.kalman.as_mut() {
             let basis_bps = (pm / hm - 1.0) * 1e4;
-            let combined_spread_bps = ((pa - pb) / pm + (ha - hb) / hm) * 1e4;
-            let snap = kalman.observe(now_ms, basis_bps, combined_spread_bps.max(0.0), regime);
+            let snap = kalman.observe(now_ms, basis_bps, combined_spread_bps, regime);
             self.last_kalman_snapshot = Some(snap);
             Some(snap)
         } else {
@@ -1317,7 +1326,12 @@ impl BasisCoreEngine {
         };
 
         let penalty_bp = self.ladder_add_penalty_bp(pos_usd);
-        let req_edge_bp = self.config.entry_bp + penalty_bp;
+        let spread_surcharge_bp = if self.config.spread_cost_entry_coeff > 0.0 {
+            self.config.spread_cost_entry_coeff * combined_spread_bps
+        } else {
+            0.0
+        };
+        let req_edge_bp = self.config.entry_bp + penalty_bp + spread_surcharge_bp;
         let mut best_dir = 0_i8;
         let mut best_raw_bp = f64::NEG_INFINITY;
         let mut leung_li_hit = false;
@@ -1545,6 +1559,7 @@ mod tests {
             funding_settlement: FundingSettlementConfig::default(),
             multi_oracle: None,
             latency_budget: LatencyBudgetConfig::default(),
+            spread_cost_entry_coeff: 0.0,
         }
     }
 
@@ -2116,5 +2131,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn spread_cost_entry_coeff_blocks_wide_simultaneous_books_and_defaults_to_zero() {
+        let mut cfg = base_cfg();
+        cfg.spread_cost_entry_coeff = 0.5;
+        let guard = DailyLossGuard::open(None, 0.05, 1_000.0, 1_000).unwrap();
+        let mut engine = BasisCoreEngine::new(cfg, BasisLegConstraints::default()).unwrap();
+
+        // Wide 20 bps combined book spread adds 0.5 * 20 = +10 bps hurdle above entry_bp=10 => req=20 bps.
+        // Observed edge (hb/pa - 1) = (100.12 / 100.01 - 1) = +11 bps < 20 bps -> blocked!
+        let p =
+            NormalizedLegBook::from_l1(10_000, 10_000, d("99.91"), d("10"), d("100.01"), d("10"))
+                .unwrap();
+        let h =
+            NormalizedLegBook::from_l1(10_000, 10_000, d("100.12"), d("10"), d("100.22"), d("10"))
+                .unwrap();
+        let act = engine.on_books_with_context(
+            10_000,
+            &p,
+            &h,
+            &guard,
+            true,
+            Some(d("100.05")),
+            SessionRegime::OffHours,
+            BasisMarketContext::default(),
+        );
+        assert_eq!(
+            act,
+            BasisCoreAction::Hold {
+                reason: "below_entry_threshold"
+            }
+        );
+
+        let mut bad = base_cfg();
+        bad.spread_cost_entry_coeff = -0.1;
+        assert!(bad.validate().is_err());
     }
 }

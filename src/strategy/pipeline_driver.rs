@@ -64,6 +64,10 @@ pub struct RestingSlotOrder {
 pub struct SlotDiffConfig {
     /// Price drift tolerance (in ticks) inside which an unchanged opening quote stays resting.
     pub reprice_deadband_ticks: u32,
+    /// Optional scale-invariant deadband in basis points (`resting.price * bps / 10_000`).
+    /// When `Some`, the larger of `reprice_deadband_ticks * tick_size` and the bps band applies.
+    #[serde(default)]
+    pub reprice_deadband_bps: Option<f64>,
     /// Relative size drift tolerance `[0, 1]` inside which an opening quote stays resting.
     pub min_size_change_frac: f64,
     /// Minimum lot increment used to conservatively floor all order quantities.
@@ -76,6 +80,7 @@ impl Default for SlotDiffConfig {
     fn default() -> Self {
         Self {
             reprice_deadband_ticks: 1,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.10,
             lot_step: 1e-4,
             min_order_qty: 1e-3,
@@ -85,6 +90,11 @@ impl Default for SlotDiffConfig {
 
 impl SlotDiffConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.reprice_deadband_bps
+                .is_none_or(|bps| bps.is_finite() && (0.0..10_000.0).contains(&bps)),
+            "reprice_deadband_bps must be finite and in [0, 10_000)"
+        );
         ensure!(
             self.min_size_change_frac.is_finite()
                 && (0.0..=1.0).contains(&self.min_size_change_frac),
@@ -562,8 +572,12 @@ impl QuoteSlotTracker {
                         && (r.price - t.price).abs() <= PX_EPS
                         && (r.qty - t.qty).abs() <= self.config.lot_step * 0.5 + QTY_EPS
                 } else {
-                    let max_px_drift =
-                        f64::from(self.config.reprice_deadband_ticks) * tick_size + PX_EPS;
+                    let tick_band = f64::from(self.config.reprice_deadband_ticks) * tick_size;
+                    let bps_band = self
+                        .config
+                        .reprice_deadband_bps
+                        .map_or(0.0, |bps| r.price * bps / 10_000.0);
+                    let max_px_drift = tick_band.max(bps_band) + PX_EPS;
                     let rel_qty_diff = (r.qty - t.qty).abs() / r.qty.max(QTY_EPS);
                     let toxicity_newly_engaged = !r.faded_by_toxicity && t.faded_by_toxicity;
                     r.side == t.side
@@ -950,7 +964,12 @@ pub fn run_continuous_pipeline_replay(
                     ((front.fill_price - tick_mid) / front.fill_price) * 10_000.0
                 };
                 if signed_bps.is_finite() {
-                    pipeline.observe_fill_markout_bps(signed_bps);
+                    let side = if front.is_buy {
+                        QuoteSide::Bid
+                    } else {
+                        QuoteSide::Ask
+                    };
+                    pipeline.observe_fill_markout_for_side_bps(side, signed_bps);
                 }
             }
         }
@@ -1502,6 +1521,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
                 oracle_px: Some(mid),
                 funding_rate_bps_per_hour: None,
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
             },
             leader,
             taker_sweep,
@@ -1528,6 +1548,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
         markout_shield: crate::strategy::quote_pipeline::MarkoutShieldConfig::default(),
         funding_bias: Default::default(),
         inventory_clip: Default::default(),
+        vol_momentum_defense: Default::default(),
         max_oracle_divergence_bps: 25.0,
         base_order_qty: 1.0,
     };
@@ -1536,6 +1557,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
         pipeline: base_pipeline.clone(),
         slot_diff: SlotDiffConfig {
             reprice_deadband_ticks: 0,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.0,
             lot_step: 0.01,
             min_order_qty: 0.01,
@@ -1556,6 +1578,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
         pipeline: shielded_pipeline,
         slot_diff: SlotDiffConfig {
             reprice_deadband_ticks: 2,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.15,
             lot_step: 0.01,
             min_order_qty: 0.01,
@@ -1681,6 +1704,7 @@ mod tests {
             markout_shield: crate::strategy::quote_pipeline::MarkoutShieldConfig::default(),
             funding_bias: Default::default(),
             inventory_clip: Default::default(),
+            vol_momentum_defense: Default::default(),
             max_oracle_divergence_bps: 25.0,
             base_order_qty: 1.0,
         }
@@ -1690,6 +1714,7 @@ mod tests {
     fn slot_tracker_preserves_queue_within_deadband_and_replaces_immediately_on_toxicity() {
         let mut tracker = QuoteSlotTracker::new(SlotDiffConfig {
             reprice_deadband_ticks: 1,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.15,
             lot_step: 0.01,
             min_order_qty: 0.01,
@@ -1773,6 +1798,7 @@ mod tests {
     fn apply_batch_result_binds_by_side_price_size_not_position_and_fails_closed_on_no_match() {
         let slot_diff = SlotDiffConfig {
             reprice_deadband_ticks: 1,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.15,
             lot_step: 0.01,
             min_order_qty: 0.01,
@@ -1940,6 +1966,7 @@ mod tests {
             oracle_px: Some(100.05),
             funding_rate_bps_per_hour: None,
             exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
         };
         let long_inv = GenericInventoryState {
             signed_inventory_base: 1.239,
@@ -2010,6 +2037,7 @@ mod tests {
                 oracle_px: None,
                 funding_rate_bps_per_hour: None,
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
             },
             leader: None,
             taker_sweep: None,
@@ -2031,6 +2059,7 @@ mod tests {
             pipeline: p_cfg,
             slot_diff: SlotDiffConfig {
                 reprice_deadband_ticks: 0,
+                reprice_deadband_bps: None,
                 min_size_change_frac: 0.0,
                 lot_step: 0.1,
                 min_order_qty: 0.1,
@@ -2070,6 +2099,7 @@ mod tests {
                     oracle_px: Some(1.1),
                     funding_rate_bps_per_hour: None,
                     exit_queue_ahead_base: None,
+                    realized_vol_bps_per_sqrt_s: None,
                 },
                 leader: None,
                 taker_sweep: None,
@@ -2086,6 +2116,7 @@ mod tests {
                     oracle_px: Some(1.1),
                     funding_rate_bps_per_hour: None,
                     exit_queue_ahead_base: None,
+                    realized_vol_bps_per_sqrt_s: None,
                 },
                 leader: None,
                 taker_sweep: None,
@@ -2102,6 +2133,7 @@ mod tests {
                     oracle_px: None,
                     funding_rate_bps_per_hour: None,
                     exit_queue_ahead_base: None,
+                    realized_vol_bps_per_sqrt_s: None,
                 },
                 leader: None,
                 taker_sweep: None,
@@ -2118,6 +2150,7 @@ mod tests {
                     oracle_px: None,
                     funding_rate_bps_per_hour: None,
                     exit_queue_ahead_base: None,
+                    realized_vol_bps_per_sqrt_s: None,
                 },
                 leader: None,
                 taker_sweep: None,
@@ -2171,6 +2204,7 @@ mod tests {
                 oracle_px: None,
                 funding_rate_bps_per_hour: None,
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
             },
             leader: None,
             taker_sweep: None,
@@ -2461,6 +2495,7 @@ mod tests {
             pipeline: p_cfg,
             slot_diff: SlotDiffConfig {
                 reprice_deadband_ticks: 0,
+                reprice_deadband_bps: None,
                 min_size_change_frac: 0.0,
                 lot_step: 1.0,
                 min_order_qty: 1.0,
@@ -2491,6 +2526,7 @@ mod tests {
                 oracle_px: None,
                 funding_rate_bps_per_hour: Some(100.0), // 100 bp/h -> longs pay shorts
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
             },
             leader: None,
             taker_sweep: None,
@@ -2510,6 +2546,7 @@ mod tests {
     fn apply_batch_result_fails_closed_on_ambiguous_open_and_reduce_only_same_shape() {
         let mut tracker = QuoteSlotTracker::new(SlotDiffConfig {
             reprice_deadband_ticks: 0,
+            reprice_deadband_bps: None,
             min_size_change_frac: 0.0,
             lot_step: 0.01,
             min_order_qty: 0.01,
@@ -2574,6 +2611,7 @@ mod tests {
             pipeline: base_pipe_cfg(),
             slot_diff: SlotDiffConfig {
                 reprice_deadband_ticks: 0,
+                reprice_deadband_bps: None,
                 min_size_change_frac: 0.0,
                 lot_step: 1.0,
                 min_order_qty: 1.0,
@@ -2606,6 +2644,7 @@ mod tests {
                 oracle_px: None,
                 funding_rate_bps_per_hour: None,
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
             },
             leader: None,
             taker_sweep: None,
@@ -2638,6 +2677,72 @@ mod tests {
                 || on_report.eval_ledger.paired_cycle_net_cash_usd
                     != off_report.eval_ledger.paired_cycle_net_cash_usd
                 || on_report.queue_preserved_ticks != off_report.queue_preserved_ticks
+        );
+    }
+
+    #[test]
+    fn slot_tracker_reprice_deadband_bps_reduces_high_price_churn() {
+        let mut tracker = QuoteSlotTracker::new(SlotDiffConfig {
+            reprice_deadband_ticks: 1,
+            reprice_deadband_bps: Some(1.0), // 1 bp on 60_000 = 6.0 USD >> 0.1 tick
+            min_size_change_frac: 0.10,
+            lot_step: 0.001,
+            min_order_qty: 0.001,
+        })
+        .unwrap();
+        let make_plan = |bid_px: f64| QuotePlan {
+            mode: StrategyMode::NeutralMarketMaking,
+            fair_mid: bid_px + 5.0,
+            lead_lag_shift_bps: 0.0,
+            funding_shift_bps: 0.0,
+            leader_stale: false,
+            leader_vetoed_bid: false,
+            leader_vetoed_ask: false,
+            oracle_divergence_bps: None,
+            oracle_reduce_only: false,
+            bid_open: Some(OpeningQuote {
+                side: QuoteSide::Bid,
+                price: bid_px,
+                qty: 0.01,
+                spread_offset_bps: 1.0,
+                faded_by_toxicity: false,
+            }),
+            ask_open: None,
+            exit_directive: ExitDirective::Flat,
+        };
+        let a1 = tracker
+            .diff_plan(&make_plan(60_000.0), 0.1, OrderType::PostOnly)
+            .unwrap();
+        assert_eq!(a1.len(), 1);
+        tracker
+            .apply_batch_result(
+                &a1,
+                &BatchResult {
+                    tx_hashes: vec!["seed".into()],
+                    place_results: vec![PlaceResult {
+                        client_order_index: 1,
+                        side: Side::Buy,
+                        price: 60_000.0,
+                        size: 0.01,
+                    }],
+                },
+            )
+            .unwrap();
+
+        // Drift of 30 ticks (3.0 USD = 0.5 bp <= 1.0 bp) stays resting with zero cancel/replace.
+        assert!(
+            tracker
+                .diff_plan(&make_plan(60_003.0), 0.1, OrderType::PostOnly)
+                .unwrap()
+                .is_empty()
+        );
+        // Drift of 1.5 bp (9.0 USD > 6.0 USD) triggers cancel+replace.
+        assert_eq!(
+            tracker
+                .diff_plan(&make_plan(60_009.0), 0.1, OrderType::PostOnly)
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

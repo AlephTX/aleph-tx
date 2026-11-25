@@ -815,10 +815,46 @@ pub fn basis_frames_from_perp_frames(
         ) else {
             continue;
         };
-        let oracle_px = (frame.reference.timestamp_ms > 0
-            && frame.reference.timestamp_ms <= frame.now_ms
-            && frame.reference.price > Decimal::ZERO)
-            .then_some(frame.reference.price);
+        let oracle_px = [
+            frame.reference,
+            frame.legs[hedge_leg].oracle,
+            frame.legs[primary_leg].oracle,
+        ]
+        .into_iter()
+        .find_map(|o| {
+            (o.timestamp_ms > 0 && o.timestamp_ms <= frame.now_ms && o.price > Decimal::ZERO)
+                .then_some(o.price)
+        });
+        let funding_clock = (|| -> Option<FundingClockSample> {
+            let p_fc = frame.legs[primary_leg].forecast.as_ref()?;
+            let h_fc = frame.legs[hedge_leg].forecast.as_ref()?;
+            if p_fc.observed_at_ms == 0
+                || p_fc.observed_at_ms > frame.now_ms
+                || h_fc.observed_at_ms == 0
+                || h_fc.observed_at_ms > frame.now_ms
+            {
+                return None;
+            }
+            let p_pt = p_fc.payments.first()?;
+            let h_pt = h_fc.payments.first()?;
+            if p_pt.at_ms < frame.now_ms || h_pt.at_ms < frame.now_ms {
+                return None;
+            }
+            let p_bps = p_pt.rate.to_f64()? * 10_000.0;
+            let h_bps = h_pt.rate.to_f64()? * 10_000.0;
+            if !p_bps.is_finite()
+                || !h_bps.is_finite()
+                || p_bps.abs() > 500.0
+                || h_bps.abs() > 500.0
+            {
+                return None;
+            }
+            Some(FundingClockSample {
+                next_settlement_ms: p_pt.at_ms.min(h_pt.at_ms),
+                primary_funding_bps_per_period: p_bps,
+                hedge_funding_bps_per_period: h_bps,
+            })
+        })();
         out.push(BasisReplayFrame {
             now_ms: frame.now_ms,
             primary,
@@ -827,7 +863,7 @@ pub fn basis_frames_from_perp_frames(
             regime: default_regime,
             primary_lease_ok: true,
             adl_shock: None,
-            funding_clock: None,
+            funding_clock,
             hedge_rtt_ms: None,
             realized_vol_bps_per_sqrt_s: None,
         });
@@ -975,6 +1011,7 @@ pub fn run_basis_benchmark() -> Result<BasisBenchmarkReport> {
         funding_settlement: Default::default(),
         multi_oracle: None,
         latency_budget: Default::default(),
+        spread_cost_entry_coeff: 0.0,
     };
     let constraints = BasisLegConstraints {
         primary_step_size: dec_s("0.01"),
@@ -1066,6 +1103,7 @@ mod tests {
                 funding_settlement: Default::default(),
                 multi_oracle: None,
                 latency_budget: Default::default(),
+                spread_cost_entry_coeff: 0.0,
             },
             constraints: BasisLegConstraints::default(),
             window: ReplayWindowSpec {
@@ -1175,6 +1213,7 @@ mod tests {
                 funding_settlement: Default::default(),
                 multi_oracle: None,
                 latency_budget: Default::default(),
+                spread_cost_entry_coeff: 0.0,
             },
             constraints: BasisLegConstraints {
                 primary_step_size: dec_s("0.01"),
@@ -1290,5 +1329,8 @@ mod tests {
                 .iter()
                 .all(|f| f.regime == SessionRegime::OffHours)
         );
+        // Causal funding_clock + leg oracle fallback extracted safely from PerpFrame fixture.
+        assert!(converted.iter().any(|f| f.funding_clock.is_some()));
+        assert!(converted.iter().all(|f| f.reference_oracle_px.is_some()));
     }
 }

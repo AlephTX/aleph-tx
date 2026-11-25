@@ -106,6 +106,9 @@ pub struct MarkoutShieldConfig {
     pub engaged_size_scale: f64,
     /// Markout bps magnitude at which widening saturates to `max_widen_mult`.
     pub saturation_bps: f64,
+    /// When true, track realized markout independently per quote side (`Bid` vs `Ask`).
+    #[serde(default)]
+    pub per_side: bool,
 }
 
 impl Default for MarkoutShieldConfig {
@@ -117,6 +120,7 @@ impl Default for MarkoutShieldConfig {
             max_widen_mult: 2.5,
             engaged_size_scale: 0.5,
             saturation_bps: 3.0,
+            per_side: false,
         }
     }
 }
@@ -156,6 +160,8 @@ impl MarkoutShieldConfig {
 pub struct MarkoutShield {
     config: MarkoutShieldConfig,
     ewma_markout_bps: Option<f64>,
+    ewma_bid_bps: Option<f64>,
+    ewma_ask_bps: Option<f64>,
 }
 
 impl MarkoutShield {
@@ -164,7 +170,16 @@ impl MarkoutShield {
         Ok(Self {
             config,
             ewma_markout_bps: None,
+            ewma_bid_bps: None,
+            ewma_ask_bps: None,
         })
+    }
+
+    fn update_ewma(slot: &mut Option<f64>, alpha: f64, markout_bps: f64) {
+        *slot = Some(match *slot {
+            Some(prev) => alpha * markout_bps + (1.0 - alpha) * prev,
+            None => markout_bps,
+        });
     }
 
     /// Feed one realized post-fill markout in bps, signed so adverse selection is NEGATIVE
@@ -173,23 +188,39 @@ impl MarkoutShield {
         if !markout_bps.is_finite() {
             return;
         }
-        let a = self.config.ewma_alpha;
-        self.ewma_markout_bps = Some(match self.ewma_markout_bps {
-            Some(prev) => a * markout_bps + (1.0 - a) * prev,
-            None => markout_bps,
-        });
+        Self::update_ewma(
+            &mut self.ewma_markout_bps,
+            self.config.ewma_alpha,
+            markout_bps,
+        );
+    }
+
+    /// Feed one realized post-fill markout tagged with the maker quote side (`Bid` vs `Ask`).
+    pub fn observe_markout_for_side_bps(&mut self, side: QuoteSide, markout_bps: f64) {
+        if !markout_bps.is_finite() {
+            return;
+        }
+        Self::update_ewma(
+            &mut self.ewma_markout_bps,
+            self.config.ewma_alpha,
+            markout_bps,
+        );
+        let side_slot = match side {
+            QuoteSide::Bid => &mut self.ewma_bid_bps,
+            QuoteSide::Ask => &mut self.ewma_ask_bps,
+        };
+        Self::update_ewma(side_slot, self.config.ewma_alpha, markout_bps);
     }
 
     pub fn smoothed_markout_bps(&self) -> Option<f64> {
         self.ewma_markout_bps
     }
 
-    /// Engagement fraction in `[0, 1]`: 0 below threshold, ramping to 1 at `saturation_bps`.
-    fn engagement(&self) -> f64 {
+    fn engagement_from(&self, ewma: Option<f64>) -> f64 {
         if !self.config.enabled {
             return 0.0;
         }
-        let adverse = self.ewma_markout_bps.map(|m| (-m).max(0.0)).unwrap_or(0.0);
+        let adverse = ewma.map(|m| (-m).max(0.0)).unwrap_or(0.0);
         if adverse <= self.config.widen_threshold_bps {
             return 0.0;
         }
@@ -197,15 +228,89 @@ impl MarkoutShield {
         ((adverse - self.config.widen_threshold_bps) / span).clamp(0.0, 1.0)
     }
 
-    /// Current (spread_multiplier >= 1.0, size_scale in (0, 1]) from the shield.
-    fn adjustment(&self) -> (f64, f64) {
-        let e = self.engagement();
+    fn adjustment_for_side(&self, side: QuoteSide) -> (f64, f64) {
+        let ewma = if self.config.per_side {
+            match side {
+                QuoteSide::Bid => self.ewma_bid_bps,
+                QuoteSide::Ask => self.ewma_ask_bps,
+            }
+        } else {
+            self.ewma_markout_bps
+        };
+        let e = self.engagement_from(ewma);
         if e <= 0.0 {
             return (1.0, 1.0);
         }
         let mult = 1.0 + e * (self.config.max_widen_mult - 1.0);
         let size = 1.0 + e * (self.config.engaged_size_scale - 1.0);
         (mult, size)
+    }
+}
+
+/// Causal local-volatility & short-horizon momentum defense configuration. Default `enabled = false`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VolatilityMomentumDefenseConfig {
+    pub enabled: bool,
+    /// Baseline short-horizon realized volatility (`bps / sqrt(s)`, `> 0`).
+    pub vol_baseline_bps_per_sqrt_s: f64,
+    /// Linear spread-multiplier slope when `realized_vol > vol_baseline` (`>= 0`).
+    pub vol_widen_k: f64,
+    /// Maximum volatility spread multiplier (`>= 1.0`).
+    pub max_vol_widen_mult: f64,
+    /// Absolute local 3s momentum (`bps`, `> 0`) beyond which the exposed opening side is vetoed.
+    pub momentum_veto_bps: f64,
+    /// Reservation-price skew weight on `momentum_3s_bps` (`[0, 2.0]`).
+    pub momentum_skew_beta: f64,
+    /// Symmetric clamp on momentum-induced fair-mid shift (`bps`, `>= 0 && < 10_000`).
+    pub max_momentum_shift_bps: f64,
+}
+
+impl Default for VolatilityMomentumDefenseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vol_baseline_bps_per_sqrt_s: 1.0,
+            vol_widen_k: 0.5,
+            max_vol_widen_mult: 4.0,
+            momentum_veto_bps: 2.0,
+            momentum_skew_beta: 0.25,
+            max_momentum_shift_bps: 10.0,
+        }
+    }
+}
+
+impl VolatilityMomentumDefenseConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.vol_baseline_bps_per_sqrt_s.is_finite() && self.vol_baseline_bps_per_sqrt_s > 0.0,
+            "vol_momentum_defense.vol_baseline_bps_per_sqrt_s must be finite and > 0"
+        );
+        ensure!(
+            self.vol_widen_k.is_finite() && self.vol_widen_k >= 0.0,
+            "vol_momentum_defense.vol_widen_k must be finite and >= 0"
+        );
+        ensure!(
+            self.max_vol_widen_mult.is_finite() && self.max_vol_widen_mult >= 1.0,
+            "vol_momentum_defense.max_vol_widen_mult must be finite and >= 1.0"
+        );
+        ensure!(
+            self.momentum_veto_bps.is_finite() && self.momentum_veto_bps > 0.0,
+            "vol_momentum_defense.momentum_veto_bps must be finite and > 0"
+        );
+        ensure!(
+            self.momentum_skew_beta.is_finite()
+                && self.momentum_skew_beta >= 0.0
+                && self.momentum_skew_beta <= 2.0,
+            "vol_momentum_defense.momentum_skew_beta must be finite and in [0, 2]"
+        );
+        ensure!(
+            self.max_momentum_shift_bps.is_finite()
+                && self.max_momentum_shift_bps >= 0.0
+                && self.max_momentum_shift_bps < 10_000.0,
+            "vol_momentum_defense.max_momentum_shift_bps must be finite and in [0, 10_000)"
+        );
+        Ok(())
     }
 }
 
@@ -312,6 +417,8 @@ pub struct QuotePipelineConfig {
     pub funding_bias: FundingBiasConfig,
     #[serde(default)]
     pub inventory_clip: InventoryClipConfig,
+    #[serde(default)]
+    pub vol_momentum_defense: VolatilityMomentumDefenseConfig,
     /// Maximum tolerated fair-mid vs oracle divergence in bps before dropping to reduce-only.
     pub max_oracle_divergence_bps: f64,
     /// Nominal per-side opening order size in base units prior to drawdown/toxicity scaling.
@@ -327,12 +434,17 @@ impl QuotePipelineConfig {
         self.markout_shield.validate()?;
         self.funding_bias.validate()?;
         self.inventory_clip.validate()?;
+        self.vol_momentum_defense.validate()?;
         let combined_shift_bps = (if self.lead_lag.enabled {
             self.lead_lag.max_shift_bps
         } else {
             0.0
         }) + (if self.funding_bias.enabled {
             self.funding_bias.max_reservation_shift_bps
+        } else {
+            0.0
+        }) + (if self.vol_momentum_defense.enabled {
+            self.vol_momentum_defense.max_momentum_shift_bps
         } else {
             0.0
         });
@@ -367,6 +479,8 @@ pub struct GenericMarketState {
     pub funding_rate_bps_per_hour: Option<f64>,
     #[serde(default)]
     pub exit_queue_ahead_base: Option<f64>,
+    #[serde(default)]
+    pub realized_vol_bps_per_sqrt_s: Option<f64>,
 }
 
 impl GenericMarketState {
@@ -392,6 +506,7 @@ impl GenericMarketState {
             oracle_px,
             funding_rate_bps_per_hour,
             exit_queue_ahead_base,
+            realized_vol_bps_per_sqrt_s: None,
         }
     }
 }
@@ -486,6 +601,12 @@ impl QuotePipeline {
         self.markout_shield.observe_markout_bps(markout_bps);
     }
 
+    /// Feed one realized own-fill post-fill markout attributed to a quote side (`Bid` vs `Ask`).
+    pub fn observe_fill_markout_for_side_bps(&mut self, side: QuoteSide, markout_bps: f64) {
+        self.markout_shield
+            .observe_markout_for_side_bps(side, markout_bps);
+    }
+
     /// Current smoothed adverse-selection markout estimate (bps), if any fills observed.
     pub fn markout_estimate_bps(&self) -> Option<f64> {
         self.markout_shield.smoothed_markout_bps()
@@ -558,7 +679,10 @@ impl QuotePipeline {
                     .is_none_or(|r| r.is_finite())
                 && market
                     .exit_queue_ahead_base
-                    .is_none_or(|qa| qa.is_finite() && qa >= 0.0),
+                    .is_none_or(|qa| qa.is_finite() && qa >= 0.0)
+                && market
+                    .realized_vol_bps_per_sqrt_s
+                    .is_none_or(|v| v.is_finite() && v >= 0.0),
             "invalid market book inputs"
         );
         ensure!(
@@ -655,7 +779,19 @@ impl QuotePipeline {
         } else {
             0.0
         };
-        let fair_mid = base_fair_mid * (1.0 + (lead_lag_shift_bps + funding_shift_bps) / 10_000.0);
+        let (mom_shift_bps, mom_veto_bid, mom_veto_ask) =
+            if self.config.vol_momentum_defense.enabled {
+                let vm = &self.config.vol_momentum_defense;
+                let shift = (vm.momentum_skew_beta * market.momentum_3s_bps)
+                    .clamp(-vm.max_momentum_shift_bps, vm.max_momentum_shift_bps);
+                let veto_ask = market.momentum_3s_bps >= vm.momentum_veto_bps;
+                let veto_bid = market.momentum_3s_bps <= -vm.momentum_veto_bps;
+                (shift, veto_bid, veto_ask)
+            } else {
+                (0.0, false, false)
+            };
+        let fair_mid = base_fair_mid
+            * (1.0 + (lead_lag_shift_bps + funding_shift_bps + mom_shift_bps) / 10_000.0);
         ensure!(
             fair_mid.is_finite() && fair_mid > 0.0,
             "computed fair_mid must be finite and > 0"
@@ -722,10 +858,12 @@ impl QuotePipeline {
             })?
         };
 
-        let suppress_bid_open =
-            (carrying_inventory && inv.signed_inventory_base < 0.0) || leader_vetoed_bid;
-        let suppress_ask_open =
-            (carrying_inventory && inv.signed_inventory_base > 0.0) || leader_vetoed_ask;
+        let suppress_bid_open = (carrying_inventory && inv.signed_inventory_base < 0.0)
+            || leader_vetoed_bid
+            || mom_veto_bid;
+        let suppress_ask_open = (carrying_inventory && inv.signed_inventory_base > 0.0)
+            || leader_vetoed_ask
+            || mom_veto_ask;
 
         let (bid_open, ask_open) = if let Some(glft_q) = glft_q {
             let bid = if suppress_bid_open {
@@ -783,9 +921,18 @@ impl QuotePipeline {
         base_offset_bps: f64,
     ) -> OpeningQuote {
         let tox = self.toxicity.quote_adjustment(market.now_ms, side, false);
-        // Online markout shield widens symmetrically and may decay size; it composes
-        // multiplicatively with the wallet-tier toxicity adjustment. Disabled -> (1.0, 1.0).
-        let (markout_mult, markout_size) = self.markout_shield.adjustment();
+        // Online markout shield widens (globally or per side) and may decay size; it composes
+        // multiplicatively with wallet-tier toxicity and realized-volatility defense. Disabled -> 1.0.
+        let (markout_mult, markout_size) = self.markout_shield.adjustment_for_side(side);
+        let vol_mult = if self.config.vol_momentum_defense.enabled
+            && let Some(vol) = market.realized_vol_bps_per_sqrt_s
+        {
+            let vm = &self.config.vol_momentum_defense;
+            let excess = ((vol / vm.vol_baseline_bps_per_sqrt_s) - 1.0).max(0.0);
+            (1.0 + vm.vol_widen_k * excess).clamp(1.0, vm.max_vol_widen_mult)
+        } else {
+            1.0
+        };
         let inv_clip_scale = if self.config.inventory_clip.enabled {
             let ic = &self.config.inventory_clip;
             let u =
@@ -794,7 +941,7 @@ impl QuotePipeline {
         } else {
             1.0
         };
-        let eff_offset_bps = base_offset_bps * tox.spread_multiplier * markout_mult;
+        let eff_offset_bps = base_offset_bps * tox.spread_multiplier * markout_mult * vol_mult;
         let frac = eff_offset_bps / 10_000.0;
         let tick = market.tick_size;
         let price = match side {
@@ -851,6 +998,7 @@ mod tests {
             markout_shield: MarkoutShieldConfig::default(),
             funding_bias: FundingBiasConfig::default(),
             inventory_clip: InventoryClipConfig::default(),
+            vol_momentum_defense: VolatilityMomentumDefenseConfig::default(),
             max_oracle_divergence_bps: 25.0,
             base_order_qty: 2.0,
         }
@@ -913,6 +1061,7 @@ mod tests {
             oracle_px: Some(100.05),
             funding_rate_bps_per_hour: None,
             exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
         };
         let flat = GenericInventoryState {
             signed_inventory_base: 0.0,
@@ -1011,6 +1160,7 @@ mod tests {
             oracle_px: Some(100.05),
             funding_rate_bps_per_hour: None,
             exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
         };
         let flat = GenericInventoryState {
             signed_inventory_base: 0.0,
@@ -1070,6 +1220,7 @@ mod tests {
             oracle_px: None,
             funding_rate_bps_per_hour: None,
             exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
         };
         let flat = GenericInventoryState {
             signed_inventory_base: 0.0,
@@ -1178,6 +1329,7 @@ mod tests {
             oracle_px: None,
             funding_rate_bps_per_hour: None,
             exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
         };
         let flat = GenericInventoryState {
             signed_inventory_base: 0.0,
@@ -1270,6 +1422,7 @@ mod tests {
             oracle_px: None,
             funding_rate_bps_per_hour: Some(20.0), // clamped to -5 bp reservation shift
             exit_queue_ahead_base: Some(20.0),     // 20 / 2.0 = 10s > 5s -> advances exit stage
+            realized_vol_bps_per_sqrt_s: None,
         };
         let half_inv = GenericInventoryState {
             signed_inventory_base: 5.0, // 50% of max_inventory_base=10 -> clip_scale = 0.625
@@ -1332,5 +1485,58 @@ mod tests {
         assert_eq!(state.oracle_px, Some(100.05));
         assert_eq!(state.funding_rate_bps_per_hour, Some(-0.5));
         assert_eq!(state.exit_queue_ahead_base, Some(3.0));
+        assert_eq!(state.realized_vol_bps_per_sqrt_s, None);
+    }
+
+    #[test]
+    fn vol_momentum_defense_and_perside_markout_shield_only_engage_when_enabled() {
+        let mut cfg = pipeline_cfg();
+        cfg.vol_momentum_defense = VolatilityMomentumDefenseConfig {
+            enabled: true,
+            vol_baseline_bps_per_sqrt_s: 1.0,
+            vol_widen_k: 0.5,
+            max_vol_widen_mult: 3.0,
+            momentum_veto_bps: 2.0,
+            momentum_skew_beta: 0.25,
+            max_momentum_shift_bps: 5.0,
+        };
+        cfg.markout_shield = MarkoutShieldConfig {
+            enabled: true,
+            per_side: true,
+            ewma_alpha: 1.0,
+            widen_threshold_bps: 0.5,
+            max_widen_mult: 3.0,
+            engaged_size_scale: 0.5,
+            saturation_bps: 2.5,
+        };
+        let mut pipe = QuotePipeline::new(cfg, None).unwrap();
+
+        let calm_flat = GenericInventoryState {
+            signed_inventory_base: 0.0,
+            avg_entry_price: 0.0,
+            entry_opened_at_ms: None,
+            dust_base: 1e-6,
+            daily_loss_risk_scale: 1.0,
+        };
+        let storm_up = GenericMarketState {
+            now_ms: 10_000,
+            bid_px: 100.0,
+            ask_px: 100.1,
+            bid_sz: 5.0,
+            ask_sz: 5.0,
+            tick_size: 0.1,
+            momentum_3s_bps: 3.0, // >= 2.0 veto_bps -> vetoes Ask, widens Bid via vol=3.0
+            oracle_px: None,
+            funding_rate_bps_per_hour: None,
+            exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: Some(3.0), // excess=2 => vol_mult=2.0
+        };
+        // Adverse markout ONLY on Ask side should leave Bid width unaffected by markout when per_side=true.
+        pipe.observe_fill_markout_for_side_bps(QuoteSide::Ask, -3.0);
+        let plan = pipe.evaluate(&storm_up, &calm_flat).unwrap();
+        assert!(plan.ask_open.is_none());
+        let bid = plan.bid_open.unwrap();
+        let raw_q = pipe.quoter.quote(0.0).unwrap();
+        assert!((bid.spread_offset_bps - raw_q.bid_offset_bps * 2.0).abs() < 1e-9);
     }
 }

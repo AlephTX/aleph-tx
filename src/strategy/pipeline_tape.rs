@@ -188,6 +188,22 @@ fn causal_oracle_px(now_ms: u64, oracle: Oracle) -> Option<f64> {
     oracle.price.to_f64().filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn causal_funding_rate_bps_per_hour(
+    now_ms: u64,
+    forecast: Option<&crate::strategy::relative_value::FundingForecast>,
+) -> Option<f64> {
+    let fc = forecast?;
+    if fc.observed_at_ms == 0 || fc.observed_at_ms > now_ms {
+        return None;
+    }
+    let pt = fc.payments.first()?;
+    if pt.at_ms < now_ms {
+        return None;
+    }
+    let bps = pt.rate.to_f64()? * 10_000.0;
+    (bps.is_finite() && bps.abs() <= 500.0).then_some(bps)
+}
+
 /// Causally translate compiled `PerpFrame` snapshots into `ReplayTick`s & warm-up microprice samples.
 pub fn translate_perp_frames(
     cfg: &PipelineTapeConfig,
@@ -279,6 +295,7 @@ pub fn translate_perp_frames(
         let momentum_3s_bps =
             causal_return_bps(&mut target_mid_hist, now_ms, mid, cfg.momentum_window_ms);
 
+        let mut current_vol_bps = None;
         if let Some((prev_t, prev_m)) = prev_valid_target
             && now_ms > prev_t
             && prev_m > 0.0
@@ -291,6 +308,7 @@ pub fn translate_perp_frames(
                 }
                 vol_returns.push_back(scaled_ret);
                 if let Some(sigma) = sample_std_dev(&vol_returns) {
+                    current_vol_bps = Some(sigma);
                     max_sigma = max_sigma.max(sigma);
                     let next_regime = match regime {
                         VolRegime::Calm if sigma >= cfg.high_vol_enter_sigma_bps => {
@@ -346,6 +364,8 @@ pub fn translate_perp_frames(
 
         let oracle_px = causal_oracle_px(now_ms, frame.legs[cfg.target_leg].oracle)
             .or_else(|| causal_oracle_px(now_ms, frame.reference));
+        let funding_rate_bps_per_hour =
+            causal_funding_rate_bps_per_hour(now_ms, frame.legs[cfg.target_leg].forecast.as_ref());
 
         // Warm-up microprice fit observes strictly `now_ms < eval_start_ms` frames.
         if now_ms < cfg.replay.window.eval_start_ms {
@@ -369,8 +389,9 @@ pub fn translate_perp_frames(
                 tick_size: cfg.tick_size,
                 momentum_3s_bps,
                 oracle_px,
-                funding_rate_bps_per_hour: None,
+                funding_rate_bps_per_hour,
                 exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: current_vol_bps,
             },
             leader,
             taker_sweep: None,
@@ -442,30 +463,34 @@ pub fn run_perp_frames_pipeline_replay(
     })
 }
 
-/// Load `Frame`s from either a `PaperScenario` JSON file or a `perp-compile` NDJSON tape
-/// (auto-skipping optional line-1 `pair` scenario header).
+/// Load `Frame`s from either a `PaperScenario` JSON file, a `perp-compile` NDJSON tape, or
+/// stdin (`-`) streaming NDJSON lines (auto-skipping optional line-1 `pair` scenario header).
 pub fn load_perp_frames_from_path(path: &Path) -> Result<Vec<PerpFrame>> {
-    ensure!(
-        path.is_file(),
-        "tape file '{}' does not exist or is not a file",
-        path.display()
-    );
-    if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("read JSON tape '{}'", path.display()))?;
-        let scenario: PaperScenario = serde_json::from_str(&raw)
-            .with_context(|| format!("parse PaperScenario JSON '{}'", path.display()))?;
+    let mut reader: Box<dyn BufRead> = if path == Path::new("-") {
+        Box::new(BufReader::new(std::io::stdin().lock()))
+    } else {
         ensure!(
-            !scenario.frames.is_empty(),
-            "JSON tape '{}' contains zero frames",
+            path.is_file(),
+            "tape file '{}' does not exist or is not a file",
             path.display()
         );
-        return Ok(scenario.frames);
-    }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("read JSON tape '{}'", path.display()))?;
+            let scenario: PaperScenario = serde_json::from_str(&raw)
+                .with_context(|| format!("parse PaperScenario JSON '{}'", path.display()))?;
+            ensure!(
+                !scenario.frames.is_empty(),
+                "JSON tape '{}' contains zero frames",
+                path.display()
+            );
+            return Ok(scenario.frames);
+        }
+        let file =
+            File::open(path).with_context(|| format!("open NDJSON tape '{}'", path.display()))?;
+        Box::new(BufReader::new(file))
+    };
 
-    let file =
-        File::open(path).with_context(|| format!("open NDJSON tape '{}'", path.display()))?;
-    let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut line_no = 0_usize;
     let mut frames = Vec::new();
@@ -576,11 +601,13 @@ mod tests {
                     markout_shield: crate::strategy::quote_pipeline::MarkoutShieldConfig::default(),
                     funding_bias: Default::default(),
                     inventory_clip: Default::default(),
+                    vol_momentum_defense: Default::default(),
                     max_oracle_divergence_bps: 50.0,
                     base_order_qty: 0.5,
                 },
                 slot_diff: SlotDiffConfig {
                     reprice_deadband_ticks: 1,
+                    reprice_deadband_bps: None,
                     min_size_change_frac: 0.1,
                     lot_step: 0.01,
                     min_order_qty: 0.01,
@@ -637,5 +664,40 @@ mod tests {
         // Regressed timestamp must fail closed.
         frames[2].now_ms = frames[1].now_ms - 1;
         assert!(translate_perp_frames(&cfg, &frames).is_err());
+    }
+
+    #[test]
+    fn pipeline_tape_extracts_causal_funding_rate_and_rejects_future_forecast() {
+        let mut frames =
+            load_perp_frames_from_path(Path::new("examples/crypto_funding_paper.json")).unwrap();
+        let first_ms = frames[0].now_ms;
+        let last_ms = frames.last().unwrap().now_ms;
+        let mid_ms = first_ms + (last_ms - first_ms) / 2;
+        let cfg = sample_tape_cfg(first_ms, mid_ms, last_ms, last_ms);
+
+        // Inject future forecast timestamp on frame 0 (must ignore) and causal forecast on frame 1.
+        let now0 = frames[0].now_ms;
+        if let Some(fc0) = frames[0].legs[0].forecast.as_mut() {
+            fc0.observed_at_ms = now0 + 1;
+        }
+        let now1 = frames[1].now_ms;
+        if let Some(fc1) = frames[1].legs[0].forecast.as_mut() {
+            fc1.observed_at_ms = now1;
+            if let Some(pt) = fc1.payments.first_mut() {
+                pt.at_ms = now1 + 60_000;
+                pt.rate = rust_decimal::Decimal::new(15, 5); // 1.5 bps/h
+            }
+        }
+        let translated = translate_perp_frames(&cfg, &frames).unwrap();
+        assert_eq!(translated.ticks[0].market.funding_rate_bps_per_hour, None);
+        assert!(
+            (translated.ticks[1]
+                .market
+                .funding_rate_bps_per_hour
+                .unwrap()
+                - 1.5)
+                .abs()
+                < 1e-9
+        );
     }
 }
