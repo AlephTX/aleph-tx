@@ -601,6 +601,161 @@ pub fn evaluate_adl_delta_breaker(
     })
 }
 
+/// Thresholds for [`evaluate_collateral_rebalance`] live free-collateral & in-flight transfer checks.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollateralRebalanceConfig {
+    /// Minimum free collateral buffer ratio `effective_free / (required_margin + max(effective_free, 0))`
+    /// before escalating to `ReduceOnly`.
+    pub min_free_buffer_ratio: f64,
+    /// Critical free buffer ratio at or below which [`evaluate_collateral_rebalance`] escalates to `HaltAndFlatten`.
+    pub halt_free_buffer_ratio: f64,
+    /// Maximum tolerated age (`ms`) of an unsettled in-flight transfer before escalating to `ReduceOnly`.
+    pub max_in_flight_age_ms: u64,
+}
+
+impl Default for CollateralRebalanceConfig {
+    fn default() -> Self {
+        Self {
+            min_free_buffer_ratio: 0.25,
+            halt_free_buffer_ratio: 0.10,
+            max_in_flight_age_ms: 300_000,
+        }
+    }
+}
+
+impl CollateralRebalanceConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.halt_free_buffer_ratio.is_finite() && self.halt_free_buffer_ratio > 0.0,
+            "halt_free_buffer_ratio must be finite and > 0.0"
+        );
+        ensure!(
+            self.min_free_buffer_ratio.is_finite()
+                && self.min_free_buffer_ratio > self.halt_free_buffer_ratio
+                && self.min_free_buffer_ratio < 1.0,
+            "min_free_buffer_ratio must be finite, > halt_free_buffer_ratio, and < 1.0"
+        );
+        ensure!(
+            self.max_in_flight_age_ms > 0,
+            "max_in_flight_age_ms must be > 0"
+        );
+        Ok(())
+    }
+}
+
+/// Per-venue live collateral & in-flight transfer snapshot for [`evaluate_collateral_rebalance`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollateralRebalanceSnapshot {
+    pub venue: String,
+    pub free_collateral_usd: f64,
+    pub required_margin_usd: f64,
+    /// Pending inbound bridge/transfer USD (NEVER credited to effective free collateral before settlement).
+    pub in_flight_inbound_usd: f64,
+    /// Pending outbound bridge/transfer USD (deducted immediately from free collateral).
+    pub in_flight_outbound_usd: f64,
+    /// Elapsed age (`ms`) of the oldest unsettled transfer on this venue, if any transfer is in flight.
+    pub in_flight_age_ms: Option<u64>,
+}
+
+/// Pessimistic collateral & in-flight transfer verdict across active venues.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CollateralRebalanceAssessment {
+    pub action: TailRiskAction,
+    pub reasons: Vec<String>,
+    pub min_effective_free_buffer_ratio: Option<f64>,
+    pub total_in_flight_inbound_usd: f64,
+    pub total_in_flight_outbound_usd: f64,
+}
+
+/// Evaluate live available collateral across venues using pessimistic transfer accounting:
+/// `in_flight_outbound_usd` is deducted immediately while `in_flight_inbound_usd` is NOT credited
+/// until confirmed settled, and aged/undated in-flight transfers escalate to `ReduceOnly`.
+pub fn evaluate_collateral_rebalance(
+    cfg: &CollateralRebalanceConfig,
+    snapshots: &[CollateralRebalanceSnapshot],
+) -> Result<CollateralRebalanceAssessment> {
+    cfg.validate()?;
+    ensure!(
+        !snapshots.is_empty(),
+        "collateral snapshots must not be empty"
+    );
+
+    let mut action = TailRiskAction::Normal;
+    let mut reasons = BTreeSet::new();
+    let mut min_ratio: Option<f64> = None;
+    let mut total_in = 0.0_f64;
+    let mut total_out = 0.0_f64;
+
+    for (idx, snap) in snapshots.iter().enumerate() {
+        let venue = snap.venue.trim();
+        ensure!(
+            !venue.is_empty(),
+            "snapshots[{idx}].venue must not be empty"
+        );
+        ensure!(
+            snap.free_collateral_usd.is_finite()
+                && snap.free_collateral_usd >= 0.0
+                && snap.required_margin_usd.is_finite()
+                && snap.required_margin_usd >= 0.0
+                && snap.in_flight_inbound_usd.is_finite()
+                && snap.in_flight_inbound_usd >= 0.0
+                && snap.in_flight_outbound_usd.is_finite()
+                && snap.in_flight_outbound_usd >= 0.0,
+            "snapshots[{idx}] collateral values must be finite and >= 0"
+        );
+
+        total_in += snap.in_flight_inbound_usd;
+        total_out += snap.in_flight_outbound_usd;
+
+        let effective_free = snap.free_collateral_usd - snap.in_flight_outbound_usd;
+        if effective_free < 0.0 {
+            action = action.max(TailRiskAction::HaltAndFlatten);
+            reasons.insert(format!("negative_effective_free_collateral:{venue}"));
+        }
+
+        if snap.required_margin_usd > 0.0 {
+            let denom = snap.required_margin_usd + effective_free.max(0.0);
+            let ratio = if effective_free <= 0.0 {
+                0.0
+            } else {
+                normalize_zero((effective_free / denom).clamp(0.0, 1.0))
+            };
+            min_ratio = Some(min_ratio.map_or(ratio, |cur| cur.min(ratio)));
+            if ratio <= cfg.halt_free_buffer_ratio {
+                action = action.max(TailRiskAction::HaltAndFlatten);
+                reasons.insert(format!("free_collateral_halt:{venue}"));
+            } else if ratio <= cfg.min_free_buffer_ratio {
+                action = action.max(TailRiskAction::ReduceOnly);
+                reasons.insert(format!("free_collateral_reduce_only:{venue}"));
+            }
+        }
+
+        if snap.in_flight_inbound_usd > 0.0 || snap.in_flight_outbound_usd > 0.0 {
+            match snap.in_flight_age_ms {
+                None => {
+                    action = action.max(TailRiskAction::ReduceOnly);
+                    reasons.insert(format!("in_flight_transfer_age_missing:{venue}"));
+                }
+                Some(age_ms) if age_ms > cfg.max_in_flight_age_ms => {
+                    action = action.max(TailRiskAction::ReduceOnly);
+                    reasons.insert(format!("in_flight_transfer_stale:{venue}"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    Ok(CollateralRebalanceAssessment {
+        action,
+        reasons: reasons.into_iter().collect(),
+        min_effective_free_buffer_ratio: min_ratio,
+        total_in_flight_inbound_usd: normalize_zero(total_in),
+        total_in_flight_outbound_usd: normalize_zero(total_out),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1474,6 +1629,79 @@ mod tests {
                     hedge_leg_base: -6.0,
                     reference_gross_base: 10.0,
                 },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn collateral_rebalance_deducts_outbound_ignores_inbound_and_flags_stale_transfers() {
+        let cfg = CollateralRebalanceConfig::default();
+
+        // Outbound $250 leaves only $50 effective free against $300 required margin => 50/350 = 0.1428 <= 0.25 (ReduceOnly),
+        // even though $500 inbound is in-flight (must NEVER be pre-credited!).
+        let reduce = evaluate_collateral_rebalance(
+            &cfg,
+            &[CollateralRebalanceSnapshot {
+                venue: "arcus".into(),
+                free_collateral_usd: 300.0,
+                required_margin_usd: 300.0,
+                in_flight_inbound_usd: 500.0,
+                in_flight_outbound_usd: 250.0,
+                in_flight_age_ms: Some(15_000),
+            }],
+        )
+        .unwrap();
+        assert_eq!(reduce.action, TailRiskAction::ReduceOnly);
+        assert_eq!(reduce.reasons, vec!["free_collateral_reduce_only:arcus"]);
+        assert!(reduce.total_in_flight_inbound_usd > 499.0);
+
+        // Stale in-flight transfer > max_in_flight_age_ms escalates healthy venue to ReduceOnly.
+        let stale = evaluate_collateral_rebalance(
+            &cfg,
+            &[CollateralRebalanceSnapshot {
+                venue: "hyperliquid_xyz".into(),
+                free_collateral_usd: 500.0,
+                required_margin_usd: 500.0,
+                in_flight_inbound_usd: 100.0,
+                in_flight_outbound_usd: 0.0,
+                in_flight_age_ms: Some(400_000),
+            }],
+        )
+        .unwrap();
+        assert_eq!(stale.action, TailRiskAction::ReduceOnly);
+        assert_eq!(
+            stale.reasons,
+            vec!["in_flight_transfer_stale:hyperliquid_xyz"]
+        );
+
+        // Over-committed outbound (> free) fails into HaltAndFlatten.
+        let halt = evaluate_collateral_rebalance(
+            &cfg,
+            &[CollateralRebalanceSnapshot {
+                venue: "lighter".into(),
+                free_collateral_usd: 100.0,
+                required_margin_usd: 200.0,
+                in_flight_inbound_usd: 0.0,
+                in_flight_outbound_usd: 150.0,
+                in_flight_age_ms: Some(5_000),
+            }],
+        )
+        .unwrap();
+        assert_eq!(halt.action, TailRiskAction::HaltAndFlatten);
+
+        // NaN / negative amounts fail closed with Err.
+        assert!(
+            evaluate_collateral_rebalance(
+                &cfg,
+                &[CollateralRebalanceSnapshot {
+                    venue: "arcus".into(),
+                    free_collateral_usd: -1.0,
+                    required_margin_usd: 100.0,
+                    in_flight_inbound_usd: 0.0,
+                    in_flight_outbound_usd: 0.0,
+                    in_flight_age_ms: None,
+                }],
             )
             .is_err()
         );

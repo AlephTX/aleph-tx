@@ -1,6 +1,6 @@
 # AlephTX 策略与工程全面优化实施蓝图（2026-11-25）
 
-> **范围与真实性声明**：本文档将 2026-11-25 策略深度优化研究报告与仓库当前实际代码基线（`origin/main = cf96f5e` + Patrol #91–#95 及本轮落地模块）逐项对账，明确区分**已提前修复/现存组件**、**本轮已编码落地的模块与护栏**以及**尚待数据采集或独立人工审批解冻的剩余工作**。本文档不包含任何私钥、账户敏感信息或外部私有链接；所有美元数值均以内联代码标示以隔离渲染语法。
+> **范围与真实性声明**：本文档将 2026-11-25 策略深度优化研究报告与仓库当前实际代码基线（`origin/main = 94e000f` 及其后本轮增量加固）逐项对账，明确区分**已提前修复/现存组件**、**本轮已编码落地的模块与护栏**以及**尚待数据采集或独立人工审批解冻的剩余工作**。本文档不包含任何私钥、账户敏感信息或外部私有链接；所有美元数值均以内联代码标示以隔离渲染语法。
 
 ---
 
@@ -95,7 +95,13 @@
 2. **`BULK` 逐笔成交（`-bulk-trades`）与实盘执行适配**：当前仓库在 [src/capture.rs](../src/capture.rs) 与 [src/exchanges/bulk/](../src/exchanges/) 已支持 L2 快照录制与只读回放，尚未补齐 `-bulk-trades`（`TODO-DATA-02`）与实盘下单执行器，须按 [TOKYO_RESEARCH_AND_EXECUTION_TODO.md](TOKYO_RESEARCH_AND_EXECUTION_TODO.md) 独立推进。
 3. **统一策略模式路由器（`strategy_mode`）实盘适配器**：已通过 [quote_pipeline.rs](../src/strategy/quote_pipeline.rs) 完成无交易所耦合核心；待 Scenario 1 / 2 / 3 各自 10 小时 OOS 验证放行后，由轻量化 venue runner 调用 `QuotePipeline::evaluate` 并严守跨轨道独立资金隔离（不写入冻结基线 `config.example.toml`）。
 
-### 4.4 三条实盘 / Canary 轨道维持 `HOLD` 的客观放行条件
+### 4.4 本轮增量工程加固（`94e000f` 之后）
+
+- **Codex `#714` 同形开/平批回报身份消歧**（[src/strategy/pipeline_driver.rs](../src/strategy/pipeline_driver.rs)）：`QuoteSlotTracker::apply_batch_result` 对同批次内同 `(side, price, size)` 的多重候选报错并触发 `invalidate_all_unknown()`（防止乱序批回报把 `Opening` 与 `ReduceOnlyExit` 槽位 `client_order_index` 交叉错绑）。
+- **因果闭环 `MarkoutShield` + FIFO 排队估计与回放接通**（[src/strategy/pipeline_driver.rs](../src/strategy/pipeline_driver.rs), [src/strategy/hybrid_exit.rs](../src/strategy/hybrid_exit.rs)）：`run_continuous_pipeline_replay` 新增严格因果 `1_000 ms` 延迟队列反馈已实现 markout 至 `MarkoutShield`，并集成栈上 `QueueAheadTracker` 在启用 `queue_exit` 时持续跟踪减仓单前方排队量。
+- **零堆分配行情直通与双所在途抵押品守卫**（[src/shm_book.rs](../src/shm_book.rs), [src/strategy/quote_pipeline.rs](../src/strategy/quote_pipeline.rs), [src/strategy/tail_risk.rs](../src/strategy/tail_risk.rs)）：`FastBookSnapshot` 提供零分配 `mid_f64 / spread_bps / top_depth_imbalance` 及 `GenericMarketState::from_fast_book` 直通桥接；`evaluate_collateral_rebalance` 按悲观口径扣减在途出金、不预计在途入金并拦截超时在途划转。
+
+### 4.5 三条实盘 / Canary 轨道维持 `HOLD` 的客观放行条件
 
 - **`lighter_inventory_mm`（Core / RH）**：维持 `HOLD`，需先在独立账户与实盘/录制验证中消除零返佣磨损（`S12` 实盘回放与正净利留存门控通过）。
 - **`relative_value`**：维持 `HOLD`，须等待美股 RTH 时段 Step 2 Gate 采集及跨所 Oracle/Funding OOS 验证全部放行。

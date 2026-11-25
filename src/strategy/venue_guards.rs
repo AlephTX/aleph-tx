@@ -405,7 +405,11 @@ pub fn evaluate_multi_source_oracle_median(
     let median_price = if fresh_prices.len() % 2 == 1 {
         fresh_prices[mid]
     } else {
-        (fresh_prices[mid - 1] + fresh_prices[mid]) * Decimal::new(5, 1)
+        let lo = fresh_prices[mid - 1];
+        let hi = fresh_prices[mid];
+        lo.checked_add(hi)
+            .and_then(|s| s.checked_div(Decimal::TWO))
+            .unwrap_or_else(|| lo + (hi - lo) / Decimal::TWO)
     };
     ensure!(median_price > Decimal::ZERO, "oracle median must be > 0");
 
@@ -687,6 +691,54 @@ mod tests {
                 &policy,
             )
             .is_err()
+        );
+
+        // Extreme Decimal::MAX and 4e28 even-length consensus must not overflow-panic.
+        let extreme_equal = evaluate_multi_source_oracle_median(
+            now_ms,
+            &[
+                ReferenceOracleSample {
+                    source_id: "max_a".into(),
+                    price: Decimal::MAX,
+                    source_ms: 99_500,
+                    receipt_ms: 99_600,
+                },
+                ReferenceOracleSample {
+                    source_id: "max_b".into(),
+                    price: Decimal::MAX,
+                    source_ms: 99_550,
+                    receipt_ms: 99_650,
+                },
+            ],
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(extreme_equal.median_price, Decimal::MAX);
+
+        let large_a = Decimal::from_str_exact("40000000000000000000000000000").unwrap();
+        let large_b = Decimal::from_str_exact("40000000000000000000000000002").unwrap();
+        let extreme_mid = evaluate_multi_source_oracle_median(
+            now_ms,
+            &[
+                ReferenceOracleSample {
+                    source_id: "big_a".into(),
+                    price: large_a,
+                    source_ms: 99_500,
+                    receipt_ms: 99_600,
+                },
+                ReferenceOracleSample {
+                    source_id: "big_b".into(),
+                    price: large_b,
+                    source_ms: 99_550,
+                    receipt_ms: 99_650,
+                },
+            ],
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            extreme_mid.median_price,
+            Decimal::from_str_exact("40000000000000000000000000001").unwrap()
         );
     }
 }

@@ -548,6 +548,14 @@ impl BasisCoreConfig {
             multi.validate()?;
         }
         self.latency_budget.validate()?;
+        if self.latency_budget.enabled {
+            ensure!(
+                self.latency_budget.max_slippage_bps >= self.slippage_bps,
+                "latency_budget.max_slippage_bps ({}) must be >= slippage_bps ({})",
+                self.latency_budget.max_slippage_bps,
+                self.slippage_bps
+            );
+        }
         Ok(())
     }
 
@@ -1212,7 +1220,10 @@ impl BasisCoreEngine {
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .unwrap_or(1.0);
                 let drift_bps = lb.vol_drift_k * sigma * (p95_ms / 1_000.0).sqrt();
-                let eff_slip = (self.config.slippage_bps + drift_bps).min(lb.max_slippage_bps);
+                let eff_slip = (self.config.slippage_bps + drift_bps).clamp(
+                    self.config.slippage_bps,
+                    lb.max_slippage_bps.max(self.config.slippage_bps),
+                );
                 let scale = if p95_ms > lb.target_rtt_ms {
                     let span = (lb.max_entry_rtt_ms - lb.target_rtt_ms).max(1.0);
                     let frac = ((p95_ms - lb.target_rtt_ms) / span).clamp(0.0, 1.0);
@@ -1281,6 +1292,16 @@ impl BasisCoreEngine {
             self.reset_persist();
             return BasisCoreAction::Hold {
                 reason: "max_notional_reached",
+            };
+        }
+        if self.config.funding_settlement.enabled
+            && let Some(fc) = ctx.funding_clock
+            && (!fc.primary_funding_bps_per_period.is_finite()
+                || !fc.hedge_funding_bps_per_period.is_finite())
+        {
+            self.reset_persist();
+            return BasisCoreAction::Hold {
+                reason: "invalid_funding_clock",
             };
         }
 
@@ -1987,5 +2008,113 @@ mod tests {
                 reason: "latency_budget_exceeded"
             }
         );
+    }
+
+    #[test]
+    fn basis_core_rejects_under_floor_latency_slippage_and_fails_closed_on_nan_funding_while_allowing_exit()
+     {
+        let mut under_floor_cfg = base_cfg();
+        under_floor_cfg.latency_budget = LatencyBudgetConfig {
+            enabled: true,
+            window_samples: 8,
+            target_rtt_ms: 50.0,
+            max_entry_rtt_ms: 200.0,
+            vol_drift_k: 2.0,
+            max_slippage_bps: 5.0, // < slippage_bps (8.0)
+            min_clip_scale: 0.25,
+        };
+        assert!(under_floor_cfg.validate().is_err());
+        under_floor_cfg.latency_budget.max_slippage_bps = under_floor_cfg.slippage_bps;
+        assert!(under_floor_cfg.validate().is_ok());
+
+        let constraints = BasisLegConstraints {
+            primary_step_size: d("0.01"),
+            primary_min_order_size: d("0.01"),
+            primary_min_order_notional_usd: 5.0,
+            hedge_step_size: d("0.01"),
+            hedge_min_order_size: d("0.01"),
+            hedge_min_order_notional_usd: 10.0,
+        };
+        let mut cfg = base_cfg();
+        cfg.funding_settlement = FundingSettlementConfig {
+            enabled: true,
+            pre_settlement_blackout_ms: 120_000,
+            adverse_funding_block_bps: 0.5,
+            funding_exit_weight: 0.5,
+            max_exit_bp_adjust: 5.0,
+        };
+        let mut engine = BasisCoreEngine::new(cfg, constraints).unwrap();
+        let guard = DailyLossGuard::open(None, 0.05, 1_000.0, utc_day_now()).unwrap();
+        let now_ms = 10_000_u64;
+        let nan_funding = BasisMarketContext {
+            funding_clock: Some(FundingClockSample {
+                next_settlement_ms: now_ms + 30_000,
+                primary_funding_bps_per_period: f64::NAN,
+                hedge_funding_bps_per_period: 0.0,
+            }),
+            reference_oracles: Some(&[ReferenceOracleSample {
+                source_id: "s1".into(),
+                price: d("100.00"),
+                source_ms: 9_850,
+                receipt_ms: 9_950,
+            }]),
+            hedge_rtt_ms: Some(40.0),
+            realized_vol_bps_per_sqrt_s: Some(1.0),
+        };
+        let entry_p =
+            NormalizedLegBook::from_l1(now_ms, now_ms, d("99.90"), d("10"), d("99.92"), d("10"))
+                .unwrap();
+        let entry_h =
+            NormalizedLegBook::from_l1(now_ms, now_ms, d("100.10"), d("10"), d("100.12"), d("10"))
+                .unwrap();
+
+        let blocked = engine.on_books_with_context(
+            now_ms,
+            &entry_p,
+            &entry_h,
+            &guard,
+            true,
+            Some(d("100.00")),
+            SessionRegime::UsRth,
+            nan_funding,
+        );
+        assert_eq!(
+            blocked,
+            BasisCoreAction::Hold {
+                reason: "invalid_funding_clock"
+            }
+        );
+
+        // Open paired position must still emit reduce-only exit under the same NaN funding clock.
+        engine.reconcile_positions(
+            d("0.5"),
+            d("-0.5"),
+            now_ms - 5_000,
+            now_ms - 5_000,
+            now_ms - 5_000,
+        );
+        let exit_p =
+            NormalizedLegBook::from_l1(now_ms, now_ms, d("100.10"), d("10"), d("100.12"), d("10"))
+                .unwrap();
+        let exit_h =
+            NormalizedLegBook::from_l1(now_ms, now_ms, d("99.90"), d("10"), d("99.92"), d("10"))
+                .unwrap();
+        let exit_act = engine.on_books_with_context(
+            now_ms,
+            &exit_p,
+            &exit_h,
+            &guard,
+            true,
+            Some(d("100.00")),
+            SessionRegime::UsRth,
+            nan_funding,
+        );
+        assert!(matches!(
+            exit_act,
+            BasisCoreAction::ExitPairIoc {
+                direction_primary_buy: false,
+                ..
+            }
+        ));
     }
 }

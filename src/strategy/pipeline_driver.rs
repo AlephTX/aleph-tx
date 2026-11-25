@@ -9,6 +9,7 @@ use crate::daily_loss::DailyLossGuard;
 use crate::exchange::{BatchAction, BatchResult, Exchange, OrderParams, OrderType, Side};
 use crate::strategy::hybrid_exit::{
     CycleCashSummary, CycleFillInput, ExitDirective, FillExitMode, InventoryCycleCashLedger,
+    QueueAheadTracker,
 };
 use crate::strategy::microprice::MarkovMicropriceTable;
 use crate::strategy::quote_pipeline::{
@@ -20,9 +21,18 @@ use crate::strategy::wallet_toxicity::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 const QTY_EPS: f64 = 1e-12;
 const PX_EPS: f64 = 1e-9;
+const CAUSAL_MARKOUT_HORIZON_MS: u64 = 1_000;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingFillMarkout {
+    fill_ms: u64,
+    is_buy: bool,
+    fill_price: f64,
+}
 
 /// Exact 10-hour minimum continuous evaluation window duration in milliseconds.
 pub const FULL_10H_CONTINUOUS_MS: u64 = 36_000_000;
@@ -366,20 +376,30 @@ impl QuoteSlotTracker {
         // ambiguous (0 or >1) match fails closed via invalidate_all_unknown().
         let mut consumed = vec![false; batch_result.place_results.len()];
         for (slot, params, faded) in place_actions.into_iter() {
-            // First unconsumed result whose (side, price, size) matches this placement.
-            // Two legitimately identical clips are interchangeable: each still binds a
-            // distinct, valid client_order_index, so greedy consumption is correct.
-            let match_idx = batch_result
-                .place_results
-                .iter()
-                .enumerate()
-                .find(|(i, placed)| {
-                    !consumed[*i]
-                        && placed.side == params.side
-                        && (placed.price - params.price).abs() <= PX_EPS
-                        && (placed.size - params.size).abs() <= QTY_EPS
-                })
-                .map(|(i, _)| i);
+            // Require a UNIQUE unconsumed `(side, price, size)` match. An opening placement and a
+            // `reduce_only` exit placement (or separate slots) sharing `(side, price, size)` are
+            // NOT interchangeable in `RestingSlotOrder` / exit accounting when returned out of order.
+            let mut matches =
+                batch_result
+                    .place_results
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, placed)| {
+                        !consumed[*i]
+                            && placed.side == params.side
+                            && (placed.price - params.price).abs() <= PX_EPS
+                            && (placed.size - params.size).abs() <= QTY_EPS
+                    });
+            let match_idx = matches.next().map(|(i, _)| i);
+            if matches.next().is_some() {
+                self.invalidate_all_unknown();
+                bail!(
+                    "ambiguous batch place_result for placement side={:?} price={} size={}",
+                    params.side,
+                    params.price,
+                    params.size
+                );
+            }
             let Some(idx) = match_idx else {
                 self.invalidate_all_unknown();
                 bail!(
@@ -849,6 +869,8 @@ pub fn run_continuous_pipeline_replay(
     let mut sim_open_bid: Option<SimOrder> = None;
     let mut sim_open_ask: Option<SimOrder> = None;
     let mut sim_exit: Option<SimOrder> = None;
+    let mut pending_markouts: VecDeque<PendingFillMarkout> = VecDeque::new();
+    let mut exit_queue_tracker: Option<QueueAheadTracker> = None;
 
     let mut signed_inv = 0.0_f64;
     let mut avg_entry_price = 0.0_f64;
@@ -916,6 +938,22 @@ pub fn run_continuous_pipeline_replay(
         }
 
         let tick_mid = 0.5 * (tick.market.bid_px + tick.market.ask_px);
+        while let Some(front) = pending_markouts.front().copied() {
+            if now_ms < front.fill_ms.saturating_add(CAUSAL_MARKOUT_HORIZON_MS) {
+                break;
+            }
+            pending_markouts.pop_front();
+            if front.fill_price > 0.0 && tick_mid.is_finite() && tick_mid > 0.0 {
+                let signed_bps = if front.is_buy {
+                    ((tick_mid - front.fill_price) / front.fill_price) * 10_000.0
+                } else {
+                    ((front.fill_price - tick_mid) / front.fill_price) * 10_000.0
+                };
+                if signed_bps.is_finite() {
+                    pipeline.observe_fill_markout_bps(signed_bps);
+                }
+            }
+        }
         if dt_ms > 0
             && signed_inv.abs() > QTY_EPS
             && let Some(funding_rate_bps) = tick.market.funding_rate_bps_per_hour
@@ -1047,8 +1085,16 @@ pub fn run_continuous_pipeline_replay(
                         exit_mode,
                         markout_1s_usd: markout_est,
                     })?;
+                    pending_markouts.push_back(PendingFillMarkout {
+                        fill_ms: now_ms,
+                        is_buy: order.side == Side::Buy,
+                        fill_price: order.price,
+                    });
                     if is_exit {
                         pipeline.notify_exit_partial_fill(fqty)?;
+                        if let Some(qt) = exit_queue_tracker.as_mut() {
+                            qt.on_partial_fill(fqty);
+                        }
                     }
                     ensure!(
                         tracker.notify_fill(order.slot, order.client_order_index, fqty)?,
@@ -1056,6 +1102,9 @@ pub fn run_continuous_pipeline_replay(
                     );
                     if order.qty - fqty <= QTY_EPS {
                         *slot_opt = None;
+                        if is_exit {
+                            exit_queue_tracker = None;
+                        }
                     } else if let Some(existing) = slot_opt.as_mut() {
                         existing.qty -= fqty;
                     }
@@ -1099,8 +1148,29 @@ pub fn run_continuous_pipeline_replay(
             },
         };
 
+        let mut eval_market = tick.market;
+        if cfg.pipeline.hybrid_exit.queue_exit.enabled
+            && eval_market.exit_queue_ahead_base.is_none()
+            && let Some(qt) = exit_queue_tracker.as_mut()
+        {
+            let exit_sweep_hit = tick.taker_sweep.map_or(0.0, |s| {
+                let matches_exit = sim_exit.is_some_and(|eo| match eo.side {
+                    Side::Buy => !s.taker_is_buy,
+                    Side::Sell => s.taker_is_buy,
+                });
+                if matches_exit { s.sweep_size_base } else { 0.0 }
+            });
+            eval_market.exit_queue_ahead_base = Some(qt.on_book_and_trade(
+                tick.market.bid_px,
+                tick.market.bid_sz,
+                tick.market.ask_px,
+                tick.market.ask_sz,
+                exit_sweep_hit,
+            ));
+        }
+
         let mut plan =
-            pipeline.evaluate_with_leader(&tick.market, &inv_state, tick.leader.as_ref())?;
+            pipeline.evaluate_with_leader(&eval_market, &inv_state, tick.leader.as_ref())?;
         if in_drain {
             plan.bid_open = None;
             plan.ask_open = None;
@@ -1148,6 +1218,7 @@ pub fn run_continuous_pipeline_replay(
                             if sim_exit.is_some_and(|o| o.client_order_index == *client_order_index)
                             {
                                 sim_exit = None;
+                                exit_queue_tracker = None;
                             }
                         }
                     }
@@ -1229,6 +1300,16 @@ pub fn run_continuous_pipeline_replay(
                                 exit_mode: FillExitMode::TakerOrHazardClose,
                                 markout_1s_usd: markout_est,
                             })?;
+                            pending_markouts.push_back(PendingFillMarkout {
+                                fill_ms: now_ms,
+                                is_buy: params.side == Side::Buy,
+                                fill_price: fill_px,
+                            });
+                            if *slot == OrderSlotKind::ReduceOnlyExit
+                                && let Some(qt) = exit_queue_tracker.as_mut()
+                            {
+                                qt.on_partial_fill(exec_qty);
+                            }
                         }
                     } else {
                         let sim_order = SimOrder {
@@ -1243,7 +1324,22 @@ pub fn run_continuous_pipeline_replay(
                         match slot {
                             OrderSlotKind::OpeningBid => sim_open_bid = Some(sim_order),
                             OrderSlotKind::OpeningAsk => sim_open_ask = Some(sim_order),
-                            OrderSlotKind::ReduceOnlyExit => sim_exit = Some(sim_order),
+                            OrderSlotKind::ReduceOnlyExit => {
+                                sim_exit = Some(sim_order);
+                                if cfg.pipeline.hybrid_exit.queue_exit.enabled {
+                                    let init_touch_sz = if params.side == Side::Buy {
+                                        tick.market.bid_sz
+                                    } else {
+                                        tick.market.ask_sz
+                                    };
+                                    exit_queue_tracker = Some(QueueAheadTracker::new(
+                                        params.side == Side::Buy,
+                                        params.price,
+                                        params.size,
+                                        init_touch_sz.max(0.0),
+                                    )?);
+                                }
+                            }
                         }
                     }
                 }
@@ -2408,5 +2504,140 @@ mod tests {
         let report = run_continuous_pipeline_replay(&cfg, None, &ticks).unwrap();
         assert!(report.eval_ledger.funding_cash_usd < -0.5);
         assert!(report.eval_ledger.paired_cycle_net_cash_usd < 0.0);
+    }
+
+    #[test]
+    fn apply_batch_result_fails_closed_on_ambiguous_open_and_reduce_only_same_shape() {
+        let mut tracker = QuoteSlotTracker::new(SlotDiffConfig {
+            reprice_deadband_ticks: 0,
+            min_size_change_frac: 0.0,
+            lot_step: 0.01,
+            min_order_qty: 0.01,
+        })
+        .unwrap();
+
+        let actions = vec![
+            DriverOrderAction::Place {
+                slot: OrderSlotKind::OpeningBid,
+                params: OrderParams {
+                    side: Side::Buy,
+                    order_type: OrderType::PostOnly,
+                    price: 100.0,
+                    size: 1.0,
+                    reduce_only: false,
+                },
+                faded_by_toxicity: false,
+            },
+            DriverOrderAction::Place {
+                slot: OrderSlotKind::ReduceOnlyExit,
+                params: OrderParams {
+                    side: Side::Buy,
+                    order_type: OrderType::PostOnly,
+                    price: 100.0,
+                    size: 1.0,
+                    reduce_only: true,
+                },
+                faded_by_toxicity: false,
+            },
+        ];
+
+        // Venue returns both identical-shape Buy placements in swapped order -> must fail closed!
+        let err = tracker.apply_batch_result(
+            &actions,
+            &BatchResult {
+                tx_hashes: vec!["swapped".into()],
+                place_results: vec![
+                    PlaceResult {
+                        client_order_index: 202,
+                        side: Side::Buy,
+                        price: 100.0,
+                        size: 1.0,
+                    },
+                    PlaceResult {
+                        client_order_index: 101,
+                        side: Side::Buy,
+                        price: 100.0,
+                        size: 1.0,
+                    },
+                ],
+            },
+        );
+        assert!(err.is_err());
+        assert!(tracker.is_dirty());
+        assert!(tracker.resting(OrderSlotKind::OpeningBid).is_none());
+        assert!(tracker.resting(OrderSlotKind::ReduceOnlyExit).is_none());
+    }
+
+    #[test]
+    fn replay_feeds_causal_markout_shield_without_lookahead_and_tracks_queue_ahead() {
+        let mut off_cfg = PipelineReplayConfig {
+            pipeline: base_pipe_cfg(),
+            slot_diff: SlotDiffConfig {
+                reprice_deadband_ticks: 0,
+                min_size_change_frac: 0.0,
+                lot_step: 1.0,
+                min_order_qty: 1.0,
+            },
+            window: ReplayWindowSpec {
+                warmup_start_ms: 500,
+                eval_start_ms: 1_000,
+                eval_end_ms: 15_000,
+                drain_end_ms: 18_000,
+            },
+            initial_capital_usd: 1_000.0,
+            daily_loss_limit_pct: 0.25,
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
+            queue_fill_delay_ms: 0,
+            passive_touch_fill_stride: 1,
+            pre_registered_wallets: vec![],
+        };
+        off_cfg.pipeline.hybrid_exit.timeout_ms = 20_000;
+
+        let mk_tick = |now_ms: u64, bid_px: f64, ask_px: f64| ReplayTick {
+            market: GenericMarketState {
+                now_ms,
+                bid_px,
+                ask_px,
+                bid_sz: 20.0,
+                ask_sz: 20.0,
+                tick_size: 0.1,
+                momentum_3s_bps: 0.0,
+                oracle_px: None,
+                funding_rate_bps_per_hour: None,
+                exit_queue_ahead_base: None,
+            },
+            leader: None,
+            taker_sweep: None,
+        };
+        // Fill buy @ t=2000 (around 99.9) while mid drops sharply by t=3000 -> causal 1s markout < 0.
+        let ticks = vec![
+            mk_tick(1_000, 99.9, 100.1),
+            mk_tick(2_000, 95.0, 95.2),
+            mk_tick(3_000, 94.0, 94.2),
+            mk_tick(4_000, 94.0, 94.2),
+            mk_tick(5_000, 94.0, 94.2),
+        ];
+
+        let off_report = run_continuous_pipeline_replay(&off_cfg, None, &ticks).unwrap();
+
+        let mut on_cfg = off_cfg.clone();
+        on_cfg.pipeline.markout_shield.enabled = true;
+        on_cfg.pipeline.markout_shield.ewma_alpha = 1.0;
+        on_cfg.pipeline.markout_shield.widen_threshold_bps = 0.5;
+        on_cfg.pipeline.markout_shield.max_widen_mult = 3.0;
+        on_cfg.pipeline.markout_shield.engaged_size_scale = 0.5;
+        on_cfg.pipeline.hybrid_exit.queue_exit.enabled = true;
+        on_cfg.pipeline.hybrid_exit.queue_exit.max_expected_fill_sec = 5.0;
+
+        let on_report = run_continuous_pipeline_replay(&on_cfg, None, &ticks).unwrap();
+        assert_ne!(off_report.orders_placed + off_report.reprice_cancels, 0);
+        // Causal adverse markout + queue exit change downstream quoting decisions once matured (>= +1s).
+        assert!(
+            on_report.orders_placed != off_report.orders_placed
+                || on_report.eval_ledger.paired_cycle_net_cash_usd
+                    != off_report.eval_ledger.paired_cycle_net_cash_usd
+                || on_report.queue_preserved_ticks != off_report.queue_preserved_ticks
+        );
     }
 }

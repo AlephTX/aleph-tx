@@ -663,6 +663,85 @@ impl InventoryCycleCashLedger {
     }
 }
 
+/// Stack-only conservative FIFO queue-ahead estimator for one resting reduce-only exit order.
+///
+/// Tracks estimated volume ahead at the exit order's price level using public sweep depletion
+/// and top-of-book depth shrinkage (accounting for ahead cancellations conservatively without
+/// claiming queue improvement when behind-us liquidity is added).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueueAheadTracker {
+    is_buy: bool,
+    order_price: f64,
+    order_qty: f64,
+    queue_ahead_base: f64,
+}
+
+impl QueueAheadTracker {
+    pub fn new(
+        is_buy: bool,
+        order_price: f64,
+        order_qty: f64,
+        initial_touch_size_base: f64,
+    ) -> Result<Self> {
+        ensure!(
+            order_price.is_finite()
+                && order_price > 0.0
+                && order_qty.is_finite()
+                && order_qty > 0.0
+                && initial_touch_size_base.is_finite()
+                && initial_touch_size_base >= 0.0,
+            "invalid QueueAheadTracker initialization inputs"
+        );
+        Ok(Self {
+            is_buy,
+            order_price,
+            order_qty,
+            queue_ahead_base: initial_touch_size_base,
+        })
+    }
+
+    pub fn matches_order(&self, is_buy: bool, order_price: f64) -> bool {
+        self.is_buy == is_buy && (self.order_price - order_price).abs() <= 1e-9
+    }
+
+    pub fn queue_ahead_base(&self) -> f64 {
+        self.queue_ahead_base
+    }
+
+    /// Update estimated queue ahead from contemporaneous top-of-book state and hit sweep volume.
+    pub fn on_book_and_trade(
+        &mut self,
+        best_bid_px: f64,
+        best_bid_sz: f64,
+        best_ask_px: f64,
+        best_ask_sz: f64,
+        sweep_hit_qty: f64,
+    ) -> f64 {
+        if sweep_hit_qty.is_finite() && sweep_hit_qty > 0.0 {
+            self.queue_ahead_base = (self.queue_ahead_base - sweep_hit_qty).max(0.0);
+        }
+        let (touch_px, touch_sz) = if self.is_buy {
+            (best_bid_px, best_bid_sz)
+        } else {
+            (best_ask_px, best_ask_sz)
+        };
+        if (self.order_price - touch_px).abs() <= 1e-9 && touch_sz.is_finite() && touch_sz >= 0.0 {
+            self.queue_ahead_base = self
+                .queue_ahead_base
+                .min((touch_sz - self.order_qty).max(0.0));
+        }
+        self.queue_ahead_base
+    }
+
+    /// Once our order experiences a fill, all volume strictly ahead in FIFO at this level has cleared.
+    pub fn on_partial_fill(&mut self, filled_qty: f64) {
+        if filled_qty.is_finite() && filled_qty > 0.0 {
+            self.order_qty = (self.order_qty - filled_qty).max(0.0);
+            self.queue_ahead_base = 0.0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,5 +1030,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn queue_ahead_tracker_depletes_via_sweeps_touch_shrinkage_and_partial_fill() {
+        let mut tracker = QueueAheadTracker::new(false, 100.1, 2.0, 12.0).unwrap();
+        assert!((tracker.queue_ahead_base() - 12.0).abs() < 1e-12);
+
+        // Sweep eats 3.0 ahead and ask touch shrinks from 12.0 to 10.0 (meaning <= 8.0 ahead of our 2.0).
+        let q1 = tracker.on_book_and_trade(100.0, 5.0, 100.1, 10.0, 3.0);
+        assert!((q1 - 8.0).abs() < 1e-12);
+
+        // New size joining behind us (ask_sz = 15.0) must NOT increase our estimated queue ahead.
+        let q2 = tracker.on_book_and_trade(100.0, 5.0, 100.1, 15.0, 0.0);
+        assert!((q2 - 8.0).abs() < 1e-12);
+
+        // Partial fill clears remaining queue ahead to zero.
+        tracker.on_partial_fill(0.5);
+        assert!((tracker.queue_ahead_base()).abs() < 1e-12);
     }
 }

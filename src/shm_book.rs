@@ -175,6 +175,43 @@ pub struct FastBookSnapshot {
     pub asks: FastPriceLevels,
 }
 
+impl FastBookSnapshot {
+    /// Zero-allocation mid-price in quote currency.
+    #[inline]
+    pub fn mid_f64(&self) -> f64 {
+        0.5 * (self.bid_px + self.ask_px)
+    }
+
+    /// Zero-allocation top-of-book bid-ask spread in basis points (`0.0` if non-positive/non-finite mid).
+    #[inline]
+    pub fn spread_bps(&self) -> f64 {
+        let mid = self.mid_f64();
+        if !mid.is_finite() || mid <= 0.0 {
+            return 0.0;
+        }
+        let spread = ((self.ask_px - self.bid_px) / mid) * 10_000.0;
+        if spread.is_finite() {
+            spread.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Normalized L1 order-book imbalance `(bid_sz - ask_sz) / (bid_sz + ask_sz)` in `[-1.0, 1.0]`.
+    #[inline]
+    pub fn top_depth_imbalance(&self) -> f64 {
+        let denom = self.bid_sz + self.ask_sz;
+        if !denom.is_finite()
+            || denom <= 0.0
+            || !self.bid_sz.is_finite()
+            || !self.ask_sz.is_finite()
+        {
+            return 0.0;
+        }
+        ((self.bid_sz - self.ask_sz) / denom).clamp(-1.0, 1.0)
+    }
+}
+
 fn default_bbo_shm_path() -> String {
     "/dev/shm/aleph-matrix".to_owned()
 }
@@ -882,5 +919,18 @@ mod tests {
         assert_eq!(h_dec.bids.len(), 2);
         assert_eq!(h_fast.bids[1].price, 100.1);
         assert_eq!(h_fast.asks[1].size, 8.0);
+        assert!((p_fast.mid_f64() - 100.05).abs() < 1e-12);
+        assert!((p_fast.spread_bps() - (0.1 / 100.05) * 10_000.0).abs() < 1e-9);
+        assert!((p_fast.top_depth_imbalance() - (1.0 / 9.0)).abs() < 1e-12);
+
+        let degenerate = FastBookSnapshot {
+            bid_px: 0.0,
+            ask_px: 0.0,
+            bid_sz: 0.0,
+            ask_sz: 0.0,
+            ..p_fast
+        };
+        assert_eq!(degenerate.spread_bps(), 0.0);
+        assert_eq!(degenerate.top_depth_imbalance(), 0.0);
     }
 }

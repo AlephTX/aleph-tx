@@ -4,6 +4,7 @@
 //! [`HybridExitController`], and [`evaluate_reference_oracle_divergence_f64`] using
 //! normalized market/inventory inputs with ZERO dependencies on `crate::exchanges::*`.
 
+use crate::shm_book::FastBookSnapshot;
 use crate::strategy::glft::{GlftParams, GlftQuoter};
 use crate::strategy::hybrid_exit::{
     ExitDirective, ExitEvalInput, HybridExitConfig, HybridExitController,
@@ -366,6 +367,33 @@ pub struct GenericMarketState {
     pub funding_rate_bps_per_hour: Option<f64>,
     #[serde(default)]
     pub exit_queue_ahead_base: Option<f64>,
+}
+
+impl GenericMarketState {
+    /// Build a market state directly from a zero-allocation [`FastBookSnapshot`] without
+    /// intermediate `Decimal` conversion or heap allocation.
+    pub fn from_fast_book(
+        snap: &FastBookSnapshot,
+        now_ms: u64,
+        tick_size: f64,
+        momentum_3s_bps: f64,
+        oracle_px: Option<f64>,
+        funding_rate_bps_per_hour: Option<f64>,
+        exit_queue_ahead_base: Option<f64>,
+    ) -> Self {
+        Self {
+            now_ms,
+            bid_px: snap.bid_px,
+            ask_px: snap.ask_px,
+            bid_sz: snap.bid_sz,
+            ask_sz: snap.ask_sz,
+            tick_size,
+            momentum_3s_bps,
+            oracle_px,
+            funding_rate_bps_per_hour,
+            exit_queue_ahead_base,
+        }
+    }
 }
 
 /// Venue-agnostic inventory & drawdown brake state consumed by [`QuotePipeline::evaluate`].
@@ -1275,5 +1303,34 @@ mod tests {
         combined_bad.lead_lag.enabled = true;
         combined_bad.funding_bias.max_reservation_shift_bps = 3_999.0;
         assert!(combined_bad.validate().is_ok());
+    }
+
+    #[test]
+    fn generic_market_state_builds_directly_from_fast_book_snapshot() {
+        let fast = FastBookSnapshot {
+            source_ms: 9_990,
+            feeder_receipt_ms: Some(10_000),
+            bid_px: 100.0,
+            bid_sz: 6.0,
+            ask_px: 100.1,
+            ask_sz: 4.0,
+            bids: crate::shm_book::FastPriceLevels::from_l1(100.0, 6.0),
+            asks: crate::shm_book::FastPriceLevels::from_l1(100.1, 4.0),
+        };
+        let state = GenericMarketState::from_fast_book(
+            &fast,
+            10_000,
+            0.1,
+            1.2,
+            Some(100.05),
+            Some(-0.5),
+            Some(3.0),
+        );
+        assert_eq!(state.now_ms, 10_000);
+        assert_eq!(state.bid_px, 100.0);
+        assert_eq!(state.ask_sz, 4.0);
+        assert_eq!(state.oracle_px, Some(100.05));
+        assert_eq!(state.funding_rate_bps_per_hour, Some(-0.5));
+        assert_eq!(state.exit_queue_ahead_base, Some(3.0));
     }
 }
