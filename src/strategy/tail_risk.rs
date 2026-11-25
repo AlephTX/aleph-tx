@@ -420,6 +420,187 @@ pub fn evaluate_tail_risk(
     })
 }
 
+/// Configuration for the 100 ms ADL / unplanned net-delta circuit breaker (`S2-2B`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdlDeltaBreakerConfig {
+    /// Maximum tolerated unplanned net delta fraction of leg notional/base (`default 0.01` = 1%).
+    pub max_unplanned_delta_ratio: f64,
+    /// Base-unit dust tolerance below which imbalance is ignored (`default 1e-6`).
+    pub dust_base: f64,
+    /// Target recovery dispatch SLA in milliseconds (`default 100 ms`).
+    pub response_sla_ms: u64,
+    /// Hard SLA ceiling beyond which unresolved delta escalates to `HaltAndFlatten` (`default 200 ms`).
+    pub halt_sla_ms: u64,
+}
+
+impl Default for AdlDeltaBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_unplanned_delta_ratio: 0.01,
+            dust_base: 1e-6,
+            response_sla_ms: 100,
+            halt_sla_ms: 200,
+        }
+    }
+}
+
+impl AdlDeltaBreakerConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_unplanned_delta_ratio.is_finite()
+                && self.max_unplanned_delta_ratio > 0.0
+                && self.max_unplanned_delta_ratio <= 1.0,
+            "max_unplanned_delta_ratio must be finite and in (0, 1]"
+        );
+        ensure!(
+            self.dust_base.is_finite() && self.dust_base >= 0.0,
+            "dust_base must be finite and >= 0"
+        );
+        ensure!(
+            self.response_sla_ms > 0 && self.halt_sla_ms >= self.response_sla_ms,
+            "require 0 < response_sla_ms <= halt_sla_ms"
+        );
+        Ok(())
+    }
+}
+
+/// Paired leg position snapshot evaluated by [`evaluate_adl_delta_breaker`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NetDeltaSnapshot {
+    pub now_ms: u64,
+    pub unplanned_since_ms: Option<u64>,
+    pub target_leg_base: f64,
+    pub hedge_leg_base: f64,
+    pub reference_gross_base: f64,
+}
+
+/// Identifies which paired leg should execute a reduce-only recovery trim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairedLeg {
+    Primary,
+    Hedge,
+}
+
+/// Deterministic ADL / unplanned net-delta breaker decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AdlDeltaAction {
+    Balanced {
+        net_delta_base: f64,
+        delta_ratio: f64,
+    },
+    EmergencyReduceLeg {
+        leg: PairedLeg,
+        is_buy: bool,
+        qty_base: f64,
+        reduce_only: bool,
+        elapsed_ms: u64,
+        within_response_sla: bool,
+    },
+    HaltAndFlatten {
+        net_delta_base: f64,
+        elapsed_ms: u64,
+        reason: String,
+    },
+}
+
+/// Evaluate unplanned delta across paired venues (such as a profitable leg being shrunk
+/// by venue Auto-Deleveraging) and force sub-100ms recovery or 200ms halt escalation.
+///
+/// Always selects a surviving leg whose sign matches `net_delta_base` and clamps `qty_base`
+/// to `|leg_pos|`, ensuring the recovery order can safely execute with `reduce_only = true`.
+pub fn evaluate_adl_delta_breaker(
+    cfg: &AdlDeltaBreakerConfig,
+    snap: &NetDeltaSnapshot,
+) -> Result<AdlDeltaAction> {
+    cfg.validate()?;
+    ensure!(snap.now_ms > 0, "now_ms must be > 0");
+    ensure!(
+        snap.target_leg_base.is_finite()
+            && snap.hedge_leg_base.is_finite()
+            && snap.reference_gross_base.is_finite()
+            && snap.reference_gross_base >= 0.0,
+        "position inputs must be finite and reference_gross_base >= 0"
+    );
+    if let Some(since_ms) = snap.unplanned_since_ms {
+        ensure!(
+            since_ms > 0 && since_ms <= snap.now_ms,
+            "invalid or future unplanned_since_ms ({since_ms} vs {})",
+            snap.now_ms
+        );
+    }
+
+    let net_delta_base = snap.target_leg_base + snap.hedge_leg_base;
+    let abs_net = net_delta_base.abs();
+    let scale = snap
+        .reference_gross_base
+        .max(snap.target_leg_base.abs())
+        .max(snap.hedge_leg_base.abs());
+
+    if abs_net <= cfg.dust_base || scale <= cfg.dust_base {
+        return Ok(AdlDeltaAction::Balanced {
+            net_delta_base,
+            delta_ratio: 0.0,
+        });
+    }
+
+    let delta_ratio = abs_net / scale;
+    if delta_ratio <= cfg.max_unplanned_delta_ratio {
+        return Ok(AdlDeltaAction::Balanced {
+            net_delta_base,
+            delta_ratio,
+        });
+    }
+
+    let elapsed_ms = snap
+        .unplanned_since_ms
+        .map_or(0, |since| snap.now_ms.saturating_sub(since));
+    if elapsed_ms > cfg.halt_sla_ms {
+        return Ok(AdlDeltaAction::HaltAndFlatten {
+            net_delta_base,
+            elapsed_ms,
+            reason: format!(
+                "adl_delta_sla_breached: elapsed={}ms > {}ms (ratio={:.4})",
+                elapsed_ms, cfg.halt_sla_ms, delta_ratio
+            ),
+        });
+    }
+
+    let same_sign_as_net =
+        |pos: f64| (net_delta_base > 0.0 && pos > 0.0) || (net_delta_base < 0.0 && pos < 0.0);
+    let primary_eligible = same_sign_as_net(snap.target_leg_base);
+    let hedge_eligible = same_sign_as_net(snap.hedge_leg_base);
+    let (leg, leg_pos) = match (primary_eligible, hedge_eligible) {
+        (true, true) => {
+            if snap.target_leg_base.abs() >= snap.hedge_leg_base.abs() {
+                (PairedLeg::Primary, snap.target_leg_base)
+            } else {
+                (PairedLeg::Hedge, snap.hedge_leg_base)
+            }
+        }
+        (true, false) => (PairedLeg::Primary, snap.target_leg_base),
+        (false, true) => (PairedLeg::Hedge, snap.hedge_leg_base),
+        (false, false) => {
+            return Ok(AdlDeltaAction::HaltAndFlatten {
+                net_delta_base,
+                elapsed_ms,
+                reason: "no_reduce_only_leg_available".into(),
+            });
+        }
+    };
+    let qty_base = abs_net.min(leg_pos.abs());
+    let is_buy = leg_pos < 0.0;
+
+    Ok(AdlDeltaAction::EmergencyReduceLeg {
+        leg,
+        is_buy,
+        qty_base,
+        reduce_only: true,
+        elapsed_ms,
+        within_response_sla: elapsed_ms <= cfg.response_sla_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,5 +1350,132 @@ mod tests {
 
         let bad_json = r#"{"reduce_only_margin_util":0.7,"unknown_field":1}"#;
         assert!(serde_json::from_str::<TailRiskConfig>(bad_json).is_err());
+    }
+
+    #[test]
+    fn adl_delta_breaker_triggers_sub_100ms_reduce_only_and_escalates_past_200ms() {
+        let cfg = AdlDeltaBreakerConfig::default();
+
+        let balanced = evaluate_adl_delta_breaker(
+            &cfg,
+            &NetDeltaSnapshot {
+                now_ms: NOW_MS,
+                unplanned_since_ms: None,
+                target_leg_base: 10.0,
+                hedge_leg_base: -9.95,
+                reference_gross_base: 10.0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(balanced, AdlDeltaAction::Balanced { .. }));
+
+        // Short hedge leg is ADL-trimmed by venue (-10 -> -6), leaving +4.0 net long.
+        // Recovery MUST sell 4.0 on the surviving long Primary leg (`reduce_only = true`).
+        let hedge_trimmed = evaluate_adl_delta_breaker(
+            &cfg,
+            &NetDeltaSnapshot {
+                now_ms: NOW_MS,
+                unplanned_since_ms: Some(NOW_MS - 45),
+                target_leg_base: 10.0,
+                hedge_leg_base: -6.0,
+                reference_gross_base: 10.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hedge_trimmed,
+            AdlDeltaAction::EmergencyReduceLeg {
+                leg: PairedLeg::Primary,
+                is_buy: false,
+                qty_base: 4.0,
+                reduce_only: true,
+                elapsed_ms: 45,
+                within_response_sla: true,
+            }
+        );
+
+        // Primary long leg is ADL-trimmed (+10 -> +7), leaving -3.0 net short.
+        // Recovery MUST buy 3.0 on the surviving short Hedge leg (`reduce_only = true`).
+        let primary_trimmed = evaluate_adl_delta_breaker(
+            &cfg,
+            &NetDeltaSnapshot {
+                now_ms: NOW_MS,
+                unplanned_since_ms: Some(NOW_MS - 30),
+                target_leg_base: 7.0,
+                hedge_leg_base: -10.0,
+                reference_gross_base: 10.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            primary_trimmed,
+            AdlDeltaAction::EmergencyReduceLeg {
+                leg: PairedLeg::Hedge,
+                is_buy: true,
+                qty_base: 3.0,
+                reduce_only: true,
+                elapsed_ms: 30,
+                within_response_sla: true,
+            }
+        );
+
+        // Same-sign drift (+3, +2 => +5 net): qty_base clamps safely to surviving leg's |pos| (3.0).
+        let same_sign = evaluate_adl_delta_breaker(
+            &cfg,
+            &NetDeltaSnapshot {
+                now_ms: NOW_MS,
+                unplanned_since_ms: Some(NOW_MS - 10),
+                target_leg_base: 3.0,
+                hedge_leg_base: 2.0,
+                reference_gross_base: 5.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            same_sign,
+            AdlDeltaAction::EmergencyReduceLeg {
+                leg: PairedLeg::Primary,
+                is_buy: false,
+                qty_base: 3.0,
+                reduce_only: true,
+                elapsed_ms: 10,
+                within_response_sla: true,
+            }
+        );
+
+        // Unresolved past 200 ms halt SLA escalates to HaltAndFlatten.
+        let halt = evaluate_adl_delta_breaker(
+            &cfg,
+            &NetDeltaSnapshot {
+                now_ms: NOW_MS,
+                unplanned_since_ms: Some(NOW_MS - 250),
+                target_leg_base: 10.0,
+                hedge_leg_base: -6.0,
+                reference_gross_base: 10.0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            halt,
+            AdlDeltaAction::HaltAndFlatten {
+                elapsed_ms: 250,
+                ..
+            }
+        ));
+
+        // Future unplanned_since_ms fails closed.
+        assert!(
+            evaluate_adl_delta_breaker(
+                &cfg,
+                &NetDeltaSnapshot {
+                    now_ms: NOW_MS,
+                    unplanned_since_ms: Some(NOW_MS + 1),
+                    target_leg_base: 10.0,
+                    hedge_leg_base: -6.0,
+                    reference_gross_base: 10.0,
+                },
+            )
+            .is_err()
+        );
     }
 }

@@ -28,6 +28,11 @@ def digest(path):
         return file_digest(file, "sha256").hexdigest()
 
 
+# Canonical missing-capture sentinel matching Rust `Oracle::MISSING_CAPTURE`
+# in `src/strategy/relative_value.rs`.
+MISSING_CAPTURE_ORACLE = {"price": "0", "timestamp_ms": 0, "mode": "last_close"}
+
+
 def frame_to_maker_book_event(frame, *, available_notional="150"):
     books = [leg["book"] | {"available_notional": available_notional} for leg in frame["legs"]]
     event = {"kind": "book", "at_ms": frame["now_ms"], "books": books}
@@ -35,8 +40,11 @@ def frame_to_maker_book_event(frame, *, available_notional="150"):
         event["reference"] = frame["reference"]
     if frame.get("equity_session") is not None:
         event["equity_session"] = frame["equity_session"]
-    if frame["legs"] and all(leg.get("oracle") is not None for leg in frame["legs"]):
-        event["leg_oracles"] = [leg["oracle"] for leg in frame["legs"]]
+    if frame["legs"] and any(leg.get("oracle") is not None for leg in frame["legs"]):
+        event["leg_oracles"] = [
+            leg["oracle"] if leg.get("oracle") is not None else dict(MISSING_CAPTURE_ORACLE)
+            for leg in frame["legs"]
+        ]
     return event
 
 

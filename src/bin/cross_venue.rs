@@ -6,6 +6,7 @@ use aleph_tx::{
     exchanges::{arcus, bulk, hyperliquid, variational},
     funding_evidence,
     hedging::{HedgeAction, HedgeMachine, HedgePlan, OrderUpdate},
+    strategy::basis_replay::{run_basis_benchmark, run_basis_tape_file},
     strategy::cross_venue::{
         PlanKind, PlanRejection, PlannerConfig, TradePlan, VenueSnapshot, evaluate_pair,
     },
@@ -15,6 +16,8 @@ use aleph_tx::{
     strategy::multiday_carry::{
         MultiDayCarryPortfolioRequest, MultiDayCarryScenario, evaluate_multiday_carry_portfolio,
     },
+    strategy::pipeline_driver::run_pipeline_benchmark,
+    strategy::pipeline_tape::run_pipeline_tape_file,
     strategy::portfolio_risk::{PortfolioRiskScenario, evaluate_portfolio_risk_scenario},
     strategy::relative_value::{
         Frame as PerpFrame, MakerFirstConfig, MakerFirstEvent, PairConfig, PaperReport,
@@ -374,6 +377,37 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&run_glft_benchmark()?)?);
             Ok(())
         }
+        [command] if command == "pipeline-bench" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&run_pipeline_benchmark()?)?
+            );
+            Ok(())
+        }
+        [command] if command == "basis-bench" => {
+            println!("{}", serde_json::to_string_pretty(&run_basis_benchmark()?)?);
+            Ok(())
+        }
+        [command, config, tape] if command == "pipeline-replay" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&run_pipeline_tape_file(
+                    Path::new(config),
+                    Path::new(tape),
+                )?)?
+            );
+            Ok(())
+        }
+        [command, config, tape] if command == "basis-replay" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&run_basis_tape_file(
+                    Path::new(config),
+                    Path::new(tape),
+                )?)?
+            );
+            Ok(())
+        }
         [command, venue, tier, asset_class] if command == "capability-check" => {
             print(&registry.resolve_execution_capability(venue, tier, asset_class)?)
         }
@@ -597,7 +631,7 @@ async fn main() -> Result<()> {
             }
         },
         _ => anyhow::bail!(
-            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | router-fault-bench | glft-bench | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
+            "Usage: cross_venue venues | capabilities | capability-check VENUE TIER ASSET_CLASS | router-fault-bench | glft-bench | pipeline-bench | basis-bench | pipeline-replay CONFIG TAPE | basis-replay CONFIG TAPE | multiday-carry FILE | multiday-carry-portfolio FILE | portfolio-risk FILE | hedge-journal-audit JOURNAL [EVIDENCE] | hedge-fee-view JOURNAL EVIDENCE TELEMETRY CLOID | hedge-fee-coverage JOURNAL EVIDENCE TELEMETRY | replay FILE | hedge-replay FILE | perp-replay FILE | matched-settlement FILE | maker-first-preflight CONFIG | maker-first-replay CONFIG TAPE | perp-compile CONFIG INPUT OUTPUT [LIGHTER_PROOF HYPERLIQUID_PROOF] | perp-funding-proof VENUE POLICY FIRST_SLOT_MS LAST_SLOT_MS | perp-funding-audit VENUE PROOF | markets VENUE | bbo VENUE MARKET | arcus <testnet|mainnet> COMMAND"
         ),
     }
 }
@@ -839,5 +873,29 @@ mod tests {
         assert_eq!(report.shallow_calibration.discarded_deep_buckets, 3);
         assert!((report.shallow_calibration.intensity_a - 2.98).abs() < 1e-6);
         assert!((report.shallow_calibration.decay_k - 0.85).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pipeline_bench_and_basis_bench_contracts_hold() {
+        let pipe = run_pipeline_benchmark().unwrap();
+        assert_eq!(pipe.disclaimer, "synthetic_diagnostic_not_10h_oos_evidence");
+        assert!(!pipe.naive_reprice_arm.is_full_10h_continuous);
+        assert!(!pipe.shielded_hybrid_arm.is_full_10h_continuous);
+        assert!(pipe.cancel_reduction_count > 0);
+        assert!(pipe.net_cash_improvement_usd > 0.0);
+        assert!(
+            pipe.shielded_hybrid_arm.toxic_sweep_hits <= pipe.naive_reprice_arm.toxic_sweep_hits
+        );
+
+        let basis = run_basis_benchmark().unwrap();
+        assert_eq!(
+            basis.disclaimer,
+            "synthetic_diagnostic_not_10h_oos_evidence"
+        );
+        assert!(!basis.adl_shielded_arm.is_full_10h_continuous);
+        assert_eq!(basis.adl_shielded_arm.non_reduce_only_residual_orders, 0);
+        assert!(basis.adl_shielded_arm.primary_adl_reduce_only_fills > 0);
+        assert!(basis.adl_shielded_arm.oracle_blocked_ticks > 0);
+        assert!(basis.classic_hedge_arm.non_reduce_only_residual_orders > 0);
     }
 }

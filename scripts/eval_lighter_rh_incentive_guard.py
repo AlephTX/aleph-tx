@@ -205,10 +205,11 @@ def evaluate_lighter_rh_incentive(payload: dict[str, Any]) -> dict[str, Any]:
             continue
 
         dev_bps = abs(price - DECIMAL_ONE) * BPS_SCALE
-        # Retain worst-case deviation if an identical source appears more than once.
-        prev = valid_sources.get(source)
+        # Canonicalize oracle names case-insensitively so casing aliases cannot spoof quorum.
+        source_key = source.lower()
+        prev = valid_sources.get(source_key)
         if prev is None or dev_bps > prev:
-            valid_sources[source] = dev_bps
+            valid_sources[source_key] = dev_bps
 
     if not cross_stablecoin_authorized:
         action = _escalate(action, ACTION_HALT)
@@ -221,7 +222,7 @@ def evaluate_lighter_rh_incentive(payload: dict[str, Any]) -> dict[str, Any]:
     if quorum_count < 2:
         action = _escalate(action, ACTION_HALT)
         reasons.append("depeg_oracle_quorum_unavailable")
-    elif max_abs_deviation_bps is not None:
+    if max_abs_deviation_bps is not None:
         if max_abs_deviation_bps >= depeg_halt_bps:
             action = _escalate(action, ACTION_HALT)
             reasons.append("usdc_usdg_depeg_halt")
@@ -388,35 +389,32 @@ def evaluate_lighter_rh_incentive(payload: dict[str, Any]) -> dict[str, Any]:
     shadow_coverage_ratio: Decimal | None = None
     annualized_shadow_roi_pct: Decimal | None = None
 
+    evaluate_shadow_roi = True
     if weekly_cash_cost_usd > DECIMAL_ZERO:
         if points_received <= DECIMAL_ZERO:
             action = _escalate(action, ACTION_HALT)
             reasons.append("zero_points_with_positive_cash_cost")
+            evaluate_shadow_roi = False
         else:
             implied_cost_per_point_usd = weekly_cash_cost_usd / points_received
-            if lit_per_point is not None:
-                shadow_points_value_usd = points_received * lit_per_point * lit_price_usd
-                shadow_coverage_ratio = shadow_points_value_usd / weekly_cash_cost_usd
-                annualized_shadow_roi_pct = (
-                    ((shadow_points_value_usd - weekly_cash_cost_usd) / total_locked_margin_usd)
-                    * (Decimal("365") / period_days)
-                    * Decimal("100")
-                )
-                if (
-                    shadow_coverage_ratio < min_safety_margin_ratio
-                    or annualized_shadow_roi_pct < min_annualized_roi_pct
-                ):
-                    action = _escalate(action, ACTION_HALT)
-                    reasons.append("friday_roi_below_safety_cushion")
     else:
         implied_cost_per_point_usd = DECIMAL_ZERO
-        if lit_per_point is not None:
-            shadow_points_value_usd = points_received * lit_per_point * lit_price_usd
-            annualized_shadow_roi_pct = (
-                ((shadow_points_value_usd - weekly_cash_cost_usd) / total_locked_margin_usd)
-                * (Decimal("365") / period_days)
-                * Decimal("100")
-            )
+
+    if evaluate_shadow_roi and lit_per_point is not None:
+        shadow_points_value_usd = points_received * lit_per_point * lit_price_usd
+        if weekly_cash_cost_usd > DECIMAL_ZERO:
+            shadow_coverage_ratio = shadow_points_value_usd / weekly_cash_cost_usd
+        annualized_shadow_roi_pct = (
+            ((shadow_points_value_usd - weekly_cash_cost_usd) / total_locked_margin_usd)
+            * (Decimal("365") / period_days)
+            * Decimal("100")
+        )
+        if (
+            shadow_coverage_ratio is not None
+            and shadow_coverage_ratio < min_safety_margin_ratio
+        ) or annualized_shadow_roi_pct < min_annualized_roi_pct:
+            action = _escalate(action, ACTION_HALT)
+            reasons.append("friday_roi_below_safety_cushion")
 
     return {
         "schema_version": SCHEMA_VERSION,

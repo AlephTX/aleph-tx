@@ -64,6 +64,37 @@ struct ObservedMid {
     valid_until_ms: u64,
 }
 
+#[derive(Default, Clone, Copy)]
+struct SigmaAccum {
+    sum_sq_log_return: f64,
+    observed_ms: u64,
+    samples: u64,
+    gaps: u64,
+}
+
+impl SigmaAccum {
+    fn record(&mut self, dt: u64, expired: bool, last_mid: f64, mid: f64) {
+        if dt > MAX_SIGMA_GAP_MS || expired {
+            self.gaps += 1;
+        } else if dt > 0 {
+            let r = (mid / last_mid).ln();
+            if r.is_finite() {
+                self.sum_sq_log_return += r * r;
+                self.observed_ms += dt;
+                self.samples += 1;
+            }
+        }
+    }
+
+    fn observed_secs(&self) -> f64 {
+        self.observed_ms as f64 / 1_000.0
+    }
+
+    fn per_sqrt_sec(&self) -> Option<f64> {
+        (self.observed_ms > 0).then(|| (self.sum_sq_log_return / self.observed_secs()).sqrt())
+    }
+}
+
 pub(super) struct CalibrationAccum {
     horizons_ms: [u64; HORIZONS],
     exposure_ms: [u64; DISTANCE_BINS],
@@ -73,10 +104,9 @@ pub(super) struct CalibrationAccum {
     markouts: [MarkoutHistogram; HORIZONS],
     observations: VecDeque<ObservedMid>,
     retention_ms: u64,
-    sum_sq_log_return: f64,
-    sigma_observed_ms: u64,
-    sigma_samples: u64,
-    sigma_gaps: u64,
+    sigma: SigmaAccum,
+    decision_sigma_interval: Option<(u64, u64)>,
+    decision_sigma: SigmaAccum,
 }
 
 fn distance_bin(price: f64, is_ask: bool, mid: f64) -> Option<usize> {
@@ -99,11 +129,18 @@ impl CalibrationAccum {
             markouts: [MarkoutHistogram::default(); HORIZONS],
             observations: VecDeque::with_capacity(retention_ms as usize + 2),
             retention_ms,
-            sum_sq_log_return: 0.0,
-            sigma_observed_ms: 0,
-            sigma_samples: 0,
-            sigma_gaps: 0,
+            sigma: SigmaAccum::default(),
+            decision_sigma_interval: None,
+            decision_sigma: SigmaAccum::default(),
         }
+    }
+
+    pub(super) fn with_decision_sigma_interval(mut self, trade_from_ms: u64, end_ms: u64) -> Self {
+        debug_assert!(trade_from_ms < end_ms);
+        if trade_from_ms < end_ms {
+            self.decision_sigma_interval = Some((trade_from_ms, end_ms));
+        }
+        self
     }
 
     /// The caller supplies the orders live just before a book changes, and
@@ -134,15 +171,13 @@ impl CalibrationAccum {
             && let (Some(last_mid), Some((mid, _))) = (prev.mid, next)
         {
             let dt = now_ms.saturating_sub(prev.received_ms);
-            if dt > MAX_SIGMA_GAP_MS || now_ms > prev.valid_until_ms {
-                self.sigma_gaps += 1;
-            } else if dt > 0 {
-                let r = (mid / last_mid).ln();
-                if r.is_finite() {
-                    self.sum_sq_log_return += r * r;
-                    self.sigma_observed_ms += dt;
-                    self.sigma_samples += 1;
-                }
+            let expired = now_ms > prev.valid_until_ms;
+            self.sigma.record(dt, expired, last_mid, mid);
+            if let Some((start, end)) = self.decision_sigma_interval
+                && (start..end).contains(&prev.received_ms)
+                && (start..end).contains(&now_ms)
+            {
+                self.decision_sigma.record(dt, expired, last_mid, mid);
             }
         }
         // Keep the final observation before the earliest admissible print as
@@ -225,12 +260,22 @@ impl CalibrationAccum {
             markout_bin_bps: MARKOUT_BIN_BPS,
             markout_min_bps: MARKOUT_MIN_BPS,
             markout_histograms,
-            sum_sq_log_return: self.sum_sq_log_return,
-            sigma_observed_secs: self.sigma_observed_ms as f64 / 1_000.0,
-            sigma_samples: self.sigma_samples,
-            sigma_gaps: self.sigma_gaps,
-            sigma_per_sqrt_sec: (self.sigma_observed_ms > 0).then(|| {
-                (self.sum_sq_log_return / (self.sigma_observed_ms as f64 / 1_000.0)).sqrt()
+            sum_sq_log_return: self.sigma.sum_sq_log_return,
+            sigma_observed_secs: self.sigma.observed_secs(),
+            sigma_samples: self.sigma.samples,
+            sigma_gaps: self.sigma.gaps,
+            sigma_per_sqrt_sec: self.sigma.per_sqrt_sec(),
+            decision_phase_sigma: self.decision_sigma_interval.map(|(trade_from_ms, end_ms)| {
+                DecisionPhaseSigma {
+                    scope: "receipt_half_open",
+                    trade_from_ms,
+                    end_ms,
+                    sum_sq_log_return: self.decision_sigma.sum_sq_log_return,
+                    sigma_observed_secs: self.decision_sigma.observed_secs(),
+                    sigma_samples: self.decision_sigma.samples,
+                    sigma_gaps: self.decision_sigma.gaps,
+                    sigma_per_sqrt_sec: self.decision_sigma.per_sqrt_sec(),
+                }
             }),
         }
     }
@@ -254,6 +299,18 @@ pub(super) struct HorizonHistogram {
 }
 
 #[derive(Serialize)]
+pub(super) struct DecisionPhaseSigma {
+    scope: &'static str,
+    trade_from_ms: u64,
+    end_ms: u64,
+    sum_sq_log_return: f64,
+    sigma_observed_secs: f64,
+    sigma_samples: u64,
+    sigma_gaps: u64,
+    sigma_per_sqrt_sec: Option<f64>,
+}
+
+#[derive(Serialize)]
 pub(super) struct CalibrationReport {
     exposure_model: &'static str,
     fill_distance_model: &'static str,
@@ -268,6 +325,8 @@ pub(super) struct CalibrationReport {
     sigma_samples: u64,
     sigma_gaps: u64,
     sigma_per_sqrt_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_phase_sigma: Option<DecisionPhaseSigma>,
 }
 
 #[cfg(test)]
@@ -349,5 +408,84 @@ mod tests {
         assert_eq!(rep.sigma_gaps, 1);
         let expected = (100.01f64 / 100.0).ln().powi(2) / 0.4;
         assert!((rep.sigma_per_sqrt_sec.unwrap() - expected.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn decision_phase_sigma_scopes_receipt_endpoints_and_preserves_other_telemetry() {
+        let mut legacy = CalibrationAccum::new([1_000, 5_000, 30_000], 5_000);
+        let mut scoped = CalibrationAccum::new([1_000, 5_000, 30_000], 5_000)
+            .with_decision_sigma_interval(1_000, 1_500);
+        for (receipt, source, mid) in [
+            (900, 850, 95.0),
+            (1_000, 990, 110.0),
+            (1_250, 1_210, 111.0),
+            (1_499, 1_490, 113.0),
+            (1_500, 1_491, 130.0),
+            (1_600, 1_590, 120.0),
+        ] {
+            let book = Some((mid, source + 500));
+            let live = [(1_000, 95.0, false)];
+            legacy.on_book(receipt, book, live);
+            scoped.on_book(receipt, book, live);
+        }
+        assert_eq!(scoped.observable_mid(1_000), Some(95.0));
+        assert_eq!(scoped.observable_mid(1_601), Some(120.0));
+
+        let legacy_json = serde_json::to_value(legacy.finish()).unwrap();
+        assert!(legacy_json.get("decision_phase_sigma").is_none());
+        let scoped_json = serde_json::to_value(scoped.finish()).unwrap();
+        assert_eq!(scoped_json["sigma_observed_secs"], 0.7);
+        assert_eq!(scoped_json["sigma_samples"], 5);
+        assert_eq!(
+            scoped_json["decision_phase_sigma"]["scope"],
+            "receipt_half_open"
+        );
+        assert_eq!(scoped_json["decision_phase_sigma"]["trade_from_ms"], 1_000);
+        assert_eq!(scoped_json["decision_phase_sigma"]["end_ms"], 1_500);
+        assert_eq!(
+            scoped_json["decision_phase_sigma"]["sigma_observed_secs"],
+            0.499
+        );
+        assert_eq!(scoped_json["decision_phase_sigma"]["sigma_samples"], 2);
+        let expected_sq = (111.0_f64 / 110.0).ln().powi(2) + (113.0_f64 / 111.0).ln().powi(2);
+        assert!(
+            (scoped_json["decision_phase_sigma"]["sum_sq_log_return"]
+                .as_f64()
+                .unwrap()
+                - expected_sq)
+                .abs()
+                < 1e-15
+        );
+
+        let mut equality = CalibrationAccum::new([1_000, 5_000, 30_000], 5_000)
+            .with_decision_sigma_interval(1_000, 1_500);
+        equality.on_book(1_001, Some((100.0, 1_020)), []);
+        equality.on_book(1_020, Some((101.0, 1_100)), []);
+        let eq_json = serde_json::to_value(equality.finish()).unwrap();
+        assert_eq!(eq_json["decision_phase_sigma"]["sigma_samples"], 1);
+        assert_eq!(eq_json["decision_phase_sigma"]["sigma_gaps"], 0);
+        assert_eq!(
+            eq_json["decision_phase_sigma"]["sigma_observed_secs"],
+            0.019
+        );
+
+        let mut expired = CalibrationAccum::new([1_000, 5_000, 30_000], 5_000)
+            .with_decision_sigma_interval(1_000, 1_500);
+        expired.on_book(1_001, Some((100.0, 1_020)), []);
+        expired.on_book(1_021, Some((101.0, 1_100)), []);
+        let exp_json = serde_json::to_value(expired.finish()).unwrap();
+        assert_eq!(exp_json["decision_phase_sigma"]["sigma_samples"], 0);
+        assert_eq!(exp_json["decision_phase_sigma"]["sigma_gaps"], 1);
+        assert!(exp_json["decision_phase_sigma"]["sigma_per_sqrt_sec"].is_null());
+
+        let mut single_active = CalibrationAccum::new([1_000, 5_000, 30_000], 5_000)
+            .with_decision_sigma_interval(1_000, 1_500);
+        for at in [950, 999, 1_000, 1_500, 1_600] {
+            single_active.on_book(at, Some((100.0, at + 500)), []);
+        }
+        let single_json = serde_json::to_value(single_active.finish()).unwrap();
+        assert_eq!(single_json["decision_phase_sigma"]["sigma_samples"], 0);
+        assert_eq!(single_json["decision_phase_sigma"]["sigma_gaps"], 0);
+        assert!(single_json["decision_phase_sigma"]["sigma_per_sqrt_sec"].is_null());
     }
 }

@@ -40,6 +40,12 @@ TEN_HOURS_MS = 36_000_000
 MIN_WITNESSED_HOURS_10H = 9
 CAPTURE_COVERAGE_TOLERANCE_MS = 60_000
 MAX_SOURCE_BOOK_GAP_MS = 300_000
+# Rust replay continuity bound (`DEFAULT_MAX_CONTINUOUS_EVAL_GAP_MS` in
+# `src/strategy/pipeline_driver.rs`). New pre-registrations may opt into this tighter
+# ceiling by declaring `continuity_schema_version >= 2`; frozen pre-registrations that
+# predate the field keep the historical 300s ceiling so their verdicts never change.
+RUST_ALIGNED_SOURCE_BOOK_GAP_MS = 60_000
+CONTINUITY_SCHEMA_V2 = 2
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 ET_TZ = ZoneInfo("America/New_York")
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -176,10 +182,22 @@ def _verify_dual_source_continuity(
     start_ms: int,
     end_ms: int,
 ) -> bool:
+    # Opt-in tightened ceiling for NEW pre-registrations only. A manifest that declares
+    # `continuity_schema_version >= 2` is held to the Rust-aligned 60s bound; manifests
+    # without the field (every historical frozen contract) keep the legacy 300s ceiling so
+    # their acceptance is bit-for-bit unchanged. An unknown/invalid schema version fails closed.
+    schema_version = prereg_manifest.get("continuity_schema_version")
+    if schema_version is None:
+        ceiling_ms = MAX_SOURCE_BOOK_GAP_MS
+    elif schema_version == CONTINUITY_SCHEMA_V2:
+        ceiling_ms = RUST_ALIGNED_SOURCE_BOOK_GAP_MS
+    else:
+        return False
+
     raw_cap = prereg_manifest.get("max_source_book_gap_ms")
     if raw_cap is None:
-        max_gap_ms = MAX_SOURCE_BOOK_GAP_MS
-    elif _is_pos_int(raw_cap) and raw_cap <= MAX_SOURCE_BOOK_GAP_MS:
+        max_gap_ms = ceiling_ms
+    elif _is_pos_int(raw_cap) and raw_cap <= ceiling_ms:
         max_gap_ms = raw_cap
     else:
         return False
@@ -1052,6 +1070,124 @@ def _run_pinned_replay(source: bytes, path: Path, captures: list[Path], contract
             sys.modules[name] = prior
 
 
+def _load_external_witness(external_witness_path: Path | None) -> Any:
+    if external_witness_path is None:
+        return None
+    try:
+        loaded_witness = json.loads(external_witness_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"_load_error": True}
+    return {"_null": True} if loaded_witness is None else loaded_witness
+
+
+def _load_prereg_manifest(
+    prereg_manifest_path: Path | None,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    if prereg_manifest_path is None:
+        return (None, None, "prereg_manifest_not_supplied")
+    try:
+        frozen_bytes = prereg_manifest_path.read_bytes()
+        digest = hashlib.sha256(frozen_bytes).hexdigest()
+        loaded = json.loads(frozen_bytes)
+    except (OSError, ValueError):
+        return (None, None, "prereg_manifest_load_error")
+    if not isinstance(loaded, dict):
+        return ({}, digest, "invalid_prereg_manifest_object")
+    return (loaded, digest, None)
+
+
+def preflight_rth_ant_witness(
+    prereg_manifest_path: Path | None,
+    external_witness_path: Path | None,
+    trusted_tsa_ca_path: Path | None,
+) -> dict[str, Any]:
+    """Fail-closed RFC 3161 preregistration witness check prior to replay or archive hashing."""
+    manifest, verified_prereg_sha256, load_error = _load_prereg_manifest(prereg_manifest_path)
+    external_witness = _load_external_witness(external_witness_path)
+    decision_start_ms = manifest.get("decision_start_ms") if isinstance(manifest, dict) else None
+    if load_error is not None:
+        ok, witness_time_ms, detail = False, None, load_error
+    elif not (_is_valid_ms(decision_start_ms) and decision_start_ms > 0 and _is_sha256(verified_prereg_sha256)):
+        ok, witness_time_ms, detail = False, None, "invalid_decision_start_ms"
+    else:
+        ok, witness_time_ms, detail = verify_rfc3161_witness(
+            external_witness,
+            expected_prereg_sha256=verified_prereg_sha256,
+            decision_start_ms=decision_start_ms,
+            trusted_ca_path=trusted_tsa_ca_path,
+        )
+    return {
+        "gate": "rth_ant_witness_preflight",
+        "verdict": "VERIFIED" if ok else "NO_GO",
+        "independent_preregistration_witness_verified": ok,
+        "pre_registration_clock_trust": (
+            "verified_rfc3161_tsa_witness"
+            if ok
+            else "self_asserted_json_only_requires_external_witness"
+        ),
+        "witness_time_ms": witness_time_ms if ok else None,
+        "witness_verification_detail": detail,
+        "prereg_manifest": str(prereg_manifest_path) if prereg_manifest_path is not None else None,
+        "prereg_manifest_sha256": verified_prereg_sha256,
+        "decision_start_ms": decision_start_ms if _is_valid_ms(decision_start_ms) else None,
+        "external_witness": str(external_witness_path) if external_witness_path is not None else None,
+        "trusted_tsa_ca": str(trusted_tsa_ca_path) if trusted_tsa_ca_path is not None else None,
+    }
+
+
+def run_rth_ant_witness_preflight_cli(
+    prereg_manifest_path: Path | None,
+    external_witness_path: Path | None,
+    trusted_tsa_ca_path: Path | None,
+    output: Path | None = None,
+) -> int:
+    report = preflight_rth_ant_witness(
+        prereg_manifest_path=prereg_manifest_path,
+        external_witness_path=external_witness_path,
+        trusted_tsa_ca_path=trusted_tsa_ca_path,
+    )
+    text = json.dumps(report, indent=2) + "\n"
+    if output is not None:
+        output.write_text(text, encoding="utf-8")
+    print(text, end="")
+    return 0 if report["verdict"] == "VERIFIED" else 1
+
+
+def _emit_rth_ant_output(
+    report: dict[str, Any],
+    *,
+    capture_dirs: list[Path],
+    role: str,
+    output: Path,
+    prereg_manifest_path: Path | None,
+    verified_prereg_sha256: str | None,
+    seal_receipt_path: Path | None,
+    external_witness_path: Path | None,
+    trusted_tsa_ca_path: Path | None,
+) -> int:
+    report["capture_dirs"] = [str(p) for p in capture_dirs]
+    report["prereg_manifest"] = str(prereg_manifest_path) if prereg_manifest_path is not None else None
+    report["prereg_manifest_sha256"] = verified_prereg_sha256
+    report["seal_receipt"] = str(seal_receipt_path) if seal_receipt_path is not None else None
+    report["external_witness"] = str(external_witness_path) if external_witness_path is not None else None
+    report["trusted_tsa_ca"] = str(trusted_tsa_ca_path) if trusted_tsa_ca_path is not None else None
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    summary = {
+        "gate": report["gate"],
+        "role": role,
+        "verdict": report["verdict"],
+        "checks": report["checks"],
+        "provenance": report["provenance"],
+        "max_drawdown_usd": report["max_drawdown_usd"],
+    }
+    if "witness_preflight_blocked" in report:
+        summary["witness_preflight_blocked"] = report["witness_preflight_blocked"]
+    print(json.dumps(summary, indent=2))
+    if role == "monday_rth_oos" and report["verdict"] != "GO":
+        return 1
+    return 0
+
+
 def run_rth_ant_cli(
     capture_dirs: list[Path],
     role: str,
@@ -1061,7 +1197,44 @@ def run_rth_ant_cli(
     seal_receipt_path: Path | None = None,
     external_witness_path: Path | None = None,
     trusted_tsa_ca_path: Path | None = None,
+    *,
+    require_witness_preflight: bool = False,
 ) -> int:
+    external_witness = _load_external_witness(external_witness_path)
+    if require_witness_preflight and role == "monday_rth_oos":
+        preflight = preflight_rth_ant_witness(
+            prereg_manifest_path=prereg_manifest_path,
+            external_witness_path=external_witness_path,
+            trusted_tsa_ca_path=trusted_tsa_ca_path,
+        )
+        if not preflight["independent_preregistration_witness_verified"]:
+            manifest_pre, digest_pre, _ = _load_prereg_manifest(prereg_manifest_path)
+            report = evaluate_rth_ant_gate(
+                {},
+                role=role,
+                prereg_manifest=manifest_pre,
+                seal_receipt=None,
+                verified_prereg_sha256=digest_pre,
+                verified_segment_digests={},
+                verified_engine_digests={},
+                external_witness=external_witness,
+                trusted_tsa_ca_path=trusted_tsa_ca_path,
+            )
+            if manifest_pre is None:
+                report["provenance"]["witness_verification_detail"] = preflight["witness_verification_detail"]
+            report["witness_preflight_blocked"] = True
+            return _emit_rth_ant_output(
+                report,
+                capture_dirs=capture_dirs,
+                role=role,
+                output=output,
+                prereg_manifest_path=prereg_manifest_path,
+                verified_prereg_sha256=digest_pre,
+                seal_receipt_path=seal_receipt_path,
+                external_witness_path=external_witness_path,
+                trusted_tsa_ca_path=trusted_tsa_ca_path,
+            )
+
     manifest: dict[str, Any] | None = None
     verified_prereg_sha256: str | None = None
     if prereg_manifest_path is not None:
@@ -1074,14 +1247,6 @@ def run_rth_ant_cli(
     if seal_receipt_path is not None:
         loaded_seal = json.loads(seal_receipt_path.read_text())
         seal_receipt = loaded_seal if isinstance(loaded_seal, dict) else {}
-
-    external_witness: Any = None
-    if external_witness_path is not None:
-        try:
-            loaded_witness = json.loads(external_witness_path.read_text(encoding="utf-8"))
-            external_witness = {"_null": True} if loaded_witness is None else loaded_witness
-        except (OSError, ValueError):
-            external_witness = {"_load_error": True}
 
     declared = manifest.get("strategy_contract") if manifest else None
     decision_bounds_ns: tuple[int, int] | None = None
@@ -1114,29 +1279,17 @@ def run_rth_ant_cli(
         external_witness=external_witness,
         trusted_tsa_ca_path=trusted_tsa_ca_path,
     )
-    report["capture_dirs"] = [str(p) for p in capture_dirs]
-    report["prereg_manifest"] = str(prereg_manifest_path) if prereg_manifest_path is not None else None
-    report["prereg_manifest_sha256"] = verified_prereg_sha256
-    report["seal_receipt"] = str(seal_receipt_path) if seal_receipt_path is not None else None
-    report["external_witness"] = str(external_witness_path) if external_witness_path is not None else None
-    report["trusted_tsa_ca"] = str(trusted_tsa_ca_path) if trusted_tsa_ca_path is not None else None
-    output.write_text(json.dumps(report, indent=2) + "\n")
-    print(
-        json.dumps(
-            {
-                "gate": report["gate"],
-                "role": role,
-                "verdict": report["verdict"],
-                "checks": report["checks"],
-                "provenance": report["provenance"],
-                "max_drawdown_usd": report["max_drawdown_usd"],
-            },
-            indent=2,
-        )
+    return _emit_rth_ant_output(
+        report,
+        capture_dirs=capture_dirs,
+        role=role,
+        output=output,
+        prereg_manifest_path=prereg_manifest_path,
+        verified_prereg_sha256=verified_prereg_sha256,
+        seal_receipt_path=seal_receipt_path,
+        external_witness_path=external_witness_path,
+        trusted_tsa_ca_path=trusted_tsa_ca_path,
     )
-    if role == "monday_rth_oos" and report["verdict"] != "GO":
-        return 1
-    return 0
 
 
 def main() -> int:
@@ -1151,7 +1304,21 @@ def main() -> int:
     p_ant.add_argument("--seal-receipt", type=Path, default=None, help="Post-capture seal receipt JSON referencing prereg SHA-256")
     p_ant.add_argument("--external-witness", type=Path, default=None, help="External RFC 3161 TSA preregistration witness JSON")
     p_ant.add_argument("--trusted-tsa-ca", type=Path, default=None, help="Explicit trusted TSA CA PEM file (never embedded)")
+    p_ant.add_argument(
+        "--require-witness-preflight",
+        action="store_true",
+        help="Verify external RFC 3161 witness before running formal replay or archive hashing",
+    )
     p_ant.add_argument("--output", type=Path, required=True)
+
+    p_pre = sub.add_parser(
+        "rth-ant-witness-preflight",
+        help="Verify external RFC 3161 TSA preregistration witness before dataset reads",
+    )
+    p_pre.add_argument("--prereg-manifest", type=Path, required=True, help="Pre-capture frozen plan JSON")
+    p_pre.add_argument("--external-witness", type=Path, default=None, help="External RFC 3161 TSA preregistration witness JSON")
+    p_pre.add_argument("--trusted-tsa-ca", type=Path, default=None, help="Explicit trusted TSA CA PEM file")
+    p_pre.add_argument("--output", type=Path, default=None)
 
     p_rwa = sub.add_parser("w15-rwa", help="Diagnose Core RWA cost or report formal admission status")
     p_rwa.add_argument("--role", choices=("formal", "diagnostic"), default="formal")
@@ -1174,6 +1341,14 @@ def main() -> int:
             args.seal_receipt,
             args.external_witness,
             args.trusted_tsa_ca,
+            require_witness_preflight=args.require_witness_preflight,
+        )
+    if args.command == "rth-ant-witness-preflight":
+        return run_rth_ant_witness_preflight_cli(
+            args.prereg_manifest,
+            args.external_witness,
+            args.trusted_tsa_ca,
+            args.output,
         )
     if args.command == "w15-rwa":
         return run_w15_rwa_cli(

@@ -34,8 +34,16 @@ canary_max_order_usd = 50.0
 canary_max_total_notional_usd = 100.0
 
 require_arcus_cancel_lease = true
+require_hl_growth_mode = true
+max_hl_deployer_fee_scale = 1.0
+max_oracle_divergence_bps = 25.0
+# Maximum oracle staleness (local receipt - oracle source) before NEW entries are blocked
+# (reduce/close stay open). Must be >= poll_interval_ms.
+max_oracle_age_ms = 2000
 dry_run = true
-poll_interval_ms = 250
+# poll_interval_ms must be <= adl_delta_breaker.halt_sla_ms (see that section) so the ADL
+# reduce-only response tier is reachable rather than skipped straight to halt.
+poll_interval_ms = 100
 account_refresh_interval_ms = 1000
 
 journal_path = "state/arcus_xyz_basis_journal.ndjson"
@@ -62,3 +70,41 @@ depeg_reduce_only_bps = 30.0
 depeg_halt_bps = 75.0
 max_peg_age_ms = 60000
 max_future_skew_ms = 5000
+
+# Emergency ADL delta-neutrality circuit breaker (>1% unplanned leg mismatch -> reduce-only,
+# sustained breach -> halt). SLAs MUST be consistent with the observation cadence: the residual
+# is re-observed at most once per poll_interval_ms (account-sourced ADL can lag a further
+# account_refresh_interval_ms), so config load fails unless halt_sla_ms >= poll_interval_ms.
+# With poll_interval_ms = 100 the response (100ms) and halt (200ms) tiers are both reachable.
+# A genuine sub-100ms reduce-only response would require a faster private-event inner loop that
+# is NOT wired here; do not shorten these below the poll interval. See ARCUS_XYZ_BASIS_RUNBOOK.md.
+[adl_delta_breaker]
+max_unplanned_delta_ratio = 0.01
+dust_base = 0.000001
+response_sla_ms = 100
+halt_sla_ms = 200
+
+# Optional adaptive Kalman / Ornstein-Uhlenbeck basis filter (enable only for research / promoted profiles).
+# [kalman_basis]
+# q_per_sec = 0.005
+# r_base_bps2 = 4.0
+# spread_r_coeff = 1.0
+# initial_variance_p = 25.0
+# reset_variance_p = 25.0
+# max_gap_ms = 30000
+# ou_window = 64
+# ou_min_samples = 16
+# phi_max_stationary = 0.98
+# min_dislocation_bps = 3.0
+# max_dislocation_bps = 30.0
+# time_stop_half_life_mult = 3.0
+# max_hold_ms_cap = 300000
+
+# Optional low-latency shared-memory book feed (slots 7 = Arcus, 10 = TradeXYZ; auto-falls back to REST).
+# [shm_book_feed]
+# enabled = false
+# bbo_shm_path = "/dev/shm/aleph-matrix"
+# depth_shm_path = "/dev/shm/aleph-depth"
+# symbol_id = 0
+# arcus_exchange_id = 7
+# hl_exchange_id = 10

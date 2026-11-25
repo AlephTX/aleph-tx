@@ -362,6 +362,23 @@ pub struct Oracle {
     pub mode: OracleMode,
 }
 
+impl Oracle {
+    pub(crate) const MISSING_CAPTURE: Self = Self {
+        price: Decimal::ZERO,
+        timestamp_ms: 0,
+        mode: OracleMode::LastClose,
+    };
+
+    pub(crate) fn is_missing_capture(self) -> bool {
+        self.timestamp_ms == 0 && self.price == Decimal::ZERO && self.mode == OracleMode::LastClose
+    }
+
+    pub(crate) fn is_observed_internal_or_close(self) -> bool {
+        !self.is_missing_capture()
+            && matches!(self.mode, OracleMode::Internal | OracleMode::LastClose)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EquitySession {

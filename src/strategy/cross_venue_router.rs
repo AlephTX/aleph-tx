@@ -32,6 +32,11 @@ const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
 /// Maximum per-side depth levels evaluated by the router.
 pub const MAX_ROUTER_BOOK_LEVELS: usize = 20;
 
+/// Default maximum age in milliseconds admitted for entry books.
+pub const DEFAULT_MAX_ENTRY_BOOK_AGE_MS: u64 = 1_000;
+/// Default maximum age in milliseconds admitted for dynamic follow-up hedge books.
+pub const DEFAULT_MAX_FOLLOWUP_BOOK_AGE_MS: u64 = 1_000;
+
 /// Configuration for [`CrossVenueExecutionRouter`].
 ///
 /// [`Default`] leaves `max_entry_notional_usd` at `0` so unconfigured routers
@@ -57,6 +62,10 @@ pub struct CrossVenueRouterConfig {
     pub ioc_slippage_bps: Decimal,
     /// Maximum number of book levels per side considered (`1..=20`).
     pub max_book_levels: usize,
+    /// Maximum age in milliseconds accepted for entry `Book` snapshots (`> 0`).
+    pub max_entry_book_age_ms: u64,
+    /// Maximum age in milliseconds accepted when repricing a follow-up hedge from live `Book` (`> 0`).
+    pub max_followup_book_age_ms: u64,
     /// Optional explicit cross-stablecoin hedge authorization and depeg policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cross_stablecoin_policy: Option<CrossStablecoinHedgePolicy>,
@@ -71,6 +80,8 @@ impl Default for CrossVenueRouterConfig {
             max_entry_notional_usd: Decimal::ZERO,
             ioc_slippage_bps: Decimal::new(5, 0),
             max_book_levels: 5,
+            max_entry_book_age_ms: DEFAULT_MAX_ENTRY_BOOK_AGE_MS,
+            max_followup_book_age_ms: DEFAULT_MAX_FOLLOWUP_BOOK_AGE_MS,
             cross_stablecoin_policy: None,
         }
     }
@@ -98,6 +109,14 @@ impl CrossVenueRouterConfig {
         ensure!(
             (1..=MAX_ROUTER_BOOK_LEVELS).contains(&self.max_book_levels),
             "max_book_levels must be in 1..={MAX_ROUTER_BOOK_LEVELS}"
+        );
+        ensure!(
+            self.max_entry_book_age_ms > 0,
+            "max_entry_book_age_ms must be > 0"
+        );
+        ensure!(
+            self.max_followup_book_age_ms > 0,
+            "max_followup_book_age_ms must be > 0"
         );
         if let Some(policy) = &self.cross_stablecoin_policy {
             policy.validate()?;
@@ -311,9 +330,11 @@ pub struct RouteEntryParams<'a> {
 struct ActiveRouteContext {
     hedge_venue_id: String,
     hedge_liquidity_domain: String,
+    hedge_market: String,
     hedge_tick: Decimal,
     hedge_base_per_contract: Decimal,
     planned_hedge_limit_price: Decimal,
+    planned_hedge_book_timestamp_ms: u64,
     first_leg_filled_base: Option<Decimal>,
     hedge_intent_emitted: bool,
 }
@@ -386,7 +407,11 @@ impl CrossVenueExecutionRouter {
             effective_notional_cap = effective_notional_cap.min(cap);
         }
 
-        if !valid_pair_books(params.books) {
+        if !valid_pair_books(
+            params.books,
+            params.now_ms,
+            self.config.max_entry_book_age_ms,
+        ) {
             return RouterEntryPlan::Blocked {
                 reason: RouterBlockReason::InsufficientCrossableDepthOrEdge,
             };
@@ -554,9 +579,11 @@ impl CrossVenueExecutionRouter {
         self.active_context = Some(ActiveRouteContext {
             hedge_venue_id: params.legs[hedge_leg_index].venue_id.to_string(),
             hedge_liquidity_domain: params.legs[hedge_leg_index].liquidity_domain.to_string(),
+            hedge_market: params.books[hedge_leg_index].market.clone(),
             hedge_tick: params.price_ticks[hedge_leg_index],
             hedge_base_per_contract: params.base_per_contract[hedge_leg_index],
             planned_hedge_limit_price: leg_orders[hedge_leg_index].limit_price,
+            planned_hedge_book_timestamp_ms: params.books[hedge_leg_index].timestamp_ms,
             first_leg_filled_base: None,
             hedge_intent_emitted: false,
         });
@@ -631,6 +658,7 @@ impl CrossVenueExecutionRouter {
         if !res.is_active()
             || res.reservation_id != reservation_id
             || res.topology == ExecutionTopology::ConcurrentProtectedIoc
+            || now_ms < res.created_at_ms
         {
             return FollowupPlan::RejectUnverifiedTerminalState;
         }
@@ -676,7 +704,8 @@ impl CrossVenueExecutionRouter {
                 ctx.first_leg_filled_base = Some(filled_base);
 
                 let hedge_limit_price = match Self::compute_followup_hedge_limit(
-                    self.config.ioc_slippage_bps,
+                    &self.config,
+                    now_ms,
                     res.hedge_is_buy,
                     filled_base,
                     current_hedge_book,
@@ -744,6 +773,7 @@ impl CrossVenueExecutionRouter {
 
     fn validate_entry_inputs(&self, params: &RouteEntryParams<'_>) -> Result<()> {
         self.config.validate()?;
+        ensure!(params.now_ms > 0, "now_ms must be > 0");
         ensure!(params.base_step > Decimal::ZERO, "base_step must be > 0");
         for (i, tick) in params.price_ticks.iter().enumerate() {
             ensure!(*tick > Decimal::ZERO, "price_ticks[{i}] must be > 0");
@@ -868,7 +898,8 @@ impl CrossVenueExecutionRouter {
     }
 
     fn compute_followup_hedge_limit(
-        ioc_slippage_bps: Decimal,
+        config: &CrossVenueRouterConfig,
+        now_ms: u64,
         hedge_is_buy: bool,
         filled_base: Decimal,
         current_hedge_book: Option<&Book>,
@@ -877,6 +908,20 @@ impl CrossVenueExecutionRouter {
         let Some(book) = current_hedge_book else {
             return Ok(ctx.planned_hedge_limit_price);
         };
+        ensure!(
+            book.market == ctx.hedge_market,
+            "follow-up hedge book market mismatch"
+        );
+        ensure!(
+            book.timestamp_ms > 0
+                && book.timestamp_ms <= now_ms
+                && book.timestamp_ms >= ctx.planned_hedge_book_timestamp_ms,
+            "follow-up hedge book clock violates causality or regressed"
+        );
+        ensure!(
+            now_ms - book.timestamp_ms <= config.max_followup_book_age_ms,
+            "follow-up hedge book exceeded max_followup_book_age_ms"
+        );
         if !book.tradable {
             return Ok(ctx.planned_hedge_limit_price);
         }
@@ -885,7 +930,12 @@ impl CrossVenueExecutionRouter {
             return Ok(ctx.planned_hedge_limit_price);
         }
         let worst_px = sweep_worst_level_price(levels, ctx.hedge_base_per_contract, filled_base)?;
-        apply_ioc_protection(hedge_is_buy, worst_px, ioc_slippage_bps, ctx.hedge_tick)
+        apply_ioc_protection(
+            hedge_is_buy,
+            worst_px,
+            config.ioc_slippage_bps,
+            ctx.hedge_tick,
+        )
     }
 }
 
@@ -915,16 +965,22 @@ pub fn portfolio_pair_cap_usd(
     Ok(min_cap)
 }
 
-fn valid_pair_books(books: [&Book; 2]) -> bool {
-    books.iter().all(|b| {
-        b.tradable
-            && b.available_notional > Decimal::ZERO
-            && !b.bids.is_empty()
-            && !b.asks.is_empty()
-            && b.bids[0].price > Decimal::ZERO
-            && b.asks[0].price > Decimal::ZERO
-            && b.bids[0].price < b.asks[0].price
-    })
+fn valid_pair_books(books: [&Book; 2], now_ms: u64, max_entry_book_age_ms: u64) -> bool {
+    now_ms > 0
+        && max_entry_book_age_ms > 0
+        && books.iter().all(|b| {
+            !b.market.trim().is_empty()
+                && b.timestamp_ms > 0
+                && b.timestamp_ms <= now_ms
+                && now_ms - b.timestamp_ms <= max_entry_book_age_ms
+                && b.tradable
+                && b.available_notional > Decimal::ZERO
+                && !b.bids.is_empty()
+                && !b.asks.is_empty()
+                && b.bids[0].price > Decimal::ZERO
+                && b.asks[0].price > Decimal::ZERO
+                && b.bids[0].price < b.asks[0].price
+        })
 }
 
 fn truncate_levels(levels: &[Level], max_levels: usize) -> &[Level] {
@@ -1216,6 +1272,8 @@ pub fn simulate_midflight_jump_comparison() -> Result<FaultInjectionComparison> 
         max_entry_notional_usd: Decimal::from(1_000),
         ioc_slippage_bps: Decimal::new(5, 0),
         max_book_levels: 5,
+        max_entry_book_age_ms: DEFAULT_MAX_ENTRY_BOOK_AGE_MS,
+        max_followup_book_age_ms: DEFAULT_MAX_FOLLOWUP_BOOK_AGE_MS,
         cross_stablecoin_policy: None,
     };
 
@@ -1380,6 +1438,8 @@ mod tests {
             max_entry_notional_usd: dec("1000"),
             ioc_slippage_bps: dec("5"),
             max_book_levels: 5,
+            max_entry_book_age_ms: DEFAULT_MAX_ENTRY_BOOK_AGE_MS,
+            max_followup_book_age_ms: DEFAULT_MAX_FOLLOWUP_BOOK_AGE_MS,
             cross_stablecoin_policy: None,
         }
     }
@@ -1422,6 +1482,14 @@ mod tests {
 
         cfg = default_cfg();
         cfg.max_book_levels = 21;
+        assert!(cfg.validate().is_err());
+
+        cfg = default_cfg();
+        cfg.max_entry_book_age_ms = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg = default_cfg();
+        cfg.max_followup_book_age_ms = 0;
         assert!(cfg.validate().is_err());
 
         // CrossVenueRouterConfig::default() fails closed until notional budget is configured.
@@ -1804,11 +1872,16 @@ mod tests {
             }
         );
 
-        // After cooldown expires on leg 1, open MakerFirst entry.
+        // After cooldown expires on leg 1, open MakerFirst entry with fresh books.
         let open_ms = NOW_MS + 16_000;
+        let mut hl_open = hl_book.clone();
+        hl_open.timestamp_ms = open_ms;
+        let mut lt_open = lt_book.clone();
+        lt_open.timestamp_ms = open_ms;
         let RouterEntryPlan::MakerFirst { reservation, .. } = router.plan_entry(
             RouteEntryParams {
                 now_ms: open_ms,
+                books: [&hl_open, &lt_open],
                 ..params
             },
             [&mut b0, &mut b1],
@@ -1829,7 +1902,7 @@ mod tests {
                 filled_base: dec("1.5"),
                 avg_fill_price: Some(dec("99.99")),
             },
-            Some(&hl_book),
+            Some(&hl_open),
             &mut b0,
         );
         assert!(matches!(
@@ -2128,6 +2201,8 @@ mod tests {
             max_entry_notional_usd: dec("1000"),
             ioc_slippage_bps: dec("2"),
             max_book_levels: 1, // truncates level 2 ("100.06")
+            max_entry_book_age_ms: DEFAULT_MAX_ENTRY_BOOK_AGE_MS,
+            max_followup_book_age_ms: DEFAULT_MAX_FOLLOWUP_BOOK_AGE_MS,
             cross_stablecoin_policy: None,
         };
         let mut maker_router = CrossVenueExecutionRouter::new(maker_cfg.clone()).unwrap();
@@ -2762,5 +2837,329 @@ mod tests {
                 assert_eq!(b0.used_weight(NOW_MS + 14), before_clean);
             }
         }
+    }
+
+    #[test]
+    fn followup_rejects_wrong_market_future_regressed_and_stale_books_while_preserving_wal_and_planned_fallback()
+     {
+        let registry = VenueRegistry::default();
+        let hl = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+        let lighter = registry
+            .resolve_execution_capability("lighter", "standard", "crypto")
+            .unwrap();
+
+        let cfg = CrossVenueRouterConfig {
+            max_followup_book_age_ms: 500,
+            ..default_cfg()
+        };
+        let mut router = CrossVenueExecutionRouter::new(cfg).unwrap();
+        let [mut b0, mut b1] = default_budgets();
+
+        let planned_ts = NOW_MS + 10;
+        let mut hl_book = book_with_levels(
+            "ETH-HL",
+            vec![("100.18", "10")],
+            vec![("100.20", "10")],
+            "5000",
+        );
+        hl_book.timestamp_ms = planned_ts;
+        let mut lt_book = book_with_levels(
+            "ETH-LT",
+            vec![("99.98", "10")],
+            vec![("100.00", "10")],
+            "5000",
+        );
+        lt_book.timestamp_ms = planned_ts;
+
+        let params = RouteEntryParams {
+            now_ms: planned_ts,
+            direction: RouteDirection::SellLeg0BuyLeg1,
+            legs: [&hl, &lighter],
+            books: [&hl_book, &lt_book],
+            base_step: dec("0.1"),
+            base_per_contract: [Decimal::ONE, Decimal::ONE],
+            price_ticks: [dec("0.01"), dec("0.01")],
+            portfolio_leg_cap_usd: None,
+            tail_risk: RouterTailRiskInput::default(),
+        };
+
+        let (res_id, shifted_hl) = match router.plan_entry(params, [&mut b0, &mut b1]) {
+            RouterEntryPlan::MakerFirst { reservation, .. } => {
+                let mut moved_hl = hl_book.clone();
+                moved_hl.bids = vec![Level {
+                    price: dec("99.00"),
+                    contracts: dec("10"),
+                }];
+                (reservation.reservation_id, moved_hl)
+            }
+            other => panic!("expected MakerFirst: {other:?}"),
+        };
+
+        let positive = SlowLegTerminalOutcome::Confirmed {
+            filled_base: dec("2.0"),
+            avg_fill_price: Some(dec("100")),
+        };
+        let weight_before = b0.used_weight(planned_ts);
+
+        // Call before reservation creation rejects fail-closed.
+        assert_eq!(
+            router.on_first_leg_terminal(
+                planned_ts - 1,
+                res_id,
+                positive.clone(),
+                Some(&hl_book),
+                &mut b0,
+            ),
+            FollowupPlan::RejectUnverifiedTerminalState
+        );
+
+        let wrong_market = Book {
+            market: "BTC-HL".to_string(),
+            timestamp_ms: NOW_MS + 600,
+            ..shifted_hl.clone()
+        };
+        let zero_ts = Book {
+            timestamp_ms: 0,
+            ..shifted_hl.clone()
+        };
+        let regressed = Book {
+            timestamp_ms: planned_ts - 1,
+            ..shifted_hl.clone()
+        };
+        let future = Book {
+            timestamp_ms: NOW_MS + 601,
+            ..shifted_hl.clone()
+        };
+        let stale = Book {
+            timestamp_ms: NOW_MS + 99,
+            ..shifted_hl.clone()
+        };
+
+        for bad_book in [&wrong_market, &zero_ts, &regressed, &future, &stale] {
+            assert_eq!(
+                router.on_first_leg_terminal(
+                    NOW_MS + 600,
+                    res_id,
+                    positive.clone(),
+                    Some(bad_book),
+                    &mut b0,
+                ),
+                FollowupPlan::RejectUnverifiedTerminalState
+            );
+            assert_eq!(b0.used_weight(NOW_MS + 600), weight_before);
+            assert!(router.active_reservation().is_some());
+            assert!(router.confirm_hedge_settled(res_id).is_err());
+        }
+
+        // Exact boundary age (now_ms - timestamp_ms == max_followup_book_age_ms == 500) succeeds and reprices.
+        let boundary_fresh = Book {
+            timestamp_ms: NOW_MS + 100,
+            ..shifted_hl
+        };
+        let FollowupPlan::DispatchFastHedgeIoc { hedge_order, .. } = router.on_first_leg_terminal(
+            NOW_MS + 600,
+            res_id,
+            positive.clone(),
+            Some(&boundary_fresh),
+            &mut b0,
+        ) else {
+            panic!("expected DispatchFastHedgeIoc at exact boundary age");
+        };
+        assert_eq!(hedge_order.size_base, dec("2.0"));
+        assert!(!hedge_order.is_buy);
+        assert!(hedge_order.limit_price < hl_book.bids[0].price);
+        assert_eq!(b0.used_weight(NOW_MS + 600), weight_before + 1);
+        assert!(router.active_reservation().is_some());
+        assert!(!router.confirm_hedge_settled(res_id).unwrap().is_active());
+
+        // Second cycle: reject wrong market first, then fallback to planned limit with None while preserving WAL.
+        let RouterEntryPlan::MakerFirst {
+            reservation: r2, ..
+        } = router.plan_entry(params, [&mut b0, &mut b1])
+        else {
+            panic!("expected second MakerFirst");
+        };
+        let planned_expected =
+            apply_ioc_protection(false, hl_book.bids[0].price, dec("5"), dec("0.01")).unwrap();
+        let w2_before = b0.used_weight(planned_ts + 20);
+        assert_eq!(
+            router.on_first_leg_terminal(
+                planned_ts + 20,
+                r2.reservation_id,
+                positive.clone(),
+                Some(&wrong_market),
+                &mut b0,
+            ),
+            FollowupPlan::RejectUnverifiedTerminalState
+        );
+        assert_eq!(b0.used_weight(planned_ts + 20), w2_before);
+        let FollowupPlan::DispatchFastHedgeIoc {
+            hedge_order: fallback_order,
+            ..
+        } = router.on_first_leg_terminal(
+            planned_ts + 25,
+            r2.reservation_id,
+            positive,
+            None,
+            &mut b0,
+        )
+        else {
+            panic!("expected planned limit fallback on None");
+        };
+        assert_eq!(fallback_order.limit_price, planned_expected);
+        assert_eq!(b0.used_weight(planned_ts + 25), w2_before + 1);
+        assert!(router.active_reservation().is_some());
+        assert!(
+            !router
+                .confirm_hedge_settled(r2.reservation_id)
+                .unwrap()
+                .is_active()
+        );
+    }
+
+    #[test]
+    fn entry_rejects_future_stale_and_zero_clock_books_before_wal_or_budget_use() {
+        let registry = VenueRegistry::default();
+        let hl = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+        let lighter = registry
+            .resolve_execution_capability("lighter", "standard", "crypto")
+            .unwrap();
+
+        let cfg = CrossVenueRouterConfig {
+            max_entry_book_age_ms: 400,
+            max_followup_book_age_ms: 500,
+            ..default_cfg()
+        };
+        let mut router = CrossVenueExecutionRouter::new(cfg).unwrap();
+        let [mut b0, mut b1] = default_budgets();
+
+        let hl_book = book_with_levels(
+            "ETH-HL",
+            vec![("100.18", "10")],
+            vec![("100.20", "10")],
+            "5000",
+        );
+        let lt_book = book_with_levels(
+            "ETH-LT",
+            vec![("99.98", "10")],
+            vec![("100.00", "10")],
+            "5000",
+        );
+
+        let base_params = RouteEntryParams {
+            now_ms: NOW_MS,
+            direction: RouteDirection::SellLeg0BuyLeg1,
+            legs: [&hl, &lighter],
+            books: [&hl_book, &lt_book],
+            base_step: dec("0.1"),
+            base_per_contract: [Decimal::ONE, Decimal::ONE],
+            price_ticks: [dec("0.01"), dec("0.01")],
+            portfolio_leg_cap_usd: None,
+            tail_risk: RouterTailRiskInput::default(),
+        };
+
+        // 1) Zero entry decision clock rejects fail-closed before touching WAL or budgets.
+        let zero_plan = router.plan_entry(
+            RouteEntryParams {
+                now_ms: 0,
+                ..base_params
+            },
+            [&mut b0, &mut b1],
+        );
+        assert!(matches!(
+            zero_plan,
+            RouterEntryPlan::Blocked {
+                reason: RouterBlockReason::InvalidConfiguration(_)
+            }
+        ));
+        assert!(router.active_reservation().is_none());
+        assert_eq!(b0.used_weight(NOW_MS), 0);
+        assert_eq!(b1.used_weight(NOW_MS), 0);
+
+        // 2) Future entry books (leg 0 +1ms, or leg 1 #665 case +500ms) and stale entry books block cleanly.
+        let future_leg0 = Book {
+            timestamp_ms: NOW_MS + 1,
+            ..hl_book.clone()
+        };
+        let future_leg1 = Book {
+            timestamp_ms: NOW_MS + 500,
+            ..lt_book.clone()
+        };
+        let stale_leg0 = Book {
+            timestamp_ms: NOW_MS - 401,
+            ..hl_book.clone()
+        };
+        for pair in [
+            [&future_leg0, &lt_book],
+            [&hl_book, &future_leg1],
+            [&stale_leg0, &lt_book],
+        ] {
+            let blocked = router.plan_entry(
+                RouteEntryParams {
+                    books: pair,
+                    ..base_params
+                },
+                [&mut b0, &mut b1],
+            );
+            assert_eq!(
+                blocked,
+                RouterEntryPlan::Blocked {
+                    reason: RouterBlockReason::InsufficientCrossableDepthOrEdge
+                }
+            );
+            assert!(router.active_reservation().is_none());
+            assert_eq!(b0.used_weight(NOW_MS), 0);
+            assert_eq!(b1.used_weight(NOW_MS), 0);
+        }
+
+        // 3) Exact boundary entry age succeeds, and contemporaneous follow-up reprices and settles cleanly.
+        let boundary_hl = Book {
+            timestamp_ms: NOW_MS - 400,
+            ..hl_book.clone()
+        };
+        let RouterEntryPlan::MakerFirst { reservation, .. } = router.plan_entry(
+            RouteEntryParams {
+                books: [&boundary_hl, &lt_book],
+                ..base_params
+            },
+            [&mut b0, &mut b1],
+        ) else {
+            panic!("expected MakerFirst at exact boundary entry book age");
+        };
+        assert_eq!(b0.used_weight(NOW_MS), 0);
+        assert_eq!(b1.used_weight(NOW_MS), 1);
+
+        let mut followup_hl = hl_book;
+        followup_hl.timestamp_ms = NOW_MS + 100;
+        followup_hl.bids = vec![Level {
+            price: dec("99.50"),
+            contracts: dec("10"),
+        }];
+        let FollowupPlan::DispatchFastHedgeIoc { hedge_order, .. } = router.on_first_leg_terminal(
+            NOW_MS + 100,
+            reservation.reservation_id,
+            SlowLegTerminalOutcome::Confirmed {
+                filled_base: dec("1.5"),
+                avg_fill_price: Some(dec("99.99")),
+            },
+            Some(&followup_hl),
+            &mut b0,
+        ) else {
+            panic!("expected DispatchFastHedgeIoc with contemporaneous follow-up book");
+        };
+        let expected_limit =
+            apply_ioc_protection(false, dec("99.50"), dec("5"), dec("0.01")).unwrap();
+        assert_eq!(hedge_order.limit_price, expected_limit);
+        assert_eq!(b0.used_weight(NOW_MS + 100), 1);
+        assert!(
+            !router
+                .confirm_hedge_settled(reservation.reservation_id)
+                .unwrap()
+                .is_active()
+        );
     }
 }

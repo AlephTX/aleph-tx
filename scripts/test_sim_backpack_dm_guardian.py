@@ -254,6 +254,8 @@ class BackpackDmGuardianTests(unittest.TestCase):
             [dict(valid_base, bid_px=100.00, ask_px=100.00)],  # locked
             [dict(valid_base, mid_px=0.0)],
             [dict(valid_base, mid_px=-5.0)],
+            [dict(valid_base, bid_px=99.50, ask_px=99.54, mid_px=90.0)],
+            [dict(valid_base, bid_px=99.50, ask_px=99.54, mid_px=100.0)],
             # Non-monotonic timestamps (backwards and duplicate)
             [dict(valid_base, timestamp_ms=1000), dict(valid_base, timestamp_ms=999)],
             [dict(valid_base, timestamp_ms=1000), dict(valid_base, timestamp_ms=1000)],
@@ -364,6 +366,113 @@ class BackpackDmGuardianTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(bad_proc.returncode, 0)
+
+    def test_sim_config_and_compute_snapshot_dm_reject_bool_and_invalid_slippage_bounds(self):
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", cascade_window_ms=True)
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", maker_fee_bps=True)
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", maker_fee_bps=10_000.0)
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", hedge_fee_bps=10_000.0)
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", hedge_slippage_bps=10_000.0)
+        with self.assertRaises(ValueError):
+            SimConfig.for_tier("tier3_alt", inner_band_bps=float("nan"))
+
+        t3 = TIER_PRESETS["tier3_alt"]
+        with self.assertRaises(ValueError):
+            compute_snapshot_dm(
+                t3,
+                True,  # type: ignore[arg-type]
+                QuoteLevel(price=99.9, notional_usd=5000.0),
+                QuoteLevel(price=100.1, notional_usd=5000.0),
+            )
+        dm_bool_q, zero_bool_q = compute_snapshot_dm(
+            t3,
+            100.0,
+            QuoteLevel(price=True, notional_usd=5000.0),  # type: ignore[arg-type]
+            QuoteLevel(price=100.1, notional_usd=True),  # type: ignore[arg-type]
+        )
+        self.assertEqual(dm_bool_q, 0.25)
+        self.assertTrue(zero_bool_q)
+
+    def test_simulate_arm_direct_call_validates_config_and_frames_fail_closed(self):
+        cfg_bad_slip = SimConfig(
+            preset=TIER_PRESETS["tier3_alt"],
+            inner_band_bps=8.0,
+            soft_limit_usd=3000.0,
+            hedge_trigger_usd=4500.0,
+            max_inventory_usd=15_000.0,
+            max_loss_usd=150.0,
+            hedge_slippage_bps=10_000.0,
+        )
+        good_frames = [
+            Frame(1000, 99.98, 100.02, 100.0, "none", 0.0),
+            Frame(1100, 99.98, 100.02, 100.0, "none", 0.0),
+        ]
+        with self.assertRaises(ValueError):
+            simulate_arm("outer_band_dm_guardian", good_frames, cfg_bad_slip)
+
+        cfg_ok = SimConfig.for_tier("tier3_alt")
+        for bad_frames in (
+            [],
+            [
+                Frame(1100, 99.98, 100.02, 100.0, "none", 0.0),
+                Frame(1000, 99.98, 100.02, 100.0, "none", 0.0),
+            ],
+            [Frame(1000, 100.05, 100.00, 100.02, "none", 0.0)],
+        ):
+            with self.subTest(bad_frames=bad_frames):
+                with self.assertRaises(ValueError):
+                    simulate_arm("outer_band_dm_guardian", bad_frames, cfg_ok)
+
+    def test_load_tape_rejects_directory_and_cli_rejects_self_test_with_tape(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(FileNotFoundError):
+                load_tape_jsonl(Path(td))
+            tape = Path(td) / "good.jsonl"
+            tape.write_text(
+                json.dumps(
+                    {
+                        "timestamp_ms": 1000,
+                        "bid_px": 99.98,
+                        "ask_px": 100.02,
+                        "mid_px": 100.0,
+                        "trade_side": "none",
+                        "trade_notional_usd": 0.0,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "--self-test", "--tape", str(tape)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 2)
+
+    def test_validate_frame_binds_mid_px_to_same_book_bbo(self):
+        with self.assertRaises(ValueError):
+            validate_frames([Frame(1000, 99.50, 99.54, 90.0, "none", 0.0)])
+        with self.assertRaises(ValueError):
+            validate_frames([Frame(1000, 99.50, 99.54, 100.0, "none", 0.0)])
+
+        cfg = SimConfig.for_tier("tier3_alt")
+        for mid_bad in (90.0, 100.0):
+            with self.assertRaises(ValueError):
+                simulate_arm(
+                    "outer_band_dm_guardian",
+                    [Frame(1000, 99.50, 99.54, mid_bad, "none", 0.0)],
+                    cfg,
+                )
+
+        for mid_ok in (99.50, 99.51, 99.54):
+            validated = validate_frames([Frame(1000, 99.50, 99.54, mid_ok, "none", 0.0)])
+            self.assertEqual(validated[0].mid_px, mid_ok)
 
 
 if __name__ == "__main__":

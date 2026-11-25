@@ -203,6 +203,47 @@ class ContinuousSourceTests(unittest.TestCase):
         self.assertEqual(len(emitted[0]['leg_oracles']), 2)
         self.assertEqual(emitted[0]['books'][0]['available_notional'], '150')
 
+    def test_frame_to_maker_book_event_normalizes_partial_nullable_leg_oracles(self):
+        from replay_maker_first_campaign import (
+            MISSING_CAPTURE_ORACLE,
+            book_rows,
+            frame_to_maker_book_event,
+        )
+
+        absent = object()
+        external = {'price': '101.20', 'timestamp_ms': 149, 'mode': 'live_external'}
+        internal = {'price': '101.25', 'timestamp_ms': 0, 'mode': 'internal'}
+        last_close = {'price': '101.10', 'timestamp_ms': 149, 'mode': 'last_close'}
+
+        def build_frame(lhs_oracle, rhs_oracle):
+            return {
+                'now_ms': 150,
+                'reference': external,
+                'legs': [
+                    {'book': {'market': market}, **({} if oracle is absent else {'oracle': oracle})}
+                    for market, oracle in (('RWA-A', lhs_oracle), ('RWA-B', rhs_oracle))
+                ],
+            }
+
+        frame_null_lhs = build_frame(None, internal)
+        event_null_lhs = frame_to_maker_book_event(frame_null_lhs)
+        self.assertEqual(event_null_lhs['leg_oracles'], [MISSING_CAPTURE_ORACLE, internal])
+        self.assertIsNot(event_null_lhs['leg_oracles'][0], MISSING_CAPTURE_ORACLE)
+        self.assertEqual(
+            list(book_rows(io.StringIO(json.dumps(frame_null_lhs) + '\n'), 149, 151)),
+            [event_null_lhs],
+        )
+
+        event_absent_rhs = frame_to_maker_book_event(build_frame(last_close, absent))
+        self.assertEqual(event_absent_rhs['leg_oracles'], [last_close, MISSING_CAPTURE_ORACLE])
+        self.assertIsNot(event_absent_rhs['leg_oracles'][1], MISSING_CAPTURE_ORACLE)
+
+        for pair in ((absent, absent), (None, None)):
+            self.assertNotIn('leg_oracles', frame_to_maker_book_event(build_frame(*pair)))
+
+        for pair in ((MISSING_CAPTURE_ORACLE, internal), (MISSING_CAPTURE_ORACLE, MISSING_CAPTURE_ORACLE)):
+            self.assertEqual(frame_to_maker_book_event(build_frame(*pair))['leg_oracles'], list(pair))
+
 
 if __name__ == '__main__':
     unittest.main()

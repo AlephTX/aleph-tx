@@ -257,14 +257,6 @@ fn line(output: &mut impl Write, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn missing_oracle() -> Oracle {
-    Oracle {
-        price: Decimal::ZERO,
-        timestamp_ms: 0,
-        mode: OracleMode::LastClose,
-    }
-}
-
 fn fresh(timestamp: u64, now: u64, age: u64) -> bool {
     timestamp > 0 && now.checked_sub(timestamp).is_some_and(|delta| delta <= age)
 }
@@ -696,7 +688,7 @@ impl<'a> Compiler<'a> {
                 }),
             ReferenceFeed::Missing => None,
         }
-        .unwrap_or_else(missing_oracle);
+        .unwrap_or(Oracle::MISSING_CAPTURE);
         let equity_session = self
             .config
             .equity_sessions
@@ -748,7 +740,8 @@ impl<'a> Compiler<'a> {
             (ctx.oracle, ctx.forecast.clone())
         } else {
             (
-                leg.context().map_or_else(missing_oracle, |ctx| ctx.oracle),
+                leg.context()
+                    .map_or(Oracle::MISSING_CAPTURE, |ctx| ctx.oracle),
                 leg.context().and_then(|ctx| self.forecast(i, now, ctx)),
             )
         };

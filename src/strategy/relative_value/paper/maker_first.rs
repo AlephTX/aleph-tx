@@ -4641,8 +4641,7 @@ impl Replay<'_> {
         let regime = if self.config.pair.asset_class != AssetClass::Equity {
             SessionRegime::UsRth
         } else {
-            let is_internal =
-                |r: Oracle| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose);
+            let is_internal = Oracle::is_observed_internal_or_close;
             let incoming_internal = reference.is_some_and(is_internal);
             let cached_internal = self.last_reference.is_some_and(is_internal);
             let leg_internal =
@@ -4794,12 +4793,11 @@ impl Replay<'_> {
         if !self.saw_rwa_metadata {
             return self.effective_equity_session(now);
         }
-        let any_internal = reference
-            .is_some_and(|r| matches!(r.mode, OracleMode::Internal | OracleMode::LastClose))
+        let any_internal = reference.is_some_and(Oracle::is_observed_internal_or_close)
             || leg_oracles.is_some_and(|oracles| {
                 oracles
-                    .iter()
-                    .any(|o| matches!(o.mode, OracleMode::Internal | OracleMode::LastClose))
+                    .into_iter()
+                    .any(Oracle::is_observed_internal_or_close)
             });
         match equity_session {
             Some(s) if s.halted || now < s.observed_at_ms || now >= s.clear_until_ms => {
@@ -5660,6 +5658,12 @@ impl Replay<'_> {
                     ..
                 } => {
                     self.set_books(books, now)?;
+                    // Compiled frames use an exact placeholder for unavailable Oracle fields.
+                    // Keep observed evidence from either leg when the other is unavailable.
+                    let reference = reference.filter(|oracle| !oracle.is_missing_capture());
+                    let leg_oracles = leg_oracles.filter(|oracles| {
+                        oracles.iter().any(|oracle| !oracle.is_missing_capture())
+                    });
                     let admitted_session =
                         self.observe_rwa_frame(now, reference, equity_session, leg_oracles);
                     self.observe_kalman_basis(now, reference, admitted_session, leg_oracles);
@@ -8880,6 +8884,96 @@ mod tests {
             rep_db.turnover_breakdown.dual_venue_gross_turnover_quote
                 > rep_db.turnover_breakdown.target_venue_turnover_quote
         );
+    }
+
+    #[test]
+    fn maker_first_compiled_missing_oracles_preserve_observed_equity_state() {
+        // The capture compiler serializes a concrete Oracle for absent sources.
+        let missing = Oracle {
+            price: Decimal::ZERO,
+            timestamp_ms: 0,
+            mode: OracleMode::LastClose,
+        };
+        let mut cfg = config();
+        cfg.pair.asset_class = AssetClass::Equity;
+        cfg.pair.oracle_max_age_ms = 5_000;
+        cfg.pair.equity_close_buffer_ms = 1_000;
+        cfg.enforce_equity_session_gate = true;
+        cfg.flat_at_funding = Some(FlatAtFunding {
+            settlement_guard_ms: 2_000,
+        });
+        cfg.kalman_basis = Some(KalmanBasisConfig::default());
+        let start = cfg.start_ms;
+        cfg.end_ms = start + 20_000;
+        let at = start + 100;
+        let live = Oracle {
+            price: d("1000.1"),
+            timestamp_ms: at,
+            mode: OracleMode::LiveExternal,
+        };
+        let local_close = Oracle {
+            mode: OracleMode::LastClose,
+            ..live
+        };
+
+        for (reference, leg_oracles, expected_internal) in [
+            (Some(missing), Some([missing, missing]), false),
+            (None, None, false),
+            (Some(live), Some([missing, live]), false),
+            (Some(live), Some([missing, local_close]), true),
+            (Some(live), Some([local_close, missing]), true),
+        ] {
+            let MakerFirstEvent::Book { books, .. } = books(&cfg, at, "1000") else {
+                unreachable!()
+            };
+            let events = [
+                MakerFirstEvent::TradeFeed {
+                    at_ms: start,
+                    leg: 0,
+                    online: true,
+                },
+                MakerFirstEvent::Book {
+                    at_ms: at,
+                    books,
+                    reference,
+                    equity_session: Some(EquitySession {
+                        observed_at_ms: at,
+                        opens_at_ms: start,
+                        closes_at_ms: start + 50_000,
+                        clear_until_ms: start + 100_000,
+                        halted: false,
+                    }),
+                    leg_oracles,
+                },
+                MakerFirstEvent::End { at_ms: cfg.end_ms },
+            ];
+            let report =
+                run_maker_first(&cfg, events.into_iter().map(Ok), &VenueRegistry::default())
+                    .unwrap();
+            let session = report.rwa_session.unwrap();
+            assert_eq!(
+                session.off_hours_internal_or_close_frames,
+                usize::from(expected_internal)
+            );
+            assert_eq!(session.regular_cash_frames, usize::from(!expected_internal));
+            if reference.is_none_or(|r| r.timestamp_ms == 0) {
+                assert!(
+                    report
+                        .entry_blocked
+                        .contains_key("equity_missing_reference")
+                );
+                assert_eq!(report.quotes_submitted, 0);
+            }
+            let kalman = report.kalman_basis.unwrap();
+            assert_eq!(
+                kalman.current_regime,
+                Some(if expected_internal {
+                    SessionRegime::OffHours
+                } else {
+                    SessionRegime::UsRth
+                })
+            );
+        }
     }
 
     #[test]

@@ -1937,3 +1937,1023 @@ The W19 Core close audit plan preserves the two original public Crypto journal a
 The Carry v3 market-context readback uses the original 151 signed public responses and the corresponding 74-pair report. It records when the venue-wide Arcus, Hyperliquid and TradeXYZ context responses were received relative to when both books of each pair had arrived. The original book-clock gate remains separate. The audit records receipt ages and leaves the source time and contemporaneous validity of the market state, oracle and funding values unknown. [Original receipt chronology and comparison](../.agent-state/forward_ops_20261118/carry_market_context_receipt_clock_20261123/REPORT.md)
 
 The November 23 Carry RTH arrival readback consumes Gemini's signed 09:36 EST set of 151 public receipts and the signed Carry v3 report for 74 pairs. It checks the two original source and receipt clocks at first joint visibility and at fixed 10/310 ms parallel and 310 ms per-leg serial delays. The original $100 and $500 snapshot checks, model cost and funding history are retained separately. There is one book per leg, so observed depth persistence, live execution latency, actual fees, settlement and realized cash remain unknown. [Signed clock and context readback](../.agent-state/forward_ops_20261118/carry_rth_clock_latency_headroom_20261123/REPORT.md)
+
+The $500 BTC turnover break-even readback reuses the signed same-template 10%, 25% and 50% IOC-depth wallets for W09–W16 and the distinct W18 standing regression. It preserves the original per-window cash admission, modeled prices, funding, fees and notionals. It derives a fixed-fill cash shortfall per dollar of modeled maker turnover under the separately signed 0.25 bp gross and 1 bp taker stress. Earlier missing cash stays unknown. Actual fill paths, fees and execution capacity remain unmeasured. [Signed hurdle and wallet scope](../.agent-state/forward_ops_20261118/turnover_500_edge_hurdle_20261124/REPORT.md)
+
+The original November 22 Lighter Core four-asset first-attempt readback pins the registered protocol, funding and price receipts. It reconciles the two width-one BTC/XRP endpoint ledgers at the original $50 per leg, 310 ms modeled arrival and 1.25 bp stress. The 1,645-second joint path gap remains and both width-two wallets retain the original SOL endpoint blocker. Complete-window cash remains unknown and the date stays outside the earlier two signed-day comparison. [First-attempt endpoint audit](../.agent-state/forward_ops_20261118/fourcoin_native_nov22_width1_provisional_20261124/REPORT.md)
+
+The separate Bybit linear archive records BTCUSDT, ETHUSDT, SOLUSDT and XRPUSDT on June 17, August 19 and September 16, 2026. Twelve full day ZIPs total 1,574,232,242 bytes with per-file CRC and SHA-256 receipts. The bounded prefixes identify matching engine time and exchange publication time, with no observed independent collector receipt. Twelve official funding history responses contribute 36 signed rates and timestamps. Settlement prices and actual fills remain unknown. The retrospective four-asset campaign has its own frozen ten-hour clock, cost scope and wallet boundaries. [Bybit historical archive](https://www.bybit.com/en/derivative-activity/history-data) [Public stream clock definitions](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook) [Custody, protocol and probes](../.agent-state/forward_ops_20261118/bybit_native_l2_source_scope_20261124/REPORT.md)
+
+The first frozen Bybit publication-clock projection reads all twelve original ZIP members through EOF and keeps all 48 withheld endpoints. The independent UTC edge audit attributes its 162 combined day-or-order failures to monotone next-day publication tails, 23–1,885 ms after midnight. It records zero actual publication-time regressions in the input files and preserves the original withholding. The historical collector receipt clock remains unavailable. [First projection](../.agent-state/forward_ops_20261118/bybit_four_asset_historical_20261124/projection_publication_v1/REPORT.md) [Independent day-boundary audit](../.agent-state/forward_ops_20261118/bybit_four_asset_historical_20261124/publication_day_edge_check_v1/REPORT.md)
+
+The second Bybit publication-clock projection is independently pinned to the verified original 162 post-midnight tail records and their physical row identities. It keeps all other source rules, the 2.2-second age threshold and the original ten-hour clocks. The four checkpoints on each market-day produce 48 eligible book observations and all 12 market-day paths have zero detected publication-clock unavailability under that rule. No actual receipt clock, fills, settlement prices or cash were determined. [Versioned projection and receipts](../.agent-state/forward_ops_20261118/bybit_four_asset_historical_20261124/projection_publication_v2/REPORT.md)
+
+The separate Bybit funding-time and closing-decision projection rechecks all
+12 archived market-days and 36 official funding rates. It adds observations
+as of 16:00 UTC and 23:00 UTC, preserving the four earlier anchors and all
+original ten-hour path evidence. It uses publisher time and keeps historical
+collector receipt unknown. The separate endpoint sensitivity uses the frozen
+310 ms delay, decision-time collars, independent 100 USDT wallet intent and
+zero rewards. Account fills, fees and funding settlement remain unknown.
+[Funding and close observations](../.agent-state/forward_ops_20261118/bybit_funding_time_publication_20261124/REPORT.md)
+[Endpoint execution and modeled cash](../.agent-state/forward_ops_20261118/bybit_four_asset_endpoint_execution_20261124/REPORT.md)
+
+Bybit's public mark-price candle API supplies 24 exact minute rows across the
+same 12 market-days. The saved public responses include the 15:59 and 16:00
+UTC candles for each market and date, with bounds and SHA-256 verified on Mac
+and aleph. The 16:00 minute is used only as an ex-post open and high–low
+funding sensitivity. The actual mark used at settlement remains unknown.
+[Official candle schema](https://bybit-exchange.github.io/docs/v5/market/mark-kline)
+[Archive receipts and observed mark scope](../.agent-state/forward_ops_20261118/bybit_mark_minute_scope_20261124/REPORT.md)
+
+The additional Bybit comparison completes the six third Wednesdays from May
+through October. The May 20, July 15 and October 21 sample adds 12 full public
+Bybit depth ZIPs totaling 1,417,685,704 bytes. Mac verified the compression
+and digests. aleph Gold separately read back the 12 hashes. A separate
+source scan checks the full public clock order and records 116 exact
+monotone next-day tail rows for exclusion. The six anchors per market-day
+and each original 10-hour path satisfy the publisher-clock availability
+rule. Another 36 exact signed funding rates come from the official
+historical endpoint. The four unchanged wallet variants reproduce byte for
+byte on both hosts and remain modeled book-depth results. [Additional
+sources, clocks and comparison](../.agent-state/forward_ops_20261118/bybit_four_asset_complementary_months_20261124/REPORT.md)
+
+### November 24 — Original W19 funding scope and W18 BTC identity check
+
+The original W19 Core RWA funding attribution rechecks the signed inventory,
+native brackets and official funding receipts. Two NVDA and SPY observations
+at 12:00 UTC explain all 16 affected market-wallet cells. The model positions
+agree across each of the three settlement phases. A separate official
+public Core mark-candle request retained three 1-minute OHLC and sample
+counts per market at 11:59, 12:00 and 12:01 UTC. The candles have no field
+binding a sample to the funding event. The original settlement-mark and
+unit qualification remains unknown. [Original blocker attribution](../.agent-state/forward_ops_20261118/w19_core_funding_blocker_classification_20261124/REPORT.md)
+[Official mark-candle intake](../.agent-state/forward_ops_20261118/w19_core_public_mark_minute_scope_20261124/REPORT.md)
+[Lighter public candle schema](https://github.com/elliottech/lighter-python/blob/main/docs/MarkPriceCandle.md)
+
+The original W18 Core Silver two-second control uses the signed BTC and ETH
+markets at 21:59:59–22:00:01 UTC on November 22. The receipt-clock and
+availability-clock projections agree. BTC has 32 tradable BBO observations
+and three ordinary public trades with distinct native IDs on two collector
+message sequences. ETH has 25 tradable BBO observations and zero prints.
+This bounded check records public source identities, timing consistency and
+control scope. Ten-hour native ACK and trade completeness remain unknown.
+[Original bounded Core market control](../.agent-state/forward_ops_20261118/glft_w18_core_btc_silver_control_20261124/REPORT.md)
+[Native ID and collector sequence audit](../.agent-state/forward_ops_20261118/glft_w18_core_btc_identity_readiness_20261124/REPORT.md)
+
+The W19 two-source funding sensitivity uses only the original frozen
+cash, inventory, native brackets and verified HTTP receipts. It varies
+Core NVDA and SPY at the single 12:00 UTC settlement using four
+before/after index combinations and one reported-value combination. The
+original wallet, fees, terminal, eligibility and ten-hour receipts are
+unchanged. The calculation is conditional and publishes basket counts only.
+[Five frozen sensitivity cases](../.agent-state/forward_ops_20261118/w19_core_two_point_conditional_gate_20261124/REPORT.md)
+
+The Lighter circuit source review binds six official source files to Git
+commit `fa85b33197710ece649739bc38f5e23e816ddbdf`. Its public block input
+model has per-market funding prefixes, marks and quote multipliers. The
+documented block response has no equivalent event-level market witness.
+No deployed proof was bound to either original W19 funding slot.
+[Exact source receipts and scope](../.agent-state/forward_ops_20261118/w19_lighter_funding_prover_source_scope_20261124/REPORT.md)
+
+The W18 Core BTC Bronze-to-Silver identity check opens five original
+indexed shards totaling 64,824,374 compressed bytes. The fixed seven-second
+local evidence includes a five-second prelude and the original two-second
+target. It binds 32 book and 3 trade rows in the target and observes 113
+adjacent book nonce links across the local slice. A separate original
+startup anchor associates an ACK with the same capture run and connection
+epoch. Native trade sequence indices are absent in the three rows, so
+exchange-print completeness and ten-hour exposure are still unproven.
+[Native public shard and causal checks](../.agent-state/forward_ops_20261118/glft_w18_core_btc_native_slice_20261124/REPORT.md)
+
+### November 23 — Original ANT Monday regular-hours replay
+
+The original Arcus ANT-USD and TradeXYZ xyz:ANT public capture supplies
+the fixed November 23 12:00–22:00 UTC decision window. Tokyo's receive-clock
+audit and the Mac and aleph compressed readbacks match the same 11
+complete objects in two collector runs (827,548,591 bytes). The original
+prelude and tail remain in custody. The archived decoder applies the
+window before scoring. Inside the window the source audit counts 142,373
+Arcus books, 30,768 Arcus public trades, 2,916 TradeXYZ books and 34,882
+TradeXYZ funding context records. The maximum respective book gaps were
+31.268 and 38.989 seconds. The maximum context gap was 31.646 seconds.
+Ten hourly source buckets were present. The archived evaluator requires
+nine interior settlement-hour witnesses, all of which passed.
+
+The existing preregistration, two archived programs and two original
+simulation files match their fixed SHA-256 digests. The legacy OOS gate
+returned GO. All three required 100, 250 and 500 ms taker configurations
+were positive on modeled cash and passed the joint activity hurdle. All
+six variants met the original terminal flatness and drawdown rules. The
+source seal and result receipts bind this single offline evaluation.
+Venue fee realization, account settlement and current live execution
+require separate evidence.
+[Source chronology](../.agent-state/forward_ops_20261118/ant_monday_terminal_seal_audit_20261124/REPORT.md) ·
+[Original custody, simulated outcome and evidence limits](../.agent-state/forward_ops_20261118/ant_monday_legacy_native_delivery_20261124/REPORT.md)
+
+### November 24 — W18 Core BTC public touch exposure protocol
+
+This historical draft reuses the original W18 decision bounds and the
+signed seven-second Bronze/Silver comparison. It fixes a 250 ms local
+availability TTL and two-sided quote distances of 1, 2, 3 and 5 bp.
+A trade's local receipt must follow the eligible book's availability.
+Verified subscription history seeds identity only after matching the
+acknowledgement clock and generation. Collector sequence and message
+ordinal specify publication order. Strict exposure requires a documented
+complete market sequence or an independently certified complete ID set.
+The original draft and its false-zero examples remain in the evidence
+archive. The revised protocol passed twelve synthetic tests and consumes
+no new market files. W18 complete ten-hour exposure and queue fills
+remain unqualified.
+[Revised protocol, counterexamples and tests](../.agent-state/forward_ops_20261118/glft_w18_core_btc_exposure_prereg_v2_20261124/REPORT.md)
+
+### November 24 — ANT arrival feasibility and frozen BTC/GLFT diagnostics
+
+The ANT regular-hours comparison pins the current Python replay, its gate
+contract, and the Rust order-sizing and protection sources. Four synthetic
+500 ms arrival outcomes compare the existing paired fills with local
+freshness, default protective limits, and executable depth. A separate
+remaining-capacity case checks the 10 USD Hyperliquid entry minimum.
+Live execution and Monday's original archived economics retain their
+separate evidence. [Synthetic arrival and sizing evidence](../.agent-state/forward_ops_20261118/ant_rth_next_arrival_protection_peer_20261124/REPORT.md)
+
+A BTC missingness diagnostic reuses signed W09–W19 aggregate receipts
+over eleven original nonoverlapping ten-hour windows, preserving eight
+forward and three standing roles. Both wallets share their original
+zero-reward and stressed fee assumptions. Four pairs qualify for a cash
+comparison. The diagnostic reports algebraic bounds for the seven
+unknown pairs and keeps them unknown. [Original receipt hashes and missingness](../.agent-state/forward_ops_20261118/btc_quant_window_missingness_20261124/REPORT.md)
+
+The GLFT composition prototype consumes no market files. It exercises two
+synthetic subscription epochs and four book states against the pinned
+single-state oracle. Prints crossing a book update between local receipt
+and availability are censored separately. It deduplicates the canonical
+native ID across verified epochs within one capture, distinguishes
+geometric book and subscription coverage from independently witnessed
+trade completeness, and retains unknown strict W18 exposure.
+[Synthetic composition and evidence limits](../.agent-state/forward_ops_20261118/glft_book_epoch_composition_peer_20261124/REPORT.md)
+
+### November 24 — Four-coin November 22 and 23 original finals
+
+The original Lighter Core four-coin watch accepted the November 22
+scheduled retry and November 23 first attempt. Each accepted arm set
+references four native BTC, ETH, SOL and XRP ranking-anchor books and
+48 holding-hour book receipts. The signed intake records capture the
+publisher URL, source object digest, first availability and archived
+size. The independent acceptance rehashes eight anchors and checks the
+receipt, clock and object bindings of all holding-hour books. The prior
+November 22 first-attempt missing object and its receipt remain. Each
+original result retains four endpoint-priced wallets under the frozen
+1.25 bp stress. No wallet admits complete traversal of its ten-hour
+holding path. Separate depth and asset-attribution results bind their
+own pre-window methods and the selected original final and priced files.
+[Readback and coverage](../.agent-state/forward_ops_20261118/fourcoin_native_nov22_nov23_final_20261124/REPORT.md)
+
+The Lighter Core watch accepted the first November 24 attempt for
+BTC, ETH, SOL, and XRP. The frozen decision interval was 13:00–23:00
+UTC, with 310 ms modeled arrival for entry and exit. Four input
+anchor objects were rehashed. Forty-eight book receipt bindings and
+physical extents were checked against the already-recorded source
+hashes. Each asset has ten original public funding times. The
+original zero rewards and 1.25 bp fee stress apply to all four
+wallets. Both reversal endpoint estimates are positive. The two
+holdings groups lack 263 or 368 seconds of common path coverage,
+so all four strict ten-hour cash outcomes remain unknown.
+[November 24 original custody and asset results](../.agent-state/forward_ops_20261118/fourcoin_native_nov24_original_final_20261125/REPORT.md)
+
+The November 20–24 book coverage comparison uses the original
+13:00–23:00 UTC grids and their frozen 310 ms modeled arrival.
+The full four-asset grid is a subset of each corresponding
+two-asset grid. On November 20, 21, 23, and 24, gaps occurred
+within the best recorded two-asset group and at additional
+seconds when that group was complete. Recovering the four-asset
+common path on those dates therefore requires evidence for at
+least two distinct asset streams, assuming their original clock
+grid remains fixed. Individual asset identity and the cause of
+each gap remain unknown. The November 22 first attempt and
+unobserved November 25–26 slots are preserved. Original native
+continuity, zero rewards, fees, and unknown cash stay in scope.
+[Four-asset common coverage necessary recovery bound](../.agent-state/forward_ops_20261118/fourcoin_native_coverage_repair_bound_20261125/REPORT.md)
+
+A Bybit influence check reuses six signed historical ten-hour decision
+windows with original positions, funding estimates and fee assumptions. It keeps the original and complementary three-day
+groups separate and removes exactly one date per diagnostic, reporting
+all 24 omissions. Each of the two positive full-six momentum means
+turns negative when its most influential date is removed.
+[Exact scope and sensitivity](../.agent-state/forward_ops_20261118/bybit_fixed_six_day_influence_20261124/REPORT.md)
+
+The W18 BTC independent-print source review fixes the original
+availability clock and identifies eleven nominal UTC execution-hour
+partitions across November 22 and 23. That request envelope also needs
+independently bound boundary identities because a trade can cross an
+availability boundary. The reviewed signed corpus contains a same-source
+Tokyo estimate, two independent BTC hours outside the intended dates,
+and four-coin order books. It supplies no qualifying whole-window
+trade event set. [Source qualification](../.agent-state/forward_ops_20261118/glft_w18_independent_source_admission_20261124/REPORT.md)
+
+The ANT isolated execution evidence prototype uses synthetic quantity and
+price lattices, public-book depth and independent terminal outcomes.
+It tests limit-side rounding, minimum notional after rounding, matched
+market and order identity, and position and fill watermarks before
+narrowing the worst-case residual. It consumes no public market archive
+or private record and assigns no trading cash.
+[IOC proof checks and limitations](../.agent-state/forward_ops_20261118/ant_rth_per_leg_ioc_admission_peer_20261124/REPORT.md)
+
+### November 24 — W19 pre-execution funding identity and ANT scope regression
+
+Two exact source objects from official Lighter Prover revision
+`fa85b33197710ece649739bc38f5e23e816ddbdf` bind the candidate funding
+transition. An active market's hourly integer funding rate is applied
+to its pre-execution index price before the same transition can replace
+the index or mark. The documented public block transaction route admits
+no inference about this transition from an absent funding transaction.
+W19 still lacks the deployment binding, the original market state and
+the normalized signed coefficient for Core markets 110 and 128 at
+November 23 12:00 UTC. Three constructive counterexamples also preserve
+the distinction between rounded public values, before/after prefix
+differences and settlement-event identity. No historical cash changed.
+[Exact source identities and candidate operands](../.agent-state/forward_ops_20261118/w19_core_funding_preexecution_index_20261124/REPORT.md)
+[Signed coefficient and unit evidence](../.agent-state/forward_ops_20261118/w19_core_funding_event_identity_20261124/REPORT.md)
+[Official block transaction schema](https://github.com/elliottech/lighter-python/blob/main/docs/TransactionApi.md#block_txs)
+
+The ANT serialized evidence prototype tests minimum notional using the
+lower of touch and protective limit. Synthetic same-ledger fixtures
+require both position proofs and a strictly later clock before a new
+pair can be admitted. Each evidence window checks a single order intent,
+the prior position, the native source epoch and fill watermark. A zero
+per-cycle net change leaves existing residual inventory visible. The
+original prototype and independent failing examples are retained. This
+work uses no new market or account data.
+[Five isolated regressions and two exact-source reproductions](../.agent-state/forward_ops_20261118/ant_rth_ioc_serialized_ledger_peer_20261124/REPORT.md)
+
+### November 24 — Independent W18 BTC print reconciliation
+
+CryptoHFTData supplied twelve hourly Lighter Core BTC trade archives
+(3,648,826 compressed bytes) across the original W18 Tokyo decision
+window of November 22 20:06:04.485 UTC to November 23 06:06:04.485 UTC.
+The vendor partitions by its receipt clock, with the following hour
+included to inspect late deliveries. Each source URL, payload size,
+digest and observed timestamp is inventoried outside Git. The first
+transport and HEAD attempts and the successful GET outcomes are
+retained.
+
+The original verified Tokyo Silver and the separate recorder have
+the same 202,477 ordinary trade IDs in scope. Native ID, price, size
+and aggressor side match throughout. The vendor's trade and event
+milliseconds coincide with Tokyo's block-opening milliseconds; only
+6,359 also match the original sequencer execution milliseconds. The
+largest difference is 806 ms. A one-row difference under mixed-clock
+interior trimming disappears when both sides use the block clock.
+Matching recorders do not provide an authoritative exchange event
+sequence, so strict market-wide exposure remains unknown.
+[Clock and coverage readback](../.agent-state/forward_ops_20261118/glft_w18_independent_recorder_observed_match_20261124/REPORT.md)
+[Vendor partition semantics](https://www.cryptohftdata.com/docs/rest-trades)
+
+The W19 funding deployment join separates the full historic L1
+commitment from the verifier's reduced scalar and binds the old-state
+market opening to the correct effective root. It preserves exceptions
+for an authenticated state-root update and keeps exact funding unknown
+until the historic deployment, batch and market proof are available.
+Eight synthetic fixtures exercise the proof-join shape.
+[Deployment and opening prerequisites](../.agent-state/forward_ops_20261118/w19_core_funding_deployment_join_20261124/REPORT.md)
+
+ANT's isolated reduction successor extends the serialized proof model.
+It clips to confirmed inventory and the venue's quantity lattice while
+retaining possible net exposure through the unresolved interval. The
+other market's unchanged position requires a directly attested coverage
+horizon. Its later receipt time alone cannot establish that horizon.
+Twelve synthetic controls extend the original five controls with
+reducing direction, dust, partial fills and actual two-market flatness.
+[Synthetic reduction and terminal coverage](../.agent-state/forward_ops_20261118/ant_rth_single_leg_reduction_peer_20261124/REPORT.md)
+
+### November 24 — W18 observed quote touches and BTC risk bounds
+
+The W18 Core BTC observed touch diagnostic joins the original signed
+Silver BBO and public trades. It fixes a 250 ms reference lifetime and
+symmetric unrounded 1, 2, 3 and 5 bp distances. A quote must strictly
+precede the trade's received-millisecond lower bound and remain active
+through the available-millisecond upper bound. Of 202,477 observed
+trade IDs, 189,746 satisfy the conservative clock join. The remaining
+12,568 cross a book update and 163 exceed the quote lifetime. Ten
+fixed hourly bins preserve the source window. The two largest hours
+contain 202 of 241 ask-side observations at 5 bp. The audit reports
+observed touches and geometric coverage. Exchange event completeness,
+own-position queues and executable cash remain unknown.
+[Source clocks, thresholds and all bins](../.agent-state/forward_ops_20261118/glft_w18_observed_public_touch_clock_diagnostic_20261124/REPORT.md)
+
+A four-window BTC stress readback reuses the independent original
+control and reversal wallets and their sampled drawdowns. It bounds
+all placements of the same cumulative nonnegative stress fees using
+the original marks and fills. The W09, W14 and W15 reversal intervals
+lie below their corresponding controls. W18 overlaps. The original
+seven unavailable cash windows stay unknown. Both the earlier
+three-window analysis and extended W09 scope remain preserved.
+[Exact bounds and all source digests](../.agent-state/forward_ops_20261118/btc_quant_stress_drawdown_bounds_20261124/REPORT.md)
+
+The ANT gross-risk prototype extends the synthetic serialized
+reduction path. Net-zero paired inventory retains its absolute
+gross exposure. Entry requires both markets to be flat and reserves
+all independent-fill outcomes. Over-limit repairs are constrained to
+move toward zero under every positive partial fill, within the
+synthetic venue grid. The risk limits are base quantities. Twenty
+synthetic checks retain the earlier evidence and report no actual
+execution or position data.
+[Risk bounds and same-ledger terminal tests](../.agent-state/forward_ops_20261118/ant_rth_gross_and_derisk_peer_20261124/REPORT.md)
+
+The W19 Crypto retention receipt binds the sealed Tokyo object to
+its aleph cold copy and verified whole-file Drive backup after the
+native lane reclaimed its Tokyo copy at 12:10 CST. The independent root
+archiver remained active. The exact deployed flywheel code was exercised
+with a synthetic low-water crossing during an unfinished seal scan.
+[Receipt ancestry and low-water control](../.agent-state/forward_ops_20261118/operations_w20_native_low_water_w19_crypto_20261124/REPORT.md)
+
+The W20 Tokyo rollover published three original Bronze sidecars by
+12:18 CST. The 14,183,480,603 compressed bytes contain 219,588,715
+precisely timed records, with 36,884,181 ms of shared physical span.
+The native identities are retained beside the changing transfer
+state. The frozen decision bounds and actual archive and Drive
+readbacks require their own receipts.
+[Native seals and exact-receipt comparison](../.agent-state/forward_ops_20261118/operations_w20_three_native_sidecars_20261124/REPORT.md)
+
+The W20 original Tokyo captures arrived at aleph cold storage through
+the standing Mac dispatcher. The original receipt at 13:02 CST and
+each cold sidecar match the Tokyo publisher. All three archives passed
+the transfer verifier for size, SHA-256 and gzip EOF. Bulk readiness at
+13:09 CST and the moving original converter offset establish that the
+standing replay has started. Independent whole-file Drive verification
+and the final 14-profile scoring and cash receipts were pending when
+the checkpoints were sampled.
+[W20 cold custody and original replay checkpoints](../.agent-state/forward_ops_20261118/operations_w20_original_cold_and_replay_started_20261124/REPORT.md)
+
+The W19 original Crypto Silver bracket uses public Lighter Core BTC and
+ETH ordinary trades for 2026-11-23 only. It keeps native source, local
+receipt, availability and sequencer execution clocks distinct. Within
+two seconds of 12:00 UTC, 74 observed trades identify 39 distinct
+blocks. The nearest observed heights are 399081692 and 399081721.
+The official block metadata request for the first height returned HTTP
+403. The value for W19 NVDA and SPY requires an independently verified
+historical L1 batch join and the native funding event and scale. The
+official blob header provides a candidate exact integer accumulator
+for two authenticated historical endpoints. All 16 affected wallet
+hours remain unknown.
+[Observed Silver block locator](../.agent-state/forward_ops_20261118/w19_core_funding_native_block_locator_20261124/REPORT.md)
+[Official public market header method](../.agent-state/forward_ops_20261118/w19_core_funding_blob_header_route_20261124/REPORT.md)
+
+The isolated ANT causal replay preserves the preceding synthetic
+ledger and risk package. It adds separate per-leg source, receipt,
+modeled order arrival and terminal event clocks. Six new synthetic
+checks cover stale source clocks, pre-arrival evidence and later
+independent reconciliation. Twenty-six checks total pass. Actual
+fills, fees and both-venue terminal coverage remain unverified.
+[Synthetic replay and exact predecessor](../.agent-state/forward_ops_20261118/ant_rth_causal_replay_peer_20261124/REPORT.md)
+
+The W19 public Ethereum record maps both observed Lighter L2 heights
+to batch 274979. The preceding and following commitment tuples match
+the corresponding verification calldata. The successful L1 receipts
+and fixed finalized checkpoint define batch membership and clocks.
+The earlier batch ends at 11:59:23.049 UTC. The covering batch spans
+11:59:23.079 to 12:01:00.182 UTC. Each of the two relevant commit
+transactions names exactly one blob. Recomputed KZG commitments
+match the two corresponding versioned hashes. The retained projection
+contains only the NVDA 110 and SPY 128 public header values. Exact
+wire accumulator differences are +5,593,015 and +283,792. Verified
+single-round attribution, historical units and released cash remain
+pending.
+[Historical receipts and two-market projection](../.agent-state/forward_ops_20261118/w19_core_funding_l1_blob_projection_20261124/REPORT.md)
+
+The W18 Core BTC 5 bp public-touch diagnostic projects a single
+one-second horizon on the original continuous ten-hour window and
+original Tokyo availability clock. Of 241 ask-side touches, 234
+marks are negative, six positive and one unknown. The lower and upper
+negative fractions are 97.10 and 97.51 percent. The 12 bid-side
+touches have three negative and nine positive marks. The strict
+future BBO boundary, independent hour-side aggregates and first
+failed wrapper receipt are retained. Realized execution, cash and
+regional latency differences remain unknown.
+[Fixed rule and signed market result](../.agent-state/forward_ops_20261118/glft_w18_public_touch_5bp_markout_20261124/REPORT.md)
+
+W19 Ethereum archive reads bind the two settlement-bracketing
+batches to the same historical Lighter and verifier implementations.
+Both actual verification traces succeed with the scalar derived from
+the independently rebuilt full commitment. Rebuilt commitments for
+three adjacent batches preserve the old and new root chain. Four
+historical archive reads verify the USDC collateral divisor of
+10^12. The target batch consumes two L1Deposit priority requests.
+The verified Solidity compilation does not identify the historical
+L2 circuit build by itself. Current public market precision and the
+archived pre-boundary index give matching candidate per-base amounts
+of 0.005593015 USDC for NVDA and 0.00283792 USDC for SPY. Among the
+16 source model snapshots, 15 lie exactly on the candidate quantity
+grid. The other SPY snapshot requires a separate sizing review.
+The original 16 model cash observations remain unknown.
+[Runtime, calldata, quantity grid and conditional accounting](../.agent-state/forward_ops_20261118/w19_core_funding_historical_runtime_and_units_20261124/REPORT.md)
+
+The W19 follow-up runs the already fixed W18 Core BTC 5 bp and
+one-second public markout method on the original W19 continuous
+ten-hour Cwin. Of 820 observed ask-side touches, 557 are negative,
+261 positive and two unknown. Of 336 bid-side touches, 148 are
+negative, 179 positive and nine unknown. The original feed gap and
+the cluster of 735 ask-side touches in one hour stay visible.
+Actual executions and cash remain unknown. The same W20 procedure
+has separate source admission requirements.
+[W19 full result and W20 data gate](../.agent-state/forward_ops_20261118/glft_w19_fixed_public_touch_markout_20261124/REPORT.md)
+
+The isolated ANT clock offset study uses bounded calibration
+from each source epoch to the chosen reference epoch. Quote
+availability, both freshness clocks, order arrival, terminal time
+and continuous coverage pass only when all possible interval
+endpoints admit the evidence. Thirty-five synthetic checks and 150
+interval comparisons preserve the original point-clock output.
+The live clock, coverage and authoritative order data have not
+been supplied to this offline probe.
+[Calibrated interval controls and observed evidence requirements](../.agent-state/forward_ops_20261118/ant_rth_bounded_clock_offsets_peer_20261124/REPORT.md)
+
+The W19 source induction fixes the official recursive program and
+its market writing paths. If both historical verification keys bind
+this program, the preceding verified batch tail forces the prior
+funding hour to be at least 11:00 UTC. The next batch ends before
+13:00 UTC. Together with the verified adjacent roots, two deposits
+and retained nonzero quote multipliers, the two nonzero accumulator
+increments imply exactly one effective 12:00 UTC update in that
+program. The historical key-to-circuit binding still gates attribution.
+[Source pins, induction and counterexample](../.agent-state/forward_ops_20261118/w19_exact_source_single_round_induction_20261124/REPORT.md)
+
+The W20 original three-lane Silver and aggregate ingest are signed.
+The original GPU preprocessing query initially exhausted DuckDB
+memory. Its recovery preserves the signed input, SQL and strategy
+parameters, uses two DuckDB threads and places capped spills on
+a dedicated E drive path. The original GPU and analytics artifacts
+were then signed and the frozen standing preparation resumed.
+[Full ingest and resource-only recovery](../.agent-state/forward_ops_20261118/operations_w20_gpu_memory_recovery_20261124/REPORT.md)
+
+The W19 deployed Solidity verifier source is bound to the historical
+runtime hash. Four PLONK commitment coordinates differ from the
+pinned public candidate. The latest checked public key fingerprint
+also differs from the historical verification key. The historical
+wrapper source-to-build binding remains open.
+[Historical verifier source and key comparison](../.agent-state/forward_ops_20261118/w19_historical_verifier_key_comparison_20261124/REPORT.md)
+
+The W19 frozen Core RWA model uses decimal quote quantities on each
+market's configured order-size grid. Its SPY inventory exception
+is exactly half a lot in the sole model with fractional cancellation
+credit. An isolated replay of the unchanged engine reproduces a
+half-lot simulated fill from two displayed-size changes and one
+ordinary at-price print. This experiment retains the original cash
+qualification and the historical event path is still unverified.
+[Signed grid counts and synthetic fill](../.agent-state/forward_ops_20261118/w19_spy_half_lot_queue_diagnostic_20261124/REPORT.md)
+
+The ANT clock-epoch replay adds explicit reference and venue source
+generations around the calibrated interval guard. The synthetic
+controls distinguish capture restart, stream reconnection, clock step,
+rollback, duplicate source observation and same-time collector
+sequence. Pre-generation terminals leave a cross-generation
+attempt in flight. The existing 35 and new 11 tests pass.
+[Epoch controls and evidence boundary](../.agent-state/forward_ops_20261118/ant_rth_capture_epoch_peer_20261124/REPORT.md)
+
+The W20 markout admission checker reads only original metadata and
+requires a complete sealed, ingested, prepared and scored ten-hour
+Cwin with matching native BTC feed evidence. W21 freezes a separate
+2:1 opposite top-of-book depth rule before any W21 data inspection.
+The ask side is the sole primary comparison and at least half of
+observable quote time must remain. The research preserves unknown
+marks and incomplete feed coverage. Some W21 collection elapsed
+before method registration. The current results cover only the
+synthetic gate and replay checks.
+[W20 admission](../.agent-state/forward_ops_20261118/glft_w20_gate_w21_prereg_20261124/REPORT.md)
+[W21 frozen observation method](../.agent-state/forward_ops_20261118/glft_w21_causal_pressure_gate_20261124/REPORT.md)
+
+On W20, the original standing readiness, three Silver tapes, prepared
+windows, bound inputs, scores and cash report reconcile to the
+completion receipt. The two decision clocks are each 36,000,000 ms.
+All 14 frozen profiles complete. Cash qualification is withheld for
+both quant profiles, both arbitrage profiles and all ten zero-reward
+turnover profiles. Quant and turnover have original trade-feed
+failures. Both arbitrage profiles lack equity-session metadata and
+paired round trips. Tokyo retains all three source archives while
+whole-file Drive readback is pending.
+[Original W20 reconciliation](../.agent-state/forward_ops_20261118/operations_w20_original_14_complete_20261124/REPORT.md)
+
+The fixed BTC 5 bp, one-second public-touch measurement uses the
+original W20 Cwin and only its native Crypto Silver BBO and ordinary
+trade partitions. The 21 observed ask touches produce 15 negative,
+one positive and five unobservable marks. The adverse share ranges
+from 71.43% to 95.24%. All 16 observable ask marks cluster in one
+hour. The 95 bid touches include four negative marks. Two runs
+produce identical aggregate bytes. The original trade-feed failures
+withhold a complete-market result, fills and cash.
+[W20 public-touch measurement](../.agent-state/forward_ops_20261118/glft_w20_fixed_public_touch_markout_20261124/REPORT.md)
+
+The next offline ANT replay reproduces the stale-book pricing path
+from the prior epoch model. The candidate derives each leg's touch
+and protected depth from the current admitted two-sided book. The
+synthetic controls cover stale, copied and edited observations,
+same-time ordering, and continued risk reservation without independent
+terminal evidence. All 56 controls pass. Production capture ordering
+and native market-rule provenance remain unverified for this candidate.
+[Current-book binding controls](../.agent-state/forward_ops_20261118/ant_rth_current_book_binding_peer_20261124/REPORT.md)
+
+The original W20 BTC tape records a 1,128 ms offline interval
+33 minutes and 41.692 seconds into Cwin. Its start matches a public
+Lighter trades connection disconnect at the same availability
+millisecond. The tape contains eleven BBO events and zero observed
+ordinary trades during the interval. Missing trade quantity and
+strict cash remain unknown.
+[W20 native trade lifecycle attribution](../.agent-state/forward_ops_20261118/w20_native_trade_disconnect_20261124/REPORT.md)
+
+The W21 metadata adapter independently checks the original roster's
+registration policy and the original frozen protocol in the completion
+receipt. The frozen 2:1 registration and event reader are byte-identical
+to the prior release. The new tests use synthetic inputs exclusively.
+[W21 admission correction](../.agent-state/forward_ops_20261118/glft_w21_causal_pressure_gate_admission_v2_20261124/REPORT.md)
+
+The W19 SPY lot-closure experiment uses a hash-pinned copy of the
+original simulator and 252 synthetic same-price queue combinations.
+It rounds simulated own fills to the native lot. A sub-lot print can
+deplete queue ahead with zero own fill. Subsequent whole-lot fills,
+reserved quantity and the pending-cancel terminal agree with the
+candidate ledger. The original sixteen historical wallet-hour results
+retain their signed evidence and unresolved cash status.
+[W19 SPY synthetic lot closure](../.agent-state/forward_ops_20261118/w19_spy_lot_fill_closure_20261124/REPORT.md)
+
+The ANT rule binding experiment uses pinned synthetic market catalogs
+on the same offline replay as the current-book controls. It checks
+native market identity, bytes, causal receipt ordering and validity
+at dispatch. Sixty-five controls pass. Actual Arcus price tiers,
+XYZ precision and historical market-catalog evidence remain open.
+[ANT market-rule binding controls](../.agent-state/forward_ops_20261118/ant_rth_native_rules_binding_peer_20261124/REPORT.md)
+
+The original W19 ten-hour RWA Silver regression checks native Lighter
+Core public quantities by availability time. All 28,396 positive
+ordinary SPY trades and all 908,050 BBO side quantities are on the
+0.0001 candidate grid. One-lot amounts occur on both sides of the
+12:00 UTC split. NVDA serves as a separate 0.001 control. The aggregate
+reproduces byte for byte in aleph. Full-depth historical grid,
+exchange minimum, queue fills and cash remain unverified.
+[W19 public native-lot observation](../.agent-state/forward_ops_20261118/w19_spy_native_lot_grid_public_20261124/REPORT.md)
+
+The ANT price-grid audit extracts pure functions from three pinned
+repository Rust files. Two synthetic Arcus tick tables expose prices
+that the helper produces and the repository wire validator rejects.
+The isolated candidate computes directionally protected prices on
+the final tier and base grid. Five XYZ precision vectors match the
+original implementation. Historical venue catalogs and rules at the
+time of arrival remain open.
+[ANT native price-grid audit](../.agent-state/forward_ops_20261118/ant_rth_native_tick_boundary_peer_20261124/REPORT.md)
+
+The Arcus call-site review reads three archived public market catalogs,
+one with a verified receipt time on 2026-11-20 and two catalog snapshots
+bound by the 2026-11-23 Carry archive hashes. Each snapshot contains
+87 markets. The audit checks 410 directional tier boundaries per
+catalog and observes zero invalid transitions. The isolated Rust
+test shows that both prior synthetic invalid prices fail before the
+other venue begins preparation or either leg sends. The snapshots
+leave continuous rule validity and live occurrence rates unknown.
+[Arcus call-site and archived catalog review](../.agent-state/forward_ops_20261118/ant_arcus_price_guard_callsite_peer_20261124/REPORT.md)
+
+The original W19 model inventory provides hourly checkpoints. SPY's
+conservative queue arm first shows a half lot at 09:00 UTC and keeps
+that status through the terminal checkpoint. NVDA shows a half lot
+from 07:00 through 09:00 UTC and returns to the integer grid. The
+inventory bounds a transition; individual modeled fill times remain
+unknown. The model clock starts 12.382 seconds after the original
+RWA Silver observation clock.
+[W19 original inventory checkpoints](../.agent-state/forward_ops_20261118/w19_spy_first_offgrid_inventory_20261124/REPORT.md)
+
+The W19 candidate grid also matches the original ten-hour model clock
+using the same pinned RWA Bronze archive and public Silver partitions.
+All 28,428 observed ordinary SPY trades and 908,344 BBO side quantities
+fit the 0.0001 grid. The boundary audit counts the rows removed and
+added by shifting the clock. This is public input evidence. Complete
+depth, historical lot rules, modeled execution, and cash remain open.
+[W19 model-clock public grid](../.agent-state/forward_ops_20261118/w19_model_clock_native_grid_20261124/REPORT.md)
+
+The ANT arrival-rule diagnostic binds each simulated leg to the
+market rule used at dispatch. Its synthetic cases require evidence
+covering the entire interval through the latest possible arrival in
+the same clock epochs. The case that reaches an exclusive rule end
+remains unknown. The three verified public catalogs provide snapshots,
+and historical rule continuity remains unverified.
+[ANT dispatch-to-arrival rule diagnostic](../.agent-state/forward_ops_20261118/ant_rth_rule_arrival_continuity_peer_20261124/REPORT.md)
+
+The W19 ten-hour baseline reuses the exact original RWA Bronze input,
+six markets, eight model arms and model decision clocks. The original
+summary digest and all 48 fill counts reproduce. The diagnostic
+counts 242 simulated half-lot fills, all in the 0.5 queue-credit arm.
+The first SPY half-lot round trip lasts 49 microseconds in the model
+application clock. The corresponding two updates share one archived
+availability time. The candidate replay and cash assessment remain
+separate work.
+[W19 original model event trace](../.agent-state/forward_ops_20261118/w19_rwa_original_fill_ledger_trace_20261124/REPORT.md)
+
+The ANT catalog diagnostic now checks the same captured catalog from
+receipt through dispatch and the latest possible arrival. Synthetic
+cases cover a gap before dispatch, a later scheduled effective time,
+and a reused digest in a different source epoch. The tests preserve
+independent order-terminal evidence. Historical continuous catalog
+coverage remains unverified.
+[ANT captured-catalog continuity](../.agent-state/forward_ops_20261118/ant_rth_catalog_capture_continuity_peer_20261124/REPORT.md)
+
+The W19 whole-lot replay launcher pins the original six markets,
+eight arms and ten-hour decision clock. Synthetic checks cover
+whole-lot through-price fills, an invalid fractional remainder
+and equality of the unaffected control arms. This release records
+the run plan and test fixtures. Candidate cash remains unknown.
+[W19 candidate replay plan](../.agent-state/forward_ops_20261118/w19_rwa_whole_lot_candidate_run_20261124/REPORT.md)
+
+The ANT detached rule-witness check binds both continuity witnesses to
+the same validated dispatch receipt using a versioned digest. Synthetic
+cross-process cases preserve exact decimal fields, catalog identity,
+source epochs, and recorded availability. The receipt still requires
+separate continuity and terminal proofs. Historical coverage remains
+unverified.
+[ANT cross-process rule witness](../.agent-state/forward_ops_20261118/ant_rth_detached_rule_reference_peer_20261124/REPORT.md)
+
+The W20 conditional readback successor adds a locked, checksummed
+prefix checkpoint and bounded backoff for reopening the same public
+archive object. The original whole-file SHA-256 remains the publication
+gate. Mac and WSL reproduce 19 synthetic cases. The live Drive
+transport and the three W20 full readback receipts remain open.
+[W20 offline resumable readback](../.agent-state/forward_ops_20261118/w20_resumable_range_readback_peer_20261124/REPORT.md)
+
+The one-shot W19 whole-lot candidate completed against the same
+six-market, eight-arm ten-hour selection window. The replay read
+83,336,644 original public rows. All 242 modeled off-grid fills
+disappeared, and the 42 other market-arm summaries matched exactly.
+The original funding gaps and zero-incentive cash result remain unknown.
+[W19 whole-lot candidate outcome](../.agent-state/forward_ops_20261118/w19_rwa_whole_lot_candidate_result_20261124/REPORT.md)
+
+The original W18–W20 public BTC markout results support a separate
+hour-concentration diagnostic. It consumes only the three signed
+ten-hour tabulations, holding the 5 bp distance, 1-second markout,
+time boundaries, and unknown marks fixed. W18 ask-side adverse
+observations remain a majority after excluding any one hour.
+Excluding the dominant hour removes the majority in W19 and leaves
+only unknown marks in W20. Actual execution and cash remain unknown.
+[Original clock and hour sensitivities](../.agent-state/forward_ops_20261118/glft_w18_w20_public_touch_hour_sensitivity_20261125/REPORT.md)
+
+A descriptive W19 check uses the signed half-lot trace, the one-shot
+whole-lot outcome, the original placement code, and the unchanged
+zero-incentive registration. At fixed original order prices and
+events, flooring the 242 half-lot quantities could remove at most
+$814.70 of notional. The full counterfactual replay removed $38,880.68.
+The rest depends on the replay path and requires event-level
+attribution. The linear fee stress is available separately from
+net cash, which remains unknown.
+[W19 static floor bound](../.agent-state/forward_ops_20261118/w19_whole_lot_static_bound_20261125/REPORT.md)
+
+The six signed Bybit four-asset model cohorts support a funding-mark
+sensitivity bound at their original event clocks and costs. Letting
+each leg's proxy settlement price vary independently from zero to
+twice its original mark preserves the sign of 23 of 24 individual
+wallets and all 12 arm-by-cohort means. This is a hypothetical
+pricing range. Actual funding marks and net cash remain unknown.
+[Bybit six-window funding sensitivity](../.agent-state/forward_ops_20261118/bybit_six_day_funding_mark_bound_20261125/REPORT.md)
+
+The Lighter Core BTC touch comparison consumes the original signed W18,
+W19, and W20 public 5 bp / 1 s markout tabulations. The three ten-hour
+decision starts are November 22 at 20:06:04.485 UTC and November 23 at
+06:21:04.772 and 16:36:04.974 UTC. The input digests and exact clocks
+are pinned in the diagnostic. It compares the adverse fractions of the
+two sides within hours where both had observed touches, weights those
+hours equally, and bounds unknown outcomes on both sides. W18 has no
+such hour. The W19 difference spans zero across three hours, while
+W20 retains a 92.63 percentage-point difference in its only comparable
+hour. The original zero rewards and missing marks carry through.
+Market-wide coverage, actual fills, fees, and net cash remain unknown.
+[BTC side comparison within each hour](../.agent-state/forward_ops_20261118/glft_w18_w20_matched_hour_sides_20261125/REPORT.md)
+
+The ETH Lighter Core/RH paired-cycle diagnostic pins the admitted cycle
+projection and original frozen rollup for W12–W16, spanning November 20
+06:35:53.973 through November 22 09:36:00.976 UTC. It uses the five
+separate ten-hour clocks, each with a separate 60-second warm-up and
+15-second terminal drain. The within-window multiset union reduces 59
+observed paired cycles in the two arms to 35. Under the original path,
+zero rewards, and fee reserves of 0.25 bp across turnover plus 1 bp on
+taker notional, removing all adverse net execution cost leaves all 35
+negative. Removing the adverse net reference drift alone makes three
+positive. Each original window retains its joint order-book gap. Actual
+fees, funding cash and coverage-qualified net cash remain unknown.
+[ETH paired-cycle price-component sensitivity](../.agent-state/forward_ops_20261118/eth_w12_w16_paired_price_component_relief_20261125/REPORT.md)
+
+The original W21 standing regression now has all 14 frozen scores and
+the independent single-leg cash report. The W21 Tokyo Bulk, Crypto and
+RWA archives were transferred and fully read back from Drive under
+their original digests. On November 24 the ten-hour crypto clock began
+at 02:51:05.174 UTC, and the ten-hour RWA clock at 02:50:53.786 UTC.
+Each has its own signed warm-up and terminal drain. With zero rewards,
+0.25 bp on turnover and an extra 1 bp on taker turnover, the BTC
+reversal is positive in this single model window. All ten turnover
+profiles are negative under that stress. The two RWA arbitrage profiles
+have zero matched cycles and missing session frames. Scores, fee
+assumptions and coverage remain tied to the original receipt digests.
+[W21 original frozen acceptance](../.agent-state/forward_ops_20261118/operations_w21_original_score_and_cash_complete_20261125/REPORT.md)
+
+The BTC reconnection timing check uses the signed Lighter Core BTC
+trade-feed gaps and original local reversal configuration in W13–W16,
+from November 20 16:50:54.981 to November 22 09:36:00.976 UTC across
+four separate ten-hour windows. It pins the pre-window Rust source
+commit and the received decision clocks. At the original 2,000 ms
+lookback and 100 ms buckets, an applied reconnect requires at least
+2,200 ms of new history. The five explicit gaps imply lower bounds
+of 9.777 seconds unready in W13 and 6.626 seconds in W16. Their prior
+1-second entry holds expire by reconnect. W14 and W15 have zero
+recorded explicit gaps of this type. First actual ready decisions,
+live exposure, and realised cash remain unknown.
+[BTC reconnection readiness timing](../.agent-state/forward_ops_20261118/btc_quant_reconnect_causal_floor_20261125/REPORT.md)
+
+The W21 turnover size check uses the original signed ten-hour crypto
+clock and all ten frozen turnover wallets. It binds every profile to
+its original digest and compares $500 with $5,000 base order notional
+within each 10%, 25% and 50% depth cap. These pairs share 250 ms entry
+and 100 ms response assumptions. With zero rewards, 0.25 bp on gross
+turnover and 1 bp extra on taker turnover, every profile costs more
+than $20 per million of modeled maker turnover. Changing size raises
+per-million gross cost at 10% depth and lowers it at 25% and 50%.
+The separate range diagnostic pins the W21 score summary and the
+W18 ten-hour clock from November 22 20:06:04.485 to November 23
+06:06:04.485 UTC. It proves why group summaries alone cannot recover
+each W21 pairing. Actual cash, exchange fees and the effect of adaptive
+sizing remain unknown.
+[W21 exact size and cost comparison](../.agent-state/forward_ops_20261118/w21_original_turnover_exact_size_cost_20261125/REPORT.md)
+[W18 comparison and W21 group limits](../.agent-state/forward_ops_20261118/w21_turnover_marginal_cost_bounds_20261125/REPORT.md)
+
+The W21 Arcus/Lighter RH SPY and QQQ session diagnostic ties the
+original RWA Bronze receipt and both frozen replay outputs to the
+registered November 24 clock, 02:50:53.786–12:50:53.786 UTC, with
+separate 60-second warm-up and 30-second drain. Whole-archive market
+identity proves that the four leg identifiers appear somewhere in
+the recording. Each original replay reported 353,609 book frames
+with missing session metadata. Both also report zero entry checks,
+quotes, and paired cycles. Session and funding-horizon blocks are
+separate counters. Historical Rust fixtures show why a missing frame
+alone does not determine the entry outcome. The current receipts do
+not establish leg-by-leg continuity, fresh executable depth, actual
+fees, or cash.
+[W21 paired-admission counters and fixtures](../.agent-state/forward_ops_20261118/w21_pair_session_counter_evidence_20261125/REPORT.md)
+
+The BTC extra-cost check keeps the 13 original W09–W21 ten-hour
+decision windows and their two separate wallet configurations. Five
+windows have qualified model cash for both wallets, and eight retain
+their original unknown status. W09 uses its original frozen cash
+receipt. W21 uses its standing score and cash receipts and a separate
+digest-bound projection of the maker and taker counts and amounts.
+W21 reversal has seven maker and seven taker fills. On each positive
+window's fixed executed notional, the added uniform fee that brings
+the model to zero is 5.06808 bp for W09 and 1.94887 bp for W21.
+Single-fill sensitivity is bounded by the original side totals and
+counts. Live fees, per-fill P&L, and realised cash remain unknown.
+[BTC signed extra-cost headroom](../.agent-state/forward_ops_20261118/btc_quant_signed_fill_cost_headroom_20261125/REPORT.md)
+
+The RWA resize diagnostic pins the original Arcus and TradeXYZ AMD,
+META and NVDA fixed entry and exit receipts and their receipt-time
+availability rules. The original W15–W17 ten-hour starts were November
+21 13:20:49.594 and 23:35:51.575 UTC, and November 22 09:50:51.776 UTC.
+The sixteen cases with all four endpoints come from the wider timing condition.
+All eighteen original strict schedules lack a complete protected
+open and close. Across the two venues and six unchanged delay
+conditions, resizing can only help cases without a known independent
+age or other non-size blocker. Some thin-book cases have unknown
+price protection and minimum order eligibility. The diagnostic
+leaves zero rewards, executed fills, cost and cash at their original
+scope. The proposed separate ten-hour test locks both sizes at the
+decision clock and keeps the original schedules and failures visible.
+[RWA fixed endpoint size and timing](../.agent-state/forward_ops_20261118/rwa_fixed_pair_size_and_clock_bound_20261125/REPORT.md)
+
+The BTC turnover cost attribution reads four digest-bound original
+inputs from W09–W16, W18 and W21. Each wallet keeps its original
+ten-hour decision window, warm-up, drain, terminal cash coverage, fees
+and funding. The matched $500 and $5,000 profiles retain the original
+10%, 25% or 50% depth cap. On each wallet's fixed gross-turnover
+denominator, the 0.25 bp gross surcharge is $25 per million and the
+1 bp taker surcharge is $100 per million times the taker share.
+Removing those two added pressures changes none of the nine known
+size rankings. Twenty-one pairs still have an unknown leg. W21's ten
+modeled wallets remain negative before the surcharges. The diagnostic
+holds modeled executions fixed and leaves live costs and cash unknown.
+[BTC turnover cost attribution](../.agent-state/forward_ops_20261118/btc_turnover_cost_ranking_bridge_20261125/REPORT.md)
+
+The W22 Arcus public trade audit uses all twelve hash-verified trade
+shards from the original Tokyo RWA Bronze archive. Its receipt coverage
+is November 24, 2026, 12:59:54.859–23:14:53.760 UTC. Of 106,759 trade
+observations across eighteen markets, one NVDA-USD identity has two
+source timestamps 57 µs apart within the same millisecond. Price,
+quantity, side and venue sequence agree. Receipt and causal
+availability differ by 2 ms after projection. The later public REST
+response agrees on identity and economics and gives a third source
+timestamp. Its response hash and actual retrieval time are pinned as
+retrospective evidence. Strict Silver remains withheld for RWA. The
+audit produces no fee, funding, execution or cash estimates.
+[W22 Arcus source identity audit](../.agent-state/forward_ops_20261118/operations_w22_arcus_nvda_source_identity_20261125/REPORT.md)
+
+The isolated W22 replay preparation rehashes all three original
+Tokyo Bronze archives. On November 24, 2026, the public receipt
+spans were 12:59:49.456–23:14:49.194 UTC for Bulk,
+13:00:06.963–23:15:06.920 UTC for Crypto, and
+12:59:54.859–23:14:53.760 UTC for RWA. The pinned compiler keeps the
+complete original arrival sequence and uses the ceiling of the
+collector's precise availability clock. It produces Crypto BTC and
+ETH and RWA NVDA, QQQ, and SPY tapes. The independent gate checks
+the ETH and NVDA anchors and the actual tape coverage for two
+continuous ten-hour decision windows, with warm-up and drain
+reported separately. The Arcus REST response supplies no fill
+input. The isolated attempt inherits original fees, funding
+requirements, and gaps. No score or cash estimate is available at
+the compilation milestone.
+[Isolated W22 inputs and preparation](../.agent-state/forward_ops_20261118/w22_isolated_preparation_started_20261125/REPORT.md)
+[W22 five precise-time compile receipts](../.agent-state/forward_ops_20261118/w22_isolated_five_precise_compiles_published_20261125/REPORT.md)
+
+The W22 isolated original scorer subsequently completed all fourteen
+profiles. The Crypto decision window was November 24, 2026,
+13:06:06.964–23:06:06.964 UTC, with a 60-second warm-up and a 15-second
+drain. The RWA decision window was 13:05:54.860–23:05:54.860 UTC, with
+a 60-second warm-up and a 30-second drain. The independently verified
+BTC cash ledger has two trade feed gaps in every wallet. All twelve
+BTC wallets retain unknown settlement cash. Two turnover wallets also
+lack complete verified funding slots and settled terminal state. Both
+paired wallets show zero executions. The scoped receipts retain the
+full RWA Silver and merged GPU withholding.
+[W22 isolated score and cash receipts](../.agent-state/forward_ops_20261118/w22_isolated_14_scores_and_scoped_standing_20261125/REPORT.md)
+
+The W22 BTC gap audit rehashes eleven original Lighter Core public
+trade shards, with 25,902,618 compressed bytes and 270,505 archive
+records. It reconstructs the same five BTC feed-state markers as the
+signed single-market tape. The two disconnect-to-acknowledgment
+intervals were 13:51:38.280–13:51:39.405 UTC and
+19:22:24.392–19:22:25.512 UTC on November 24, 2026. Both fell wholly
+inside the Crypto decision span. The recorded disconnections carried
+no upstream cause. Completion of the later subscription starts a new
+epoch and leaves the earlier trades and settlement cash unknown.
+[W22 original BTC trade gap evidence](../.agent-state/forward_ops_20261118/w22_btc_trade_feed_gap_source_audit_20261125/REPORT.md)
+
+The W22 decision-phase volatility diagnostic reuses the exact
+722,885,258-byte Lighter Core BTC single-market tape, the original
+Crypto window, and the first frozen quant profile in lexical order.
+A separately built native diagnostic binary enables calibration and
+cross-market diagnostics. The standard importer accepts the same
+report in legacy and decision-phase modes. The latter uses 351,008
+receipt intervals over 35,980.294 seconds and increases observed
+volatility by 0.01421% in this window. The original two trade-feed
+gaps remain. The diagnostic neither prices missing cash nor changes
+fees or funding, and writes no strategy overlay.
+[W22 native BTC volatility comparison](../.agent-state/forward_ops_20261118/w22_btc_decision_phase_sigma_native_diagnostic_20261125/REPORT.md)
+
+The W22 two-profile diagnostic reuses the exact original Core BTC
+tape and the Crypto decision interval on November 24,
+13:06:06.964–23:06:06.964 UTC. Both original quant configurations
+use the same recorded quote data and the same pinned native
+diagnostic binary. Both public-market variance scopes match
+field-for-field across the two runs. Their simulated maker and
+taker fill counts differ. Each run retains the same two print feed
+gaps and the previously signed cash remains unknown. The comparison
+uses a separate diagnostic with the original decision, warm-up,
+drain, fees and funding settings.
+[Same-tape volatility across both W22 quant profiles](../.agent-state/forward_ops_20261118/w22_btc_sigma_two_frozen_arms_diagnostic_20261125/REPORT.md)
+
+The BTC turnover capacity and absolute-loss comparison uses the
+original W18–W21 ten-hour profile roster and signed model cash
+summaries. It preserves all 40 original slots and leaves the 20 W19
+and W20 results with unknown cash out of the comparisons. On W18 and
+W21, three of ten original profiles remain when comparing maker
+turnover and absolute modeled loss separately on each window.
+All comparable profiles still lose under zero rewards, original fees
+and funding, and the original 0.25 bp gross and 1 bp taker stresses.
+[BTC turnover and absolute modeled loss](../.agent-state/forward_ops_20261118/btc_turnover_absolute_loss_frontier_20261125/REPORT.md)
+
+The BTC quant execution-cost sensitivity retains both original
+wallets in each W09–W21 ten-hour window. It prices additional adverse
+execution at each wallet's own simulated notional, after original
+fees, funding, and stress. Five windows have comparable model cash,
+and eight retain unknown cash. With executions and original fees
+and funding held fixed, W18 ties if the reversal wallet alone
+incurs another 0.03627 bp. W09 and W21 positive modeled cash reach
+zero before their reversal-versus-control ranking changes.
+[BTC quant differential execution sensitivity](../.agent-state/forward_ops_20261118/btc_quant_differential_execution_margin_20261125/REPORT.md)
+
+The W23 BTC volatility replication was registered while Tokyo was
+still capturing and before any sealed tape or replay outcome existed.
+It uses the same binary and importer hashes as the W22 diagnostic.
+The original Crypto decision window and first frozen quant profile
+determine the input. Exact raw and tape hashes become available after
+sealing. The future comparison preserves the original receipt clock,
+warm-up, drain, and any trade continuity gaps.
+[W23 BTC volatility replication protocol](../.agent-state/forward_ops_20261118/w23_btc_decision_sigma_replication_registered_20261125/REPORT.md)
+
+W23 canonical ingest binds the original Tokyo Bulk, Crypto, and RWA
+Bronze files and their three whole-file readbacks to the matching WSL
+transfer receipt. The files contain 194,573,930 precise-clock records.
+Their common availability envelope spans 36,882,134 ms and provides
+the outer bounds for the later replay window. The GPU receipt records
+selection diagnostics using a 60-second embargo. Continuous decision
+coverage and the 14 frozen wallet outcomes require their own receipts.
+[W23 canonical ingest and GPU provenance](../.agent-state/forward_ops_20261118/w23_original_ingest_gpu_canonical_identity_20261125/REPORT.md)
+
+The RWA joint-arrival diagnostic intersects the already-signed
+Arcus and TradeXYZ AMD, META, and NVDA endpoint records from the
+three continuous W15–W17 historical decision windows. Each leg
+uses the original fixed open and close and one of six unchanged
+extra delays on top of the 310 ms baseline. All 36 joint choices
+retain the original two missing wide-schedule slots and eighteen
+strict cases without complete endpoints. Both original single-leg
+axes match exactly. The two 200 ms delays leave six of sixteen
+complete wide cases with protected endpoints. Any available funding
+proxy is reused only with exact settlement-hour membership, and
+the original zero rewards and 1.25 bp gross stress apply.
+[RWA same-market joint arrival grid](../.agent-state/forward_ops_20261118/rwa_fixed_endpoints_joint_arrival_grid_20261125/REPORT.md)
+
+The four-asset endpoint concentration diagnostic reuses signed per-asset
+replay contributions for November 20, 21, and 24, including original fees,
+funding, and the 1.25 bp stress at zero rewards. It enumerates complete
+opposite-side decompositions of the original broad portfolios at their
+equal target sizing, without simulating separate wallets. November 24's
+positive reversal aggregate contains a losing pair in every decomposition.
+November 22–23 remain unclassified for lack of a local per-asset projection.
+Continuous ten-hour cash qualification is unchanged.
+[Four-asset endpoint concentration](../.agent-state/forward_ops_20261118/fourcoin_balanced_endpoint_concentration_20261125/REPORT.md)
+
+The W18–W20 Lighter Core BTC markout magnitude diagnostic consumes
+the signed ten-hour public-touch projections for the original 5 bp
+distance and one-second mark, plus their method and rounding sources.
+It retains both sides, all original hourly bins, and all unknown
+marks. Reported means are bounded at their six-decimal rounding
+precision. W20 has 15 known negative sell-side marks among 21
+observed touches, but a mean of about +1.028 bp across the five
+unknown marks would bring the full touch-weighted mean to zero.
+The result describes public marks, with execution, cash, and venue
+latency still unmeasured by this diagnostic.
+[BTC public-touch markout magnitude](../.agent-state/forward_ops_20261118/btc_public_touch_markout_magnitude_20261125/REPORT.md)
+
+The ANT partial-repair cash diagnostic reuses the signed historical
+310 ms single-leg example from the November 20–21 continuous
+ten-hour window. It retains the original opening debit, $86.173
+modeled repair price, 1.12 bp venue fee, and 1.25 bp stress.
+Eight synthetic confirmation sizes preserve the same starting
+ledger. A hypothetical first confirmation of 1.10 ANT leaves
+0.05 ANT requiring a sale at $91.024535 to reach zero cash if later
+funding is zero. Execution, lot eligibility, and the complete cash
+of either original frozen wallet remain unknown.
+[ANT partial-repair cash boundary](../.agent-state/forward_ops_20261118/ant_residual_cash_after_partial_20261125/REPORT.md)
+
+The W23 original standing regression used the three hash-verified Tokyo
+archives and the original 14-profile roster, scorer, and cash method.
+Crypto and RWA each retained their own ten-hour decision clock, warm-up,
+and drain. A recorded trade-feed gap leaves the two quant and ten
+turnover cash projections unknown, with further funding and settlement
+blocks on one turnover profile. Both arbitrage profiles reported zero
+matched cycles. The separate preregistered W23 Core BTC calibration
+diagnostic rehashed the original 716,467,477-byte arrival-ordered tape
+on both hosts. It compared legacy and decision-only variance on the
+frozen first arm, with a relative sigma difference of +0.07102668%.
+The recorded trade-feed discontinuity remains separate from the
+quote sampling cadence. The diagnostic did not change the frozen
+profiles, fees, funding, or cash ledger.
+[W23 original standing scores](../.agent-state/forward_ops_20261118/w23_original_standing_14_scores_and_cash_20261125/REPORT.md)
+[W23 original BTC sigma](../.agent-state/forward_ops_20261118/w23_btc_decision_sigma_canonical_replication_20261125/REPORT.md)
+
+The SPY and QQQ primary-listing-hours comparison binds the signed W18,
+W21 and W23 RWA decision clocks. It intersects their original independent
+ten-hour intervals with the official NYSE Arca and Nasdaq schedules
+then in effect. None intersects the regular session. Scheduled early and
+late sessions together overlap zero, 3:50:53.786, and 2:00:00 respectively.
+These are calendar bounds. They leave timestamped ETF quotes, symbol-level
+halt observations, corporate-action clearance, and derivatives execution
+unresolved.
+[Exact clock intersection and exchange notices](../.agent-state/forward_ops_20261118/rwa_listing_hours_clock_overlap_w18_w21_w23_20261125/REPORT.md)
+
+The separate W23 SPY and QQQ gate audit binds native RWA Bronze
+and the compiled sidecars through the original paired replay inputs
+to the signed frozen score. Both original compiler configurations
+lack equity-session observations and use a missing external-reference
+source. Each original replay had 353,512 book frames, with over 99.9%
+classified as synchronized by the model, yet zero admitted entry
+checks or pairs. Funding-entry-horizon rejections remain separate.
+The original ten-hour boundary, archive provenance, and unknown
+economic assessment are retained.
+[W23 signed pair entry and reference scope](../.agent-state/forward_ops_20261118/w23_original_spy_qqq_entry_gate_and_reference_scope_20261125/REPORT.md)
+
+The W23 Core public-trade lifecycle audit verifies 22 signed hourly
+Crypto Core and RH trade shards and matches the canonical BTC tape
+lifecycle counts. It uses ceiling-rounded availability time on the
+original 10-hour Cwin. Core's shared disconnect starts at 05:17:27.072
+UTC on November 25. The next-epoch trade subscription acknowledgments
+leave 1,122 ms offline for BTC and 1,120 ms for ETH inside the same
+decision window. Crypto RH has no observed offline episode inside that
+clock. Twelve frozen Core BTC configurations share the one gap, with
+additional funding and settlement blocks on one configuration. The
+separate RWA archive's RH count does not inform the Crypto lifecycle or
+its modeled cash. Missing native trades, real fills, and net cash
+remain unknown.
+[W23 original trade gap and cash qualification](../.agent-state/forward_ops_20261118/w23_core_btc_trade_gap_exact_cash_scope_20261125/REPORT.md)
+
+The W23 Core same-venue reconnect snapshot audit reads one hash-verified
+05 UTC trade shard through the original timing validator. The next-epoch
+BTC and ETH acknowledgments each hold 50 distinct exchange trade IDs.
+Three BTC labels and one ETH label fall inside the corresponding collector
+outage bracket under an uncalibrated cross-clock comparison. Their first
+scoped availability is after the outage, with none of those IDs in
+ordinary messages elsewhere in that shard. The pinned public reader uses
+subscription snapshots for online state and deduplication. It does not
+emit the historical trades as decision inputs. This evidence constrains
+what became visible at recovery without determining the complete number
+of missing trades or an alternative cash outcome. All 12 original Core
+BTC cash results retain their frozen status.
+[W23 same-venue reconnect snapshot](../.agent-state/forward_ops_20261118/w23_core_native_reconnect_ack_trade_witness_20261125/REPORT.md)

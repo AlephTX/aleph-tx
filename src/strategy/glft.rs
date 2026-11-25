@@ -237,6 +237,12 @@ impl GlftQuoter {
         // Positive inventory (long) widens the bid offset and tightens the ask offset.
         let raw_bid_offset_bps = self.coeffs.raw_half_spread_bps + reservation_skew_bps;
         let raw_ask_offset_bps = self.coeffs.raw_half_spread_bps - reservation_skew_bps;
+        ensure!(
+            reservation_skew_bps.is_finite()
+                && raw_bid_offset_bps.is_finite()
+                && raw_ask_offset_bps.is_finite(),
+            "normalized GLFT raw quote overflowed"
+        );
 
         let (bid_offset_bps, bid_clamped_by_floor, bid_clamped_by_max) =
             clamp_offset(raw_bid_offset_bps, &self.params);
@@ -702,6 +708,281 @@ pub fn run_glft_benchmark() -> Result<GlftBenchmarkReport> {
     })
 }
 
+/// Volatility regime for two-state dynamic $\kappa$ calibration (`S1-3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolRegime {
+    Calm,
+    HighVol,
+}
+
+/// Configuration for two-regime rolling shallow-book $\kappa$ calibration with `S12-3` stability gates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegimeKappaConfig {
+    /// Trailing rolling lookback horizon (`ms`, default `600_000` = 10 min).
+    pub window_ms: u64,
+    /// Minimum cadence between recalibrations in the same regime (`ms`, default `5_000`).
+    pub recalibration_cadence_ms: u64,
+    /// Short-horizon sigma threshold entering [`VolRegime::HighVol`] (`bps / sqrt(s)`).
+    pub high_vol_enter_sigma_bps: f64,
+    /// Lower hysteresis threshold returning to [`VolRegime::Calm`] (`bps / sqrt(s)`).
+    pub high_vol_exit_sigma_bps: f64,
+    /// Maximum allowed single-window notional share before `S12-3` rejects calibration (`< 0.35`).
+    pub max_single_window_volume_share: f64,
+    /// Shallow calibration settings & conservative fallback in calm regime.
+    pub calm_shallow: ShallowCalibrationConfig,
+    /// Shallow calibration settings & conservative fallback in high-vol regime.
+    pub high_vol_shallow: ShallowCalibrationConfig,
+}
+
+impl Default for RegimeKappaConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: 600_000,
+            recalibration_cadence_ms: 5_000,
+            high_vol_enter_sigma_bps: 1.5,
+            high_vol_exit_sigma_bps: 1.2,
+            max_single_window_volume_share: 0.35,
+            calm_shallow: ShallowCalibrationConfig {
+                fallback_a: 2.5,
+                fallback_k: 1.85,
+                ..ShallowCalibrationConfig::default()
+            },
+            high_vol_shallow: ShallowCalibrationConfig {
+                fallback_a: 1.2,
+                fallback_k: 0.55,
+                ..ShallowCalibrationConfig::default()
+            },
+        }
+    }
+}
+
+impl RegimeKappaConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.window_ms > 0 && self.recalibration_cadence_ms > 0,
+            "window_ms and recalibration_cadence_ms must be > 0"
+        );
+        ensure!(
+            self.recalibration_cadence_ms <= self.window_ms,
+            "recalibration_cadence_ms must be <= window_ms"
+        );
+        ensure!(
+            self.high_vol_exit_sigma_bps.is_finite()
+                && self.high_vol_enter_sigma_bps.is_finite()
+                && self.high_vol_exit_sigma_bps > 0.0
+                && self.high_vol_enter_sigma_bps > self.high_vol_exit_sigma_bps,
+            "require finite 0 < high_vol_exit_sigma_bps < high_vol_enter_sigma_bps"
+        );
+        ensure!(
+            self.max_single_window_volume_share.is_finite()
+                && self.max_single_window_volume_share > 0.0
+                && self.max_single_window_volume_share <= 1.0,
+            "max_single_window_volume_share must be finite and in (0, 1]"
+        );
+        self.calm_shallow.validate()?;
+        self.high_vol_shallow.validate()?;
+        Ok(())
+    }
+}
+
+/// Non-overlapping fill window fed into [`RegimeDynamicKappaCalibrator`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeFillWindow {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub notional_volume_usd: f64,
+    pub observations: Vec<ShallowFillObservation>,
+}
+
+/// Result of a regime-aware dynamic $\kappa$ evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeKappaCalibration {
+    pub regime: VolRegime,
+    pub fit: ShallowIntensityFit,
+    pub max_window_volume_share: f64,
+    pub stability_gate_passed: bool,
+    pub gate_reason: Option<String>,
+    pub next_recalibration_after_ms: u64,
+}
+
+/// Causal two-regime dynamic $\kappa$ calibrator with hysteresis and `S12-3` stability gating.
+#[derive(Debug, Clone)]
+pub struct RegimeDynamicKappaCalibrator {
+    config: RegimeKappaConfig,
+    regime: VolRegime,
+    last_eval_ms: Option<u64>,
+    cached: Option<RegimeKappaCalibration>,
+}
+
+impl RegimeDynamicKappaCalibrator {
+    pub fn new(config: RegimeKappaConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            regime: VolRegime::Calm,
+            last_eval_ms: None,
+            cached: None,
+        })
+    }
+
+    pub fn current_regime(&self) -> VolRegime {
+        self.regime
+    }
+
+    pub fn update_and_calibrate(
+        &mut self,
+        now_ms: u64,
+        sigma_bps_per_sqrt_s: f64,
+        windows: &[RegimeFillWindow],
+    ) -> Result<RegimeKappaCalibration> {
+        ensure!(now_ms > 0, "now_ms must be > 0");
+        ensure!(
+            sigma_bps_per_sqrt_s.is_finite() && sigma_bps_per_sqrt_s >= 0.0,
+            "sigma_bps_per_sqrt_s must be finite and >= 0"
+        );
+        if let Some(prev_ms) = self.last_eval_ms {
+            ensure!(
+                now_ms >= prev_ms,
+                "regressed calibration timestamp {now_ms} < {prev_ms}"
+            );
+        }
+
+        // Validate ALL windows up front BEFORE mutating `self.regime` or cached state.
+        // Enforce strict S12-3 non-overlapping chronological window invariant.
+        for (idx, w) in windows.iter().enumerate() {
+            ensure!(
+                w.start_ms > 0 && w.end_ms > w.start_ms && w.end_ms <= now_ms,
+                "invalid or future fill window bounds at index {idx}"
+            );
+            ensure!(
+                w.notional_volume_usd.is_finite() && w.notional_volume_usd >= 0.0,
+                "invalid window notional volume at index {idx}"
+            );
+            if idx > 0 {
+                ensure!(
+                    w.start_ms >= windows[idx - 1].end_ms,
+                    "overlapping or out-of-order fill window at index {idx}"
+                );
+            }
+        }
+
+        let prev_regime = self.regime;
+        let next_regime = match prev_regime {
+            VolRegime::Calm if sigma_bps_per_sqrt_s >= self.config.high_vol_enter_sigma_bps => {
+                VolRegime::HighVol
+            }
+            VolRegime::HighVol if sigma_bps_per_sqrt_s <= self.config.high_vol_exit_sigma_bps => {
+                VolRegime::Calm
+            }
+            other => other,
+        };
+        self.regime = next_regime;
+
+        if next_regime == prev_regime
+            && let Some(cached) = self.cached.as_ref()
+            && now_ms < cached.next_recalibration_after_ms
+        {
+            self.last_eval_ms = Some(now_ms);
+            return Ok(cached.clone());
+        }
+
+        let cutoff = now_ms.saturating_sub(self.config.window_ms);
+        let active_cfg = match next_regime {
+            VolRegime::Calm => &self.config.calm_shallow,
+            VolRegime::HighVol => &self.config.high_vol_shallow,
+        };
+
+        let mut total_vol = 0.0_f64;
+        let mut max_win_vol = 0.0_f64;
+        let mut active_windows = 0usize;
+        // Pool observations by discrete `distance_ticks` across active windows so repeating
+        // a sparse set of ticks across windows cannot artificially pass `min_buckets`.
+        let mut pooled: std::collections::BTreeMap<u32, (u64, f64, f64)> =
+            std::collections::BTreeMap::new();
+        for w in windows.iter().filter(|w| w.end_ms > cutoff) {
+            active_windows += 1;
+            total_vol += w.notional_volume_usd;
+            if w.notional_volume_usd > max_win_vol {
+                max_win_vol = w.notional_volume_usd;
+            }
+            for obs in &w.observations {
+                if obs.sample_count == 0
+                    || !obs.distance_bps.is_finite()
+                    || !obs.arrival_rate_per_sec.is_finite()
+                    || obs.distance_bps <= 0.0
+                    || obs.arrival_rate_per_sec <= 0.0
+                {
+                    continue;
+                }
+                let entry = pooled.entry(obs.distance_ticks).or_insert((0, 0.0, 0.0));
+                entry.0 = entry.0.saturating_add(obs.sample_count);
+                let weight = obs.sample_count as f64;
+                entry.1 += weight * obs.distance_bps;
+                entry.2 += weight * obs.arrival_rate_per_sec;
+            }
+        }
+        let combined_obs: Vec<ShallowFillObservation> = pooled
+            .into_iter()
+            .filter(|(_, (cnt, _, _))| *cnt > 0)
+            .map(|(distance_ticks, (cnt, sum_dist, sum_rate))| {
+                let w = cnt as f64;
+                ShallowFillObservation {
+                    distance_ticks,
+                    distance_bps: sum_dist / w,
+                    arrival_rate_per_sec: sum_rate / w,
+                    sample_count: cnt,
+                }
+            })
+            .collect();
+
+        let max_share = if total_vol > 0.0 {
+            max_win_vol / total_vol
+        } else {
+            1.0
+        };
+        let next_after = now_ms.saturating_add(self.config.recalibration_cadence_ms);
+
+        let result = if active_windows < 2 || total_vol <= 0.0 {
+            let fit = calibrate_shallow_intensity(&[], active_cfg)?;
+            RegimeKappaCalibration {
+                regime: next_regime,
+                fit,
+                max_window_volume_share: max_share,
+                stability_gate_passed: false,
+                gate_reason: Some("insufficient_non_overlapping_windows".into()),
+                next_recalibration_after_ms: next_after,
+            }
+        } else if max_share >= self.config.max_single_window_volume_share {
+            let fit = calibrate_shallow_intensity(&[], active_cfg)?;
+            RegimeKappaCalibration {
+                regime: next_regime,
+                fit,
+                max_window_volume_share: max_share,
+                stability_gate_passed: false,
+                gate_reason: Some("single_window_volume_concentration".into()),
+                next_recalibration_after_ms: next_after,
+            }
+        } else {
+            let fit = calibrate_shallow_intensity(&combined_obs, active_cfg)?;
+            RegimeKappaCalibration {
+                regime: next_regime,
+                fit,
+                max_window_volume_share: max_share,
+                stability_gate_passed: !fit.used_fallback,
+                gate_reason: fit
+                    .used_fallback
+                    .then(|| format!("shallow_fallback:{:?}", fit.fallback_reason)),
+                next_recalibration_after_ms: next_after,
+            }
+        };
+
+        self.last_eval_ms = Some(now_ms);
+        self.cached = Some(result.clone());
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,5 +1244,218 @@ mod tests {
             ..ShallowCalibrationConfig::default()
         };
         assert!(calibrate_shallow_intensity(&[], &bad_cfg).is_err());
+    }
+
+    #[test]
+    fn glft_rejects_raw_quote_overflow_while_preserving_extreme_finite_clamps() {
+        for inventory_sign in [1.0_f64, -1.0_f64] {
+            let mut skew_params = barbell_reference_params();
+            skew_params.sigma_bps_per_sqrt_s = 13.35;
+            skew_params.inventory_skew_scale = f64::MAX;
+            let skew_overflow = GlftQuoter::new(skew_params).unwrap();
+            let quantity = inventory_sign * skew_params.max_inventory_base;
+            assert!((skew_overflow.coefficients().skew_per_unit_bps * f64::MAX).is_infinite());
+            assert_eq!(
+                skew_overflow.quote(quantity).unwrap_err().to_string(),
+                "normalized GLFT raw quote overflowed"
+            );
+
+            let mut raw_params = barbell_reference_params();
+            raw_params.sigma_bps_per_sqrt_s = 1.6e308;
+            raw_params.inventory_skew_scale = 5.0;
+            let sum_overflow = GlftQuoter::new(raw_params).unwrap();
+            let coeffs = sum_overflow.coefficients();
+            let skew = coeffs.skew_per_unit_bps * raw_params.inventory_skew_scale;
+            assert!(skew.is_finite() && (coeffs.raw_half_spread_bps + skew).is_infinite());
+            assert_eq!(
+                sum_overflow.quote(quantity).unwrap_err().to_string(),
+                "normalized GLFT raw quote overflowed"
+            );
+        }
+
+        let mut extreme_finite = barbell_reference_params();
+        extreme_finite.inventory_skew_scale = f64::MAX;
+        let q = GlftQuoter::new(extreme_finite).unwrap();
+        let res = q.quote(extreme_finite.max_inventory_base).unwrap();
+        assert!(res.reservation_skew_bps.is_finite());
+        assert!(res.raw_bid_offset_bps.is_finite() && res.raw_ask_offset_bps.is_finite());
+        assert_eq!(res.bid_offset_bps, 50.0);
+        assert_eq!(res.ask_offset_bps, 0.40);
+    }
+
+    fn synth_shallow_obs(a: f64, k: f64) -> Vec<ShallowFillObservation> {
+        [(1_u32, 0.25), (5, 0.75), (15, 1.50), (40, 2.50)]
+            .into_iter()
+            .map(|(distance_ticks, distance_bps)| ShallowFillObservation {
+                distance_ticks,
+                distance_bps,
+                arrival_rate_per_sec: a * (-k * distance_bps).exp(),
+                sample_count: 50,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_regime_dynamic_kappa_enforces_hysteresis_cadence_and_s12_3_volume_gate() {
+        let mut cal = RegimeDynamicKappaCalibrator::new(RegimeKappaConfig::default()).unwrap();
+        let calm_obs = synth_shallow_obs(2.8, 1.9);
+        let hv_obs = synth_shallow_obs(1.1, 0.6);
+
+        // Balanced 3 non-overlapping 2-minute windows in Calm regime -> passes S12-3.
+        let calm_windows = vec![
+            RegimeFillWindow {
+                start_ms: 1_000,
+                end_ms: 121_000,
+                notional_volume_usd: 1_000.0,
+                observations: calm_obs.clone(),
+            },
+            RegimeFillWindow {
+                start_ms: 121_000,
+                end_ms: 241_000,
+                notional_volume_usd: 1_100.0,
+                observations: calm_obs.clone(),
+            },
+            RegimeFillWindow {
+                start_ms: 241_000,
+                end_ms: 361_000,
+                notional_volume_usd: 1_050.0,
+                observations: calm_obs,
+            },
+        ];
+        let c1 = cal
+            .update_and_calibrate(361_000, 1.0, &calm_windows)
+            .unwrap();
+        assert_eq!(c1.regime, VolRegime::Calm);
+        assert!(c1.stability_gate_passed);
+        assert!((c1.fit.decay_k - 1.9).abs() < 1e-3);
+
+        // Within 5s cadence in same regime -> reuses cached calibration without jittering.
+        let c_cached = cal
+            .update_and_calibrate(364_000, 1.35, &calm_windows)
+            .unwrap();
+        assert_eq!(c_cached.regime, VolRegime::Calm);
+        assert_eq!(c_cached.fit.decay_k, c1.fit.decay_k);
+
+        // Single-window dominance (>= 35% of volume, like July 1 60% spike) triggers S12-3 fallback!
+        let skewed_windows = vec![
+            RegimeFillWindow {
+                start_ms: 1_000,
+                end_ms: 121_000,
+                notional_volume_usd: 6_000.0,
+                observations: hv_obs.clone(),
+            },
+            RegimeFillWindow {
+                start_ms: 121_000,
+                end_ms: 241_000,
+                notional_volume_usd: 2_000.0,
+                observations: hv_obs.clone(),
+            },
+            RegimeFillWindow {
+                start_ms: 241_000,
+                end_ms: 361_000,
+                notional_volume_usd: 2_000.0,
+                observations: hv_obs.clone(),
+            },
+        ];
+        let c_skew = cal
+            .update_and_calibrate(370_000, 1.6, &skewed_windows)
+            .unwrap();
+        assert_eq!(c_skew.regime, VolRegime::HighVol);
+        assert!(!c_skew.stability_gate_passed);
+        assert_eq!(
+            c_skew.gate_reason.as_deref(),
+            Some("single_window_volume_concentration")
+        );
+        assert!(c_skew.fit.used_fallback);
+        assert!((c_skew.fit.decay_k - 0.55).abs() < 1e-9);
+
+        // Hysteresis keeps HighVol at sigma=1.35 (> 1.2 exit), drops back to Calm at 1.15.
+        let balanced_hv: Vec<_> = skewed_windows
+            .iter()
+            .map(|w| RegimeFillWindow {
+                notional_volume_usd: 3_000.0,
+                ..w.clone()
+            })
+            .collect();
+        let c_hold = cal
+            .update_and_calibrate(376_000, 1.35, &balanced_hv)
+            .unwrap();
+        assert_eq!(c_hold.regime, VolRegime::HighVol);
+        assert!(c_hold.stability_gate_passed);
+        assert!((c_hold.fit.decay_k - 0.6).abs() < 1e-3);
+
+        let c_exit = cal
+            .update_and_calibrate(382_000, 1.15, &balanced_hv)
+            .unwrap();
+        assert_eq!(c_exit.regime, VolRegime::Calm);
+
+        // Overlapping windows fail closed.
+        let mut overlapping = balanced_hv;
+        overlapping[1].start_ms = overlapping[0].end_ms - 1;
+        assert!(
+            cal.update_and_calibrate(390_000, 1.0, &overlapping)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn two_regime_dynamic_kappa_keeps_regime_atomic_on_error_and_pools_duplicate_ticks() {
+        let mut cal = RegimeDynamicKappaCalibrator::new(RegimeKappaConfig::default()).unwrap();
+        assert_eq!(cal.current_regime(), VolRegime::Calm);
+
+        // Invalid overlapping windows with high-vol sigma must fail closed WITHOUT mutating `self.regime`.
+        let obs2 = vec![
+            ShallowFillObservation {
+                distance_ticks: 1,
+                distance_bps: 0.4,
+                arrival_rate_per_sec: 3.0,
+                sample_count: 100,
+            },
+            ShallowFillObservation {
+                distance_ticks: 2,
+                distance_bps: 0.8,
+                arrival_rate_per_sec: 1.5,
+                sample_count: 100,
+            },
+        ];
+        let invalid_windows = vec![
+            RegimeFillWindow {
+                start_ms: 1_000,
+                end_ms: 50_000,
+                notional_volume_usd: 1_000.0,
+                observations: obs2.clone(),
+            },
+            RegimeFillWindow {
+                start_ms: 40_000,
+                end_ms: 90_000,
+                notional_volume_usd: 1_000.0,
+                observations: obs2.clone(),
+            },
+        ];
+        assert!(
+            cal.update_and_calibrate(90_000, 2.5, &invalid_windows)
+                .is_err()
+        );
+        assert_eq!(cal.current_regime(), VolRegime::Calm);
+
+        // 4 valid windows that each only cover ticks {1, 2} must pool into 2 buckets
+        // and fail min_buckets = 4 fallback rather than counting 8 raw entries.
+        let sparse_windows: Vec<_> = (0..4_u64)
+            .map(|i| RegimeFillWindow {
+                start_ms: 1_000 + i * 30_000,
+                end_ms: 31_000 + i * 30_000,
+                notional_volume_usd: 1_000.0,
+                observations: obs2.clone(),
+            })
+            .collect();
+        let pooled_out = cal
+            .update_and_calibrate(121_000, 1.0, &sparse_windows)
+            .unwrap();
+        assert!(!pooled_out.stability_gate_passed);
+        assert_eq!(pooled_out.fit.retained_buckets, 2);
+        assert_eq!(
+            pooled_out.fit.fallback_reason,
+            Some(CalibrationFallbackReason::InsufficientBuckets)
+        );
     }
 }

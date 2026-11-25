@@ -9,6 +9,7 @@ Helps shift market making away from crowded 0-fee BTC/ETH books toward high spre
 niches (e.g., Arcus RWA 0-bp maker or long-tail markets).
 """
 import argparse
+from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 import json
 import math
@@ -134,6 +135,25 @@ def _is_nonpositive_fee(raw_fee) -> bool:
         return False
 
 
+def _parse_book_top(levels):
+    if not isinstance(levels, Sequence) or isinstance(levels, (str, bytes, bytearray)) or not levels:
+        return None
+    top = levels[0]
+    if not isinstance(top, Sequence) or isinstance(top, (str, bytes, bytearray)) or len(top) < 2:
+        return None
+    raw_px, raw_sz = top[0], top[1]
+    if isinstance(raw_px, bool) or isinstance(raw_sz, bool):
+        return None
+    try:
+        px = float(raw_px)
+        sz = float(raw_sz)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(px) and math.isfinite(sz)):
+        return None
+    return px, sz
+
+
 def score_market_book_series(
     samples,
     *,
@@ -149,6 +169,17 @@ def score_market_book_series(
     expected_1s_adverse_selection_bps=None,
 ):
     """Score chronological `{timestamp_ms, bids: [[px, sz], ...], asks: [[px, sz], ...]}` frames."""
+    max_gap_ms_val = _validate_finite_real(max_gap_ms, "max_gap_ms")
+    if max_gap_ms_val <= 0.0:
+        raise ValueError("max_gap_ms must be > 0")
+    adv = None
+    if expected_1s_adverse_selection_bps is not None:
+        adv = _validate_finite_real(
+            expected_1s_adverse_selection_bps, "expected_1s_adverse_selection_bps"
+        )
+        if adv < 0.0:
+            raise ValueError("expected_1s_adverse_selection_bps must be finite and nonnegative")
+
     spreads_bps = []
     l1_notionals = []
     var_per_sec = []
@@ -157,28 +188,42 @@ def score_market_book_series(
     prev_ts = None
 
     for frame in samples:
-        ts = frame.get("timestamp_ms")
-        bids = frame.get("bids") or []
-        asks = frame.get("asks") or []
-        if (type(ts) not in (int, float) or not math.isfinite(ts) or ts < 0
-                or (prev_ts is not None and ts < prev_ts) or not bids or not asks):
+        if not isinstance(frame, dict):
             continue
-        bid_px, bid_sz = float(bids[0][0]), float(bids[0][1])
-        ask_px, ask_sz = float(asks[0][0]), float(asks[0][1])
-        if (not all(math.isfinite(x) for x in (bid_px, ask_px, bid_sz, ask_sz))
-                or not (0 < bid_px < ask_px and bid_sz > 0 and ask_sz > 0)):
+        ts = frame.get("timestamp_ms")
+        try:
+            finite_timestamp = type(ts) in (int, float) and math.isfinite(ts)
+        except OverflowError:
+            continue
+        top_bid = _parse_book_top(frame.get("bids"))
+        top_ask = _parse_book_top(frame.get("asks"))
+        if (not finite_timestamp or ts < 0
+                or (prev_ts is not None and ts < prev_ts)
+                or top_bid is None or top_ask is None):
+            continue
+        bid_px, bid_sz = top_bid
+        ask_px, ask_sz = top_ask
+        if not (0 < bid_px < ask_px and bid_sz > 0 and ask_sz > 0):
             continue
         mid = bid_px + (ask_px - bid_px) / 2
+        spread_bps = (ask_px - bid_px) / mid * 10_000.0
         l1_notional = min(bid_px * bid_sz, ask_px * ask_sz)
-        if not math.isfinite(l1_notional):
+        if not (math.isfinite(mid) and mid > 0 and math.isfinite(spread_bps) and math.isfinite(l1_notional)):
             continue
-        spreads_bps.append((ask_px - bid_px) / mid * 10_000.0)
-        l1_notionals.append(l1_notional)
-        if prev_mid is not None and prev_ts is not None and 0 < ts - prev_ts <= max_gap_ms:
-            ret_bps = (mid - prev_mid) / prev_mid * 10_000.0
+        if prev_mid is not None and prev_ts is not None and 0 < ts - prev_ts <= max_gap_ms_val:
             dt_s = (ts - prev_ts) / 1_000.0
-            var_per_sec.append((ret_bps * ret_bps) / dt_s)
-            abs_scaled_rets.append(abs(ret_bps) / math.sqrt(dt_s))
+            # A positive millisecond interval can round to zero in seconds.
+            if dt_s == 0.0:
+                continue
+            ret_bps = (mid - prev_mid) / prev_mid * 10_000.0
+            var_rate = (ret_bps * ret_bps) / dt_s
+            scaled_abs = abs(ret_bps) / math.sqrt(dt_s)
+            if not (math.isfinite(ret_bps) and math.isfinite(var_rate) and math.isfinite(scaled_abs)):
+                continue
+            var_per_sec.append(var_rate)
+            abs_scaled_rets.append(scaled_abs)
+        spreads_bps.append(spread_bps)
+        l1_notionals.append(l1_notional)
         prev_mid = mid
         prev_ts = ts
 
@@ -216,14 +261,16 @@ def score_market_book_series(
         }
 
     med_spread = median(spreads_bps)
-    vol_1s = math.sqrt(sum(var_per_sec) / len(var_per_sec))
-    ratio = med_spread / vol_1s if vol_1s > 1e-12 else None
+    sum_var = sum(var_per_sec)
+    if not (math.isfinite(med_spread) and math.isfinite(sum_var) and sum_var >= 0.0):
+        raise ValueError("computed spread or variance summary overflowed to non-finite value")
+    vol_1s = math.sqrt(sum_var / len(var_per_sec))
+    if not math.isfinite(vol_1s):
+        raise ValueError("realized_1s_vol_bps overflowed to non-finite value")
+    ratio = med_spread / vol_1s if vol_1s > 1e-12 and math.isfinite(med_spread / vol_1s) else None
     net_half_spread = 0.5 * med_spread - maker_fee_bps if math.isfinite(maker_fee_bps) else None
     margin_ok = None
-    if expected_1s_adverse_selection_bps is not None and net_half_spread is not None:
-        adv = float(expected_1s_adverse_selection_bps)
-        if not math.isfinite(adv) or adv < 0:
-            raise ValueError("expected_1s_adverse_selection_bps must be finite and nonnegative")
+    if adv is not None and net_half_spread is not None:
         margin_ok = net_half_spread >= 2.0 * adv
     return {
         "capability_snapshot_version": scope["capability_snapshot_version"],
@@ -262,8 +309,12 @@ def rank_markets(metrics):
             m["net_half_spread_after_maker_fee_bps"] is not None
             and m["net_half_spread_after_maker_fee_bps"] > 0,
             _is_nonpositive_fee(m["maker_fee_bps"]),
-            m["spread_to_1s_vol_ratio"] or -1.0,
-            m["net_half_spread_after_maker_fee_bps"] or -1e9,
+            m["spread_to_1s_vol_ratio"] if m["spread_to_1s_vol_ratio"] is not None else -1.0,
+            (
+                m["net_half_spread_after_maker_fee_bps"]
+                if m["net_half_spread_after_maker_fee_bps"] is not None
+                else -1e9
+            ),
         ),
         reverse=True,
     )
@@ -351,12 +402,14 @@ def main(argv=None):
                 symbol=spec["symbol"],
                 asset_class=spec["asset_class"],
                 account_tier=spec["account_tier"],
+                strategy_posture=spec.get("strategy_posture", "directional_or_unhedged"),
                 growth_mode=spec.get("growth_mode", False),
                 deployer_fee_scale=spec.get("deployer_fee_scale", "1"),
+                max_gap_ms=spec.get("max_gap_ms", 10_000),
                 expected_1s_adverse_selection_bps=spec.get("expected_1s_adverse_selection_bps"),
             )
         )
-    print(json.dumps(rank_markets(results), indent=2))
+    print(json.dumps(rank_markets(results), indent=2, allow_nan=False))
     return 0
 
 

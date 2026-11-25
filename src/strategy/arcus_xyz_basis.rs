@@ -12,15 +12,26 @@ use crate::exchanges::arcus::{
 };
 use crate::exchanges::hyperliquid::{
     AccountState as HlAccountState, ExecutionStatus as HlExecutionStatus, OpenOrder as HlOpenOrder,
-    OrderLookup as HlOrderLookup, PerpAsset as HlPerpAsset, SubmissionError as HlSubmissionError,
-    ValidatedBook,
+    OrderLookup as HlOrderLookup, PerpAsset as HlPerpAsset, PerpMarket as HlPerpMarket,
+    SubmissionError as HlSubmissionError, ValidatedBook,
 };
 use crate::live_hedge::{
     IocIdentity, LOOKUP_SKEW_MS, LookupOutcome, account_confirmed_fill, classify_lookup,
 };
 use crate::order_budget::OrderBudgetConfig;
+use crate::shm_reader::{NUM_EXCHANGES, NUM_SYMBOLS};
+use crate::strategy::basis_core::quantize_shared_step_qty;
+use crate::strategy::kalman_basis::{
+    KalmanBasisConfig, KalmanBasisFilter, KalmanBasisSnapshot, MakerEntrySide, SessionRegime,
+};
 use crate::strategy::tail_risk::{
-    AdlRiskLevel, TailRiskAssessment, TailRiskConfig, VenueMarginSnapshot, evaluate_tail_risk,
+    AdlDeltaAction, AdlDeltaBreakerConfig, AdlRiskLevel, NetDeltaSnapshot, TailRiskAction,
+    TailRiskAssessment, TailRiskConfig, VenueMarginSnapshot, evaluate_adl_delta_breaker,
+    evaluate_tail_risk,
+};
+use crate::strategy::venue_guards::{
+    VenueMarketMetadata, VenuePreflightPolicy, evaluate_reference_oracle_divergence_bps,
+    validate_venue_market_preflight,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rust_decimal::prelude::ToPrimitive;
@@ -77,6 +88,83 @@ fn default_poll_interval_ms() -> u64 {
 fn default_account_refresh_interval_ms() -> u64 {
     1_000
 }
+fn default_max_hl_deployer_fee_scale() -> f64 {
+    1.0
+}
+fn default_max_oracle_divergence_bps() -> f64 {
+    25.0
+}
+fn default_max_oracle_age_ms() -> u64 {
+    // One account-refresh interval of staleness tolerance by default. The oracle price is
+    // refreshed with the account snapshot (account_refresh_interval_ms), so anything older
+    // than roughly one refresh cycle is treated as stale for new-entry gating.
+    2_000
+}
+fn default_bbo_shm_path() -> String {
+    "/dev/shm/aleph-matrix".to_owned()
+}
+fn default_depth_shm_path() -> String {
+    "/dev/shm/aleph-depth".to_owned()
+}
+fn default_arcus_shm_exchange_id() -> u8 {
+    7
+}
+fn default_hl_shm_exchange_id() -> u8 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShmBookFeedConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_bbo_shm_path")]
+    pub bbo_shm_path: String,
+    #[serde(default = "default_depth_shm_path")]
+    pub depth_shm_path: String,
+    #[serde(default)]
+    pub symbol_id: usize,
+    #[serde(default = "default_arcus_shm_exchange_id")]
+    pub arcus_exchange_id: u8,
+    #[serde(default = "default_hl_shm_exchange_id")]
+    pub hl_exchange_id: u8,
+}
+
+impl Default for ShmBookFeedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bbo_shm_path: default_bbo_shm_path(),
+            depth_shm_path: default_depth_shm_path(),
+            symbol_id: 0,
+            arcus_exchange_id: default_arcus_shm_exchange_id(),
+            hl_exchange_id: default_hl_shm_exchange_id(),
+        }
+    }
+}
+
+impl ShmBookFeedConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.symbol_id < NUM_SYMBOLS,
+            "shm_book_feed.symbol_id ({}) must be < {NUM_SYMBOLS}",
+            self.symbol_id
+        );
+        ensure!(
+            usize::from(self.arcus_exchange_id) < NUM_EXCHANGES
+                && usize::from(self.hl_exchange_id) < NUM_EXCHANGES
+                && self.arcus_exchange_id != self.hl_exchange_id,
+            "shm_book_feed exchange IDs must be distinct and < {NUM_EXCHANGES}"
+        );
+        if self.enabled {
+            ensure!(
+                !self.bbo_shm_path.trim().is_empty() && !self.depth_shm_path.trim().is_empty(),
+                "shm_book_feed paths must be non-empty when enabled"
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +207,18 @@ pub struct ArcusXyzBasisConfig {
     pub canary_max_total_notional_usd: f64,
     #[serde(default = "default_true")]
     pub require_arcus_cancel_lease: bool,
+    #[serde(default)]
+    pub require_hl_growth_mode: Option<bool>,
+    #[serde(default = "default_max_hl_deployer_fee_scale")]
+    pub max_hl_deployer_fee_scale: f64,
+    #[serde(default = "default_max_oracle_divergence_bps")]
+    pub max_oracle_divergence_bps: f64,
+    /// Maximum tolerated age (local receipt time minus oracle source time) of the HL oracle
+    /// price before the divergence gate treats it as stale and blocks NEW entries (fail-closed).
+    /// Reduce/close paths stay open. Guards against a stale cached oracle that still looks
+    /// aligned to a freshly-moved book.
+    #[serde(default = "default_max_oracle_age_ms")]
+    pub max_oracle_age_ms: u64,
     #[serde(default = "default_true")]
     pub dry_run: bool,
     #[serde(default = "default_poll_interval_ms")]
@@ -129,11 +229,22 @@ pub struct ArcusXyzBasisConfig {
     pub order_budget: OrderBudgetConfig,
     #[serde(default)]
     pub tail_risk: TailRiskConfig,
+    #[serde(default)]
+    pub adl_delta_breaker: AdlDeltaBreakerConfig,
+    #[serde(default)]
+    pub kalman_basis: Option<KalmanBasisConfig>,
+    #[serde(default)]
+    pub shm_book_feed: ShmBookFeedConfig,
     pub journal_path: PathBuf,
     pub daily_loss_state_path: PathBuf,
 }
 
 impl ArcusXyzBasisConfig {
+    /// Require Hyperliquid HIP-3 Growth Mode (`growth_mode == "enabled"`) by default on HIP-3 DEXes (`!hl_dex.is_empty()`).
+    pub fn effective_require_hl_growth_mode(&self) -> bool {
+        self.require_hl_growth_mode
+            .unwrap_or_else(|| !self.hl_dex.trim().is_empty())
+    }
     pub fn book_problem(
         &self,
         now_ms: u64,
@@ -141,6 +252,9 @@ impl ArcusXyzBasisConfig {
         xyz: &ValidatedBook,
         xyz_rx_ms: u64,
     ) -> Option<&'static str> {
+        if now_ms == 0 {
+            return Some("invalid_eval_time");
+        }
         if arc.bid_px <= Decimal::ZERO
             || arc.ask_px <= arc.bid_px
             || arc.bid_sz <= Decimal::ZERO
@@ -148,8 +262,14 @@ impl ArcusXyzBasisConfig {
         {
             return Some("invalid_arcus_book");
         }
+        if arc.receipt_ms == 0 || arc.receipt_ms > now_ms {
+            return Some("invalid_arcus_receipt_time");
+        }
         if now_ms.saturating_sub(arc.receipt_ms) > self.max_arcus_book_age_ms {
             return Some("stale_arcus_book");
+        }
+        if xyz_rx_ms == 0 || xyz_rx_ms > now_ms {
+            return Some("invalid_xyz_receipt_time");
         }
         if now_ms.saturating_sub(xyz_rx_ms) > self.max_hl_book_age_ms {
             return Some("stale_xyz_book");
@@ -278,8 +398,44 @@ impl ArcusXyzBasisConfig {
                 && !self.daily_loss_state_path.as_os_str().is_empty(),
             "journal_path and daily_loss_state_path must be non-empty"
         );
+        ensure!(
+            self.max_hl_deployer_fee_scale.is_finite() && self.max_hl_deployer_fee_scale >= 0.0,
+            "max_hl_deployer_fee_scale must be finite and >= 0"
+        );
+        ensure!(
+            self.max_oracle_divergence_bps.is_finite() && self.max_oracle_divergence_bps > 0.0,
+            "max_oracle_divergence_bps must be finite and > 0"
+        );
+        ensure!(
+            self.max_oracle_age_ms >= self.poll_interval_ms,
+            "max_oracle_age_ms ({}) must be >= poll_interval_ms ({})",
+            self.max_oracle_age_ms,
+            self.poll_interval_ms
+        );
         self.order_budget.validate()?;
         self.tail_risk.validate()?;
+        self.adl_delta_breaker.validate()?;
+        // The ADL breaker's response/halt SLAs are measured against the loop that observes
+        // the residual, which runs at most once per `poll_interval_ms`. If `halt_sla_ms` is
+        // shorter than one poll, any residual that a single hedge attempt fails to clear is
+        // re-observed only after `elapsed >= poll_interval_ms > halt_sla_ms`, so the breaker
+        // escalates straight to HaltAndFlatten and the `EmergencyReduceLeg` response tier is
+        // unreachable. Require the halt ceiling to span at least one observation cycle so the
+        // configured SLAs reflect the architecture's actual detection cadence. (Account-sourced
+        // ADL detection can lag a further `account_refresh_interval_ms`; the sub-100ms response
+        // SLA is only physically reachable with a faster private-event inner loop, which is not
+        // wired here — see docs/ARCUS_XYZ_BASIS_RUNBOOK.md.)
+        ensure!(
+            self.adl_delta_breaker.halt_sla_ms >= self.poll_interval_ms,
+            "adl_delta_breaker.halt_sla_ms ({}) must be >= poll_interval_ms ({}): a sub-poll halt \
+             SLA skips the reduce-only response tier and escalates directly to halt",
+            self.adl_delta_breaker.halt_sla_ms,
+            self.poll_interval_ms
+        );
+        if let Some(kalman) = &self.kalman_basis {
+            kalman.validate()?;
+        }
+        self.shm_book_feed.validate()?;
         Ok(())
     }
 
@@ -304,6 +460,51 @@ impl ArcusXyzBasisConfig {
         );
         Ok(())
     }
+}
+
+/// Preflight gate for Hyperliquid HIP-3 / native perp markets, delegating to the
+/// venue-agnostic [`validate_venue_market_preflight`] boundary.
+pub fn validate_hl_market_preflight(
+    market: &HlPerpMarket,
+    cfg: &ArcusXyzBasisConfig,
+) -> Result<()> {
+    let fee_scale = market
+        .asset
+        .deployer_fee_scale
+        .as_deref()
+        .map(|raw| {
+            raw.trim().parse::<f64>().with_context(|| {
+                format!(
+                    "invalid deployer_fee_scale '{raw}' for '{}'",
+                    market.asset.name
+                )
+            })
+        })
+        .transpose()?;
+    let meta = VenueMarketMetadata {
+        venue_id: "hyperliquid".into(),
+        symbol: market.asset.name.clone(),
+        is_delisted: market.asset.is_delisted,
+        fee_discount_mode: market.asset.growth_mode.clone(),
+        fee_scale,
+        oracle_price: Some(market.oracle_price),
+    };
+    let policy = VenuePreflightPolicy {
+        require_fee_discount_mode: cfg
+            .effective_require_hl_growth_mode()
+            .then(|| "enabled".to_owned()),
+        max_fee_scale: cfg.max_hl_deployer_fee_scale,
+    };
+    validate_venue_market_preflight(&meta, &policy)
+}
+
+/// Evaluate cross-venue execution mid vs Hyperliquid oracle divergence via [`evaluate_reference_oracle_divergence_bps`].
+pub fn evaluate_oracle_divergence_bps(
+    arcus_ref_px: Decimal,
+    hl_oracle_px: Decimal,
+    max_divergence_bps: f64,
+) -> Result<(f64, TailRiskAction)> {
+    evaluate_reference_oracle_divergence_bps(arcus_ref_px, hl_oracle_px, max_divergence_bps)
 }
 
 /// Top-of-book Arcus snapshot keeping venue source time separate from local receipt time.
@@ -346,15 +547,6 @@ pub enum BasisAction {
     },
 }
 
-fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a
-}
-
 /// Quantize base size down conservatively to HL's lot precision (`sz_decimals`).
 pub fn quantize_hl_base_qty(raw_qty: Decimal, hl_sz_decimals: u32) -> Result<Decimal> {
     ensure!(
@@ -376,36 +568,9 @@ pub fn quantize_shared_base_qty(
         raw_qty > Decimal::ZERO && arcus_step > Decimal::ZERO && hl_sz_decimals <= 6,
         "invalid quantization parameters"
     );
-    let arc_norm = arcus_step.normalize();
     let hl_step = Decimal::new(1, hl_sz_decimals).normalize();
-    let scale = arc_norm.scale().max(hl_step.scale());
-    ensure!(scale <= 12, "step size precision exceeds 12 decimal places");
-    let pow10 = 10_i128.checked_pow(scale).context("step scale overflow")?;
-    let pow10_dec = Decimal::from_i128_with_scale(pow10, 0);
-    let arc_scaled = (arc_norm * pow10_dec).normalize();
-    ensure!(
-        arc_scaled.fract().is_zero() && arc_scaled > Decimal::ZERO,
-        "Arcus step_size {arcus_step} cannot be represented cleanly at scale {scale}"
-    );
-    let arc_ticks = u128::try_from(arc_scaled.mantissa()).context("Arcus step ticks overflow")?;
-    let hl_scaled = (hl_step * pow10_dec).normalize();
-    let hl_ticks = u128::try_from(hl_scaled.mantissa()).context("HL step ticks overflow")?;
-    let g = gcd_u128(arc_ticks, hl_ticks);
-    let lcm_ticks = (arc_ticks / g)
-        .checked_mul(hl_ticks)
-        .context("shared step LCM overflow")?;
-    let lcm_i128 = i128::try_from(lcm_ticks).context("shared step exceeds Decimal range")?;
-    let shared_step = Decimal::from_i128_with_scale(lcm_i128, scale).normalize();
-
-    let units = (raw_qty / shared_step)
-        .round_dp_with_strategy(0, RoundingStrategy::ToZero)
-        .max(Decimal::ZERO);
-    let q = (units * shared_step).normalize();
+    let q = quantize_shared_step_qty(raw_qty, arcus_step, hl_step)?;
     if q > Decimal::ZERO {
-        ensure!(
-            (q % arcus_step).is_zero(),
-            "quantized qty {q} is not a multiple of arcus_step {arcus_step}"
-        );
         ensure!(
             q.scale() <= hl_sz_decimals,
             "quantized qty {q} exceeds hl_sz_decimals {hl_sz_decimals}"
@@ -698,17 +863,24 @@ pub struct ArcusXyzBasisEngine {
     in_flight: bool,
     residual_blocked_reason: Option<&'static str>,
     entry_open_ms: Option<u64>,
+    unplanned_residual_since_ms: Option<u64>,
     last_trade_arc_rx_ms: u64,
     last_trade_xyz_rx_ms: u64,
     armed_dir: Option<i8>,
     armed_since_ms: u64,
     dust_qty: Decimal,
+    kalman: Option<KalmanBasisFilter>,
+    last_kalman_snapshot: Option<KalmanBasisSnapshot>,
     pub counters: BasisEngineCounters,
 }
 
 impl ArcusXyzBasisEngine {
     pub fn new(config: ArcusXyzBasisConfig) -> Result<Self> {
         config.validate()?;
+        let kalman = config
+            .kalman_basis
+            .map(KalmanBasisFilter::new)
+            .transpose()?;
         Ok(Self {
             config,
             constraints: VenueOrderConstraints::default(),
@@ -717,11 +889,14 @@ impl ArcusXyzBasisEngine {
             in_flight: false,
             residual_blocked_reason: None,
             entry_open_ms: None,
+            unplanned_residual_since_ms: None,
             last_trade_arc_rx_ms: 0,
             last_trade_xyz_rx_ms: 0,
             armed_dir: None,
             armed_since_ms: 0,
             dust_qty: Decimal::new(1, 6),
+            kalman,
+            last_kalman_snapshot: None,
             counters: BasisEngineCounters::default(),
         })
     }
@@ -750,6 +925,31 @@ impl ArcusXyzBasisEngine {
         self.in_flight
     }
 
+    pub fn last_kalman_snapshot(&self) -> Option<KalmanBasisSnapshot> {
+        self.last_kalman_snapshot
+    }
+
+    pub fn unplanned_residual_since_ms(&self) -> Option<u64> {
+        self.unplanned_residual_since_ms
+    }
+
+    /// Evaluate unplanned paired-leg delta for sub-100ms ADL recovery / 200ms halt escalation.
+    pub fn evaluate_adl_delta(&self, now_ms: u64) -> Result<AdlDeltaAction> {
+        let snap = NetDeltaSnapshot {
+            now_ms,
+            unplanned_since_ms: self.unplanned_residual_since_ms,
+            target_leg_base: self.inv_arc.to_f64().unwrap_or(f64::NAN),
+            hedge_leg_base: self.inv_xyz.to_f64().unwrap_or(f64::NAN),
+            reference_gross_base: self
+                .inv_arc
+                .abs()
+                .max(self.inv_xyz.abs())
+                .to_f64()
+                .unwrap_or(f64::NAN),
+        };
+        evaluate_adl_delta_breaker(&self.config.adl_delta_breaker, &snap)
+    }
+
     /// Reconcile venue positions cleanly after a dispatch settles or on startup.
     pub fn reconcile_positions(
         &mut self,
@@ -762,8 +962,12 @@ impl ArcusXyzBasisEngine {
         self.inv_arc = inv_arc;
         self.inv_xyz = inv_xyz;
         self.in_flight = false;
-        if (self.inv_arc + self.inv_xyz).abs() <= self.dust_qty {
+        let residual = (self.inv_arc + self.inv_xyz).abs();
+        if residual <= self.dust_qty {
             self.residual_blocked_reason = None;
+            self.unplanned_residual_since_ms = None;
+        } else if self.unplanned_residual_since_ms.is_none() {
+            self.unplanned_residual_since_ms = Some(now_ms);
         }
         self.last_trade_arc_rx_ms = self.last_trade_arc_rx_ms.max(arc_rx_ms);
         self.last_trade_xyz_rx_ms = self.last_trade_xyz_rx_ms.max(xyz_rx_ms);
@@ -812,6 +1016,30 @@ impl ArcusXyzBasisEngine {
         xyz_rx_ms: u64,
         daily_loss: &DailyLossGuard,
         cancel_lease_ok: bool,
+    ) -> BasisAction {
+        self.on_books_with_regime(
+            now_ms,
+            arc,
+            xyz,
+            xyz_rx_ms,
+            daily_loss,
+            cancel_lease_ok,
+            SessionRegime::UsRth,
+        )
+    }
+
+    /// Evaluate cross-venue snapshots under an explicit market session regime
+    /// (used when optional `kalman_basis` filtering is enabled).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_books_with_regime(
+        &mut self,
+        now_ms: u64,
+        arc: &ArcusBookSnapshot,
+        xyz: &ValidatedBook,
+        xyz_rx_ms: u64,
+        daily_loss: &DailyLossGuard,
+        cancel_lease_ok: bool,
+        regime: SessionRegime,
     ) -> BasisAction {
         if self.in_flight {
             return BasisAction::Hold {
@@ -914,11 +1142,21 @@ impl ArcusXyzBasisEngine {
             };
         };
         let am = 0.5 * (ab + aa);
-        if am <= 0.0 || aa <= 0.0 || xa <= 0.0 {
+        let xm = 0.5 * (xb + xa);
+        if am <= 0.0 || aa <= 0.0 || xa <= 0.0 || xm <= 0.0 {
             return BasisAction::Hold {
                 reason: "invalid_prices",
             };
         }
+        let kalman_snap = if let Some(kalman) = self.kalman.as_mut() {
+            let basis_bps = (am / xm - 1.0) * 1e4;
+            let combined_spread_bps = ((aa - ab) / am + (xa - xb) / xm) * 1e4;
+            let snap = kalman.observe(now_ms, basis_bps, combined_spread_bps.max(0.0), regime);
+            self.last_kalman_snapshot = Some(snap);
+            Some(snap)
+        } else {
+            None
+        };
         // Raw executable basis edges (bps): +1 buy Arcus / sell xyz; -1 sell Arcus / buy xyz.
         let edge_pos_bp = (xb / aa - 1.0) * 1e4;
         let edge_neg_bp = (ab / xa - 1.0) * 1e4;
@@ -928,7 +1166,12 @@ impl ArcusXyzBasisEngine {
         if self.inv_arc.abs() > self.dust_qty {
             let pos_sign: i8 = if self.inv_arc > Decimal::ZERO { 1 } else { -1 };
             let hold_ms = now_ms.saturating_sub(self.entry_open_ms.unwrap_or(now_ms));
-            let timed_out = hold_ms >= self.config.max_hold_ms;
+            let kalman_time_stop = self
+                .kalman
+                .as_ref()
+                .zip(kalman_snap.as_ref())
+                .is_some_and(|(k, s)| k.should_time_stop(s, hold_ms));
+            let timed_out = hold_ms >= self.config.max_hold_ms || kalman_time_stop;
             let close_edge_bp = if pos_sign > 0 {
                 edge_neg_bp
             } else {
@@ -1053,6 +1296,12 @@ impl ArcusXyzBasisEngine {
         let mut best_dir = 0_i8;
         let mut best_raw_bp = f64::NEG_INFINITY;
         let mut leung_li_hit = false;
+        let mut kalman_blocked = false;
+        let kalman_eval = self
+            .kalman
+            .as_ref()
+            .zip(kalman_snap.as_ref())
+            .map(|(k, s)| k.evaluate_entry(s));
 
         for &dir in &allowed_dirs {
             if dir == 0 {
@@ -1062,6 +1311,16 @@ impl ArcusXyzBasisEngine {
             if raw_bp > self.config.max_entry_bp {
                 leung_li_hit = true;
                 continue;
+            }
+            if let Some(eval) = kalman_eval {
+                let side_matches = (dir > 0 && eval.preferred_side == Some(MakerEntrySide::Buy))
+                    || (dir < 0 && eval.preferred_side == Some(MakerEntrySide::Sell));
+                if !eval.allowed || !side_matches {
+                    if raw_bp >= req_edge_bp {
+                        kalman_blocked = true;
+                    }
+                    continue;
+                }
             }
             if raw_bp >= req_edge_bp && raw_bp > best_raw_bp {
                 best_raw_bp = raw_bp;
@@ -1077,6 +1336,8 @@ impl ArcusXyzBasisEngine {
             return BasisAction::Hold {
                 reason: if leung_li_hit {
                     "leung_li_structural_cap"
+                } else if kalman_blocked {
+                    "kalman_ou_entry_blocked"
                 } else {
                     "below_entry_threshold"
                 },
@@ -2277,11 +2538,20 @@ mod tests {
             canary_max_order_usd: 500.0,
             canary_max_total_notional_usd: 2_000.0,
             require_arcus_cancel_lease: false,
+            require_hl_growth_mode: None,
+            max_hl_deployer_fee_scale: 1.0,
+            max_oracle_divergence_bps: 25.0,
+            max_oracle_age_ms: 2_000,
             dry_run: true,
-            poll_interval_ms: 250,
+            // poll (100) <= adl halt_sla (200) and <= max_oracle_age (2000) keep the fixture
+            // internally consistent with the new SLA/freshness-vs-poll validation guards.
+            poll_interval_ms: 100,
             account_refresh_interval_ms: 1_000,
             order_budget: OrderBudgetConfig::default(),
             tail_risk: TailRiskConfig::default(),
+            adl_delta_breaker: AdlDeltaBreakerConfig::default(),
+            kalman_basis: None,
+            shm_book_feed: ShmBookFeedConfig::default(),
             journal_path: PathBuf::from("state/test-journal.ndjson"),
             daily_loss_state_path: PathBuf::from("state/test-daily-loss.json"),
         }
@@ -3685,6 +3955,62 @@ mod tests {
     }
 
     #[test]
+    fn engine_rejects_zero_or_future_eval_and_receipt_timestamps() {
+        let mut cfg = test_config();
+        cfg.persist_ms = 0;
+        let mut engine = ArcusXyzBasisEngine::new(cfg.clone()).unwrap();
+        let guard = DailyLossGuard::open(None, 0.05, 1_000.0, 100).unwrap();
+
+        let a_valid = arc_book(10_000, "99.90", "99.92", "10");
+        let x_valid = xyz_book(10_000, &[("100.10", "10")], &[("100.12", "10")]);
+        assert_eq!(cfg.book_problem(10_000, &a_valid, &x_valid, 10_000), None);
+
+        // Zero eval clock fails closed even with otherwise valid books.
+        assert_eq!(
+            engine.on_books(0, &a_valid, &x_valid, 10_000, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_eval_time"
+            }
+        );
+
+        // Uninitialized zero Arcus receipt_ms fails closed even when now_ms < max_arcus_book_age_ms.
+        let mut a_zero_rx = arc_book(100, "99.90", "99.92", "10");
+        a_zero_rx.receipt_ms = 0;
+        let x_early = xyz_book(100, &[("100.10", "10")], &[("100.12", "10")]);
+        assert_eq!(
+            engine.on_books(100, &a_zero_rx, &x_early, 100, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_arcus_receipt_time"
+            }
+        );
+
+        // Future local Arcus receipt_ms fails closed rather than saturating age to zero.
+        let mut a_future_rx = arc_book(10_000, "99.90", "99.92", "10");
+        a_future_rx.receipt_ms = 10_001;
+        assert_eq!(
+            engine.on_books(10_000, &a_future_rx, &x_valid, 10_000, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_arcus_receipt_time"
+            }
+        );
+
+        // Uninitialized zero or future local HL/xyz receipt_ms fails closed too.
+        let a_early = arc_book(100, "99.90", "99.92", "10");
+        assert_eq!(
+            engine.on_books(100, &a_early, &x_early, 0, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_xyz_receipt_time"
+            }
+        );
+        assert_eq!(
+            engine.on_books(10_000, &a_valid, &x_valid, 10_001, &guard, true),
+            BasisAction::Hold {
+                reason: "invalid_xyz_receipt_time"
+            }
+        );
+    }
+
+    #[test]
     fn arcus_leg_pnl_tracker_drives_combined_daily_loss_guard() {
         let mut tracker = ArcusLegPnlTracker::new(Decimal::ZERO, None);
         tracker.record_fill(true, d("2.0"), d("100.0"), 0.0005); // +2 @ 100, fee = $0.10
@@ -3816,5 +4142,223 @@ mod tests {
         assert!(
             evaluate_hl_basis_tail_risk(1_700_000_000_000, f64::NAN, 200.0, None, &cfg).is_err()
         );
+    }
+
+    #[test]
+    fn hl_market_preflight_enforces_growth_mode_delisted_and_fee_scale() {
+        let cfg = test_config();
+        let make_market =
+            |growth_mode: Option<&str>, is_delisted: bool, fee_scale: Option<&str>| HlPerpMarket {
+                asset_id: 110_000,
+                asset: HlPerpAsset {
+                    name: "xyz:ANT".into(),
+                    sz_decimals: 2,
+                    max_leverage: 10,
+                    is_delisted,
+                    growth_mode: growth_mode.map(str::to_owned),
+                    deployer_fee_scale: fee_scale.map(str::to_owned),
+                },
+                collateral_token: Some(0),
+                mark_price: d("100"),
+                oracle_price: d("100"),
+                hourly_funding: Decimal::ZERO,
+                open_interest: d("1000"),
+            };
+
+        assert!(
+            validate_hl_market_preflight(&make_market(Some("enabled"), false, Some("1.0")), &cfg)
+                .is_ok()
+        );
+        assert!(validate_hl_market_preflight(&make_market(None, false, None), &cfg).is_err());
+        assert!(
+            validate_hl_market_preflight(&make_market(Some("disabled"), false, None), &cfg)
+                .is_err()
+        );
+        assert!(
+            validate_hl_market_preflight(&make_market(Some("enabled"), true, None), &cfg).is_err()
+        );
+        assert!(
+            validate_hl_market_preflight(&make_market(Some("enabled"), false, Some("1.5")), &cfg)
+                .is_err()
+        );
+        assert!(
+            validate_hl_market_preflight(&make_market(Some("enabled"), false, Some("bad")), &cfg)
+                .is_err()
+        );
+
+        let mut relaxed = cfg.clone();
+        relaxed.require_hl_growth_mode = Some(false);
+        assert!(validate_hl_market_preflight(&make_market(None, false, None), &relaxed).is_ok());
+    }
+
+    #[test]
+    fn oracle_divergence_breaker_blocks_entries_above_threshold_and_fails_closed() {
+        let (ok_div, ok_act) =
+            evaluate_oracle_divergence_bps(d("100.10"), d("100.00"), 25.0).unwrap();
+        assert!((ok_div - 10.0).abs() < 1e-6);
+        assert_eq!(ok_act, TailRiskAction::Normal);
+
+        let (bad_div, bad_act) =
+            evaluate_oracle_divergence_bps(d("100.30"), d("100.00"), 25.0).unwrap();
+        assert!((bad_div - 30.0).abs() < 1e-6);
+        assert_eq!(bad_act, TailRiskAction::ReduceOnly);
+
+        assert!(evaluate_oracle_divergence_bps(Decimal::ZERO, d("100"), 25.0).is_err());
+        assert!(evaluate_oracle_divergence_bps(d("100"), Decimal::ZERO, 25.0).is_err());
+        assert!(evaluate_oracle_divergence_bps(d("100"), d("100"), f64::NAN).is_err());
+    }
+
+    #[test]
+    fn optional_kalman_basis_filter_gates_non_stationary_entries_and_triggers_time_stop() {
+        let mut cfg = test_config();
+        cfg.persist_ms = 0;
+        cfg.entry_bp = 5.0;
+        cfg.kalman_basis = Some(KalmanBasisConfig {
+            ou_window: 16,
+            ou_min_samples: 6,
+            min_dislocation_bps: 3.0,
+            max_dislocation_bps: 30.0,
+            max_hold_ms_cap: 60_000,
+            ..KalmanBasisConfig::default()
+        });
+        let mut engine = ArcusXyzBasisEngine::new(cfg).unwrap();
+        let guard =
+            DailyLossGuard::open(None, 0.05, 1_000.0, crate::daily_loss::utc_day_now()).unwrap();
+
+        // Warm-up sample with large executable edge is blocked by Kalman OU stationarity gate.
+        let arc0 = arc_book(10_000, "99.90", "99.91", "10");
+        let xyz0 = xyz_book(10_000, &[("100.10", "10")], &[("100.12", "10")]);
+        let act0 = engine.on_books(10_000, &arc0, &xyz0, 10_000, &guard, true);
+        assert_eq!(
+            act0,
+            BasisAction::Hold {
+                reason: "kalman_ou_entry_blocked"
+            }
+        );
+
+        // Feed stationary oscillating series around alpha ~ 0 bps so OU becomes stationary.
+        for i in 1..=10_u64 {
+            let t = 10_000 + i * 500;
+            let xyz_mid = if i % 2 == 0 { "100.01" } else { "99.99" };
+            let xyz_ask = if i % 2 == 0 { "100.02" } else { "100.00" };
+            let a = arc_book(t, "99.995", "100.005", "10");
+            let x = xyz_book(t, &[(xyz_mid, "10")], &[(xyz_ask, "10")]);
+            let _ = engine.on_books(t, &a, &x, t, &guard, true);
+        }
+        // Stationary negative basis dislocation (`arc < xyz`) admits Buy Arcus / Sell xyz.
+        let t_entry = 16_000;
+        let arc_in = arc_book(t_entry, "99.89", "99.90", "10");
+        let xyz_in = xyz_book(t_entry, &[("100.00", "10")], &[("100.01", "10")]);
+        let act_in = engine.on_books(t_entry, &arc_in, &xyz_in, t_entry, &guard, true);
+        assert!(matches!(
+            act_in,
+            BasisAction::EnterPairIoc {
+                direction_arcus_buy: true,
+                ..
+            }
+        ));
+
+        // Carry position past Kalman `max_hold_ms_cap` -> triggers timed_out exit even before max_hold_ms.
+        engine.reconcile_positions(d("2"), d("-2"), t_entry, t_entry, t_entry);
+        let t_stop = t_entry + 65_000;
+        let arc_hold = arc_book(t_stop, "99.89", "99.90", "10");
+        let xyz_hold = xyz_book(t_stop, &[("100.00", "10")], &[("100.01", "10")]);
+        let act_exit = engine.on_books(t_stop, &arc_hold, &xyz_hold, t_stop, &guard, true);
+        assert!(matches!(
+            act_exit,
+            BasisAction::ExitPairIoc {
+                timed_out: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn engine_adl_delta_breaker_triggers_emergency_reduce_and_200ms_halt() {
+        let cfg = test_config();
+        let mut engine = ArcusXyzBasisEngine::new(cfg).unwrap();
+        engine.reconcile_positions(d("10"), d("-10"), 1_000, 1_000, 1_000);
+        assert!(matches!(
+            engine.evaluate_adl_delta(1_050).unwrap(),
+            AdlDeltaAction::Balanced { .. }
+        ));
+        assert_eq!(engine.unplanned_residual_since_ms(), None);
+
+        // Venue ADL shrinks xyz leg from -10 to -9 (10% unhedged > 1%).
+        engine.reconcile_positions(d("10"), d("-9"), 2_000, 2_000, 2_000);
+        assert_eq!(engine.unplanned_residual_since_ms(), Some(2_000));
+        match engine.evaluate_adl_delta(2_050).unwrap() {
+            AdlDeltaAction::EmergencyReduceLeg {
+                leg,
+                is_buy,
+                qty_base,
+                reduce_only,
+                within_response_sla,
+                ..
+            } => {
+                assert_eq!(leg, crate::strategy::tail_risk::PairedLeg::Primary);
+                assert!(!is_buy);
+                assert!(reduce_only);
+                assert!((qty_base - 1.0).abs() < 1e-9);
+                assert!(within_response_sla);
+            }
+            other => panic!("expected EmergencyReduceLeg, got {other:?}"),
+        }
+
+        // Unhealed beyond 200ms escalates to HaltAndFlatten.
+        assert!(matches!(
+            engine.evaluate_adl_delta(2_250).unwrap(),
+            AdlDeltaAction::HaltAndFlatten { .. }
+        ));
+
+        // Healing back to balanced resets unplanned timer.
+        engine.reconcile_positions(d("9"), d("-9"), 2_300, 2_300, 2_300);
+        assert_eq!(engine.unplanned_residual_since_ms(), None);
+        assert!(matches!(
+            engine.evaluate_adl_delta(2_310).unwrap(),
+            AdlDeltaAction::Balanced { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validates_adl_delta_breaker_and_shm_feed_defaults() {
+        let base_toml = include_str!("../../config.arcus_xyz_basis.example.toml");
+        let parsed: ArcusXyzBasisConfig = toml::from_str(base_toml).unwrap();
+        assert_eq!(parsed.adl_delta_breaker, AdlDeltaBreakerConfig::default());
+        assert!(parsed.effective_require_hl_growth_mode());
+        assert_eq!(parsed.max_hl_deployer_fee_scale, 1.0);
+        assert_eq!(parsed.max_oracle_divergence_bps, 25.0);
+        assert!(!parsed.shm_book_feed.enabled);
+        assert!(parsed.validate().is_ok());
+
+        let mut bad_shm = test_config();
+        bad_shm.shm_book_feed.arcus_exchange_id = bad_shm.shm_book_feed.hl_exchange_id;
+        assert!(bad_shm.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_adl_halt_sla_shorter_than_poll_interval() {
+        let mut cfg = test_config();
+        assert!(cfg.validate().is_ok());
+        // A halt SLA below the poll interval makes the reduce-only response tier unreachable:
+        // the residual is re-observed only after one poll, already past the halt ceiling.
+        cfg.poll_interval_ms = cfg.adl_delta_breaker.halt_sla_ms + 1;
+        // keep account_refresh >= poll so only the ADL/poll guard trips
+        cfg.account_refresh_interval_ms = cfg.poll_interval_ms;
+        assert!(cfg.validate().is_err());
+        // Equal is acceptable (halt ceiling spans exactly one observation cycle).
+        cfg.poll_interval_ms = cfg.adl_delta_breaker.halt_sla_ms;
+        cfg.account_refresh_interval_ms = cfg.poll_interval_ms;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_oracle_age_shorter_than_poll_interval() {
+        let mut cfg = test_config();
+        assert!(cfg.validate().is_ok());
+        cfg.max_oracle_age_ms = cfg.poll_interval_ms - 1;
+        assert!(cfg.validate().is_err());
+        cfg.max_oracle_age_ms = cfg.poll_interval_ms;
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -1,17 +1,27 @@
 pub mod arcus_xyz_basis;
+pub mod basis_core;
+pub mod basis_replay;
 pub mod cross_sectional;
 pub mod cross_venue;
 pub mod cross_venue_router;
 pub mod glft;
+pub mod hybrid_exit;
 pub mod inventory_neutral_mm;
 pub mod kalman_basis;
 pub mod matched_settlement;
+pub mod microprice;
 pub mod multiday_carry;
+pub mod pipeline_driver;
+pub mod pipeline_tape;
 pub mod portfolio_risk;
+pub mod quote_pipeline;
 pub mod relative_value;
 mod replay_queue_depth;
 pub mod slow_cascade;
 pub mod tail_risk;
+pub mod track_coordinator;
+pub mod venue_guards;
+pub mod wallet_toxicity;
 
 use crate::shm_reader::ShmBboMessage;
 use std::future::Future;

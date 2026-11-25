@@ -1169,6 +1169,10 @@ impl Matching {
                         MARKOUT_HORIZONS_MS,
                         config.trade_delivery_grace_ms + config.trade_clock_guard_ms,
                     )
+                    .with_decision_sigma_interval(
+                        config.trade_from_ms.unwrap_or(config.start_ms),
+                        config.end_ms,
+                    )
                 }),
                 queue_model_report: config.queue_model.map(|qm| QueueModelReport {
                     initial_ahead_fraction: qm.initial_ahead_fraction,
@@ -2065,6 +2069,8 @@ impl Matching {
 pub struct RecordedMakerReport {
     fair_value_mode: &'static str,
     start_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trade_from_ms: Option<u64>,
     end_ms: u64,
     active_until_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2582,6 +2588,7 @@ async fn drive(
             "external_with_local_fallback"
         },
         start_ms: config.start_ms,
+        trade_from_ms: config.trade_from_ms,
         end_ms: config.end_ms,
         active_until_ms,
         strategy_halted_at_ms,
@@ -4762,6 +4769,66 @@ mod tests {
         assert_eq!(
             report.cancel_depletion_events, 0,
             "pre-activation sweep-through print must not credit a cancellation"
+        );
+    }
+
+    #[test]
+    fn calibration_decision_phase_sigma_binds_trade_from_and_excludes_warmup_and_drain() {
+        let make_cfg = |calibration_telemetry: bool| {
+            let mut cfg = continuous_config(15);
+            cfg.trade_from_ms = Some(START + 4_000);
+            cfg.diagnose_cross_market = true;
+            cfg.calibration_telemetry = calibration_telemetry;
+            cfg
+        };
+        let cfg = make_cfg(true);
+        let mut input_tape = format!(
+            "{{\"kind\":\"trade_feed\",\"at_ms\":{},\"online\":true}}\n",
+            cfg.start_ms
+        );
+        for at in (cfg.start_ms..cfg.drain_until_ms).step_by(1_000) {
+            let rel = at - START;
+            let (bid, ask) = if rel == 1_000 || rel == 2_000 {
+                (119.0, 121.0)
+            } else if rel == 6_000 {
+                (99.05, 101.05)
+            } else if rel >= 15_000 {
+                (129.0, 131.0)
+            } else {
+                (99.0, 101.0)
+            };
+            let book = serde_json::json!({"timestamp_ms":at,"bids":[[bid,1.0]],"asks":[[ask,1.0]]});
+            let event =
+                serde_json::json!({"kind":"book","at_ms":at,"lighter":book,"hyperliquid":book});
+            input_tape.push_str(&event.to_string());
+            input_tape.push('\n');
+        }
+
+        let baseline = run_recorded_maker(make_cfg(false), input_tape.as_bytes()).unwrap();
+        let baseline_json = serde_json::to_value(&baseline).unwrap();
+        assert_eq!(baseline_json["trade_from_ms"], START + 4_000);
+
+        let calibrated = run_recorded_maker(cfg, input_tape.as_bytes()).unwrap();
+        let mut calibrated_json = serde_json::to_value(&calibrated).unwrap();
+        let cal = calibrated_json
+            .as_object_mut()
+            .unwrap()
+            .remove("calibration")
+            .expect("calibration present when enabled");
+        assert_eq!(calibrated_json, baseline_json);
+
+        let dps = &cal["decision_phase_sigma"];
+        assert_eq!(dps["scope"], "receipt_half_open");
+        assert_eq!(dps["trade_from_ms"], START + 4_000);
+        assert_eq!(dps["end_ms"], START + 15_000);
+        assert_eq!(dps["sigma_observed_secs"], 10.0);
+        assert_eq!(dps["sigma_samples"], 10);
+        let expected_sq = 2.0 * (100.05_f64 / 100.0).ln().powi(2);
+        assert!((dps["sum_sq_log_return"].as_f64().unwrap() - expected_sq).abs() < 1e-12);
+        assert!(
+            cal["sigma_observed_secs"].as_f64().unwrap() > 10.0
+                && cal["sum_sq_log_return"].as_f64().unwrap() > expected_sq * 10.0,
+            "legacy sigma includes warmup and drain jumps excluded from decision_phase_sigma"
         );
     }
 }

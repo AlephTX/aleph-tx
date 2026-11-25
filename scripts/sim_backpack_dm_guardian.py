@@ -117,36 +117,68 @@ class SimConfig:
         return cfg
 
     def validate(self) -> None:
-        if self.inner_band_bps <= 0.0 or not math.isfinite(self.inner_band_bps):
-            raise ValueError("inner_band_bps must be finite and > 0")
-        if self.inner_band_bps >= self.preset.outer_band_bps:
-            raise ValueError("inner_band_bps must be < outer_band_bps")
-        if self.preset.outer_band_bps > self.preset.max_bandwidth_bps:
-            raise ValueError("outer_band_bps must be <= max_bandwidth_bps")
-        if self.soft_limit_usd <= 0.0 or not math.isfinite(self.soft_limit_usd):
-            raise ValueError("soft_limit_usd must be finite and > 0")
-        if self.hedge_trigger_usd <= 0.0 or not math.isfinite(self.hedge_trigger_usd):
-            raise ValueError("hedge_trigger_usd must be finite and > 0")
-        if self.max_inventory_usd <= 0.0 or not math.isfinite(self.max_inventory_usd):
-            raise ValueError("max_inventory_usd must be finite and > 0")
-        if self.max_loss_usd <= 0.0 or not math.isfinite(self.max_loss_usd):
-            raise ValueError("max_loss_usd must be finite and > 0")
-        if self.depth_per_bp_usd <= 0.0 or not math.isfinite(self.depth_per_bp_usd):
-            raise ValueError("depth_per_bp_usd must be finite and > 0")
-        if self.cascade_window_ms <= 0:
-            raise ValueError("cascade_window_ms must be > 0")
-        if self.cascade_trigger_bps <= 0.0 or not math.isfinite(self.cascade_trigger_bps):
-            raise ValueError("cascade_trigger_bps must be finite and > 0")
-        if not math.isfinite(self.maker_fee_bps) or self.maker_fee_bps < 0.0:
-            raise ValueError("maker_fee_bps must be finite and >= 0 (no assumed rebate subsidy)")
-        if not math.isfinite(self.hedge_fee_bps) or self.hedge_fee_bps < 0.0:
-            raise ValueError("hedge_fee_bps must be finite and >= 0")
-        if not math.isfinite(self.hedge_slippage_bps) or self.hedge_slippage_bps < 0.0:
-            raise ValueError("hedge_slippage_bps must be finite and >= 0")
+        max_bandwidth = _require_finite_float(
+            self.preset.max_bandwidth_bps, "preset.max_bandwidth_bps"
+        )
+        min_side_notional = _require_finite_float(
+            self.preset.min_side_notional_usd, "preset.min_side_notional_usd"
+        )
+        outer_band = _require_finite_float(
+            self.preset.outer_band_bps, "preset.outer_band_bps"
+        )
+        dm_floor = _require_finite_float(self.preset.dm_floor, "preset.dm_floor")
+        _require_int_field(
+            self.preset.non_post_only_speed_bump_ms,
+            "preset.non_post_only_speed_bump_ms",
+            min_value=0,
+        )
+        if max_bandwidth <= 0.0:
+            raise ValueError("preset.max_bandwidth_bps must be > 0")
+        if min_side_notional <= 0.0:
+            raise ValueError("preset.min_side_notional_usd must be > 0")
+        if outer_band <= 0.0 or outer_band > max_bandwidth:
+            raise ValueError("outer_band_bps must be in (0, max_bandwidth_bps]")
+        if not (0.0 < dm_floor <= 1.0):
+            raise ValueError("preset.dm_floor must be in (0, 1]")
+
+        inner_band = _require_finite_float(self.inner_band_bps, "inner_band_bps")
+        if inner_band <= 0.0 or inner_band >= outer_band:
+            raise ValueError("inner_band_bps must be finite and in (0, outer_band_bps)")
+
+        for field_name in (
+            "soft_limit_usd",
+            "hedge_trigger_usd",
+            "max_inventory_usd",
+            "max_loss_usd",
+            "depth_per_bp_usd",
+            "cascade_trigger_bps",
+        ):
+            val = _require_finite_float(getattr(self, field_name), field_name)
+            if val <= 0.0:
+                raise ValueError(f"{field_name} must be finite and > 0")
+
+        _require_int_field(self.cascade_window_ms, "cascade_window_ms", min_value=1)
+
+        maker_fee = _require_finite_float(self.maker_fee_bps, "maker_fee_bps")
+        if not (0.0 <= maker_fee < BPS_DIV):
+            raise ValueError("maker_fee_bps must be in [0, 10000) (no assumed rebate subsidy)")
+        hedge_fee = _require_finite_float(self.hedge_fee_bps, "hedge_fee_bps")
+        if not (0.0 <= hedge_fee < BPS_DIV):
+            raise ValueError("hedge_fee_bps must be in [0, 10000)")
+        hedge_slippage = _require_finite_float(self.hedge_slippage_bps, "hedge_slippage_bps")
+        if not (0.0 <= hedge_slippage < BPS_DIV):
+            raise ValueError("hedge_slippage_bps must be in [0, 10000)")
 
 
 @dataclass(frozen=True)
 class Frame:
+    """Chronological L1 snapshot with same-book BBO valuation.
+
+    `mid_px` is treated strictly as a same-book BBO valuation (midpoint or
+    microprice), not an independent external oracle, so it must lie within
+    `[bid_px, ask_px]`.
+    """
+
     timestamp_ms: int
     bid_px: float
     ask_px: float
@@ -178,12 +210,16 @@ def _require_finite_float(value: Any, field_name: str) -> float:
     return out
 
 
-def _require_int_ts(value: Any) -> int:
+def _require_int_field(value: Any, field_name: str, *, min_value: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"field 'timestamp_ms' must be an int, got {type(value).__name__}")
-    if value < 0:
-        raise ValueError(f"field 'timestamp_ms' must be >= 0, got {value}")
+        raise ValueError(f"field {field_name!r} must be an int, got {type(value).__name__}")
+    if value < min_value:
+        raise ValueError(f"field {field_name!r} must be >= {min_value}, got {value}")
     return value
+
+
+def _require_int_ts(value: Any) -> int:
+    return _require_int_field(value, "timestamp_ms", min_value=0)
 
 
 def validate_frame(raw: Frame | dict[str, Any], prev_ts_ms: int | None) -> Frame:
@@ -218,6 +254,10 @@ def validate_frame(raw: Frame | dict[str, Any], prev_ts_ms: int | None) -> Frame
         raise ValueError(f"crossed or locked book: ask_px ({ask_px}) <= bid_px ({bid_px})")
     if mid_px <= 0.0:
         raise ValueError(f"mid_px must be > 0, got {mid_px}")
+    if not (bid_px <= mid_px <= ask_px):
+        raise ValueError(
+            f"mid_px ({mid_px}) must lie within same-book BBO [{bid_px}, {ask_px}]"
+        )
 
     trade_side = data["trade_side"]
     if not isinstance(trade_side, str) or trade_side not in VALID_TRADE_SIDES:
@@ -258,8 +298,8 @@ def _reject_json_constant(token: str) -> Any:
 
 def load_tape_jsonl(path: Path) -> list[Frame]:
     """Load and fail-closed validate a JSONL frame tape."""
-    if not path.exists():
-        raise FileNotFoundError(f"tape file not found: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"tape file not found or not a regular file: {path}")
     raw_rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -288,29 +328,48 @@ def compute_snapshot_dm(
     within <= preset.max_bandwidth_bps of mid_px; otherwise DM drops to
     preset.dm_floor (0.25). Returns (dm, is_zero_side).
     """
-    if not math.isfinite(mid_px) or mid_px <= 0.0:
+    mid = _require_finite_float(mid_px, "mid_px")
+    if mid <= 0.0:
         raise ValueError(f"mid_px must be finite and > 0, got {mid_px}")
+    max_bandwidth = _require_finite_float(preset.max_bandwidth_bps, "preset.max_bandwidth_bps")
+    min_side_notional = _require_finite_float(
+        preset.min_side_notional_usd, "preset.min_side_notional_usd"
+    )
+    dm_floor = _require_finite_float(preset.dm_floor, "preset.dm_floor")
+    if max_bandwidth <= 0.0 or min_side_notional <= 0.0 or not (0.0 < dm_floor <= 1.0):
+        raise ValueError("preset bandwidth, notional, or dm_floor out of valid domain")
 
     def qualifying_notional(q: QuoteLevel | None, is_bid: bool) -> float:
-        if q is None or q.notional_usd <= 0.0 or not math.isfinite(q.notional_usd):
+        if q is None:
             return 0.0
-        if q.price <= 0.0 or not math.isfinite(q.price):
+        if (
+            isinstance(q.price, bool)
+            or isinstance(q.notional_usd, bool)
+            or not isinstance(q.price, (int, float))
+            or not isinstance(q.notional_usd, (int, float))
+        ):
+            return 0.0
+        q_px = float(q.price)
+        q_notional = float(q.notional_usd)
+        if q_notional <= 0.0 or not math.isfinite(q_notional):
+            return 0.0
+        if q_px <= 0.0 or not math.isfinite(q_px):
             return 0.0
         dist_bps = (
-            (mid_px - q.price) / mid_px * BPS_DIV
+            (mid - q_px) / mid * BPS_DIV
             if is_bid
-            else (q.price - mid_px) / mid_px * BPS_DIV
+            else (q_px - mid) / mid * BPS_DIV
         )
-        if 0.0 <= dist_bps <= preset.max_bandwidth_bps + 1e-9:
-            return q.notional_usd
+        if 0.0 <= dist_bps <= max_bandwidth + 1e-9:
+            return q_notional
         return 0.0
 
     bid_qual = qualifying_notional(bid_quote, is_bid=True)
     ask_qual = qualifying_notional(ask_quote, is_bid=False)
     is_zero_side = bid_qual <= 0.0 or ask_qual <= 0.0
-    if bid_qual >= preset.min_side_notional_usd and ask_qual >= preset.min_side_notional_usd:
+    if bid_qual >= min_side_notional and ask_qual >= min_side_notional:
         return 1.0, is_zero_side
-    return preset.dm_floor, is_zero_side
+    return dm_floor, is_zero_side
 
 
 def build_synthetic_tape(tier: str) -> list[Frame]:
@@ -406,6 +465,8 @@ def simulate_arm(
         "outer_band_dm_guardian_cascade_guard",
     ):
         raise ValueError(f"unknown arm {arm_name!r}")
+    cfg.validate()
+    frames = validate_frames(frames)
 
     preset = cfg.preset
     cash_usd = 0.0
@@ -596,6 +657,9 @@ def simulate_arm(
     if final_drawdown > max_drawdown_usd:
         max_drawdown_usd = final_drawdown
 
+    if not (math.isfinite(cash_usd) and math.isfinite(max_drawdown_usd)):
+        raise ValueError("simulation accounting overflowed to non-finite float")
+
     total_snapshots = len(dm_values)
     mean_dm = sum(dm_values) / total_snapshots
     min_dm = min(dm_values)
@@ -719,10 +783,11 @@ def run_self_test() -> dict[str, Any]:
     assert r_base["ex_subsidy_cash_pnl_usd"] == r_pert["ex_subsidy_cash_pnl_usd"]
     assert r_base["hedge_volume_usd"] == r_pert["hedge_volume_usd"]
 
-    # Verify fail-closed validation rejects NaN / crossed book / non-monotonic ts / bad side.
+    # Verify fail-closed validation rejects NaN / crossed book / out-of-spread mid / non-monotonic ts / bad side.
     for bad in (
         [{"timestamp_ms": 100, "bid_px": float("nan"), "ask_px": 101.0, "mid_px": 100.5, "trade_side": "none", "trade_notional_usd": 0.0}],
         [{"timestamp_ms": 100, "bid_px": 101.0, "ask_px": 100.0, "mid_px": 100.5, "trade_side": "none", "trade_notional_usd": 0.0}],
+        [{"timestamp_ms": 100, "bid_px": 99.50, "ask_px": 99.54, "mid_px": 90.0, "trade_side": "none", "trade_notional_usd": 0.0}],
         [{"timestamp_ms": 200, "bid_px": 99.0, "ask_px": 101.0, "mid_px": 100.0, "trade_side": "none", "trade_notional_usd": 0.0},
          {"timestamp_ms": 150, "bid_px": 99.0, "ask_px": 101.0, "mid_px": 100.0, "trade_side": "none", "trade_notional_usd": 0.0}],
         [{"timestamp_ms": 100, "bid_px": 99.0, "ask_px": 101.0, "mid_px": 100.0, "trade_side": "invalid", "trade_notional_usd": 0.0}],
@@ -777,12 +842,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Run built-in causal, DM, circuit-breaker, and fail-closed self-tests.",
     )
     args = parser.parse_args(argv)
+    if args.self_test and args.tape is not None:
+        parser.error("cannot combine --self-test with --tape")
 
     try:
         if args.self_test:
             res = run_self_test()
             if args.json:
-                print(json.dumps(res, indent=2))
+                print(json.dumps(res, indent=2, allow_nan=False))
             else:
                 t3 = res["tiers"]["tier3_alt"]["arms"]
                 t4 = res["tiers"]["tier4_equity"]["arms"]
@@ -801,7 +868,7 @@ def main(argv: list[str] | None = None) -> int:
         tape_source = str(args.tape) if args.tape is not None else None
         report = run_comparison(args.tier, frames=frames, tape_source=tape_source)
         if args.json:
-            print(json.dumps(report, indent=2))
+            print(json.dumps(report, indent=2, allow_nan=False))
         else:
             _print_human_summary(report)
         return 0

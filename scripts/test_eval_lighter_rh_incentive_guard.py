@@ -194,6 +194,57 @@ class LighterRhIncentiveGuardTests(unittest.TestCase):
         self.assertEqual(out["depeg_35bp_action"], ACTION_REDUCE_ONLY)
         self.assertEqual(out["depeg_80bp_action"], ACTION_HALT)
 
+    def test_case_alias_quorum_single_source_depeg_and_zero_cost_roi_hurdle_fail_closed(
+        self,
+    ) -> None:
+        now_ms = 1_764_000_000_000
+
+        # Same oracle differing only by case cannot fabricate a 2-source quorum, and
+        # any single surviving fresh depeg breaching 75 bp is still surfaced diagnostically.
+        p_alias = _base_healthy_payload(now_ms)
+        p_alias["stablecoin_guard"]["peg_observations"] = [
+            {
+                "source": "pyth",
+                "usdc_usdg_price": "1.0002",
+                "observed_at_ms": now_ms - 1_000,
+            },
+            {
+                "source": "Pyth",
+                "usdc_usdg_price": "0.9910",
+                "observed_at_ms": now_ms - 500,
+            },
+        ]
+        r_alias = evaluate_lighter_rh_incentive(p_alias)
+        self.assertEqual(r_alias["decision_action"], ACTION_HALT)
+        self.assertEqual(r_alias["gate_diagnostics"]["peg_quorum_count"], 1)
+        self.assertEqual(r_alias["gate_diagnostics"]["peg_quorum_sources"], ["pyth"])
+        self.assertEqual(Decimal(r_alias["gate_diagnostics"]["max_abs_deviation_bps"]), Decimal("90"))
+        self.assertIn("depeg_oracle_quorum_unavailable", r_alias["reasons"])
+        self.assertIn("usdc_usdg_depeg_halt", r_alias["reasons"])
+
+        # Zero weekly cash loss cannot bypass a positive minimum annualized ROI hurdle.
+        p_zero_cost_low_roi = _base_healthy_payload(now_ms)
+        p_zero_cost_low_roi["weekly_cash_ledger"]["trading_spread_pnl_usd"] = "370"
+        p_zero_cost_low_roi["friday_settlement"]["points_received"] = "10"
+        p_zero_cost_low_roi["friday_settlement"]["min_annualized_roi_pct"] = "10"
+        r_low_roi = evaluate_lighter_rh_incentive(p_zero_cost_low_roi)
+        self.assertEqual(r_low_roi["cash_ledger"]["weekly_cash_cost_usd"], "0")
+        self.assertEqual(r_low_roi["decision_action"], ACTION_HALT)
+        self.assertFalse(r_low_roi["allow_new_farming"])
+        self.assertIn("friday_roi_below_safety_cushion", r_low_roi["reasons"])
+
+        p_zero_cost_ok_roi = _base_healthy_payload(now_ms)
+        p_zero_cost_ok_roi["weekly_cash_ledger"]["trading_spread_pnl_usd"] = "370"
+        p_zero_cost_ok_roi["friday_settlement"]["points_received"] = "1000"
+        p_zero_cost_ok_roi["friday_settlement"]["min_annualized_roi_pct"] = "10"
+        r_ok_roi = evaluate_lighter_rh_incentive(p_zero_cost_ok_roi)
+        self.assertEqual(r_ok_roi["decision_action"], ACTION_CONTINUE)
+        self.assertTrue(r_ok_roi["allow_new_farming"])
+        self.assertGreaterEqual(
+            Decimal(r_ok_roi["shadow_incentive_valuation"]["annualized_shadow_roi_pct"]),
+            Decimal("10"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

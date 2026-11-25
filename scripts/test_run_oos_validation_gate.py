@@ -720,6 +720,69 @@ class OosValidationGateTests(unittest.TestCase):
             self.assertTrue(rep_pos["provenance"]["structural_checks_passed"])
             self.assertFalse(rep_pos["provenance"]["qualified"])
 
+    def test_continuity_schema_v2_opt_in_tightens_gap_ceiling_without_touching_legacy(self) -> None:
+        # A 120s source-book gap: allowed under the legacy (default) 300s ceiling, rejected
+        # only when the pre-registration opts into continuity_schema_version = 2 (Rust 60s).
+        segs = _sample_seg_digests()
+        engs = _sample_eng_digests()
+        win_120s_gap = _sample_ant_window(arc_max_gap_ns=120_000 * 1_000_000)
+
+        # Legacy manifest (no continuity_schema_version) — unchanged acceptance of the 120s gap.
+        legacy = _sample_ant_prereg()
+        legacy_sha = _sample_prereg_sha(legacy)
+        legacy_rep = evaluate_rth_ant_gate(
+            win_120s_gap,
+            role="monday_rth_oos",
+            prereg_manifest=legacy,
+            seal_receipt=_sample_seal_receipt(legacy_sha),
+            verified_prereg_sha256=legacy_sha,
+            verified_segment_digests=segs,
+            verified_engine_digests=engs,
+        )
+        self.assertTrue(legacy_rep["provenance"]["checks"]["dual_source_continuity_verified"])
+
+        # Opt-in V2 manifest — the same 120s gap now fails the tightened 60s ceiling.
+        v2 = {**_sample_ant_prereg(), "continuity_schema_version": 2}
+        v2_sha = _sample_prereg_sha(v2)
+        v2_rep = evaluate_rth_ant_gate(
+            win_120s_gap,
+            role="monday_rth_oos",
+            prereg_manifest=v2,
+            seal_receipt=_sample_seal_receipt(v2_sha),
+            verified_prereg_sha256=v2_sha,
+            verified_segment_digests=segs,
+            verified_engine_digests=engs,
+        )
+        self.assertEqual(v2_rep["verdict"], "NO_GO")
+        self.assertFalse(v2_rep["provenance"]["checks"]["dual_source_continuity_verified"])
+
+        # A V2 manifest with a <=60s gap still verifies continuity.
+        v2_ok_rep = evaluate_rth_ant_gate(
+            _sample_ant_window(arc_max_gap_ns=30_000 * 1_000_000),
+            role="monday_rth_oos",
+            prereg_manifest=v2,
+            seal_receipt=_sample_seal_receipt(v2_sha),
+            verified_prereg_sha256=v2_sha,
+            verified_segment_digests=segs,
+            verified_engine_digests=engs,
+        )
+        self.assertTrue(v2_ok_rep["provenance"]["checks"]["dual_source_continuity_verified"])
+
+        # Unknown/invalid schema version fails closed.
+        vx = {**_sample_ant_prereg(), "continuity_schema_version": 99}
+        vx_sha = _sample_prereg_sha(vx)
+        vx_rep = evaluate_rth_ant_gate(
+            _sample_ant_window(arc_max_gap_ns=30_000 * 1_000_000),
+            role="monday_rth_oos",
+            prereg_manifest=vx,
+            seal_receipt=_sample_seal_receipt(vx_sha),
+            verified_prereg_sha256=vx_sha,
+            verified_segment_digests=segs,
+            verified_engine_digests=engs,
+        )
+        self.assertEqual(vx_rep["verdict"], "NO_GO")
+        self.assertFalse(vx_rep["provenance"]["checks"]["dual_source_continuity_verified"])
+
     def test_w15_rwa_gate_distinguishes_hedged_unhedged_and_no_go(self) -> None:
         # Pure ex-NVDA = +$2.5M volume, -$25 cash = $10/M (<=20); Hedged ex-NVDA = -$50 = $20/M (<=20)
         hedged_ok = _sample_rwa_summary(nvda_cash=-80.0, other_cash=-5.0)
@@ -1450,6 +1513,208 @@ class OosValidationGateTests(unittest.TestCase):
                 with self.subTest(bad_args=bad_args), patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as ctx:
                     sim_rwa_cli_main(bad_args)
                 self.assertEqual(ctx.exception.code, 2)
+
+    def test_rth_ant_witness_preflight_short_circuits_formal_replay_and_preserves_dryrun(self) -> None:
+        from scripts import run_oos_validation_gate as gate
+
+        now_et = datetime.now(timezone.utc).astimezone(ET_TZ)
+        next_mon = (now_et + timedelta(days=(7 - now_et.weekday()) % 7 or 7)).date()
+        fut_start_ms = int(datetime(next_mon.year, next_mon.month, next_mon.day, 7, 0, tzinfo=ET_TZ).timestamp() * 1000)
+        fut_end_ms = fut_start_ms + TEN_HOURS_MS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ca_cert, ts_cnf = self._create_ephemeral_tsa(root, name="preflight")
+            wrong_ca, _ = self._create_ephemeral_tsa(root, name="preflight_wrong")
+            engine_key, = FROZEN_ANT_ENGINE_FILES
+            stub_engine = root / engine_key
+            stub_engine.parent.mkdir(parents=True)
+            stub_engine.write_bytes(b"# synthetic preflight test stub\n")
+            engine_sha = hashlib.sha256(stub_engine.read_bytes()).hexdigest()
+
+            manifest = _sample_ant_prereg(
+                frozen_at_ms=fut_start_ms - 60_000,
+                decision_start_ms=fut_start_ms,
+                decision_end_ms=fut_end_ms,
+                expected_rth_date_et=next_mon.isoformat(),
+                frozen_engine_sha256={engine_key: engine_sha},
+            )
+            prereg_path = root / "prereg.json"
+            prereg_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+            prereg_sha = hashlib.sha256(prereg_path.read_bytes()).hexdigest()
+
+            seal_obj = _sample_seal_receipt(
+                prereg_sha,
+                sealed_at_ms=fut_end_ms + 60_000,
+                archive_first_rx_ns=fut_start_ms * 1_000_000,
+                archive_last_rx_ns=fut_end_ms * 1_000_000,
+            )
+            seal_path = root / "seal.json"
+            seal_path.write_text(json.dumps(seal_obj, sort_keys=True) + "\n", encoding="utf-8")
+
+            bad_wit_path = root / "bad_witness.json"
+            bad_wit_path.write_text("truncated-not-json", encoding="utf-8")
+
+            tsq_path = root / "fut.tsq"
+            tsr_path = root / "fut.tsr"
+            good_wit_path = root / "good_witness.json"
+            create_witness_query(prereg_manifest_path=prereg_path, output=tsq_path)
+            self._issue_tsr(ts_cnf, tsq_path, tsr_path)
+            wrap_witness_receipt(prereg_manifest_path=prereg_path, tsr_path=tsr_path, output=good_wit_path)
+
+            # 1. Standalone rth-ant-witness-preflight CLI fails closed on bad inputs and succeeds with valid TSA witness.
+            pre_out = root / "preflight.json"
+            for wit_arg, ca_arg, pre_arg, expected_detail in (
+                (None, ca_cert, prereg_path, "external_witness_not_supplied"),
+                (bad_wit_path, ca_cert, prereg_path, "invalid_witness_schema"),
+                (good_wit_path, wrong_ca, prereg_path, "openssl_ts_verify_failed"),
+                (good_wit_path, ca_cert, root / "missing_prereg.json", "prereg_manifest_load_error"),
+            ):
+                pre_out.unlink(missing_ok=True)
+                argv = ["run_oos_validation_gate.py", "rth-ant-witness-preflight", "--prereg-manifest", str(pre_arg), "--output", str(pre_out)]
+                if wit_arg is not None:
+                    argv.extend(["--external-witness", str(wit_arg)])
+                if ca_arg is not None:
+                    argv.extend(["--trusted-tsa-ca", str(ca_arg)])
+                with patch.object(sys, "argv", argv), patch("sys.stdout", new_callable=io.StringIO):
+                    rc = cli_main()
+                self.assertEqual(rc, 1)
+                pre_rep = json.loads(pre_out.read_text(encoding="utf-8"))
+                self.assertEqual(pre_rep["verdict"], "NO_GO")
+                self.assertFalse(pre_rep["independent_preregistration_witness_verified"])
+                self.assertEqual(pre_rep["witness_verification_detail"], expected_detail)
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_oos_validation_gate.py",
+                    "rth-ant-witness-preflight",
+                    "--prereg-manifest",
+                    str(prereg_path),
+                    "--external-witness",
+                    str(good_wit_path),
+                    "--trusted-tsa-ca",
+                    str(ca_cert),
+                    "--output",
+                    str(pre_out),
+                ],
+            ), patch("sys.stdout", new_callable=io.StringIO):
+                rc_pre_ok = cli_main()
+            self.assertEqual(rc_pre_ok, 0)
+            pre_ok_rep = json.loads(pre_out.read_text(encoding="utf-8"))
+            self.assertEqual(pre_ok_rep["verdict"], "VERIFIED")
+            self.assertTrue(pre_ok_rep["independent_preregistration_witness_verified"])
+            self.assertLessEqual(pre_ok_rep["witness_time_ms"], fut_start_ms)
+
+            # 2. --require-witness-preflight short-circuits monday_rth_oos BEFORE heavy replay/archive reads, even if replay would raise OSError.
+            gate_out = root / "gate.json"
+            for wit_arg, expected_detail in (
+                (None, "external_witness_not_supplied"),
+                (bad_wit_path, "invalid_witness_schema"),
+            ):
+                calls: list[str] = []
+
+                def replay_boom(*args):
+                    calls.append("replay")
+                    raise OSError("replay I/O should not run when witness preflight blocks")
+
+                def seg_boom(*args):
+                    calls.append("segments")
+                    return seal_obj["segment_sha256"]
+
+                gate_out.unlink(missing_ok=True)
+                with patch.object(gate, "_run_pinned_replay", side_effect=replay_boom), \
+                     patch.object(gate, "_collect_segment_hashes", side_effect=seg_boom), \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    rc_blocked = gate.run_rth_ant_cli(
+                        [],
+                        "monday_rth_oos",
+                        gate_out,
+                        root,
+                        prereg_path,
+                        root / "unreadable_seal_ignored_by_preflight.json",
+                        wit_arg,
+                        ca_cert,
+                        require_witness_preflight=True,
+                    )
+                self.assertEqual(rc_blocked, 1)
+                self.assertEqual(calls, [])
+                rep = json.loads(gate_out.read_text(encoding="utf-8"))
+                self.assertEqual(rep["verdict"], "NO_GO")
+                self.assertTrue(rep.get("witness_preflight_blocked"))
+                self.assertEqual(rep["provenance"]["witness_verification_detail"], expected_detail)
+
+            cli_calls: list[str] = []
+            with patch.object(gate, "_run_pinned_replay", side_effect=lambda *a: cli_calls.append("replay")), \
+                 patch.object(gate, "_collect_segment_hashes", side_effect=lambda *a: cli_calls.append("segments")), \
+                 patch.object(sys, "argv", [
+                     "run_oos_validation_gate.py", "rth-ant",
+                     "--capture-dirs", str(root),
+                     "--role", "monday_rth_oos",
+                     "--prereg-manifest", str(prereg_path),
+                     "--output", str(gate_out),
+                     "--require-witness-preflight",
+                 ]), patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli_main(), 1)
+            self.assertEqual(cli_calls, [])
+            self.assertTrue(json.loads(gate_out.read_text(encoding="utf-8")).get("witness_preflight_blocked"))
+
+            # 3. Valid TSA witness passes --require-witness-preflight CLI wiring and completes GO.
+            good_calls: list[str] = []
+
+            def replay_ok(*args):
+                good_calls.append("replay")
+                return _sample_ant_window(start_ms=fut_start_ms, end_ms=fut_end_ms)
+
+            def seg_ok(*args):
+                good_calls.append("segments")
+                return seal_obj["segment_sha256"]
+
+            with patch.object(gate, "_run_pinned_replay", side_effect=replay_ok), \
+                 patch.object(gate, "_collect_segment_hashes", side_effect=seg_ok), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                rc_go = gate.run_rth_ant_cli(
+                    [],
+                    "monday_rth_oos",
+                    gate_out,
+                    root,
+                    prereg_path,
+                    seal_path,
+                    good_wit_path,
+                    ca_cert,
+                    require_witness_preflight=True,
+                )
+            self.assertEqual(rc_go, 0)
+            self.assertEqual(good_calls, ["replay", "segments"])
+            go_rep = json.loads(gate_out.read_text(encoding="utf-8"))
+            self.assertEqual(go_rep["verdict"], "GO")
+            self.assertNotIn("witness_preflight_blocked", go_rep)
+
+            # 4. selection_dev_dryrun still executes replay even when require_witness_preflight=True and witness is missing.
+            dry_calls: list[str] = []
+
+            def dry_replay(*args):
+                dry_calls.append("replay")
+                return _sample_ant_window(start_ms=fut_start_ms, end_ms=fut_end_ms)
+
+            with patch.object(gate, "_run_pinned_replay", side_effect=dry_replay), \
+                 patch.object(gate, "_collect_segment_hashes", return_value=seal_obj["segment_sha256"]), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                rc_dry = gate.run_rth_ant_cli(
+                    [],
+                    "selection_dev_dryrun",
+                    gate_out,
+                    root,
+                    prereg_path,
+                    seal_path,
+                    None,
+                    None,
+                    require_witness_preflight=True,
+                )
+            self.assertEqual(rc_dry, 0)
+            self.assertEqual(dry_calls, ["replay"])
+            self.assertEqual(json.loads(gate_out.read_text(encoding="utf-8"))["verdict"], "DRY_RUN_NOT_OOS")
 
 
 if __name__ == "__main__":

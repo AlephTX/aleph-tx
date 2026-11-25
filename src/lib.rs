@@ -11,6 +11,7 @@ pub mod hedging;
 pub mod live_hedge;
 pub mod order_budget;
 pub mod order_tracker;
+pub mod shm_book;
 pub mod shm_depth_reader;
 pub mod shm_event_reader;
 pub mod shm_path;

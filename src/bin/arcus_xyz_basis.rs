@@ -24,16 +24,18 @@ use aleph_tx::exchanges::hyperliquid::{
 use aleph_tx::order_budget::{
     BudgetDecision, OrderIntentClass, VenueOrderBudget, looks_like_rate_limit_error,
 };
+use aleph_tx::shm_book::{GenericShmBookFeed, ShmPairFeedConfig};
 use aleph_tx::strategy::arcus_xyz_basis::{
     ArcusBookSnapshot, ArcusLegIntent, ArcusLegPnlTracker, ArcusSubmitOutcome, ArcusXyzBasisConfig,
     ArcusXyzBasisEngine, BasisAction, BasisJournal, BasisJournalEvent, HL_MIN_ORDER_NOTIONAL_USD,
     HlLegIntent, HlSubmitOutcome, ShutdownDisposition, VenueOrderConstraints, VerifiedLegTerminal,
     classify_arcus_submit, classify_hl_submit, classify_shutdown, evaluate_hl_basis_tail_risk,
-    liquidation_distance_bps, parse_hl_market_liquidation_px, parse_hl_market_position,
-    quantize_arcus_limit_price, quantize_hl_base_qty, quantize_shared_base_qty,
-    verify_arcus_leg_terminal, verify_hl_leg_terminal,
+    evaluate_oracle_divergence_bps, liquidation_distance_bps, parse_hl_market_liquidation_px,
+    parse_hl_market_position, quantize_arcus_limit_price, quantize_hl_base_qty,
+    quantize_shared_base_qty, validate_hl_market_preflight, verify_arcus_leg_terminal,
+    verify_hl_leg_terminal,
 };
-use aleph_tx::strategy::tail_risk::TailRiskAction;
+use aleph_tx::strategy::tail_risk::{AdlDeltaAction, TailRiskAction};
 use aleph_tx::telemetry_sink::{HedgeFillRecord, SessionInfo, StrategySnapshot, TelemetrySink};
 use aleph_tx::venues::{
     CapabilityAssetScope, audited_execution_capabilities, select_execution_topology,
@@ -308,8 +310,14 @@ fn run_check(config_path: &Path) -> Result<()> {
             "max_notional_usd": cfg.max_notional_usd,
             "canary_max_order_usd": cfg.canary_max_order_usd,
             "canary_max_total_notional_usd": cfg.canary_max_total_notional_usd,
+            "require_hl_growth_mode": cfg.effective_require_hl_growth_mode(),
+            "max_hl_deployer_fee_scale": cfg.max_hl_deployer_fee_scale,
+            "max_oracle_divergence_bps": cfg.max_oracle_divergence_bps,
             "order_budget": cfg.order_budget,
             "tail_risk": cfg.tail_risk,
+            "adl_delta_breaker": cfg.adl_delta_breaker,
+            "kalman_basis": cfg.kalman_basis,
+            "shm_book_feed": cfg.shm_book_feed,
             "topology": topology,
         }))?
     );
@@ -608,12 +616,14 @@ async fn run_shadow(config_path: &Path, duration_secs: u64) -> Result<()> {
         .iter()
         .find(|m| m.asset.name == cfg.hl_coin)
         .with_context(|| format!("unknown HL market {}", cfg.hl_coin))?;
+    validate_hl_market_preflight(hl_market, &cfg)?;
 
     let mut engine = ArcusXyzBasisEngine::new(cfg.clone())?;
     engine.set_constraints(VenueOrderConstraints::from_markets(
         arc_market,
         &hl_market.asset,
     )?);
+    let mut shm_feed = ShmBookFeed::try_open(&cfg);
     let guard = DailyLossGuard::open(
         None,
         cfg.daily_loss_limit_pct,
@@ -628,24 +638,35 @@ async fn run_shadow(config_path: &Path, duration_secs: u64) -> Result<()> {
 
     loop {
         let now_ms = unix_ms()?;
-        let ((arc_res, arc_rx_res), (hl_res, hl_rx_res)) = tokio::join!(
-            async {
-                let r = arc_info.bbo(&cfg.arcus_symbol).await;
-                (r, unix_ms())
-            },
-            async {
-                let r = hl_info.l2_book(&cfg.hl_coin).await;
-                (r, unix_ms())
-            },
-        );
-        let arc_rx_ms = arc_rx_res?;
-        let hl_rx_ms = hl_rx_res?;
+        let shm_books = shm_feed
+            .as_mut()
+            .and_then(|feed| feed.read_books(&cfg, now_ms));
+        let (arc_snap_res, arc_rx_ms, hl_book_res, hl_rx_ms) =
+            if let Some((arc_snap, hl_book, rx_ms)) = shm_books {
+                (Ok(arc_snap), rx_ms, Ok(hl_book), rx_ms)
+            } else {
+                let ((arc_res, arc_rx_res), (hl_res, hl_rx_res)) = tokio::join!(
+                    async {
+                        let r = arc_info.bbo(&cfg.arcus_symbol).await;
+                        (r, unix_ms())
+                    },
+                    async {
+                        let r = hl_info.l2_book(&cfg.hl_coin).await;
+                        (r, unix_ms())
+                    },
+                );
+                let arc_rx_ms = arc_rx_res?;
+                let hl_rx_ms = hl_rx_res?;
+                (
+                    arc_res.and_then(|b| to_arcus_snapshot(&b, arc_rx_ms)),
+                    arc_rx_ms,
+                    hl_res,
+                    hl_rx_ms,
+                )
+            };
         let eval_now_ms = unix_ms()?;
         polls += 1;
-        match (
-            arc_res.and_then(|b| to_arcus_snapshot(&b, arc_rx_ms)),
-            hl_res,
-        ) {
+        match (arc_snap_res, hl_book_res) {
             (Ok(arc_snap), Ok(hl_book)) => {
                 let action =
                     engine.on_books(eval_now_ms, &arc_snap, &hl_book, hl_rx_ms, &guard, true);
@@ -831,6 +852,7 @@ async fn load_and_preflight(
         .into_iter()
         .find(|m| m.asset.name == cfg.hl_coin)
         .with_context(|| format!("unknown HL market {}", cfg.hl_coin))?;
+    validate_hl_market_preflight(&hl_market, cfg)?;
 
     let window = HistoryWindow::default();
     let (arc_open, hl_open, arc_positions, core_state, dex_state) = tokio::try_join!(
@@ -897,6 +919,191 @@ fn ensure_account_time(cfg: &ArcusXyzBasisConfig, now: u64, core: u64, dex: u64)
     Ok(())
 }
 
+/// While an unplanned net-delta emergency is active (e.g. the profitable leg was ADL-trimmed),
+/// block any action that would INCREASE gross exposure: new pair entries, and — critically — a
+/// NON-reduce-only residual hedge on the just-deleveraged leg. That re-hedge would grow gross
+/// toward/over the `<= 1.0x` leverage cap and invite immediate re-ADL. A `reduce_only`
+/// residual hedge is risk-reducing and stays permitted, as do exits.
+fn adl_delta_blocks_action(action: &BasisAction, adl: &AdlDeltaAction) -> bool {
+    if !matches!(adl, AdlDeltaAction::EmergencyReduceLeg { .. }) {
+        return false;
+    }
+    match action {
+        BasisAction::EnterPairIoc { .. } => true,
+        BasisAction::HedgeResidualXyz { reduce_only, .. } => !reduce_only,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OracleGateOutcome {
+    Allow,
+    BlockEntryMissingOracle,
+    BlockEntryStaleOracle { age_ms: u64 },
+    BlockEntryDiverged { divergence_bps: f64 },
+    InvalidOracle { error: String },
+}
+
+/// Inputs describing the freshness of the HL oracle price used by the divergence gate.
+/// `source_ms` is the oracle's exchange source clock; `now_ms` is local receipt time. Keeping
+/// them distinct lets the gate reject a stale cached oracle that still looks aligned to a
+/// freshly-moved book (a source clock is never treated as a receipt clock).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OracleFreshness {
+    source_ms: u64,
+    now_ms: u64,
+    max_age_ms: u64,
+    max_future_skew_ms: u64,
+}
+
+impl OracleFreshness {
+    /// Age of the oracle in ms, saturating. A source clock ahead of local time ages to 0.
+    fn age_ms(&self) -> u64 {
+        self.now_ms.saturating_sub(self.source_ms)
+    }
+    fn is_future_skewed(&self) -> bool {
+        self.source_ms > self.now_ms.saturating_add(self.max_future_skew_ms)
+    }
+    fn is_stale(&self) -> bool {
+        self.source_ms == 0
+            || self.now_ms == 0
+            || self.is_future_skewed()
+            || self.age_ms() > self.max_age_ms
+    }
+}
+
+fn evaluate_action_oracle_gate(
+    action: &BasisAction,
+    reference_mid: Decimal,
+    hl_oracle_px: Option<Decimal>,
+    max_oracle_divergence_bps: f64,
+    freshness: OracleFreshness,
+) -> OracleGateOutcome {
+    if matches!(action, BasisAction::Hold { .. }) {
+        return OracleGateOutcome::Allow;
+    }
+    let is_new_entry = matches!(action, BasisAction::EnterPairIoc { .. });
+    match hl_oracle_px {
+        None => {
+            if is_new_entry {
+                OracleGateOutcome::BlockEntryMissingOracle
+            } else {
+                OracleGateOutcome::Allow
+            }
+        }
+        Some(oracle_px) => {
+            // Fail closed on a stale oracle for NEW entries only: a cached oracle that lags the
+            // book can both falsely pass the divergence check and justify an entry. Reduce/close
+            // paths stay open so risk can always be unwound.
+            if is_new_entry && freshness.is_stale() {
+                return OracleGateOutcome::BlockEntryStaleOracle {
+                    age_ms: freshness.age_ms(),
+                };
+            }
+            match evaluate_oracle_divergence_bps(
+                reference_mid,
+                oracle_px,
+                max_oracle_divergence_bps,
+            ) {
+                Err(err) => OracleGateOutcome::InvalidOracle {
+                    error: err.to_string(),
+                },
+                Ok((div_bps, TailRiskAction::ReduceOnly)) if is_new_entry => {
+                    OracleGateOutcome::BlockEntryDiverged {
+                        divergence_bps: div_bps,
+                    }
+                }
+                Ok(_) => OracleGateOutcome::Allow,
+            }
+        }
+    }
+}
+
+/// Thin venue adapter over the venue-agnostic [`GenericShmBookFeed`].
+/// Converts [`NormalizedBookSnapshot`] slots into `ArcusBookSnapshot` and `hyperliquid::ValidatedBook`,
+/// preserving strict `cfg.book_problem` clock/spread checks and automatic REST fallback.
+struct ShmBookFeed {
+    inner: GenericShmBookFeed,
+    hl_coin: String,
+}
+
+fn convert_normalized_shm_pair(
+    cfg: &ArcusXyzBasisConfig,
+    hl_coin: &str,
+    now_ms: u64,
+    arc_norm: aleph_tx::shm_book::NormalizedBookSnapshot,
+    hl_norm: aleph_tx::shm_book::NormalizedBookSnapshot,
+) -> Option<(ArcusBookSnapshot, hyperliquid::ValidatedBook, u64)> {
+    // Never alias or clamp venue `source_ms` into local receipt time: without an
+    // independent feeder receipt clock, fail closed so callers fall back to REST (`unix_ms()`).
+    let arc_rx_ms = arc_norm.feeder_receipt_ms?;
+    let hl_rx_ms = hl_norm.feeder_receipt_ms?;
+    let arc_snap = ArcusBookSnapshot {
+        source_ms: arc_norm.source_ms,
+        receipt_ms: arc_rx_ms,
+        bid_px: arc_norm.bid_px,
+        bid_sz: arc_norm.bid_sz,
+        ask_px: arc_norm.ask_px,
+        ask_sz: arc_norm.ask_sz,
+    };
+    let hl_bbo = hyperliquid::BestBidAsk {
+        coin: hl_coin.to_owned(),
+        timestamp_ms: hl_norm.source_ms,
+        bid: hl_norm.bid_px,
+        bid_size: hl_norm.bid_sz,
+        ask: hl_norm.ask_px,
+        ask_size: hl_norm.ask_sz,
+    };
+    let hl_book = hyperliquid::ValidatedBook {
+        bbo: hl_bbo,
+        bids: hl_norm.bids.to_vec(),
+        asks: hl_norm.asks.to_vec(),
+    };
+    if cfg
+        .book_problem(now_ms, &arc_snap, &hl_book, hl_rx_ms)
+        .is_some()
+    {
+        return None;
+    }
+    Some((arc_snap, hl_book, hl_rx_ms))
+}
+
+impl ShmBookFeed {
+    fn try_open(cfg: &ArcusXyzBasisConfig) -> Option<Self> {
+        let pair_cfg = ShmPairFeedConfig {
+            enabled: cfg.shm_book_feed.enabled,
+            bbo_shm_path: cfg.shm_book_feed.bbo_shm_path.clone(),
+            depth_shm_path: cfg.shm_book_feed.depth_shm_path.clone(),
+            symbol_id: cfg.shm_book_feed.symbol_id,
+            primary_exchange_id: cfg.shm_book_feed.arcus_exchange_id,
+            hedge_exchange_id: cfg.shm_book_feed.hl_exchange_id,
+        };
+        match GenericShmBookFeed::open(&pair_cfg) {
+            Ok(Some(inner)) => Some(Self {
+                inner,
+                hl_coin: cfg.hl_coin.clone(),
+            }),
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!(
+                    "shm_book_feed unavailable at {} ({err}); falling back to REST",
+                    cfg.shm_book_feed.bbo_shm_path
+                );
+                None
+            }
+        }
+    }
+
+    fn read_books(
+        &mut self,
+        cfg: &ArcusXyzBasisConfig,
+        now_ms: u64,
+    ) -> Option<(ArcusBookSnapshot, hyperliquid::ValidatedBook, u64)> {
+        let (arc_norm, hl_norm) = self.inner.read_pair()?;
+        convert_normalized_shm_pair(cfg, &self.hl_coin, now_ms, arc_norm, hl_norm)
+    }
+}
+
 #[derive(Clone)]
 struct VenueSnapshot {
     core_time: u64,
@@ -905,6 +1112,7 @@ struct VenueSnapshot {
     hl_equity: Decimal,
     hl_margin_used: Decimal,
     hl_liq_px: Option<Decimal>,
+    hl_oracle_px: Option<Decimal>,
     hl_account_time_ms: u64,
 }
 
@@ -954,16 +1162,24 @@ async fn reconcile_both_venues(
     handles: &LiveHandles,
     cfg: &ArcusXyzBasisConfig,
 ) -> Result<VenueSnapshot> {
-    let (arc_res, core_res, dex_res) = tokio::join!(
+    let (arc_res, core_res, dex_res, markets_res) = tokio::join!(
         handles.arc_info.positions(&handles.arc_account),
         handles.hl_info.account_state(&handles.hl_account),
         handles
             .hl_info
             .account_state_for_dex(&handles.hl_account, &cfg.hl_dex),
+        handles
+            .hl_info
+            .perpetual_markets((!cfg.hl_dex.is_empty()).then_some(cfg.hl_dex.as_str())),
     );
     let arc_positions = arc_res.map_err(|e| tag_venue_err(BudgetVenue::Arcus, e))?;
     let core_state = core_res.map_err(|e| tag_venue_err(BudgetVenue::Hl, e))?;
     let dex_state = dex_res.map_err(|e| tag_venue_err(BudgetVenue::Hl, e))?;
+    let hl_oracle_px = markets_res
+        .map_err(|e| tag_venue_err(BudgetVenue::Hl, e))?
+        .into_iter()
+        .find(|m| m.asset.name == cfg.hl_coin)
+        .map(|m| m.oracle_price);
     let inv_arc = arc_positions
         .get(&handles.arc_market.market_id)
         .map(|p| p.size)
@@ -980,6 +1196,7 @@ async fn reconcile_both_venues(
         hl_equity,
         hl_margin_used,
         hl_liq_px,
+        hl_oracle_px,
         hl_account_time_ms: dex_state.time,
     })
 }
@@ -1084,11 +1301,14 @@ impl Valuation {
 }
 
 const KNOWN_POLL_REASONS: &[&str] = &[
+    "invalid_eval_time",
     "stale_arcus_book",
     "stale_xyz_book",
     "stale_arcus_source_book",
     "stale_xyz_source_book",
     "invalid_arcus_book",
+    "invalid_arcus_receipt_time",
+    "invalid_xyz_receipt_time",
     "invalid_arcus_source_time",
     "invalid_xyz_source_time",
     "legs and account valuation times are too far apart",
@@ -1114,8 +1334,11 @@ fn classify_poll_error(err: &anyhow::Error) -> &'static str {
     "poll_failed"
 }
 
-async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<Valuation> {
-    let (arc_res, hl_res, account_res) = tokio::join!(
+async fn fetch_rest_books(
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+) -> Result<(ArcusBookSnapshot, hyperliquid::ValidatedBook, u64)> {
+    let (arc_res, hl_res) = tokio::join!(
         async {
             let bbo = handles
                 .arc_info
@@ -1132,11 +1355,38 @@ async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<V
                 .map_err(|e| tag_venue_err(BudgetVenue::Hl, e))?;
             Ok::<_, anyhow::Error>((book, unix_ms()?))
         },
-        reconcile_both_venues(handles, cfg),
     );
     let arc = arc_res?;
     let (hl, hl_rx) = hl_res?;
-    let account = account_res?;
+    Ok((arc, hl, hl_rx))
+}
+
+async fn valuation(handles: &LiveHandles, cfg: &ArcusXyzBasisConfig) -> Result<Valuation> {
+    valuation_with_shm(handles, cfg, None).await
+}
+
+async fn valuation_with_shm(
+    handles: &LiveHandles,
+    cfg: &ArcusXyzBasisConfig,
+    shm_feed: Option<&mut ShmBookFeed>,
+) -> Result<Valuation> {
+    let (arc, hl, hl_rx, account) = if let Some(feed) = shm_feed {
+        let account = reconcile_both_venues(handles, cfg).await?;
+        let now_ms = unix_ms()?;
+        let (arc, hl, hl_rx) = match feed.read_books(cfg, now_ms) {
+            Some(books) => books,
+            None => fetch_rest_books(handles, cfg).await?,
+        };
+        (arc, hl, hl_rx, account)
+    } else {
+        let (books_res, account_res) = tokio::join!(
+            fetch_rest_books(handles, cfg),
+            reconcile_both_venues(handles, cfg),
+        );
+        let (arc, hl, hl_rx) = books_res?;
+        let account = account_res?;
+        (arc, hl, hl_rx, account)
+    };
     let v = Valuation {
         sampled_at: Instant::now(),
         sampled_ms: unix_ms()?,
@@ -1153,6 +1403,7 @@ async fn poll_valuation(
     handles: &LiveHandles,
     cfg: &ArcusXyzBasisConfig,
     cached_account: &mut Option<(VenueSnapshot, Instant)>,
+    mut shm_feed: Option<&mut ShmBookFeed>,
 ) -> Result<(Valuation, bool)> {
     let now = Instant::now();
     let last_refresh = cached_account.as_ref().map(|(_, t)| *t);
@@ -1160,25 +1411,15 @@ async fn poll_valuation(
         && let Some((cached, _)) = cached_account.as_ref()
     {
         let cached_snap = cached.clone();
-        let arc_fut = async {
-            let bbo = handles
-                .arc_info
-                .bbo(&cfg.arcus_symbol)
-                .await
-                .map_err(|e| tag_venue_err(BudgetVenue::Arcus, e))?;
-            to_arcus_snapshot(&bbo, unix_ms()?)
+        let now_ms = unix_ms()?;
+        let (arc, hl, hl_rx) = if let Some(books) = shm_feed
+            .as_deref_mut()
+            .and_then(|feed| feed.read_books(cfg, now_ms))
+        {
+            books
+        } else {
+            fetch_rest_books(handles, cfg).await?
         };
-        let hl_fut = async {
-            let book = handles
-                .hl_info
-                .l2_book(&cfg.hl_coin)
-                .await
-                .map_err(|e| tag_venue_err(BudgetVenue::Hl, e))?;
-            Ok::<_, anyhow::Error>((book, unix_ms()?))
-        };
-        let (arc_res, hl_res) = tokio::join!(arc_fut, hl_fut);
-        let arc = arc_res?;
-        let (hl, hl_rx) = hl_res?;
         let sampled_ms = unix_ms()?;
         let v = Valuation {
             sampled_at: Instant::now(),
@@ -1200,7 +1441,7 @@ async fn poll_valuation(
         }
     }
     *cached_account = None;
-    let v = valuation(handles, cfg).await?;
+    let v = valuation_with_shm(handles, cfg, shm_feed).await?;
     *cached_account = Some((v.account.clone(), v.sampled_at));
     Ok((v, true))
 }
@@ -2066,6 +2307,7 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
     let mut hl_budget = VenueOrderBudget::new(cfg.order_budget)?;
     let mut arcus_order_rate_limited = false;
     let mut hl_order_rate_limited = false;
+    let mut shm_feed = ShmBookFeed::try_open(&cfg);
 
     loop {
         if let Some(sig) = shutdown
@@ -2259,7 +2501,8 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
                 }
             }
         }
-        let valuation_result = poll_valuation(&handles, &cfg, &mut cached_account).await;
+        let valuation_result =
+            poll_valuation(&handles, &cfg, &mut cached_account, shm_feed.as_mut()).await;
         let eval_now_ms = unix_ms()?;
         let (mut v, account_fresh) = match valuation_result {
             Ok(res) => {
@@ -2452,7 +2695,221 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
             Ok(_) => false,
         };
 
-        let skip_for_budget = if skip_for_tail_risk {
+        let skip_for_adl_delta = match engine.evaluate_adl_delta(eval_now_ms) {
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "mode": "canary_error",
+                        "event": "adl_delta_halt",
+                        "ms": eval_now_ms,
+                        "error": err.to_string(),
+                    })
+                );
+                return Err(halt_canary_on_budget(
+                    "adl_delta_halt",
+                    &handles,
+                    &cfg,
+                    &journal,
+                    telemetry.as_ref(),
+                    Some(&v.arc),
+                    session_eq,
+                    session_start_equity,
+                    &daily_loss,
+                    &engine,
+                    lease_ok,
+                )
+                .await);
+            }
+            Ok(AdlDeltaAction::HaltAndFlatten {
+                net_delta_base,
+                elapsed_ms,
+                reason,
+            }) => {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "mode": "canary_error",
+                        "event": "adl_delta_halt",
+                        "ms": eval_now_ms,
+                        "net_delta_base": net_delta_base,
+                        "elapsed_ms": elapsed_ms,
+                        "reason": reason,
+                    })
+                );
+                return Err(halt_canary_on_budget(
+                    "adl_delta_halt",
+                    &handles,
+                    &cfg,
+                    &journal,
+                    telemetry.as_ref(),
+                    Some(&v.arc),
+                    session_eq,
+                    session_start_equity,
+                    &daily_loss,
+                    &engine,
+                    lease_ok,
+                )
+                .await);
+            }
+            Ok(
+                ref adl @ AdlDeltaAction::EmergencyReduceLeg {
+                    leg,
+                    is_buy,
+                    qty_base,
+                    reduce_only,
+                    elapsed_ms,
+                    within_response_sla,
+                },
+            ) => {
+                if adl_delta_blocks_action(&action, adl) {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "entry_adl_delta_blocked",
+                            "ms": eval_now_ms,
+                            "leg": format!("{leg:?}"),
+                            "is_buy": is_buy,
+                            "qty_base": qty_base,
+                            "reduce_only": reduce_only,
+                            "elapsed_ms": elapsed_ms,
+                            "within_response_sla": within_response_sla,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        eval_now_ms,
+                    );
+                    true
+                } else {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "adl_delta_emergency_hedge",
+                            "ms": eval_now_ms,
+                            "leg": format!("{leg:?}"),
+                            "is_buy": is_buy,
+                            "qty_base": qty_base,
+                            "reduce_only": reduce_only,
+                            "elapsed_ms": elapsed_ms,
+                            "within_response_sla": within_response_sla,
+                        })
+                    );
+                    false
+                }
+            }
+            Ok(AdlDeltaAction::Balanced { .. }) => false,
+        };
+
+        let skip_for_oracle_div = if skip_for_tail_risk || skip_for_adl_delta {
+            true
+        } else {
+            match evaluate_action_oracle_gate(
+                &action,
+                v.mid(),
+                v.account.hl_oracle_px,
+                cfg.max_oracle_divergence_bps,
+                OracleFreshness {
+                    source_ms: v.account.hl_account_time_ms,
+                    now_ms: eval_now_ms,
+                    max_age_ms: cfg.max_oracle_age_ms,
+                    max_future_skew_ms: cfg.tail_risk.max_future_skew_ms,
+                },
+            ) {
+                OracleGateOutcome::InvalidOracle { error } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_error",
+                            "event": "oracle_divergence_invalid",
+                            "ms": eval_now_ms,
+                            "error": error,
+                        })
+                    );
+                    return Err(halt_canary_on_budget(
+                        "oracle_divergence_invalid",
+                        &handles,
+                        &cfg,
+                        &journal,
+                        telemetry.as_ref(),
+                        Some(&v.arc),
+                        session_eq,
+                        session_start_equity,
+                        &daily_loss,
+                        &engine,
+                        lease_ok,
+                    )
+                    .await);
+                }
+                OracleGateOutcome::BlockEntryStaleOracle { age_ms } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "entry_oracle_stale_blocked",
+                            "ms": eval_now_ms,
+                            "oracle_age_ms": age_ms,
+                            "max_oracle_age_ms": cfg.max_oracle_age_ms,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        eval_now_ms,
+                    );
+                    true
+                }
+                OracleGateOutcome::BlockEntryMissingOracle => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "entry_oracle_missing_blocked",
+                            "ms": eval_now_ms,
+                            "hl_coin": cfg.hl_coin,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        eval_now_ms,
+                    );
+                    true
+                }
+                OracleGateOutcome::BlockEntryDiverged { divergence_bps } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "entry_oracle_divergence_blocked",
+                            "ms": eval_now_ms,
+                            "divergence_bps": divergence_bps,
+                            "max_oracle_divergence_bps": cfg.max_oracle_divergence_bps,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        eval_now_ms,
+                    );
+                    true
+                }
+                OracleGateOutcome::Allow => false,
+            }
+        };
+
+        let skip_for_budget = if skip_for_tail_risk || skip_for_adl_delta || skip_for_oracle_div {
             true
         } else if let Some(intent_class) = classify_intent(&action) {
             match admit_dual_venue_intent(
@@ -2594,6 +3051,189 @@ async fn run_canary_live(config_path: &Path, env_path: &Path) -> Result<()> {
             )
             .await?;
             let fresh_now_ms = unix_ms()?;
+            match evaluate_hl_basis_tail_risk(
+                fresh_now_ms,
+                v.account.hl_equity.to_f64().unwrap_or(f64::NAN),
+                v.account.hl_margin_used.to_f64().unwrap_or(f64::NAN),
+                liquidation_distance_bps(v.account.inv_xyz, v.mid(), v.account.hl_liq_px),
+                &cfg.tail_risk,
+            ) {
+                Err(err) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_error",
+                            "event": "pre_dispatch_tail_risk_halt",
+                            "ms": fresh_now_ms,
+                            "error": err.to_string(),
+                        })
+                    );
+                    return Err(halt_canary_on_budget(
+                        "tail_risk_halt",
+                        &handles,
+                        &cfg,
+                        &journal,
+                        telemetry.as_ref(),
+                        Some(&v.arc),
+                        session_eq,
+                        session_start_equity,
+                        &daily_loss,
+                        &engine,
+                        lease_ok,
+                    )
+                    .await);
+                }
+                Ok(assess) if assess.action == TailRiskAction::HaltAndFlatten => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_error",
+                            "event": "pre_dispatch_tail_risk_halt",
+                            "ms": fresh_now_ms,
+                            "reasons": assess.reasons,
+                            "max_margin_util": assess.max_margin_util,
+                            "min_liq_buffer_bps": assess.min_liq_buffer_bps,
+                        })
+                    );
+                    return Err(halt_canary_on_budget(
+                        "tail_risk_halt",
+                        &handles,
+                        &cfg,
+                        &journal,
+                        telemetry.as_ref(),
+                        Some(&v.arc),
+                        session_eq,
+                        session_start_equity,
+                        &daily_loss,
+                        &engine,
+                        lease_ok,
+                    )
+                    .await);
+                }
+                Ok(assess)
+                    if assess.action == TailRiskAction::ReduceOnly
+                        && matches!(action, BasisAction::EnterPairIoc { .. }) =>
+                {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "pre_dispatch_entry_tail_risk_blocked",
+                            "ms": fresh_now_ms,
+                            "reasons": assess.reasons,
+                            "max_margin_util": assess.max_margin_util,
+                            "min_liq_buffer_bps": assess.min_liq_buffer_bps,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        fresh_now_ms,
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match evaluate_action_oracle_gate(
+                &action,
+                v.mid(),
+                v.account.hl_oracle_px,
+                cfg.max_oracle_divergence_bps,
+                OracleFreshness {
+                    source_ms: v.account.hl_account_time_ms,
+                    now_ms: fresh_now_ms,
+                    max_age_ms: cfg.max_oracle_age_ms,
+                    max_future_skew_ms: cfg.tail_risk.max_future_skew_ms,
+                },
+            ) {
+                OracleGateOutcome::InvalidOracle { error } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_error",
+                            "event": "oracle_divergence_invalid",
+                            "ms": fresh_now_ms,
+                            "error": error,
+                        })
+                    );
+                    return Err(halt_canary_on_budget(
+                        "oracle_divergence_invalid",
+                        &handles,
+                        &cfg,
+                        &journal,
+                        telemetry.as_ref(),
+                        Some(&v.arc),
+                        session_eq,
+                        session_start_equity,
+                        &daily_loss,
+                        &engine,
+                        lease_ok,
+                    )
+                    .await);
+                }
+                OracleGateOutcome::BlockEntryStaleOracle { age_ms } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "pre_dispatch_entry_oracle_stale_blocked",
+                            "ms": fresh_now_ms,
+                            "oracle_age_ms": age_ms,
+                            "max_oracle_age_ms": cfg.max_oracle_age_ms,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        fresh_now_ms,
+                    );
+                    continue;
+                }
+                OracleGateOutcome::BlockEntryMissingOracle => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "pre_dispatch_entry_oracle_missing_blocked",
+                            "ms": fresh_now_ms,
+                            "hl_coin": cfg.hl_coin,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        fresh_now_ms,
+                    );
+                    continue;
+                }
+                OracleGateOutcome::BlockEntryDiverged { divergence_bps } => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "mode": "canary_warn",
+                            "event": "pre_dispatch_entry_oracle_divergence_blocked",
+                            "ms": fresh_now_ms,
+                            "divergence_bps": divergence_bps,
+                            "max_oracle_divergence_bps": cfg.max_oracle_divergence_bps,
+                        })
+                    );
+                    engine.reconcile_positions(
+                        v.account.inv_arc,
+                        v.account.inv_xyz,
+                        v.arc.receipt_ms,
+                        v.hl_rx,
+                        fresh_now_ms,
+                    );
+                    continue;
+                }
+                OracleGateOutcome::Allow => {}
+            }
             let brake_tightened = matches!(
                 action,
                 BasisAction::EnterPairIoc { brake_scale, .. }
@@ -3231,6 +3871,7 @@ mod tests {
                 hl_equity: 100.into(),
                 hl_margin_used: Decimal::ZERO,
                 hl_liq_px: None,
+                hl_oracle_px: None,
                 inv_arc: Decimal::ZERO,
                 inv_xyz: Decimal::ZERO,
             },
@@ -3521,6 +4162,7 @@ mod tests {
                 hl_equity: 100.into(),
                 hl_margin_used: Decimal::ZERO,
                 hl_liq_px: None,
+                hl_oracle_px: None,
                 hl_account_time_ms: now - cfg.account_refresh_interval_ms,
             },
         };
@@ -3729,5 +4371,431 @@ mod tests {
             tag_venue_err(BudgetVenue::Arcus, anyhow::anyhow!("HTTP 429")).context("outer context");
         assert_eq!(venue_from_error(&tagged), Some(BudgetVenue::Arcus));
         assert!(looks_like_rate_limit_error(&format!("{tagged:#}")));
+    }
+
+    #[test]
+    fn shm_book_feed_reads_valid_bbo_and_depth_and_falls_back_on_stale_slot() {
+        use aleph_tx::shm_depth_reader::DEPTH_MAGIC_V12;
+        use aleph_tx::shm_reader::{NUM_EXCHANGES, NUM_SYMBOLS, SHM_MAGIC_V12};
+
+        struct TempFileGuard(PathBuf);
+        impl Drop for TempFileGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir();
+        let uid = uuid::Uuid::new_v4();
+        let bbo_path = dir.join(format!("test_bbo_{uid}.shm"));
+        let depth_path = dir.join(format!("test_depth_{uid}.shm"));
+        let _bbo_guard = TempFileGuard(bbo_path.clone());
+        let _depth_guard = TempFileGuard(depth_path.clone());
+
+        let version_hdr = NUM_SYMBOLS * 8;
+        let bbo_total = version_hdr + NUM_SYMBOLS * NUM_EXCHANGES * 64;
+        let mut bbo_buf = vec![0_u8; bbo_total];
+        bbo_buf[version_hdr + 48..version_hdr + 64].copy_from_slice(&SHM_MAGIC_V12);
+
+        let now_ms: u64 = 1_700_000_000_000;
+        let write_bbo_slot = |buf: &mut [u8], exch: u8, ts_ns: u64, bid: f64, ask: f64| {
+            let off = version_hdr + usize::from(exch) * 64;
+            buf[off..off + 4].copy_from_slice(&2_u32.to_le_bytes());
+            buf[off + 4] = 1;
+            buf[off + 5] = exch;
+            buf[off + 6..off + 8].copy_from_slice(&0_u16.to_le_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&ts_ns.to_le_bytes());
+            buf[off + 16..off + 24].copy_from_slice(&bid.to_le_bytes());
+            buf[off + 24..off + 32].copy_from_slice(&5.0_f64.to_le_bytes());
+            buf[off + 32..off + 40].copy_from_slice(&ask.to_le_bytes());
+            buf[off + 40..off + 48].copy_from_slice(&4.0_f64.to_le_bytes());
+        };
+        write_bbo_slot(&mut bbo_buf, 7, now_ms * 1_000_000, 100.0, 100.1);
+        write_bbo_slot(&mut bbo_buf, 10, now_ms * 1_000_000, 100.2, 100.3);
+        fs::write(&bbo_path, &bbo_buf).unwrap();
+
+        let depth_total = version_hdr + NUM_SYMBOLS * NUM_EXCHANGES * 256;
+        let mut depth_buf = vec![0_u8; depth_total];
+        depth_buf[version_hdr + 184..version_hdr + 200].copy_from_slice(&DEPTH_MAGIC_V12);
+        let d_off = version_hdr + 10 * 256;
+        depth_buf[d_off..d_off + 4].copy_from_slice(&2_u32.to_le_bytes());
+        depth_buf[d_off + 4] = 10;
+        depth_buf[d_off + 6..d_off + 8].copy_from_slice(&0_u16.to_le_bytes());
+        depth_buf[d_off + 16..d_off + 24].copy_from_slice(&(now_ms * 1_000_000).to_le_bytes());
+        // Write 2 bid levels and 2 ask levels for TradeXYZ depth enrichment.
+        for (i, (px, sz)) in [(100.2_f64, 5.0_f64), (100.1_f64, 10.0_f64)]
+            .into_iter()
+            .enumerate()
+        {
+            let p_off = d_off + 24 + i * 16;
+            depth_buf[p_off..p_off + 8].copy_from_slice(&px.to_le_bytes());
+            depth_buf[p_off + 8..p_off + 16].copy_from_slice(&sz.to_le_bytes());
+        }
+        for (i, (px, sz)) in [(100.3_f64, 4.0_f64), (100.4_f64, 8.0_f64)]
+            .into_iter()
+            .enumerate()
+        {
+            let p_off = d_off + 104 + i * 16;
+            depth_buf[p_off..p_off + 8].copy_from_slice(&px.to_le_bytes());
+            depth_buf[p_off + 8..p_off + 16].copy_from_slice(&sz.to_le_bytes());
+        }
+        fs::write(&depth_path, &depth_buf).unwrap();
+
+        let mut cfg: ArcusXyzBasisConfig =
+            toml::from_str(include_str!("../../config.arcus_xyz_basis.example.toml")).unwrap();
+        cfg.shm_book_feed.enabled = true;
+        cfg.shm_book_feed.bbo_shm_path = bbo_path.display().to_string();
+        cfg.shm_book_feed.depth_shm_path = depth_path.display().to_string();
+
+        let mut feed = ShmBookFeed::try_open(&cfg).expect("SHM feed should open");
+        // Matrix V12 stores venue source timestamps only without an independent feeder receipt
+        // clock (`feeder_receipt_ms: None`), so ShmBookFeed MUST fail closed and fall back to REST.
+        assert!(feed.read_books(&cfg, now_ms).is_none());
+
+        let (mut arc_norm, mut hl_norm) = feed.inner.read_pair().expect("raw V12 slots decode");
+        assert!(arc_norm.feeder_receipt_ms.is_none());
+        assert!(hl_norm.feeder_receipt_ms.is_none());
+
+        // When an independent feeder local receipt timestamp IS supplied, fresh frames pass
+        // (including positive venue source clock lead <= max_venue_clock_skew_ms).
+        arc_norm.feeder_receipt_ms = Some(now_ms);
+        hl_norm.feeder_receipt_ms = Some(now_ms);
+        let (arc, hl, rx_ms) = convert_normalized_shm_pair(
+            &cfg,
+            &cfg.hl_coin,
+            now_ms,
+            arc_norm.clone(),
+            hl_norm.clone(),
+        )
+        .expect("explicit independent feeder receipt clock should decode");
+        assert_eq!(rx_ms, now_ms);
+        assert_eq!(arc.bid_px, Decimal::from(100));
+        assert_eq!(hl.bids.len(), 2);
+        assert_eq!(hl.asks.len(), 2);
+
+        let mut arc_skew = arc_norm.clone();
+        let mut hl_skew = hl_norm.clone();
+        arc_skew.source_ms = now_ms + 50;
+        hl_skew.source_ms = now_ms + 50;
+        arc_skew.feeder_receipt_ms = Some(now_ms);
+        hl_skew.feeder_receipt_ms = Some(now_ms);
+        let (arc_s, hl_s, rx_s) =
+            convert_normalized_shm_pair(&cfg, &cfg.hl_coin, now_ms, arc_skew, hl_skew)
+                .expect("small positive venue source lead should decode with true rx_ms");
+        assert_eq!(rx_s, now_ms);
+        assert_eq!(arc_s.source_ms, now_ms + 50);
+        assert_eq!(hl_s.bbo.timestamp_ms, now_ms + 50);
+
+        // #677 counterexample: venue source clock +600 ms ahead while local feeder receipt is
+        // 500 ms stale MUST fail against the 250 ms receipt TTL (never masked by source_ms).
+        let mut arc_677 = arc_norm;
+        let mut hl_677 = hl_norm;
+        arc_677.source_ms = now_ms + 600;
+        hl_677.source_ms = now_ms + 600;
+        arc_677.feeder_receipt_ms = Some(now_ms);
+        hl_677.feeder_receipt_ms = Some(now_ms);
+        assert!(
+            convert_normalized_shm_pair(&cfg, &cfg.hl_coin, now_ms + 500, arc_677, hl_677)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adl_delta_emergency_blocks_new_entries_and_permits_reduce_only_exits() {
+        let adl_emergency = AdlDeltaAction::EmergencyReduceLeg {
+            leg: aleph_tx::strategy::tail_risk::PairedLeg::Primary,
+            is_buy: false,
+            qty_base: 2.0,
+            reduce_only: true,
+            elapsed_ms: 40,
+            within_response_sla: true,
+        };
+        let adl_balanced = AdlDeltaAction::Balanced {
+            net_delta_base: 0.0,
+            delta_ratio: 0.0,
+        };
+        let entry = BasisAction::EnterPairIoc {
+            direction_arcus_buy: true,
+            qty: Decimal::ONE,
+            arcus_limit_px: Decimal::from(100),
+            xyz_limit_px: Decimal::from(100),
+            raw_edge_bp: 12.0,
+            req_edge_bp: 10.0,
+            brake_scale: 1.0,
+        };
+        let exit = BasisAction::ExitPairIoc {
+            direction_arcus_buy: false,
+            qty: Decimal::ONE,
+            arcus_limit_px: Decimal::from(100),
+            xyz_limit_px: Decimal::from(100),
+            timed_out: false,
+        };
+        let hedge_residual = BasisAction::HedgeResidualXyz {
+            is_buy: false,
+            qty: Decimal::ONE,
+            limit_price: Decimal::from(100),
+            reduce_only: true,
+        };
+
+        let hedge_residual_non_reduce = BasisAction::HedgeResidualXyz {
+            is_buy: false,
+            qty: Decimal::ONE,
+            limit_price: Decimal::from(100),
+            reduce_only: false,
+        };
+
+        assert!(adl_delta_blocks_action(&entry, &adl_emergency));
+        assert!(!adl_delta_blocks_action(&exit, &adl_emergency));
+        // A reduce-only residual hedge is risk-reducing and stays permitted.
+        assert!(!adl_delta_blocks_action(&hedge_residual, &adl_emergency));
+        // A NON-reduce-only residual hedge would grow gross on the ADL-trimmed leg -> blocked.
+        assert!(adl_delta_blocks_action(
+            &hedge_residual_non_reduce,
+            &adl_emergency
+        ));
+        // With no active emergency, nothing is blocked by this predicate.
+        assert!(!adl_delta_blocks_action(&entry, &adl_balanced));
+        assert!(!adl_delta_blocks_action(
+            &hedge_residual_non_reduce,
+            &adl_balanced
+        ));
+    }
+
+    #[test]
+    fn oracle_gate_blocks_missing_or_divergent_new_entries_while_permitting_reduce_only_paths() {
+        let entry = BasisAction::EnterPairIoc {
+            direction_arcus_buy: true,
+            qty: Decimal::ONE,
+            arcus_limit_px: Decimal::from(100),
+            xyz_limit_px: Decimal::from(100),
+            raw_edge_bp: 12.0,
+            req_edge_bp: 10.0,
+            brake_scale: 1.0,
+        };
+        let exit = BasisAction::ExitPairIoc {
+            direction_arcus_buy: false,
+            qty: Decimal::ONE,
+            arcus_limit_px: Decimal::from(100),
+            xyz_limit_px: Decimal::from(100),
+            timed_out: false,
+        };
+        let hedge_residual = BasisAction::HedgeResidualXyz {
+            is_buy: false,
+            qty: Decimal::ONE,
+            limit_price: Decimal::from(100),
+            reduce_only: true,
+        };
+        let hold = BasisAction::Hold { reason: "idle" };
+        let max_div = 25.0;
+        // Fresh oracle (age 0) for all divergence/missing/invalid assertions below; staleness is
+        // exercised separately at the end of this test.
+        let fresh = OracleFreshness {
+            source_ms: 1_000,
+            now_ms: 1_000,
+            max_age_ms: 2_000,
+            max_future_skew_ms: 5_000,
+        };
+
+        // #679 runtime catalog missing target coin -> None must fail closed on new entries.
+        assert_eq!(
+            evaluate_action_oracle_gate(&entry, Decimal::from(100), None, max_div, fresh),
+            OracleGateOutcome::BlockEntryMissingOracle
+        );
+
+        // Exact 25.0 bp threshold is allowed; >25.0 bp is blocked on new entries.
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &entry,
+                "100.25".parse().unwrap(),
+                Some(Decimal::from(100)),
+                max_div,
+                fresh,
+            ),
+            OracleGateOutcome::Allow
+        );
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                "100.25001".parse().unwrap(),
+                Some(Decimal::from(100)),
+                max_div,
+                fresh,
+            ),
+            OracleGateOutcome::BlockEntryDiverged { divergence_bps } if divergence_bps > max_div
+        ));
+
+        // Non-positive oracle price fails cleanly as InvalidOracle.
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::ZERO),
+                max_div,
+                fresh
+            ),
+            OracleGateOutcome::InvalidOracle { .. }
+        ));
+
+        // Pre-dispatch refresh transition: initial Some(100.00) passes, then refreshed None or
+        // diverged Some(99.60) is caught by the same pre-dispatch gate before dispatch.
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                fresh,
+            ),
+            OracleGateOutcome::Allow
+        );
+        assert_eq!(
+            evaluate_action_oracle_gate(&entry, Decimal::from(100), None, max_div, fresh),
+            OracleGateOutcome::BlockEntryMissingOracle
+        );
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some("99.60".parse().unwrap()),
+                max_div,
+                fresh,
+            ),
+            OracleGateOutcome::BlockEntryDiverged { divergence_bps } if divergence_bps > max_div
+        ));
+
+        // Stale oracle fails closed for NEW entries even when the price looks perfectly aligned
+        // (zero divergence), and the age is reported.
+        let stale = OracleFreshness {
+            source_ms: 1_000,
+            now_ms: 1_000 + 2_001,
+            max_age_ms: 2_000,
+            max_future_skew_ms: 5_000,
+        };
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                stale,
+            ),
+            OracleGateOutcome::BlockEntryStaleOracle { age_ms } if age_ms == 2_001
+        ));
+        // But a stale oracle does NOT block risk-reducing exits/hedges or Hold.
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &exit,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                stale
+            ),
+            OracleGateOutcome::Allow
+        );
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &hedge_residual,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                stale
+            ),
+            OracleGateOutcome::Allow
+        );
+
+        // Zero timestamps and future-skewed oracle source clocks fail closed for NEW entries,
+        // while bounded skew within `max_future_skew_ms` and reduce-only exits stay allowed.
+        let zero_clock = OracleFreshness {
+            source_ms: 0,
+            now_ms: 0,
+            max_age_ms: 2_000,
+            max_future_skew_ms: 5_000,
+        };
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                zero_clock,
+            ),
+            OracleGateOutcome::BlockEntryStaleOracle { .. }
+        ));
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &exit,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                zero_clock,
+            ),
+            OracleGateOutcome::Allow
+        );
+
+        let future_skewed = OracleFreshness {
+            source_ms: 1_000 + 5_001,
+            now_ms: 1_000,
+            max_age_ms: 2_000,
+            max_future_skew_ms: 5_000,
+        };
+        assert!(matches!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                future_skewed,
+            ),
+            OracleGateOutcome::BlockEntryStaleOracle { .. }
+        ));
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &exit,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                future_skewed,
+            ),
+            OracleGateOutcome::Allow
+        );
+
+        let bounded_skew = OracleFreshness {
+            source_ms: 1_000 + 5_000,
+            now_ms: 1_000,
+            max_age_ms: 2_000,
+            max_future_skew_ms: 5_000,
+        };
+        assert_eq!(
+            evaluate_action_oracle_gate(
+                &entry,
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+                max_div,
+                bounded_skew,
+            ),
+            OracleGateOutcome::Allow
+        );
+
+        // Reduce-only exits/hedges and Hold stay permitted even with missing or 100 bp diverged oracle.
+        for oracle_px in [None, Some(Decimal::from(99))] {
+            assert_eq!(
+                evaluate_action_oracle_gate(&exit, Decimal::from(100), oracle_px, max_div, fresh),
+                OracleGateOutcome::Allow
+            );
+            assert_eq!(
+                evaluate_action_oracle_gate(
+                    &hedge_residual,
+                    Decimal::from(100),
+                    oracle_px,
+                    max_div,
+                    fresh
+                ),
+                OracleGateOutcome::Allow
+            );
+            assert_eq!(
+                evaluate_action_oracle_gate(&hold, Decimal::from(100), oracle_px, max_div, fresh),
+                OracleGateOutcome::Allow
+            );
+        }
     }
 }

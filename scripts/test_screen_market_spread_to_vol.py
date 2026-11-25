@@ -36,6 +36,23 @@ class SpreadToVolScreenerTest(unittest.TestCase):
         ]
         self.assertEqual(score_market_book_series([first, *bad, last], **inputs), clean)
 
+    def test_unrepresentable_timestamps_do_not_contaminate_valid_frames(self):
+        def quote(timestamp_ms, mid):
+            return {
+                "timestamp_ms": timestamp_ms,
+                "bids": [[mid - 0.01, 10.0]],
+                "asks": [[mid + 0.01, 10.0]],
+            }
+
+        inputs = dict(venue="lighter", liquidity_domain="lighter", symbol="BTC",
+                      asset_class="crypto", account_tier="standard")
+        clean = [quote(0, 100), quote(1000, 100.01), quote(2000, 100.02)]
+        expected = score_market_book_series(clean, **inputs)
+        for invalid_time in (10**400, 5e-324):
+            with self.subTest(timestamp_ms=invalid_time):
+                frames = [clean[0], quote(invalid_time, 200), *clean[1:]]
+                self.assertEqual(score_market_book_series(frames, **inputs), expected)
+
     def test_ranks_wide_calm_zero_fee_rwa_above_crowded_or_high_fee_markets(self):
         # Crowded zero-fee BTC: 0.2 bp spread, 1.0 bp/sqrt(s) volatility -> ratio 0.2
         btc_samples = [
@@ -271,6 +288,130 @@ class SpreadToVolScreenerTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 main([])
         self.assertEqual(ctx.exception.code, 2)
+
+    def test_rank_markets_distinguishes_exact_zero_from_negative_and_none(self):
+        base = {
+            "adverse_selection_margin_ok": None,
+            "maker_fee_bps": "0",
+            "spread_to_1s_vol_ratio": 2.0,
+        }
+        zero_spread = {**base, "symbol": "ZERO", "net_half_spread_after_maker_fee_bps": 0.0}
+        neg_spread = {**base, "symbol": "NEG", "net_half_spread_after_maker_fee_bps": -0.5}
+        none_spread = {**base, "symbol": "NONE", "net_half_spread_after_maker_fee_bps": None}
+        zero_ratio = {
+            **base,
+            "symbol": "ZERO_RATIO",
+            "spread_to_1s_vol_ratio": 0.0,
+            "net_half_spread_after_maker_fee_bps": 0.1,
+        }
+        none_ratio = {
+            **base,
+            "symbol": "NONE_RATIO",
+            "spread_to_1s_vol_ratio": None,
+            "net_half_spread_after_maker_fee_bps": None,
+        }
+        ranked = rank_markets([none_spread, neg_spread, zero_spread])
+        self.assertEqual([m["symbol"] for m in ranked], ["ZERO", "NEG", "NONE"])
+        ranked_ratios = rank_markets([none_ratio, zero_ratio])
+        self.assertEqual([m["symbol"] for m in ranked_ratios], ["ZERO_RATIO", "NONE_RATIO"])
+
+    def test_eager_validation_and_malformed_level_handling_in_screener(self):
+        clean_samples = [
+            {"timestamp_ms": 1000, "bids": [[99.99, 10.0]], "asks": [[100.01, 10.0]]},
+            {"timestamp_ms": 2000, "bids": [[99.995, 10.0]], "asks": [[100.015, 10.0]]},
+        ]
+        # Eager validation must fail closed even on empty samples or unknown fee tier.
+        for bad_gap in (0, -100, float("nan"), True, "1000"):
+            with self.subTest(bad_gap=bad_gap):
+                with self.assertRaises(ValueError):
+                    score_market_book_series(
+                        [],
+                        venue="lighter",
+                        liquidity_domain="lighter",
+                        symbol="BTC",
+                        asset_class="crypto",
+                        account_tier="standard",
+                        max_gap_ms=bad_gap,
+                    )
+        for bad_adv in (-0.1, float("nan"), float("inf"), True, "0.5"):
+            with self.subTest(bad_adv=bad_adv):
+                with self.assertRaises(ValueError):
+                    score_market_book_series(
+                        [],
+                        venue="arcus",
+                        liquidity_domain="arcus",
+                        symbol="NVDA",
+                        asset_class="equity",
+                        account_tier="unknown_tier",
+                        expected_1s_adverse_selection_bps=bad_adv,
+                    )
+
+        # Boolean/malformed L1 levels are skipped cleanly without corrupting valid frames.
+        expected = score_market_book_series(
+            clean_samples,
+            venue="lighter",
+            liquidity_domain="lighter",
+            symbol="ETH",
+            asset_class="crypto",
+            account_tier="standard",
+        )
+        malformed_frames = [
+            {"timestamp_ms": 1200, "bids": [[True, 10.0]], "asks": [[100.01, 10.0]]},
+            {"timestamp_ms": 1300, "bids": "99.99", "asks": [[100.01, 10.0]]},
+            {"timestamp_ms": 1400, "bids": [[99.99]], "asks": [[100.01, 10.0]]},
+            "not_a_dict",
+        ]
+        self.assertEqual(
+            score_market_book_series(
+                [clean_samples[0], *malformed_frames, clean_samples[1]],
+                venue="lighter",
+                liquidity_domain="lighter",
+                symbol="ETH",
+                asset_class="crypto",
+                account_tier="standard",
+            ),
+            expected,
+        )
+
+    def test_main_forwards_strategy_posture_and_max_gap_ms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            tape_path = tmp_path / "tape.jsonl"
+            manifest_path = tmp_path / "manifest.json"
+            # Frames 3000ms apart: included at default max_gap_ms=10000, excluded at max_gap_ms=2000.
+            tape_path.write_text(
+                json.dumps({"timestamp_ms": 1000, "bids": [[99.98, 20.0]], "asks": [[100.02, 20.0]]})
+                + "\n"
+                + json.dumps({"timestamp_ms": 4000, "bids": [[99.99, 20.0]], "asks": [[100.03, 20.0]]})
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "jsonl": str(tape_path),
+                            "venue": "lighter",
+                            "liquidity_domain": "lighter",
+                            "symbol": "ETH",
+                            "asset_class": "crypto",
+                            "account_tier": "standard",
+                            "strategy_posture": "hedged_or_two_sided",
+                            "max_gap_ms": 2000,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main([str(manifest_path)])
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["samples"], 2)
+            self.assertEqual(out[0]["vol_intervals"], 0)
+            self.assertEqual(out[0]["disqualification_risks"], [])
 
 
 if __name__ == "__main__":
