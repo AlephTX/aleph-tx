@@ -19,6 +19,7 @@ use crate::strategy::wallet_toxicity::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// High-level strategy track mode isolated across independent capital/risk budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,7 +451,7 @@ impl QuotePipelineConfig {
         });
         ensure!(
             combined_shift_bps < 10_000.0,
-            "combined enabled lead_lag.max_shift_bps + funding_bias.max_reservation_shift_bps ({combined_shift_bps}) must be < 10000"
+            "combined enabled lead_lag.max_shift_bps + funding_bias.max_reservation_shift_bps + vol_momentum_defense.max_momentum_shift_bps ({combined_shift_bps}) must be < 10000"
         );
         ensure!(
             self.max_oracle_divergence_bps.is_finite() && self.max_oracle_divergence_bps > 0.0,
@@ -486,6 +487,11 @@ pub struct GenericMarketState {
 impl GenericMarketState {
     /// Build a market state directly from a zero-allocation [`FastBookSnapshot`] without
     /// intermediate `Decimal` conversion or heap allocation.
+    ///
+    /// Note: `QuotePipeline`, [`FastBookSnapshot`], and [`CausalRealizedVolEstimator`] are
+    /// ready venue-agnostic building blocks not yet wired into frozen live
+    /// `inventory_neutral_mm.rs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_fast_book(
         snap: &FastBookSnapshot,
         now_ms: u64,
@@ -494,6 +500,7 @@ impl GenericMarketState {
         oracle_px: Option<f64>,
         funding_rate_bps_per_hour: Option<f64>,
         exit_queue_ahead_base: Option<f64>,
+        realized_vol_bps_per_sqrt_s: Option<f64>,
     ) -> Self {
         Self {
             now_ms,
@@ -506,8 +513,84 @@ impl GenericMarketState {
             oracle_px,
             funding_rate_bps_per_hour,
             exit_queue_ahead_base,
-            realized_vol_bps_per_sqrt_s: None,
+            realized_vol_bps_per_sqrt_s,
         }
+    }
+}
+
+/// Causal zero-hot-path-allocation rolling estimator of realized volatility (`bps / sqrt(s)`).
+///
+/// Pre-allocates its sample ring buffer at construction so [`Self::observe`] never allocates on
+/// the quote path. Ready venue-agnostic building block for [`GenericMarketState`] and replay,
+/// not yet wired into frozen live `inventory_neutral_mm.rs`.
+#[derive(Debug, Clone)]
+pub struct CausalRealizedVolEstimator {
+    window_samples: usize,
+    returns: VecDeque<f64>,
+    prev_sample: Option<(u64, f64)>,
+    last_sigma: Option<f64>,
+}
+
+impl CausalRealizedVolEstimator {
+    pub fn new(window_samples: usize) -> Result<Self> {
+        ensure!(
+            window_samples >= 2,
+            "CausalRealizedVolEstimator window_samples must be >= 2"
+        );
+        Ok(Self {
+            window_samples,
+            returns: VecDeque::with_capacity(window_samples),
+            prev_sample: None,
+            last_sigma: None,
+        })
+    }
+
+    pub fn last_sigma_bps_per_sqrt_s(&self) -> Option<f64> {
+        self.last_sigma
+    }
+
+    /// Observe `(now_ms, mid_px)` strictly causally.
+    ///
+    /// Ignores non-positive / non-finite prices and non-increasing timestamps (`now_ms <= prev_t`)
+    /// without mutating state, returning the prior `last_sigma`.
+    pub fn observe(&mut self, now_ms: u64, mid_px: f64) -> Option<f64> {
+        if now_ms == 0 || !mid_px.is_finite() || mid_px <= 0.0 {
+            return self.last_sigma;
+        }
+        let Some((prev_t, prev_m)) = self.prev_sample else {
+            self.prev_sample = Some((now_ms, mid_px));
+            return self.last_sigma;
+        };
+        if now_ms <= prev_t {
+            return self.last_sigma;
+        }
+
+        let dt_s = ((now_ms - prev_t) as f64) / 1_000.0;
+        let scaled_ret = ((mid_px / prev_m - 1.0) * 10_000.0) / dt_s.sqrt();
+        self.prev_sample = Some((now_ms, mid_px));
+        if scaled_ret.is_finite() {
+            if self.returns.len() == self.window_samples {
+                self.returns.pop_front();
+            }
+            self.returns.push_back(scaled_ret);
+            if self.returns.len() >= 2 {
+                let n = self.returns.len() as f64;
+                let mean = self.returns.iter().sum::<f64>() / n;
+                let var = self
+                    .returns
+                    .iter()
+                    .map(|x| {
+                        let d = *x - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / (n - 1.0);
+                if var.is_finite() && var >= 0.0 {
+                    self.last_sigma = Some(var.sqrt());
+                }
+            }
+        }
+        self.last_sigma
     }
 }
 
@@ -1478,6 +1561,7 @@ mod tests {
             Some(100.05),
             Some(-0.5),
             Some(3.0),
+            Some(1.75),
         );
         assert_eq!(state.now_ms, 10_000);
         assert_eq!(state.bid_px, 100.0);
@@ -1485,7 +1569,48 @@ mod tests {
         assert_eq!(state.oracle_px, Some(100.05));
         assert_eq!(state.funding_rate_bps_per_hour, Some(-0.5));
         assert_eq!(state.exit_queue_ahead_base, Some(3.0));
-        assert_eq!(state.realized_vol_bps_per_sqrt_s, None);
+        assert_eq!(state.realized_vol_bps_per_sqrt_s, Some(1.75));
+    }
+
+    #[test]
+    fn causal_realized_vol_estimator_ignores_regressed_clocks_and_computes_exact_sigma() {
+        assert!(CausalRealizedVolEstimator::new(1).is_err());
+        let mut est = CausalRealizedVolEstimator::new(4).unwrap();
+        assert_eq!(est.last_sigma_bps_per_sqrt_s(), None);
+        // Zero timestamp and non-positive prices are ignored before priming.
+        assert_eq!(est.observe(0, 100.0), None);
+        assert_eq!(est.observe(1_000, 0.0), None);
+        // Prime at t=1_000, mid=100.0
+        assert_eq!(est.observe(1_000, 100.0), None);
+        // After 1st return (+10 bps over 1s) we have 1 return -> sigma still None.
+        assert_eq!(est.observe(2_000, 100.1), None);
+        // Non-increasing or bad mid ticks do not mutate state.
+        assert_eq!(est.observe(2_000, 105.0), None);
+        assert_eq!(est.observe(1_500, 105.0), None);
+        assert_eq!(est.observe(2_500, -1.0), None);
+        // Second return (-9.99 bps over 1s from 100.1 -> 100.0) gives sample std dev > 0.
+        let sigma = est.observe(3_000, 100.0).unwrap();
+        let r1 = (100.1_f64 / 100.0 - 1.0) * 10_000.0;
+        let r2 = (100.0_f64 / 100.1 - 1.0) * 10_000.0;
+        let expected = ((r1 - r2).powi(2) / 2.0).sqrt();
+        assert!((sigma - expected).abs() < 1e-9);
+        assert_eq!(est.last_sigma_bps_per_sqrt_s(), Some(sigma));
+    }
+
+    #[test]
+    fn quote_pipeline_config_rejects_three_way_combined_shift_overflow() {
+        let mut cfg = pipeline_cfg();
+        cfg.lead_lag.enabled = true;
+        cfg.lead_lag.max_shift_bps = 4_000.0;
+        cfg.funding_bias.enabled = true;
+        cfg.funding_bias.max_reservation_shift_bps = 4_000.0;
+        cfg.vol_momentum_defense.enabled = true;
+        cfg.vol_momentum_defense.max_momentum_shift_bps = 2_000.0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_momentum_shift_bps"));
+
+        cfg.vol_momentum_defense.max_momentum_shift_bps = 1_999.0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

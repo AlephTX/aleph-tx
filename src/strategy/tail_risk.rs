@@ -687,12 +687,17 @@ pub fn evaluate_collateral_rebalance(
     let mut min_ratio: Option<f64> = None;
     let mut total_in = 0.0_f64;
     let mut total_out = 0.0_f64;
+    let mut seen_venues = BTreeSet::new();
 
     for (idx, snap) in snapshots.iter().enumerate() {
         let venue = snap.venue.trim();
         ensure!(
             !venue.is_empty(),
             "snapshots[{idx}].venue must not be empty"
+        );
+        ensure!(
+            seen_venues.insert(venue.to_ascii_lowercase()),
+            "duplicate collateral venue '{venue}'"
         );
         ensure!(
             snap.free_collateral_usd.is_finite()
@@ -1705,5 +1710,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn collateral_rebalance_rejects_duplicate_canonical_venues() {
+        let cfg = CollateralRebalanceConfig::default();
+        let make_snap = |venue: &str, outbound: f64| CollateralRebalanceSnapshot {
+            venue: venue.into(),
+            free_collateral_usd: 100.0,
+            required_margin_usd: 100.0,
+            in_flight_inbound_usd: 0.0,
+            in_flight_outbound_usd: outbound,
+            in_flight_age_ms: Some(100),
+        };
+
+        let repeated = evaluate_collateral_rebalance(
+            &cfg,
+            &[make_snap(" Venue_A ", 60.0), make_snap("venue_a", 60.0)],
+        );
+        assert!(
+            repeated
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate collateral venue")
+        );
+
+        let distinct = evaluate_collateral_rebalance(
+            &cfg,
+            &[make_snap(" Venue_A ", 60.0), make_snap("Venue_B", 60.0)],
+        )
+        .unwrap();
+        assert_eq!(distinct.action, TailRiskAction::Normal);
+        assert_eq!(distinct.total_in_flight_outbound_usd, 120.0);
+
+        let consolidated =
+            evaluate_collateral_rebalance(&cfg, &[make_snap("Venue_A", 120.0)]).unwrap();
+        assert_eq!(consolidated.action, TailRiskAction::HaltAndFlatten);
     }
 }

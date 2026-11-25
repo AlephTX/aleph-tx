@@ -287,6 +287,10 @@ fn default_require_reference_oracle_for_entry() -> bool {
 }
 
 /// Cross-venue funding settlement clock snapshot passed into [`BasisCoreEngine::on_books_with_context`].
+///
+/// `primary_funding_bps_per_period` and `hedge_funding_bps_per_period` represent cashflows
+/// settling specifically at `next_settlement_ms`; any leg whose next settlement is strictly
+/// later than `next_settlement_ms` must be reported as `0.0` at this settlement point.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FundingClockSample {
     pub next_settlement_ms: u64,

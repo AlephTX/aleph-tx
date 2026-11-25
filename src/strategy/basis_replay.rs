@@ -130,12 +130,21 @@ pub struct BasisReplayReport {
     pub terminal_inv_primary: f64,
     pub terminal_inv_hedge: f64,
     pub daily_loss_risk_scale_end: f64,
+    #[serde(default)]
+    pub traded_notional_usd: f64,
+    #[serde(default)]
+    pub net_per_roundtrip_usd: Option<f64>,
+    #[serde(default)]
+    pub net_to_fee_ratio: Option<f64>,
+    #[serde(default)]
+    pub net_per_notional_bps: Option<f64>,
 }
 
 struct ReplayCashLedger {
     cash_usd: f64,
     realized_pnl_usd: f64,
     fees_usd: f64,
+    traded_notional_usd: f64,
 }
 
 struct LegTouchFill {
@@ -143,6 +152,7 @@ struct LegTouchFill {
     qty: Decimal,
     exec_px: Decimal,
     fee_bps: f64,
+    count_traded_notional: bool,
 }
 
 fn fill_leg_at_touch(
@@ -160,6 +170,9 @@ fn fill_leg_at_touch(
         "non-finite fill math"
     );
     ledger.fees_usd += fee;
+    if fill.count_traded_notional {
+        ledger.traded_notional_usd += notional;
+    }
 
     let signed_delta = if fill.is_buy { fill.qty } else { -fill.qty };
     let prev = *leg_pos;
@@ -232,6 +245,7 @@ pub fn run_continuous_basis_replay(
         cash_usd: cfg.initial_capital_usd,
         realized_pnl_usd: 0.0_f64,
         fees_usd: 0.0_f64,
+        traded_notional_usd: 0.0_f64,
     };
 
     let mut prev_ms = 0_u64;
@@ -331,6 +345,7 @@ pub fn run_continuous_basis_replay(
                                 qty: bounded_cut,
                                 exec_px: mid_dec,
                                 fee_bps: 0.0,
+                                count_traded_notional: false,
                             },
                         )?;
                     }
@@ -354,6 +369,7 @@ pub fn run_continuous_basis_replay(
                                 qty: bounded_cut,
                                 exec_px: mid_dec,
                                 fee_bps: 0.0,
+                                count_traded_notional: false,
                             },
                         )?;
                     }
@@ -455,6 +471,7 @@ pub fn run_continuous_basis_replay(
                             qty: exec_qty,
                             exec_px,
                             fee_bps: cfg.primary_taker_fee_bps,
+                            count_traded_notional: true,
                         },
                     )?;
                     if reduce_only {
@@ -509,6 +526,7 @@ pub fn run_continuous_basis_replay(
                             qty: exec_qty,
                             exec_px,
                             fee_bps: cfg.hedge_taker_fee_bps,
+                            count_traded_notional: true,
                         },
                     )?;
                     hedge_residual_fills += 1;
@@ -580,6 +598,7 @@ pub fn run_continuous_basis_replay(
                                 qty: close_q,
                                 exec_px: p_exec,
                                 fee_bps: cfg.primary_taker_fee_bps,
+                                count_traded_notional: true,
                             },
                         )?;
                         fill_leg_at_touch(
@@ -591,6 +610,7 @@ pub fn run_continuous_basis_replay(
                                 qty: close_q,
                                 exec_px: h_exec,
                                 fee_bps: cfg.hedge_taker_fee_bps,
+                                count_traded_notional: true,
                             },
                         )?;
                         exits_filled += 1;
@@ -660,6 +680,7 @@ pub fn run_continuous_basis_replay(
                                     qty: fill_q,
                                     exec_px: p_exec,
                                     fee_bps: cfg.primary_taker_fee_bps,
+                                    count_traded_notional: true,
                                 },
                             )?;
                             fill_leg_at_touch(
@@ -671,6 +692,7 @@ pub fn run_continuous_basis_replay(
                                     qty: fill_q,
                                     exec_px: h_exec,
                                     fee_bps: cfg.hedge_taker_fee_bps,
+                                    count_traded_notional: true,
                                 },
                             )?;
                             entries_filled += 1;
@@ -711,6 +733,12 @@ pub fn run_continuous_basis_replay(
         && observed_eval_span_ms >= FULL_10H_CONTINUOUS_MS
         && effective_max_eval_gap_ms <= DEFAULT_MAX_CONTINUOUS_EVAL_GAP_MS;
 
+    let net_cash_usd = ledger.realized_pnl_usd - ledger.fees_usd;
+    let net_per_roundtrip_usd = (exits_filled > 0).then(|| net_cash_usd / (exits_filled as f64));
+    let net_to_fee_ratio = (ledger.fees_usd > 0.0).then(|| net_cash_usd / ledger.fees_usd);
+    let net_per_notional_bps = (ledger.traded_notional_usd > 0.0)
+        .then(|| (net_cash_usd / ledger.traded_notional_usd) * 10_000.0);
+
     Ok(BasisReplayReport {
         eval_duration_ms: cfg.window.eval_duration_ms(),
         observed_eval_span_ms,
@@ -729,11 +757,15 @@ pub fn run_continuous_basis_replay(
         max_unplanned_residual_ms,
         realized_pnl_usd: ledger.realized_pnl_usd,
         fees_usd: ledger.fees_usd,
-        net_cash_usd: ledger.realized_pnl_usd - ledger.fees_usd,
+        net_cash_usd,
         peak_gross_notional_usd,
         terminal_inv_primary: inv_primary.to_f64().unwrap_or(0.0),
         terminal_inv_hedge: inv_hedge.to_f64().unwrap_or(0.0),
         daily_loss_risk_scale_end: daily_loss.risk_scale(),
+        traded_notional_usd: ledger.traded_notional_usd,
+        net_per_roundtrip_usd,
+        net_to_fee_ratio,
+        net_per_notional_bps,
     })
 }
 
@@ -835,11 +867,16 @@ pub fn basis_frames_from_perp_frames(
             {
                 return None;
             }
-            let p_pt = p_fc.payments.first()?;
-            let h_pt = h_fc.payments.first()?;
-            if p_pt.at_ms < frame.now_ms || h_pt.at_ms < frame.now_ms {
-                return None;
-            }
+            let p_pt = p_fc
+                .payments
+                .iter()
+                .filter(|pt| pt.at_ms >= frame.now_ms)
+                .min_by_key(|pt| pt.at_ms)?;
+            let h_pt = h_fc
+                .payments
+                .iter()
+                .filter(|pt| pt.at_ms >= frame.now_ms)
+                .min_by_key(|pt| pt.at_ms)?;
             let p_bps = p_pt.rate.to_f64()? * 10_000.0;
             let h_bps = h_pt.rate.to_f64()? * 10_000.0;
             if !p_bps.is_finite()
@@ -849,10 +886,19 @@ pub fn basis_frames_from_perp_frames(
             {
                 return None;
             }
+            let next_settlement_ms = p_pt.at_ms.min(h_pt.at_ms);
             Some(FundingClockSample {
-                next_settlement_ms: p_pt.at_ms.min(h_pt.at_ms),
-                primary_funding_bps_per_period: p_bps,
-                hedge_funding_bps_per_period: h_bps,
+                next_settlement_ms,
+                primary_funding_bps_per_period: if p_pt.at_ms == next_settlement_ms {
+                    p_bps
+                } else {
+                    0.0
+                },
+                hedge_funding_bps_per_period: if h_pt.at_ms == next_settlement_ms {
+                    h_bps
+                } else {
+                    0.0
+                },
             })
         })();
         out.push(BasisReplayFrame {
@@ -1332,5 +1378,199 @@ mod tests {
         // Causal funding_clock + leg oracle fallback extracted safely from PerpFrame fixture.
         assert!(converted.iter().any(|f| f.funding_clock.is_some()));
         assert!(converted.iter().all(|f| f.reference_oracle_px.is_some()));
+    }
+
+    #[test]
+    fn basis_frames_isolates_asynchronous_dual_leg_funding_clocks() {
+        use crate::strategy::relative_value::{FundingForecast, FundingPoint};
+
+        let perp_frames =
+            load_perp_frames_from_path(Path::new("examples/crypto_funding_paper.json")).unwrap();
+        let mut frame = perp_frames
+            .into_iter()
+            .find(|f| {
+                basis_frames_from_perp_frames(
+                    std::slice::from_ref(f),
+                    0,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    SessionRegime::OffHours,
+                )
+                .is_ok()
+            })
+            .unwrap();
+        let now = frame.now_ms;
+        let pt = |at_ms: u64, rate_bps: i64| FundingPoint {
+            at_ms,
+            rate: Decimal::new(rate_bps, 4),
+            uncertainty_bps: Decimal::ZERO,
+            oracle_price: Decimal::ONE,
+        };
+        let fc = |payments: Vec<FundingPoint>| FundingForecast {
+            observed_at_ms: now,
+            payments,
+        };
+
+        // 1. Primary settles earlier (at now + 1_000, paying +3 bp) while hedge settles later
+        // (at now + 60_000, receiving +5 bp): at primary's settlement, hedge cashflow MUST be 0.0!
+        frame.legs[0].forecast = Some(fc(vec![
+            pt(now + 120_000, 8),
+            pt(now - 1, 9),
+            pt(now + 1_000, 3),
+        ]));
+        frame.legs[1].forecast = Some(fc(vec![pt(now + 60_000, 5)]));
+        let converted = basis_frames_from_perp_frames(
+            std::slice::from_ref(&frame),
+            0,
+            Decimal::ONE,
+            Decimal::ONE,
+            SessionRegime::OffHours,
+        )
+        .unwrap();
+        let clock1 = converted[0].funding_clock.unwrap();
+        assert_eq!(clock1.next_settlement_ms, now + 1_000);
+        assert!((clock1.primary_funding_bps_per_period - 3.0).abs() < 1e-9);
+        assert!(clock1.hedge_funding_bps_per_period.abs() < 1e-12);
+
+        // Verify BasisCoreEngine computes -3.0 bp carry (blocks adverse entry inside blackout)
+        // rather than +2.0 bp (which would have falsely allowed entry!).
+        let mut core_cfg = BasisCoreConfig {
+            primary_venue_id: "a".into(),
+            hedge_venue_id: "b".into(),
+            entry_bp: 10.0,
+            exit_bp: 0.0,
+            max_entry_bp: 35.0,
+            persist_ms: 0,
+            post_trade_refresh_lock: false,
+            clip_usd: 100.0,
+            max_notional_usd: 500.0,
+            max_order_usd: 250.0,
+            max_total_notional_usd: 500.0,
+            ladder_floor_frac: 0.25,
+            ladder_scale_bps: 2.0,
+            ladder_convex_power: 1.0,
+            max_hold_ms: 3_600_000,
+            max_primary_book_age_ms: 10_000,
+            max_hedge_book_age_ms: 10_000,
+            max_venue_clock_skew_ms: 2_000,
+            slippage_bps: 8.0,
+            max_oracle_divergence_bps: 50.0,
+            require_reference_oracle_for_entry: true,
+            residual_policy: ResidualRecoveryPolicy::PreferReduceOnlySurvivingLeg,
+            adl_delta_breaker: AdlDeltaBreakerConfig::default(),
+            kalman_basis: None,
+            funding_settlement: crate::strategy::basis_core::FundingSettlementConfig {
+                enabled: true,
+                pre_settlement_blackout_ms: 5_000,
+                adverse_funding_block_bps: 0.5,
+                funding_exit_weight: 1.0,
+                max_exit_bp_adjust: 10.0,
+            },
+            multi_oracle: None,
+            latency_budget: Default::default(),
+            spread_cost_entry_coeff: 0.0,
+        };
+        core_cfg.require_reference_oracle_for_entry = false;
+        let mut engine = BasisCoreEngine::new(core_cfg, BasisLegConstraints::default()).unwrap();
+        let dl = DailyLossGuard::open(None, 0.05, 1_000.0, sim_utc_day(now)).unwrap();
+        let p_book = NormalizedLegBook::from_l1(
+            now,
+            now,
+            dec_s("99.90"),
+            dec_s("10"),
+            dec_s("99.92"),
+            dec_s("10"),
+        )
+        .unwrap();
+        let h_book = NormalizedLegBook::from_l1(
+            now,
+            now,
+            dec_s("100.10"),
+            dec_s("10"),
+            dec_s("100.12"),
+            dec_s("10"),
+        )
+        .unwrap();
+        let act = engine.on_books_with_context(
+            now,
+            &p_book,
+            &h_book,
+            &dl,
+            true,
+            None,
+            SessionRegime::OffHours,
+            BasisMarketContext {
+                funding_clock: Some(clock1),
+                ..BasisMarketContext::default()
+            },
+        );
+        assert_eq!(
+            act,
+            BasisCoreAction::Hold {
+                reason: "funding_blackout_adverse_carry"
+            }
+        );
+
+        // 2. Hedge settles at `now` while primary is later -> primary cashflow MUST be 0.0.
+        frame.legs[1].forecast = Some(fc(vec![pt(now, 5), pt(now + 60_000, 2)]));
+        let c2 = basis_frames_from_perp_frames(
+            std::slice::from_ref(&frame),
+            0,
+            Decimal::ONE,
+            Decimal::ONE,
+            SessionRegime::OffHours,
+        )
+        .unwrap();
+        let clock2 = c2[0].funding_clock.unwrap();
+        assert_eq!(clock2.next_settlement_ms, now);
+        assert!(clock2.primary_funding_bps_per_period.abs() < 1e-12);
+        assert!((clock2.hedge_funding_bps_per_period - 5.0).abs() < 1e-9);
+
+        // 3. Synchronized settlement (`at_ms == now + 1_000` on both) preserves both cashflows.
+        frame.legs[1].forecast = Some(fc(vec![pt(now + 1_000, 5)]));
+        let c3 = basis_frames_from_perp_frames(
+            std::slice::from_ref(&frame),
+            0,
+            Decimal::ONE,
+            Decimal::ONE,
+            SessionRegime::OffHours,
+        )
+        .unwrap();
+        let clock3 = c3[0].funding_clock.unwrap();
+        assert_eq!(clock3.next_settlement_ms, now + 1_000);
+        assert!((clock3.primary_funding_bps_per_period - 3.0).abs() < 1e-9);
+        assert!((clock3.hedge_funding_bps_per_period - 5.0).abs() < 1e-9);
+
+        // 4. Future forecast timestamp fails closed to None.
+        let mut future = frame;
+        future.legs[1].forecast.as_mut().unwrap().observed_at_ms = now + 1;
+        let c4 = basis_frames_from_perp_frames(
+            &[future],
+            0,
+            Decimal::ONE,
+            Decimal::ONE,
+            SessionRegime::OffHours,
+        )
+        .unwrap();
+        assert!(c4[0].funding_clock.is_none());
+
+        // 5. Verify P0 normalized metrics in BasisReplayReport on benchmark.
+        let bench = run_basis_benchmark().unwrap();
+        assert!(bench.adl_shielded_arm.traded_notional_usd > 0.0);
+        assert_eq!(
+            bench.adl_shielded_arm.net_per_roundtrip_usd,
+            Some(bench.adl_shielded_arm.net_cash_usd / bench.adl_shielded_arm.exits_filled as f64)
+        );
+        assert_eq!(
+            bench.adl_shielded_arm.net_to_fee_ratio,
+            Some(bench.adl_shielded_arm.net_cash_usd / bench.adl_shielded_arm.fees_usd)
+        );
+        assert_eq!(
+            bench.adl_shielded_arm.net_per_notional_bps,
+            Some(
+                (bench.adl_shielded_arm.net_cash_usd / bench.adl_shielded_arm.traded_notional_usd)
+                    * 10_000.0
+            )
+        );
     }
 }

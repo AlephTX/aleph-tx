@@ -725,6 +725,10 @@ impl ReplayWindowSpec {
     }
 }
 
+fn default_one() -> f64 {
+    1.0
+}
+
 /// Deterministic public taker sweep event optionally coinciding with a replay tick.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ReplayTakerSweep {
@@ -732,6 +736,12 @@ pub struct ReplayTakerSweep {
     pub taker_is_buy: bool,
     pub is_twap_sub: bool,
     pub sweep_size_base: f64,
+    /// Worst price level touched or cleared by the taker sweep (when inferred from book diffs).
+    #[serde(default)]
+    pub sweep_limit_px: Option<f64>,
+    /// Volume depleted specifically at `sweep_limit_px` (defaults to `sweep_size_base` when `None`).
+    #[serde(default)]
+    pub touch_depleted_base: Option<f64>,
 }
 
 /// One chronological market snapshot in a continuous replay tape.
@@ -755,6 +765,9 @@ pub struct PipelineReplayConfig {
     pub queue_fill_delay_ms: u64,
     /// Deterministic cadence (`0` disables ambient non-sweep touch fills) for touch resting fills.
     pub passive_touch_fill_stride: u64,
+    /// Fraction `[0, 1]` of displayed touch depth initially placed ahead of newly posted quotes.
+    #[serde(default = "default_one")]
+    pub initial_queue_ahead_frac: f64,
     /// Initial wallet tiers pre-registered prior to replay start (strictly causal).
     pub pre_registered_wallets: Vec<(u64, WalletToxicityTier)>,
 }
@@ -777,6 +790,11 @@ impl PipelineReplayConfig {
         ensure!(
             self.maker_fee_bps.is_finite() && self.taker_fee_bps.is_finite(),
             "fee bps must be finite"
+        );
+        ensure!(
+            self.initial_queue_ahead_frac.is_finite()
+                && (0.0..=1.0).contains(&self.initial_queue_ahead_frac),
+            "initial_queue_ahead_frac must be finite and in [0, 1]"
         );
         Ok(())
     }
@@ -812,6 +830,20 @@ pub struct PipelineReplayReport {
     pub eval_ledger: CycleCashSummary,
     /// Terminal drain (post-eval reduce-only unwind) cash, kept separate from the eval figure.
     pub drain_ledger: CycleCashSummary,
+    #[serde(default)]
+    pub price_through_fills: u64,
+    #[serde(default)]
+    pub sweep_cleared_fills: u64,
+    #[serde(default)]
+    pub sweep_touch_fills: u64,
+    #[serde(default)]
+    pub stride_touch_fills: u64,
+    #[serde(default)]
+    pub eval_traded_notional_usd: f64,
+    #[serde(default)]
+    pub eval_net_per_notional_bps: Option<f64>,
+    #[serde(default)]
+    pub eval_markout_1s_bps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -823,6 +855,7 @@ struct SimOrder {
     qty: f64,
     reduce_only: bool,
     placed_at_ms: u64,
+    queue_ahead_base: f64,
 }
 
 fn forward_1s_markout_usd(
@@ -912,6 +945,10 @@ pub fn run_continuous_pipeline_replay(
     let mut leader_veto_ticks = 0_u64;
     let mut toxicity_faded_ticks = 0_u64;
     let mut peak_abs_inventory_base = 0.0_f64;
+    let mut price_through_fills = 0_u64;
+    let mut sweep_cleared_fills = 0_u64;
+    let mut sweep_touch_fills = 0_u64;
+    let mut stride_touch_fills = 0_u64;
 
     for (tick_idx, tick) in ticks.iter().enumerate() {
         let now_ms = tick.market.now_ms;
@@ -1004,6 +1041,18 @@ pub fn run_continuous_pipeline_replay(
                 sweep.sweep_size_base.is_finite() && sweep.sweep_size_base > 0.0,
                 "tick {tick_idx}: sweep_size_base must be finite and > 0"
             );
+            ensure!(
+                sweep
+                    .sweep_limit_px
+                    .is_none_or(|p| p.is_finite() && p > 0.0),
+                "tick {tick_idx}: sweep_limit_px must be finite and > 0"
+            );
+            ensure!(
+                sweep
+                    .touch_depleted_base
+                    .is_none_or(|v| v.is_finite() && v >= 0.0),
+                "tick {tick_idx}: touch_depleted_base must be finite and >= 0"
+            );
         }
 
         let mut check_passive_fill = |slot_opt: &mut Option<SimOrder>,
@@ -1013,19 +1062,73 @@ pub fn run_continuous_pipeline_replay(
                 return Ok(());
             };
             let rested_ms = now_ms.saturating_sub(order.placed_at_ms);
-            let swept = tick.taker_sweep.is_some_and(|s| {
+            let mut sweep_cleared = false;
+            let mut sweep_touch = false;
+            let mut legacy_swept = false;
+            let mut sweep_fill_cap = 0.0_f64;
+
+            if let Some(s) = tick.taker_sweep
+                && rested_ms >= 10
+            {
                 let maker_side_matches = match order.side {
                     Side::Buy => !s.taker_is_buy,
                     Side::Sell => s.taker_is_buy,
                 };
-                let touch_ok = match order.side {
-                    Side::Buy => order.price >= tick.market.bid_px - tick.market.tick_size - PX_EPS,
-                    Side::Sell => {
-                        order.price <= tick.market.ask_px + tick.market.tick_size + PX_EPS
+                if maker_side_matches {
+                    if let Some(limit_px) = s.sweep_limit_px {
+                        let cleared_by_limit = match order.side {
+                            Side::Buy => order.price > limit_px + PX_EPS,
+                            Side::Sell => order.price < limit_px - PX_EPS,
+                        };
+                        let at_limit = (order.price - limit_px).abs() <= PX_EPS;
+                        if cleared_by_limit {
+                            if let Some(existing) = slot_opt.as_mut() {
+                                existing.queue_ahead_base = 0.0;
+                            }
+                            sweep_cleared = true;
+                            sweep_fill_cap = s.sweep_size_base;
+                        } else if at_limit {
+                            let touch_vol = s.touch_depleted_base.unwrap_or(s.sweep_size_base);
+                            let consumed = order.queue_ahead_base.min(touch_vol);
+                            let new_ahead = (order.queue_ahead_base - consumed).max(0.0);
+                            if let Some(existing) = slot_opt.as_mut() {
+                                existing.queue_ahead_base = new_ahead;
+                            }
+                            let overflow = (touch_vol - consumed).max(0.0);
+                            if overflow > QTY_EPS {
+                                sweep_touch = true;
+                                sweep_fill_cap = overflow;
+                            }
+                        }
+                    } else {
+                        let touch_ok = match order.side {
+                            Side::Buy => {
+                                order.price >= tick.market.bid_px - tick.market.tick_size - PX_EPS
+                            }
+                            Side::Sell => {
+                                order.price <= tick.market.ask_px + tick.market.tick_size + PX_EPS
+                            }
+                        };
+                        if touch_ok {
+                            legacy_swept = true;
+                            sweep_fill_cap = s.sweep_size_base;
+                        }
                     }
-                };
-                maker_side_matches && touch_ok
-            });
+                }
+            }
+
+            let (touch_px, touch_sz) = match order.side {
+                Side::Buy => (tick.market.bid_px, tick.market.bid_sz),
+                Side::Sell => (tick.market.ask_px, tick.market.ask_sz),
+            };
+            if (order.price - touch_px).abs() <= PX_EPS
+                && touch_sz.is_finite()
+                && touch_sz >= 0.0
+                && let Some(existing) = slot_opt.as_mut()
+            {
+                existing.queue_ahead_base = existing.queue_ahead_base.min(touch_sz);
+            }
+
             let price_through = match order.side {
                 Side::Buy => tick.market.ask_px <= order.price + PX_EPS,
                 Side::Sell => tick.market.bid_px >= order.price - PX_EPS,
@@ -1037,15 +1140,15 @@ pub fn run_continuous_pipeline_replay(
                     Side::Buy => order.price >= tick.market.bid_px - PX_EPS,
                     Side::Sell => order.price <= tick.market.ask_px + PX_EPS,
                 };
-
-            let fill_cap = if let Some(s) = tick.taker_sweep
-                && swept
-            {
-                s.sweep_size_base
-            } else {
+            let swept = sweep_cleared || sweep_touch || legacy_swept;
+            let fill_cap = if price_through || stride_touch {
                 order.qty
+            } else if swept {
+                sweep_fill_cap
+            } else {
+                0.0
             };
-            if (swept && rested_ms >= 10) || price_through || stride_touch {
+            if price_through || stride_touch || swept {
                 let raw_qty = if order.reduce_only {
                     let reducible = if order.side == Side::Buy {
                         (-signed_inv).max(0.0)
@@ -1066,7 +1169,16 @@ pub fn run_continuous_pipeline_replay(
                         passive_open_fills += 1;
                         FillExitMode::OpeningOrAdding
                     };
-                    if swept {
+                    if price_through {
+                        price_through_fills += 1;
+                    } else if sweep_cleared {
+                        sweep_cleared_fills += 1;
+                    } else if sweep_touch || legacy_swept {
+                        sweep_touch_fills += 1;
+                    } else if stride_touch {
+                        stride_touch_fills += 1;
+                    }
+                    if swept && tick.taker_sweep.is_some_and(|s| s.wallet_key != 0) {
                         toxic_sweep_hits += 1;
                     }
                     let markout_est = forward_1s_markout_usd(
@@ -1126,6 +1238,7 @@ pub fn run_continuous_pipeline_replay(
                         }
                     } else if let Some(existing) = slot_opt.as_mut() {
                         existing.qty -= fqty;
+                        existing.queue_ahead_base = 0.0;
                     }
                 }
             }
@@ -1137,7 +1250,9 @@ pub fn run_continuous_pipeline_replay(
         check_passive_fill(&mut sim_open_ask, false)?;
 
         // Step B: Observe public taker sweep for causal toxicity shielding on subsequent quotes.
-        if let Some(sweep) = tick.taker_sweep {
+        if let Some(sweep) = tick.taker_sweep
+            && sweep.wallet_key != 0
+        {
             let _ = pipeline.observe_public_taker_sweep(
                 now_ms,
                 sweep.wallet_key,
@@ -1173,11 +1288,22 @@ pub fn run_continuous_pipeline_replay(
             && let Some(qt) = exit_queue_tracker.as_mut()
         {
             let exit_sweep_hit = tick.taker_sweep.map_or(0.0, |s| {
-                let matches_exit = sim_exit.is_some_and(|eo| match eo.side {
-                    Side::Buy => !s.taker_is_buy,
-                    Side::Sell => s.taker_is_buy,
+                let matches_exit = sim_exit.is_some_and(|eo| {
+                    let side_ok = match eo.side {
+                        Side::Buy => !s.taker_is_buy,
+                        Side::Sell => s.taker_is_buy,
+                    };
+                    let level_ok = s.sweep_limit_px.is_none_or(|limit_px| match eo.side {
+                        Side::Buy => eo.price >= limit_px - PX_EPS,
+                        Side::Sell => eo.price <= limit_px + PX_EPS,
+                    });
+                    side_ok && level_ok
                 });
-                if matches_exit { s.sweep_size_base } else { 0.0 }
+                if matches_exit {
+                    s.touch_depleted_base.unwrap_or(s.sweep_size_base)
+                } else {
+                    0.0
+                }
             });
             eval_market.exit_queue_ahead_base = Some(qt.on_book_and_trade(
                 tick.market.bid_px,
@@ -1331,6 +1457,22 @@ pub fn run_continuous_pipeline_replay(
                             }
                         }
                     } else {
+                        let init_queue_ahead = match params.side {
+                            Side::Buy => {
+                                if params.price > tick.market.bid_px + PX_EPS {
+                                    0.0
+                                } else {
+                                    tick.market.bid_sz.max(0.0) * cfg.initial_queue_ahead_frac
+                                }
+                            }
+                            Side::Sell => {
+                                if params.price < tick.market.ask_px - PX_EPS {
+                                    0.0
+                                } else {
+                                    tick.market.ask_sz.max(0.0) * cfg.initial_queue_ahead_frac
+                                }
+                            }
+                        };
                         let sim_order = SimOrder {
                             slot: *slot,
                             client_order_index: coi,
@@ -1339,6 +1481,7 @@ pub fn run_continuous_pipeline_replay(
                             qty: params.size,
                             reduce_only: params.reduce_only,
                             placed_at_ms: now_ms,
+                            queue_ahead_base: init_queue_ahead,
                         };
                         match slot {
                             OrderSlotKind::OpeningBid => sim_open_bid = Some(sim_order),
@@ -1386,6 +1529,13 @@ pub fn run_continuous_pipeline_replay(
         && eval_ticks >= 2
         && observed_eval_span_ms >= FULL_10H_CONTINUOUS_MS
         && effective_max_eval_gap_ms <= DEFAULT_MAX_CONTINUOUS_EVAL_GAP_MS;
+    let eval_summary = eval_ledger.summary();
+    let eval_traded_notional_usd =
+        eval_summary.passive_exit_notional_usd + eval_summary.taker_exit_notional_usd;
+    let eval_net_per_notional_bps = (eval_traded_notional_usd > 0.0)
+        .then(|| (eval_summary.paired_cycle_net_cash_usd / eval_traded_notional_usd) * 10_000.0);
+    let eval_markout_1s_bps = (eval_traded_notional_usd > 0.0)
+        .then(|| (eval_summary.cumulative_1s_markout_usd / eval_traded_notional_usd) * 10_000.0);
 
     Ok(PipelineReplayReport {
         mode: cfg.pipeline.mode,
@@ -1411,8 +1561,15 @@ pub fn run_continuous_pipeline_replay(
         terminal_open_inventory_base: signed_inv,
         daily_loss_risk_scale_end: daily_loss.risk_scale(),
         warmup_ledger: warmup_ledger.summary(),
-        eval_ledger: eval_ledger.summary(),
+        eval_ledger: eval_summary,
         drain_ledger: drain_ledger.summary(),
+        price_through_fills,
+        sweep_cleared_fills,
+        sweep_touch_fills,
+        stride_touch_fills,
+        eval_traded_notional_usd,
+        eval_net_per_notional_bps,
+        eval_markout_1s_bps,
     })
 }
 
@@ -1505,6 +1662,8 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
                 taker_is_buy: true,
                 is_twap_sub: false,
                 sweep_size_base: 2.0,
+                sweep_limit_px: None,
+                touch_depleted_base: None,
             })
         } else {
             None
@@ -1569,6 +1728,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
         taker_fee_bps: 3.5,
         queue_fill_delay_ms: 500,
         passive_touch_fill_stride: 3,
+        initial_queue_ahead_frac: 1.0,
         pre_registered_wallets: vec![],
     };
 
@@ -1590,6 +1750,7 @@ pub fn run_pipeline_benchmark() -> Result<PipelineBenchmarkReport> {
         taker_fee_bps: 3.5,
         queue_fill_delay_ms: 500,
         passive_touch_fill_stride: 3,
+        initial_queue_ahead_frac: 1.0,
         pre_registered_wallets: vec![(toxic_wallet, WalletToxicityTier::Decile(10))],
     };
 
@@ -2023,6 +2184,7 @@ mod tests {
             taker_fee_bps: 3.5,
             queue_fill_delay_ms: 100,
             passive_touch_fill_stride: 0,
+            initial_queue_ahead_frac: 1.0,
             pre_registered_wallets: vec![],
         };
         let t1 = ReplayTick {
@@ -2076,6 +2238,7 @@ mod tests {
             taker_fee_bps: 5.0,
             queue_fill_delay_ms: 100,
             passive_touch_fill_stride: 0,
+            initial_queue_ahead_frac: 1.0,
             pre_registered_wallets: vec![],
         };
 
@@ -2190,6 +2353,7 @@ mod tests {
             taker_fee_bps: 0.0,
             queue_fill_delay_ms: 0,
             passive_touch_fill_stride: 0,
+            initial_queue_ahead_frac: 1.0,
             pre_registered_wallets: vec![],
         };
         let tick_at = |now_ms: u64| ReplayTick {
@@ -2512,6 +2676,7 @@ mod tests {
             taker_fee_bps: 0.0,
             queue_fill_delay_ms: 0,
             passive_touch_fill_stride: 1,
+            initial_queue_ahead_frac: 1.0,
             pre_registered_wallets: vec![],
         };
         let mk_tick = |now_ms: u64, bid_px: f64, ask_px: f64| ReplayTick {
@@ -2628,6 +2793,7 @@ mod tests {
             taker_fee_bps: 0.0,
             queue_fill_delay_ms: 0,
             passive_touch_fill_stride: 1,
+            initial_queue_ahead_frac: 1.0,
             pre_registered_wallets: vec![],
         };
         off_cfg.pipeline.hybrid_exit.timeout_ms = 20_000;
@@ -2744,5 +2910,216 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn replay_book_diff_sweep_respects_limit_px_fifo_queue_and_computes_p0_metrics() {
+        let mk_tick = |now_ms: u64,
+                       bid_px: f64,
+                       bid_sz: f64,
+                       ask_px: f64,
+                       ask_sz: f64,
+                       taker_sweep: Option<ReplayTakerSweep>| ReplayTick {
+            market: GenericMarketState {
+                now_ms,
+                bid_px,
+                ask_px,
+                bid_sz,
+                ask_sz,
+                tick_size: 0.1,
+                momentum_3s_bps: 0.0,
+                oracle_px: None,
+                funding_rate_bps_per_hour: None,
+                exit_queue_ahead_base: None,
+                realized_vol_bps_per_sqrt_s: None,
+            },
+            leader: None,
+            taker_sweep,
+        };
+
+        // 1. Order strictly behind `sweep_limit_px` must NOT fill.
+        let mut behind_p = base_pipe_cfg();
+        behind_p.glft.fee_floor_bps = 20.0; // quotes at 99.8 / 100.2 around 99.9 / 100.1
+        let behind_cfg = PipelineReplayConfig {
+            pipeline: behind_p,
+            slot_diff: SlotDiffConfig {
+                reprice_deadband_ticks: 0,
+                reprice_deadband_bps: None,
+                min_size_change_frac: 0.0,
+                lot_step: 0.1,
+                min_order_qty: 0.1,
+            },
+            window: ReplayWindowSpec {
+                warmup_start_ms: 500,
+                eval_start_ms: 1_000,
+                eval_end_ms: 3_000,
+                drain_end_ms: 3_500,
+            },
+            initial_capital_usd: 1_000.0,
+            daily_loss_limit_pct: 0.25,
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
+            queue_fill_delay_ms: 0,
+            passive_touch_fill_stride: 0,
+            initial_queue_ahead_frac: 1.0,
+            pre_registered_wallets: vec![],
+        };
+        let behind_ticks = vec![
+            mk_tick(1_000, 99.9, 5.0, 100.1, 5.0, None),
+            mk_tick(
+                1_100,
+                99.9,
+                5.0,
+                100.1,
+                1.0,
+                Some(ReplayTakerSweep {
+                    wallet_key: 0,
+                    taker_is_buy: true,
+                    is_twap_sub: false,
+                    sweep_size_base: 10.0,
+                    sweep_limit_px: Some(100.1),
+                    touch_depleted_base: Some(10.0),
+                }),
+            ),
+        ];
+        let behind_rep = run_continuous_pipeline_replay(&behind_cfg, None, &behind_ticks).unwrap();
+        assert_eq!(behind_rep.passive_open_fills, 0);
+        assert_eq!(behind_rep.sweep_cleared_fills, 0);
+        assert_eq!(behind_rep.sweep_touch_fills, 0);
+
+        // 2. Order at `sweep_limit_px` waits until FIFO `queue_ahead_base` depletes across ticks,
+        // then fills overflow (`sweep_touch_fills > 0`) and earns positive 1s markout & net bps.
+        let mut touch_p = base_pipe_cfg();
+        touch_p.glft.fee_floor_bps = 10.0; // quotes at 99.9 / 100.1 on 99.9 / 100.1
+        touch_p.hybrid_exit.stage_1_offset_bps = 5.0;
+        let touch_cfg = PipelineReplayConfig {
+            pipeline: touch_p,
+            slot_diff: SlotDiffConfig {
+                reprice_deadband_ticks: 0,
+                reprice_deadband_bps: None,
+                min_size_change_frac: 0.0,
+                lot_step: 0.1,
+                min_order_qty: 0.1,
+            },
+            window: ReplayWindowSpec {
+                warmup_start_ms: 500,
+                eval_start_ms: 1_000,
+                eval_end_ms: 4_000,
+                drain_end_ms: 4_500,
+            },
+            initial_capital_usd: 1_000.0,
+            daily_loss_limit_pct: 0.25,
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
+            queue_fill_delay_ms: 0,
+            passive_touch_fill_stride: 0,
+            initial_queue_ahead_frac: 1.0,
+            pre_registered_wallets: vec![],
+        };
+        let touch_ticks = vec![
+            // Places Bid @ 99.9 (queue_ahead = 5.0) & Ask @ 100.1 (queue_ahead = 5.0).
+            mk_tick(1_000, 99.9, 5.0, 100.1, 5.0, None),
+            // Depletes 3.0 at 99.9 (< 5.0 ahead) -> still queued, NO fill yet.
+            mk_tick(
+                1_100,
+                99.9,
+                2.0,
+                100.1,
+                5.0,
+                Some(ReplayTakerSweep {
+                    wallet_key: 0,
+                    taker_is_buy: false,
+                    is_twap_sub: false,
+                    sweep_size_base: 3.0,
+                    sweep_limit_px: Some(99.9),
+                    touch_depleted_base: Some(3.0),
+                }),
+            ),
+            // Depletes another 3.0 at 99.9 -> 1.0 overflow fills OpeningBid @ 99.9!
+            mk_tick(
+                1_200,
+                99.9,
+                2.0,
+                100.1,
+                5.0,
+                Some(ReplayTakerSweep {
+                    wallet_key: 0,
+                    taker_is_buy: false,
+                    is_twap_sub: false,
+                    sweep_size_base: 3.0,
+                    sweep_limit_px: Some(99.9),
+                    touch_depleted_base: Some(3.0),
+                }),
+            ),
+            // Rebounds to 100.0 / 100.2 and buyer sweeps ask -> passive exit fills!
+            mk_tick(1_300, 100.0, 5.0, 100.2, 5.0, None),
+            mk_tick(
+                2_300,
+                100.0,
+                5.0,
+                100.2,
+                5.0,
+                Some(ReplayTakerSweep {
+                    wallet_key: 0,
+                    taker_is_buy: true,
+                    is_twap_sub: false,
+                    sweep_size_base: 5.0,
+                    sweep_limit_px: Some(100.2),
+                    touch_depleted_base: Some(0.0),
+                }),
+            ),
+            mk_tick(3_500, 100.1, 5.0, 100.3, 5.0, None),
+        ];
+        let touch_rep = run_continuous_pipeline_replay(&touch_cfg, None, &touch_ticks).unwrap();
+        assert_eq!(touch_rep.passive_open_fills, 1);
+        assert_eq!(touch_rep.passive_exit_fills, 1);
+        assert_eq!(touch_rep.price_through_fills, 0);
+        assert_eq!(touch_rep.sweep_touch_fills, 1);
+        assert_eq!(touch_rep.sweep_cleared_fills, 1);
+        assert_eq!(touch_rep.toxic_sweep_hits, 0);
+        assert!(touch_rep.eval_ledger.paired_cycle_net_cash_usd > 0.0);
+        assert!(touch_rep.eval_markout_1s_bps.unwrap() > 0.0);
+        assert!(touch_rep.eval_net_per_notional_bps.unwrap() > 0.0);
+
+        let expected_ntl = touch_rep.eval_ledger.passive_exit_notional_usd
+            + touch_rep.eval_ledger.taker_exit_notional_usd;
+        assert!((touch_rep.eval_traded_notional_usd - expected_ntl).abs() < 1e-9);
+        assert!(
+            (touch_rep.eval_net_per_notional_bps.unwrap()
+                - (touch_rep.eval_ledger.paired_cycle_net_cash_usd / expected_ntl) * 10_000.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (touch_rep.eval_markout_1s_bps.unwrap()
+                - (touch_rep.eval_ledger.cumulative_1s_markout_usd / expected_ntl) * 10_000.0)
+                .abs()
+                < 1e-9
+        );
+
+        // 3. Order strictly inside `sweep_limit_px` fills immediately (`sweep_cleared_fills > 0`)
+        // even when `ask_px > order.price` (`price_through == false`).
+        let cleared_ticks = vec![
+            mk_tick(1_000, 99.9, 5.0, 100.1, 5.0, None),
+            mk_tick(
+                1_100,
+                99.7,
+                5.0,
+                100.0,
+                5.0,
+                Some(ReplayTakerSweep {
+                    wallet_key: 0,
+                    taker_is_buy: false,
+                    is_twap_sub: false,
+                    sweep_size_base: 2.0,
+                    sweep_limit_px: Some(99.7),
+                    touch_depleted_base: Some(0.0),
+                }),
+            ),
+        ];
+        let cleared_rep = run_continuous_pipeline_replay(&touch_cfg, None, &cleared_ticks).unwrap();
+        assert_eq!(cleared_rep.passive_open_fills, 1);
+        assert_eq!(cleared_rep.sweep_cleared_fills, 1);
+        assert_eq!(cleared_rep.price_through_fills, 0);
     }
 }
