@@ -126,7 +126,7 @@ func subscriptions(lighter, hl, coinbase, arcus, bulk, arcusWS, bulkWS string, s
 					})
 				}
 			case "hyperliquid":
-				for _, channel := range []string{"l2Book", "activeAssetCtx"} {
+				for _, channel := range []string{"l2Book", "bbo", "activeAssetCtx"} {
 					request := map[string]any{"type": channel, "coin": item}
 					if channel == "l2Book" && hlFastBook {
 						request["fast"] = true
@@ -191,11 +191,7 @@ func subscriptions(lighter, hl, coinbase, arcus, bulk, arcusWS, bulkWS string, s
 		}
 		source := subscription{source: ws.name, url: ws.url, coins: coins}
 		if ws.name == "arcus" {
-			for _, coin := range coins {
-				source.requests = append(source.requests, map[string]any{
-					"type": "subscribe", "channel": "l2Orderbook", "id": coin, "nLevels": 20,
-				})
-			}
+			source.requests = arcusBookRequests(coins)
 		} else {
 			books := make([]map[string]any, 0, len(coins))
 			for _, coin := range coins {
@@ -454,7 +450,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			}
 			continue
 		case "arcus":
-			if header.Channel != "l2Orderbook" || !slices.Contains(source.coins, gjson.GetBytes(raw, "id").String()) ||
+			if !isArcusBookChannel(header.Channel) || !slices.Contains(source.coins, gjson.GetBytes(raw, "id").String()) ||
 				(header.Type != "subscribed" && header.Type != "channel_data") {
 				continue
 			}
@@ -469,7 +465,7 @@ func connect(ctx context.Context, source subscription, emit func(record) error) 
 			switch header.Type {
 			case "subscribed/order_book", "update/order_book", "subscribed/market_stats", "update/market_stats", "ticker":
 			default:
-				if header.Channel != "l2Book" && header.Channel != "activeAssetCtx" {
+				if header.Channel != "l2Book" && header.Channel != "bbo" && header.Channel != "activeAssetCtx" {
 					continue
 				}
 			}
@@ -757,7 +753,7 @@ func run() error {
 	coinbase := flag.String("coinbase", "", "comma-separated Coinbase spot products")
 	arcus := flag.String("arcus", "", "comma-separated Arcus perpetuals for 1s REST snapshots")
 	bulk := flag.String("bulk", "", "comma-separated BULK perpetuals for 1s REST snapshots")
-	arcusWS := flag.String("arcus-ws", "", "comma-separated Arcus perpetuals for WebSocket L2 books")
+	arcusWS := flag.String("arcus-ws", "", "comma-separated Arcus perpetuals for WebSocket L2 books and event-driven BBO")
 	arcusTrades := flag.Bool("arcus-trades", false, "record Arcus public trades and subscription acknowledgments")
 	bulkWS := flag.String("bulk-ws", "", "comma-separated BULK perpetuals for WebSocket L2 snapshots")
 	snapshotInterval := flag.Duration("hl-snapshot-interval", 0, "optional Hyperliquid REST L2 interval")

@@ -88,7 +88,7 @@ func hyperliquidPublication(source subscription, channel string, raw []byte, ack
 			if source.source != "hyperliquid_trades" {
 				return record{}, errors.New("unexpected Hyperliquid trade subscription")
 			}
-		case "l2Book", "activeAssetCtx":
+		case "l2Book", "bbo", "activeAssetCtx":
 			if source.source != "hyperliquid" {
 				return record{}, errors.New("unexpected Hyperliquid book subscription")
 			}
@@ -129,7 +129,7 @@ func hyperliquidPublication(source subscription, channel string, raw []byte, ack
 			return record{}, err
 		}
 		row.Market, row.Event, row.Payload = coin, "message", payload
-	case "l2Book", "activeAssetCtx":
+	case "l2Book", "bbo", "activeAssetCtx":
 		var data struct {
 			Coin string `json:"coin"`
 		}

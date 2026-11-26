@@ -21,8 +21,10 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
-// Arcus connects to the Arcus L2 orderbook WebSocket (wss://api.arcus.xyz/v1/ws)
-// and publishes validated top-of-book quotes and 5-level depth into SHM.
+// Arcus connects to the Arcus WebSocket (wss://api.arcus.xyz/v1/ws). The
+// event-driven `bbo` channel and the ~200 ms `l2Orderbook` snapshot both feed
+// validated top-of-book quotes into SHM (newest globalSequenceId wins);
+// l2Orderbook alone feeds 5-level depth.
 type Arcus struct {
 	cfg         config.ExchangeConfig
 	matrix      *shm.Matrix
@@ -299,6 +301,104 @@ func (s *arcusDepthSide) UnmarshalJSON(b []byte) error {
 	return errJSONWrongType
 }
 
+// arcusBBOLevel decodes a `bbo` channel level ({"price":"..","size":".."})
+// without heap allocations. A null or missing level, or one with zero size,
+// leaves present=false (empty side). Unparseable or negative values set
+// valid=false (malformed side).
+type arcusBBOLevel struct {
+	present bool
+	valid   bool
+	price   float64
+	size    float64
+	scratch []byte
+}
+
+func (l *arcusBBOLevel) reset() {
+	l.present = false
+	l.valid = true
+	l.price = 0
+	l.size = 0
+	l.scratch = l.scratch[:0]
+}
+
+var (
+	arcusKeyPrice = []byte("price")
+	arcusKeySize  = []byte("size")
+)
+
+func (l *arcusBBOLevel) UnmarshalJSON(b []byte) error {
+	l.reset()
+	b = trimJSONSpace(b)
+	if bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	if len(b) < 2 || b[0] != '{' {
+		return errJSONWrongType
+	}
+	var pxBytes, szBytes []byte
+	var havePx, haveSz bool
+	i := skipJSONSpace(b, 1)
+	if i < len(b) && b[i] == '}' {
+		return nil
+	}
+	for i < len(b) {
+		key, next, ok, wrong := parseJSONStringOrNull(b, i, &l.scratch)
+		if wrong || !ok || key == nil {
+			return errJSONWrongType
+		}
+		i = skipJSONSpace(b, next)
+		if i >= len(b) || b[i] != ':' {
+			return errJSONWrongType
+		}
+		i = skipJSONSpace(b, i+1)
+		switch {
+		case bytes.Equal(key, arcusKeyPrice):
+			pxBytes, i, ok, wrong = parseJSONStringOrNull(b, i, &l.scratch)
+			if wrong || !ok {
+				return errJSONWrongType
+			}
+			px, err := parseFloatBytes(pxBytes)
+			if err != nil || math.IsNaN(px) || math.IsInf(px, 0) || px <= 0 {
+				l.valid = false
+			}
+			l.price = px
+			havePx = true
+		case bytes.Equal(key, arcusKeySize):
+			szBytes, i, ok, wrong = parseJSONStringOrNull(b, i, &l.scratch)
+			if wrong || !ok {
+				return errJSONWrongType
+			}
+			sz, err := parseFloatBytes(szBytes)
+			if err != nil || math.IsNaN(sz) || math.IsInf(sz, 0) || sz < 0 {
+				l.valid = false
+			}
+			l.size = sz
+			haveSz = true
+		default:
+			i, ok = skipJSONValue(b, i)
+			if !ok {
+				return errJSONWrongType
+			}
+		}
+		i = skipJSONSpace(b, i)
+		if i < len(b) && b[i] == ',' {
+			i = skipJSONSpace(b, i+1)
+			continue
+		}
+		if i < len(b) && b[i] == '}' {
+			break
+		}
+		return errJSONWrongType
+	}
+	if !havePx || !haveSz {
+		l.valid = false
+	}
+	// A valid level with zero size is an empty side, like a zero-size
+	// l2Orderbook level.
+	l.present = !l.valid || l.size > 0
+	return nil
+}
+
 type arcusEnvelope struct {
 	Type     jsonScratchString `json:"type"`
 	Channel  jsonScratchString `json:"channel"`
@@ -306,10 +406,16 @@ type arcusEnvelope struct {
 	Contents arcusBookBody     `json:"contents"`
 }
 
+// arcusBookBody is the union of the `l2Orderbook` (bids/asks) and `bbo`
+// (bestBid/bestAsk) contents. Both carry a microsecond timestamp and the
+// venue-wide globalSequenceId.
 type arcusBookBody struct {
-	Timestamp int64          `json:"timestamp"`
-	Bids      arcusDepthSide `json:"bids"`
-	Asks      arcusDepthSide `json:"asks"`
+	Timestamp        int64          `json:"timestamp"`
+	GlobalSequenceID uint64         `json:"globalSequenceId"`
+	Bids             arcusDepthSide `json:"bids"`
+	Asks             arcusDepthSide `json:"asks"`
+	BestBid          arcusBBOLevel  `json:"bestBid"`
+	BestAsk          arcusBBOLevel  `json:"bestAsk"`
 }
 
 func (e *arcusEnvelope) reset() {
@@ -317,8 +423,11 @@ func (e *arcusEnvelope) reset() {
 	e.Channel.reset()
 	e.ID.reset()
 	e.Contents.Timestamp = 0
+	e.Contents.GlobalSequenceID = 0
 	e.Contents.Bids.reset()
 	e.Contents.Asks.reset()
+	e.Contents.BestBid.reset()
+	e.Contents.BestAsk.reset()
 }
 
 var arcusEnvelopePool = sync.Pool{
@@ -328,28 +437,77 @@ var arcusEnvelopePool = sync.Pool{
 			Channel: make([]byte, 0, 24),
 			ID:      make([]byte, 0, 24),
 			Contents: arcusBookBody{
-				Bids: arcusDepthSide{descending: true, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
-				Asks: arcusDepthSide{descending: false, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
+				Bids:    arcusDepthSide{descending: true, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
+				Asks:    arcusDepthSide{descending: false, valid: true, scratchPx: make([]byte, 0, 32), scratchSz: make([]byte, 0, 32)},
+				BestBid: arcusBBOLevel{valid: true, scratch: make([]byte, 0, 32)},
+				BestAsk: arcusBBOLevel{valid: true, scratch: make([]byte, 0, 32)},
 			},
 		}
 	},
 }
 
+// arcusSymbolState is the per-symbol publication watermark. The top-of-book
+// watermark is shared by the `bbo` and `l2Orderbook` channels so a ~200 ms
+// l2 snapshot never overwrites a fresher event-driven bbo. Depth has its own
+// watermark because only l2Orderbook carries depth.
+//
+// Sequence watermarks are per connection (reset on reconnect); timestamp
+// watermarks persist so a reconnect never republishes an older quote.
+type arcusSymbolState struct {
+	bboSeq    uint64
+	bboTsUs   int64
+	depthSeq  uint64
+	depthTsUs int64
+}
+
+// arcusFresh reports whether an update is strictly newer than the watermark.
+// When both sides carry a globalSequenceId it is authoritative; the timestamp
+// must also not regress because the SHM matrix drops older timestamps.
+// Without sequence evidence the timestamp must strictly advance.
+func arcusFresh(lastSeq uint64, lastTsUs int64, seq uint64, tsUs int64) bool {
+	if seq > 0 && lastSeq > 0 {
+		return seq > lastSeq && tsUs >= lastTsUs
+	}
+	return tsUs > lastTsUs
+}
+
+func (st *arcusSymbolState) markBBO(seq uint64, tsUs int64) {
+	if seq > 0 {
+		st.bboSeq = seq
+	}
+	st.bboTsUs = max(st.bboTsUs, tsUs)
+}
+
+func (st *arcusSymbolState) markDepth(seq uint64, tsUs int64) {
+	if seq > 0 {
+		st.depthSeq = seq
+	}
+	st.depthTsUs = max(st.depthTsUs, tsUs)
+}
+
 func (a *Arcus) Run(ctx context.Context) error {
 	a.invalidateAll()
-	lastPublicationUs := make(map[uint16]int64, len(a.symMap))
+	states := make(map[uint16]arcusSymbolState, len(a.symMap))
 	return RunConnectionLoop(ctx, "arcus", func(ctx context.Context) error {
-		return a.connect(ctx, lastPublicationUs)
+		return a.connect(ctx, states)
 	})
 }
 
-func (a *Arcus) invalidateBook(symbolID uint16) {
+func (a *Arcus) invalidateBBO(symbolID uint16) {
 	if a.matrix != nil {
 		a.matrix.InvalidateBBO(ExchangeArcus, symbolID)
 	}
+}
+
+func (a *Arcus) invalidateDepth(symbolID uint16) {
 	if a.depthWriter != nil {
 		a.depthWriter.InvalidateDepth(symbolID, ExchangeArcus)
 	}
+}
+
+func (a *Arcus) invalidateBook(symbolID uint16) {
+	a.invalidateBBO(symbolID)
+	a.invalidateDepth(symbolID)
 }
 
 func (a *Arcus) invalidateAll() {
@@ -358,8 +516,35 @@ func (a *Arcus) invalidateAll() {
 	}
 }
 
-func (a *Arcus) connect(ctx context.Context, lastPublicationUs map[uint16]int64) error {
+type arcusSubscribeRequest struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
+	ID      string `json:"id"`
+	NLevels int    `json:"nLevels,omitempty"`
+}
+
+// arcusSubscribeRequests subscribes each market to the event-driven `bbo`
+// channel (top of book) and the fixed-cadence `l2Orderbook` channel (depth).
+func arcusSubscribeRequests(coins []string) []arcusSubscribeRequest {
+	requests := make([]arcusSubscribeRequest, 0, 2*len(coins))
+	for _, coin := range coins {
+		requests = append(requests,
+			arcusSubscribeRequest{Type: "subscribe", Channel: "l2Orderbook", ID: coin, NLevels: 20},
+			arcusSubscribeRequest{Type: "subscribe", Channel: "bbo", ID: coin},
+		)
+	}
+	return requests
+}
+
+func (a *Arcus) connect(ctx context.Context, states map[uint16]arcusSymbolState) error {
 	defer a.invalidateAll()
+
+	// Sequence numbers are only compared within one connection.
+	for symID, st := range states {
+		st.bboSeq = 0
+		st.depthSeq = 0
+		states[symID] = st
+	}
 
 	c, _, err := websocket.Dial(ctx, a.cfg.WSURL, nil)
 	if err != nil {
@@ -375,18 +560,12 @@ func (a *Arcus) connect(ctx context.Context, lastPublicationUs map[uint16]int64)
 		coins = append(coins, coin)
 	}
 	slices.Sort(coins)
-	for _, rawCoin := range coins {
-		sub := map[string]any{
-			"type":    "subscribe",
-			"channel": "l2Orderbook",
-			"id":      rawCoin,
-			"nLevels": 20,
-		}
+	for _, sub := range arcusSubscribeRequests(coins) {
 		if err := wsjson.Write(ctx, c, sub); err != nil {
-			return fmt.Errorf("subscribe %s: %w", rawCoin, err)
+			return fmt.Errorf("subscribe %s %s: %w", sub.Channel, sub.ID, err)
 		}
-		log.Printf("arcus: subscribed to %s", rawCoin)
 	}
+	log.Printf("arcus: subscribed to l2Orderbook+bbo for %v", coins)
 
 	stopKeepalive := wsutil.StartKeepalive(ctx, "arcus", c, 15*time.Second, nil)
 	defer stopKeepalive()
@@ -405,7 +584,7 @@ func (a *Arcus) connect(ctx context.Context, lastPublicationUs map[uint16]int64)
 		if _, err := frameBuf.ReadFrom(r); err != nil {
 			return err
 		}
-		if err := a.handleMessage(frameBuf.Bytes(), time.Now(), lastPublicationUs); err != nil {
+		if err := a.handleMessage(frameBuf.Bytes(), time.Now(), states); err != nil {
 			return err
 		}
 	}
@@ -413,11 +592,12 @@ func (a *Arcus) connect(ctx context.Context, lastPublicationUs map[uint16]int64)
 
 var (
 	arcusChannelBytes    = []byte("l2Orderbook")
+	arcusBBOChannelBytes = []byte("bbo")
 	arcusTypeSubscribed  = []byte("subscribed")
 	arcusTypeChannelData = []byte("channel_data")
 )
 
-func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[uint16]int64) error {
+func (a *Arcus) handleMessage(raw []byte, now time.Time, states map[uint16]arcusSymbolState) error {
 	env := arcusEnvelopePool.Get().(*arcusEnvelope)
 	env.reset()
 	defer func() {
@@ -428,8 +608,11 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[u
 	if json.Unmarshal(raw, env) != nil {
 		return nil
 	}
-	if !bytes.Equal(env.Channel, arcusChannelBytes) ||
-		(!bytes.Equal(env.Type, arcusTypeSubscribed) && !bytes.Equal(env.Type, arcusTypeChannelData)) {
+	if !bytes.Equal(env.Type, arcusTypeSubscribed) && !bytes.Equal(env.Type, arcusTypeChannelData) {
+		return nil
+	}
+	isL2 := bytes.Equal(env.Channel, arcusChannelBytes)
+	if !isL2 && !bytes.Equal(env.Channel, arcusBBOChannelBytes) {
 		return nil
 	}
 	symID, ok := a.symMap[env.ID.asString()]
@@ -437,14 +620,69 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[u
 		return nil
 	}
 	tsUs := env.Contents.Timestamp
-	if tsUs <= 0 || tsUs <= lastPublicationUs[symID] {
+	if tsUs <= 0 {
+		return nil
+	}
+	st := states[symID]
+	seq := env.Contents.GlobalSequenceID
+	bboFresh := arcusFresh(st.bboSeq, st.bboTsUs, seq, tsUs)
+	depthFresh := isL2 && arcusFresh(st.depthSeq, st.depthTsUs, seq, tsUs)
+	if !bboFresh && !depthFresh {
 		return nil
 	}
 	if tsUs > now.Add(time.Second).UnixMicro() {
 		return fmt.Errorf("market %s: future book timestamp %d", string(env.ID), tsUs)
 	}
-	if env.Contents.Bids.rawLen == 0 || env.Contents.Asks.rawLen == 0 {
+	if isL2 {
+		return a.handleL2(env, symID, &st, states, seq, tsUs, bboFresh, depthFresh)
+	}
+	return a.handleBBO(env, symID, &st, states, seq, tsUs)
+}
+
+func (a *Arcus) handleBBO(env *arcusEnvelope, symID uint16, st *arcusSymbolState, states map[uint16]arcusSymbolState, seq uint64, tsUs int64) error {
+	bid := &env.Contents.BestBid
+	ask := &env.Contents.BestAsk
+	if !bid.present || !ask.present {
+		// An authoritative empty side; later stale l2 snapshots must not
+		// resurrect the previous quote.
 		a.invalidateBook(symID)
+		st.markBBO(seq, tsUs)
+		states[symID] = *st
+		return nil
+	}
+	if !bid.valid {
+		a.invalidateBook(symID)
+		return fmt.Errorf("market %s: malformed bbo bid", string(env.ID))
+	}
+	if !ask.valid {
+		a.invalidateBook(symID)
+		return fmt.Errorf("market %s: malformed bbo ask", string(env.ID))
+	}
+	if bid.price >= ask.price {
+		a.invalidateBook(symID)
+		return fmt.Errorf("market %s: crossed or empty top-of-book", string(env.ID))
+	}
+	if a.matrix != nil {
+		a.matrix.WriteBBO(ExchangeArcus, symID, uint64(tsUs)*1_000, bid.price, bid.size, ask.price, ask.size)
+	}
+	st.markBBO(seq, tsUs)
+	states[symID] = *st
+	return nil
+}
+
+func (a *Arcus) handleL2(env *arcusEnvelope, symID uint16, st *arcusSymbolState, states map[uint16]arcusSymbolState, seq uint64, tsUs int64, bboFresh, depthFresh bool) error {
+	if env.Contents.Bids.rawLen == 0 || env.Contents.Asks.rawLen == 0 {
+		// Only invalidate the views this snapshot is fresh for: a stale
+		// snapshot must not clear a newer bbo.
+		if bboFresh {
+			a.invalidateBBO(symID)
+			st.markBBO(seq, tsUs)
+		}
+		if depthFresh {
+			a.invalidateDepth(symID)
+			st.markDepth(seq, tsUs)
+		}
+		states[symID] = *st
 		return nil
 	}
 
@@ -467,12 +705,18 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, lastPublicationUs map[u
 	}
 
 	tsNs := uint64(tsUs) * 1_000 // us -> ns
-	if a.matrix != nil {
-		a.matrix.WriteBBO(ExchangeArcus, symID, tsNs, bids[0].Price, bids[0].Size, asks[0].Price, asks[0].Size)
+	if bboFresh {
+		if a.matrix != nil {
+			a.matrix.WriteBBO(ExchangeArcus, symID, tsNs, bids[0].Price, bids[0].Size, asks[0].Price, asks[0].Size)
+		}
+		st.markBBO(seq, tsUs)
 	}
-	if a.depthWriter != nil {
-		a.depthWriter.WriteDepth(symID, ExchangeArcus, tsNs, bids, asks)
+	if depthFresh {
+		if a.depthWriter != nil {
+			a.depthWriter.WriteDepth(symID, ExchangeArcus, tsNs, bids, asks)
+		}
+		st.markDepth(seq, tsUs)
 	}
-	lastPublicationUs[symID] = tsUs
+	states[symID] = *st
 	return nil
 }

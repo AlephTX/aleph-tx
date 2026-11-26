@@ -38,7 +38,7 @@ func TestArcusHandleMessageWritesBBOAndDepthAndInvalidates(t *testing.T) {
 		Symbols: map[string]string{"NVDA": "NVDA-USD", "ETH": "ETH-USD"},
 	}, matrix, depth)
 
-	lastPub := make(map[uint16]int64)
+	lastPub := make(map[uint16]arcusSymbolState)
 	now := time.UnixMilli(1_794_712_727_000)
 
 	valid := []byte(`{"type":"channel_data","channel":"l2Orderbook","id":"NVDA-USD","contents":{"timestamp":1794712726850123,"bids":[["145.10","25.0"],["145.05","40.0"]],"asks":[["145.15","30.0"],["145.20","50.0"]]}}`)

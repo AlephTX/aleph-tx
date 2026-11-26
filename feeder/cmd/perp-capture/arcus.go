@@ -15,6 +15,25 @@ type arcusTradeSubscribe struct {
 	ID      string `json:"id"`
 }
 
+// arcusBookRequests subscribes each market to the ~200 ms `l2Orderbook`
+// snapshot (depth) and the event-driven `bbo` channel (top of book). Both are
+// archived under the "arcus" source; the raw payload's "channel" field keeps
+// them distinguishable, and existing book consumers select l2Orderbook only.
+func arcusBookRequests(coins []string) []any {
+	requests := make([]any, 0, 2*len(coins))
+	for _, coin := range coins {
+		requests = append(requests,
+			map[string]any{"type": "subscribe", "channel": "l2Orderbook", "id": coin, "nLevels": 20},
+			map[string]any{"type": "subscribe", "channel": "bbo", "id": coin},
+		)
+	}
+	return requests
+}
+
+func isArcusBookChannel(channel string) bool {
+	return channel == "l2Orderbook" || channel == "bbo"
+}
+
 type arcusSubscribedAck struct {
 	Channel string `json:"channel"`
 	ID      string `json:"id"`

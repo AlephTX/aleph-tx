@@ -27,6 +27,7 @@ ExecStart=/usr/bin/python3 /opt/aleph-tx/current/scripts/perp_rolling_runner.py 
   -arcus-ws NVDA-USD,SNDK-USD,AAPL-USD,TSLA-USD,MU-USD,SPY-USD,QQQ-USD,HOOD-USD,COIN-USD,MSTR-USD,AMD-USD,MSFT-USD,GOOGL-USD,AMZN-USD,META-USD,PLTR-USD,CRCL-USD,DRAM-USD \
   -arcus-trades \
   -hyperliquid io:NVDA,io:SNDK,io:AAPL,io:CRCL,io:DRAM,io:NBIS,xyz:NVDA,xyz:SNDK,xyz:AAPL,xyz:TSLA,xyz:MU,xyz:SP500,xyz:XYZ100,xyz:HOOD,xyz:COIN,xyz:MSTR,xyz:AMD,xyz:MSFT,xyz:GOOGL,xyz:AMZN,xyz:META,xyz:PLTR,xyz:CRCL,xyz:DRAM \
+  -hl-fast-book \
   -hl-trades \
   -hl-funding-interval 5m \
   -lighter-robinhood 15,32,10,16,31,26,25,23,29,14,12,11,13,34,24 \

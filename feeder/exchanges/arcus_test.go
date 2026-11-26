@@ -2,6 +2,7 @@ package exchanges
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -68,7 +69,7 @@ func TestArcusPooledDecoderNoStaleLeakageAndEdgeCases(t *testing.T) {
 		Symbols: map[string]string{"NVDA": "NVDA-USD"},
 	}, matrix, depth)
 
-	lastPub := make(map[uint16]int64)
+	lastPub := make(map[uint16]arcusSymbolState)
 	now := time.UnixMilli(1_794_712_727_000)
 
 	// 1. 20-level message populates all 5 SHM depth levels.
@@ -151,9 +152,9 @@ func TestArcusConcurrentPoolSafety(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			localPub := make(map[uint16]int64)
+			localPub := make(map[uint16]arcusSymbolState)
 			for i := 0; i < 100; i++ {
-				localPub[1003] = 0
+				localPub[1003] = arcusSymbolState{}
 				if err := arc.handleMessage(payload, now, localPub); err != nil {
 					t.Errorf("concurrent handleMessage error: %v", err)
 					return
@@ -208,7 +209,7 @@ func TestArcusWebSocketReaderLoopEndToEnd(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- arc.connect(ctx, make(map[uint16]int64))
+		done <- arc.connect(ctx, make(map[uint16]arcusSymbolState))
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -254,14 +255,292 @@ func BenchmarkArcusHandleMessage20Levels(b *testing.B) {
 
 	const tsUs = int64(1_794_712_726_850_123)
 	payload := buildArcusBenchmarkPayload(20, tsUs)
-	lastPub := map[uint16]int64{1003: 0}
+	lastPub := map[uint16]arcusSymbolState{}
 	now := time.UnixMilli(1_794_712_727_000)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		lastPub[1003] = 0
+		lastPub[1003] = arcusSymbolState{}
 		if err := arc.handleMessage(payload, now, lastPub); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func newArcusBBOTestFeed(t *testing.T, name string) (*Arcus, *shm.Matrix, *shm.DepthWriter) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("ALEPH_SHM_DIR", tmp)
+	matrix, err := shm.NewMatrix(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { matrix.Close() })
+	depth, err := shm.NewDepthWriter(filepath.Join(tmp, "aleph-depth"), shm.NumSymbols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { depth.Close() })
+	withTestSymbolRegistry(t, map[string]uint16{"BTC": 1})
+	arc := NewArcus(config.ExchangeConfig{
+		Enabled: true,
+		WSURL:   "wss://api.arcus.xyz/v1/ws",
+		Symbols: map[string]string{"BTC": "BTC-USD"},
+	}, matrix, depth)
+	return arc, matrix, depth
+}
+
+func arcusBBOFrame(kind string, tsUs int64, seq uint64, bid, ask string) []byte {
+	return []byte(fmt.Sprintf(`{"type":%q,"channel":"bbo","id":"BTC-USD","contents":{"bestBid":{"price":%q,"size":"0.08408347"},"bestAsk":{"price":%q,"size":"0.01058685"},"timestamp":%d,"lastSequenceId":980274961,"globalSequenceId":%d}}`, kind, bid, ask, tsUs, seq))
+}
+
+func arcusL2Frame(tsUs int64, seq uint64, bid, ask string) []byte {
+	return []byte(fmt.Sprintf(`{"type":"channel_data","channel":"l2Orderbook","id":"BTC-USD","contents":{"timestamp":%d,"lastSequenceId":980274900,"globalSequenceId":%d,"bids":[[%q,"1.5"],["60000.0","2"]],"asks":[[%q,"1.25"],["61000.0","3"]]}}`, tsUs, seq, bid, ask))
+}
+
+func TestArcusParsesBBOChannel(t *testing.T) {
+	arc, matrix, depth := newArcusBBOTestFeed(t, "arcus-bbo-parse")
+	states := make(map[uint16]arcusSymbolState)
+	now := time.UnixMicro(1_795_691_150_500_000)
+
+	// Real public message shape from wss://api.arcus.xyz/v1/ws.
+	raw := []byte(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":{"bestBid":{"price":"60415.1","size":"0.08408347"},"bestAsk":{"price":"60415.2","size":"0.01058685"},"timestamp":1795691150080124,"lastSequenceId":980274961,"globalSequenceId":16893834613}}`)
+	if err := arc.handleMessage(raw, now, states); err != nil {
+		t.Fatal(err)
+	}
+	bbo, ok := matrix.ReadBBO(ExchangeArcus, 1)
+	if !ok || bbo.BidPrice != 60415.1 || bbo.BidSize != 0.08408347 || bbo.AskPrice != 60415.2 ||
+		bbo.AskSize != 0.01058685 || bbo.TimestampNs != 1795691150080124*1_000 {
+		t.Fatalf("unexpected bbo publication: ok=%v %+v", ok, bbo)
+	}
+	if st := states[1]; st.bboSeq != 16893834613 || st.bboTsUs != 1795691150080124 || st.depthSeq != 0 {
+		t.Fatalf("unexpected watermark after bbo: %+v", st)
+	}
+	if _, ok := depth.ReadDepth(1, ExchangeArcus); ok {
+		t.Fatal("bbo must not publish depth")
+	}
+
+	// A subscribed snapshot of the bbo channel is accepted too.
+	if err := arc.handleMessage(arcusBBOFrame("subscribed", 1795691150090000, 16893834620, "60415.0", "60415.3"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	if bbo, ok := matrix.ReadBBO(ExchangeArcus, 1); !ok || bbo.BidPrice != 60415.0 {
+		t.Fatalf("subscribed bbo snapshot not published: ok=%v %+v", ok, bbo)
+	}
+
+	// Unknown key order and extra fields decode identically; a decoding
+	// allocation regression would show up in the benchmark.
+	reordered := []byte(`{"contents":{"globalSequenceId":16893834630,"timestamp":1795691150095000,"bestAsk":{"size":"2","price":"60415.4","extra":[1,{"a":"b"}]},"bestBid":{"size":"1","price":"60415.1"}},"id":"BTC-USD","channel":"bbo","type":"channel_data"}`)
+	if err := arc.handleMessage(reordered, now, states); err != nil {
+		t.Fatal(err)
+	}
+	if bbo, ok := matrix.ReadBBO(ExchangeArcus, 1); !ok || bbo.BidPrice != 60415.1 || bbo.AskPrice != 60415.4 || bbo.AskSize != 2 {
+		t.Fatalf("reordered bbo not published: ok=%v %+v", ok, bbo)
+	}
+
+	// Empty side invalidates without error and advances the watermark.
+	empty := []byte(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":{"bestBid":null,"bestAsk":{"price":"60415.4","size":"1"},"timestamp":1795691150096000,"globalSequenceId":16893834640}}`)
+	if err := arc.handleMessage(empty, now, states); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeArcus, 1); ok {
+		t.Fatal("empty bbo side did not invalidate the quote")
+	}
+	// An older l2 snapshot cannot resurrect the invalidated quote.
+	if err := arc.handleMessage(arcusL2Frame(1795691150070000, 16893834500, "60415.0", "60415.5"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := matrix.ReadBBO(ExchangeArcus, 1); ok {
+		t.Fatal("stale l2 snapshot resurrected an invalidated bbo")
+	}
+}
+
+func TestArcusSequenceGuardKeepsFresherBBO(t *testing.T) {
+	arc, matrix, depth := newArcusBBOTestFeed(t, "arcus-bbo-seq")
+	states := make(map[uint16]arcusSymbolState)
+	now := time.UnixMicro(1_795_691_151_000_000)
+
+	if err := arc.handleMessage(arcusBBOFrame("channel_data", 1795691150080124, 16893834613, "60415.1", "60415.2"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	// The l2 snapshot is older by sequence, even with a later timestamp
+	// (snapshot emission time). Its top of book must not overwrite the bbo,
+	// but its depth is still published.
+	if err := arc.handleMessage(arcusL2Frame(1795691150100000, 16893834600, "60410.0", "60420.0"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	bbo, ok := matrix.ReadBBO(ExchangeArcus, 1)
+	if !ok || bbo.BidPrice != 60415.1 || bbo.AskPrice != 60415.2 {
+		t.Fatalf("stale l2 snapshot overwrote fresher bbo: ok=%v %+v", ok, bbo)
+	}
+	d, ok := depth.ReadDepth(1, ExchangeArcus)
+	if !ok || d.Bids[0].Price != 60410.0 || d.Asks[1].Price != 61000.0 {
+		t.Fatalf("l2 depth not published alongside guarded bbo: ok=%v %+v", ok, d)
+	}
+
+	// Equal sequence is not strictly newer.
+	if err := arc.handleMessage(arcusL2Frame(1795691150110000, 16893834613, "60411.0", "60421.0"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	if bbo, _ := matrix.ReadBBO(ExchangeArcus, 1); bbo.BidPrice != 60415.1 {
+		t.Fatalf("equal-sequence l2 overwrote bbo: %+v", bbo)
+	}
+
+	// A replayed older bbo is ignored.
+	if err := arc.handleMessage(arcusBBOFrame("channel_data", 1795691150070000, 16893834500, "60400.0", "60401.0"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	if bbo, _ := matrix.ReadBBO(ExchangeArcus, 1); bbo.BidPrice != 60415.1 {
+		t.Fatalf("older bbo overwrote newer bbo: %+v", bbo)
+	}
+
+	// A newer l2 snapshot publishes both top of book and depth.
+	if err := arc.handleMessage(arcusL2Frame(1795691150200000, 16893834700, "60412.0", "60412.5"), now, states); err != nil {
+		t.Fatal(err)
+	}
+	if bbo, ok := matrix.ReadBBO(ExchangeArcus, 1); !ok || bbo.BidPrice != 60412.0 || bbo.AskPrice != 60412.5 || bbo.BidSize != 1.5 {
+		t.Fatalf("newer l2 snapshot did not publish top of book: ok=%v %+v", ok, bbo)
+	}
+	if d, _ := depth.ReadDepth(1, ExchangeArcus); d.Bids[0].Price != 60412.0 {
+		t.Fatalf("newer l2 snapshot did not publish depth: %+v", d)
+	}
+	if st := states[1]; st.bboSeq != 16893834700 || st.depthSeq != 16893834700 {
+		t.Fatalf("unexpected watermarks: %+v", st)
+	}
+}
+
+func TestArcusRejectsCrossedAndMalformedBBO(t *testing.T) {
+	cases := map[string][]byte{
+		"crossed": arcusBBOFrame("channel_data", 1795691150090000, 16893834620, "60415.3", "60415.2"),
+		"locked":  arcusBBOFrame("channel_data", 1795691150090000, 16893834620, "60415.2", "60415.2"),
+		"bad_px":  arcusBBOFrame("channel_data", 1795691150090000, 16893834620, "abc", "60415.2"),
+		"neg_sz":  []byte(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":{"bestBid":{"price":"60415.1","size":"-1"},"bestAsk":{"price":"60415.2","size":"1"},"timestamp":1795691150090000,"globalSequenceId":16893834620}}`),
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			arc, matrix, _ := newArcusBBOTestFeed(t, "arcus-bbo-bad-"+name)
+			states := make(map[uint16]arcusSymbolState)
+			now := time.UnixMicro(1_795_691_151_000_000)
+			if err := arc.handleMessage(arcusBBOFrame("channel_data", 1795691150080124, 16893834613, "60415.1", "60415.2"), now, states); err != nil {
+				t.Fatal(err)
+			}
+			if err := arc.handleMessage(raw, now, states); err == nil {
+				t.Fatal("expected invalid bbo to be rejected with an error")
+			}
+			if _, ok := matrix.ReadBBO(ExchangeArcus, 1); ok {
+				t.Fatal("invalid bbo left the previous quote readable")
+			}
+		})
+	}
+}
+
+func TestArcusSubscribeRequestsIncludeBBOAndL2(t *testing.T) {
+	got := arcusSubscribeRequests([]string{"BTC-USD", "ETH-USD"})
+	want := []string{
+		`{"type":"subscribe","channel":"l2Orderbook","id":"BTC-USD","nLevels":20}`,
+		`{"type":"subscribe","channel":"bbo","id":"BTC-USD"}`,
+		`{"type":"subscribe","channel":"l2Orderbook","id":"ETH-USD","nLevels":20}`,
+		`{"type":"subscribe","channel":"bbo","id":"ETH-USD"}`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d requests, want %d", len(got), len(want))
+	}
+	for i := range want {
+		b, err := json.Marshal(got[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != want[i] {
+			t.Fatalf("request %d: got %s want %s", i, b, want[i])
+		}
+	}
+}
+
+func TestArcusWebSocketSubscribesAndPublishesBBO(t *testing.T) {
+	arc, matrix, _ := newArcusBBOTestFeed(t, "arcus-bbo-ws")
+	tsUs := time.Now().UnixMicro()
+	subs := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var channels []string
+		for range 2 {
+			var sub map[string]any
+			if wsjson.Read(r.Context(), c, &sub) != nil {
+				return
+			}
+			channels = append(channels, fmt.Sprint(sub["channel"], ":", sub["id"]))
+		}
+		subs <- channels
+		_ = c.Write(r.Context(), websocket.MessageText, arcusL2Frame(tsUs, 100, "60410.0", "60420.0"))
+		_ = c.Write(r.Context(), websocket.MessageText, arcusBBOFrame("channel_data", tsUs+50, 102, "60415.1", "60415.2"))
+		// Newer depth (seq 101 > 100) but older top of book (101 < 102).
+		_ = c.Write(r.Context(), websocket.MessageText, arcusL2Frame(tsUs+100, 101, "60409.0", "60421.0"))
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	arc.cfg.WSURL = "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- arc.connect(ctx, make(map[uint16]arcusSymbolState)) }()
+	// Stop the reader before the SHM mappings are closed by earlier cleanups.
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { cancel(); <-done }) }
+	t.Cleanup(stop)
+
+	select {
+	case channels := <-subs:
+		if strings.Join(channels, ",") != "l2Orderbook:BTC-USD,bbo:BTC-USD" {
+			t.Fatalf("unexpected subscriptions: %v", channels)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for subscriptions")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d, ok := arc.depthWriter.ReadDepth(1, ExchangeArcus); ok && d.Bids[0].Price == 60409.0 {
+			bbo, ok := matrix.ReadBBO(ExchangeArcus, 1)
+			if !ok || bbo.BidPrice != 60415.1 {
+				t.Fatalf("stale l2 overwrote bbo over the wire: ok=%v %+v", ok, bbo)
+			}
+			stop()
+			if _, live := matrix.ReadBBO(ExchangeArcus, 1); live {
+				t.Fatal("expected BBO invalidated on disconnect")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for Arcus WS publications")
+}
+
+func BenchmarkArcusHandleMessageBBO(b *testing.B) {
+	tmp := b.TempDir()
+	b.Setenv("ALEPH_SHM_DIR", tmp)
+	matrix, err := shm.NewMatrix("arcus-bbo-bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer matrix.Close()
+	withTestSymbolRegistry(b, map[string]uint16{"BTC": 1})
+	arc := NewArcus(config.ExchangeConfig{
+		Enabled: true,
+		WSURL:   "wss://api.arcus.xyz/v1/ws",
+		Symbols: map[string]string{"BTC": "BTC-USD"},
+	}, matrix, nil)
+	payload := arcusBBOFrame("channel_data", 1795691150080124, 16893834613, "60415.1", "60415.2")
+	states := map[uint16]arcusSymbolState{}
+	now := time.UnixMicro(1_795_691_151_000_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		states[1] = arcusSymbolState{}
+		if err := arc.handleMessage(payload, now, states); err != nil {
 			b.Fatal(err)
 		}
 	}
