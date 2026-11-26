@@ -494,6 +494,7 @@ fn run_shm(
         TrackKind::Track02 => {
             let cfg: Track02ShadowConfig = load_toml(config_path)?;
             let mut session = Track02ShadowSession::new(cfg, init_day)?;
+            session.set_fill_evidence_mode("shm_bbo_cross_diagnostic_no_trades");
             let routes: HashMap<u16, (u8, u8, u8)> = session
                 .pair_ids()
                 .map(|(sym, m, h, r)| (sym, (m, h, r)))
@@ -520,20 +521,32 @@ fn run_shm(
                     ) else {
                         continue;
                     };
+                    let maker_touch = MakerTouch {
+                        bid: maker_slot.0,
+                        ask: maker_slot.1,
+                        recv_ms: maker_slot.4,
+                    };
+                    let hedge_touch = MakerTouch {
+                        bid: hedge_slot.0,
+                        ask: hedge_slot.1,
+                        recv_ms: hedge_slot.4,
+                    };
+                    let utc_day = utc_day_now();
+                    let _ = session.on_maker_bbo_cross_diagnostic(
+                        symbol_id,
+                        now_ms,
+                        maker_touch,
+                        maker_slot.2,
+                        maker_slot.3,
+                        hedge_touch,
+                        utc_day,
+                    )?;
                     let _ = session.on_pair_books(
                         symbol_id,
                         now_ms,
-                        MakerTouch {
-                            bid: maker_slot.0,
-                            ask: maker_slot.1,
-                            recv_ms: maker_slot.4,
-                        },
-                        MakerTouch {
-                            bid: hedge_slot.0,
-                            ask: hedge_slot.1,
-                            recv_ms: hedge_slot.4,
-                        },
-                        utc_day_now(),
+                        maker_touch,
+                        hedge_touch,
+                        utc_day,
                     )?;
                 }
                 if !progressed {
@@ -753,8 +766,27 @@ fail_closed_when_unready = true
             panic!("expected Track02 report");
         };
         assert_eq!(rep.fills, 1);
+        assert_eq!(rep.fill_evidence_mode, "public_trade_prints");
+        assert_eq!(rep.fill_evidence_note, "trade_print_strict_trade_through");
+        assert_eq!(rep.hedge_slip_mode, "expected_adverse_bps_applied");
         assert!(rep.total_fees_usd > 0.0);
+        assert!(rep.total_modeled_hedge_slip_usd > 0.0);
+        assert_eq!(rep.unhedged_maker_notional_usd, 0.0);
+        assert!(rep.pairs[0].net_unhedged_base_qty.abs() < 1e-12);
         assert!(!rep.halted);
+
+        let serialized = serde_json::to_value(&rep).unwrap();
+        assert_eq!(serialized["fill_evidence_mode"], "public_trade_prints");
+        assert_eq!(
+            serialized["hedge_slip_mode"],
+            "expected_adverse_bps_applied"
+        );
+        assert!(serialized["total_modeled_hedge_slip_usd"].as_f64().unwrap() > 0.0);
+        assert_eq!(
+            serialized["unhedged_maker_notional_usd"].as_f64().unwrap(),
+            0.0
+        );
+        assert!(serialized["pairs"][0]["net_unhedged_base_qty"].is_number());
 
         fs::remove_file(cfg_path).unwrap();
         fs::remove_file(replay_path).unwrap();

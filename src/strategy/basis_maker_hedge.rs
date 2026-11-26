@@ -360,6 +360,14 @@ impl MakerHedgeQuoter {
         {
             return Err(QuoteBlock::InvalidBook);
         }
+        // Check book staleness before folding into `self.fair` or advancing `self.last_ms`,
+        // so frozen/stale feeds never poison the fair-basis EMA or mask `max_gap_ms` re-seeding.
+        if now_ms - maker.recv_ms > self.cfg.max_book_age_ms {
+            return Err(QuoteBlock::StaleMaker);
+        }
+        if now_ms - hedge.recv_ms > self.cfg.max_book_age_ms {
+            return Err(QuoteBlock::StaleHedge);
+        }
         let b = maker.mid().ln() - hedge.mid().ln();
         let gap = self.last_ms.map(|l| now_ms - l);
         let prior = match (self.fair, gap) {
@@ -378,12 +386,6 @@ impl MakerHedgeQuoter {
         });
         self.last_ms = Some(now_ms);
 
-        if now_ms - maker.recv_ms > self.cfg.max_book_age_ms {
-            return Err(QuoteBlock::StaleMaker);
-        }
-        if now_ms - hedge.recv_ms > self.cfg.max_book_age_ms {
-            return Err(QuoteBlock::StaleHedge);
-        }
         let Some(fair) = prior else {
             return Err(QuoteBlock::WarmingUp);
         };
@@ -897,5 +899,88 @@ mod tests {
         assert!(same_coin.net_expected_edge_bps(f64::NAN).is_nan());
         assert!(!same_coin.is_economically_viable(f64::INFINITY, 0.0));
         assert!(!same_coin.is_economically_viable(10.0, f64::NAN));
+    }
+
+    #[test]
+    fn stale_hedge_does_not_pollute_fair_and_re_warms_after_long_outage() {
+        let c = cfg();
+        let mut q = MakerHedgeQuoter::new(c).unwrap();
+        let now = warm(&mut q, (99.99, 100.01), (99.99, 100.01));
+        let last_fresh = now - 100;
+
+        // Short stale-hedge burst while maker ticks sharply higher (+200 bps):
+        // must return StaleHedge without moving fair_basis_bps.
+        let frozen_hedge = t(99.99, 100.01, last_fresh);
+        for dt in [6_000, 8_000, 10_000] {
+            let t_stale = last_fresh + dt;
+            assert_eq!(
+                q.step(t_stale, t(101.99, 102.01, t_stale), frozen_hedge, 0.0),
+                Err(QuoteBlock::StaleHedge)
+            );
+        }
+
+        // Hedge recovers within max_gap_ms (60_000 ms) at matching price: fair stays ~ 0 bps.
+        let t_rec = last_fresh + 12_000;
+        let out = q
+            .step(
+                t_rec,
+                t(101.99, 102.01, t_rec),
+                t(101.99, 102.01, t_rec),
+                0.0,
+            )
+            .unwrap();
+        assert!(
+            out.fair_basis_bps.abs() < 1e-9,
+            "fair basis was polluted during stale hedge: {}",
+            out.fair_basis_bps
+        );
+
+        // Long stale-hedge outage exceeding max_gap_ms (60_000 ms):
+        // stale ticks must not advance last_ms, so recovery re-seeds and re-warms.
+        let frozen_long = t(101.99, 102.01, t_rec);
+        for dt in [10_000, 35_000, c.max_gap_ms + 5_000] {
+            let t_stale = t_rec + dt;
+            assert_eq!(
+                q.step(t_stale, t(103.99, 104.01, t_stale), frozen_long, 0.0),
+                Err(QuoteBlock::StaleHedge)
+            );
+        }
+
+        // Fresh books arrive after > max_gap_ms with a +100 bps basis shift:
+        // must re-seed and return WarmingUp until warmup_ms elapses.
+        let t_reseed = t_rec + c.max_gap_ms + 6_000;
+        assert_eq!(
+            q.step(
+                t_reseed,
+                t(100.99, 101.01, t_reseed),
+                t(99.99, 100.01, t_reseed),
+                0.0,
+            ),
+            Err(QuoteBlock::WarmingUp)
+        );
+        assert_eq!(
+            q.step(
+                t_reseed + c.warmup_ms - 100,
+                t(100.99, 101.01, t_reseed + c.warmup_ms - 100),
+                t(99.99, 100.01, t_reseed + c.warmup_ms - 100),
+                0.0,
+            ),
+            Err(QuoteBlock::WarmingUp)
+        );
+        let t_ready = t_reseed + c.warmup_ms;
+        let out_after = q
+            .step(
+                t_ready,
+                t(100.99, 101.01, t_ready),
+                t(99.99, 100.01, t_ready),
+                0.0,
+            )
+            .unwrap();
+        let expected_bps = (101.0_f64.ln() - 100.0_f64.ln()) * 1e4;
+        assert!(
+            (out_after.fair_basis_bps - expected_bps).abs() < 1e-6,
+            "got {}, expected {expected_bps}",
+            out_after.fair_basis_bps
+        );
     }
 }

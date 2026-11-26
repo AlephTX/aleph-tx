@@ -345,35 +345,29 @@ impl HybridExitController {
             -input.momentum_3s_bps
         };
 
-        let early_hazard_triggered = hold_ms >= self.config.early_hazard_min_hold_ms
-            && signed_unrealized_bps <= self.config.early_hazard_unrealized_pnl_bps
-            && adverse_momentum_bps <= self.config.early_hazard_momentum_3s_bps;
         let catastrophe_breached = self
             .config
             .catastrophe_ioc_unrealized_pnl_bps
             .is_some_and(|cat| signed_unrealized_bps <= cat);
+        let early_hazard_triggered = hold_ms >= self.config.early_hazard_min_hold_ms
+            && signed_unrealized_bps <= self.config.early_hazard_unrealized_pnl_bps
+            && adverse_momentum_bps <= self.config.early_hazard_momentum_3s_bps;
 
-        let mut forced_stage3_passive = false;
-        if early_hazard_triggered {
-            if !self.config.passive_touch_before_hazard_ioc || catastrophe_breached {
-                self.active_slot = None;
-                let raw_limit = if is_buy {
-                    input.ask_touch * (1.0 + slip)
-                } else {
-                    input.bid_touch * (1.0 - slip)
-                };
-                let limit_price = quantize_price(raw_limit, input.tick_size, is_buy);
-                return Ok(ExitDirective::EarlyHazardHedgeLock {
-                    reduce_only: true,
-                    hedge_is_buy: is_buy,
-                    qty: abs_inv,
-                    limit_price,
-                    unrealized_pnl_bps: signed_unrealized_bps,
-                    momentum_3s_bps: adverse_momentum_bps,
-                });
-            }
-            forced_stage3_passive = true;
+        if catastrophe_breached
+            || (early_hazard_triggered && !self.config.passive_touch_before_hazard_ioc)
+        {
+            self.active_slot = None;
+            return Ok(self.early_hazard_hedge_lock(
+                is_buy,
+                abs_inv,
+                input.bid_touch,
+                input.ask_touch,
+                input.tick_size,
+                signed_unrealized_bps,
+                adverse_momentum_bps,
+            ));
         }
+        let forced_stage3_passive = early_hazard_triggered;
 
         let mut stage = if forced_stage3_passive {
             PassiveExitStage::Stage3Touch
@@ -392,20 +386,15 @@ impl HybridExitController {
                 * self.config.queue_exit.urgent_ioc_fill_sec_mult;
             if expected_fill_s > urgent_limit_s && signed_unrealized_bps < 0.0 {
                 self.active_slot = None;
-                let raw_limit = if is_buy {
-                    input.ask_touch * (1.0 + slip)
-                } else {
-                    input.bid_touch * (1.0 - slip)
-                };
-                let limit_price = quantize_price(raw_limit, input.tick_size, is_buy);
-                return Ok(ExitDirective::EarlyHazardHedgeLock {
-                    reduce_only: true,
-                    hedge_is_buy: is_buy,
-                    qty: abs_inv,
-                    limit_price,
-                    unrealized_pnl_bps: signed_unrealized_bps,
-                    momentum_3s_bps: adverse_momentum_bps,
-                });
+                return Ok(self.early_hazard_hedge_lock(
+                    is_buy,
+                    abs_inv,
+                    input.bid_touch,
+                    input.ask_touch,
+                    input.tick_size,
+                    signed_unrealized_bps,
+                    adverse_momentum_bps,
+                ));
             }
             if expected_fill_s > self.config.queue_exit.max_expected_fill_sec {
                 stage = match stage {
@@ -485,6 +474,33 @@ impl HybridExitController {
         };
         self.active_slot = Some(slot);
         Ok(ExitDirective::PassiveReduce(slot))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn early_hazard_hedge_lock(
+        &self,
+        is_buy: bool,
+        qty: f64,
+        bid_touch: f64,
+        ask_touch: f64,
+        tick_size: f64,
+        unrealized_pnl_bps: f64,
+        momentum_3s_bps: f64,
+    ) -> ExitDirective {
+        let slip = self.config.hedge_ioc_slippage_bps / 10_000.0;
+        let raw_limit = if is_buy {
+            ask_touch * (1.0 + slip)
+        } else {
+            bid_touch * (1.0 - slip)
+        };
+        ExitDirective::EarlyHazardHedgeLock {
+            reduce_only: true,
+            hedge_is_buy: is_buy,
+            qty,
+            limit_price: quantize_price(raw_limit, tick_size, is_buy),
+            unrealized_pnl_bps,
+            momentum_3s_bps,
+        }
     }
 }
 
@@ -1122,5 +1138,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn catastrophe_breach_forces_ioc_without_adverse_momentum_or_min_hold() {
+        let passive_cfg = HybridExitConfig {
+            passive_touch_before_hazard_ioc: true,
+            catastrophe_ioc_unrealized_pnl_bps: Some(-10.0),
+            early_hazard_min_hold_ms: 2_000,
+            early_hazard_momentum_3s_bps: -1.0,
+            ..HybridExitConfig::default()
+        };
+        let mut ctrl = HybridExitController::new(passive_cfg).unwrap();
+
+        // Seed an active passive slot first to verify catastrophe clears it.
+        assert!(matches!(
+            ctrl.evaluate(base_input(1_000_200, 5.0, 100.0, 0.0))
+                .unwrap(),
+            ExitDirective::PassiveReduce(_)
+        ));
+        assert!(ctrl.active_slot().is_some());
+
+        // Long with hold_ms = 500 (< early_hazard_min_hold_ms 2_000), positive 3s momentum (+2.0 bps),
+        // passive_touch_before_hazard_ioc = true, and unrealized PnL = -12.0 bps (<= -10.0 bps).
+        let catastrophe_long = base_input(1_000_500, 5.0, 99.88, 2.0);
+        assert!(matches!(
+            ctrl.evaluate(catastrophe_long).unwrap(),
+            ExitDirective::EarlyHazardHedgeLock {
+                reduce_only: true,
+                hedge_is_buy: false,
+                qty,
+                ..
+            } if (qty - 5.0).abs() < 1e-12
+        ));
+        assert!(ctrl.active_slot().is_none());
+
+        // Short with hold_ms = 100 (< 2_000), zero momentum (0.0 bps), unrealized PnL = -12.0 bps.
+        let catastrophe_short = base_input(1_000_100, -3.0, 100.12, 0.0);
+        assert!(matches!(
+            ctrl.evaluate(catastrophe_short).unwrap(),
+            ExitDirective::EarlyHazardHedgeLock {
+                reduce_only: true,
+                hedge_is_buy: true,
+                qty,
+                ..
+            } if (qty - 3.0).abs() < 1e-12
+        ));
+        assert!(ctrl.active_slot().is_none());
     }
 }

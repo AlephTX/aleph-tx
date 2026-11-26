@@ -203,6 +203,14 @@ impl LeadLagTaker {
         self.position = None;
     }
 
+    /// Confirm an authoritative exit fill so risk is released only once execution reports flat.
+    ///
+    /// Timeout `Exit` actions retain `self.position` until execution confirms the position is
+    /// flat (`AGENTS.md`: never release risk on a timeout alone).
+    pub fn notify_exit_filled(&mut self) {
+        self.position = None;
+    }
+
     /// Process one synchronized observation. `*_recv_ms` are local receipt times of the
     /// books used (never venue source times), `now_ms` is the local decision clock.
     pub fn observe(
@@ -224,33 +232,41 @@ impl LeadLagTaker {
         {
             return LeadLagAction::Blocked(LeadLagBlock::InvalidInput);
         }
-        let x = ref_mid.ln() - tgt_mid.ln();
-        // Strictly causal deviation against the prior EMA, then update.
-        let gap = self.last_obs_ms.map(|l| now_ms - l);
-        let prior = match (self.ema, gap) {
-            (Some(e), Some(g)) if g <= self.cfg.max_gap_ms => Some(e),
-            _ => None,
-        };
-        let dev_bps = prior.map(|e| (x - e) * 1e4);
-        self.ema = Some(match (prior, gap) {
-            (Some(e), Some(g)) => {
-                let alpha = 1.0 - (-(g as f64) / self.cfg.tau_ms as f64).exp();
-                e + alpha * (x - e)
-            }
-            _ => {
-                // (Re)seed after a gap: restart warm-up so no entry uses a cold EMA.
-                self.first_obs_ms = Some(now_ms);
-                x
-            }
-        });
-        if self.first_obs_ms.is_none() {
-            self.first_obs_ms = Some(now_ms);
-        }
-        self.last_obs_ms = Some(now_ms);
-        self.last_dev_bps = dev_bps;
 
         let ref_stale = now_ms.saturating_sub(ref_recv_ms) > self.cfg.max_ref_age_ms;
         let tgt_stale = now_ms.saturating_sub(tgt_recv_ms) > self.cfg.max_tgt_age_ms;
+
+        // Only fold fresh paired observations into the EMA and observation timestamps,
+        // preventing stale feeds from poisoning the EMA or masking `max_gap_ms` re-seeding.
+        let dev_bps = if !ref_stale && !tgt_stale {
+            let x = ref_mid.ln() - tgt_mid.ln();
+            // Strictly causal deviation against the prior EMA, then update.
+            let gap = self.last_obs_ms.map(|l| now_ms - l);
+            let prior = match (self.ema, gap) {
+                (Some(e), Some(g)) if g <= self.cfg.max_gap_ms => Some(e),
+                _ => None,
+            };
+            let dev_bps = prior.map(|e| (x - e) * 1e4);
+            self.ema = Some(match (prior, gap) {
+                (Some(e), Some(g)) => {
+                    let alpha = 1.0 - (-(g as f64) / self.cfg.tau_ms as f64).exp();
+                    e + alpha * (x - e)
+                }
+                _ => {
+                    // (Re)seed after a gap: restart warm-up so no entry uses a cold EMA.
+                    self.first_obs_ms = Some(now_ms);
+                    x
+                }
+            });
+            if self.first_obs_ms.is_none() {
+                self.first_obs_ms = Some(now_ms);
+            }
+            self.last_obs_ms = Some(now_ms);
+            self.last_dev_bps = dev_bps;
+            dev_bps
+        } else {
+            None
+        };
 
         if let Some(pos) = self.position {
             if now_ms < pos.exit_due_ms {
@@ -268,7 +284,7 @@ impl LeadLagTaker {
             if tgt_stale {
                 return LeadLagAction::Blocked(LeadLagBlock::StaleTarget);
             }
-            self.position = None;
+            // Retain `self.position` until execution confirms flat via `notify_exit_filled()`.
             return LeadLagAction::Exit { side: pos.side };
         }
         if ref_stale {
@@ -369,6 +385,8 @@ mod tests {
                 side: LeadLagSide::Long
             }
         );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+        e.notify_exit_filled();
         assert_eq!(e.position(), None);
     }
 
@@ -479,13 +497,15 @@ mod tests {
                 side: LeadLagSide::Long
             }
         );
-        // At timeout -> falls back to taker Exit.
+        // At timeout -> falls back to taker Exit, retaining position until confirmed flat.
         assert_eq!(
             e.observe(t + 1_300, 100.05, t + 1_300, 100.02, t + 1_300),
             LeadLagAction::Exit {
                 side: LeadLagSide::Long
             }
         );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+        e.notify_exit_filled();
         assert_eq!(e.position(), None);
 
         // Early passive fill confirmation clears position before timeout.
@@ -567,6 +587,131 @@ mod tests {
                 side: LeadLagSide::Long
             }
         );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+        e.notify_exit_filled();
         assert_eq!(e.position(), None);
+    }
+
+    #[test]
+    fn timeout_exit_retains_position_until_confirmed_flat() {
+        let mut e = LeadLagTaker::new(cfg()).unwrap();
+        let t = warm(&mut e, 1_000, 20);
+        assert!(matches!(
+            e.observe(t, 100.05, t, 100.0, t),
+            LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            }
+        ));
+
+        // At exit_due_ms (1_300 ms): emits Exit but retains position until execution confirms flat.
+        assert_eq!(
+            e.observe(t + 1_300, 100.05, t + 1_300, 100.0, t + 1_300),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+
+        // Subsequent ticks re-emit Exit (never Enter) even with strong new signals.
+        assert_eq!(
+            e.observe(t + 1_400, 99.80, t + 1_400, 100.0, t + 1_400),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        assert_eq!(
+            e.observe(t + 1_500, 100.20, t + 1_500, 100.0, t + 1_500),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+
+        // Once execution confirms flat, position clears and normal quoting/entry resumes.
+        e.notify_exit_filled();
+        assert_eq!(e.position(), None);
+        assert_eq!(
+            e.observe(t + 1_600, 100.0, t + 1_600, 100.0, t + 1_600),
+            LeadLagAction::Idle
+        );
+    }
+
+    #[test]
+    fn stale_feed_does_not_pollute_ema_and_still_allows_open_position_exit() {
+        let c = cfg();
+        let mut e = LeadLagTaker::new(c).unwrap();
+        let t = warm(&mut e, 1_000, 20);
+        let last_warm = t - 100;
+
+        // While flat, stale reference or stale target with extreme prices must not poison EMA.
+        for dt in [6_000, 8_000, 10_000] {
+            let t_s = last_warm + dt;
+            assert_eq!(
+                e.observe(t_s, 105.0, last_warm, 100.0, t_s),
+                LeadLagAction::Blocked(LeadLagBlock::StaleReference)
+            );
+            assert_eq!(
+                e.observe(t_s, 100.0, t_s, 95.0, last_warm),
+                LeadLagAction::Blocked(LeadLagBlock::StaleTarget)
+            );
+        }
+
+        // Fresh observation within max_gap_ms (30_000 ms) sees unpoisoned EMA (~ 0 bps dev).
+        let t_rec = last_warm + 12_000;
+        assert_eq!(
+            e.observe(t_rec, 100.0, t_rec, 100.0, t_rec),
+            LeadLagAction::Idle
+        );
+        assert!(
+            e.last_dev_bps().unwrap().abs() < 1e-9,
+            "EMA polluted by stale ticks: {:?}",
+            e.last_dev_bps()
+        );
+
+        // Enter Long, then let the reference feed go stale past exit_due_ms.
+        let t_enter = t_rec + 100;
+        assert!(matches!(
+            e.observe(t_enter, 100.05, t_enter, 100.0, t_enter),
+            LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            }
+        ));
+
+        // Reference stale at t_exit (age 6_000 > max_ref_age_ms 5_000), target fresh:
+        // open position must still be allowed to unwind via Exit, without polluting EMA.
+        let t_exit = t_enter + 6_000;
+        assert_eq!(
+            e.observe(t_exit, 120.0, t_enter, 100.0, t_exit),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        // If target is stale at exit time, Exit is blocked by StaleTarget.
+        assert_eq!(
+            e.observe(t_exit + 100, 100.0, t_exit + 100, 100.0, t_enter),
+            LeadLagAction::Blocked(LeadLagBlock::StaleTarget)
+        );
+
+        e.notify_exit_filled();
+        assert_eq!(e.position(), None);
+
+        // Long stale outage (> max_gap_ms = 30_000) does not advance last_obs_ms, so recovery re-warms.
+        let t_long_stale = t_enter + c.max_gap_ms + 5_000;
+        assert_eq!(
+            e.observe(t_long_stale, 105.0, t_enter, 100.0, t_long_stale),
+            LeadLagAction::Blocked(LeadLagBlock::StaleReference)
+        );
+        assert_eq!(
+            e.observe(
+                t_long_stale + 100,
+                101.0,
+                t_long_stale + 100,
+                100.0,
+                t_long_stale + 100
+            ),
+            LeadLagAction::Blocked(LeadLagBlock::WarmingUp)
+        );
     }
 }

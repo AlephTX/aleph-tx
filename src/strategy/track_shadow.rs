@@ -460,6 +460,11 @@ impl Track01ShadowSession {
             LeadLagAction::Exit { .. } => {
                 if tgt_touch.valid() {
                     arm.exit(tgt_touch);
+                    // Shadow execution immediately confirms flat
+                    arm.engine.clear_position();
+                } else if arm.open_pos.is_none() {
+                    // Resynchronize cleanly if somehow out of sync with no shadow position open.
+                    arm.engine.clear_position();
                 }
             }
             LeadLagAction::Blocked(_) => {
@@ -823,6 +828,8 @@ struct Track02PairRuntime {
     inventory_clips: f64,
     realized_pnl_usd: f64,
     total_fees_usd: f64,
+    total_modeled_hedge_slip_usd: f64,
+    unhedged_maker_notional_usd: f64,
     fills: u64,
     shield_blocked_ticks: u64,
     unhedged_stale_halts: u64,
@@ -856,8 +863,11 @@ pub struct Track02PairReport {
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
     pub total_fees_usd: f64,
+    pub total_modeled_hedge_slip_usd: f64,
+    pub unhedged_maker_notional_usd: f64,
     pub maker_qty: f64,
     pub hedge_qty: f64,
+    pub net_unhedged_base_qty: f64,
     pub inventory_clips: f64,
     pub fills: u64,
     pub shield_blocked_ticks: u64,
@@ -869,11 +879,16 @@ pub struct Track02PairReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Track02ShadowReport {
     pub track: &'static str,
+    pub fill_evidence_mode: &'static str,
+    pub fill_evidence_note: &'static str,
+    pub hedge_slip_mode: &'static str,
     pub capital_usd: f64,
     pub equity_usd: f64,
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
     pub total_fees_usd: f64,
+    pub total_modeled_hedge_slip_usd: f64,
+    pub unhedged_maker_notional_usd: f64,
     pub max_drawdown_usd: f64,
     pub fills: u64,
     pub shield_blocked_ticks: u64,
@@ -889,6 +904,7 @@ pub struct Track02ShadowSession {
     pairs: Vec<Track02PairRuntime>,
     pair_by_symbol_id: HashMap<u16, usize>,
     daily_loss: DailyLossGuard,
+    fill_evidence_mode: &'static str,
     halted: bool,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
@@ -920,6 +936,8 @@ impl Track02ShadowSession {
                 inventory_clips: 0.0,
                 realized_pnl_usd: 0.0,
                 total_fees_usd: 0.0,
+                total_modeled_hedge_slip_usd: 0.0,
+                unhedged_maker_notional_usd: 0.0,
                 fills: 0,
                 shield_blocked_ticks: 0,
                 unhedged_stale_halts: 0,
@@ -932,9 +950,22 @@ impl Track02ShadowSession {
             pairs,
             pair_by_symbol_id,
             daily_loss,
+            fill_evidence_mode: "public_trade_prints",
             halted: false,
             max_drawdown_usd: 0.0,
         })
+    }
+
+    pub fn set_fill_evidence_mode(&mut self, mode: &'static str) {
+        self.fill_evidence_mode = mode;
+    }
+
+    pub fn fill_evidence_note(&self) -> &'static str {
+        if self.fill_evidence_mode == "shm_bbo_cross_diagnostic_no_trades" {
+            "BboMatrix SHM has no public trade prints; Track 02 fills are conservative BBO-cross sweep diagnostics only"
+        } else {
+            "trade_print_strict_trade_through"
+        }
     }
 
     pub fn config(&self) -> &Track02ShadowConfig {
@@ -1081,10 +1112,37 @@ impl Track02ShadowSession {
             && hedge.recv_ms <= now_ms
             && now_ms - hedge.recv_ms <= self.pairs[idx].cfg.max_hedge_stale_ms;
         if !hedge_fresh {
-            let pair = &mut self.pairs[idx];
-            pair.unhedged_stale_halts += 1;
-            pair.halted = true;
-            pair.latest_quotes = None;
+            let pair_clip = self.pairs[idx].cfg.clip_usd;
+            let risk_scale = self.daily_loss.risk_scale();
+            let fill_notional = pair_clip.min(trade_px * trade_sz) * risk_scale.max(0.0);
+            let did_fill = {
+                let pair = &mut self.pairs[idx];
+                pair.unhedged_stale_halts += 1;
+                pair.halted = true;
+                pair.latest_quotes = None;
+
+                if fill_notional.is_finite() && fill_notional > 0.0 {
+                    let qty = fill_notional / maker_px;
+                    let (signed_maker_qty, signed_clip_delta) = match fill_side {
+                        FillSide::MakerBought => (qty, fill_notional / pair_clip),
+                        FillSide::MakerSold => (-qty, -(fill_notional / pair_clip)),
+                    };
+                    let maker_realized = pair.maker_leg.apply_fill(signed_maker_qty, maker_px);
+                    let maker_fee = fill_notional * pair.cfg.economics.maker_fee_bps * 1e-4;
+                    pair.realized_pnl_usd += maker_realized - maker_fee;
+                    pair.total_fees_usd += maker_fee;
+                    pair.inventory_clips += signed_clip_delta;
+                    pair.fills += 1;
+                    pair.unhedged_maker_notional_usd += fill_notional;
+                    true
+                } else {
+                    false
+                }
+            };
+            if did_fill {
+                self.check_equity_and_drawdown(utc_day);
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -1092,18 +1150,28 @@ impl Track02ShadowSession {
         if risk_scale <= 0.0 {
             return Ok(false);
         }
-        let fill_notional = self.pairs[idx].cfg.clip_usd.min(trade_px * trade_sz) * risk_scale;
+        let pair_clip = self.pairs[idx].cfg.clip_usd;
+        let fill_notional = pair_clip.min(trade_px * trade_sz) * risk_scale;
         if !fill_notional.is_finite() || fill_notional <= 0.0 {
             return Ok(false);
         }
 
         let qty = fill_notional / maker_px;
-        let (signed_maker_qty, hedge_px, signed_clip_delta) = match fill_side {
-            FillSide::MakerBought => (qty, hedge.bid, fill_notional / self.pairs[idx].cfg.clip_usd),
+        let econ = self.pairs[idx].cfg.economics;
+        let slip_bps = econ.expected_hedge_slip_bps.max(0.0);
+        let slip_frac = slip_bps * 1e-4;
+        let (signed_maker_qty, hedge_px, raw_hedge_touch_px, signed_clip_delta) = match fill_side {
+            FillSide::MakerBought => (
+                qty,
+                hedge.bid * (1.0 - slip_frac),
+                hedge.bid,
+                fill_notional / pair_clip,
+            ),
             FillSide::MakerSold => (
                 -qty,
+                hedge.ask * (1.0 + slip_frac),
                 hedge.ask,
-                -(fill_notional / self.pairs[idx].cfg.clip_usd),
+                -(fill_notional / pair_clip),
             ),
         };
 
@@ -1112,7 +1180,6 @@ impl Track02ShadowSession {
             pair.last_hedge_touch = Some(hedge);
             let maker_realized = pair.maker_leg.apply_fill(signed_maker_qty, maker_px);
             let hedge_realized = pair.hedge_leg.apply_fill(-signed_maker_qty, hedge_px);
-            let econ = &pair.cfg.economics;
             let maker_fee = (qty * maker_px) * econ.maker_fee_bps * 1e-4;
             let hedge_fee_bps = econ.hedge_taker_fee_bps
                 + if econ.cross_stablecoin {
@@ -1125,6 +1192,7 @@ impl Track02ShadowSession {
 
             pair.realized_pnl_usd += maker_realized + hedge_realized - total_fee;
             pair.total_fees_usd += total_fee;
+            pair.total_modeled_hedge_slip_usd += qty * (raw_hedge_touch_px - hedge_px).abs();
             pair.inventory_clips += signed_clip_delta;
             pair.fills += 1;
             if let Some(q) = pair.latest_quotes.as_mut() {
@@ -1139,10 +1207,74 @@ impl Track02ShadowSession {
         Ok(true)
     }
 
+    /// Diagnostic fill probe for SHM streams lacking public trade prints.
+    ///
+    /// Triggers a synthetic strict trade-through only when the incoming maker BBO
+    /// strictly crosses an active resting quote (`maker.ask < bid` or `maker.bid > ask`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_maker_bbo_cross_diagnostic(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        maker: MakerTouch,
+        maker_bid_sz: f64,
+        maker_ask_sz: f64,
+        hedge: MakerTouch,
+        utc_day: i32,
+    ) -> Result<bool> {
+        let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
+            return Ok(false);
+        };
+        if self.halted || self.pairs[idx].halted {
+            self.pairs[idx].latest_quotes = None;
+            return Ok(false);
+        }
+        if !valid_bid_ask(maker.bid, maker.ask) {
+            return Ok(false);
+        }
+        let Some(quotes) = self.pairs[idx].latest_quotes else {
+            return Ok(false);
+        };
+
+        let mut bid_hit = false;
+        if let Some(bid) = quotes.bid
+            && maker.ask < bid
+        {
+            bid_hit = self.on_maker_trade_print(
+                symbol_id,
+                now_ms,
+                maker.ask,
+                maker_ask_sz.max(0.0),
+                false,
+                hedge,
+                utc_day,
+            )?;
+        }
+
+        let mut ask_hit = false;
+        if let Some(ask) = self.pairs[idx].latest_quotes.and_then(|q| q.ask)
+            && maker.bid > ask
+        {
+            ask_hit = self.on_maker_trade_print(
+                symbol_id,
+                now_ms,
+                maker.bid,
+                maker_bid_sz.max(0.0),
+                true,
+                hedge,
+                utc_day,
+            )?;
+        }
+
+        Ok(bid_hit || ask_hit)
+    }
+
     pub fn report(&self) -> Track02ShadowReport {
         let mut realized = 0.0;
         let mut unrealized = 0.0;
         let mut fees = 0.0;
+        let mut total_modeled_hedge_slip_usd = 0.0;
+        let mut unhedged_maker_notional_usd = 0.0;
         let mut fills = 0;
         let mut shield_blocked_ticks = 0;
         let mut unhedged_stale_halts = 0;
@@ -1154,6 +1286,8 @@ impl Track02ShadowSession {
                 realized += p.realized_pnl_usd;
                 unrealized += mtm;
                 fees += p.total_fees_usd;
+                total_modeled_hedge_slip_usd += p.total_modeled_hedge_slip_usd;
+                unhedged_maker_notional_usd += p.unhedged_maker_notional_usd;
                 fills += p.fills;
                 shield_blocked_ticks += p.shield_blocked_ticks;
                 unhedged_stale_halts += p.unhedged_stale_halts;
@@ -1166,8 +1300,11 @@ impl Track02ShadowSession {
                     realized_pnl_usd: p.realized_pnl_usd,
                     unrealized_pnl_usd: mtm,
                     total_fees_usd: p.total_fees_usd,
+                    total_modeled_hedge_slip_usd: p.total_modeled_hedge_slip_usd,
+                    unhedged_maker_notional_usd: p.unhedged_maker_notional_usd,
                     maker_qty: p.maker_leg.qty,
                     hedge_qty: p.hedge_leg.qty,
+                    net_unhedged_base_qty: p.maker_leg.qty + p.hedge_leg.qty,
                     inventory_clips: p.inventory_clips,
                     fills: p.fills,
                     shield_blocked_ticks: p.shield_blocked_ticks,
@@ -1178,11 +1315,16 @@ impl Track02ShadowSession {
             .collect();
         Track02ShadowReport {
             track: "02_hedge_arbitrage",
+            fill_evidence_mode: self.fill_evidence_mode,
+            fill_evidence_note: self.fill_evidence_note(),
+            hedge_slip_mode: "expected_adverse_bps_applied",
             capital_usd: self.cfg.capital_usd,
             equity_usd: self.cfg.capital_usd + realized + unrealized,
             realized_pnl_usd: realized,
             unrealized_pnl_usd: unrealized,
             total_fees_usd: fees,
+            total_modeled_hedge_slip_usd,
+            unhedged_maker_notional_usd,
             max_drawdown_usd: self.max_drawdown_usd,
             fills,
             shield_blocked_ticks,
@@ -1599,7 +1741,7 @@ mod tests {
             .unwrap();
         let ask = q2.ask.expect("ask should quote");
         assert!(
-            !s.on_maker_trade_print(
+            s.on_maker_trade_print(
                 1002,
                 t,
                 ask + 0.01,
@@ -1612,6 +1754,8 @@ mod tests {
         );
         let r_halted = s.report();
         assert_eq!(r_halted.unhedged_stale_halts, 1);
+        assert!(r_halted.unhedged_maker_notional_usd > 0.0);
+        assert!(r_halted.pairs[0].net_unhedged_base_qty.abs() > 0.0);
         assert!(r_halted.pairs[0].halted);
         // Subsequent pair books remain cleared when halted.
         t += 100;
@@ -1762,5 +1906,164 @@ mod tests {
             Some(LeadLagAction::Enter { .. })
         ));
         assert!((s.report().arms[0].open_notional_usd - 200.0).abs() < 1e-6);
+    }
+
+    fn warm_track02_session(
+        cfg: Track02ShadowConfig,
+    ) -> (Track02ShadowSession, u64, MakerHedgeQuotes) {
+        let mut t = 10_000_u64;
+        let mut s = Track02ShadowSession::new(cfg, utc_day_from_ms(t)).unwrap();
+        for _ in 0..12 {
+            let _ = s
+                .on_pair_books(
+                    1002,
+                    t,
+                    mk_touch(99.99, 100.01, t),
+                    mk_touch(99.99, 100.01, t),
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        s.on_reference_mid(1002, t, 100.0);
+        t += 50;
+        s.on_reference_mid(1002, t, 100.0);
+        t += 50;
+        let q = s
+            .on_pair_books(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        (s, t, q)
+    }
+
+    #[test]
+    fn track02_f3_modeled_hedge_slip_applies_to_hedge_price_and_equity() {
+        let mut cfg = t2_cfg();
+        cfg.pairs[0].expected_gross_edge_bps = 15.0;
+        cfg.pairs[0].economics.maker_fee_bps = 0.0;
+        cfg.pairs[0].economics.hedge_taker_fee_bps = 0.0;
+        cfg.pairs[0].economics.expected_hedge_slip_bps = 10.0;
+        let (mut s, t, q) = warm_track02_session(cfg);
+        let bid = q.bid.expect("bid should quote");
+
+        let hedge_touch = mk_touch(99.99, 100.01, t);
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                bid - 0.01,
+                10.0,
+                false,
+                hedge_touch,
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        let rep = s.report();
+        assert_eq!(rep.hedge_slip_mode, "expected_adverse_bps_applied");
+
+        let qty = 500.0 / bid;
+        let slip_frac = 10.0 * 1e-4;
+        let slipped_hedge_px = hedge_touch.bid * (1.0 - slip_frac);
+        let expected_slip_usd = qty * (hedge_touch.bid - slipped_hedge_px).abs();
+        assert!((rep.total_modeled_hedge_slip_usd - expected_slip_usd).abs() < 1e-9);
+        assert!((rep.pairs[0].total_modeled_hedge_slip_usd - expected_slip_usd).abs() < 1e-9);
+
+        // Compare against zero-slippage MTM equity: equity drops by exact modeled slippage USD.
+        let maker_mtm = qty * (100.0 - bid);
+        let hedge_mtm = -qty * (100.0 - slipped_hedge_px);
+        let expected_equity = rep.capital_usd + maker_mtm + hedge_mtm;
+        assert!((rep.equity_usd - expected_equity).abs() < 1e-9);
+        let zero_slip_equity = rep.capital_usd + qty * (hedge_touch.bid - bid);
+        assert!((zero_slip_equity - rep.equity_usd - expected_slip_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn track02_f2_stale_hedge_records_unhedged_fill_and_mtm_drawdown() {
+        let mut cfg = t2_cfg();
+        cfg.capital_usd = 1_000.0;
+        cfg.daily_loss_limit_pct = 0.02; // $20 budget
+        cfg.pairs[0].clip_usd = 500.0;
+        let (mut s, mut t, q) = warm_track02_session(cfg);
+        let bid = q.bid.expect("bid should quote");
+
+        // Maker bid hit while hedge book is stale (> max_hedge_stale_ms) -> records unhedged long maker leg and halts.
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                bid - 0.01,
+                10.0,
+                false,
+                mk_touch(99.99, 100.01, t - 6_000),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        let rep1 = s.report();
+        assert_eq!(rep1.fills, 1);
+        assert_eq!(rep1.unhedged_stale_halts, 1);
+        assert!((rep1.unhedged_maker_notional_usd - 500.0).abs() < 1e-9);
+        assert!((rep1.pairs[0].unhedged_maker_notional_usd - 500.0).abs() < 1e-9);
+        assert!(rep1.pairs[0].maker_qty > 0.0);
+        assert_eq!(rep1.pairs[0].hedge_qty, 0.0);
+        assert!((rep1.pairs[0].net_unhedged_base_qty - rep1.pairs[0].maker_qty).abs() < 1e-12);
+        assert!(rep1.pairs[0].halted);
+
+        // Adverse 6% market drop marks unhedged long maker position down by ~$30 -> MTM drawdown & daily loss halt.
+        t += 100;
+        assert_eq!(
+            s.on_pair_books(
+                1002,
+                t,
+                mk_touch(93.99, 94.01, t),
+                mk_touch(93.99, 94.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap(),
+            None
+        );
+        let rep2 = s.report();
+        assert!(rep2.unrealized_pnl_usd < -20.0);
+        assert!(rep2.max_drawdown_usd > 20.0);
+        assert!(rep2.halted);
+    }
+
+    #[test]
+    fn track02_f4_bbo_cross_diagnostic_fills_hedges_and_sets_evidence_mode() {
+        let (mut s, mut t, q) = warm_track02_session(t2_cfg());
+        s.set_fill_evidence_mode("shm_bbo_cross_diagnostic_no_trades");
+        let ask = q.ask.expect("ask should quote");
+
+        // Maker market spikes strictly above our resting ask -> synthetic buy sweep fills ask + hedges.
+        t += 50;
+        let maker_spike = mk_touch(ask + 0.02, ask + 0.04, t);
+        let hedge_now = mk_touch(ask + 0.01, ask + 0.03, t);
+        assert!(
+            s.on_maker_bbo_cross_diagnostic(
+                1002,
+                t,
+                maker_spike,
+                10.0,
+                10.0,
+                hedge_now,
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        let rep = s.report();
+        assert_eq!(rep.fill_evidence_mode, "shm_bbo_cross_diagnostic_no_trades");
+        assert!(rep.fill_evidence_note.contains("BboMatrix SHM"));
+        assert_eq!(rep.fills, 1);
+        assert!(rep.pairs[0].maker_qty < 0.0);
+        assert!(rep.pairs[0].hedge_qty > 0.0);
+        assert!(rep.pairs[0].net_unhedged_base_qty.abs() < 1e-12);
+        assert!(rep.total_modeled_hedge_slip_usd > 0.0);
     }
 }
