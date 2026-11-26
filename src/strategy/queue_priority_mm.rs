@@ -219,6 +219,26 @@ pub struct QueuePriorityMmConfig {
     /// narrow (`<= 2` tick) books where touch is likely to move before wire arrival.
     #[serde(default)]
     pub alo_flight_guard_obi_threshold: Option<f64>,
+    /// Avellaneda-Stoikov inventory skew coefficient (`gamma >= 0.0`, `0.0` disables).
+    /// Scales reservation-price skew with normalized inventory and `(1.0 + sigma_1s^2)`.
+    #[serde(default)]
+    pub as_inventory_skew_gamma: f64,
+    /// Causal volatility-adaptive half-spread multiplier (`>= 0.0`, `0.0` disables):
+    /// adds `vol_spread_mult * sigma_1s_bps` bps to opening required half-spread.
+    #[serde(default)]
+    pub vol_spread_mult: f64,
+    /// Asymmetric directional negative-markout skew multiplier (`>= 0.0`, `0.0` disables):
+    /// widens/skews ONLY the side with `markout_ewma_bps < 0` by `(-markout_ewma_bps) * mult` bps.
+    #[serde(default)]
+    pub directional_markout_skew_mult: f64,
+    /// Quiet-regime opening admission gate (`>= 0.0`, `0.0` disables):
+    /// suppresses NEW opening quotes when `spread_bps / sigma_1s.max(0.05) < min_ratio`.
+    #[serde(default)]
+    pub quiet_regime_min_spread_to_vol: f64,
+    /// Quiet-regime max entry volatility gate (`bps / sqrt(s)`): suppresses NEW opening quotes
+    /// when `sigma_1s > max_vol`, while ALWAYS keeping inventory-reducing exits active.
+    #[serde(default)]
+    pub quiet_regime_max_entry_vol_bps: Option<f64>,
     pub max_book_age_ms: u64,
     pub max_session_loss_usd: f64,
     pub max_inventory_hold_ms: u64,
@@ -263,6 +283,11 @@ impl Default for QueuePriorityMmConfig {
             submit_rtt_ms: default_submit_rtt_ms(),
             alo_flight_guard_sigma_bps: default_alo_flight_guard_sigma_bps(),
             alo_flight_guard_obi_threshold: None,
+            as_inventory_skew_gamma: 0.0,
+            vol_spread_mult: 0.0,
+            directional_markout_skew_mult: 0.0,
+            quiet_regime_min_spread_to_vol: 0.0,
+            quiet_regime_max_entry_vol_bps: None,
             max_book_age_ms: 5_000,
             max_session_loss_usd: 3.0,
             max_inventory_hold_ms: 90_000,
@@ -478,6 +503,30 @@ impl QueuePriorityMmConfig {
             ensure!(
                 obi_flight.is_finite() && obi_flight > 0.0 && obi_flight <= 1.0,
                 "alo_flight_guard_obi_threshold must be finite and in (0, 1]"
+            );
+        }
+        ensure!(
+            self.as_inventory_skew_gamma.is_finite() && self.as_inventory_skew_gamma >= 0.0,
+            "as_inventory_skew_gamma must be finite and >= 0"
+        );
+        ensure!(
+            self.vol_spread_mult.is_finite() && self.vol_spread_mult >= 0.0,
+            "vol_spread_mult must be finite and >= 0"
+        );
+        ensure!(
+            self.directional_markout_skew_mult.is_finite()
+                && self.directional_markout_skew_mult >= 0.0,
+            "directional_markout_skew_mult must be finite and >= 0"
+        );
+        ensure!(
+            self.quiet_regime_min_spread_to_vol.is_finite()
+                && self.quiet_regime_min_spread_to_vol >= 0.0,
+            "quiet_regime_min_spread_to_vol must be finite and >= 0"
+        );
+        if let Some(max_vol) = self.quiet_regime_max_entry_vol_bps {
+            ensure!(
+                max_vol.is_finite() && max_vol > 0.0,
+                "quiet_regime_max_entry_vol_bps must be finite and > 0"
             );
         }
         ensure!(self.max_book_age_ms > 0, "max_book_age_ms must be positive");
@@ -1149,13 +1198,33 @@ impl QueuePriorityMmEngine {
         let bid_danger = bid_lead_danger || bid_sweep_danger;
         let ask_danger = ask_lead_danger || ask_sweep_danger;
 
-        // 7. Compute skewed reservation price.
+        // 7. Compute skewed reservation price (with optional Avellaneda-Stoikov inventory gamma).
         let pos_notional = inventory.target_qty * target_mid;
         let inv_ratio = (pos_notional / self.cfg.max_position_notional_usd).clamp(-1.5, 1.5);
         // Smooth linear + quadratic skew: gentle near zero, firm near cap.
         let skew_factor = 0.5 * inv_ratio + 0.5 * inv_ratio * inv_ratio.abs();
-        let skew_bps = skew_factor * self.cfg.inventory_skew_bps_per_full_limit;
+        let as_skew_bps = if self.cfg.as_inventory_skew_gamma > 0.0 {
+            inv_ratio * self.cfg.as_inventory_skew_gamma * (1.0 + self.var_bps2_per_s)
+        } else {
+            0.0
+        };
+        let skew_bps = skew_factor * self.cfg.inventory_skew_bps_per_full_limit + as_skew_bps;
         let reservation_px = fair_value * (-skew_bps / 10_000.0).exp();
+
+        let quiet_ratio_blocked = self.cfg.quiet_regime_min_spread_to_vol > 0.0
+            && (target_spread_bps / sigma_bps_per_sqrt_s.max(0.05))
+                < self.cfg.quiet_regime_min_spread_to_vol;
+        let quiet_vol_blocked = self
+            .cfg
+            .quiet_regime_max_entry_vol_bps
+            .is_some_and(|max_vol| sigma_bps_per_sqrt_s > max_vol);
+        let quiet_entry_blocked = quiet_ratio_blocked || quiet_vol_blocked;
+        let vol_half_spread_bps = self.cfg.vol_spread_mult * sigma_bps_per_sqrt_s;
+        let as_max_skew_bps = if self.cfg.as_inventory_skew_gamma > 0.0 {
+            1.5 * self.cfg.as_inventory_skew_gamma * (1.0 + self.var_bps2_per_s)
+        } else {
+            0.0
+        };
 
         let spread_ticks = ((best_ask - best_bid) / self.cfg.tick_size)
             .round()
@@ -1191,8 +1260,9 @@ impl QueuePriorityMmEngine {
             }
 
             let min_edge_total_bps = self.cfg.min_entry_edge_bps + self.cfg.maker_fee_bps;
-            let reducing_edge_floor_bps =
-                self.cfg.maker_fee_bps - self.cfg.inventory_skew_bps_per_full_limit;
+            let reducing_edge_floor_bps = self.cfg.maker_fee_bps
+                - self.cfg.inventory_skew_bps_per_full_limit
+                - as_max_skew_bps;
             let max_pos_qty = self.cfg.max_position_notional_usd / target_mid;
 
             // Track committed exposure across levels on this side so total never breaches max_pos.
@@ -1215,6 +1285,17 @@ impl QueuePriorityMmEngine {
                         self.ask_markout_cooldown_until_ms,
                     ),
                 };
+            let asym_markout_skew_bps =
+                if self.cfg.directional_markout_skew_mult > 0.0 && side_markout_ewma < 0.0 {
+                    (-side_markout_ewma) * self.cfg.directional_markout_skew_mult
+                } else {
+                    0.0
+                };
+            let opening_req_half_bps =
+                min_edge_total_bps + vol_half_spread_bps + asym_markout_skew_bps;
+            let use_g4_quote_skew = self.cfg.as_inventory_skew_gamma > 0.0
+                || self.cfg.vol_spread_mult > 0.0
+                || self.cfg.directional_markout_skew_mult > 0.0;
 
             for lvl in 0..self.cfg.ladder_levels {
                 let remaining_to_flat = (-committed_qty).max(0.0);
@@ -1246,9 +1327,21 @@ impl QueuePriorityMmEngine {
                         base + stepback_ticks * self.cfg.tick_size
                     }
                 };
+                let level_anchor = if !is_reducing && use_g4_quote_skew {
+                    let skewed_limit_px = match side {
+                        QuoteSide::Bid => reservation_px * (-opening_req_half_bps / 10_000.0).exp(),
+                        QuoteSide::Ask => reservation_px * (opening_req_half_bps / 10_000.0).exp(),
+                    };
+                    match side {
+                        QuoteSide::Bid => touch_l1.min(skewed_limit_px),
+                        QuoteSide::Ask => touch_l1.max(skewed_limit_px),
+                    }
+                } else {
+                    touch_l1
+                };
                 let desired_px_raw = match side {
-                    QuoteSide::Bid => touch_l1 - (lvl as f64) * self.cfg.tick_size,
-                    QuoteSide::Ask => touch_l1 + (lvl as f64) * self.cfg.tick_size,
+                    QuoteSide::Bid => level_anchor - (lvl as f64) * self.cfg.tick_size,
+                    QuoteSide::Ask => level_anchor + (lvl as f64) * self.cfg.tick_size,
                 };
                 let desired_px = match side {
                     QuoteSide::Bid => round_tick_down(desired_px_raw, self.cfg.tick_size),
@@ -1264,7 +1357,7 @@ impl QueuePriorityMmEngine {
                 let edge_ok = if is_reducing {
                     desired_edge_bps >= reducing_edge_floor_bps
                 } else {
-                    desired_edge_bps >= min_edge_total_bps
+                    desired_edge_bps >= opening_req_half_bps
                 };
 
                 // Check post-only crossing guard against current opposing touch.
@@ -1298,7 +1391,7 @@ impl QueuePriorityMmEngine {
                     let r_opens_past_flat = !is_reducing
                         || r.qty > remaining_to_flat.min(inventory.target_qty.abs()) + 1e-12;
                     let r_edge_ok = if r_opens_past_flat {
-                        r_edge_bps >= min_edge_total_bps
+                        r_edge_bps >= opening_req_half_bps
                     } else {
                         r_edge_bps >= reducing_edge_floor_bps
                     };
@@ -1326,9 +1419,13 @@ impl QueuePriorityMmEngine {
                     });
                 }
 
-                // Opening-only entry gates (ALO cooldown, severe markout shield cooldown, OBI veto,
-                // and proactive narrow-spread ALO flight-collision guard). Never blocks Keep or reduce_only.
+                // Opening-only entry gates (quiet-regime gate, ALO cooldown, severe markout shield
+                // cooldown, OBI veto, and narrow-spread ALO flight-collision guard).
+                // Never blocks Keep or reduce_only exits.
                 if !is_reducing {
+                    if quiet_entry_blocked {
+                        continue;
+                    }
                     if now_ms < alo_cooldown_until || now_ms < markout_cooldown_until {
                         continue;
                     }
@@ -2381,5 +2478,281 @@ mod tests {
         }
         assert_eq!(eng.telemetry().validated_lead_ref_count, 1);
         assert!(eng.telemetry().max_validated_lead_score_bps > 0.02);
+    }
+
+    #[test]
+    fn g4_defaults_remain_backward_compatible_off() {
+        let cfg = QueuePriorityMmConfig::default();
+        assert_eq!(cfg.as_inventory_skew_gamma, 0.0);
+        assert_eq!(cfg.vol_spread_mult, 0.0);
+        assert_eq!(cfg.directional_markout_skew_mult, 0.0);
+        assert_eq!(cfg.quiet_regime_min_spread_to_vol, 0.0);
+        assert_eq!(cfg.quiet_regime_max_entry_vol_bps, None);
+
+        // Deserializing legacy TOML/JSON without G4 fields keeps all new gates disabled.
+        let legacy_json = serde_json::to_value(&cfg).unwrap();
+        let mut obj = legacy_json.as_object().unwrap().clone();
+        obj.remove("as_inventory_skew_gamma");
+        obj.remove("vol_spread_mult");
+        obj.remove("directional_markout_skew_mult");
+        obj.remove("quiet_regime_min_spread_to_vol");
+        obj.remove("quiet_regime_max_entry_vol_bps");
+        let parsed: QueuePriorityMmConfig =
+            serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert_eq!(parsed, cfg);
+
+        let mut bad_cfg = base_cfg();
+        bad_cfg.quiet_regime_max_entry_vol_bps = Some(0.0);
+        assert!(bad_cfg.validate().is_err());
+        bad_cfg.quiet_regime_max_entry_vol_bps = None;
+        bad_cfg.as_inventory_skew_gamma = -0.1;
+        assert!(bad_cfg.validate().is_err());
+    }
+
+    #[test]
+    fn g4_as_inventory_skew_and_vol_adaptive_spread_widen_opening_quotes() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.as_inventory_skew_gamma = 2.0;
+        cfg.vol_spread_mult = 1.5;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Warm up realized vol (~2.54 bps/sqrt(s) from 10 bps move over 1s).
+        let _ = eng.evaluate(
+            Some(&book(100.00, 10.0, 100.04, 10.0, 1_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            1_000,
+        );
+        let acts_vol = eng.evaluate(
+            Some(&book(100.10, 10.0, 100.14, 10.0, 2_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            2_000,
+        );
+        let bid_px = acts_vol
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected widened bid");
+        let ask_px = acts_vol
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected widened ask");
+        // With vol_spread_mult * sigma (~3.81 bps) > 2.0 bps book half-spread, both quotes widen strictly beyond touch.
+        assert!(bid_px < 100.10, "expected bid < 100.10, got {bid_px}");
+        assert!(ask_px > 100.14, "expected ask > 100.14, got {ask_px}");
+
+        // Now add LONG inventory (+0.30): AS gamma skew pushes Bid even lower while Ask reduces at touch!
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_inv = eng.evaluate(
+            Some(&book(100.10, 10.0, 100.14, 10.0, 2_250)),
+            &[],
+            &[],
+            inv_long,
+            2_250,
+        );
+        let bid_skewed = acts_inv
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected skewed opening bid");
+        let ask_reduce = acts_inv
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected reduce-only ask");
+        assert!(
+            bid_skewed < bid_px,
+            "AS skew should push opening bid lower when long: {bid_skewed} vs {bid_px}"
+        );
+        assert!(
+            ask_reduce <= 100.14,
+            "reducing ask should stay at touch or better: {ask_reduce}"
+        );
+    }
+
+    #[test]
+    fn g4_directional_markout_skew_widens_only_negative_markout_side() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.markout_shield_horizon_ms = 500;
+        cfg.markout_shield_adverse_threshold_bps = 100.0; // disable symmetric cooldown so skew is isolated
+        cfg.directional_markout_skew_mult = 2.0;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Adverse BID fill: filled Bid at 100.10, mid drops to 100.02 (-8 bps) -> bid_markout_ewma = -2.0 bps.
+        // Ask has 0.0 markout EWMA, so ONLY Bid should widen (> 4 bps skew); Ask stays at touch 100.04!
+        eng.on_fill(QuoteSide::Bid, 100.10, 0.3, 1_000);
+        let b = book(100.00, 10.0, 100.04, 10.0, 1_600);
+        let acts = eng.evaluate(Some(&b), &[], &[], InventoryState::default(), 1_600);
+        assert!(eng.telemetry().bid_markout_ewma_bps < -1.0);
+        assert_eq!(eng.telemetry().ask_markout_ewma_bps, 0.0);
+
+        let bid_px = acts
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected skewed bid");
+        let ask_px = acts
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected unskewed ask");
+        assert!(
+            bid_px < 100.00,
+            "negative bid markout should widen bid below 100.00, got {bid_px}"
+        );
+        assert!(
+            (ask_px - 100.04).abs() < 1e-6,
+            "non-negative ask markout should leave ask at touch 100.04, got {ask_px}"
+        );
+    }
+
+    #[test]
+    fn g4_quiet_regime_gates_suppress_opening_but_preserve_reducing_exits() {
+        // 1. Spread-to-vol ratio gate (`spread_bps / max(sigma_1s, 0.05) < min_ratio`).
+        let mut cfg_tight = base_cfg();
+        cfg_tight.tick_size = 0.005;
+        cfg_tight.min_penny_spread_ticks = 99;
+        cfg_tight.min_entry_edge_bps = 0.05;
+        cfg_tight.quiet_regime_min_spread_to_vol = 20.0; // requires spread >= 20 * max(sigma, 0.05) = 1.0 bp at sigma=0
+        let mut eng_tight = QueuePriorityMmEngine::new(cfg_tight).unwrap();
+        // 0.50 bp spread (100.00 / 100.005, mid=100.0025) at sigma=0 => ratio=10 < 20 -> blocked!
+        let tight_b = VenueBookUpdate {
+            bids: vec![(100.00, 10.0)],
+            asks: vec![(100.005, 10.0)],
+            received_at_ms: 1_000,
+            source_ms: Some(1_000),
+        };
+        let acts_blocked =
+            eng_tight.evaluate(Some(&tight_b), &[], &[], InventoryState::default(), 1_000);
+        assert!(
+            !acts_blocked
+                .iter()
+                .any(|a| matches!(a, MmAction::PlaceAlo { .. })),
+            "expected opening quotes suppressed when spread/vol < min_ratio, got {acts_blocked:?}"
+        );
+
+        // Same mid (100.0025) with wider 4.0 bp spread (99.9825 / 100.0225) keeps sigma=0 -> ratio = 80 >= 20 -> allowed!
+        let wide_b = VenueBookUpdate {
+            bids: vec![(99.9825, 10.0)],
+            asks: vec![(100.0225, 10.0)],
+            received_at_ms: 1_500,
+            source_ms: Some(1_500),
+        };
+        let acts_ok = eng_tight.evaluate(Some(&wide_b), &[], &[], InventoryState::default(), 1_500);
+        assert_eq!(
+            acts_ok
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MmAction::PlaceAlo {
+                        reduce_only: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+
+        // 2. Max entry volatility gate (`sigma_1s > max_entry_vol_bps`): suppresses opening quotes
+        // under volatile regime while ALWAYS keeping reduce_only exits active when position != 0.
+        let mut cfg_vol = base_cfg();
+        cfg_vol.quiet_regime_min_spread_to_vol = 0.80;
+        cfg_vol.quiet_regime_max_entry_vol_bps = Some(1.2);
+        let mut eng_vol = QueuePriorityMmEngine::new(cfg_vol).unwrap();
+
+        let _ = eng_vol.evaluate(
+            Some(&book(100.00, 10.0, 100.04, 10.0, 1_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            1_000,
+        );
+        // Trigger volatile jump (+15 bps in 500ms -> sigma_1s > 1.2 bps/sqrt(s)).
+        let storm_b = book(100.15, 10.0, 100.19, 10.0, 1_500);
+        let acts_storm_flat =
+            eng_vol.evaluate(Some(&storm_b), &[], &[], InventoryState::default(), 1_500);
+        assert!(eng_vol.telemetry().sigma_bps_per_sqrt_s > 1.2);
+        assert!(
+            !acts_storm_flat
+                .iter()
+                .any(|a| matches!(a, MmAction::PlaceAlo { .. })),
+            "expected all new opening quotes suppressed when sigma > max_entry_vol_bps"
+        );
+
+        // Now hold LONG inventory (+0.30): Ask exit MUST remain active (reduce_only=true), while Bid stays suppressed!
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_storm_inv = eng_vol.evaluate(Some(&storm_b), &[], &[], inv_long, 1_750);
+        assert!(
+            !acts_storm_inv.iter().any(|a| matches!(
+                a,
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    ..
+                }
+            )),
+            "opening bid must remain suppressed in volatile regime"
+        );
+        assert!(
+            acts_storm_inv.iter().any(|a| matches!(
+                a,
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    reduce_only: true,
+                    qty,
+                    ..
+                } if *qty > 0.0 && *qty <= 0.30 + 1e-6
+            )),
+            "reducing ask exit MUST stay active under volatile regime, got {acts_storm_inv:?}"
+        );
     }
 }
