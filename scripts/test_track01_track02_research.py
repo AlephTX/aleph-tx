@@ -12,7 +12,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import numpy as np  # noqa: E402
+try:
+    import numpy as np  # noqa: E402
+except ImportError:  # pragma: no cover - stdlib-only offline CI
+    np = None  # type: ignore[assignment]
 
 import lakehouse_grid as lg  # noqa: E402
 import replay_maker_hedge_basis as mh  # noqa: E402
@@ -27,6 +30,7 @@ def _random_walk(n, seed, step_bps=1.0):
     return 100.0 * np.exp(np.cumsum(rng.normal(0.0, step_bps * 1e-4, n)))
 
 
+@unittest.skipIf(np is None, "numpy not installed")
 class GridTests(unittest.TestCase):
     def test_build_grid_is_causal_and_tracks_age(self):
         cols = {
@@ -45,6 +49,7 @@ class GridTests(unittest.TestCase):
         self.assertEqual(list(out), [0.0, 0.0, 5.0])
 
 
+@unittest.skipIf(np is None, "numpy not installed")
 class LeadLagTests(unittest.TestCase):
     def _run(self, ref, tgt_mid, delay=3):
         n = len(ref)
@@ -152,6 +157,7 @@ class LeadLagTests(unittest.TestCase):
         self.assertGreater(r["net_bps_mean"], 4.0)
 
 
+@unittest.skipIf(np is None, "numpy not installed")
 class MakerHedgeTests(unittest.TestCase):
     def _books(self, n, mk_mid, hd_mid, half=0.005):
         z = np.zeros(n, int)
@@ -243,6 +249,7 @@ class FundingCarryTests(unittest.TestCase):
 
 
 class HybridAndShieldedTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_hybrid_passive_exit_captures_spread_and_l1_depth_caps_usd(self):
         n = 300
         ref = np.full(n, 100.0)
@@ -273,6 +280,7 @@ class HybridAndShieldedTests(unittest.TestCase):
         self.assertAlmostEqual(r_taker["clip_pnl_usd"]["1000"], r_taker["clip_pnl_usd"]["500"], places=4)
         self.assertLess(abs(r_taker["clip_pnl_usd"]["1000"]), 0.35)
 
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_shielded_maker_blocks_toxic_binance_move_inside_speedbump(self):
         n = 400
         mk_mid = np.full(n, 100.0)
@@ -304,6 +312,7 @@ class HybridAndShieldedTests(unittest.TestCase):
         import json
         json.dumps({"unsh": unsh, "sh": sh}, allow_nan=False)
 
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_hybrid_stale_entry_deferred_and_unsettled_exit_no_overlap(self):
         n = 80
         ref = np.full(n, 100.0)
@@ -359,6 +368,7 @@ class HybridAndShieldedTests(unittest.TestCase):
         self.assertEqual(r_uns["trades"], 0)
         self.assertEqual(r_uns["unsettled_exits"], 1)
 
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_shielded_maker_unhedged_stale_skip_and_cross_stablecoin_drag(self):
         n = 1_500
         mk_mid = np.full(n, 100.0)
@@ -417,6 +427,7 @@ class HybridAndShieldedTests(unittest.TestCase):
             self.assertEqual(sorted(sm.discover_windows(root, "crypto", max_window=24).keys()), [19, 24])
             self.assertEqual(sorted(sm.discover_windows(root, "crypto", max_window=25).keys()), [19, 24, 25])
 
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_hybrid_taker_only_print_verified_matches_quant_mean(self):
         n = 120
         ref = np.full(n, 100.0)
@@ -472,6 +483,7 @@ class HybridAndShieldedTests(unittest.TestCase):
             [p for p in sm.ALL_PAIRS if p[7] == "crypto"],
         )
 
+    @unittest.skipIf(np is None, "numpy not installed")
     def test_hybrid_passive_exit_excludes_exit_print_from_entry_witness(self):
         n = 120
         ref = np.full(n, 100.0)
