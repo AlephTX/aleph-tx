@@ -455,6 +455,104 @@ impl CancelAction {
     }
 }
 
+/// Wire field order matters for EIP-712 MessagePack hashing: `asset`, `cloid`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelByCloidWire {
+    pub asset: u32,
+    pub cloid: String,
+}
+
+impl CancelByCloidWire {
+    pub fn new(asset: u32, cloid: impl Into<String>) -> Result<Self> {
+        let cloid = cloid.into();
+        validate_hex(&cloid, 16)?;
+        Ok(Self { asset, cloid })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelByCloidAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    pub cancels: Vec<CancelByCloidWire>,
+}
+
+impl CancelByCloidAction {
+    pub fn new(cancels: Vec<CancelByCloidWire>) -> Result<Self> {
+        ensure!(
+            !cancels.is_empty() && cancels.len() <= 100,
+            "Cancel-by-cloid batch must contain 1..=100 orders"
+        );
+        for item in &cancels {
+            validate_hex(&item.cloid, 16)?;
+        }
+        Ok(Self {
+            kind: "cancelByCloid",
+            cancels,
+        })
+    }
+}
+
+/// Wire field order matters for EIP-712 MessagePack hashing: `oid`, `order`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModifyWire {
+    pub oid: u64,
+    pub order: OrderWire,
+}
+
+pub(crate) fn validate_batch_modify_cloids(modifies: &[ModifyWire]) -> Result<()> {
+    let mut seen_cloids = std::collections::HashSet::with_capacity(modifies.len());
+    for item in modifies {
+        if let Some(cloid) = &item.order.c {
+            ensure!(!cloid.trim().is_empty(), "ModifyWire cloid cannot be empty");
+            validate_hex(cloid, 16)?;
+            ensure!(
+                seen_cloids.insert(cloid.to_ascii_lowercase()),
+                "Duplicate cloid in batchModify request"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchModifyAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    pub modifies: Vec<ModifyWire>,
+}
+
+impl BatchModifyAction {
+    pub fn new(modifies: Vec<ModifyWire>) -> Result<Self> {
+        ensure!(
+            !modifies.is_empty() && modifies.len() <= 100,
+            "Modify batch must contain 1..=100 orders"
+        );
+        validate_batch_modify_cloids(&modifies)?;
+        Ok(Self {
+            kind: "batchModify",
+            modifies,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleCancelAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
+}
+
+impl ScheduleCancelAction {
+    pub fn new(time: Option<u64>) -> Self {
+        Self {
+            kind: "scheduleCancel",
+            time,
+        }
+    }
+}
+
 pub fn validate_hex(value: &str, bytes: usize) -> Result<()> {
     let raw = value
         .strip_prefix("0x")
@@ -506,9 +604,17 @@ pub fn parse_execution_response(
                 .to_owned(),
         ));
     }
-    if value["status"] != "ok" || value["response"]["type"] != response_type {
+    let resp_type = value["response"]["type"].as_str().unwrap_or("");
+    let type_matches = match response_type {
+        "order" | "batchModify" => matches!(resp_type, "order" | "batchModify"),
+        "cancel" | "cancelByCloid" => matches!(resp_type, "cancel" | "cancelByCloid"),
+        other => resp_type == other,
+    };
+    if value["status"] != "ok" || !type_matches {
         return Err(uncertain("Unexpected response envelope"));
     }
+    let is_cancel_like = matches!(response_type, "cancel" | "cancelByCloid");
+    let is_order_like = matches!(response_type, "order" | "batchModify");
     let statuses = value["response"]["data"]["statuses"]
         .as_array()
         .ok_or_else(|| uncertain("Missing statuses"))?;
@@ -523,10 +629,10 @@ pub fn parse_execution_response(
                     reason: reason.to_owned(),
                 });
             }
-            if response_type == "cancel" && status == "success" {
+            if is_cancel_like && status == "success" {
                 return Ok(ExecutionStatus::Canceled);
             }
-            if response_type == "order" {
+            if is_order_like {
                 if let Some(order_id) = status
                     .get("resting")
                     .and_then(|s| s.get("oid"))

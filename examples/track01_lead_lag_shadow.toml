@@ -1,0 +1,57 @@
+# Track 01 (`01_quant_profit`) Shadow Configuration: Cross-Venue Lead-Lag Taker
+#
+# Parameters frozen from W19 selection (see `.agent-state/research/track01_lead_lag_20261126.json`).
+# Strictly isolated capital and daily loss budget; read-only shadow/replay only.
+# Exchange indices (`src/shm_reader.rs`): 2=Lighter, 6=Binance, 7=Arcus, 8=LighterRH.
+
+capital_usd = 10000.0
+daily_loss_limit_pct = 0.02
+allowlisted_symbols = ["ETH", "SOL"]
+
+# W19 frozen: lighter ETH <- binance (theta=6.0 bp, hold_steps=100 -> 10_000 ms, tau_s=2.0 -> 2_000 ms)
+[[arms]]
+symbol = "ETH"
+symbol_id = 1002
+ref_exchange_id = 6
+tgt_exchange_id = 2
+clip_usd = 250.0
+max_l1_depth_fraction = 0.50
+taker_fee_bps = 0.0
+
+[arms.strategy]
+theta_bps = 6.0
+tau_ms = 2000
+hold_ms = 10000
+taker_delay_ms = 330
+max_ref_age_ms = 5000
+max_tgt_age_ms = 5000
+max_dev_bps = 60.0
+warmup_ms = 60000
+max_gap_ms = 30000
+
+[arms.strategy.exit_mode]
+kind = "taker_only"
+
+# W19 frozen: lighter SOL <- binance (theta=4.0 bp, hold_steps=30 -> 3_000 ms, tau_s=120.0 -> 120_000 ms)
+[[arms]]
+symbol = "SOL"
+symbol_id = 1003
+ref_exchange_id = 6
+tgt_exchange_id = 2
+clip_usd = 250.0
+max_l1_depth_fraction = 0.50
+taker_fee_bps = 0.0
+
+[arms.strategy]
+theta_bps = 4.0
+tau_ms = 120000
+hold_ms = 3000
+taker_delay_ms = 330
+max_ref_age_ms = 5000
+max_tgt_age_ms = 5000
+max_dev_bps = 60.0
+warmup_ms = 60000
+max_gap_ms = 30000
+
+[arms.strategy.exit_mode]
+kind = "taker_only"

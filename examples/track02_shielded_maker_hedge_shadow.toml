@@ -1,0 +1,130 @@
+# Track 02 (`02_hedge_arbitrage`) Shadow Configuration: Shielded Maker-Hedge
+#
+# Parameters frozen from W19 selection (see `.agent-state/research/track02_w25_shielded_regression_20261126.json`).
+# Strictly isolated capital ($20,000) and daily loss budget; read-only shadow/replay only.
+# Enforces fail-closed reference cancel shield, distinct risk domains, and Arcus level_0 fee hurdles
+# (2.30 bp crypto / 2.25 bp RWA, cross_stablecoin = false, same_risk_domain = false).
+# Exchange indices (`src/shm_reader.rs`): 2=Lighter, 6=Binance, 7=Arcus, 9=Entropy, 10=TradeXYZ.
+
+capital_usd = 20000.0
+daily_loss_limit_pct = 0.02
+
+# W19 frozen: lighter>arcus ETH (e0=6.0 bp, tau_s=3600 -> 3_600_000 ms, crypto level_0 fee 2.30 bp)
+[[pairs]]
+label = "lighter>arcus ETH"
+symbol_id = 1002
+maker_exchange_id = 2
+hedge_exchange_id = 7
+ref_exchange_id = 6
+clip_usd = 500.0
+expected_gross_edge_bps = 6.0
+min_net_edge_bps = 0.5
+max_hedge_stale_ms = 5000
+require_fail_closed_shield = true
+
+[pairs.economics]
+maker_fee_bps = 0.0
+hedge_taker_fee_bps = 2.30
+cross_stablecoin_drag_bps = 0.0
+expected_hedge_slip_bps = 1.42
+cross_stablecoin = false
+same_risk_domain = false
+
+[pairs.strategy]
+e0_bps = 6.0
+skew_bps_per_clip = 0.5
+q_max_clips = 4.0
+tau_ms = 3600000
+lead_beta = 0.0
+improve_one_tick = false
+tick_size = 0.01
+max_book_age_ms = 5000
+warmup_ms = 900000
+max_gap_ms = 60000
+
+[pairs.strategy.ref_shield]
+enabled = true
+adverse_move_bps = 2.5
+lookback_ms = 200
+allow_reduce_only_through_shield = false
+fail_closed_when_unready = true
+
+# W19 frozen: lighter>arcus QQQ (e0=4.0 bp, tau_s=3600 -> 3_600_000 ms, RWA level_0 fee 2.25 bp)
+[[pairs]]
+label = "lighter>arcus QQQ"
+symbol_id = 1004
+maker_exchange_id = 2
+hedge_exchange_id = 7
+ref_exchange_id = 10
+clip_usd = 500.0
+expected_gross_edge_bps = 4.0
+min_net_edge_bps = 0.5
+max_hedge_stale_ms = 5000
+require_fail_closed_shield = true
+
+[pairs.economics]
+maker_fee_bps = 0.0
+hedge_taker_fee_bps = 2.25
+cross_stablecoin_drag_bps = 0.0
+expected_hedge_slip_bps = 0.97
+cross_stablecoin = false
+same_risk_domain = false
+
+[pairs.strategy]
+e0_bps = 4.0
+skew_bps_per_clip = 0.5
+q_max_clips = 4.0
+tau_ms = 3600000
+lead_beta = 0.0
+improve_one_tick = false
+tick_size = 0.01
+max_book_age_ms = 5000
+warmup_ms = 900000
+max_gap_ms = 60000
+
+[pairs.strategy.ref_shield]
+enabled = true
+adverse_move_bps = 2.5
+lookback_ms = 200
+allow_reduce_only_through_shield = false
+fail_closed_when_unready = true
+
+# W19 frozen: lighter>arcus NVDA (e0=6.0 bp, tau_s=600 -> 600_000 ms, shield_bps=4.0, RWA level_0 fee 2.25 bp)
+[[pairs]]
+label = "lighter>arcus NVDA"
+symbol_id = 1005
+maker_exchange_id = 2
+hedge_exchange_id = 7
+ref_exchange_id = 10
+clip_usd = 500.0
+expected_gross_edge_bps = 6.0
+min_net_edge_bps = 0.5
+max_hedge_stale_ms = 5000
+require_fail_closed_shield = true
+
+[pairs.economics]
+maker_fee_bps = 0.0
+hedge_taker_fee_bps = 2.25
+cross_stablecoin_drag_bps = 0.0
+expected_hedge_slip_bps = 1.20
+cross_stablecoin = false
+same_risk_domain = false
+
+[pairs.strategy]
+e0_bps = 6.0
+skew_bps_per_clip = 0.5
+q_max_clips = 4.0
+tau_ms = 600000
+lead_beta = 0.0
+improve_one_tick = false
+tick_size = 0.01
+max_book_age_ms = 5000
+warmup_ms = 900000
+max_gap_ms = 60000
+
+[pairs.strategy.ref_shield]
+enabled = true
+adverse_move_bps = 4.0
+lookback_ms = 200
+allow_reduce_only_through_shield = false
+fail_closed_when_unready = true

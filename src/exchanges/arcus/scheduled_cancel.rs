@@ -89,17 +89,26 @@ impl ScheduledCancelReceipt {
         } else {
             "disarmed"
         };
+        // Arcus truncates microsecond deadlines down to whole milliseconds when
+        // storing and echoing `time` on `/v1/scheduleCancel`.
+        let time_matches = match (deadline_us, self.time) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => {
+                actual == expected || actual == (expected / 1_000) * 1_000
+            }
+            _ => false,
+        };
         ensure!(
             self.address.eq_ignore_ascii_case(&account.address)
                 && self.account_index == account.index
                 && self.market_id == market_id
-                && self.time == deadline_us
+                && time_matches
                 && self.status == expected_status,
             "Uncorrelated Arcus cancel schedule receipt"
         );
-        if let Some(deadline) = deadline_us {
+        if let Some(confirmed_us) = self.time {
             ensure!(
-                deadline
+                confirmed_us
                     .checked_mul(1_000)
                     .is_some_and(|ns| ns > received_ns),
                 "Arcus cancel schedule already expired on receipt"
@@ -211,5 +220,31 @@ mod tests {
         );
         let disarmed = parse(json!({"address":ADDRESS,"accountIndex":2,"status":"disarmed"}));
         assert!(disarmed.validate(&account, None, None, NOW).is_ok());
+
+        let sub_ms_deadline = NOW / 1_000 + 60_000_042;
+        let ms_trunc = parse(json!({
+            "address": ADDRESS,
+            "accountIndex": 2,
+            "marketId": 88,
+            "time": (sub_ms_deadline / 1_000) * 1_000,
+            "status": "scheduled"
+        }));
+        assert!(
+            ms_trunc
+                .validate(&account, Some(88), Some(sub_ms_deadline), NOW)
+                .is_ok()
+        );
+        let bad_trunc = parse(json!({
+            "address": ADDRESS,
+            "accountIndex": 2,
+            "marketId": 88,
+            "time": sub_ms_deadline - 1,
+            "status": "scheduled"
+        }));
+        assert!(
+            bad_trunc
+                .validate(&account, Some(88), Some(sub_ms_deadline), NOW)
+                .is_err()
+        );
     }
 }

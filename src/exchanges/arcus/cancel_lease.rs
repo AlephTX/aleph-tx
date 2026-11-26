@@ -236,16 +236,22 @@ impl CancelLease {
             Some(request.deadline_us),
             received_wall_ns,
         )?;
+        let trunc_delta_us = receipt
+            .deadline_us()
+            .map_or(0, |confirmed| request.deadline_us.saturating_sub(confirmed));
+        let confirmed_expires = request
+            .expires
+            .checked_sub(Duration::from_micros(trunc_delta_us))
+            .context("Arcus monotonic deadline underflow")?;
         ensure!(
-            request
-                .expires
+            confirmed_expires
                 .checked_duration_since(now)
                 .is_some_and(|left| left > self.policy.stop_before_expiry),
             "Arcus cancel protection too short on receipt"
         );
         self.confirmed = Some(Confirmed {
             observed_at: now,
-            expires: request.expires,
+            expires: confirmed_expires,
             refresh_at: request.refresh_at,
         });
         self.faulted = false;

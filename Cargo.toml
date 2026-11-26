@@ -63,6 +63,14 @@ required-features = ["research-replay"]
 name = "arcus_xyz_basis"
 path = "src/bin/arcus_xyz_basis.rs"
 
+[[bin]]
+name = "venue_mm_calibrator"
+path = "src/bin/venue_mm_calibrator.rs"
+
+[[bin]]
+name = "track01_track02_shadow"
+path = "src/bin/track01_track02_shadow.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

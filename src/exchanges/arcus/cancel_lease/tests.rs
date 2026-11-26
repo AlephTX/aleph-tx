@@ -262,3 +262,25 @@ fn new_ack_after_old_deadline_cannot_hide_protection_gap() {
     assert!(guard.requires_reconciliation(now + Duration::from_secs(60)));
     assert!(!guard.allows_new_exposure(now + Duration::from_secs(60)));
 }
+
+#[test]
+fn millisecond_truncated_receipt_confirms_and_trims_monotonic_expiry() {
+    let now = Instant::now();
+    let wall_sub_ms = WALL + 42_000;
+    let mut guard = lease(Some(33));
+    let request = guard.begin_renewal(wall_sub_ms, now).unwrap();
+    let trunc_time = (request.deadline_us() / 1_000) * 1_000;
+    let receipt: ScheduledCancelReceipt = serde_json::from_value(json!({
+        "address": ADDRESS,
+        "accountIndex": 2,
+        "marketId": 33,
+        "time": trunc_time,
+        "status": "scheduled"
+    }))
+    .unwrap();
+    guard.confirm_renewal(&receipt, wall_sub_ms, now).unwrap();
+    assert!(guard.allows_new_exposure(now));
+    // Margin expires 42us earlier than raw lifetime - stop_before_expiry (55s).
+    assert!(guard.allows_new_exposure(now + Duration::from_secs(55) - Duration::from_micros(43)));
+    assert!(!guard.allows_new_exposure(now + Duration::from_secs(55) - Duration::from_micros(42)));
+}

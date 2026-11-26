@@ -633,3 +633,112 @@ async fn shared_nonce_pool_and_warm_http_and_expiry_counter_work() {
         4
     );
 }
+
+#[test]
+fn cloid_cancel_batch_modify_and_schedule_cancel_wire_and_parse() {
+    let cancel_cloid =
+        CancelByCloidAction::new(vec![CancelByCloidWire::new(120_002, CLOID).unwrap()]).unwrap();
+    let encoded_cancel = rmp_serde::to_vec_named(&cancel_cloid).unwrap();
+    assert!(!encoded_cancel.is_empty());
+    let cancel_json = serde_json::to_value(&cancel_cloid).unwrap();
+    assert_eq!(
+        cancel_json,
+        json!({"type":"cancelByCloid","cancels":[{"asset":120002,"cloid":CLOID}]})
+    );
+    assert!(CancelByCloidWire::new(120_002, "0x01").is_err());
+    assert!(CancelByCloidAction::new(vec![]).is_err());
+
+    let wire = OrderWire::new(120_002, &asset(4), &order("100.00", "1.23")).unwrap();
+    let batch_mod = BatchModifyAction::new(vec![ModifyWire {
+        oid: 77738308,
+        order: wire.clone(),
+    }])
+    .unwrap();
+    let mod_json = serde_json::to_value(&batch_mod).unwrap();
+    assert_eq!(mod_json["type"], "batchModify");
+    assert_eq!(mod_json["modifies"][0]["oid"], 77738308);
+    assert!(BatchModifyAction::new(vec![]).is_err());
+
+    // Duplicate or empty cloids inside batchModify must be rejected.
+    let mut bad_empty_wire = wire.clone();
+    bad_empty_wire.c = Some("".into());
+    assert!(
+        BatchModifyAction::new(vec![ModifyWire {
+            oid: 1,
+            order: bad_empty_wire,
+        }])
+        .is_err()
+    );
+    let mut dup_upper_wire = wire.clone();
+    dup_upper_wire.c = Some(CLOID.to_ascii_uppercase());
+    assert!(
+        BatchModifyAction::new(vec![
+            ModifyWire {
+                oid: 1,
+                order: wire
+            },
+            ModifyWire {
+                oid: 2,
+                order: dup_upper_wire,
+            },
+        ])
+        .is_err()
+    );
+
+    let sched = ScheduleCancelAction::new(Some(1_740_000_030_000));
+    assert_eq!(
+        serde_json::to_value(&sched).unwrap(),
+        json!({"type":"scheduleCancel","time":1_740_000_030_000_u64})
+    );
+    let sched_clear = ScheduleCancelAction::new(None);
+    assert_eq!(
+        serde_json::to_value(&sched_clear).unwrap(),
+        json!({"type":"scheduleCancel"})
+    );
+
+    let mod_resp = json!({"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":99}}]}}}).to_string();
+    assert_eq!(
+        parse_execution_response(&mod_resp, "batchModify", 1).unwrap(),
+        vec![ExecutionStatus::Resting { order_id: 99 }]
+    );
+
+    let cancel_resp =
+        json!({"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}})
+            .to_string();
+    assert_eq!(
+        parse_execution_response(&cancel_resp, "cancelByCloid", 1).unwrap(),
+        vec![ExecutionStatus::Canceled]
+    );
+}
+
+#[test]
+fn spot_state_and_user_fill_deserialize_cleanly() {
+    let spot: SpotClearinghouseState = serde_json::from_value(json!({
+        "balances": [
+            {"coin":"USDC","token":0,"total":"75.50","hold":"12.00"}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(spot.balances.len(), 1);
+    assert_eq!(spot.balances[0].coin, "USDC");
+    assert_eq!(spot.balances[0].total, "75.50");
+
+    let fill: UserFill = serde_json::from_value(json!({
+        "coin": "io:SNDK",
+        "px": "75.12",
+        "sz": "0.5",
+        "side": "B",
+        "time": 1_795_200_000_000_u64,
+        "oid": 12345,
+        "tid": 67890,
+        "fee": "0.00108",
+        "feeToken": "USDC",
+        "crossed": false,
+        "cloid": CLOID,
+        "closedPnl": "0.0"
+    }))
+    .unwrap();
+    assert_eq!(fill.coin, "io:SNDK");
+    assert!(!fill.crossed);
+    assert_eq!(fill.cloid.as_deref(), Some(CLOID));
+}

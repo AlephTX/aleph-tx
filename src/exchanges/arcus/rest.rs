@@ -359,6 +359,20 @@ pub struct Fill {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    pub account_index: u8,
+    pub address: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub net_quote_balance: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub equity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub free_collateral: Decimal,
+    pub sequence_number: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
@@ -455,6 +469,22 @@ impl ArcusInfo {
             .json::<Response>()
             .await?
             .fills)
+    }
+
+    pub async fn account(&self, account: &Account) -> Result<AccountSummary> {
+        let summary: AccountSummary = self
+            .account_get("/v1/account", account)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        ensure!(
+            summary.account_index == account.index
+                && summary.address.eq_ignore_ascii_case(&account.address),
+            "Arcus account summary identity mismatch"
+        );
+        Ok(summary)
     }
 
     pub async fn positions(&self, account: &Account) -> Result<BTreeMap<u16, Position>> {
@@ -691,6 +721,59 @@ mod tests {
                 ..
             })
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_summary_parses_balances_and_rejects_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trading = local_client(&listener);
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (socket, line, _, _) = read_request(socket).await;
+            assert_eq!(
+                line,
+                format!("GET /v1/account?address={ADDRESS}&accountIndex=2 HTTP/1.1\r\n")
+            );
+            respond(
+                socket,
+                "200 OK",
+                json!({
+                    "accountIndex": 2,
+                    "address": ADDRESS,
+                    "netQuoteBalance": "125.50",
+                    "equity": "126.10",
+                    "freeCollateral": "100.25",
+                    "sequenceNumber": 42
+                }),
+            )
+            .await;
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let (socket, _, _, _) = read_request(socket).await;
+            respond(
+                socket,
+                "200 OK",
+                json!({
+                    "accountIndex": 0,
+                    "address": ADDRESS,
+                    "netQuoteBalance": "125.50",
+                    "equity": "126.10",
+                    "freeCollateral": "100.25",
+                    "sequenceNumber": 42
+                }),
+            )
+            .await;
+        });
+
+        let summary = trading.info.account(&trading.signer.account).await.unwrap();
+        assert_eq!(summary.account_index, 2);
+        assert_eq!(summary.equity, Decimal::new(12610, 2));
+        assert_eq!(summary.free_collateral, Decimal::new(10025, 2));
+        assert_eq!(summary.net_quote_balance, Decimal::new(12550, 2));
+        assert_eq!(summary.sequence_number, 42);
+
+        assert!(trading.info.account(&trading.signer.account).await.is_err());
         server.await.unwrap();
     }
 }

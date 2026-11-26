@@ -146,6 +146,40 @@ impl HyperliquidInfo {
             .await?;
         OrderLookup::from_response(response)
     }
+
+    pub async fn spot_clearinghouse_state(
+        &self,
+        account_address: &str,
+    ) -> Result<SpotClearinghouseState> {
+        validate_hex(account_address, 20)?;
+        self.info(json!({"type": "spotClearinghouseState", "user": account_address}))
+            .await
+    }
+
+    pub async fn user_abstraction(&self, account_address: &str) -> Result<String> {
+        validate_hex(account_address, 20)?;
+        self.info(json!({"type": "userAbstraction", "user": account_address}))
+            .await
+    }
+
+    pub async fn user_fills_by_time(
+        &self,
+        account_address: &str,
+        start_time_ms: u64,
+        end_time_ms: Option<u64>,
+    ) -> Result<Vec<UserFill>> {
+        validate_hex(account_address, 20)?;
+        let mut query = json!({
+            "type": "userFillsByTime",
+            "user": account_address,
+            "startTime": start_time_ms,
+            "aggregateByTime": false
+        });
+        if let Some(end_ms) = end_time_ms {
+            query["endTime"] = json!(end_ms);
+        }
+        self.info(query).await
+    }
 }
 
 impl OrderLookup {
@@ -182,6 +216,42 @@ pub struct MarginSummary {
 pub struct AssetPosition {
     pub position: Position,
 }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotBalance {
+    pub coin: String,
+    pub token: u32,
+    pub total: String,
+    pub hold: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotClearinghouseState {
+    pub balances: Vec<SpotBalance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFill {
+    pub coin: String,
+    pub px: String,
+    pub sz: String,
+    pub side: String,
+    pub time: u64,
+    pub oid: u64,
+    pub tid: u64,
+    pub fee: String,
+    #[serde(default)]
+    pub fee_token: Option<String>,
+    #[serde(default)]
+    pub crossed: bool,
+    #[serde(default)]
+    pub cloid: Option<String>,
+    #[serde(default)]
+    pub closed_pnl: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
@@ -409,6 +479,71 @@ impl HyperliquidTrading {
             .await?
             .send()
             .await
+    }
+
+    pub async fn cancel_by_cloid(
+        &self,
+        action: &CancelByCloidAction,
+    ) -> Result<Vec<ExecutionStatus>> {
+        ensure!(
+            !action.cancels.is_empty() && action.cancels.len() <= 100,
+            "Cancel-by-cloid batch must contain 1..=100 orders"
+        );
+        self.prepare(action, "cancelByCloid", action.cancels.len(), None)
+            .await?
+            .send()
+            .await
+    }
+
+    pub async fn batch_modify(&self, action: &BatchModifyAction) -> Result<Vec<ExecutionStatus>> {
+        ensure!(
+            !action.modifies.is_empty() && action.modifies.len() <= 100,
+            "Modify batch must contain 1..=100 orders"
+        );
+        crate::exchanges::hyperliquid::model::validate_batch_modify_cloids(&action.modifies)?;
+        self.prepare(action, "batchModify", action.modifies.len(), None)
+            .await?
+            .send()
+            .await
+    }
+
+    pub async fn schedule_cancel(&self, time_ms: Option<u64>) -> Result<()> {
+        let action = ScheduleCancelAction::new(time_ms);
+        let prepared = self.prepare(&action, "default", 0, None).await?;
+        let response = prepared
+            .client
+            .info
+            .client
+            .execute(prepared.request)
+            .await
+            .map_err(|err| SubmissionError::Uncertain(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| SubmissionError::Uncertain(err.to_string()))?;
+        if !status.is_success() {
+            return Err(SubmissionError::Uncertain(format!("HTTP {status}")).into());
+        }
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| SubmissionError::Uncertain("Invalid JSON response".to_owned()))?;
+        if value["status"] == "err" {
+            return Err(SubmissionError::Rejected(
+                value["response"]
+                    .as_str()
+                    .unwrap_or("Unspecified error")
+                    .to_owned(),
+            )
+            .into());
+        }
+        let resp_type = value["response"]["type"].as_str().unwrap_or("");
+        if value["status"] != "ok" || !matches!(resp_type, "default" | "scheduleCancel") {
+            return Err(SubmissionError::Uncertain(
+                "Unexpected scheduleCancel envelope".to_owned(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     async fn prepare<T: Serialize>(
