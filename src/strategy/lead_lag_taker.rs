@@ -103,8 +103,9 @@ pub struct LeadLagTakerConfig {
     pub vol_theta_mult: f64,
     /// EWMA time constant in ms for the causal target 1s log-return variance (`> 0`).
     pub vol_ewma_tau_ms: u64,
-    /// When `true` and a fresh confirmation leader observation is supplied to
-    /// [`LeadLagTaker::observe_with_confirm`], require both leaders to agree on direction.
+    /// When `true`, [`LeadLagTaker::observe_with_confirm`] fails closed on entries:
+    /// entry requires a fresh, warmed confirmation leader observation that agrees on direction.
+    /// Missing or stale confirmation observations suppress new entries.
     pub require_dual_leader_confirm: bool,
     /// Optional fraction in `(0.0, 1.0]` of the entry lead gap that, once closed by the target
     /// after `entry_filled_est_ms`, triggers an early profit-protecting `Exit`.
@@ -449,9 +450,10 @@ impl LeadLagTaker {
         } else {
             LeadLagSide::Short
         };
-        if self.cfg.require_dual_leader_confirm && confirm_fresh_obs.is_some() {
-            match confirm_dev_bps {
-                Some(c_dev) if c_dev.abs() < self.cfg.max_dev_bps && side.sign() * c_dev > 0.0 => {}
+        if self.cfg.require_dual_leader_confirm {
+            match (confirm_fresh_obs, confirm_dev_bps) {
+                (Some(_), Some(c_dev))
+                    if c_dev.abs() < self.cfg.max_dev_bps && side.sign() * c_dev > 0.0 => {}
                 _ => return LeadLagAction::Idle,
             }
         }
@@ -920,7 +922,7 @@ mod tests {
             ..cfg()
         };
         let mut e = LeadLagTaker::new(c).unwrap();
-        let mut t = 1_000u64;
+        let mut t = 10_000u64;
         for _ in 0..20 {
             assert!(!matches!(
                 e.observe_with_confirm(t, (100.0, t), Some((100.0, t)), (100.0, t)),
@@ -956,12 +958,21 @@ mod tests {
             LeadLagAction::Blocked(LeadLagBlock::InvalidInput)
         );
 
-        // Stale confirm leader does not pollute confirm_ema and falls back cleanly to primary.
-        t += 6_000;
+        // Missing confirm fails closed even when primary moves +5 bp -> Idle.
+        t += 100;
         assert_eq!(
-            e.observe_with_confirm(t, (100.0, t), Some((120.0, t - 6_000)), (100.0, t)),
+            e.observe_with_confirm(t, (100.05, t), None, (100.0, t)),
             LeadLagAction::Idle
         );
+        assert_eq!(e.position(), None);
+
+        // Stale confirm fails closed on primary +5 bp move AND does not pollute confirm_ema.
+        t += 100;
+        assert_eq!(
+            e.observe_with_confirm(t, (100.05, t), Some((120.0, t - 6_000)), (100.0, t)),
+            LeadLagAction::Idle
+        );
+        assert_eq!(e.position(), None);
 
         // Both leaders agree upward (+5 bp primary, +2 bp confirm) -> enters Long.
         t += 100;

@@ -397,6 +397,20 @@ func TestHyperliquidHardenedValidationTableDriven(t *testing.T) {
 			wantDepthValid: true,
 		},
 		{
+			name:           "bbo_empty_array_invalidates_fail_closed",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_single_side_invalidates_fail_closed",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.02","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
 			name:           "l2_empty_levels_invalidates_fail_closed",
 			payload:        []byte(fmt.Sprintf(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":%d,"levels":[]}}`, baseMs+10)),
 			wantErr:        false,

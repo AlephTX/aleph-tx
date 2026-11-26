@@ -707,13 +707,13 @@ func (h *Hyperliquid) handleBBO(
 		return nil
 	}
 	target, ok := h.symMap[ev.Coin.asString()]
-	if !ok || ev.BBO.len != 2 || ev.Time < minHyperliquidUnixMilli || ev.Time < lastBboPub[target] {
+	if !ok || ev.Time < minHyperliquidUnixMilli || ev.Time < lastBboPub[target] {
 		return nil
 	}
 	if ev.Time > now.Add(time.Second).UnixMilli() {
 		return fmt.Errorf("market %s: future bbo timestamp", string(ev.Coin))
 	}
-	if !ev.BBO.present[0] || !ev.BBO.present[1] {
+	if ev.BBO.len != 2 || !ev.BBO.present[0] || !ev.BBO.present[1] {
 		h.invalidateBBO(target)
 		lastBboPub[target] = ev.Time
 		return nil

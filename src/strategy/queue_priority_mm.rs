@@ -1396,10 +1396,17 @@ impl QueuePriorityMmEngine {
                         r_edge_bps >= reducing_edge_floor_bps
                     };
                     // Keep resting queue priority while order stays non-crossing, clears edge,
-                    // sits within `max_queue_keep_ticks` of desired_px, and stays within position cap.
+                    // sits within `max_queue_keep_ticks` of desired_px, stays within position cap,
+                    // and is not an opening order blocked by the quiet-regime gate.
                     let within_keep = tick_diff <= self.cfg.max_queue_keep_ticks;
                     let would_exceed_cap = committed_qty + r.qty > max_pos_qty + 1e-12;
-                    if !r_crosses && r_edge_ok && within_keep && !would_exceed_cap {
+                    let quiet_blocked_resting = quiet_entry_blocked && r_opens_past_flat;
+                    if !r_crosses
+                        && r_edge_ok
+                        && within_keep
+                        && !would_exceed_cap
+                        && !quiet_blocked_resting
+                    {
                         committed_qty += r.qty;
                         actions.push(MmAction::Keep {
                             client_id: r.client_id.clone(),
@@ -1411,7 +1418,9 @@ impl QueuePriorityMmEngine {
                     actions.push(MmAction::Cancel {
                         client_id: r.client_id.clone(),
                         side,
-                        reason: if would_exceed_cap {
+                        reason: if quiet_blocked_resting {
+                            "quiet_regime_gate"
+                        } else if would_exceed_cap {
                             "position_cap_trim"
                         } else {
                             "reprice_out_of_band"
@@ -1421,7 +1430,8 @@ impl QueuePriorityMmEngine {
 
                 // Opening-only entry gates (quiet-regime gate, ALO cooldown, severe markout shield
                 // cooldown, OBI veto, and narrow-spread ALO flight-collision guard).
-                // Never blocks Keep or reduce_only exits.
+                // Quiet-regime gate cancels resting opening orders above while preserving pure
+                // `reduce_only` exits (`!r_opens_past_flat`); none of these gates block exits.
                 if !is_reducing {
                     if quiet_entry_blocked {
                         continue;
@@ -2753,6 +2763,111 @@ mod tests {
                 } if *qty > 0.0 && *qty <= 0.30 + 1e-6
             )),
             "reducing ask exit MUST stay active under volatile regime, got {acts_storm_inv:?}"
+        );
+    }
+
+    #[test]
+    fn g4_quiet_regime_gate_cancels_resting_opening_orders_but_keeps_reducing_exits() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.vol_spread_mult = 0.0;
+        cfg.quiet_regime_max_entry_vol_bps = Some(1.2);
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Seed calm book then trigger a volatile jump so `quiet_entry_blocked == true`.
+        let _ = eng.evaluate(
+            Some(&book(100.00, 10.0, 100.04, 10.0, 1_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            1_000,
+        );
+        let storm_b = book(100.15, 10.0, 100.19, 10.0, 1_500);
+        let resting_pair = vec![
+            RestingQuote {
+                client_id: "b_open".into(),
+                side: QuoteSide::Bid,
+                price: 100.15,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 1_200,
+            },
+            RestingQuote {
+                client_id: "a_open".into(),
+                side: QuoteSide::Ask,
+                price: 100.19,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 1_200,
+            },
+        ];
+
+        // Flat inventory: BOTH resting opening orders must cancel with reason "quiet_regime_gate"
+        // (and neither Keep nor PlaceAlo may be emitted).
+        let acts_flat = eng.evaluate(
+            Some(&storm_b),
+            &[],
+            &resting_pair,
+            InventoryState::default(),
+            1_500,
+        );
+        assert!(eng.telemetry().sigma_bps_per_sqrt_s > 1.2);
+        assert!(
+            acts_flat.iter().any(|a| matches!(
+                a,
+                MmAction::Cancel {
+                    client_id,
+                    side: QuoteSide::Bid,
+                    reason: "quiet_regime_gate",
+                } if client_id == "b_open"
+            )),
+            "expected resting opening bid cancelled under quiet_regime_gate, got {acts_flat:?}"
+        );
+        assert!(
+            acts_flat.iter().any(|a| matches!(
+                a,
+                MmAction::Cancel {
+                    client_id,
+                    side: QuoteSide::Ask,
+                    reason: "quiet_regime_gate",
+                } if client_id == "a_open"
+            )),
+            "expected resting opening ask cancelled under quiet_regime_gate, got {acts_flat:?}"
+        );
+        assert!(
+            !acts_flat
+                .iter()
+                .any(|a| matches!(a, MmAction::Keep { .. } | MmAction::PlaceAlo { .. })),
+            "flat quiet-blocked state must not keep or place opening quotes, got {acts_flat:?}"
+        );
+
+        // Long inventory (+0.30): resting opening Bid cancels, while pure reducing Ask keeps queue priority!
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_long = eng.evaluate(Some(&storm_b), &[], &resting_pair, inv_long, 1_600);
+        assert!(
+            acts_long.iter().any(|a| matches!(
+                a,
+                MmAction::Cancel {
+                    client_id,
+                    side: QuoteSide::Bid,
+                    reason: "quiet_regime_gate",
+                } if client_id == "b_open"
+            )),
+            "long inventory must cancel opening bid under quiet_regime_gate, got {acts_long:?}"
+        );
+        assert!(
+            acts_long.iter().any(|a| matches!(
+                a,
+                MmAction::Keep {
+                    client_id,
+                    side: QuoteSide::Ask,
+                    ..
+                } if client_id == "a_open"
+            )),
+            "long inventory must KEEP pure reducing ask exit, got {acts_long:?}"
         );
     }
 }
