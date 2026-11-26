@@ -758,6 +758,14 @@ impl Default for VenueRegistry {
                     LimitOrderBook,
                 ),
                 ("arcus", "arcus", "arcus", None, RestClient, LimitOrderBook),
+                (
+                    "backpack",
+                    "backpack",
+                    "backpack",
+                    None,
+                    ReadOnly,
+                    LimitOrderBook,
+                ),
                 ("bulk", "bulk", "bulk", None, ReadOnly, LimitOrderBook),
                 (
                     "extended",

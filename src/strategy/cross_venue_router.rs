@@ -196,6 +196,51 @@ pub struct WalExposureReservation {
     pub settled_or_released: bool,
 }
 
+/// Maker-first cross-venue hurdle & stability summary derived purely from venue capability contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerFirstEdgeEstimate {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub roundtrip_fee_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub expected_midflight_slippage_bps: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub net_edge_bps: Decimal,
+    pub latency_asymmetry_ms: u64,
+    pub requires_cross_stablecoin_policy: bool,
+    pub admitted: bool,
+}
+
+/// Evaluate whether a `MakerFirst` cross-venue trade clears audited leg fees + mid-flight hedge slippage.
+pub fn evaluate_maker_first_net_edge_bps(
+    maker_cap: &VenueExecutionCapability,
+    hedge_cap: &VenueExecutionCapability,
+    gross_basis_bps: Decimal,
+    expected_midflight_slippage_bps: Decimal,
+    min_net_edge_bps: Decimal,
+) -> Result<MakerFirstEdgeEstimate> {
+    ensure!(
+        expected_midflight_slippage_bps >= Decimal::ZERO,
+        "expected_midflight_slippage_bps must be >= 0"
+    );
+    ensure!(
+        min_net_edge_bps >= Decimal::ZERO,
+        "min_net_edge_bps must be >= 0"
+    );
+    let roundtrip_fee_bps = maker_cap.maker_fee_bps + hedge_cap.taker_fee_bps;
+    let net_edge_bps = gross_basis_bps - roundtrip_fee_bps - expected_midflight_slippage_bps;
+    let requires_cross_stablecoin_policy = !maker_cap
+        .settlement_currency
+        .eq_ignore_ascii_case(hedge_cap.settlement_currency);
+    Ok(MakerFirstEdgeEstimate {
+        roundtrip_fee_bps,
+        expected_midflight_slippage_bps,
+        net_edge_bps,
+        latency_asymmetry_ms: hedge_cap.taker_delay_ms,
+        requires_cross_stablecoin_policy,
+        admitted: net_edge_bps >= min_net_edge_bps,
+    })
+}
+
 impl WalExposureReservation {
     /// Returns `true` until authoritatively released on zero fill or settled post-hedge.
     pub fn is_active(&self) -> bool {
@@ -3160,6 +3205,70 @@ mod tests {
                 .confirm_hedge_settled(reservation.reservation_id)
                 .unwrap()
                 .is_active()
+        );
+    }
+
+    #[test]
+    fn maker_first_net_edge_estimate_respects_fees_slippage_and_cross_stablecoin_flag() {
+        let registry = VenueRegistry::default();
+        let arcus_eq = registry
+            .resolve_execution_capability("arcus", "level_0", "equity")
+            .unwrap();
+        let hl_base = registry
+            .resolve_execution_capability("hyperliquid", "base", "crypto")
+            .unwrap();
+        let rh_std = registry
+            .resolve_execution_capability("lighter_robinhood", "standard", "equity")
+            .unwrap();
+
+        // Arcus maker (0.0) + HL base taker (4.5) + 1.0 bp slippage = 5.5 bp hurdle.
+        let blocked = evaluate_maker_first_net_edge_bps(
+            &arcus_eq,
+            &hl_base,
+            dec("5.0"),
+            dec("1.0"),
+            dec("0.5"),
+        )
+        .unwrap();
+        assert_eq!(blocked.roundtrip_fee_bps, dec("4.50"));
+        assert_eq!(blocked.net_edge_bps, dec("-0.50"));
+        assert!(!blocked.admitted);
+        assert!(!blocked.requires_cross_stablecoin_policy);
+
+        // Lighter RH (USDG, 200ms) maker (0.0) + Arcus (USDC, 0ms) taker (2.25) -> 2.25 bp fee, cross-stablecoin flagged.
+        let rh_arc = evaluate_maker_first_net_edge_bps(
+            &rh_std,
+            &arcus_eq,
+            dec("5.0"),
+            dec("1.0"),
+            dec("0.5"),
+        )
+        .unwrap();
+        assert_eq!(rh_arc.roundtrip_fee_bps, dec("2.25"));
+        assert_eq!(rh_arc.net_edge_bps, dec("1.75"));
+        assert!(rh_arc.admitted);
+        assert!(rh_arc.requires_cross_stablecoin_policy);
+
+        // Negative slippage or threshold fails closed.
+        assert!(
+            evaluate_maker_first_net_edge_bps(
+                &arcus_eq,
+                &hl_base,
+                dec("5.0"),
+                dec("-0.1"),
+                dec("0")
+            )
+            .is_err()
+        );
+        assert!(
+            evaluate_maker_first_net_edge_bps(
+                &arcus_eq,
+                &hl_base,
+                dec("5.0"),
+                dec("0.1"),
+                dec("-1")
+            )
+            .is_err()
         );
     }
 }

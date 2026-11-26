@@ -110,6 +110,10 @@ pub struct MarkoutShieldConfig {
     /// When true, track realized markout independently per quote side (`Bid` vs `Ask`).
     #[serde(default)]
     pub per_side: bool,
+    /// Optional severe adverse markout threshold (positive bps magnitude) beyond which opening
+    /// quotes on the affected side are completely vetoed while `reduce_only` exits stay active.
+    #[serde(default)]
+    pub adverse_veto_bps: Option<f64>,
 }
 
 impl Default for MarkoutShieldConfig {
@@ -122,6 +126,7 @@ impl Default for MarkoutShieldConfig {
             engaged_size_scale: 0.5,
             saturation_bps: 3.0,
             per_side: false,
+            adverse_veto_bps: None,
         }
     }
 }
@@ -149,6 +154,11 @@ impl MarkoutShieldConfig {
         ensure!(
             self.saturation_bps.is_finite() && self.saturation_bps > self.widen_threshold_bps,
             "markout_shield.saturation_bps must be finite and > widen_threshold_bps"
+        );
+        ensure!(
+            self.adverse_veto_bps
+                .is_none_or(|v| v.is_finite() && v > 0.0),
+            "markout_shield.adverse_veto_bps must be finite and > 0 when set"
         );
         Ok(())
     }
@@ -245,6 +255,26 @@ impl MarkoutShield {
         let mult = 1.0 + e * (self.config.max_widen_mult - 1.0);
         let size = 1.0 + e * (self.config.engaged_size_scale - 1.0);
         (mult, size)
+    }
+
+    /// Returns `true` when the shield is enabled, `adverse_veto_bps` is configured, and the
+    /// tracked EWMA markout for `side` (or aggregate when `per_side = false`) is `<= -veto_bps`.
+    pub fn vetoes_opening_side(&self, side: QuoteSide) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        let Some(veto_bps) = self.config.adverse_veto_bps else {
+            return false;
+        };
+        let ewma = if self.config.per_side {
+            match side {
+                QuoteSide::Bid => self.ewma_bid_bps,
+                QuoteSide::Ask => self.ewma_ask_bps,
+            }
+        } else {
+            self.ewma_markout_bps
+        };
+        ewma.is_some_and(|m| m <= -veto_bps)
     }
 }
 
@@ -943,10 +973,12 @@ impl QuotePipeline {
 
         let suppress_bid_open = (carrying_inventory && inv.signed_inventory_base < 0.0)
             || leader_vetoed_bid
-            || mom_veto_bid;
+            || mom_veto_bid
+            || self.markout_shield.vetoes_opening_side(QuoteSide::Bid);
         let suppress_ask_open = (carrying_inventory && inv.signed_inventory_base > 0.0)
             || leader_vetoed_ask
-            || mom_veto_ask;
+            || mom_veto_ask
+            || self.markout_shield.vetoes_opening_side(QuoteSide::Ask);
 
         let (bid_open, ask_open) = if let Some(glft_q) = glft_q {
             let bid = if suppress_bid_open {
@@ -1633,6 +1665,7 @@ mod tests {
             max_widen_mult: 3.0,
             engaged_size_scale: 0.5,
             saturation_bps: 2.5,
+            adverse_veto_bps: None,
         };
         let mut pipe = QuotePipeline::new(cfg, None).unwrap();
 
@@ -1663,5 +1696,69 @@ mod tests {
         let bid = plan.bid_open.unwrap();
         let raw_q = pipe.quoter.quote(0.0).unwrap();
         assert!((bid.spread_offset_bps - raw_q.bid_offset_bps * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn markout_shield_adverse_veto_suppresses_only_toxic_opening_side_and_keeps_exits() {
+        let mut bad = pipeline_cfg();
+        bad.markout_shield.adverse_veto_bps = Some(0.0);
+        assert!(bad.validate().is_err());
+
+        let mut cfg = pipeline_cfg();
+        cfg.markout_shield = MarkoutShieldConfig {
+            enabled: true,
+            per_side: true,
+            ewma_alpha: 1.0,
+            widen_threshold_bps: 0.5,
+            max_widen_mult: 2.5,
+            engaged_size_scale: 0.5,
+            saturation_bps: 3.0,
+            adverse_veto_bps: Some(1.5),
+        };
+        let mut pipe = QuotePipeline::new(cfg, None).unwrap();
+        pipe.observe_fill_markout_for_side_bps(QuoteSide::Bid, -1.8);
+        pipe.observe_fill_markout_for_side_bps(QuoteSide::Ask, 0.2);
+
+        let market = GenericMarketState {
+            now_ms: 10_000,
+            bid_px: 100.0,
+            ask_px: 100.1,
+            bid_sz: 5.0,
+            ask_sz: 5.0,
+            tick_size: 0.1,
+            momentum_3s_bps: 0.0,
+            oracle_px: Some(100.05),
+            funding_rate_bps_per_hour: None,
+            exit_queue_ahead_base: None,
+            realized_vol_bps_per_sqrt_s: None,
+        };
+        // Carrying long inventory while Bid is vetoed: Ask is suppressed (handled by HybridExitController),
+        // Bid is ALSO vetoed by adverse markout, yet reduce-only Ask exit stays active!
+        let long_inv = GenericInventoryState {
+            signed_inventory_base: 2.0,
+            avg_entry_price: 100.0,
+            entry_opened_at_ms: Some(9_000),
+            dust_base: 1e-6,
+            daily_loss_risk_scale: 1.0,
+        };
+        let plan = pipe.evaluate(&market, &long_inv).unwrap();
+        assert!(plan.bid_open.is_none());
+        assert!(plan.ask_open.is_none());
+        assert!(matches!(
+            plan.exit_directive,
+            ExitDirective::PassiveReduce(slot) if slot.reduce_only && !slot.is_buy
+        ));
+
+        // When flat, Bid stays vetoed while healthy Ask opening quote remains active.
+        let flat = GenericInventoryState {
+            signed_inventory_base: 0.0,
+            avg_entry_price: 0.0,
+            entry_opened_at_ms: None,
+            dust_base: 1e-6,
+            daily_loss_risk_scale: 1.0,
+        };
+        let flat_plan = pipe.evaluate(&market, &flat).unwrap();
+        assert!(flat_plan.bid_open.is_none());
+        assert!(flat_plan.ask_open.is_some());
     }
 }

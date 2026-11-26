@@ -101,6 +101,15 @@ pub struct HybridExitConfig {
     pub exempt_reduce_only_from_drawdown_brake: bool,
     #[serde(default)]
     pub queue_exit: QueueExitConfig,
+    /// When `true`, mild early-hazard triggers escalate first to `Stage3Touch` passive
+    /// `reduce_only` quoting (0 taker fee) instead of immediate taker IOC, reserving IOC
+    /// for `timeout_ms` or `catastrophe_ioc_unrealized_pnl_bps`. Default `false`.
+    #[serde(default)]
+    pub passive_touch_before_hazard_ioc: bool,
+    /// Optional severe unrealized loss threshold (`< early_hazard_unrealized_pnl_bps`) that
+    /// bypasses passive-touch escalation and forces immediate taker IOC unwind.
+    #[serde(default)]
+    pub catastrophe_ioc_unrealized_pnl_bps: Option<f64>,
 }
 
 impl Default for HybridExitConfig {
@@ -119,6 +128,8 @@ impl Default for HybridExitConfig {
             exempt_reduce_only_from_placement_bounds: true,
             exempt_reduce_only_from_drawdown_brake: true,
             queue_exit: QueueExitConfig::default(),
+            passive_touch_before_hazard_ioc: false,
+            catastrophe_ioc_unrealized_pnl_bps: None,
         }
     }
 }
@@ -152,6 +163,11 @@ impl HybridExitConfig {
                 && self.early_hazard_momentum_3s_bps.is_finite()
                 && self.early_hazard_momentum_3s_bps < 0.0,
             "early hazard triggers must be strictly negative and finite"
+        );
+        ensure!(
+            self.catastrophe_ioc_unrealized_pnl_bps
+                .is_none_or(|c| c.is_finite() && c < self.early_hazard_unrealized_pnl_bps),
+            "catastrophe_ioc_unrealized_pnl_bps must be finite and < early_hazard_unrealized_pnl_bps"
         );
         ensure!(
             self.hedge_ioc_slippage_bps.is_finite()
@@ -329,28 +345,39 @@ impl HybridExitController {
             -input.momentum_3s_bps
         };
 
-        if hold_ms >= self.config.early_hazard_min_hold_ms
+        let early_hazard_triggered = hold_ms >= self.config.early_hazard_min_hold_ms
             && signed_unrealized_bps <= self.config.early_hazard_unrealized_pnl_bps
-            && adverse_momentum_bps <= self.config.early_hazard_momentum_3s_bps
-        {
-            self.active_slot = None;
-            let raw_limit = if is_buy {
-                input.ask_touch * (1.0 + slip)
-            } else {
-                input.bid_touch * (1.0 - slip)
-            };
-            let limit_price = quantize_price(raw_limit, input.tick_size, is_buy);
-            return Ok(ExitDirective::EarlyHazardHedgeLock {
-                reduce_only: true,
-                hedge_is_buy: is_buy,
-                qty: abs_inv,
-                limit_price,
-                unrealized_pnl_bps: signed_unrealized_bps,
-                momentum_3s_bps: adverse_momentum_bps,
-            });
+            && adverse_momentum_bps <= self.config.early_hazard_momentum_3s_bps;
+        let catastrophe_breached = self
+            .config
+            .catastrophe_ioc_unrealized_pnl_bps
+            .is_some_and(|cat| signed_unrealized_bps <= cat);
+
+        let mut forced_stage3_passive = false;
+        if early_hazard_triggered {
+            if !self.config.passive_touch_before_hazard_ioc || catastrophe_breached {
+                self.active_slot = None;
+                let raw_limit = if is_buy {
+                    input.ask_touch * (1.0 + slip)
+                } else {
+                    input.bid_touch * (1.0 - slip)
+                };
+                let limit_price = quantize_price(raw_limit, input.tick_size, is_buy);
+                return Ok(ExitDirective::EarlyHazardHedgeLock {
+                    reduce_only: true,
+                    hedge_is_buy: is_buy,
+                    qty: abs_inv,
+                    limit_price,
+                    unrealized_pnl_bps: signed_unrealized_bps,
+                    momentum_3s_bps: adverse_momentum_bps,
+                });
+            }
+            forced_stage3_passive = true;
         }
 
-        let mut stage = if hold_ms < self.config.stage_1_max_hold_ms {
+        let mut stage = if forced_stage3_passive {
+            PassiveExitStage::Stage3Touch
+        } else if hold_ms < self.config.stage_1_max_hold_ms {
             PassiveExitStage::Stage1Wide
         } else if hold_ms < self.config.stage_2_max_hold_ms {
             PassiveExitStage::Stage2Mid
@@ -1048,5 +1075,52 @@ mod tests {
         // Partial fill clears remaining queue ahead to zero.
         tracker.on_partial_fill(0.5);
         assert!((tracker.queue_ahead_base()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn passive_touch_before_hazard_ioc_avoids_taker_fee_until_catastrophe_or_timeout() {
+        let mut invalid = HybridExitConfig::default();
+        invalid.catastrophe_ioc_unrealized_pnl_bps = Some(-2.0); // not strictly < -2.5 early_hazard
+        assert!(invalid.validate().is_err());
+
+        let mild_adverse = base_input(1_002_500, 5.0, 99.96, -1.5); // -4 bp unrealized, -1.5 bp mom
+        let mut legacy = HybridExitController::new(HybridExitConfig::default()).unwrap();
+        assert!(matches!(
+            legacy.evaluate(mild_adverse).unwrap(),
+            ExitDirective::EarlyHazardHedgeLock { .. }
+        ));
+
+        let passive_cfg = HybridExitConfig {
+            passive_touch_before_hazard_ioc: true,
+            catastrophe_ioc_unrealized_pnl_bps: Some(-10.0),
+            ..HybridExitConfig::default()
+        };
+        passive_cfg.validate().unwrap();
+        let mut passive = HybridExitController::new(passive_cfg).unwrap();
+        let ExitDirective::PassiveReduce(slot) = passive.evaluate(mild_adverse).unwrap() else {
+            panic!("expected Stage3Touch PassiveReduce before catastrophe threshold");
+        };
+        assert_eq!(slot.stage, PassiveExitStage::Stage3Touch);
+        assert!(slot.reduce_only);
+
+        // Severe loss below catastrophe threshold escalates immediately to IOC hedge lock.
+        let catastrophe = base_input(1_002_500, 5.0, 99.88, -1.5); // -12 bp <= -10 bp
+        assert!(matches!(
+            passive.evaluate(catastrophe).unwrap(),
+            ExitDirective::EarlyHazardHedgeLock {
+                reduce_only: true,
+                ..
+            }
+        ));
+
+        // Timeout still forces TimeoutFlatten even if loss is mild.
+        let timed_out = base_input(1_050_000, 5.0, 99.96, -1.5);
+        assert!(matches!(
+            passive.evaluate(timed_out).unwrap(),
+            ExitDirective::TimeoutFlatten {
+                reduce_only: true,
+                ..
+            }
+        ));
     }
 }
