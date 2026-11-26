@@ -186,7 +186,7 @@ func (l *hlL2Levels) parseObjectLevel(b []byte, i int, pxOut, szOut *[]byte, has
 			return i, false, false
 		}
 		i = skipJSONSpace(b, i+1)
-		if bytes.Equal(key, []byte("px")) || bytes.EqualFold(key, []byte("px")) {
+		if bytes.Equal(key, hlKeyPx) || asciiEqualFoldBytes(key, hlKeyPx) {
 			val, nextV, okV, wrongV := parseJSONStringOrNull(b, i, &l.scratchV)
 			if !okV || wrongV {
 				return i, false, false
@@ -194,7 +194,7 @@ func (l *hlL2Levels) parseObjectLevel(b []byte, i int, pxOut, szOut *[]byte, has
 			*pxOut = append((*pxOut)[:0], val...)
 			*hasPx = val != nil
 			i = nextV
-		} else if bytes.Equal(key, []byte("sz")) || bytes.EqualFold(key, []byte("sz")) {
+		} else if bytes.Equal(key, hlKeySz) || asciiEqualFoldBytes(key, hlKeySz) {
 			val, nextV, okV, wrongV := parseJSONStringOrNull(b, i, &l.scratchV)
 			if !okV || wrongV {
 				return i, false, false
@@ -457,7 +457,11 @@ var (
 	hlChannelL2Book = []byte("l2Book")
 	hlChannelBBO    = []byte("bbo")
 	hlChannelError  = []byte("error")
+	hlKeyPx         = []byte("px")
+	hlKeySz         = []byte("sz")
 )
+
+const minHyperliquidUnixMilli int64 = 1_000_000_000_000
 
 func (h *Hyperliquid) invalidateBBO(target hlTarget) {
 	if h.matrix != nil {
@@ -625,7 +629,7 @@ func (h *Hyperliquid) handleL2Book(
 	}
 
 	target, ok := h.symMap[book.Coin.asString()]
-	if !ok || book.Levels.sideCount < 2 || book.Time <= 0 {
+	if !ok || book.Time < minHyperliquidUnixMilli {
 		return nil
 	}
 	if book.Time > now.Add(time.Second).UnixMilli() {
@@ -636,6 +640,19 @@ func (h *Hyperliquid) handleL2Book(
 	bboEqualOrNewer := book.Time >= lastBboPub[target]
 	depthFresh := book.Time > lastDepthPub[target]
 	if !bboEqualOrNewer && !depthFresh {
+		return nil
+	}
+	if book.Levels.sideCount != 2 {
+		if bboEqualOrNewer {
+			h.invalidateBBO(target)
+			lastBboPub[target] = book.Time
+		}
+		if depthFresh {
+			if h.depthWriter != nil {
+				h.depthWriter.InvalidateDepth(target.symbolID, target.exchangeID)
+			}
+			lastDepthPub[target] = book.Time
+		}
 		return nil
 	}
 
@@ -690,7 +707,7 @@ func (h *Hyperliquid) handleBBO(
 		return nil
 	}
 	target, ok := h.symMap[ev.Coin.asString()]
-	if !ok || ev.BBO.len != 2 || ev.Time <= 0 || ev.Time < lastBboPub[target] {
+	if !ok || ev.BBO.len != 2 || ev.Time < minHyperliquidUnixMilli || ev.Time < lastBboPub[target] {
 		return nil
 	}
 	if ev.Time > now.Add(time.Second).UnixMilli() {

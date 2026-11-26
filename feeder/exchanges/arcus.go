@@ -80,8 +80,22 @@ func (s *jsonScratchString) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func parseFloatBytes(b []byte) (float64, error) {
+func isValidDecimalFloatBytes(b []byte) bool {
 	if len(b) == 0 {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func parseFloatBytes(b []byte) (float64, error) {
+	if !isValidDecimalFloatBytes(b) {
 		return 0, strconv.ErrSyntax
 	}
 	return strconv.ParseFloat(unsafe.String(unsafe.SliceData(b), len(b)), 64)
@@ -460,12 +474,15 @@ type arcusSymbolState struct {
 	depthTsUs int64
 }
 
+const minArcusUnixMicro int64 = 1_000_000_000_000_000
+
 // arcusFresh reports whether an update is strictly newer than the watermark.
-// When both sides carry a globalSequenceId it is authoritative; the timestamp
-// must also not regress because the SHM matrix drops older timestamps.
+// Once a sequence watermark is established (lastSeq > 0), globalSequenceId is
+// authoritative (preventing missing/zero-sequence frames from bypassing it) and
+// the timestamp must not regress because the SHM matrix drops older timestamps.
 // Without sequence evidence the timestamp must strictly advance.
 func arcusFresh(lastSeq uint64, lastTsUs int64, seq uint64, tsUs int64) bool {
-	if seq > 0 && lastSeq > 0 {
+	if lastSeq > 0 {
 		return seq > lastSeq && tsUs >= lastTsUs
 	}
 	return tsUs > lastTsUs
@@ -620,7 +637,7 @@ func (a *Arcus) handleMessage(raw []byte, now time.Time, states map[uint16]arcus
 		return nil
 	}
 	tsUs := env.Contents.Timestamp
-	if tsUs <= 0 {
+	if tsUs < minArcusUnixMicro {
 		return nil
 	}
 	st := states[symID]

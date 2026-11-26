@@ -545,3 +545,160 @@ func BenchmarkArcusHandleMessageBBO(b *testing.B) {
 		}
 	}
 }
+
+func TestArcusHardenedValidationTableDriven(t *testing.T) {
+	const (
+		baseTs  int64  = 1_795_691_150_080_124
+		baseSeq uint64 = 16_893_834_613
+	)
+	now := time.UnixMicro(baseTs + 500_000)
+
+	type tc struct {
+		name         string
+		payload      []byte
+		wantErr      bool
+		wantBBOValid bool
+	}
+
+	cases := []tc{
+		{
+			name:         "malformed_json_ignored_preserves_valid_bbo",
+			payload:      []byte(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":`),
+			wantErr:      false,
+			wantBBOValid: true,
+		},
+		{
+			name:         "nan_bid_price_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "NaN", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "inf_ask_price_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "60415.1", "Inf"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "underscore_float_rejected_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "60_415.1", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "hex_float_rejected_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "0x1p15", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "zero_bid_price_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "0", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "negative_bid_price_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "-60415.1", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "zero_ask_size_invalidates_cleanly",
+			payload:      []byte(fmt.Sprintf(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":{"bestBid":{"price":"60415.1","size":"1.0"},"bestAsk":{"price":"60415.2","size":"0"},"timestamp":%d,"globalSequenceId":%d}}`, baseTs+1000, baseSeq+1)),
+			wantErr:      false,
+			wantBBOValid: false,
+		},
+		{
+			name:         "crossed_bbo_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "60415.3", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "locked_bbo_invalidates_and_errors",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq+1, "60415.2", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: false,
+		},
+		{
+			name:         "regressed_sequence_ignored_preserves_valid_bbo",
+			payload:      arcusBBOFrame("channel_data", baseTs+1000, baseSeq-1, "60400.0", "60401.0"),
+			wantErr:      false,
+			wantBBOValid: true,
+		},
+		{
+			name:         "missing_sequence_cannot_bypass_seq_watermark",
+			payload:      []byte(fmt.Sprintf(`{"type":"channel_data","channel":"bbo","id":"BTC-USD","contents":{"bestBid":{"price":"60400.0","size":"1.0"},"bestAsk":{"price":"60401.0","size":"1.0"},"timestamp":%d}}`, baseTs+1000)),
+			wantErr:      false,
+			wantBBOValid: true,
+		},
+		{
+			name:         "regressed_timestamp_with_newer_seq_ignored",
+			payload:      arcusBBOFrame("channel_data", baseTs-1, baseSeq+1, "60400.0", "60401.0"),
+			wantErr:      false,
+			wantBBOValid: true,
+		},
+		{
+			name:         "millisecond_epoch_rejected_preserves_valid_bbo",
+			payload:      arcusBBOFrame("channel_data", 1_795_691_150_080, baseSeq+1, "60400.0", "60401.0"),
+			wantErr:      false,
+			wantBBOValid: true,
+		},
+		{
+			name:         "future_timestamp_errors",
+			payload:      arcusBBOFrame("channel_data", now.Add(5*time.Second).UnixMicro(), baseSeq+1, "60415.1", "60415.2"),
+			wantErr:      true,
+			wantBBOValid: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			arc, matrix, _ := newArcusBBOTestFeed(t, "arcus-hard-"+tc.name)
+			states := make(map[uint16]arcusSymbolState)
+			if err := arc.handleMessage(arcusBBOFrame("channel_data", baseTs, baseSeq, "60415.1", "60415.2"), now, states); err != nil {
+				t.Fatal(err)
+			}
+			err := arc.handleMessage(tc.payload, now, states)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			bbo, ok := matrix.ReadBBO(ExchangeArcus, 1)
+			if ok != tc.wantBBOValid {
+				t.Fatalf("bbo readable=%v want=%v (%+v)", ok, tc.wantBBOValid, bbo)
+			}
+			if tc.wantBBOValid && bbo.BidPrice != 60415.1 {
+				t.Fatalf("valid BBO mutated by rejected frame: %+v", bbo)
+			}
+		})
+	}
+}
+
+func TestArcusConcurrentBBOAndL2Race(t *testing.T) {
+	arc, _, _ := newArcusBBOTestFeed(t, "arcus-bbo-l2-race")
+	now := time.UnixMicro(1_795_691_151_000_000)
+	bboMsg := arcusBBOFrame("channel_data", 1_795_691_150_080_124, 100, "60415.1", "60415.2")
+	l2Msg := arcusL2Frame(1_795_691_150_090_000, 101, "60415.0", "60415.3")
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			states := make(map[uint16]arcusSymbolState)
+			for i := 0; i < 100; i++ {
+				states[1] = arcusSymbolState{}
+				if err := arc.handleMessage(bboMsg, now, states); err != nil {
+					t.Errorf("concurrent BBO error: %v", err)
+					return
+				}
+				if err := arc.handleMessage(l2Msg, now, states); err != nil {
+					t.Errorf("concurrent L2 error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

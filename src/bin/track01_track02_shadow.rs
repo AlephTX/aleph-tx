@@ -247,18 +247,36 @@ fn unix_ms() -> Result<u64> {
     )?)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShmSlotData {
+    bid: f64,
+    ask: f64,
+    bid_sz: f64,
+    ask_sz: f64,
+    recv_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ShmSlotDecode {
+    Empty,
+    InvalidOrCrossed,
+    Valid(ShmSlotData),
+}
+
 fn decode_shm_slot(
     slots: &[(u8, ShmBboMessage); NUM_EXCHANGES],
     exchange_id: u8,
     symbol_id: u16,
-) -> Option<(f64, f64, f64, f64, u64)> {
-    let slot = slots.get(usize::from(exchange_id))?.1;
+) -> ShmSlotDecode {
+    let Some((_, slot)) = slots.get(usize::from(exchange_id)).copied() else {
+        return ShmSlotDecode::Empty;
+    };
     if slot.timestamp_ns == 0
         || slot.msg_type != 1
         || slot.exchange_id != exchange_id
         || slot.symbol_id != symbol_id
     {
-        return None;
+        return ShmSlotDecode::Empty;
     }
     let recv_ms = slot.timestamp_ns / 1_000_000;
     if recv_ms == 0
@@ -271,15 +289,15 @@ fn decode_shm_slot(
         || slot.bid_size <= 0.0
         || slot.ask_size <= 0.0
     {
-        return None;
+        return ShmSlotDecode::InvalidOrCrossed;
     }
-    Some((
-        slot.bid_price,
-        slot.ask_price,
-        slot.bid_size,
-        slot.ask_size,
+    ShmSlotDecode::Valid(ShmSlotData {
+        bid: slot.bid_price,
+        ask: slot.ask_price,
+        bid_sz: slot.bid_size,
+        ask_sz: slot.ask_size,
         recv_ms,
-    ))
+    })
 }
 
 fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> {
@@ -460,10 +478,17 @@ fn run_shm(
                     };
                     progressed = true;
                     let slots = reader.read_all_exchanges(symbol_id);
-                    let (Some(ref_slot), Some(tgt_slot)) = (
-                        decode_shm_slot(&slots, ref_exch, symbol_id),
-                        decode_shm_slot(&slots, tgt_exch, symbol_id),
-                    ) else {
+                    let ref_decoded = decode_shm_slot(&slots, ref_exch, symbol_id);
+                    let tgt_decoded = decode_shm_slot(&slots, tgt_exch, symbol_id);
+                    if matches!(ref_decoded, ShmSlotDecode::InvalidOrCrossed) {
+                        session.record_venue_crossed_drop(symbol_id, ref_exch);
+                    }
+                    if matches!(tgt_decoded, ShmSlotDecode::InvalidOrCrossed) {
+                        session.record_venue_crossed_drop(symbol_id, tgt_exch);
+                    }
+                    let (ShmSlotDecode::Valid(ref_slot), ShmSlotDecode::Valid(tgt_slot)) =
+                        (ref_decoded, tgt_decoded)
+                    else {
                         continue;
                     };
                     let now_ms = unix_ms()?;
@@ -471,17 +496,17 @@ fn run_shm(
                         symbol_id,
                         now_ms,
                         LeadLagTouch {
-                            bid: ref_slot.0,
-                            ask: ref_slot.1,
-                            recv_ms: ref_slot.4,
+                            bid: ref_slot.bid,
+                            ask: ref_slot.ask,
+                            recv_ms: ref_slot.recv_ms,
                         },
                         LeadLagTouch {
-                            bid: tgt_slot.0,
-                            ask: tgt_slot.1,
-                            recv_ms: tgt_slot.4,
+                            bid: tgt_slot.bid,
+                            ask: tgt_slot.ask,
+                            recv_ms: tgt_slot.recv_ms,
                         },
-                        tgt_slot.2,
-                        tgt_slot.3,
+                        tgt_slot.bid_sz,
+                        tgt_slot.ask_sz,
                         utc_day_now(),
                     )?;
                 }
@@ -508,36 +533,50 @@ fn run_shm(
                     progressed = true;
                     let slots = reader.read_all_exchanges(symbol_id);
                     let now_ms = unix_ms()?;
-                    if let Some(ref_slot) = decode_shm_slot(&slots, ref_exch, symbol_id) {
-                        session.on_reference_mid(
-                            symbol_id,
-                            now_ms,
-                            0.5 * (ref_slot.0 + ref_slot.1),
-                        );
+                    match decode_shm_slot(&slots, ref_exch, symbol_id) {
+                        ShmSlotDecode::Valid(ref_slot) => {
+                            session.on_reference_mid(
+                                symbol_id,
+                                now_ms,
+                                0.5 * (ref_slot.bid + ref_slot.ask),
+                            );
+                        }
+                        ShmSlotDecode::InvalidOrCrossed => {
+                            session.record_venue_crossed_drop(symbol_id, ref_exch);
+                        }
+                        ShmSlotDecode::Empty => {}
                     }
-                    let (Some(maker_slot), Some(hedge_slot)) = (
-                        decode_shm_slot(&slots, maker_exch, symbol_id),
-                        decode_shm_slot(&slots, hedge_exch, symbol_id),
-                    ) else {
+                    let maker_decoded = decode_shm_slot(&slots, maker_exch, symbol_id);
+                    let hedge_decoded = decode_shm_slot(&slots, hedge_exch, symbol_id);
+                    if matches!(maker_decoded, ShmSlotDecode::InvalidOrCrossed) {
+                        session.record_venue_crossed_drop(symbol_id, maker_exch);
+                    }
+                    if matches!(hedge_decoded, ShmSlotDecode::InvalidOrCrossed) {
+                        session.record_venue_crossed_drop(symbol_id, hedge_exch);
+                    }
+                    let (ShmSlotDecode::Valid(maker_slot), ShmSlotDecode::Valid(hedge_slot)) =
+                        (maker_decoded, hedge_decoded)
+                    else {
+                        session.clear_pair_quotes(symbol_id);
                         continue;
                     };
                     let maker_touch = MakerTouch {
-                        bid: maker_slot.0,
-                        ask: maker_slot.1,
-                        recv_ms: maker_slot.4,
+                        bid: maker_slot.bid,
+                        ask: maker_slot.ask,
+                        recv_ms: maker_slot.recv_ms,
                     };
                     let hedge_touch = MakerTouch {
-                        bid: hedge_slot.0,
-                        ask: hedge_slot.1,
-                        recv_ms: hedge_slot.4,
+                        bid: hedge_slot.bid,
+                        ask: hedge_slot.ask,
+                        recv_ms: hedge_slot.recv_ms,
                     };
                     let utc_day = utc_day_now();
                     let _ = session.on_maker_bbo_cross_diagnostic(
                         symbol_id,
                         now_ms,
                         maker_touch,
-                        maker_slot.2,
-                        maker_slot.3,
+                        maker_slot.bid_sz,
+                        maker_slot.ask_sz,
                         hedge_touch,
                         utc_day,
                     )?;
@@ -787,8 +826,62 @@ fail_closed_when_unready = true
             0.0
         );
         assert!(serialized["pairs"][0]["net_unhedged_base_qty"].is_number());
+        assert!(serialized["max_gap_ms"].is_u64());
+        assert_eq!(serialized["stale_book_drops"], 0);
+        assert_eq!(serialized["clock_regression_drops"], 0);
+        assert_eq!(serialized["crossed_book_drops"], 0);
+        assert_eq!(serialized["venue_feed_health"].as_array().unwrap().len(), 3);
 
         fs::remove_file(cfg_path).unwrap();
         fs::remove_file(replay_path).unwrap();
+    }
+
+    #[test]
+    fn decode_shm_slot_distinguishes_empty_invalid_crossed_and_valid() {
+        let mut slots = [(0_u8, ShmBboMessage::default()); NUM_EXCHANGES];
+        for (idx, item) in slots.iter_mut().enumerate() {
+            item.0 = idx as u8;
+        }
+        assert_eq!(decode_shm_slot(&slots, 2, 1002), ShmSlotDecode::Empty);
+
+        // Crossed BBO with valid header is classified as InvalidOrCrossed.
+        slots[2].1 = ShmBboMessage {
+            seqlock: 2,
+            msg_type: 1,
+            exchange_id: 2,
+            symbol_id: 1002,
+            timestamp_ns: 1_794_712_726_000_000_000,
+            bid_price: 100.05,
+            bid_size: 5.0,
+            ask_price: 100.00,
+            ask_size: 5.0,
+            ..ShmBboMessage::default()
+        };
+        assert_eq!(
+            decode_shm_slot(&slots, 2, 1002),
+            ShmSlotDecode::InvalidOrCrossed
+        );
+
+        // Non-finite price is InvalidOrCrossed.
+        slots[2].1.bid_price = f64::NAN;
+        slots[2].1.ask_price = 100.10;
+        assert_eq!(
+            decode_shm_slot(&slots, 2, 1002),
+            ShmSlotDecode::InvalidOrCrossed
+        );
+
+        // Valid BBO decodes cleanly.
+        slots[2].1.bid_price = 100.00;
+        slots[2].1.ask_price = 100.02;
+        assert_eq!(
+            decode_shm_slot(&slots, 2, 1002),
+            ShmSlotDecode::Valid(ShmSlotData {
+                bid: 100.00,
+                ask: 100.02,
+                bid_sz: 5.0,
+                ask_sz: 5.0,
+                recv_ms: 1_794_712_726_000,
+            })
+        );
     }
 }

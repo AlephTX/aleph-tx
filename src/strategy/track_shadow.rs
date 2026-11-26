@@ -13,7 +13,7 @@ use crate::strategy::lead_lag_taker::{
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 pub use crate::strategy::basis_maker_hedge::Touch as MakerTouch;
@@ -41,6 +41,153 @@ fn default_max_hedge_stale_ms() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Per-venue feed continuity and drop diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct VenueFeedHealthReport {
+    pub exchange_id: u8,
+    pub samples: u64,
+    pub max_gap_ms: u64,
+    pub stale_book_drops: u64,
+    pub clock_regression_drops: u64,
+    pub crossed_book_drops: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VenueFeedTracker {
+    exchange_id: u8,
+    last_now_ms: Option<u64>,
+    last_recv_ms: Option<u64>,
+    samples: u64,
+    max_gap_ms: u64,
+    stale_book_drops: u64,
+    clock_regression_drops: u64,
+    crossed_book_drops: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedObservation {
+    Fresh,
+    CrossedOrInvalid,
+    ClockRegressed,
+    Stale,
+}
+
+impl VenueFeedTracker {
+    fn new(exchange_id: u8) -> Self {
+        Self {
+            exchange_id,
+            ..Self::default()
+        }
+    }
+
+    fn observe_bbo(
+        &mut self,
+        now_ms: u64,
+        bid: f64,
+        ask: f64,
+        recv_ms: u64,
+        max_age_ms: u64,
+    ) -> FeedObservation {
+        if !valid_bid_ask(bid, ask) {
+            self.crossed_book_drops += 1;
+            return FeedObservation::CrossedOrInvalid;
+        }
+        if recv_ms > now_ms
+            || self.last_now_ms.is_some_and(|prev| now_ms < prev)
+            || self.last_recv_ms.is_some_and(|prev| recv_ms < prev)
+        {
+            self.clock_regression_drops += 1;
+            return FeedObservation::ClockRegressed;
+        }
+        if now_ms - recv_ms > max_age_ms {
+            self.stale_book_drops += 1;
+            if let Some(prev_recv) = self.last_recv_ms {
+                self.max_gap_ms = self.max_gap_ms.max(now_ms - prev_recv);
+            }
+            self.last_now_ms = Some(now_ms);
+            return FeedObservation::Stale;
+        }
+        if let Some(prev_recv) = self.last_recv_ms
+            && recv_ms > prev_recv
+        {
+            self.max_gap_ms = self.max_gap_ms.max(recv_ms - prev_recv);
+        }
+        self.last_recv_ms = Some(recv_ms);
+        self.last_now_ms = Some(now_ms);
+        self.samples += 1;
+        FeedObservation::Fresh
+    }
+
+    fn observe_mid(&mut self, now_ms: u64, mid: f64) {
+        if !(mid.is_finite() && mid > 0.0) {
+            return;
+        }
+        if self.last_now_ms.is_some_and(|prev| now_ms < prev) {
+            self.clock_regression_drops += 1;
+            return;
+        }
+        if let Some(prev_now) = self.last_now_ms
+            && now_ms > prev_now
+        {
+            self.max_gap_ms = self.max_gap_ms.max(now_ms - prev_now);
+        }
+        self.last_now_ms = Some(now_ms);
+        self.samples += 1;
+    }
+
+    fn record_crossed_drop(&mut self) {
+        self.crossed_book_drops += 1;
+    }
+
+    fn report(&self) -> VenueFeedHealthReport {
+        VenueFeedHealthReport {
+            exchange_id: self.exchange_id,
+            samples: self.samples,
+            max_gap_ms: self.max_gap_ms,
+            stale_book_drops: self.stale_book_drops,
+            clock_regression_drops: self.clock_regression_drops,
+            crossed_book_drops: self.crossed_book_drops,
+        }
+    }
+}
+
+fn aggregate_venue_health(
+    feeds: impl IntoIterator<Item = VenueFeedHealthReport>,
+) -> (Vec<VenueFeedHealthReport>, u64, u64, u64, u64) {
+    let mut by_exchange: BTreeMap<u8, VenueFeedHealthReport> = BTreeMap::new();
+    let mut max_gap_ms = 0_u64;
+    let mut stale_book_drops = 0_u64;
+    let mut clock_regression_drops = 0_u64;
+    let mut crossed_book_drops = 0_u64;
+
+    for feed in feeds {
+        max_gap_ms = max_gap_ms.max(feed.max_gap_ms);
+        stale_book_drops += feed.stale_book_drops;
+        clock_regression_drops += feed.clock_regression_drops;
+        crossed_book_drops += feed.crossed_book_drops;
+
+        let entry = by_exchange
+            .entry(feed.exchange_id)
+            .or_insert_with(|| VenueFeedHealthReport {
+                exchange_id: feed.exchange_id,
+                ..VenueFeedHealthReport::default()
+            });
+        entry.samples += feed.samples;
+        entry.max_gap_ms = entry.max_gap_ms.max(feed.max_gap_ms);
+        entry.stale_book_drops += feed.stale_book_drops;
+        entry.clock_regression_drops += feed.clock_regression_drops;
+        entry.crossed_book_drops += feed.crossed_book_drops;
+    }
+
+    (
+        by_exchange.into_values().collect(),
+        max_gap_ms,
+        stale_book_drops,
+        clock_regression_drops,
+        crossed_book_drops,
+    )
 }
 
 // ============================================================================
@@ -202,6 +349,8 @@ struct Track01ArmRuntime {
     engine: LeadLagTaker,
     open_pos: Option<OpenShadowPos>,
     last_tgt_touch: Option<LeadLagTouch>,
+    ref_feed: VenueFeedTracker,
+    tgt_feed: VenueFeedTracker,
     realized_pnl_usd: f64,
     total_fees_usd: f64,
     trades: u64,
@@ -277,6 +426,8 @@ pub struct Track01ArmReport {
     pub blocks: u64,
     pub open_side: Option<LeadLagSide>,
     pub open_notional_usd: f64,
+    pub ref_feed: VenueFeedHealthReport,
+    pub tgt_feed: VenueFeedHealthReport,
 }
 
 /// Aggregate shadow summary for Track 01 (`01_quant_profit`).
@@ -295,6 +446,11 @@ pub struct Track01ShadowReport {
     pub blocks: u64,
     pub risk_scale: f64,
     pub halted: bool,
+    pub max_gap_ms: u64,
+    pub stale_book_drops: u64,
+    pub clock_regression_drops: u64,
+    pub crossed_book_drops: u64,
+    pub venue_feed_health: Vec<VenueFeedHealthReport>,
     pub arms: Vec<Track01ArmReport>,
 }
 
@@ -328,6 +484,8 @@ impl Track01ShadowSession {
                 engine,
                 open_pos: None,
                 last_tgt_touch: None,
+                ref_feed: VenueFeedTracker::new(arm_cfg.ref_exchange_id),
+                tgt_feed: VenueFeedTracker::new(arm_cfg.tgt_exchange_id),
                 realized_pnl_usd: 0.0,
                 total_fees_usd: 0.0,
                 trades: 0,
@@ -385,6 +543,19 @@ impl Track01ShadowSession {
         }
     }
 
+    /// Record a crossed or malformed SHM book drop detected before `on_bbo_pair`.
+    pub fn record_venue_crossed_drop(&mut self, symbol_id: u16, exchange_id: u8) {
+        let Some(&arm_idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return;
+        };
+        let arm = &mut self.arms[arm_idx];
+        if arm.cfg.ref_exchange_id == exchange_id {
+            arm.ref_feed.record_crossed_drop();
+        } else if arm.cfg.tgt_exchange_id == exchange_id {
+            arm.tgt_feed.record_crossed_drop();
+        }
+    }
+
     /// Process one synchronized reference/target BBO pair for `symbol_id`.
     #[allow(clippy::too_many_arguments)]
     pub fn on_bbo_pair(
@@ -400,18 +571,38 @@ impl Track01ShadowSession {
         let Some(&arm_idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return Ok(None);
         };
-        if tgt_touch.valid() {
-            self.arms[arm_idx].last_tgt_touch = Some(tgt_touch);
-        }
+        let (ref_obs, tgt_obs) = {
+            let arm = &mut self.arms[arm_idx];
+            let max_ref_age_ms = arm.cfg.strategy.max_ref_age_ms;
+            let max_tgt_age_ms = arm.cfg.strategy.max_tgt_age_ms;
+            let ref_obs = arm.ref_feed.observe_bbo(
+                now_ms,
+                ref_touch.bid,
+                ref_touch.ask,
+                ref_touch.recv_ms,
+                max_ref_age_ms,
+            );
+            let tgt_obs = arm.tgt_feed.observe_bbo(
+                now_ms,
+                tgt_touch.bid,
+                tgt_touch.ask,
+                tgt_touch.recv_ms,
+                max_tgt_age_ms,
+            );
+            if tgt_touch.valid() && tgt_obs != FeedObservation::ClockRegressed {
+                arm.last_tgt_touch = Some(tgt_touch);
+            }
+            (ref_obs, tgt_obs)
+        };
         // Check MTM equity & daily loss brake before sizing any new entry.
         self.check_equity_and_drawdown(utc_day);
 
-        let ref_mid = if ref_touch.valid() {
+        let ref_mid = if ref_touch.valid() && ref_obs != FeedObservation::ClockRegressed {
             ref_touch.mid()
         } else {
             f64::NAN
         };
-        let tgt_mid = if tgt_touch.valid() {
+        let tgt_mid = if tgt_touch.valid() && tgt_obs != FeedObservation::ClockRegressed {
             tgt_touch.mid()
         } else {
             f64::NAN
@@ -460,8 +651,8 @@ impl Track01ShadowSession {
             LeadLagAction::Exit { .. } => {
                 if tgt_touch.valid() {
                     arm.exit(tgt_touch);
-                    // Shadow execution immediately confirms flat
-                    arm.engine.clear_position();
+                    // Shadow execution immediately confirms flat via authoritative exit fill hook.
+                    arm.engine.notify_exit_filled();
                 } else if arm.open_pos.is_none() {
                     // Resynchronize cleanly if somehow out of sync with no shadow position open.
                     arm.engine.clear_position();
@@ -485,7 +676,7 @@ impl Track01ShadowSession {
         let mut wins = 0;
         let mut skips = 0;
         let mut blocks = 0;
-        let arms = self
+        let arms: Vec<Track01ArmReport> = self
             .arms
             .iter()
             .map(|a| {
@@ -511,9 +702,18 @@ impl Track01ShadowSession {
                     blocks: a.blocks,
                     open_side: a.open_pos.map(|p| p.side),
                     open_notional_usd: a.open_pos.map_or(0.0, |p| p.notional_usd),
+                    ref_feed: a.ref_feed.report(),
+                    tgt_feed: a.tgt_feed.report(),
                 }
             })
             .collect();
+        let (
+            venue_feed_health,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+        ) = aggregate_venue_health(arms.iter().flat_map(|a| [a.ref_feed, a.tgt_feed]));
         Track01ShadowReport {
             track: "01_quant_profit",
             capital_usd: self.cfg.capital_usd,
@@ -532,6 +732,11 @@ impl Track01ShadowSession {
                 self.daily_loss.risk_scale()
             },
             halted: self.halted,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+            venue_feed_health,
             arms,
         }
     }
@@ -823,6 +1028,9 @@ struct Track02PairRuntime {
     latest_quotes: Option<MakerHedgeQuotes>,
     last_maker_touch: Option<MakerTouch>,
     last_hedge_touch: Option<MakerTouch>,
+    maker_feed: VenueFeedTracker,
+    hedge_feed: VenueFeedTracker,
+    ref_feed: VenueFeedTracker,
     maker_leg: LegPosition,
     hedge_leg: LegPosition,
     inventory_clips: f64,
@@ -873,6 +1081,9 @@ pub struct Track02PairReport {
     pub shield_blocked_ticks: u64,
     pub unhedged_stale_halts: u64,
     pub halted: bool,
+    pub maker_feed: VenueFeedHealthReport,
+    pub hedge_feed: VenueFeedHealthReport,
+    pub ref_feed: VenueFeedHealthReport,
 }
 
 /// Aggregate shadow summary for Track 02 (`02_hedge_arbitrage`).
@@ -895,6 +1106,11 @@ pub struct Track02ShadowReport {
     pub unhedged_stale_halts: u64,
     pub risk_scale: f64,
     pub halted: bool,
+    pub max_gap_ms: u64,
+    pub stale_book_drops: u64,
+    pub clock_regression_drops: u64,
+    pub crossed_book_drops: u64,
+    pub venue_feed_health: Vec<VenueFeedHealthReport>,
     pub pairs: Vec<Track02PairReport>,
 }
 
@@ -931,6 +1147,9 @@ impl Track02ShadowSession {
                 latest_quotes: None,
                 last_maker_touch: None,
                 last_hedge_touch: None,
+                maker_feed: VenueFeedTracker::new(pair_cfg.maker_exchange_id),
+                hedge_feed: VenueFeedTracker::new(pair_cfg.hedge_exchange_id),
+                ref_feed: VenueFeedTracker::new(pair_cfg.ref_exchange_id),
                 maker_leg: LegPosition::default(),
                 hedge_leg: LegPosition::default(),
                 inventory_clips: 0.0,
@@ -1010,12 +1229,37 @@ impl Track02ShadowSession {
         }
     }
 
+    /// Clear any resting quotes for `symbol_id` (fail-closed on SHM invalidation/disconnect).
+    pub fn clear_pair_quotes(&mut self, symbol_id: u16) {
+        if let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) {
+            self.pairs[idx].latest_quotes = None;
+        }
+    }
+
+    /// Record a crossed or malformed SHM book drop detected before `on_pair_books` / `on_reference_mid`.
+    pub fn record_venue_crossed_drop(&mut self, symbol_id: u16, exchange_id: u8) {
+        let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
+            return;
+        };
+        let pair = &mut self.pairs[idx];
+        if pair.cfg.maker_exchange_id == exchange_id {
+            pair.maker_feed.record_crossed_drop();
+        }
+        if pair.cfg.hedge_exchange_id == exchange_id {
+            pair.hedge_feed.record_crossed_drop();
+        }
+        if pair.cfg.ref_exchange_id == exchange_id {
+            pair.ref_feed.record_crossed_drop();
+        }
+    }
+
     /// Feed an external reference mid price into the pair's cancel shield.
     pub fn on_reference_mid(&mut self, symbol_id: u16, now_ms: u64, ref_mid: f64) {
         let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
             return;
         };
         let pair = &mut self.pairs[idx];
+        pair.ref_feed.observe_mid(now_ms, ref_mid);
         pair.quoter.observe_reference(now_ms, ref_mid);
         pair.ref_tracker
             .observe(now_ms, ref_mid, pair.cfg.strategy.max_gap_ms);
@@ -1033,14 +1277,38 @@ impl Track02ShadowSession {
         let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
             return Ok(None);
         };
-        {
+        let (maker_obs, hedge_obs) = {
             let pair = &mut self.pairs[idx];
-            if valid_bid_ask(maker.bid, maker.ask) {
+            let max_book_age_ms = pair.cfg.strategy.max_book_age_ms;
+            let maker_obs = pair.maker_feed.observe_bbo(
+                now_ms,
+                maker.bid,
+                maker.ask,
+                maker.recv_ms,
+                max_book_age_ms,
+            );
+            let hedge_obs = pair.hedge_feed.observe_bbo(
+                now_ms,
+                hedge.bid,
+                hedge.ask,
+                hedge.recv_ms,
+                max_book_age_ms,
+            );
+            if valid_bid_ask(maker.bid, maker.ask) && maker_obs != FeedObservation::ClockRegressed {
                 pair.last_maker_touch = Some(maker);
             }
-            if valid_bid_ask(hedge.bid, hedge.ask) {
+            if valid_bid_ask(hedge.bid, hedge.ask) && hedge_obs != FeedObservation::ClockRegressed {
                 pair.last_hedge_touch = Some(hedge);
             }
+            (maker_obs, hedge_obs)
+        };
+
+        if maker_obs == FeedObservation::ClockRegressed
+            || hedge_obs == FeedObservation::ClockRegressed
+        {
+            self.check_equity_and_drawdown(utc_day);
+            self.pairs[idx].latest_quotes = None;
+            return Ok(None);
         }
 
         let step_res = {
@@ -1229,7 +1497,14 @@ impl Track02ShadowSession {
             self.pairs[idx].latest_quotes = None;
             return Ok(false);
         }
-        if !valid_bid_ask(maker.bid, maker.ask) {
+        if !valid_bid_ask(maker.bid, maker.ask)
+            || maker.recv_ms > now_ms
+            || now_ms - maker.recv_ms > self.pairs[idx].cfg.strategy.max_book_age_ms
+            || self.pairs[idx]
+                .maker_feed
+                .last_recv_ms
+                .is_some_and(|prev| maker.recv_ms < prev)
+        {
             return Ok(false);
         }
         let Some(quotes) = self.pairs[idx].latest_quotes else {
@@ -1278,7 +1553,7 @@ impl Track02ShadowSession {
         let mut fills = 0;
         let mut shield_blocked_ticks = 0;
         let mut unhedged_stale_halts = 0;
-        let pairs = self
+        let pairs: Vec<Track02PairReport> = self
             .pairs
             .iter()
             .map(|p| {
@@ -1310,9 +1585,23 @@ impl Track02ShadowSession {
                     shield_blocked_ticks: p.shield_blocked_ticks,
                     unhedged_stale_halts: p.unhedged_stale_halts,
                     halted: self.halted || p.halted,
+                    maker_feed: p.maker_feed.report(),
+                    hedge_feed: p.hedge_feed.report(),
+                    ref_feed: p.ref_feed.report(),
                 }
             })
             .collect();
+        let (
+            venue_feed_health,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+        ) = aggregate_venue_health(
+            pairs
+                .iter()
+                .flat_map(|p| [p.maker_feed, p.hedge_feed, p.ref_feed]),
+        );
         Track02ShadowReport {
             track: "02_hedge_arbitrage",
             fill_evidence_mode: self.fill_evidence_mode,
@@ -1335,6 +1624,11 @@ impl Track02ShadowSession {
                 self.daily_loss.risk_scale()
             },
             halted: self.halted,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+            venue_feed_health,
             pairs,
         }
     }
@@ -2065,5 +2359,320 @@ mod tests {
         assert!(rep.pairs[0].hedge_qty > 0.0);
         assert!(rep.pairs[0].net_unhedged_base_qty.abs() < 1e-12);
         assert!(rep.total_modeled_hedge_slip_usd > 0.0);
+    }
+
+    #[test]
+    fn track02_bbo_cross_diagnostic_drops_stale_and_clock_regressed_maker() {
+        let (mut s, t, q) = warm_track02_session(t2_cfg());
+        s.set_fill_evidence_mode("shm_bbo_cross_diagnostic_no_trades");
+        let ask = q.ask.expect("ask should quote");
+        let bid = q.bid.expect("bid should quote");
+
+        // Advance clock past max_book_age_ms (5000ms) while maker book stays frozen at `t`.
+        let now_stale = t + 5_001;
+        let stale_maker = mk_touch(ask + 0.02, ask + 0.04, t);
+        let fresh_hedge = mk_touch(ask + 0.01, ask + 0.03, now_stale);
+        assert!(
+            !s.on_maker_bbo_cross_diagnostic(
+                1002,
+                now_stale,
+                stale_maker,
+                10.0,
+                10.0,
+                fresh_hedge,
+                utc_day_from_ms(now_stale),
+            )
+            .unwrap()
+        );
+        assert_eq!(s.report().fills, 0);
+
+        // Future maker recv_ms (> now_ms) must also be dropped.
+        let future_maker = mk_touch(bid - 0.04, bid - 0.02, t + 50);
+        assert!(
+            !s.on_maker_bbo_cross_diagnostic(
+                1002,
+                t,
+                future_maker,
+                10.0,
+                10.0,
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        assert_eq!(s.report().fills, 0);
+
+        // Clock-regressed maker recv_ms (< previous maker recv_ms `t`) must also be dropped.
+        let regressed_maker = mk_touch(ask + 0.02, ask + 0.04, t - 10);
+        assert!(
+            !s.on_maker_bbo_cross_diagnostic(
+                1002,
+                t + 20,
+                regressed_maker,
+                10.0,
+                10.0,
+                mk_touch(ask + 0.01, ask + 0.03, t + 20),
+                utc_day_from_ms(t + 20),
+            )
+            .unwrap()
+        );
+        assert_eq!(s.report().fills, 0);
+
+        // Crossed maker book must also be dropped.
+        let crossed_maker = mk_touch(ask + 0.05, ask + 0.02, t + 30);
+        assert!(
+            !s.on_maker_bbo_cross_diagnostic(
+                1002,
+                t + 30,
+                crossed_maker,
+                10.0,
+                10.0,
+                mk_touch(ask + 0.01, ask + 0.03, t + 30),
+                utc_day_from_ms(t + 30),
+            )
+            .unwrap()
+        );
+        assert_eq!(s.report().fills, 0);
+    }
+
+    #[test]
+    fn track01_exit_confirms_flat_via_notify_exit_filled_and_handles_skip_distinctly() {
+        let mut s = Track01ShadowSession::new(t1_cfg(), utc_day_from_ms(1_000)).unwrap();
+        let mut t = 1_000_u64;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        // Zero target ask size triggers skip -> clear_position() keeps engine flat.
+        let skipped = s
+            .on_bbo_pair(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                0.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap();
+        assert_eq!(skipped, Some(LeadLagAction::Idle));
+        assert_eq!(s.report().skips, 1);
+        assert_eq!(s.report().trades, 0);
+        assert!(s.arms[0].engine.position().is_none());
+
+        // Re-warm and execute a full entry -> exit cycle; exit calls notify_exit_filled().
+        t += 50_000;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        assert!(matches!(
+            s.on_bbo_pair(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            })
+        ));
+        assert_eq!(s.arms[0].engine.position(), Some(LeadLagSide::Long));
+
+        let exit_t = t + 1_200;
+        assert_eq!(
+            s.on_bbo_pair(
+                1002,
+                exit_t,
+                ll_touch(100.09, 100.11, exit_t),
+                ll_touch(100.09, 100.11, exit_t),
+                10.0,
+                10.0,
+                utc_day_from_ms(exit_t),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            })
+        );
+        assert!(s.arms[0].engine.position().is_none());
+        assert_eq!(s.report().trades, 1);
+    }
+
+    #[test]
+    fn track01_feed_health_tracks_stale_clock_regression_crossed_and_gap() {
+        let mut s = Track01ShadowSession::new(t1_cfg(), utc_day_from_ms(1_000)).unwrap();
+        let day = utc_day_from_ms(1_000);
+
+        // Sample 1 & 2 establish baseline and 250ms gap.
+        let _ = s
+            .on_bbo_pair(
+                1002,
+                1_000,
+                ll_touch(99.99, 100.01, 1_000),
+                ll_touch(99.99, 100.01, 1_000),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+        let _ = s
+            .on_bbo_pair(
+                1002,
+                1_250,
+                ll_touch(99.99, 100.01, 1_250),
+                ll_touch(99.99, 100.01, 1_250),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+
+        // Crossed ref book + valid tgt book.
+        let _ = s
+            .on_bbo_pair(
+                1002,
+                1_350,
+                ll_touch(100.02, 100.01, 1_350),
+                ll_touch(99.99, 100.01, 1_350),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+
+        // Clock regression on tgt (recv_ms < prev_recv_ms = 1_350) + future recv_ms on ref.
+        let _ = s
+            .on_bbo_pair(
+                1002,
+                1_400,
+                ll_touch(99.99, 100.01, 1_500),
+                ll_touch(99.99, 100.01, 1_300),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+
+        // Stale ref book (> default max_ref_age_ms=5000) while tgt updates cleanly.
+        let _ = s
+            .on_bbo_pair(
+                1002,
+                7_000,
+                ll_touch(99.99, 100.01, 1_250),
+                ll_touch(99.99, 100.01, 7_000),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+
+        let rep = s.report();
+        assert_eq!(rep.crossed_book_drops, 1);
+        assert_eq!(rep.clock_regression_drops, 2);
+        assert_eq!(rep.stale_book_drops, 1);
+        assert_eq!(rep.max_gap_ms, 5_750);
+        assert_eq!(rep.arms[0].ref_feed.crossed_book_drops, 1);
+        assert_eq!(rep.arms[0].ref_feed.clock_regression_drops, 1);
+        assert_eq!(rep.arms[0].ref_feed.stale_book_drops, 1);
+        assert_eq!(rep.arms[0].ref_feed.max_gap_ms, 5_750);
+        assert_eq!(rep.arms[0].tgt_feed.clock_regression_drops, 1);
+        assert_eq!(rep.arms[0].tgt_feed.max_gap_ms, 5_650);
+        assert_eq!(rep.venue_feed_health.len(), 2);
+
+        let json = serde_json::to_value(&rep).unwrap();
+        assert_eq!(json["max_gap_ms"], 5_750);
+        assert_eq!(json["stale_book_drops"], 1);
+        assert_eq!(json["clock_regression_drops"], 2);
+        assert_eq!(json["crossed_book_drops"], 1);
+    }
+
+    #[test]
+    fn track02_feed_health_tracks_stale_clock_regression_crossed_and_gap() {
+        let mut s = Track02ShadowSession::new(t2_cfg(), utc_day_from_ms(10_000)).unwrap();
+        let day = utc_day_from_ms(10_000);
+
+        s.on_reference_mid(1002, 10_000, 100.0);
+        s.on_reference_mid(1002, 10_400, 100.0);
+        // Regressed reference timestamp.
+        s.on_reference_mid(1002, 10_300, 100.0);
+
+        let _ = s
+            .on_pair_books(
+                1002,
+                10_000,
+                mk_touch(99.99, 100.01, 10_000),
+                mk_touch(99.99, 100.01, 10_000),
+                day,
+            )
+            .unwrap();
+        // Crossed maker book.
+        let _ = s
+            .on_pair_books(
+                1002,
+                10_200,
+                mk_touch(100.05, 100.01, 10_200),
+                mk_touch(99.99, 100.01, 10_200),
+                day,
+            )
+            .unwrap();
+        // Regressed hedge recv_ms.
+        let _ = s
+            .on_pair_books(
+                1002,
+                10_300,
+                mk_touch(99.99, 100.01, 10_300),
+                mk_touch(99.99, 100.01, 10_150),
+                day,
+            )
+            .unwrap();
+        // Stale maker book (> max_book_age_ms = 5000ms) while hedge is fresh.
+        let _ = s
+            .on_pair_books(
+                1002,
+                17_000,
+                mk_touch(99.99, 100.01, 10_300),
+                mk_touch(99.99, 100.01, 17_000),
+                day,
+            )
+            .unwrap();
+
+        let rep = s.report();
+        assert_eq!(rep.crossed_book_drops, 1);
+        assert_eq!(rep.clock_regression_drops, 2);
+        assert_eq!(rep.stale_book_drops, 1);
+        assert_eq!(rep.max_gap_ms, 6_800);
+        assert_eq!(rep.pairs[0].maker_feed.crossed_book_drops, 1);
+        assert_eq!(rep.pairs[0].maker_feed.stale_book_drops, 1);
+        assert_eq!(rep.pairs[0].hedge_feed.clock_regression_drops, 1);
+        assert_eq!(rep.pairs[0].hedge_feed.max_gap_ms, 6_800);
+        assert_eq!(rep.pairs[0].ref_feed.clock_regression_drops, 1);
+        assert_eq!(rep.pairs[0].ref_feed.max_gap_ms, 400);
+        assert_eq!(rep.venue_feed_health.len(), 3);
     }
 }

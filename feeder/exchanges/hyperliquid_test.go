@@ -304,3 +304,165 @@ func BenchmarkHyperliquidBBO(b *testing.B) {
 		}
 	}
 }
+
+func TestHyperliquidHardenedValidationTableDriven(t *testing.T) {
+	const baseMs int64 = 1_794_712_726_200
+	now := time.UnixMilli(baseMs + 500)
+	target := hlTarget{exchangeID: ExchangeTradeXYZ, symbolID: 1003}
+
+	type tc struct {
+		name           string
+		payload        []byte
+		wantErr        bool
+		wantBBOValid   bool
+		wantDepthValid bool
+	}
+
+	cases := []tc{
+		{
+			name:           "malformed_json_ignored_preserves_valid",
+			payload:        []byte(`{"channel":"bbo","data":`),
+			wantErr:        false,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_nan_price_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"NaN","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_inf_size_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.02","sz":"Inf"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_zero_size_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.02","sz":"0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_negative_price_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"-145.02","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_underscore_float_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145_02","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_crossed_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.10","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_locked_invalidates_bbo",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.09","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_regressed_timestamp_ignored_preserves_valid",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"144.00","sz":"1.0"},{"px":"144.10","sz":"1.0"}]}}`, baseMs-1)),
+			wantErr:        false,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_seconds_epoch_rejected_preserves_valid",
+			payload:        []byte(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":1794712726,"bbo":[{"px":"144.00","sz":"1.0"},{"px":"144.10","sz":"1.0"}]}}`),
+			wantErr:        false,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+		{
+			name:           "bbo_future_timestamp_errors",
+			payload:        []byte(fmt.Sprintf(`{"channel":"bbo","data":{"coin":"xyz:NVDA","time":%d,"bbo":[{"px":"145.02","sz":"1.0"},{"px":"145.09","sz":"1.0"}]}}`, now.Add(5*time.Second).UnixMilli())),
+			wantErr:        true,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+		{
+			name:           "l2_empty_levels_invalidates_fail_closed",
+			payload:        []byte(fmt.Sprintf(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":%d,"levels":[]}}`, baseMs+10)),
+			wantErr:        false,
+			wantBBOValid:   false,
+			wantDepthValid: false,
+		},
+		{
+			name:           "l2_seconds_epoch_rejected_preserves_valid",
+			payload:        []byte(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1794712726,"levels":[[{"px":"144.00","sz":"1.0"}],[{"px":"144.10","sz":"1.0"}]]}}`),
+			wantErr:        false,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+		{
+			name:           "l2_regressed_timestamp_ignored_preserves_valid",
+			payload:        []byte(fmt.Sprintf(`{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":%d,"levels":[[{"px":"144.00","sz":"1.0"}],[{"px":"144.10","sz":"1.0"}]]}}`, baseMs-10)),
+			wantErr:        false,
+			wantBBOValid:   true,
+			wantDepthValid: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("ALEPH_SHM_DIR", tmp)
+			matrix, err := shm.NewMatrix("hl-hard-" + tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer matrix.Close()
+			depth, err := shm.NewDepthWriter(filepath.Join(tmp, "aleph-depth"), shm.NumSymbols)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer depth.Close()
+
+			withTestSymbolRegistry(t, map[string]uint16{"NVDA": 1003})
+			hl := NewHyperliquidWithDepth(config.ExchangeConfig{
+				Enabled:    true,
+				WSURL:      "wss://api.hyperliquid.xyz/ws",
+				Symbols:    map[string]string{"NVDA": "xyz:NVDA"},
+				FastBook:   true,
+				BBOChannel: true,
+			}, matrix, depth)
+
+			lastBbo := map[hlTarget]int64{}
+			lastDepth := map[hlTarget]int64{}
+			seedL2 := buildHyperliquidL2BenchmarkPayload(5, baseMs)
+			if err := hl.handleMessageWithDepth(seedL2, now, lastBbo, lastDepth); err != nil {
+				t.Fatal(err)
+			}
+			if lastBbo[target] != baseMs || lastDepth[target] != baseMs {
+				t.Fatalf("unexpected seed watermarks: bbo=%d depth=%d", lastBbo[target], lastDepth[target])
+			}
+
+			err = hl.handleMessageWithDepth(tc.payload, now, lastBbo, lastDepth)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if _, ok := matrix.ReadBBO(ExchangeTradeXYZ, 1003); ok != tc.wantBBOValid {
+				t.Fatalf("bbo valid=%v want=%v", ok, tc.wantBBOValid)
+			}
+			if _, ok := depth.ReadDepth(1003, ExchangeTradeXYZ); ok != tc.wantDepthValid {
+				t.Fatalf("depth valid=%v want=%v", ok, tc.wantDepthValid)
+			}
+		})
+	}
+}
