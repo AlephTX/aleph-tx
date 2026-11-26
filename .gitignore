@@ -71,3 +71,7 @@ AGENT_HANDOFF.md
 
 # Python
 __pycache__/
+
+# Local-only live calibration records (may contain account/fill details; never commit)
+docs/*CALIBRATION*.md
+docs/*calibration*.md

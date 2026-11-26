@@ -16,7 +16,7 @@ This blueprint defines:
 > - `.agent-state/` (including `.agent-state/research/`, `.agent-state/calibration/`, `.agent-state/archive/`)
 > - `.env*` (`.env`, `.env.all_exchanges`, `.env.backpack`, `.env.edgex`, `.env.lighter`, `.env.testnet`)
 > - `pkg/` (if present)
-> - `docs/ARCUS_ENTROPY_MM_OPTIMIZATION_AND_CALIBRATION_2026_11_26.md` (local-only calibration record containing small-size account calibration fills/PnL and authenticated account status — keep preserved locally outside Git)
+> - `docs/*CALIBRATION*.md` / `docs/*calibration*.md` (now protected by `.gitignore`, including `docs/ARCUS_ENTROPY_MM_OPTIMIZATION_AND_CALIBRATION_2026_11_26.md` — local-only calibration record containing small-size account calibration fills/PnL and authenticated account status; keep preserved locally outside Git)
 > - Never use `git add -A` or `git add .`. Stage explicit path lists only, verify `git diff --cached` before every commit, and preserve `Cargo.lock` and [inventory_neutral_mm.rs](../src/strategy/inventory_neutral_mm.rs) (`ce0930d3...`) untouched.
 
 ### 1.1 Pre-Staging Secret & Boundary Gate (`AGENTS.md`)
@@ -267,6 +267,7 @@ Only after Phase 1 & Phase 2 pass and `track01_track02_shadow` is deployed to `/
    ```
 3. **Continuous `10h` shadow acceptance criteria (required before ANY live canary proposal)**:
    - **Zero order / cancel emission**: shadow mode stays read-only with zero exchange credentials and zero REST/WS order writes.
+   - **Track 02 hedge & fill-evidence accounting (`BboMatrix` SHM)**: Track 02 shadow applies adverse `expected_hedge_slip_bps` directly to hedge fills, accounts any unhedged maker fill on a stale hedge (`unhedged_maker_notional_usd` + `unhedged_stale_halts`), and reports `fill_evidence_mode = "shm_bbo_cross_diagnostic_no_trades"` (conservative BBO-cross sweep diagnostic lacking public trade prints) when reading `BboMatrix` SHM.
    - **Live SHM latency & freshness**: verify SHM read latency and quote freshness match expected `bbo` cadence without unexpected stale-book halts.
    - **Shield trigger rate & fail-closed behavior**: verify `RefCancelShield` triggers cleanly on external reference moves and fails closed (`fail_closed_when_unready = true`) on unready/stale/future reference timestamps.
    - **Risk invariants**: verify `DailyLossGuard` state transitions remain healthy and **`unhedged_stale_halts == 0`** over a full continuous `10h` window.
