@@ -1075,6 +1075,332 @@ class QuantLakehouseTests(unittest.TestCase):
                 split_role="selection_dev",
             )
 
+    def test_arcus_bbo_normalizes_two_sided_one_sided_and_coexists_with_l2(self) -> None:
+        ts_bbo_1 = (self.t0 + 18) * 1_000 + 456
+        ts_l2 = (self.t0 + 20) * 1_000 + 123
+        ts_bbo_2 = (self.t0 + 25) * 1_000 + 789
+        ts_bbo_3 = (self.t0 + 30) * 1_000 + 999
+        rows = [
+            # Non-data subscribed ack without contents and empty contents dict must be skipped cleanly.
+            self._timed_row(
+                1,
+                "arcus",
+                "message",
+                10,
+                payload={"type": "subscribed", "channel": "bbo", "id": "BTC-USD"},
+            ),
+            self._timed_row(
+                2,
+                "arcus",
+                "message",
+                12,
+                payload={"type": "channel_data", "channel": "bbo", "id": "BTC-USD", "contents": {}},
+            ),
+            # Normal two-sided Arcus BBO quote.
+            self._timed_row(
+                3,
+                "arcus",
+                "message",
+                20,
+                payload={
+                    "type": "channel_data",
+                    "channel": "bbo",
+                    "id": "BTC-USD",
+                    "contents": {
+                        "bestBid": {"price": "60415.1", "size": "0.08408347"},
+                        "bestAsk": {"price": "60415.2", "size": "0.01058685"},
+                        "timestamp": ts_bbo_1,
+                        "lastSequenceId": 980274961,
+                        "globalSequenceId": 16893834613,
+                    },
+                },
+            ),
+            # Coexisting l2Orderbook publication keeps existing behavior (venue_seq=None, multi-level depth).
+            self._timed_row(
+                4,
+                "arcus",
+                "message",
+                22,
+                payload={
+                    "type": "channel_data",
+                    "channel": "l2Orderbook",
+                    "id": "BTC-USD",
+                    "contents": {
+                        "timestamp": ts_l2,
+                        "globalSequenceId": 16893834620,
+                        "bids": [["60415.0", "1.5"], ["60414.5", "2.0"]],
+                        "asks": [["60415.5", "1.25"]],
+                    },
+                },
+            ),
+            # One-sided quote with null bestBid.
+            self._timed_row(
+                5,
+                "arcus",
+                "message",
+                27,
+                payload={
+                    "type": "channel_data",
+                    "channel": "bbo",
+                    "id": "BTC-USD",
+                    "contents": {
+                        "bestBid": None,
+                        "bestAsk": {"price": "60415.4", "size": "1"},
+                        "timestamp": ts_bbo_2,
+                        "globalSequenceId": 16893834640,
+                    },
+                },
+            ),
+            # One-sided quote with zero-size bestAsk treated as empty.
+            self._timed_row(
+                6,
+                "arcus",
+                "message",
+                32,
+                payload={
+                    "type": "channel_data",
+                    "channel": "bbo",
+                    "id": "BTC-USD",
+                    "contents": {
+                        "bestBid": {"price": "60415.0", "size": "2.5"},
+                        "bestAsk": {"price": "60416.0", "size": "0"},
+                        "timestamp": ts_bbo_3,
+                    },
+                },
+            ),
+            self._timed_row(7, "collector", "end", 40),
+        ]
+        capture = self._write_gz_capture("arcus-bbo.ndjson.gz", rows)
+        bronze = seal_bronze_capture(
+            capture,
+            campaign_id="arcus-bbo-test",
+            collector_region="tokyo",
+            split_role="selection_dev",
+        )
+        self.assertEqual(bronze["records"], 7)
+        self.assertEqual(bronze["markets_observed"], ["arcus:mainnet:BTC-USD"])
+
+        silver_dir = self.root / "arcus_silver"
+        silver = normalize_capture(
+            capture,
+            silver_dir,
+            campaign_id="arcus-bbo-test",
+            collector_region="tokyo",
+            precise_times=True,
+        )
+        self.assertEqual(silver["tables"]["bbo_quotes"]["rows"], 4)
+        bbos = _read_gz_ndjson(silver_dir / "bbo_quotes.ndjson.gz")
+
+        # 1. Two-sided Arcus BBO
+        self.assertEqual(bbos[0]["venue"], "arcus")
+        self.assertEqual(bbos[0]["transport"], "ws")
+        self.assertEqual(bbos[0]["bid_px"], "60415.1")
+        self.assertEqual(bbos[0]["bid_sz"], "0.08408347")
+        self.assertEqual(bbos[0]["ask_px"], "60415.2")
+        self.assertEqual(bbos[0]["ask_sz"], "0.01058685")
+        self.assertEqual(bbos[0]["source_time_ms"], self.t0 + 18)
+        self.assertEqual(bbos[0]["raw_source_time"], ts_bbo_1)
+        self.assertEqual(bbos[0]["venue_seq"], 16893834613)
+        self.assertEqual((bbos[0]["depth_levels_bid"], bbos[0]["depth_levels_ask"]), (1, 1))
+        self.assertTrue(bbos[0]["tradable"])
+
+        # 2. Coexisting l2Orderbook
+        self.assertIsNone(bbos[1]["venue_seq"])
+        self.assertEqual((bbos[1]["depth_levels_bid"], bbos[1]["depth_levels_ask"]), (2, 1))
+        self.assertEqual(bbos[1]["raw_source_time"], ts_l2)
+
+        # 3. Null bestBid
+        self.assertIsNone(bbos[2]["bid_px"])
+        self.assertIsNone(bbos[2]["bid_sz"])
+        self.assertEqual(bbos[2]["ask_px"], "60415.4")
+        self.assertEqual(bbos[2]["ask_sz"], "1")
+        self.assertEqual((bbos[2]["depth_levels_bid"], bbos[2]["depth_levels_ask"]), (0, 1))
+        self.assertEqual(bbos[2]["venue_seq"], 16893834640)
+        self.assertFalse(bbos[2]["tradable"])
+        self.assertIsNone(bbos[2]["mid_px_f64"])
+
+        # 4. Zero-size bestAsk
+        self.assertEqual(bbos[3]["bid_px"], "60415")
+        self.assertEqual(bbos[3]["bid_sz"], "2.5")
+        self.assertIsNone(bbos[3]["ask_px"])
+        self.assertIsNone(bbos[3]["ask_sz"])
+        self.assertEqual((bbos[3]["depth_levels_bid"], bbos[3]["depth_levels_ask"]), (1, 0))
+        self.assertIsNone(bbos[3]["venue_seq"])
+        self.assertFalse(bbos[3]["tradable"])
+
+        duck = build_duckdb_lakehouse(silver_dir, self.root / "arcus_pq", self.root / "arcus.duckdb")
+        if duck["engine"] == "python_duckdb":
+            import duckdb
+
+            with duckdb.connect(str(self.root / "arcus.duckdb"), read_only=True) as conn:
+                got = conn.execute(
+                    "SELECT sequence, venue_seq, depth_levels_bid, depth_levels_ask, tradable "
+                    "FROM v_bbo_quotes ORDER BY sequence"
+                ).fetchall()
+                self.assertEqual(
+                    got,
+                    [(2, 16893834613, 1, 1, True), (3, None, 2, 1, True), (4, 16893834640, 0, 1, False), (5, None, 1, 0, False)],
+                )
+
+    def test_hyperliquid_tradexyz_entropy_bbo_and_l2_coexistence(self) -> None:
+        rows = [
+            # Hyperliquid Core BTC two-sided BBO
+            self._timed_row(
+                1,
+                "hyperliquid",
+                "message",
+                10,
+                market="BTC",
+                payload={
+                    "channel": "bbo",
+                    "data": {
+                        "coin": "BTC",
+                        "time": self.t0 + 9,
+                        "bbo": [{"px": "90000.5", "sz": "1.25", "n": 2}, {"px": "90001.0", "sz": "0.75", "n": 1}],
+                    },
+                },
+            ),
+            # TradeXYZ (xyz:NVDA) two-sided BBO
+            self._timed_row(
+                2,
+                "hyperliquid",
+                "message",
+                20,
+                market="xyz:NVDA",
+                payload={
+                    "channel": "bbo",
+                    "data": {
+                        "coin": "xyz:NVDA",
+                        "time": self.t0 + 19,
+                        "bbo": [{"px": "150.08", "sz": "261.5", "n": 1}, {"px": "150.09", "sz": "415.9", "n": 12}],
+                    },
+                },
+            ),
+            # Entropy (io:NVDA) two-sided BBO + coexisting l2Book
+            self._timed_row(
+                3,
+                "hyperliquid",
+                "message",
+                30,
+                market="io:NVDA",
+                payload={
+                    "channel": "bbo",
+                    "data": {
+                        "coin": "io:NVDA",
+                        "time": self.t0 + 29,
+                        "bbo": [{"px": "149.90", "sz": "10", "n": 1}, {"px": "150.00", "sz": "20", "n": 2}],
+                    },
+                },
+            ),
+            self._timed_row(
+                4,
+                "hyperliquid",
+                "message",
+                35,
+                market="io:NVDA",
+                payload={
+                    "channel": "l2Book",
+                    "data": {
+                        "coin": "io:NVDA",
+                        "time": self.t0 + 34,
+                        "levels": [
+                            [{"px": "149.85", "sz": "15"}, {"px": "149.80", "sz": "30"}],
+                            [{"px": "150.05", "sz": "25"}],
+                        ],
+                    },
+                },
+            ),
+            # Null bid side on BTC + missing time
+            self._timed_row(
+                5,
+                "hyperliquid",
+                "message",
+                40,
+                market="BTC",
+                payload={
+                    "channel": "bbo",
+                    "data": {
+                        "coin": "BTC",
+                        "bbo": [None, {"px": "90002.0", "sz": "2.0", "n": 3}],
+                    },
+                },
+            ),
+            # Zero-size ask side on xyz:NVDA
+            self._timed_row(
+                6,
+                "hyperliquid",
+                "message",
+                50,
+                market="xyz:NVDA",
+                payload={
+                    "channel": "bbo",
+                    "data": {
+                        "coin": "xyz:NVDA",
+                        "time": self.t0 + 49,
+                        "bbo": [{"px": "150.10", "sz": "5", "n": 1}, {"px": "150.20", "sz": "0", "n": 0}],
+                    },
+                },
+            ),
+            self._timed_row(7, "collector", "end", 60),
+        ]
+        capture = self._write_gz_capture("hl-bbo.ndjson.gz", rows)
+        bronze = seal_bronze_capture(
+            capture,
+            campaign_id="hl-bbo-test",
+            collector_region="tokyo",
+            split_role="selection_dev",
+        )
+        self.assertEqual(
+            bronze["markets_observed"],
+            ["entropy:hip3-io:io:NVDA", "hyperliquid:core:BTC", "trade_xyz:hip3-xyz:xyz:NVDA"],
+        )
+
+        silver_dir = self.root / "hl_silver"
+        silver = normalize_capture(
+            capture,
+            silver_dir,
+            campaign_id="hl-bbo-test",
+            collector_region="tokyo",
+            precise_times=True,
+        )
+        self.assertEqual(silver["tables"]["bbo_quotes"]["rows"], 6)
+        bbos = _read_gz_ndjson(silver_dir / "bbo_quotes.ndjson.gz")
+
+        self.assertEqual((bbos[0]["venue"], bbos[0]["domain"], bbos[0]["market"]), ("hyperliquid", "core", "BTC"))
+        self.assertEqual((bbos[0]["bid_px"], bbos[0]["ask_px"]), ("90000.5", "90001"))
+        self.assertEqual((bbos[0]["depth_levels_bid"], bbos[0]["depth_levels_ask"]), (1, 1))
+        self.assertEqual(bbos[0]["source_time_ms"], self.t0 + 9)
+        self.assertEqual(bbos[0]["transport"], "ws")
+        self.assertTrue(bbos[0]["tradable"])
+
+        self.assertEqual((bbos[1]["venue"], bbos[1]["domain"], bbos[1]["market"]), ("trade_xyz", "hip3-xyz", "xyz:NVDA"))
+        self.assertEqual((bbos[1]["bid_px"], bbos[1]["ask_px"]), ("150.08", "150.09"))
+        self.assertEqual((bbos[1]["depth_levels_bid"], bbos[1]["depth_levels_ask"]), (1, 1))
+        self.assertTrue(bbos[1]["tradable"])
+
+        self.assertEqual((bbos[2]["venue"], bbos[2]["domain"], bbos[2]["market"]), ("entropy", "hip3-io", "io:NVDA"))
+        self.assertEqual((bbos[2]["depth_levels_bid"], bbos[2]["depth_levels_ask"]), (1, 1))
+        self.assertEqual((bbos[3]["venue"], bbos[3]["domain"], bbos[3]["market"]), ("entropy", "hip3-io", "io:NVDA"))
+        self.assertEqual((bbos[3]["depth_levels_bid"], bbos[3]["depth_levels_ask"]), (2, 1))
+
+        # Null bid side and missing time
+        self.assertIsNone(bbos[4]["bid_px"])
+        self.assertIsNone(bbos[4]["bid_sz"])
+        self.assertEqual((bbos[4]["ask_px"], bbos[4]["ask_sz"]), ("90002", "2"))
+        self.assertEqual((bbos[4]["depth_levels_bid"], bbos[4]["depth_levels_ask"]), (0, 1))
+        self.assertIsNone(bbos[4]["source_time_ms"])
+        self.assertIsNone(bbos[4]["raw_source_time"])
+        self.assertFalse(bbos[4]["tradable"])
+
+        # Zero-size ask side
+        self.assertEqual((bbos[5]["bid_px"], bbos[5]["bid_sz"]), ("150.1", "5"))
+        self.assertIsNone(bbos[5]["ask_px"])
+        self.assertIsNone(bbos[5]["ask_sz"])
+        self.assertEqual((bbos[5]["depth_levels_bid"], bbos[5]["depth_levels_ask"]), (1, 0))
+        self.assertFalse(bbos[5]["tradable"])
+
+        build_duckdb_lakehouse(silver_dir, self.root / "hl_pq", self.root / "hl.duckdb")
+
 
 if __name__ == "__main__":
     unittest.main()

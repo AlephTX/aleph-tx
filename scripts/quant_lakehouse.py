@@ -640,6 +640,22 @@ def _iter_source_lines(input_path: Path):
         yield from stream_rows(handle)
 
 
+def _parse_bbo_side(side_obj: object, px_key: str, sz_key: str) -> tuple[Decimal | None, Decimal | None]:
+    """Parse one side of a top-of-book quote, treating missing/null/zero-size as empty."""
+    if side_obj is None:
+        return None, None
+    if not isinstance(side_obj, dict):
+        raise ValueError(f"invalid BBO side object: {side_obj!r}")
+    raw_px = side_obj.get(px_key)
+    raw_sz = side_obj.get(sz_key)
+    if raw_px is None or raw_sz is None:
+        return None, None
+    sz = parse_positive_dec(raw_sz, allow_zero=True)
+    if sz == 0:
+        return None, None
+    return parse_positive_dec(raw_px), sz
+
+
 def _emit_bbo_row(
     emit,
     *,
@@ -987,11 +1003,15 @@ def normalize_capture(
             elif raw_source in ("arcus", "arcus_snapshot", "bulk", "bulk_snapshot"):
                 is_snap = raw_source.endswith("_snapshot")
                 transport = "rest_snapshot" if is_snap else "ws"
+                arcus_chan = None
                 if raw_source == "arcus":
-                    if payload.get("channel") != "l2Orderbook" or payload.get("type") not in ("subscribed", "channel_data"):
+                    arcus_chan = payload.get("channel")
+                    if arcus_chan not in ("l2Orderbook", "bbo") or payload.get("type") not in ("subscribed", "channel_data", "message"):
+                        continue
+                    book_body = payload.get("contents")
+                    if not isinstance(book_body, dict) or not book_body:
                         continue
                     mkt = payload["id"]
-                    book_body = payload["contents"]
                 elif raw_source == "arcus_snapshot":
                     mkt = payload["market"]
                     book_body = payload["data"]
@@ -1007,11 +1027,24 @@ def normalize_capture(
                         continue
 
                 venue, domain = classify_venue_domain(raw_source, mkt)
+                venue_seq = None
                 if venue == "arcus":
                     raw_ts = int(book_body["timestamp"])
                     src_ms = raw_ts // 1_000
-                    bids = [( parse_positive_dec(p), parse_positive_dec(s) ) for p, s in book_body.get("bids", [])]
-                    asks = [( parse_positive_dec(p), parse_positive_dec(s) ) for p, s in book_body.get("asks", [])]
+                    if arcus_chan == "bbo":
+                        bid_px, bid_sz = _parse_bbo_side(book_body.get("bestBid"), "price", "size")
+                        ask_px, ask_sz = _parse_bbo_side(book_body.get("bestAsk"), "price", "size")
+                        depth_levels_bid = 1 if bid_px is not None else 0
+                        depth_levels_ask = 1 if ask_px is not None else 0
+                        if book_body.get("globalSequenceId") is not None:
+                            venue_seq = int(book_body["globalSequenceId"])
+                    else:
+                        bids = [( parse_positive_dec(p), parse_positive_dec(s) ) for p, s in book_body.get("bids", [])]
+                        asks = [( parse_positive_dec(p), parse_positive_dec(s) ) for p, s in book_body.get("asks", [])]
+                        bid_px, bid_sz = bids[0] if bids else (None, None)
+                        ask_px, ask_sz = asks[0] if asks else (None, None)
+                        depth_levels_bid = len(bids)
+                        depth_levels_ask = len(asks)
                 else:
                     if book_body.get("updateType") != "snapshot":
                         continue
@@ -1020,9 +1053,11 @@ def normalize_capture(
                     lvls = book_body.get("levels", [[], []])
                     bids = [(parse_positive_dec(item["px"]), parse_positive_dec(item["sz"])) for item in lvls[0]]
                     asks = [(parse_positive_dec(item["px"]), parse_positive_dec(item["sz"])) for item in lvls[1]]
+                    bid_px, bid_sz = bids[0] if bids else (None, None)
+                    ask_px, ask_sz = asks[0] if asks else (None, None)
+                    depth_levels_bid = len(bids)
+                    depth_levels_ask = len(asks)
 
-                bid_px, bid_sz = bids[0] if bids else (None, None)
-                ask_px, ask_sz = asks[0] if asks else (None, None)
                 _emit_bbo_row(
                     emit,
                     campaign_id=campaign_id,
@@ -1039,13 +1074,13 @@ def normalize_capture(
                     receipt_wall_ns=receipt_wall_ns,
                     source_time_ms=src_ms,
                     raw_source_time=raw_ts,
-                    venue_seq=None,
+                    venue_seq=venue_seq,
                     bid_px=bid_px,
                     bid_sz=bid_sz,
                     ask_px=ask_px,
                     ask_sz=ask_sz,
-                    depth_levels_bid=len(bids),
-                    depth_levels_ask=len(asks),
+                    depth_levels_bid=depth_levels_bid,
+                    depth_levels_ask=depth_levels_ask,
                 )
 
             # 4. Lighter Core & Lighter Robinhood Books + Market Stats
@@ -1183,9 +1218,9 @@ def normalize_capture(
             elif raw_source in ("hyperliquid", "hyperliquid_snapshot"):
                 is_snap = raw_source == "hyperliquid_snapshot"
                 data = payload["data"]
-                mkt = data["coin"]
-                venue, domain = classify_venue_domain(raw_source, mkt)
                 chan = payload.get("channel", "")
+                mkt = str(data.get("coin") or market or "") if chan == "bbo" else data["coin"]
+                venue, domain = classify_venue_domain(raw_source, mkt)
                 if chan == "l2Book":
                     lvls = data["levels"]
                     bids = [(parse_positive_dec(item["px"]), parse_positive_dec(item["sz"])) for item in lvls[0]]
@@ -1216,6 +1251,37 @@ def normalize_capture(
                         ask_sz=ask_sz,
                         depth_levels_bid=len(bids),
                         depth_levels_ask=len(asks),
+                    )
+                elif chan == "bbo" and not is_snap:
+                    bbo = data.get("bbo")
+                    if not isinstance(bbo, (list, tuple)) or len(bbo) != 2:
+                        raise ValueError("invalid Hyperliquid bbo payload")
+                    bid_px, bid_sz = _parse_bbo_side(bbo[0], "px", "sz")
+                    ask_px, ask_sz = _parse_bbo_side(bbo[1], "px", "sz")
+                    src_ms = int(data["time"]) if data.get("time") is not None else None
+                    _emit_bbo_row(
+                        emit,
+                        campaign_id=campaign_id,
+                        collector_region=collector_region,
+                        venue=venue,
+                        domain=domain,
+                        raw_source=raw_source,
+                        market=mkt,
+                        transport="ws",
+                        sequence=seq,
+                        available_at_ms=avail_ms,
+                        received_at_ms=received_ms,
+                        available_wall_ns=avail_wall_ns,
+                        receipt_wall_ns=receipt_wall_ns,
+                        source_time_ms=src_ms,
+                        raw_source_time=src_ms,
+                        venue_seq=None,
+                        bid_px=bid_px,
+                        bid_sz=bid_sz,
+                        ask_px=ask_px,
+                        ask_sz=ask_sz,
+                        depth_levels_bid=1 if bid_px is not None else 0,
+                        depth_levels_ask=1 if ask_px is not None else 0,
                     )
                 elif chan == "activeAssetCtx" and not is_snap:
                     ctx = data["ctx"]
