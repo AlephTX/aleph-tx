@@ -373,6 +373,7 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
                 "allowlisted_symbols": cfg.allowlisted_symbols,
                 "arms": cfg.arms.len(),
+                "defense_enabled": cfg.defense.is_some(),
             }))
         }
         TrackKind::Track02 => {
@@ -384,6 +385,7 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "capital_usd": cfg.capital_usd,
                 "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
                 "pairs": cfg.pairs.len(),
+                "defense_enabled": cfg.defense.is_some(),
             }))
         }
         TrackKind::Track03 => {
@@ -396,6 +398,7 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
                 "allowlisted_symbols": cfg.allowlisted_symbols,
                 "arms": cfg.arms.len(),
+                "defense_enabled": cfg.defense.is_some(),
             }))
         }
     }
@@ -1292,8 +1295,46 @@ mode = "passive_inventory_cycle"
             serialized["arms"][0]["account_fee_status"],
             "public_tier0_unverified"
         );
+        assert_eq!(serialized["defense_state_transitions"], 0);
+        assert_eq!(serialized["defense_blocked_entries"], 0);
 
         fs::remove_file(cfg_path).unwrap();
         fs::remove_file(replay_path).unwrap();
+    }
+
+    #[test]
+    fn all_four_example_shadow_configs_pass_check() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let t1 = run_check(
+            TrackKind::Track01,
+            &manifest_dir.join("examples/track01_lead_lag_shadow.toml"),
+        )
+        .unwrap();
+        assert_eq!(t1["status"], "Configuration OK");
+        assert_eq!(t1["defense_enabled"], false);
+
+        let t2 = run_check(
+            TrackKind::Track02,
+            &manifest_dir.join("examples/track02_shielded_maker_hedge_shadow.toml"),
+        )
+        .unwrap();
+        assert_eq!(t2["status"], "Configuration OK");
+        assert_eq!(t2["defense_enabled"], false);
+
+        let t3_legacy = run_check(
+            TrackKind::Track03,
+            &manifest_dir.join("examples/track03_queue_priority_mm_shadow.toml"),
+        )
+        .unwrap();
+        assert_eq!(t3_legacy["status"], "Configuration OK");
+        assert_eq!(t3_legacy["defense_enabled"], false);
+
+        let t3_rh = run_check(
+            TrackKind::Track03,
+            &manifest_dir.join("examples/track03_lighter_rh_standard_shadow.toml"),
+        )
+        .unwrap();
+        assert_eq!(t3_rh["status"], "Configuration OK");
+        assert_eq!(t3_rh["defense_enabled"], true);
     }
 }

@@ -6,8 +6,13 @@
 //! [`DailyLossGuard`] circuit breakers, and reports (`AGENTS.md` non-cross-subsidy contract).
 
 use crate::daily_loss::DailyLossGuard;
+use crate::order_budget::OrderIntentClass;
 use crate::strategy::basis_maker_hedge::{
     FillSide, MakerHedgeQuoter, MakerHedgeQuoterConfig, MakerHedgeQuotes, ShieldedPairEconomics,
+};
+use crate::strategy::defense_fsm::{
+    DefenseFsm, DefenseFsmConfig, DefenseSide, DefenseState, DefenseTelemetrySnapshot,
+    ResetBlockedReason,
 };
 use crate::strategy::lead_lag_taker::{
     LeadLagAction, LeadLagSide, LeadLagTaker, LeadLagTakerConfig,
@@ -65,6 +70,7 @@ struct VenueFeedTracker {
     last_now_ms: Option<u64>,
     last_recv_ms: Option<u64>,
     samples: u64,
+    last_gap_ms: u64,
     max_gap_ms: u64,
     stale_book_drops: u64,
     clock_regression_drops: u64,
@@ -109,15 +115,19 @@ impl VenueFeedTracker {
         if now_ms - recv_ms > max_age_ms {
             self.stale_book_drops += 1;
             if let Some(prev_recv) = self.last_recv_ms {
-                self.max_gap_ms = self.max_gap_ms.max(now_ms - prev_recv);
+                let gap = now_ms - prev_recv;
+                self.last_gap_ms = gap;
+                self.max_gap_ms = self.max_gap_ms.max(gap);
             }
             self.last_now_ms = Some(now_ms);
             return FeedObservation::Stale;
         }
-        if let Some(prev_recv) = self.last_recv_ms
-            && recv_ms > prev_recv
-        {
-            self.max_gap_ms = self.max_gap_ms.max(recv_ms - prev_recv);
+        if let Some(prev_recv) = self.last_recv_ms {
+            let gap = recv_ms.saturating_sub(prev_recv);
+            self.last_gap_ms = gap;
+            if gap > 0 {
+                self.max_gap_ms = self.max_gap_ms.max(gap);
+            }
         }
         self.last_recv_ms = Some(recv_ms);
         self.last_now_ms = Some(now_ms);
@@ -133,10 +143,12 @@ impl VenueFeedTracker {
             self.clock_regression_drops += 1;
             return;
         }
-        if let Some(prev_now) = self.last_now_ms
-            && now_ms > prev_now
-        {
-            self.max_gap_ms = self.max_gap_ms.max(now_ms - prev_now);
+        if let Some(prev_now) = self.last_now_ms {
+            let gap = now_ms.saturating_sub(prev_now);
+            self.last_gap_ms = gap;
+            if gap > 0 {
+                self.max_gap_ms = self.max_gap_ms.max(gap);
+            }
         }
         self.last_now_ms = Some(now_ms);
         self.samples += 1;
@@ -259,6 +271,8 @@ pub struct Track01ShadowConfig {
     pub daily_loss_state_path: Option<PathBuf>,
     pub allowlisted_symbols: Vec<String>,
     pub arms: Vec<Track01ArmShadowConfig>,
+    #[serde(default)]
+    pub defense: Option<DefenseFsmConfig>,
 }
 
 impl Default for Track01ShadowConfig {
@@ -269,6 +283,7 @@ impl Default for Track01ShadowConfig {
             daily_loss_state_path: None,
             allowlisted_symbols: Vec::new(),
             arms: Vec::new(),
+            defense: None,
         }
     }
 }
@@ -276,6 +291,9 @@ impl Default for Track01ShadowConfig {
 impl Track01ShadowConfig {
     /// Validate capital, loss limits, allowlist membership, unique symbol IDs, and arm strategies.
     pub fn validate(&self) -> Result<()> {
+        if let Some(ref defense_cfg) = self.defense {
+            defense_cfg.validate()?;
+        }
         ensure!(
             self.capital_usd.is_finite() && self.capital_usd > 0.0,
             "capital_usd must be finite and > 0"
@@ -466,6 +484,10 @@ pub struct Track01ShadowReport {
     pub blocks: u64,
     pub risk_scale: f64,
     pub halted: bool,
+    pub defense_state_transitions: u64,
+    pub defense_blocked_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defense_state: Option<DefenseState>,
     pub max_gap_ms: u64,
     pub stale_book_drops: u64,
     pub clock_regression_drops: u64,
@@ -480,6 +502,8 @@ pub struct Track01ShadowSession {
     arms: Vec<Track01ArmRuntime>,
     arm_by_symbol_id: HashMap<u16, usize>,
     daily_loss: DailyLossGuard,
+    defense: Option<DefenseFsm>,
+    defense_blocked_entries: u64,
     halted: bool,
     peak_equity_usd: f64,
     max_drawdown_usd: f64,
@@ -488,6 +512,7 @@ pub struct Track01ShadowSession {
 impl Track01ShadowSession {
     pub fn new(cfg: Track01ShadowConfig, initial_utc_day: i32) -> Result<Self> {
         cfg.validate()?;
+        let defense = cfg.defense.map(DefenseFsm::new).transpose()?;
         let daily_loss = DailyLossGuard::open(
             cfg.daily_loss_state_path.clone(),
             cfg.daily_loss_limit_pct,
@@ -521,6 +546,8 @@ impl Track01ShadowSession {
             arms,
             arm_by_symbol_id,
             daily_loss,
+            defense,
+            defense_blocked_entries: 0,
             halted: false,
             max_drawdown_usd: 0.0,
         })
@@ -532,6 +559,20 @@ impl Track01ShadowSession {
 
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    pub fn defense_state(&self) -> Option<DefenseState> {
+        self.defense.as_ref().map(DefenseFsm::state)
+    }
+
+    pub fn acknowledge_defense_reset(
+        &mut self,
+        snapshot: &DefenseTelemetrySnapshot,
+    ) -> std::result::Result<DefenseState, ResetBlockedReason> {
+        match self.defense.as_mut() {
+            Some(fsm) => fsm.acknowledge_reconciled_reset(snapshot),
+            None => Err(ResetBlockedReason::NotHalted),
+        }
     }
 
     pub fn arm_ids(&self) -> impl Iterator<Item = (u16, u8, u8)> + '_ {
@@ -680,10 +721,59 @@ impl Track01ShadowSession {
         } else {
             self.daily_loss.risk_scale()
         };
+        let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
+        if self.defense.is_some() {
+            let arm_ref = &self.arms[arm_idx];
+            let confirm_stale = confirm_touch.map_or(0, |ct| now_ms.saturating_sub(ct.recv_ms));
+            let confirm_gap = arm_ref.confirm_ref_feed.map_or(0, |f| f.last_gap_ms);
+            let feed_staleness_ms = now_ms
+                .saturating_sub(ref_touch.recv_ms)
+                .max(now_ms.saturating_sub(tgt_touch.recv_ms))
+                .max(confirm_stale);
+            let feed_gap_ms = arm_ref
+                .ref_feed
+                .last_gap_ms
+                .max(arm_ref.tgt_feed.last_gap_ms)
+                .max(confirm_gap);
+            let vol_shock_ratio =
+                (arm_ref.engine.sigma_1s_bps() / arm_ref.cfg.strategy.theta_bps.max(1e-6)).max(0.0);
+            let oracle_divergence_bps = arm_ref.engine.last_dev_bps().unwrap_or(0.0).abs();
+            let clock_regressed_externally = ref_obs == FeedObservation::ClockRegressed
+                || tgt_obs == FeedObservation::ClockRegressed
+                || confirm_obs == Some(FeedObservation::ClockRegressed);
+            let snap = DefenseTelemetrySnapshot {
+                now_ms,
+                feed_staleness_ms,
+                feed_gap_ms,
+                vol_shock_ratio,
+                trailing_bid_markout_bps: 0.0,
+                trailing_ask_markout_bps: 0.0,
+                oracle_divergence_bps,
+                daily_loss_utilization: dl_util,
+                budget_cooldown_active: false,
+                budget_halted: false,
+                clock_regressed_externally,
+            };
+            if let Some(ref mut fsm) = self.defense {
+                fsm.evaluate(&snap);
+            }
+        }
+        let mut defense_blocked_entry = false;
         let arm = &mut self.arms[arm_idx];
         let mut emitted = action;
         match action {
             LeadLagAction::Enter { side, .. } => {
+                let def_side = match side {
+                    LeadLagSide::Long => DefenseSide::Buy,
+                    LeadLagSide::Short => DefenseSide::Sell,
+                };
+                let defense_scale = self.defense.as_ref().map_or(1.0, |fsm| {
+                    if fsm.permits_intent(OrderIntentClass::RiskIncreasingEntry, Some(def_side)) {
+                        fsm.entry_size_scale(Some(def_side))
+                    } else {
+                        0.0
+                    }
+                });
                 let entry_l1_usd = match side {
                     LeadLagSide::Long => tgt_touch.ask * tgt_ask_sz,
                     LeadLagSide::Short => tgt_touch.bid * tgt_bid_sz,
@@ -692,8 +782,13 @@ impl Track01ShadowSession {
                     .cfg
                     .clip_usd
                     .min(arm.cfg.max_l1_depth_fraction * entry_l1_usd);
-                let notional = capped * risk_scale;
-                if self.halted
+                let notional = capped * risk_scale * defense_scale;
+                if defense_scale <= 0.0 {
+                    defense_blocked_entry = true;
+                    arm.engine.clear_position();
+                    arm.skips += 1;
+                    emitted = LeadLagAction::Idle;
+                } else if self.halted
                     || ref_obs != FeedObservation::Fresh
                     || tgt_obs != FeedObservation::Fresh
                     || !tgt_touch.valid()
@@ -731,6 +826,9 @@ impl Track01ShadowSession {
             LeadLagAction::Idle | LeadLagAction::QuotePassiveExit { .. } => {}
         }
 
+        if defense_blocked_entry {
+            self.defense_blocked_entries += 1;
+        }
         self.check_equity_and_drawdown(utc_day);
         Ok(Some(emitted))
     }
@@ -805,6 +903,9 @@ impl Track01ShadowSession {
                 self.daily_loss.risk_scale()
             },
             halted: self.halted,
+            defense_state_transitions: self.defense.as_ref().map_or(0, DefenseFsm::transitions),
+            defense_blocked_entries: self.defense_blocked_entries,
+            defense_state: self.defense.as_ref().map(DefenseFsm::state),
             max_gap_ms,
             stale_book_drops,
             clock_regression_drops,
@@ -866,6 +967,8 @@ pub struct Track02ShadowConfig {
     pub daily_loss_limit_pct: f64,
     pub daily_loss_state_path: Option<PathBuf>,
     pub pairs: Vec<Track02PairShadowConfig>,
+    #[serde(default)]
+    pub defense: Option<DefenseFsmConfig>,
 }
 
 impl Default for Track02ShadowConfig {
@@ -875,6 +978,7 @@ impl Default for Track02ShadowConfig {
             daily_loss_limit_pct: 0.02,
             daily_loss_state_path: None,
             pairs: Vec::new(),
+            defense: None,
         }
     }
 }
@@ -882,6 +986,9 @@ impl Default for Track02ShadowConfig {
 impl Track02ShadowConfig {
     /// Validate capital, loss limits, fail-closed shield enforcement, and pair economics.
     pub fn validate(&self) -> Result<()> {
+        if let Some(ref defense_cfg) = self.defense {
+            defense_cfg.validate()?;
+        }
         ensure!(
             self.capital_usd.is_finite() && self.capital_usd > 0.0,
             "capital_usd must be finite and > 0"
@@ -1180,6 +1287,10 @@ pub struct Track02ShadowReport {
     pub unhedged_stale_halts: u64,
     pub risk_scale: f64,
     pub halted: bool,
+    pub defense_state_transitions: u64,
+    pub defense_blocked_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defense_state: Option<DefenseState>,
     pub max_gap_ms: u64,
     pub stale_book_drops: u64,
     pub clock_regression_drops: u64,
@@ -1194,6 +1305,8 @@ pub struct Track02ShadowSession {
     pairs: Vec<Track02PairRuntime>,
     pair_by_symbol_id: HashMap<u16, usize>,
     daily_loss: DailyLossGuard,
+    defense: Option<DefenseFsm>,
+    defense_blocked_entries: u64,
     fill_evidence_mode: &'static str,
     halted: bool,
     peak_equity_usd: f64,
@@ -1203,6 +1316,7 @@ pub struct Track02ShadowSession {
 impl Track02ShadowSession {
     pub fn new(cfg: Track02ShadowConfig, initial_utc_day: i32) -> Result<Self> {
         cfg.validate()?;
+        let defense = cfg.defense.map(DefenseFsm::new).transpose()?;
         let daily_loss = DailyLossGuard::open(
             cfg.daily_loss_state_path.clone(),
             cfg.daily_loss_limit_pct,
@@ -1244,6 +1358,8 @@ impl Track02ShadowSession {
             pairs,
             pair_by_symbol_id,
             daily_loss,
+            defense,
+            defense_blocked_entries: 0,
             fill_evidence_mode: "public_trade_prints",
             halted: false,
             max_drawdown_usd: 0.0,
@@ -1268,6 +1384,20 @@ impl Track02ShadowSession {
 
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    pub fn defense_state(&self) -> Option<DefenseState> {
+        self.defense.as_ref().map(DefenseFsm::state)
+    }
+
+    pub fn acknowledge_defense_reset(
+        &mut self,
+        snapshot: &DefenseTelemetrySnapshot,
+    ) -> std::result::Result<DefenseState, ResetBlockedReason> {
+        match self.defense.as_mut() {
+            Some(fsm) => fsm.acknowledge_reconciled_reset(snapshot),
+            None => Err(ResetBlockedReason::NotHalted),
+        }
     }
 
     pub fn pair_ids(&self) -> impl Iterator<Item = (u16, u8, u8, u8)> + '_ {
@@ -1432,6 +1562,30 @@ impl Track02ShadowSession {
             || hedge_obs == FeedObservation::ClockRegressed
         {
             self.check_equity_and_drawdown(utc_day);
+            let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
+            if let Some(ref mut fsm) = self.defense {
+                let p = &self.pairs[idx];
+                fsm.evaluate(&DefenseTelemetrySnapshot {
+                    now_ms,
+                    feed_staleness_ms: now_ms
+                        .saturating_sub(maker.recv_ms)
+                        .max(now_ms.saturating_sub(hedge.recv_ms)),
+                    feed_gap_ms: p.maker_feed.last_gap_ms.max(p.hedge_feed.last_gap_ms),
+                    vol_shock_ratio: (p.quoter.basis_sigma_bps() / p.cfg.strategy.e0_bps.max(1e-6))
+                        .max(0.0),
+                    trailing_bid_markout_bps: 0.0,
+                    trailing_ask_markout_bps: 0.0,
+                    oracle_divergence_bps: p
+                        .ref_tracker
+                        .return_bps(now_ms, &p.cfg.strategy)
+                        .unwrap_or(0.0)
+                        .abs(),
+                    daily_loss_utilization: dl_util,
+                    budget_cooldown_active: false,
+                    budget_halted: false,
+                    clock_regressed_externally: true,
+                });
+            }
             self.pairs[idx].latest_quotes = None;
             return Ok(None);
         }
@@ -1451,9 +1605,41 @@ impl Track02ShadowSession {
             }
         };
         self.check_equity_and_drawdown(utc_day);
+        let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
+        if self.defense.is_some() {
+            let pair_ref = &self.pairs[idx];
+            let snap = DefenseTelemetrySnapshot {
+                now_ms,
+                feed_staleness_ms: now_ms
+                    .saturating_sub(maker.recv_ms)
+                    .max(now_ms.saturating_sub(hedge.recv_ms)),
+                feed_gap_ms: pair_ref
+                    .maker_feed
+                    .last_gap_ms
+                    .max(pair_ref.hedge_feed.last_gap_ms),
+                vol_shock_ratio: (pair_ref.quoter.basis_sigma_bps()
+                    / pair_ref.cfg.strategy.e0_bps.max(1e-6))
+                .max(0.0),
+                trailing_bid_markout_bps: 0.0,
+                trailing_ask_markout_bps: 0.0,
+                oracle_divergence_bps: pair_ref
+                    .ref_tracker
+                    .return_bps(now_ms, &pair_ref.cfg.strategy)
+                    .unwrap_or(0.0)
+                    .abs(),
+                daily_loss_utilization: dl_util,
+                budget_cooldown_active: false,
+                budget_halted: false,
+                clock_regressed_externally: false,
+            };
+            if let Some(ref mut fsm) = self.defense {
+                fsm.evaluate(&snap);
+            }
+        }
 
+        let mut defense_blocked = 0_u64;
         let pair = &mut self.pairs[idx];
-        let Ok(quotes) = step_res else {
+        let Ok(mut quotes) = step_res else {
             pair.latest_quotes = None;
             return Ok(None);
         };
@@ -1467,7 +1653,32 @@ impl Track02ShadowSession {
             pair.latest_quotes = None;
             return Ok(None);
         }
+        if let Some(ref fsm) = self.defense {
+            let bid_is_reduce = pair.inventory_clips < -1e-9;
+            let ask_is_reduce = pair.inventory_clips > 1e-9;
+            if quotes.bid.is_some() && !bid_is_reduce {
+                let allowed = fsm.permits_intent(
+                    OrderIntentClass::RiskIncreasingEntry,
+                    Some(DefenseSide::Buy),
+                );
+                if !allowed {
+                    quotes.bid = None;
+                    defense_blocked += 1;
+                }
+            }
+            if quotes.ask.is_some() && !ask_is_reduce {
+                let allowed = fsm.permits_intent(
+                    OrderIntentClass::RiskIncreasingEntry,
+                    Some(DefenseSide::Sell),
+                );
+                if !allowed {
+                    quotes.ask = None;
+                    defense_blocked += 1;
+                }
+            }
+        }
         pair.latest_quotes = Some(quotes);
+        self.defense_blocked_entries += defense_blocked;
         Ok(Some(quotes))
     }
 
@@ -1759,6 +1970,9 @@ impl Track02ShadowSession {
                 self.daily_loss.risk_scale()
             },
             halted: self.halted,
+            defense_state_transitions: self.defense.as_ref().map_or(0, DefenseFsm::transitions),
+            defense_blocked_entries: self.defense_blocked_entries,
+            defense_state: self.defense.as_ref().map(DefenseFsm::state),
             max_gap_ms,
             stale_book_drops,
             clock_regression_drops,
@@ -1897,6 +2111,8 @@ pub struct Track03ShadowConfig {
     pub daily_loss_state_path: Option<PathBuf>,
     pub allowlisted_symbols: Vec<String>,
     pub arms: Vec<Track03ArmShadowConfig>,
+    #[serde(default)]
+    pub defense: Option<DefenseFsmConfig>,
 }
 
 impl Default for Track03ShadowConfig {
@@ -1907,6 +2123,7 @@ impl Default for Track03ShadowConfig {
             daily_loss_state_path: None,
             allowlisted_symbols: Vec::new(),
             arms: Vec::new(),
+            defense: None,
         }
     }
 }
@@ -1914,6 +2131,9 @@ impl Default for Track03ShadowConfig {
 impl Track03ShadowConfig {
     /// Validate capital, loss limits, allowlist, unique symbol IDs, fee invariants, and G4 configs.
     pub fn validate(&self) -> Result<()> {
+        if let Some(ref defense_cfg) = self.defense {
+            defense_cfg.validate()?;
+        }
         ensure!(
             self.capital_usd.is_finite() && self.capital_usd > 0.0,
             "capital_usd must be finite and > 0"
@@ -2441,6 +2661,10 @@ pub struct Track03ShadowReport {
     pub session_gated_ticks: u64,
     pub risk_scale: f64,
     pub halted: bool,
+    pub defense_state_transitions: u64,
+    pub defense_blocked_entries: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defense_state: Option<DefenseState>,
     pub max_gap_ms: u64,
     pub stale_book_drops: u64,
     pub clock_regression_drops: u64,
@@ -2455,6 +2679,8 @@ pub struct Track03ShadowSession {
     arms: Vec<Track03ArmRuntime>,
     arm_by_symbol_id: HashMap<u16, usize>,
     daily_loss: DailyLossGuard,
+    defense: Option<DefenseFsm>,
+    defense_blocked_entries: u64,
     fill_evidence_mode: &'static str,
     halted: bool,
     peak_equity_usd: f64,
@@ -2464,6 +2690,7 @@ pub struct Track03ShadowSession {
 impl Track03ShadowSession {
     pub fn new(cfg: Track03ShadowConfig, initial_utc_day: i32) -> Result<Self> {
         cfg.validate()?;
+        let defense = cfg.defense.map(DefenseFsm::new).transpose()?;
         let daily_loss = DailyLossGuard::open(
             cfg.daily_loss_state_path.clone(),
             cfg.daily_loss_limit_pct,
@@ -2534,6 +2761,8 @@ impl Track03ShadowSession {
             arms,
             arm_by_symbol_id,
             daily_loss,
+            defense,
+            defense_blocked_entries: 0,
             fill_evidence_mode: "public_trade_prints",
             halted: false,
             max_drawdown_usd: 0.0,
@@ -2558,6 +2787,20 @@ impl Track03ShadowSession {
 
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    pub fn defense_state(&self) -> Option<DefenseState> {
+        self.defense.as_ref().map(DefenseFsm::state)
+    }
+
+    pub fn acknowledge_defense_reset(
+        &mut self,
+        snapshot: &DefenseTelemetrySnapshot,
+    ) -> std::result::Result<DefenseState, ResetBlockedReason> {
+        match self.defense.as_mut() {
+            Some(fsm) => fsm.acknowledge_reconciled_reset(snapshot),
+            None => Err(ResetBlockedReason::NotHalted),
+        }
     }
 
     pub fn arm_ids(&self) -> impl Iterator<Item = (u16, u8, &[u8])> + '_ {
@@ -2727,6 +2970,28 @@ impl Track03ShadowSession {
         if obs != FeedObservation::Fresh {
             self.arms[idx].clear_all_resting();
             self.check_equity_and_drawdown(utc_day);
+            let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
+            if let Some(ref mut fsm) = self.defense {
+                let arm_ref = &self.arms[idx];
+                let tel = arm_ref.engine.telemetry();
+                let vol_shock_ratio = match arm_ref.cfg.strategy.quiet_regime_max_entry_vol_bps {
+                    Some(max_v) if max_v > 0.0 => tel.sigma_bps_per_sqrt_s / max_v,
+                    _ => tel.sigma_bps_per_sqrt_s,
+                };
+                fsm.evaluate(&DefenseTelemetrySnapshot {
+                    now_ms,
+                    feed_staleness_ms: now_ms.saturating_sub(recv_ms),
+                    feed_gap_ms: arm_ref.target_feed.last_gap_ms,
+                    vol_shock_ratio: vol_shock_ratio.max(0.0),
+                    trailing_bid_markout_bps: tel.bid_markout_ewma_bps,
+                    trailing_ask_markout_bps: tel.ask_markout_ewma_bps,
+                    oracle_divergence_bps: tel.lead_gap_bps.abs(),
+                    daily_loss_utilization: dl_util,
+                    budget_cooldown_active: false,
+                    budget_halted: false,
+                    clock_regressed_externally: obs == FeedObservation::ClockRegressed,
+                });
+            }
             return Ok(None);
         }
 
@@ -2761,8 +3026,18 @@ impl Track03ShadowSession {
         };
         let session = classify_utc_session(now_ms);
         let session_halted = self.halted;
+        let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
 
-        let (placed, cancelled, kept, taker_exited, sess_blocked, resting_orders, arm_halted) = {
+        let (
+            placed,
+            cancelled,
+            kept,
+            taker_exited,
+            sess_blocked,
+            resting_orders,
+            arm_halted,
+            defense_blocked_entries,
+        ) = {
             let arm = &mut self.arms[idx];
             let sess_blocked = !arm.session_allows(session);
             if sess_blocked {
@@ -2782,6 +3057,32 @@ impl Track03ShadowSession {
                 inv,
                 now_ms,
             );
+
+            if let Some(ref mut fsm) = self.defense {
+                let tel = arm.engine.telemetry();
+                let vol_base = arm
+                    .cfg
+                    .strategy
+                    .quiet_regime_max_entry_vol_bps
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or_else(|| arm.cfg.strategy.lead_cancel_threshold_bps.max(1.0));
+                let vol_shock_ratio = (tel.sigma_bps_per_sqrt_s / vol_base).max(0.0);
+                fsm.evaluate(&DefenseTelemetrySnapshot {
+                    now_ms,
+                    feed_staleness_ms: now_ms.saturating_sub(recv_ms),
+                    feed_gap_ms: arm.target_feed.last_gap_ms,
+                    vol_shock_ratio,
+                    trailing_bid_markout_bps: tel.bid_markout_ewma_bps,
+                    trailing_ask_markout_bps: tel.ask_markout_ewma_bps,
+                    oracle_divergence_bps: tel.lead_gap_bps.abs(),
+                    daily_loss_utilization: dl_util,
+                    budget_cooldown_active: false,
+                    budget_halted: false,
+                    clock_regressed_externally: false,
+                });
+            }
+            let defense_ref = self.defense.as_ref();
+            let mut defense_blocked_entries = 0_u64;
 
             let mut placed = 0_usize;
             let mut cancelled = 0_usize;
@@ -2816,10 +3117,24 @@ impl Track03ShadowSession {
                             let qty = arm.scratch_resting[pos].qty;
                             let meta = arm.resting_meta[pos];
                             let is_pure_reduce = arm.is_pure_reducing_order(side, qty, meta);
-                            if suppress_openings && !is_pure_reduce {
+                            let def_side = match side {
+                                QuoteSide::Bid => DefenseSide::Buy,
+                                QuoteSide::Ask => DefenseSide::Sell,
+                            };
+                            let defense_blocks_keep = !is_pure_reduce
+                                && defense_ref.is_some_and(|fsm| {
+                                    !fsm.permits_intent(
+                                        OrderIntentClass::RiskIncreasingEntry,
+                                        Some(def_side),
+                                    )
+                                });
+                            if (suppress_openings && !is_pure_reduce) || defense_blocks_keep {
                                 arm.remove_resting_at(pos);
                                 arm.cancels += 1;
                                 cancelled += 1;
+                                if defense_blocks_keep {
+                                    defense_blocked_entries += 1;
+                                }
                             } else {
                                 arm.resting_meta[pos].reduce_only = is_pure_reduce;
                                 arm.queue_preserved += 1;
@@ -2837,6 +3152,19 @@ impl Track03ShadowSession {
                         if !reduce_only && suppress_openings {
                             continue;
                         }
+                        let def_side = match side {
+                            QuoteSide::Bid => DefenseSide::Buy,
+                            QuoteSide::Ask => DefenseSide::Sell,
+                        };
+                        let defense_scale = if reduce_only {
+                            1.0
+                        } else {
+                            defense_ref.map_or(1.0, |fsm| fsm.entry_size_scale(Some(def_side)))
+                        };
+                        if !reduce_only && defense_scale <= 0.0 {
+                            defense_blocked_entries += 1;
+                            continue;
+                        }
                         if arm.scratch_resting.len() >= TRACK03_MAX_RESTING {
                             continue;
                         }
@@ -2847,8 +3175,9 @@ impl Track03ShadowSession {
                         {
                             continue;
                         }
-                        let final_qty = if !reduce_only && risk_scale < 1.0 {
-                            quantize_down(qty * risk_scale, arm.cfg.strategy.lot_size)
+                        let combined_scale = risk_scale * defense_scale;
+                        let final_qty = if !reduce_only && combined_scale < 1.0 {
+                            quantize_down(qty * combined_scale, arm.cfg.strategy.lot_size)
                         } else {
                             qty
                         };
@@ -2955,9 +3284,11 @@ impl Track03ShadowSession {
                 sess_blocked,
                 arm.scratch_resting.len(),
                 arm.halted || session_halted,
+                defense_blocked_entries,
             )
         };
 
+        self.defense_blocked_entries += defense_blocked_entries;
         self.check_equity_and_drawdown(utc_day);
         Ok(Some(Track03StepOutcome {
             utc_session: session,
@@ -3371,6 +3702,9 @@ impl Track03ShadowSession {
                 self.daily_loss.risk_scale()
             },
             halted: self.halted,
+            defense_state_transitions: self.defense.as_ref().map_or(0, DefenseFsm::transitions),
+            defense_blocked_entries: self.defense_blocked_entries,
+            defense_state: self.defense.as_ref().map(DefenseFsm::state),
             max_gap_ms,
             stale_book_drops,
             clock_regression_drops,
@@ -3385,6 +3719,7 @@ impl Track03ShadowSession {
 mod tests {
     use super::*;
     use crate::strategy::basis_maker_hedge::RefCancelShieldConfig;
+    use crate::strategy::defense_fsm::BlockedSide;
 
     fn t1_cfg() -> Track01ShadowConfig {
         Track01ShadowConfig {
@@ -3410,6 +3745,7 @@ mod tests {
                     ..LeadLagTakerConfig::default()
                 },
             }],
+            defense: None,
         }
     }
 
@@ -3453,6 +3789,7 @@ mod tests {
                     ..MakerHedgeQuoterConfig::default()
                 },
             }],
+            defense: None,
         }
     }
 
@@ -4628,6 +4965,7 @@ mod tests {
                     ..QueuePriorityMmConfig::default()
                 },
             }],
+            defense: None,
         }
     }
 
@@ -5158,5 +5496,242 @@ mod tests {
         let expected_fee_cycle = 2.0 * rep2.taker_exit_share_s; // eff_maker=0, taker=2.0
         let expected_ds = ((expected_fee_cycle - rep2.gross_ex_fee_bps) / 2.0) * 100.0;
         assert!((rep2.double_sided_usd_per_m - expected_ds).abs() < 1e-6);
+    }
+
+    #[test]
+    fn track01_defense_fsm_throttles_caution_blocks_entries_and_preserves_exits() {
+        let mut cfg = t1_cfg();
+        cfg.arms[0].taker_fee_bps = 0.0;
+        cfg.arms[0].strategy.max_dev_bps = 120.0;
+        cfg.defense = Some(DefenseFsmConfig {
+            caution_oracle_divergence_bps: 8.0,
+            reduce_only_oracle_divergence_bps: 30.0,
+            halt_oracle_divergence_bps: 80.0,
+            caution_size_scale: 0.50,
+            min_dwell_ms: 5_000,
+            ..DefenseFsmConfig::default()
+        });
+        let mut s = Track01ShadowSession::new(cfg, utc_day_from_ms(1_000)).unwrap();
+        assert_eq!(s.defense_state(), Some(DefenseState::Normal));
+
+        let mut t = 1_000_u64;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        // +10 bp divergence (>= 8.0 caution threshold) -> Caution scales clip $500 * 0.50 = $250!
+        let act = s
+            .on_bbo_pair(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap();
+        assert!(matches!(act, Some(LeadLagAction::Enter { .. })));
+        assert_eq!(s.defense_state(), Some(DefenseState::Caution));
+        let r1 = s.report();
+        assert!((r1.arms[0].open_notional_usd - 250.0).abs() < 1e-6);
+        assert_eq!(r1.defense_state_transitions, 1);
+
+        // Divergence blows out (+40 bp >= 30.0 reduce_only threshold) while open -> escalates to ReduceOnly,
+        // yet exit at exit_due_ms MUST still succeed!
+        let exit_t = t + 1_200;
+        let exit_act = s
+            .on_bbo_pair(
+                1002,
+                exit_t,
+                ll_touch(100.39, 100.41, exit_t),
+                ll_touch(99.99, 100.01, exit_t),
+                10.0,
+                10.0,
+                utc_day_from_ms(exit_t),
+            )
+            .unwrap();
+        assert_eq!(
+            exit_act,
+            Some(LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            })
+        );
+        assert_eq!(s.defense_state(), Some(DefenseState::ReduceOnly));
+        assert_eq!(s.report().trades, 1);
+
+        // Next entry signal while still inside min_dwell_ms (ReduceOnly) is blocked!
+        let block_t = exit_t + 100;
+        let blocked = s
+            .on_bbo_pair(
+                1002,
+                block_t,
+                ll_touch(100.09, 100.11, block_t),
+                ll_touch(99.99, 100.01, block_t),
+                10.0,
+                10.0,
+                utc_day_from_ms(block_t),
+            )
+            .unwrap();
+        assert_eq!(blocked, Some(LeadLagAction::Idle));
+        let r2 = s.report();
+        assert!(r2.defense_blocked_entries >= 1);
+        assert_eq!(r2.defense_state_transitions, 2);
+        assert_eq!(r2.defense_state, Some(DefenseState::ReduceOnly));
+    }
+
+    #[test]
+    fn track02_defense_fsm_blocks_opening_quotes_and_preserves_reducing_leg() {
+        let mut cfg = t2_cfg();
+        cfg.defense = Some(DefenseFsmConfig {
+            reduce_only_feed_staleness_ms: 3_000,
+            halt_feed_staleness_ms: 10_000,
+            min_dwell_ms: 5_000,
+            ..DefenseFsmConfig::default()
+        });
+        let (mut s, mut t, q) = warm_track02_session(cfg);
+        let bid = q.bid.expect("bid should quote");
+
+        // Fill maker bid to carry +1.0 clip long inventory (ask is reduce-only, bid is opening).
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                bid - 0.01,
+                10.0,
+                false,
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        assert!(s.report().pairs[0].inventory_clips > 0.0);
+
+        // Stale hedge book (now_ms - hedge.recv_ms = 3_500 >= 3_000 reduce_only threshold, < 5_000 max_book_age_ms):
+        // DefenseFsm escalates to ReduceOnly -> opening bid MUST be blocked while reducing ask MUST remain!
+        t += 3_500;
+        s.on_reference_mid(1002, t - 20, 100.0);
+        s.on_reference_mid(1002, t, 100.0);
+        let q_def = s
+            .on_pair_books(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t - 3_500),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.defense_state(), Some(DefenseState::ReduceOnly));
+        assert_eq!(q_def.bid, None, "opening bid must be blocked in ReduceOnly");
+        assert!(
+            q_def.ask.is_some(),
+            "reducing ask must stay active in ReduceOnly"
+        );
+        let rep = s.report();
+        assert!(rep.defense_state_transitions >= 1);
+        assert!(rep.defense_blocked_entries >= 1);
+    }
+
+    #[test]
+    fn track03_defense_fsm_enforces_side_defense_halt_reset_and_preserves_exits() {
+        let mut cfg = t3_cfg();
+        cfg.arms[0].strategy.quiet_regime_max_entry_vol_bps = None;
+        cfg.arms[0].strategy.quiet_regime_min_spread_to_vol = 0.0;
+        cfg.arms[0].strategy.markout_shield_adverse_threshold_bps = 0.0;
+        cfg.defense = Some(DefenseFsmConfig {
+            side_defense_adverse_markout_bps: 1.5,
+            reduce_only_adverse_markout_bps: 8.0,
+            caution_vol_shock_ratio: 25.0,
+            reduce_only_vol_shock_ratio: 50.0,
+            halt_vol_shock_ratio: 100.0,
+            halt_feed_staleness_ms: 4_500,
+            min_dwell_ms: 2_000,
+            ..DefenseFsmConfig::default()
+        });
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        // Seed Bid & Ask resting at 99.98 / 100.02.
+        let out0 = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out0.resting_orders, 2);
+
+        // Fill Bid at 99.98; then drop mid sharply to 99.84 (-14 bps) after 1.1s so bid_markout_ewma_bps <= -1.5 bps!
+        assert!(
+            s.on_trade_print(1006, t0 + 50, 99.97, 20.0, false, t0 + 50, day)
+                .unwrap()
+        );
+        let t1 = t0 + 1_200;
+        let out1 = s
+            .on_target_bbo(1006, t1, t3_touch(99.82, 99.86, 20.0, t1), day)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            s.defense_state(),
+            Some(DefenseState::SideDefense {
+                blocked_side: BlockedSide::Buy
+            })
+        ));
+        // Long inventory (>0): opening Bid blocked by SideDefense{Buy}, reducing Ask stays resting!
+        assert_eq!(out1.resting_orders, 1);
+        assert_eq!(s.arms[0].scratch_resting[0].side, QuoteSide::Ask);
+        assert!(s.arms[0].resting_meta[0].reduce_only);
+
+        // Stale target book (> 5000ms max_book_age_ms and >= 4500ms halt_feed_staleness_ms)
+        // triggers Halt in DefenseFsm while clearing resting quotes fail-closed.
+        let t_halt = t1 + 5_100;
+        assert!(
+            s.on_target_bbo(1006, t_halt, t3_touch(99.82, 99.86, 20.0, t1), day)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(s.defense_state(), Some(DefenseState::Halt));
+
+        // Fresh tick alone does NOT auto-clear Halt!
+        let t_rec = t_halt + 3_000;
+        let out_halted = s
+            .on_target_bbo(1006, t_rec, t3_touch(99.82, 99.86, 20.0, t_rec), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.defense_state(), Some(DefenseState::Halt));
+        // Taker ReduceOnlyIoc exit (max_inventory_hold_ms) or reduce-only ask still allowed even in Halt!
+        assert!(out_halted.taker_exited || out_halted.resting_orders <= 1);
+
+        // Explicit reconciled reset lifts Halt -> Normal once dwell elapsed and snapshot healthy.
+        let reset_snap = DefenseTelemetrySnapshot {
+            now_ms: t_rec + 100,
+            feed_staleness_ms: 0,
+            feed_gap_ms: 100,
+            vol_shock_ratio: 1.0,
+            trailing_bid_markout_bps: 0.0,
+            trailing_ask_markout_bps: 0.0,
+            oracle_divergence_bps: 0.0,
+            daily_loss_utilization: 0.0,
+            budget_cooldown_active: false,
+            budget_halted: false,
+            clock_regressed_externally: false,
+        };
+        assert_eq!(
+            s.acknowledge_defense_reset(&reset_snap),
+            Ok(DefenseState::Normal)
+        );
+        assert_eq!(s.defense_state(), Some(DefenseState::Normal));
+        let rep = s.report();
+        assert!(rep.defense_state_transitions >= 3);
+        assert!(rep.defense_blocked_entries >= 1);
     }
 }
