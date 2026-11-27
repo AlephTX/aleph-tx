@@ -25,6 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from track_fee_evidence import (  # noqa: E402
     VENUE_CAPABILITY_SNAPSHOT_VERSION,
     _confirmed_account_pair,
+    _parse_verified_domain_overrides,
 )
 
 BPS_TO_DECIMAL = 1e-4
@@ -181,71 +182,101 @@ def load_fee_profiles_from_evidence(evidence_path: Path) -> list[VenueFeeProfile
     for venue_name, payload in venues.items():
         if not isinstance(payload, dict):
             raise ValueError(f"Expected dict venue record for {venue_name!r} in {evidence_path}")
-        _confirmed_account_pair(payload, str(venue_name))
+        vname = str(venue_name)
+        _confirmed_account_pair(payload, vname)
+        _parse_verified_domain_overrides(payload, vname)
 
     out: list[VenueFeeProfile] = []
 
     if "arcus" in venues:
         arc = venues["arcus"]
         status = str(arc.get("account_fee_status") or "unknown")
-        pub = arc.get("public_tier0_schedule_summary") or {}
-        tiers = pub.get("tier0_fee_profiles") or []
-        custom = pub.get("custom_schedule_tier0_bps") or {}
-        if "ANT-USD" in custom:
-            ant = custom["ANT-USD"]
-            out.append(
-                VenueFeeProfile(
-                    key="arcus_ant_tier0",
-                    venue="arcus",
-                    scope="ANT-USD (public tier0 custom schedule)",
-                    maker_fee_bps=_require_finite(ant["maker_fee_bps"], "arcus.ANT.maker"),
-                    taker_fee_bps=_require_finite(ant["taker_fee_bps"], "arcus.ANT.taker"),
-                    account_fee_status=status,
+        is_verified = status == "verified_account_tier"
+        v_crypto, v_rwa, v_pm = _parse_verified_domain_overrides(arc, "arcus")
+        if is_verified and (v_crypto is not None or v_rwa is not None or v_pm):
+            if "ANT-USD" in v_pm:
+                ant_mk, ant_tk = v_pm["ANT-USD"]
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_ant_verified",
+                        venue="arcus",
+                        scope=f"ANT-USD (verified custom schedule: {ant_mk:g} / {ant_tk:g} bps)",
+                        maker_fee_bps=ant_mk,
+                        taker_fee_bps=ant_tk,
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
                 )
-            )
-        rwa_tier = _find_tier0_profile(tiers, maker_bps=0.0, taker_bps=2.25)
-        if rwa_tier is not None:
-            out.append(
-                VenueFeeProfile(
-                    key="arcus_rwa_tier0",
-                    venue="arcus",
-                    scope="RWA custom tier0 (0 / 2.25 bps)",
-                    maker_fee_bps=float(rwa_tier["maker_fee_bps"]),
-                    taker_fee_bps=float(rwa_tier["taker_fee_bps"]),
-                    account_fee_status=status,
+            if v_rwa is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_rwa_verified",
+                        venue="arcus",
+                        scope=f"RWA (verified account tier: {v_rwa[0]:g} / {v_rwa[1]:g} bps)",
+                        maker_fee_bps=v_rwa[0],
+                        taker_fee_bps=v_rwa[1],
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
                 )
-            )
-        crypto_tier = _find_tier0_profile(tiers, maker_bps=1.5, taker_bps=4.5)
-        if crypto_tier is not None:
-            out.append(
-                VenueFeeProfile(
-                    key="arcus_crypto_tier0",
-                    venue="arcus",
-                    scope="Crypto/default tier0 (1.5 / 4.5 bps)",
-                    maker_fee_bps=float(crypto_tier["maker_fee_bps"]),
-                    taker_fee_bps=float(crypto_tier["taker_fee_bps"]),
-                    account_fee_status=status,
+            if v_crypto is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_crypto_verified",
+                        venue="arcus",
+                        scope=f"Crypto/default (verified account tier: {v_crypto[0]:g} / {v_crypto[1]:g} bps)",
+                        maker_fee_bps=v_crypto[0],
+                        taker_fee_bps=v_crypto[1],
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
                 )
-            )
-
-    if "hyperliquid" in venues:
-        hl = venues["hyperliquid"]
-        hl_pair = _confirmed_account_pair(hl, "hyperliquid")
-        if hl_pair is not None:
-            out.append(
-                VenueFeeProfile(
-                    key="hyperliquid_verified",
-                    venue="hyperliquid",
-                    scope="Verified account Tier 0 (1.5 / 4.5 bps)",
-                    maker_fee_bps=hl_pair[0],
-                    taker_fee_bps=hl_pair[1],
-                    account_fee_status="verified_account_tier",
+        else:
+            pub = arc.get("public_tier0_schedule_summary") or {}
+            tiers = pub.get("tier0_fee_profiles") or []
+            custom = pub.get("custom_schedule_tier0_bps") or {}
+            pub_status = "public_tier0_schedule_only" if is_verified else status
+            if "ANT-USD" in custom:
+                ant = custom["ANT-USD"]
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_ant_tier0",
+                        venue="arcus",
+                        scope="ANT-USD (public tier0 custom schedule)",
+                        maker_fee_bps=_require_finite(ant["maker_fee_bps"], "arcus.ANT.maker"),
+                        taker_fee_bps=_require_finite(ant["taker_fee_bps"], "arcus.ANT.taker"),
+                        account_fee_status=pub_status,
+                    )
                 )
-            )
+            rwa_tier = _find_tier0_profile(tiers, maker_bps=0.0, taker_bps=2.25)
+            if rwa_tier is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_rwa_tier0",
+                        venue="arcus",
+                        scope="RWA custom tier0 (0 / 2.25 bps)",
+                        maker_fee_bps=float(rwa_tier["maker_fee_bps"]),
+                        taker_fee_bps=float(rwa_tier["taker_fee_bps"]),
+                        account_fee_status=pub_status,
+                    )
+                )
+            crypto_tier = _find_tier0_profile(tiers, maker_bps=1.5, taker_bps=4.5)
+            if crypto_tier is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="arcus_crypto_tier0",
+                        venue="arcus",
+                        scope="Crypto/default tier0 (1.5 / 4.5 bps)",
+                        maker_fee_bps=float(crypto_tier["maker_fee_bps"]),
+                        taker_fee_bps=float(crypto_tier["taker_fee_bps"]),
+                        account_fee_status=pub_status,
+                    )
+                )
 
     if "trade_xyz" in venues:
         xyz = venues["trade_xyz"]
         status = str(xyz.get("account_fee_status") or "unknown")
+        is_verified = status == "verified_account_tier"
         if xyz.get("standard_maker_fee_bps") is not None and xyz.get("standard_taker_fee_bps") is not None:
             out.append(
                 VenueFeeProfile(
@@ -255,6 +286,7 @@ def load_fee_profiles_from_evidence(evidence_path: Path) -> list[VenueFeeProfile
                     maker_fee_bps=_require_finite(xyz["standard_maker_fee_bps"], "xyz.std_maker"),
                     taker_fee_bps=_require_finite(xyz["standard_taker_fee_bps"], "xyz.std_taker"),
                     account_fee_status=status,
+                    eligible_verified=is_verified,
                 )
             )
         if xyz.get("growth_mode_maker_fee_bps") is not None and xyz.get("growth_mode_taker_fee_bps") is not None:
@@ -266,27 +298,106 @@ def load_fee_profiles_from_evidence(evidence_path: Path) -> list[VenueFeeProfile
                     maker_fee_bps=_require_finite(xyz["growth_mode_maker_fee_bps"], "xyz.gr_maker"),
                     taker_fee_bps=_require_finite(xyz["growth_mode_taker_fee_bps"], "xyz.gr_taker"),
                     account_fee_status=status,
+                    eligible_verified=is_verified,
                 )
             )
 
-    if "lighter" in venues:
-        lt = venues["lighter"]
-        if (
+    if "extended" in venues:
+        ext = venues["extended"]
+        if str(ext.get("account_fee_status") or "unknown") == "verified_account_tier":
+            ext_crypto, ext_rwa, _ = _parse_verified_domain_overrides(ext, "extended")
+            ext_pair = _confirmed_account_pair(ext, "extended")
+            if ext_rwa is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="extended_rwa_verified",
+                        venue="extended",
+                        scope=f"RWA (verified account tier: {ext_rwa[0]:g} / {ext_rwa[1]:g} bps)",
+                        maker_fee_bps=ext_rwa[0],
+                        taker_fee_bps=ext_rwa[1],
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
+                )
+            if ext_crypto is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="extended_crypto_verified",
+                        venue="extended",
+                        scope=f"Crypto (verified account tier: {ext_crypto[0]:g} / {ext_crypto[1]:g} bps)",
+                        maker_fee_bps=ext_crypto[0],
+                        taker_fee_bps=ext_crypto[1],
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
+                )
+            elif ext_rwa is None and ext_pair is not None:
+                out.append(
+                    VenueFeeProfile(
+                        key="extended_verified",
+                        venue="extended",
+                        scope=f"Verified account ({ext_pair[0]:g} / {ext_pair[1]:g} bps)",
+                        maker_fee_bps=ext_pair[0],
+                        taker_fee_bps=ext_pair[1],
+                        account_fee_status="verified_account_tier",
+                        eligible_verified=True,
+                    )
+                )
+
+    for vname in ("hyperliquid", "backpack", "okx", "binance"):
+        if vname not in venues:
+            continue
+        pair = _confirmed_account_pair(venues[vname], vname)
+        if pair is not None:
+            out.append(
+                VenueFeeProfile(
+                    key=f"{vname}_verified",
+                    venue=vname,
+                    scope=f"Verified account ({pair[0]:g} / {pair[1]:g} bps)",
+                    maker_fee_bps=pair[0],
+                    taker_fee_bps=pair[1],
+                    account_fee_status="verified_account_tier",
+                    eligible_verified=True,
+                )
+            )
+
+    for lt_venue, pub_key in (
+        ("lighter", "lighter_public_tier0"),
+        ("lighter_robinhood", "lighter_robinhood_public_tier0"),
+    ):
+        if lt_venue not in venues:
+            continue
+        lt = venues[lt_venue]
+        lt_pair = _confirmed_account_pair(lt, lt_venue)
+        if lt_pair is not None:
+            out.append(
+                VenueFeeProfile(
+                    key=f"{lt_venue}_verified",
+                    venue=lt_venue,
+                    scope=f"Verified account tier ({lt_pair[0]:g} / {lt_pair[1]:g} bps)",
+                    maker_fee_bps=lt_pair[0],
+                    taker_fee_bps=lt_pair[1],
+                    account_fee_status="verified_account_tier",
+                    eligible_verified=True,
+                )
+            )
+        elif (
             lt.get("public_schedule_maker_fee_bps") is not None
             and lt.get("public_schedule_taker_fee_bps") is not None
         ):
+            pub_mk = _require_finite(lt["public_schedule_maker_fee_bps"], f"{lt_venue}.pub_maker")
+            pub_tk = _require_finite(lt["public_schedule_taker_fee_bps"], f"{lt_venue}.pub_taker")
+            lt_status = str(lt.get("account_fee_status") or "public_schedule_only")
+            if lt_status == "verified_account_tier":
+                lt_status = "public_schedule_only_unverified_account_tier"
             out.append(
                 VenueFeeProfile(
-                    key="lighter_public_tier0",
-                    venue="lighter",
-                    scope="Public standard_type_0 unverified (0 / 0 bps)",
-                    maker_fee_bps=_require_finite(
-                        lt["public_schedule_maker_fee_bps"], "lighter.pub_maker"
-                    ),
-                    taker_fee_bps=_require_finite(
-                        lt["public_schedule_taker_fee_bps"], "lighter.pub_taker"
-                    ),
-                    account_fee_status=str(lt.get("account_fee_status") or "unknown"),
+                    key=pub_key,
+                    venue=lt_venue,
+                    scope=f"Public standard_type_0 unverified ({pub_mk:g} / {pub_tk:g} bps)",
+                    maker_fee_bps=pub_mk,
+                    taker_fee_bps=pub_tk,
+                    account_fee_status=lt_status,
                     note="Unverified account tier: requires signed /api/v1/accountLimits.",
                 )
             )

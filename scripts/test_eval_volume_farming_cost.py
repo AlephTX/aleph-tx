@@ -196,6 +196,7 @@ class VolumeFarmingCostTests(unittest.TestCase):
     def test_rejects_unverified_account_fee_overrides(self) -> None:
         bad_cases = [
             ("arcus", {"account_fee_status": "public_tier0_schedule_only", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
+            ("arcus", {"account_fee_status": "public_tier0_schedule_only", "rwa_maker_fee_bps": 0.0, "rwa_taker_fee_bps": 2.1375}, "verified_account_tier"),
             ("hyperliquid", {"account_fee_status": "unknown_requires_account_evidence", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
             ("trade_xyz", {"account_fee_status": "public_schedule_only_unverified_account_tier", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
             ("extended", {"account_fee_status": "unknown_requires_account_evidence", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
@@ -208,6 +209,133 @@ class VolumeFarmingCostTests(unittest.TestCase):
                 bad_path.write_text(json.dumps({"venues": {venue: venue_payload}}), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, msg_re):
                     vf.load_fee_profiles_from_evidence(bad_path)
+
+    def test_load_verified_account_tiers_prefers_verified_over_public_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fee_path = Path(tmp) / "verified_fee.json"
+            fee_path.write_text(
+                json.dumps(
+                    {
+                        "venues": {
+                            "lighter": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "0.4",
+                                "taker_fee_bps": "2.8",
+                                "public_schedule_maker_fee_bps": "0",
+                                "public_schedule_taker_fee_bps": "0",
+                                "settlement": "USDC",
+                            },
+                            "lighter_robinhood": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "0",
+                                "taker_fee_bps": "0",
+                                "public_schedule_maker_fee_bps": "0",
+                                "public_schedule_taker_fee_bps": "0",
+                                "settlement": "USDG",
+                            },
+                            "arcus": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": None,
+                                "taker_fee_bps": None,
+                                "crypto_maker_fee_bps": "1.425",
+                                "crypto_taker_fee_bps": "4.275",
+                                "rwa_maker_fee_bps": "0",
+                                "rwa_taker_fee_bps": "2.1375",
+                                "verified_custom_schedule_bps": {
+                                    "ANT-USD": {"maker_fee_bps": "0", "taker_fee_bps": "1.064"}
+                                },
+                                "public_tier0_schedule_summary": {
+                                    "tier0_fee_profiles": [
+                                        {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                                        {"maker_fee_bps": "1.5", "taker_fee_bps": "4.5"},
+                                    ],
+                                    "custom_schedule_tier0_bps": {
+                                        "ANT-USD": {"maker_fee_bps": "0", "taker_fee_bps": "1.12"}
+                                    },
+                                },
+                            },
+                            "extended": {
+                                "account_fee_status": "verified_account_tier",
+                                "crypto_maker_fee_bps": "0",
+                                "crypto_taker_fee_bps": "2.25",
+                                "rwa_maker_fee_bps": "0",
+                                "rwa_taker_fee_bps": "0.9",
+                            },
+                            "trade_xyz": {
+                                "account_fee_status": "verified_account_tier",
+                                "growth_mode_maker_fee_bps": "0.3",
+                                "growth_mode_taker_fee_bps": "0.9",
+                                "standard_maker_fee_bps": "3",
+                                "standard_taker_fee_bps": "9",
+                            },
+                            "hyperliquid": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "1.5",
+                                "taker_fee_bps": "4.5",
+                            },
+                            "backpack": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "1.9",
+                                "taker_fee_bps": "4.5",
+                            },
+                            "okx": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "2",
+                                "taker_fee_bps": "5",
+                            },
+                            "binance": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "2",
+                                "taker_fee_bps": "5",
+                            },
+                            "bulk": {
+                                "account_fee_status": "unknown_requires_account_evidence",
+                                "maker_fee_bps": None,
+                                "taker_fee_bps": None,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            profiles = {p.key: p for p in vf.load_fee_profiles_from_evidence(fee_path)}
+            self.assertNotIn("lighter_public_tier0", profiles)
+            self.assertNotIn("arcus_ant_tier0", profiles)
+            self.assertNotIn("arcus_rwa_tier0", profiles)
+            self.assertNotIn("arcus_crypto_tier0", profiles)
+            self.assertEqual(
+                (profiles["lighter_verified"].maker_fee_bps, profiles["lighter_verified"].taker_fee_bps, profiles["lighter_verified"].eligible_verified),
+                (0.4, 2.8, True),
+            )
+            self.assertEqual(
+                (profiles["lighter_robinhood_verified"].maker_fee_bps, profiles["lighter_robinhood_verified"].taker_fee_bps, profiles["lighter_robinhood_verified"].eligible_verified),
+                (0.0, 0.0, True),
+            )
+            self.assertEqual(
+                (profiles["arcus_ant_verified"].maker_fee_bps, profiles["arcus_ant_verified"].taker_fee_bps, profiles["arcus_ant_verified"].eligible_verified),
+                (0.0, 1.064, True),
+            )
+            self.assertEqual(
+                (profiles["arcus_rwa_verified"].maker_fee_bps, profiles["arcus_rwa_verified"].taker_fee_bps, profiles["arcus_rwa_verified"].eligible_verified),
+                (0.0, 2.1375, True),
+            )
+            self.assertEqual(
+                (profiles["arcus_crypto_verified"].maker_fee_bps, profiles["arcus_crypto_verified"].taker_fee_bps, profiles["arcus_crypto_verified"].eligible_verified),
+                (1.425, 4.275, True),
+            )
+            self.assertEqual(
+                (profiles["extended_rwa_verified"].maker_fee_bps, profiles["extended_rwa_verified"].taker_fee_bps),
+                (0.0, 0.9),
+            )
+            self.assertEqual(
+                (profiles["extended_crypto_verified"].maker_fee_bps, profiles["extended_crypto_verified"].taker_fee_bps),
+                (0.0, 2.25),
+            )
+            self.assertTrue(profiles["trade_xyz_growth"].eligible_verified)
+            self.assertTrue(profiles["hyperliquid_verified"].eligible_verified)
+            self.assertEqual((profiles["backpack_verified"].maker_fee_bps, profiles["backpack_verified"].taker_fee_bps), (1.9, 4.5))
+            self.assertEqual((profiles["okx_verified"].maker_fee_bps, profiles["okx_verified"].taker_fee_bps), (2.0, 5.0))
+            self.assertEqual((profiles["binance_verified"].maker_fee_bps, profiles["binance_verified"].taker_fee_bps), (2.0, 5.0))
 
 
 if __name__ == "__main__":
