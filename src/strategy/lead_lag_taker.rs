@@ -74,6 +74,65 @@ pub enum LeadLagAction {
     Blocked(LeadLagBlock),
 }
 
+/// Synchronized L1 top-of-book quote with local receipt timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct L1BookObs {
+    pub bid_px: f64,
+    pub bid_sz: f64,
+    pub ask_px: f64,
+    pub ask_sz: f64,
+    pub recv_ms: u64,
+}
+
+impl L1BookObs {
+    /// Returns `true` when bid/ask prices form a positive finite non-crossed touch and sizes are finite and non-negative.
+    pub fn is_valid(&self) -> bool {
+        self.bid_px.is_finite()
+            && self.ask_px.is_finite()
+            && self.bid_px > 0.0
+            && self.ask_px > self.bid_px
+            && self.bid_sz.is_finite()
+            && self.ask_sz.is_finite()
+            && self.bid_sz >= 0.0
+            && self.ask_sz >= 0.0
+    }
+
+    /// Arithmetic midpoint `(bid_px + ask_px) / 2`.
+    pub fn mid(&self) -> f64 {
+        0.5 * (self.bid_px + self.ask_px)
+    }
+
+    /// Bid-ask spread in basis points of midpoint.
+    pub fn spread_bps(&self) -> f64 {
+        let mid = self.mid();
+        if mid > 0.0 {
+            ((self.ask_px - self.bid_px) / mid) * 1e4
+        } else {
+            0.0
+        }
+    }
+
+    /// Size-weighted L1 microprice `(bid_px * ask_sz + ask_px * bid_sz) / (bid_sz + ask_sz)`,
+    /// falling back to [`Self::mid`] if either size is non-positive.
+    pub fn microprice(&self) -> f64 {
+        if self.bid_sz > 0.0 && self.ask_sz > 0.0 {
+            (self.bid_px * self.ask_sz + self.ask_px * self.bid_sz) / (self.bid_sz + self.ask_sz)
+        } else {
+            self.mid()
+        }
+    }
+
+    /// Signed L1 order-book imbalance `(bid_sz - ask_sz) / (bid_sz + ask_sz)` in `[-1.0, 1.0]`.
+    pub fn obi(&self) -> f64 {
+        let denom = self.bid_sz + self.ask_sz;
+        if denom > 0.0 {
+            (self.bid_sz - self.ask_sz) / denom
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Configuration for [`LeadLagTaker`].
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -110,6 +169,21 @@ pub struct LeadLagTakerConfig {
     /// Optional fraction in `(0.0, 1.0]` of the entry lead gap that, once closed by the target
     /// after `entry_filled_est_ms`, triggers an early profit-protecting `Exit`.
     pub exit_on_catchup_frac: Option<f64>,
+    /// When `true`, [`LeadLagTaker::observe_l1_books`] uses L1 size-weighted microprice
+    /// instead of arithmetic mid when both L1 sizes are positive (default `false`).
+    pub use_microprice_fair: bool,
+    /// Minimum directional reference L1 OBI confirmation (`side.sign() * ref_obi >= min`)
+    /// in `[0.0, 1.0]` required to open a new entry (`0.0` = disabled, default `0.0`).
+    pub ref_obi_confirm_min: f64,
+    /// Optional maximum target L1 spread in bps allowed at entry (`> 0.0` when `Some`, default `None`).
+    pub max_entry_tgt_spread_bps: Option<f64>,
+    /// Optional minimum lead edge remaining over target half-spread
+    /// (`|dev_bps| - 0.5 * tgt_spread_bps >= min`, `>= 0.0` when `Some`, default `None`).
+    pub min_edge_over_spread_bps: Option<f64>,
+    /// Optional leader-reversal early stop in bps (`> 0.0` when `Some`, default `None`).
+    /// Once `now_ms >= entry_filled_est_ms`, emits `LeadLagAction::Exit` if fresh primary reference
+    /// moves against entry relative to entry reference price by `>= ref_reversal_exit_bps`.
+    pub ref_reversal_exit_bps: Option<f64>,
 }
 
 impl Default for LeadLagTakerConfig {
@@ -133,6 +207,11 @@ impl Default for LeadLagTakerConfig {
             vol_ewma_tau_ms: 15_000,
             require_dual_leader_confirm: false,
             exit_on_catchup_frac: None,
+            use_microprice_fair: false,
+            ref_obi_confirm_min: 0.0,
+            max_entry_tgt_spread_bps: None,
+            min_edge_over_spread_bps: None,
+            ref_reversal_exit_bps: None,
         }
     }
 }
@@ -165,6 +244,28 @@ impl LeadLagTakerConfig {
                 "exit_on_catchup_frac must be finite and in (0.0, 1.0]"
             );
         }
+        ensure!(
+            self.ref_obi_confirm_min.is_finite() && (0.0..=1.0).contains(&self.ref_obi_confirm_min),
+            "ref_obi_confirm_min must be finite and in [0.0, 1.0]"
+        );
+        if let Some(max_spr) = self.max_entry_tgt_spread_bps {
+            ensure!(
+                max_spr.is_finite() && max_spr > 0.0,
+                "max_entry_tgt_spread_bps must be finite and > 0"
+            );
+        }
+        if let Some(min_edge) = self.min_edge_over_spread_bps {
+            ensure!(
+                min_edge.is_finite() && min_edge >= 0.0,
+                "min_edge_over_spread_bps must be finite and >= 0"
+            );
+        }
+        if let Some(rev_bps) = self.ref_reversal_exit_bps {
+            ensure!(
+                rev_bps.is_finite() && rev_bps > 0.0,
+                "ref_reversal_exit_bps must be finite and > 0"
+            );
+        }
         if let LeadLagExitMode::PassiveTouchThenTaker { min_passive_ms } = self.exit_mode {
             ensure!(
                 min_passive_ms <= self.hold_ms,
@@ -181,6 +282,7 @@ struct OpenPosition {
     entry_filled_est_ms: u64,
     exit_due_ms: u64,
     entry_tgt_mid: f64,
+    entry_ref_mid: f64,
     entry_gap_bps: f64,
     exit_triggered: bool,
 }
@@ -292,7 +394,82 @@ impl LeadLagTaker {
     ) -> LeadLagAction {
         let (ref_mid, ref_recv_ms) = ref_obs;
         let (tgt_mid, tgt_recv_ms) = tgt_obs;
-        if !(ref_mid.is_finite() && ref_mid > 0.0 && tgt_mid.is_finite() && tgt_mid > 0.0)
+        if !(ref_mid.is_finite() && ref_mid > 0.0 && tgt_mid.is_finite() && tgt_mid > 0.0) {
+            return LeadLagAction::Blocked(LeadLagBlock::InvalidInput);
+        }
+        if let Some((c_mid, _)) = confirm_ref_obs
+            && !(c_mid.is_finite() && c_mid > 0.0)
+        {
+            return LeadLagAction::Blocked(LeadLagBlock::InvalidInput);
+        }
+        self.observe_internal(
+            now_ms,
+            (ref_mid, 0.0, ref_recv_ms),
+            confirm_ref_obs,
+            (tgt_mid, None, tgt_recv_ms),
+        )
+    }
+
+    /// Process one synchronized L1 book observation with full bid/ask prices and sizes.
+    ///
+    /// Supports `use_microprice_fair`, `ref_obi_confirm_min`, `max_entry_tgt_spread_bps`,
+    /// `min_edge_over_spread_bps`, and `ref_reversal_exit_bps` without heap allocations.
+    pub fn observe_l1_books(
+        &mut self,
+        now_ms: u64,
+        ref_book: L1BookObs,
+        confirm_ref_book: Option<L1BookObs>,
+        tgt_book: L1BookObs,
+    ) -> LeadLagAction {
+        if !ref_book.is_valid() || !tgt_book.is_valid() {
+            return LeadLagAction::Blocked(LeadLagBlock::InvalidInput);
+        }
+        let confirm_obs = match confirm_ref_book {
+            Some(cb) => {
+                if !cb.is_valid() {
+                    return LeadLagAction::Blocked(LeadLagBlock::InvalidInput);
+                }
+                let c_px = if self.cfg.use_microprice_fair {
+                    cb.microprice()
+                } else {
+                    cb.mid()
+                };
+                Some((c_px, cb.recv_ms))
+            }
+            None => None,
+        };
+        let ref_px = if self.cfg.use_microprice_fair {
+            ref_book.microprice()
+        } else {
+            ref_book.mid()
+        };
+        let tgt_px = if self.cfg.use_microprice_fair {
+            tgt_book.microprice()
+        } else {
+            tgt_book.mid()
+        };
+        self.observe_internal(
+            now_ms,
+            (ref_px, ref_book.obi(), ref_book.recv_ms),
+            confirm_obs,
+            (tgt_px, Some(tgt_book.spread_bps()), tgt_book.recv_ms),
+        )
+    }
+
+    fn observe_internal(
+        &mut self,
+        now_ms: u64,
+        ref_obs: (f64, f64, u64),
+        confirm_ref_obs: Option<(f64, u64)>,
+        tgt_obs: (f64, Option<f64>, u64),
+    ) -> LeadLagAction {
+        let (ref_mid, ref_obi, ref_recv_ms) = ref_obs;
+        let (tgt_mid, tgt_spread_bps, tgt_recv_ms) = tgt_obs;
+        if !(ref_mid.is_finite()
+            && ref_mid > 0.0
+            && ref_obi.is_finite()
+            && tgt_mid.is_finite()
+            && tgt_mid > 0.0)
             || ref_recv_ms > now_ms
             || tgt_recv_ms > now_ms
         {
@@ -403,6 +580,20 @@ impl LeadLagTaker {
                 // Retain `self.position` until execution confirms flat via `notify_exit_filled()`.
                 return LeadLagAction::Exit { side: pos.side };
             }
+            if let Some(rev_bps) = self.cfg.ref_reversal_exit_bps
+                && !ref_stale
+                && !tgt_stale
+                && now_ms >= pos.entry_filled_est_ms
+                && pos.entry_ref_mid > 0.0
+            {
+                let ref_move_bps = pos.side.sign() * (ref_mid / pos.entry_ref_mid).ln() * 1e4;
+                if ref_move_bps.is_finite() && ref_move_bps <= -rev_bps {
+                    pos.exit_triggered = true;
+                    self.position = Some(pos);
+                    // Retain `self.position` until execution confirms flat via `notify_exit_filled()`.
+                    return LeadLagAction::Exit { side: pos.side };
+                }
+            }
             if let Some(frac) = self.cfg.exit_on_catchup_frac
                 && !tgt_stale
                 && now_ms >= pos.entry_filled_est_ms
@@ -445,11 +636,32 @@ impl LeadLagTaker {
         if dev.abs() < self.effective_theta_bps() {
             return LeadLagAction::Idle;
         }
+        if let Some(max_spr) = self.cfg.max_entry_tgt_spread_bps {
+            let Some(spr) = tgt_spread_bps else {
+                return LeadLagAction::Idle;
+            };
+            if !spr.is_finite() || spr > max_spr {
+                return LeadLagAction::Idle;
+            }
+        }
+        if let Some(min_edge) = self.cfg.min_edge_over_spread_bps {
+            let Some(spr) = tgt_spread_bps else {
+                return LeadLagAction::Idle;
+            };
+            if !spr.is_finite() || (dev.abs() - 0.5 * spr) < min_edge {
+                return LeadLagAction::Idle;
+            }
+        }
         let side = if dev > 0.0 {
             LeadLagSide::Long
         } else {
             LeadLagSide::Short
         };
+        if self.cfg.ref_obi_confirm_min > 0.0
+            && (side.sign() * ref_obi) < self.cfg.ref_obi_confirm_min
+        {
+            return LeadLagAction::Idle;
+        }
         if self.cfg.require_dual_leader_confirm {
             match (confirm_fresh_obs, confirm_dev_bps) {
                 (Some(_), Some(c_dev))
@@ -463,10 +675,62 @@ impl LeadLagTaker {
             entry_filled_est_ms,
             exit_due_ms: entry_filled_est_ms.saturating_add(self.cfg.hold_ms),
             entry_tgt_mid: tgt_mid,
+            entry_ref_mid: ref_mid,
             entry_gap_bps: dev.abs(),
             exit_triggered: false,
         });
         LeadLagAction::Enter { side, dev_bps: dev }
+    }
+}
+
+/// Zero-allocation stack helper computing a consensus reference mid and newest receipt timestamp
+/// from up to 3 leader `(mid, recv_ms)` observations (e.g. Binance + OKX/Coinbase + Hyperliquid).
+///
+/// Invalid/non-positive prices, future receipts (`recv_ms > now_ms`), and stale feeds
+/// (`now_ms - recv_ms > max_ref_age_ms`) are filtered out. Returns:
+/// - 3 valid fresh leaders -> median price
+/// - 2 valid fresh leaders -> arithmetic mean price
+/// - 1 valid fresh leader  -> that leader's price
+/// - 0 valid fresh leaders -> `None`
+pub fn consensus_ref_mid(
+    now_ms: u64,
+    max_ref_age_ms: u64,
+    leaders: [Option<(f64, u64)>; 3],
+) -> Option<(f64, u64)> {
+    let mut prices = [0.0_f64; 3];
+    let mut count = 0usize;
+    let mut newest_recv_ms = 0u64;
+    for item in leaders {
+        if let Some((mid, recv_ms)) = item
+            && mid.is_finite()
+            && mid > 0.0
+            && recv_ms <= now_ms
+            && now_ms - recv_ms <= max_ref_age_ms
+        {
+            prices[count] = mid;
+            count += 1;
+            if recv_ms > newest_recv_ms {
+                newest_recv_ms = recv_ms;
+            }
+        }
+    }
+    match count {
+        0 => None,
+        1 => Some((prices[0], newest_recv_ms)),
+        2 => Some((0.5 * (prices[0] + prices[1]), newest_recv_ms)),
+        3 => {
+            if prices[0] > prices[1] {
+                prices.swap(0, 1);
+            }
+            if prices[1] > prices[2] {
+                prices.swap(1, 2);
+            }
+            if prices[0] > prices[1] {
+                prices.swap(0, 1);
+            }
+            Some((prices[1], newest_recv_ms))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -1103,8 +1367,409 @@ mod tests {
                 exit_on_catchup_frac: Some(f64::INFINITY),
                 ..cfg()
             },
+            LeadLagTakerConfig {
+                ref_obi_confirm_min: -0.1,
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                ref_obi_confirm_min: 1.01,
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                ref_obi_confirm_min: f64::NAN,
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                max_entry_tgt_spread_bps: Some(0.0),
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                max_entry_tgt_spread_bps: Some(-1.0),
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                min_edge_over_spread_bps: Some(-0.1),
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                min_edge_over_spread_bps: Some(f64::NAN),
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                ref_reversal_exit_bps: Some(0.0),
+                ..cfg()
+            },
+            LeadLagTakerConfig {
+                ref_reversal_exit_bps: Some(f64::INFINITY),
+                ..cfg()
+            },
         ] {
             assert!(LeadLagTaker::new(bad).is_err(), "expected err for {bad:?}");
         }
+    }
+
+    fn l1(mid: f64, half_spr: f64, bid_sz: f64, ask_sz: f64, recv_ms: u64) -> L1BookObs {
+        L1BookObs {
+            bid_px: mid - half_spr,
+            bid_sz,
+            ask_px: mid + half_spr,
+            ask_sz,
+            recv_ms,
+        }
+    }
+
+    fn warm_l1(engine: &mut LeadLagTaker, start: u64, steps: u64) -> u64 {
+        let mut t = start;
+        for _ in 0..steps {
+            assert!(!matches!(
+                engine.observe_l1_books(
+                    t,
+                    l1(100.0, 0.005, 10.0, 10.0, t),
+                    None,
+                    l1(100.0, 0.005, 10.0, 10.0, t),
+                ),
+                LeadLagAction::Enter { .. }
+            ));
+            t += 100;
+        }
+        t
+    }
+
+    #[test]
+    fn l1_microprice_and_obi_directional_confirmation() {
+        // Microprice leans toward the thin side (large bid_sz -> microprice > mid).
+        let book = l1(100.0, 0.05, 9.0, 1.0, 1_000);
+        assert!((book.mid() - 100.0).abs() < 1e-12);
+        assert!((book.obi() - 0.8).abs() < 1e-12);
+        assert!((book.microprice() - 100.04).abs() < 1e-9);
+        assert!((book.spread_bps() - 10.0).abs() < 1e-9);
+
+        // Zero sizes fall back cleanly to mid and zero OBI.
+        let zero_sz = l1(100.0, 0.05, 0.0, 0.0, 1_000);
+        assert!((zero_sz.microprice() - 100.0).abs() < 1e-12);
+        assert!((zero_sz.obi() - 0.0).abs() < 1e-12);
+
+        let c = LeadLagTakerConfig {
+            use_microprice_fair: true,
+            ref_obi_confirm_min: 0.30,
+            ..cfg()
+        };
+        let mut e = LeadLagTaker::new(c).unwrap();
+        let t = warm_l1(&mut e, 10_000, 20);
+
+        // Ref mid jumps +5 bp, but ref OBI is strongly negative (-0.8 < 0.30) -> suppressed!
+        assert_eq!(
+            e.observe_l1_books(
+                t,
+                l1(100.05, 0.005, 1.0, 9.0, t),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t),
+            ),
+            LeadLagAction::Idle
+        );
+        assert_eq!(e.position(), None);
+
+        // Ref mid jumps +5 bp and ref OBI is strongly positive (+0.8 >= 0.30) -> Enter Long.
+        let act = e.observe_l1_books(
+            t + 100,
+            l1(100.05, 0.005, 9.0, 1.0, t + 100),
+            None,
+            l1(100.0, 0.005, 10.0, 10.0, t + 100),
+        );
+        assert!(
+            matches!(act, LeadLagAction::Enter { side: LeadLagSide::Long, dev_bps } if dev_bps > 5.0),
+            "expected microprice-boosted Long entry, got {act:?}"
+        );
+        e.clear_position();
+
+        // Mid-only `observe` has no OBI, so `ref_obi_confirm_min > 0` fails closed cleanly.
+        let t2 = warm_l1(&mut e, t + 200, 20);
+        assert_eq!(e.observe(t2, 100.10, t2, 100.0, t2), LeadLagAction::Idle);
+    }
+
+    #[test]
+    fn spread_cost_gate_blocks_wide_target_and_thin_edge_over_half_spread() {
+        let c = LeadLagTakerConfig {
+            theta_bps: 4.0,
+            max_entry_tgt_spread_bps: Some(3.0),
+            min_edge_over_spread_bps: Some(3.5),
+            ..cfg()
+        };
+        let mut e = LeadLagTaker::new(c).unwrap();
+        let t = warm_l1(&mut e, 10_000, 20);
+
+        // Ref +6 bp, but target spread is 4.0 bp (> max_entry_tgt_spread_bps 3.0) -> blocked (Idle).
+        assert_eq!(
+            e.observe_l1_books(
+                t,
+                l1(100.06, 0.005, 10.0, 10.0, t),
+                None,
+                l1(100.0, 0.02, 10.0, 10.0, t),
+            ),
+            LeadLagAction::Idle
+        );
+
+        // Ref +4.2 bp, target spread is 2.0 bp (<= 3.0), but edge_over_half_spread = 4.2 - 1.0 = 3.2 < 3.5 -> Idle.
+        assert_eq!(
+            e.observe_l1_books(
+                t + 100,
+                l1(100.042, 0.005, 10.0, 10.0, t + 100),
+                None,
+                l1(100.0, 0.01, 10.0, 10.0, t + 100),
+            ),
+            LeadLagAction::Idle
+        );
+
+        // Ref +6.0 bp, target spread is 2.0 bp -> edge_over_half_spread = 5.0 >= 3.5 -> Enter Long.
+        assert!(matches!(
+            e.observe_l1_books(
+                t + 200,
+                l1(100.06, 0.005, 10.0, 10.0, t + 200),
+                None,
+                l1(100.0, 0.01, 10.0, 10.0, t + 200),
+            ),
+            LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            }
+        ));
+        e.clear_position();
+
+        // Mid-only `observe` without spread fails closed when spread gate is enabled.
+        let t2 = warm_l1(&mut e, t + 300, 20);
+        assert_eq!(e.observe(t2, 100.10, t2, 100.0, t2), LeadLagAction::Idle);
+    }
+
+    #[test]
+    fn ref_reversal_exit_triggers_early_and_retains_position_until_confirmed() {
+        let c = LeadLagTakerConfig {
+            ref_reversal_exit_bps: Some(3.0),
+            ..cfg()
+        };
+        let mut e = LeadLagTaker::new(c).unwrap();
+        let t = warm_l1(&mut e, 10_000, 20);
+
+        // Ref jumps +8 bp -> Enter Long (taker_delay=300, hold=1000 -> exit_due = t + 1300).
+        assert!(matches!(
+            e.observe_l1_books(
+                t,
+                l1(100.08, 0.005, 10.0, 10.0, t),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t),
+            ),
+            LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            }
+        ));
+
+        // Before entry_filled_est_ms (t + 300): snapback does not trigger early exit yet.
+        assert_eq!(
+            e.observe_l1_books(
+                t + 200,
+                l1(100.01, 0.005, 10.0, 10.0, t + 200),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t + 200),
+            ),
+            LeadLagAction::Idle
+        );
+
+        // Stale reference snapback after entry_filled_est_ms must NOT trigger ref_reversal exit.
+        assert_eq!(
+            e.observe_l1_books(
+                t + 350,
+                l1(99.90, 0.005, 10.0, 10.0, t - 6_000),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t + 350),
+            ),
+            LeadLagAction::Idle
+        );
+
+        // Small -2 bp pullback (< 3.0 bp) stays Idle.
+        assert_eq!(
+            e.observe_l1_books(
+                t + 400,
+                l1(100.06, 0.005, 10.0, 10.0, t + 400),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t + 400),
+            ),
+            LeadLagAction::Idle
+        );
+
+        // Fresh -4 bp snapback against entry ref (100.08 -> 100.04) triggers Exit and retains position!
+        assert_eq!(
+            e.observe_l1_books(
+                t + 500,
+                l1(100.04, 0.005, 10.0, 10.0, t + 500),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t + 500),
+            ),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        assert_eq!(e.position(), Some(LeadLagSide::Long));
+
+        // Even if ref bounces back, exit_triggered persists until notify_exit_filled().
+        assert_eq!(
+            e.observe_l1_books(
+                t + 600,
+                l1(100.12, 0.005, 10.0, 10.0, t + 600),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t + 600),
+            ),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            }
+        );
+        e.notify_exit_filled();
+        assert_eq!(e.position(), None);
+
+        // Symmetric Short reversal check.
+        let t2 = warm_l1(&mut e, t + 1_000, 20);
+        assert!(matches!(
+            e.observe_l1_books(
+                t2,
+                l1(99.92, 0.005, 10.0, 10.0, t2),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t2),
+            ),
+            LeadLagAction::Enter {
+                side: LeadLagSide::Short,
+                ..
+            }
+        ));
+        assert_eq!(
+            e.observe_l1_books(
+                t2 + 400,
+                l1(99.96, 0.005, 10.0, 10.0, t2 + 400),
+                None,
+                l1(100.0, 0.005, 10.0, 10.0, t2 + 400),
+            ),
+            LeadLagAction::Exit {
+                side: LeadLagSide::Short
+            }
+        );
+        assert_eq!(e.position(), Some(LeadLagSide::Short));
+        e.notify_exit_filled();
+        assert_eq!(e.position(), None);
+    }
+
+    #[test]
+    fn consensus_ref_mid_handles_median_mean_single_and_filters_stale_invalid() {
+        // 3 fresh valid leaders -> median (regardless of ordering) + newest recv_ms.
+        assert_eq!(
+            consensus_ref_mid(
+                10_000,
+                5_000,
+                [
+                    Some((100.30, 9_800)),
+                    Some((100.10, 9_950)),
+                    Some((100.20, 9_700)),
+                ]
+            ),
+            Some((100.20, 9_950))
+        );
+
+        // 1 stale + 2 fresh -> mean of the 2 fresh leaders.
+        let two_fresh = consensus_ref_mid(
+            10_000,
+            5_000,
+            [
+                Some((100.10, 9_900)),
+                Some((150.00, 4_000)),
+                Some((100.30, 9_800)),
+            ],
+        )
+        .unwrap();
+        assert!((two_fresh.0 - 100.20).abs() < 1e-12);
+        assert_eq!(two_fresh.1, 9_900);
+
+        // Future timestamp, NaN, and non-positive prices are ignored -> 1 fresh leader remains.
+        assert_eq!(
+            consensus_ref_mid(
+                10_000,
+                5_000,
+                [
+                    Some((f64::NAN, 9_900)),
+                    Some((100.50, 10_001)),
+                    Some((100.25, 9_500)),
+                ]
+            ),
+            Some((100.25, 9_500))
+        );
+        assert_eq!(
+            consensus_ref_mid(
+                10_000,
+                5_000,
+                [Some((-1.0, 9_900)), Some((0.0, 9_900)), None]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_and_clock_regression_fail_closed_with_l1_books() {
+        let mut e = LeadLagTaker::new(LeadLagTakerConfig {
+            use_microprice_fair: true,
+            ..cfg()
+        })
+        .unwrap();
+        let t = warm_l1(&mut e, 10_000, 20);
+        let prev_dev = e.last_dev_bps();
+
+        // Crossed book, negative size, future timestamp, and clock regression all fail closed.
+        for bad_ref in [
+            L1BookObs {
+                bid_px: 100.1,
+                bid_sz: 5.0,
+                ask_px: 100.0,
+                ask_sz: 5.0,
+                recv_ms: t,
+            },
+            L1BookObs {
+                bid_px: 100.0,
+                bid_sz: -1.0,
+                ask_px: 100.1,
+                ask_sz: 5.0,
+                recv_ms: t,
+            },
+            l1(100.0, 0.005, 5.0, 5.0, t + 1),
+        ] {
+            assert_eq!(
+                e.observe_l1_books(t, bad_ref, None, l1(100.0, 0.005, 5.0, 5.0, t)),
+                LeadLagAction::Blocked(LeadLagBlock::InvalidInput)
+            );
+        }
+        // Clock regression (`now_ms < last_obs_ms`)
+        assert_eq!(
+            e.observe_l1_books(
+                t - 200,
+                l1(105.0, 0.005, 5.0, 5.0, t - 200),
+                None,
+                l1(100.0, 0.005, 5.0, 5.0, t - 200),
+            ),
+            LeadLagAction::Blocked(LeadLagBlock::InvalidInput)
+        );
+        assert_eq!(e.last_dev_bps(), prev_dev);
+
+        // Stale confirm book fails closed when `require_dual_leader_confirm` is enabled.
+        let mut e2 = LeadLagTaker::new(LeadLagTakerConfig {
+            require_dual_leader_confirm: true,
+            use_microprice_fair: true,
+            ..cfg()
+        })
+        .unwrap();
+        let t2 = warm_l1(&mut e2, 10_000, 20);
+        assert_eq!(
+            e2.observe_l1_books(
+                t2,
+                l1(100.10, 0.005, 5.0, 5.0, t2),
+                Some(l1(100.10, 0.005, 5.0, 5.0, t2 - 6_000)),
+                l1(100.0, 0.005, 5.0, 5.0, t2),
+            ),
+            LeadLagAction::Idle
+        );
+        assert_eq!(e2.position(), None);
     }
 }
