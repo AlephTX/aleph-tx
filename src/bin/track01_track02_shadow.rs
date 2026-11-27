@@ -391,6 +391,16 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
         TrackKind::Track03 => {
             let cfg: Track03ShadowConfig = load_toml(config_path)?;
             cfg.validate()?;
+            for arm in &cfg.arms {
+                if arm.ioc_exit_delay_ms == 0 {
+                    anyhow::bail!(
+                        "Track 03 arm '{}' has ioc_exit_delay_ms = 0 (instantaneous taker exit is rejected by --check; configure venue-realistic exit latency such as 330 ms for Lighter Standard or 140 ms for Lighter Premium)",
+                        arm.symbol
+                    );
+                }
+            }
+            let arm_ioc_exit_delay_ms: Vec<u64> =
+                cfg.arms.iter().map(|arm| arm.ioc_exit_delay_ms).collect();
             Ok(serde_json::json!({
                 "status": "Configuration OK",
                 "track": "03_incentive_turnover",
@@ -398,6 +408,7 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
                 "allowlisted_symbols": cfg.allowlisted_symbols,
                 "arms": cfg.arms.len(),
+                "arm_ioc_exit_delay_ms": arm_ioc_exit_delay_ms,
                 "defense_enabled": cfg.defense.is_some(),
                 "declared_end_ms": cfg.declared_end_ms,
                 "terminal_drain_ms": cfg.terminal_drain_ms,
@@ -1206,6 +1217,7 @@ rebate_bps = 0.0
 queue_ahead_fraction = 0.5
 allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
 account_fee_status = "public_tier0_unverified"
+ioc_exit_delay_ms = 140
 
 [arms.strategy]
 tick_size = 0.01
@@ -1453,5 +1465,32 @@ mode = "passive_inventory_cycle"
         .unwrap();
         assert_eq!(t3_rh["status"], "Configuration OK");
         assert_eq!(t3_rh["defense_enabled"], true);
+
+        let t3_core4 = run_check(
+            TrackKind::Track03,
+            &manifest_dir.join("examples/track03_core4_patient_shadow.toml"),
+        )
+        .unwrap();
+        assert_eq!(t3_core4["status"], "Configuration OK");
+        assert_eq!(t3_core4["defense_enabled"], true);
+    }
+
+    #[test]
+    fn check_track03_rejects_zero_ioc_exit_delay_ms() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let valid_toml = fs::read_to_string(
+            manifest_dir.join("examples/track03_lighter_rh_standard_shadow.toml"),
+        )
+        .unwrap();
+        let zero_delay_toml =
+            valid_toml.replace("ioc_exit_delay_ms = 330", "ioc_exit_delay_ms = 0");
+        assert_ne!(valid_toml, zero_delay_toml);
+        let cfg_path = temp_file("t3_zero_ioc_delay.toml", &zero_delay_toml);
+        let err = run_check(TrackKind::Track03, &cfg_path).unwrap_err();
+        assert!(
+            err.to_string().contains("ioc_exit_delay_ms = 0"),
+            "unexpected error: {err}"
+        );
+        fs::remove_file(cfg_path).unwrap();
     }
 }

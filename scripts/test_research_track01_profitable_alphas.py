@@ -251,6 +251,76 @@ class TestResearchTrack01ProfitableAlphas(unittest.TestCase):
         self.assertTrue(math.isclose(res_cut[8], 500.0, abs_tol=1e-9))  # full $500 terminal residual
         self.assertTrue(math.isclose(res_cut[2], -5.0, abs_tol=1e-9))  # residual MTM (99/100 - 1)*500
 
+    def test_no_unpenalized_persym_argmax_oos_bypass(self) -> None:
+        # Build synthetic multi-window, multi-symbol cohort rows covering dev, holdout, w26_w27_oos.
+        wins = [(f"w{i:02d}", "selection_dev") for i in range(1, 9)] + [
+            ("w21", "holdout"),
+            ("w22", "holdout"),
+            ("w26", "w26_w27_oos"),
+            ("w27", "w26_w27_oos"),
+        ]
+        cfg_keys = [(15.0, 1800, 1), (25.0, 1800, 1)]
+        rows = []
+        for sym in ("AAPL", "NVDA"):
+            for idx, (w, sp) in enumerate(wins):
+                for md, mh, fa in cfg_keys:
+                    base_pnl = 2.0 if (sym == "AAPL" and md == 15.0) or (sym == "NVDA" and md == 25.0) else -1.0
+                    pnl = base_pnl + 0.25 * ((idx % 5) - 2)
+                    rows.append(
+                        {
+                            "win": w,
+                            "split": sp,
+                            "venue": "lighter_robinhood",
+                            "exec_mode": "taker",
+                            "symbol": sym,
+                            "min_dislocation_bps": md,
+                            "max_hold_s": mh,
+                            "funding_align": fa,
+                            "trades": 3,
+                            "pv_trades": 0,
+                            "pv_unverifiable": 3,
+                            "realized_price_pnl_usd": pnl,
+                            "realized_funding_usd": 0.0,
+                            "realized_only_gross_usd": pnl,
+                            "residual_mtm_price_pnl_usd": 0.0,
+                            "residual_funding_usd": 0.0,
+                            "mtm_incl_residual_gross_usd": pnl,
+                            "maker_vol_usd": 0.0,
+                            "taker_vol_usd": 3000.0,
+                            "total_vol_usd": 3000.0,
+                            "total_entry_notl_usd": 1500.0,
+                            "avg_hold_ms": 60_000.0,
+                            "depth_clipped_entries": 0,
+                            "depth_clipped_exits": 0,
+                            "residual_trades": 0,
+                            "terminal_flat_all": True,
+                            "terminal_residual_notional_usd": 0.0,
+                        }
+                    )
+
+        res = mod._evaluate_family_cohort(
+            rows,
+            venue="lighter_robinhood",
+            exec_mode="taker",
+            cohort="rwa_only",
+            cfg_keys=cfg_keys,
+            cfg_label_fn=lambda k: f"d{k[0]}_h{k[1]}_f{k[2]}",
+            row_match_fn=lambda r, k: (
+                r["min_dislocation_bps"] == k[0]
+                and r["max_hold_s"] == k[1]
+                and r["funding_align"] == k[2]
+            ),
+            dev_wins=[f"w{i:02d}" for i in range(1, 9)],
+            all_wins=[w for w, _ in wins],
+        )
+        self.assertIn("frozen_persym_pos_dev_symbols", res["splits"]["selection_dev"])
+        self.assertNotIn("frozen_persym_pos_dev_symbols", res["splits"]["holdout"])
+        self.assertNotIn("frozen_persym_pos_dev_symbols", res["splits"]["w26_w27_oos"])
+        self.assertIn("persym_argmax_oos_omitted_reason", res["splits"]["holdout"])
+        self.assertIn("multiple_testing_persym_w01_w27", res)
+        self.assertGreaterEqual(res["multiple_testing_persym_w01_w27"]["num_trials_total"], 4)
+        self.assertEqual(res["multiple_testing_persym_w01_w27"]["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

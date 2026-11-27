@@ -595,6 +595,13 @@ impl FundingBasisCarryController {
         entry_exec_basis_bps: f64,
         notional_usd: f64,
     ) -> Result<(), CarryHaltReason> {
+        if let Some(prev) = self.last_eval_ms
+            && now_ms < prev
+        {
+            self.latch_halt(now_ms, CarryHaltReason::NonMonotonicClock);
+            return Err(CarryHaltReason::NonMonotonicClock);
+        }
+        self.last_eval_ms = Some(now_ms);
         if !entry_mid_basis_bps.is_finite()
             || !entry_exec_basis_bps.is_finite()
             || !notional_usd.is_finite()
@@ -1605,5 +1612,43 @@ mod tests {
                 reason: CarryHaltReason::NonMonotonicClock
             }
         );
+    }
+
+    #[test]
+    fn taker_hedge_complete_rejects_non_monotonic_clock_and_halts() {
+        let cfg = FundingBasisCarryConfig {
+            passive_first_enabled: true,
+            min_basis_zscore: 1.0,
+            ..Default::default()
+        };
+        let econ = CarryPairEconomics {
+            settlement_kind: PairSettlementKind::CrossStablecoinUsdgUsdc,
+            fx_drag_bps: 0.0,
+            max_fx_drag_bps: 3.0,
+            max_pair_notional_usd: 1_000.0,
+            ..Default::default()
+        };
+        let mut ctrl = warm_controller(cfg, econ, 2.0, 0.0);
+        let t = 1_020_000;
+        let dec = ctrl.evaluate_signal(
+            t,
+            mk_touch(100.08, 100.12, t),
+            mk_touch(99.99, 100.01, t),
+            500.0,
+        );
+        assert!(matches!(dec.action, CarryAction::PostPassiveLeg { .. }));
+
+        let hedge = ctrl.on_passive_fill(t + 250, 500.0).unwrap();
+        assert!(matches!(hedge, CarryAction::DispatchTakerHedge { .. }));
+
+        let reg = ctrl.on_taker_hedge_complete(t + 200, 10.0, 9.0, 500.0);
+        assert_eq!(reg, Err(CarryHaltReason::NonMonotonicClock));
+        assert!(matches!(
+            ctrl.state(),
+            PassiveFirstCarryExecState::FailClosedHalt {
+                reason: CarryHaltReason::NonMonotonicClock,
+                ..
+            }
+        ));
     }
 }

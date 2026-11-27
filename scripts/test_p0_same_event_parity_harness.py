@@ -40,6 +40,15 @@ class P0SameEventParityHarnessTests(unittest.TestCase):
     def test_three_way_parity_all_synthetic_p0_counterexamples(self) -> None:
         bundle = harness.generate_review_bundle(w27_slice_path=None, output_path=None)
         self.assertEqual(bundle["schema_version"], "alephtx_p0_parity_review_bundle_v1")
+        self.assertEqual(
+            bundle["frozen_plan"]["parity_authority_policy"],
+            "post_9c9eaf2_fresh_rebuild_required",
+        )
+        self.assertEqual(
+            bundle["frozen_plan"]["python_arm_role"],
+            "diagnostic_reference_omits_synthetic_stale_arrival_ticks",
+        )
+        self.assertEqual(len(bundle["frozen_plan"]["rust_binary_sha256"]), 64)
         self.assertTrue(bundle["deterministic_result"]["all_synthetic_p0_passed"], bundle)
         self.assertEqual(bundle["independent_review_record"]["evidence_signoff"], "PASS")
         self.assertEqual(bundle["independent_review_record"]["economic_hypothesis_status"], "PENDING_P1_UNSEEN_WINDOW")

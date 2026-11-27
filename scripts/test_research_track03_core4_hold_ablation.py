@@ -242,9 +242,90 @@ class Track03Core4HoldAblationTests(unittest.TestCase):
 
         p1 = ab.build_w28plus_prereg_plan(shadow_config_sha256="abc123")
         p2 = ab.build_w28plus_prereg_plan(shadow_config_sha256="abc123")
+        self.assertEqual(p1["schema"], "aleph_tx_track03_w28plus_prereg_plan_v2")
         self.assertEqual(p1["plan_sha256"], p2["plan_sha256"])
-        self.assertEqual(len(p1["falsification_thresholds"]), 9)
+        self.assertEqual(len(p1["falsification_thresholds"]), 12)
+        self.assertIn("10_directional_symmetry", p1["falsification_thresholds"])
+        self.assertIn("11_market_neutrality_beta", p1["falsification_thresholds"])
+        self.assertIn("12_toxic_book_cross_robustness", p1["falsification_thresholds"])
         self.assertTrue(math.isfinite(p1["falsification_thresholds"]["6_forced_ioc_share"]["max_taker_exit_share_s"]))
+
+    def test_unprinted_book_cross_toxic_fill_parity_and_single_trigger(self) -> None:
+        # Resting bid at 100.00 is crossed (no trade print) when best ask drops to 99.96, then later to 99.95,
+        # before recovering to 100.04 on exit print. Single-trigger ensures frac=0.50 fills once (not repeatedly).
+        events = [
+            {"ts": 0, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.06, 10.0)]},
+            {"ts": 250, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.06, 10.0)]},
+            {"ts": 500, "kind": "book", "bids": [(99.92, 10.0)], "asks": [(99.96, 10.0)]},
+            {"ts": 800, "kind": "book", "bids": [(99.91, 10.0)], "asks": [(99.95, 10.0)]},
+            {"ts": 2_000, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 3_000, "kind": "trade", "side": "BUY", "price": 100.03, "size": 8.0},
+            {"ts": 4_000, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+        ]
+        stream = sb.prepare_replay_stream(events)
+        base_arm = sb.SpeedbumpArmConfig(
+            name="test_base",
+            order_delay_ms=200,
+            cancel_delay_ms=300,
+            exit_delay_ms=330,
+            min_entry_edge_bps=0.1,
+            vol_spread_mult=0.0,
+            quiet_regime_only=False,
+            use_oracle_anchor=False,
+        )
+        r0 = ab.simulate_core4_arm(stream, 0.01, base_arm, declared_end_ms=4_000)
+        self.assertEqual(r0["unprinted_book_cross_fills"], 0)
+        self.assertEqual(r0["maker_fills"], 0)
+        self.assertAlmostEqual(r0["underlying_return_bps"], ((100.02 / 100.03) - 1.0) * 1e4, places=4)
+
+        for mode in ("strict_through", "opposite_touch", "level_evicted"):
+            arm_50 = sb.SpeedbumpArmConfig(
+                **{**base_arm.__dict__, "book_cross_toxic_fill_frac": 0.50, "book_cross_mode": mode}
+            )
+            r_c4 = ab.simulate_core4_arm(stream, 0.01, arm_50, declared_end_ms=4_000)
+            r_sb = sb.simulate_prepared_arm(stream, 0.01, arm_50, declared_end_ms=4_000)
+            self.assertEqual(r_c4["unprinted_book_cross_fills"], 1)
+            self.assertAlmostEqual(r_c4["net"], r_sb["net"], places=10)
+            self.assertAlmostEqual(r_c4["unprinted_book_cross_notional_usd"], 100.0, places=2)
+            self.assertAlmostEqual(
+                r_c4["unprinted_book_cross_notional_usd"],
+                r_sb["unprinted_book_cross_notional_usd"],
+                places=8,
+            )
+
+    def test_ols_beta_regression_and_regime_symmetry_math(self) -> None:
+        # Exact linear relationship y = 2.0 + 3.0 * x + small noise -> beta ~ 3.0, p < 0.001
+        xs = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, -3.0, 4.0]
+        ys = [2.0 + 3.0 * x + (0.01 if i % 2 == 0 else -0.01) for i, x in enumerate(xs)]
+        reg = ab.compute_ols_beta_regression(xs, ys)
+        self.assertEqual(reg["n"], 8)
+        self.assertAlmostEqual(reg["alpha"], 2.0, places=2)
+        self.assertAlmostEqual(reg["beta"], 3.0, places=2)
+        self.assertGreater(reg["r_squared"], 0.999)
+        self.assertLess(reg["p_beta"], 1e-4)
+
+        # Pure orthogonal constant y -> beta = 0, r_squared = 0, p_beta = 1.0
+        reg0 = ab.compute_ols_beta_regression([-1.0, 1.0, -2.0, 2.0], [5.0, 5.0, 5.0, 5.0])
+        self.assertAlmostEqual(reg0["beta"], 0.0, places=9)
+        self.assertEqual(reg0["p_beta"], 1.0)
+
+        up = [
+            {"mtm_net_usd": 4.0, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": 50.0, "spr": 5.0, "drft": -1.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": 6.0, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": 60.0, "spr": 7.0, "drft": -1.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": 5.0, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": 55.0, "spr": 6.0, "drft": -1.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": 5.5, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": 52.0, "spr": 6.5, "drft": -1.0, "pex": 0.0, "tslp": 0.0},
+        ]
+        dn = [
+            {"mtm_net_usd": -2.0, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": -40.0, "spr": 3.0, "drft": -5.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": -1.0, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": -30.0, "spr": 4.0, "drft": -5.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": -1.5, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": -35.0, "spr": 3.5, "drft": -5.0, "pex": 0.0, "tslp": 0.0},
+            {"mtm_net_usd": -1.2, "target_executed_fill_notional_usd": 100_000.0, "ret_bps": -32.0, "spr": 3.8, "drft": -5.0, "pex": 0.0, "tslp": 0.0},
+        ]
+        sym = ab.compute_regime_symmetry(up, dn)
+        self.assertEqual(sym["up_windows"]["n_units"], 4)
+        self.assertEqual(sym["down_windows"]["n_units"], 4)
+        self.assertGreater(sym["welch_t_up_minus_down_mean_usd"], 5.0)
+        self.assertLess(sym["welch_p_two_sided"], 0.01)
 
 
 if __name__ == "__main__":

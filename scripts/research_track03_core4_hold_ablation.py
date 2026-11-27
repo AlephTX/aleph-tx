@@ -274,6 +274,10 @@ def simulate_core4_arm(
     """
     if tick <= 0.0 or not math.isfinite(tick):
         raise ValueError(f"tick must be finite and > 0, got {tick}")
+    if not (0.0 <= arm.book_cross_toxic_fill_frac <= 1.0) or not math.isfinite(arm.book_cross_toxic_fill_frac):
+        raise ValueError(f"book_cross_toxic_fill_frac must be in [0, 1], got {arm.book_cross_toxic_fill_frac}")
+    if arm.book_cross_mode not in ("strict_through", "opposite_touch", "level_evicted"):
+        raise ValueError(f"Unsupported book_cross_mode {arm.book_cross_mode!r}")
     if declared_end_ms is not None:
         if isinstance(declared_end_ms, bool) or not isinstance(declared_end_ms, (int, float)) or not math.isfinite(declared_end_ms):
             raise ValueError(f"declared_end_ms must be finite integer ms or None, got {declared_end_ms!r}")
@@ -361,6 +365,11 @@ def simulate_core4_arm(
             "cancel_in_flight_fills": 0,
             "cancel_in_flight_notional_usd": 0.0,
             "cancel_in_flight_share": 0.0,
+            "unprinted_book_cross_fills": 0,
+            "unprinted_book_cross_notional_usd": 0.0,
+            "first_mid": None,
+            "last_mid": None,
+            "underlying_return_bps": None,
             "terminal_flat": True,
             "_hold_samples_ms": [],
             "_exposure_timeline": [],
@@ -471,6 +480,10 @@ def simulate_core4_arm(
 
     cancel_in_flight_fills = 0
     cancel_in_flight_notional_usd = 0.0
+    unprinted_book_cross_fills = 0
+    unprinted_book_cross_notional_usd = 0.0
+    first_mid: float | None = None
+    last_mid: float | None = None
     last_maker_fill_ts_bid: int | None = None
     last_maker_fill_ts_ask: int | None = None
     maker_fills_log: list[tuple[int, str, float, float]] = []
@@ -1049,9 +1062,68 @@ def simulate_core4_arm(
             if ask_ord is not None and ask_ord.activated and abs(ask_ord.price - cur_ba) <= tol_tick_25 and cur_asz < ask_ord.queue_ahead:
                 ask_ord.queue_ahead = cur_asz
 
+            mid_now = 0.5 * (cur_bb + cur_ba)
+            if mid_now > 0.0:
+                if first_mid is None:
+                    first_mid = mid_now
+                last_mid = mid_now
+
+            if arm.book_cross_toxic_fill_frac > 0.0 and mid_now > 0.0:
+                if bid_ord is not None and bid_ord.activated and not bid_ord.toxic_cross_handled:
+                    if arm.book_cross_mode == "strict_through":
+                        bid_crossed = cur_ba < bid_ord.price - tol_tick_10
+                    elif arm.book_cross_mode == "opposite_touch":
+                        bid_crossed = cur_ba <= bid_ord.price + tol_tick_10
+                    else:  # level_evicted
+                        bid_crossed = cur_bb < bid_ord.price - tol_tick_10
+                    if bid_crossed:
+                        fill_qty = bid_ord.remaining * arm.book_cross_toxic_fill_frac
+                        bid_ord.toxic_cross_handled = True
+                        if fill_qty > 1e-12:
+                            cif = bid_ord.cancel_effective_ms is not None and ts < bid_ord.cancel_effective_ms
+                            record_fill(
+                                ts,
+                                "BUY",
+                                bid_ord.price,
+                                fill_qty,
+                                "maker",
+                                mid_now,
+                                was_cancel_in_flight=cif,
+                            )
+                            unprinted_book_cross_fills += 1
+                            unprinted_book_cross_notional_usd += fill_qty * bid_ord.price
+                            bid_ord.remaining -= fill_qty
+                        if bid_ord.remaining <= 1e-12:
+                            bid_ord = None
+                if ask_ord is not None and ask_ord.activated and not ask_ord.toxic_cross_handled:
+                    if arm.book_cross_mode == "strict_through":
+                        ask_crossed = cur_bb > ask_ord.price + tol_tick_10
+                    elif arm.book_cross_mode == "opposite_touch":
+                        ask_crossed = cur_bb >= ask_ord.price - tol_tick_10
+                    else:  # level_evicted
+                        ask_crossed = cur_ba > ask_ord.price + tol_tick_10
+                    if ask_crossed:
+                        fill_qty = ask_ord.remaining * arm.book_cross_toxic_fill_frac
+                        ask_ord.toxic_cross_handled = True
+                        if fill_qty > 1e-12:
+                            cif = ask_ord.cancel_effective_ms is not None and ts < ask_ord.cancel_effective_ms
+                            record_fill(
+                                ts,
+                                "SELL",
+                                ask_ord.price,
+                                fill_qty,
+                                "maker",
+                                mid_now,
+                                was_cancel_in_flight=cif,
+                            )
+                            unprinted_book_cross_fills += 1
+                            unprinted_book_cross_notional_usd += fill_qty * ask_ord.price
+                            ask_ord.remaining -= fill_qty
+                        if ask_ord.remaining <= 1e-12:
+                            ask_ord = None
+
             maybe_queue_exit_ioc(ts)
 
-            mid_now = 0.5 * (cur_bb + cur_ba)
             if abs(pos_qty) > 1e-12:
                 _record_exposure(ts, abs(pos_qty) * mid_now)
             if last_vol_ts >= 0 and ts > last_vol_ts and last_vol_mid > 0.0 and mid_now > 0.0:
@@ -1266,6 +1338,15 @@ def simulate_core4_arm(
         "cancel_in_flight_fills": cancel_in_flight_fills,
         "cancel_in_flight_notional_usd": round(cancel_in_flight_notional_usd, 6),
         "cancel_in_flight_share": round(cif_share, 6),
+        "unprinted_book_cross_fills": unprinted_book_cross_fills,
+        "unprinted_book_cross_notional_usd": round(unprinted_book_cross_notional_usd, 6),
+        "first_mid": round(first_mid, 8) if first_mid is not None else None,
+        "last_mid": round(last_mid, 8) if last_mid is not None else None,
+        "underlying_return_bps": (
+            round(((last_mid / first_mid) - 1.0) * 1e4, 6)
+            if (first_mid is not None and last_mid is not None and first_mid > 0.0)
+            else None
+        ),
         "terminal_flat": terminal_flat,
         "_hold_samples_ms": hold_samples_sorted,
         "_exposure_timeline": exposure_timeline,
@@ -1486,6 +1567,8 @@ def aggregate_core4_bucket(
     cif_fills = sum(int(r.get("cancel_in_flight_fills", 0)) for r in grp)
     cif_notl = sum(float(r.get("cancel_in_flight_notional_usd", 0.0)) for r in grp)
     cif_share = (cif_notl / maker_vol) if maker_vol > 0.0 else 0.0
+    ubx_fills = sum(int(r.get("unprinted_book_cross_fills", 0)) for r in grp)
+    ubx_notl = sum(float(r.get("unprinted_book_cross_notional_usd", 0.0)) for r in grp)
 
     n_wins = len(by_win)
     out: dict[str, Any] = {
@@ -1565,6 +1648,8 @@ def aggregate_core4_bucket(
         "markout_10s_bps": _agg_mk("markout_10s_bps", "markout_10s_den"),
         "cancel_in_flight_fills": cif_fills,
         "cancel_in_flight_share": round(cif_share, 6),
+        "unprinted_book_cross_fills": ubx_fills,
+        "unprinted_book_cross_notional_usd": round(ubx_notl, 4),
         "positive_window_ratio": round(pos_wins / n_wins, 4) if n_wins > 0 else 0.0,
         "psr_zero": psr_zero,
         "max_drawdown_usd": round(max_dd_usd, 4),
@@ -1740,10 +1825,24 @@ def compute_core4_multiple_testing(
     n_blocks = 8 if len(common_wins) >= 16 else 4
     pbo_rep = cscv_pbo(varying, num_blocks=n_blocks) if len(common_wins) >= n_blocks * 2 else None
 
-    # Cumulative search-record sensitivity (e.g., 12 frontier arms + 6 new single-factor/component arms = 18)
+    # Cumulative search-record sensitivity (18 = 12 frontier + 6 ablation; 50/100 = +symbol screen + latency grid)
     sharpes = [dsr_rep["trials"][a]["sr"] for a in sorted(varying.keys())]
     sr_thresh_cum = expected_max_sharpe(sharpes, float(cumulative_n_trials_sensitivity))
     dsr_cum = probabilistic_sharpe_ratio(dsr_rep["best_trial_moments"], sr_thresh_cum)
+    cum_grid: dict[str, Any] = {}
+    for m_cum in sorted({int(cumulative_n_trials_sensitivity), 18, 50, 100}):
+        sr_t = expected_max_sharpe(sharpes, float(m_cum))
+        cum_grid[f"M_{m_cum}"] = {
+            "n_trials": m_cum,
+            "sr_threshold": round(sr_t, 6),
+            "dsr": round(probabilistic_sharpe_ratio(dsr_rep["best_trial_moments"], sr_t), 6),
+        }
+
+    n_eff_val = float(dsr_rep.get("n_eff", 1.0))
+    dsr_n_eff_warning = (
+        f"N_eff={n_eff_val:.4f} (< 2.0 across correlated hold rungs) clips E[max SR(N_eff)] near 0.0, "
+        "making DSR(N_eff) near-trivially ~1.0; use DSR(M_raw), DSR(M_cum>=50), and out-of-sample tests instead."
+    )
 
     return {
         "windows_aligned": len(common_wins),
@@ -1751,9 +1850,11 @@ def compute_core4_multiple_testing(
         "symbols": sorted(allowed_syms),
         "arms_included": sorted(varying.keys()),
         "dsr": dsr_rep,
+        "dsr_n_eff_triviality_note": dsr_n_eff_warning,
         "cumulative_n_trials_sensitivity": cumulative_n_trials_sensitivity,
         "sr_threshold_cumulative": sr_thresh_cum,
         "dsr_cumulative": dsr_cum,
+        "cumulative_sensitivity_grid": cum_grid,
         "cscv_pbo": pbo_rep,
     }
 
@@ -2358,10 +2459,603 @@ def run_core4_hold_ablation(
     return payload
 
 
+QUALITATIVE_TOXIC_CROSS_SCENARIOS: tuple[tuple[str, str, float], ...] = (
+    ("baseline_prints_only", "strict_through", 0.0),
+    ("strict_through_25", "strict_through", 0.25),
+    ("strict_through_50", "strict_through", 0.50),
+    ("strict_through_100", "strict_through", 1.00),
+    ("opposite_touch_25", "opposite_touch", 0.25),
+    ("opposite_touch_50", "opposite_touch", 0.50),
+    ("opposite_touch_100", "opposite_touch", 1.00),
+    ("level_evicted_25", "level_evicted", 0.25),
+    ("level_evicted_50", "level_evicted", 0.50),
+)
+
+QUALITATIVE_TOXIC_ARMS: tuple[str, ...] = (
+    "S4_speedbump_combined",
+    "S4_hold60s",
+    "S4_hold180s",
+    "S4_hold600s_only",
+)
+
+
+def _student_t_two_sided_p(t_abs: float, df: int) -> float | None:
+    """Pure-stdlib two-sided Student-t p-value via smooth cosine transformation on [0, pi/2]."""
+    if df < 1 or not math.isfinite(t_abs):
+        return None
+    if t_abs == 0.0:
+        return 1.0
+    theta_hi = math.atan(abs(t_abs) / math.sqrt(float(df)))
+    n_steps = 400
+    h = theta_hi / n_steps
+    power = df - 1
+    acc = 0.0
+    for i in range(n_steps + 1):
+        theta = i * h
+        w = 1.0 if (i == 0 or i == n_steps) else (4.0 if i % 2 == 1 else 2.0)
+        val = (math.cos(theta) ** power) if power > 0 else 1.0
+        acc += w * val
+    integral = (h / 3.0) * acc
+    coeff = 2.0 * math.exp(math.lgamma(0.5 * (df + 1)) - math.lgamma(0.5 * df)) / math.sqrt(math.pi)
+    cdf_two_sided_inside = coeff * integral
+    return max(0.0, min(1.0, 1.0 - cdf_two_sided_inside))
+
+
+def compute_ols_beta_regression(xs: Sequence[float], ys: Sequence[float]) -> dict[str, Any]:
+    """Pure-stdlib OLS regression `y = alpha + beta * x` with SE, t-stat, R^2, and Student-t p-value."""
+    if len(xs) != len(ys):
+        raise ValueError(f"Mismatched OLS lengths: {len(xs)} vs {len(ys)}")
+    pairs = [(float(x), float(y)) for x, y in zip(xs, ys) if math.isfinite(float(x)) and math.isfinite(float(y))]
+    n = len(pairs)
+    if n < 3:
+        return {
+            "n": n,
+            "alpha": None,
+            "beta": None,
+            "se_beta": None,
+            "t_beta": None,
+            "p_beta": None,
+            "r_squared": None,
+            "corr": None,
+        }
+    mean_x = sum(x for x, _ in pairs) / n
+    mean_y = sum(y for _, y in pairs) / n
+    sxx = sum((x - mean_x) ** 2 for x, _ in pairs)
+    syy = sum((y - mean_y) ** 2 for _, y in pairs)
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in pairs)
+    if sxx <= 1e-18:
+        return {
+            "n": n,
+            "alpha": round(mean_y, 6),
+            "beta": None,
+            "se_beta": None,
+            "t_beta": None,
+            "p_beta": None,
+            "r_squared": 0.0,
+            "corr": None,
+        }
+    beta = sxy / sxx
+    alpha = mean_y - beta * mean_x
+    rss = sum((y - (alpha + beta * x)) ** 2 for x, y in pairs)
+    df = n - 2
+    s2 = max(0.0, rss / df)
+    se_beta = math.sqrt(s2 / sxx)
+    t_beta = (beta / se_beta) if se_beta > 1e-15 else 0.0
+    p_beta = _student_t_two_sided_p(abs(t_beta), df)
+    r2 = (1.0 - (rss / syy)) if syy > 1e-18 else 0.0
+    corr = (sxy / math.sqrt(sxx * syy)) if (sxx > 1e-18 and syy > 1e-18) else 0.0
+    return {
+        "n": n,
+        "alpha": round(alpha, 6),
+        "beta": round(beta, 6),
+        "se_beta": round(se_beta, 6),
+        "t_beta": round(t_beta, 4),
+        "p_beta": round(p_beta, 6) if p_beta is not None else None,
+        "r_squared": round(max(0.0, min(1.0, r2)), 6),
+        "corr": round(max(-1.0, min(1.0, corr)), 6),
+    }
+
+
+def _summarize_regime_bucket(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    n = len(items)
+    if n == 0:
+        return {
+            "n_units": 0,
+            "mean_ret_bps": None,
+            "mtm_net_usd": 0.0,
+            "mean_net_usd": 0.0,
+            "positive_ratio": 0.0,
+            "target_executed_fill_notional_usd": 0.0,
+            "ledger_mtm_usd_per_m": None,
+            "spr": 0.0,
+            "drft": 0.0,
+            "pex": 0.0,
+            "tslp": 0.0,
+        }
+    mtm = sum(float(x["mtm_net_usd"]) for x in items)
+    exec_notl = sum(float(x["target_executed_fill_notional_usd"]) for x in items)
+    rets = [float(x["ret_bps"]) for x in items if x.get("ret_bps") is not None]
+    pos_n = sum(1 for x in items if float(x["mtm_net_usd"]) > 0.0)
+    return {
+        "n_units": n,
+        "mean_ret_bps": round(sum(rets) / len(rets), 4) if rets else None,
+        "mtm_net_usd": round(mtm, 6),
+        "mean_net_usd": round(mtm / n, 6),
+        "positive_ratio": round(pos_n / n, 4),
+        "target_executed_fill_notional_usd": round(exec_notl, 4),
+        "ledger_mtm_usd_per_m": round((-mtm / exec_notl) * 1e6, 4) if exec_notl > 0.0 else None,
+        "spr": round(sum(float(x["spr"]) for x in items), 6),
+        "drft": round(sum(float(x["drft"]) for x in items), 6),
+        "pex": round(sum(float(x["pex"]) for x in items), 6),
+        "tslp": round(sum(float(x["tslp"]) for x in items), 6),
+    }
+
+
+def compute_regime_symmetry(
+    up_items: Sequence[dict[str, Any]],
+    down_items: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare up-window vs down-window strategy profitability and Welch two-sample t-test."""
+    up_s = _summarize_regime_bucket(up_items)
+    dn_s = _summarize_regime_bucket(down_items)
+    up_vals = [float(x["mtm_net_usd"]) for x in up_items]
+    dn_vals = [float(x["mtm_net_usd"]) for x in down_items]
+    welch_t: float | None = None
+    welch_p: float | None = None
+    if len(up_vals) >= 2 and len(dn_vals) >= 2:
+        mu_u = sum(up_vals) / len(up_vals)
+        mu_d = sum(dn_vals) / len(dn_vals)
+        v_u = sum((v - mu_u) ** 2 for v in up_vals) / (len(up_vals) - 1)
+        v_d = sum((v - mu_d) ** 2 for v in dn_vals) / (len(dn_vals) - 1)
+        se2 = (v_u / len(up_vals)) + (v_d / len(dn_vals))
+        if se2 > 1e-18:
+            welch_t = round((mu_u - mu_d) / math.sqrt(se2), 4)
+            df_num = se2 * se2
+            df_den = ((v_u / len(up_vals)) ** 2) / (len(up_vals) - 1) + ((v_d / len(dn_vals)) ** 2) / (len(dn_vals) - 1)
+            df_est = max(1, int(round(df_num / df_den))) if df_den > 1e-18 else max(1, len(up_vals) + len(dn_vals) - 2)
+            welch_p = round(_student_t_two_sided_p(abs(welch_t), df_est) or 1.0, 6)
+    return {
+        "up_windows": up_s,
+        "down_windows": dn_s,
+        "welch_t_up_minus_down_mean_usd": welch_t,
+        "welch_p_two_sided": welch_p,
+    }
+
+
+def _eval_qualitative_toxic_window(
+    lakehouse_dir: Path,
+    win_id: str,
+    win_map: dict[str, dict[str, str]],
+    maker_fee_bps: float,
+    taker_fee_bps: float,
+    rebate_bps: float,
+    arm_names: Sequence[str],
+    scenarios: Sequence[tuple[str, str, float]],
+) -> list[dict[str, Any]]:
+    """Run book-cross toxic-fill sensitivity matrix for one window reusing loaded DuckDB parquet streams."""
+    if "rwa" not in win_map:
+        return []
+    import duckdb  # Lazy import
+
+    con = duckdb.connect(":memory:")
+    con.execute("SET preserve_insertion_order=false; SET threads=2; SET memory_limit='2GB';")
+    c_info = win_map["rwa"]
+    rh_map = VENUE_SYMBOL_MAP[TARGET_VENUE]
+    ref_venues = ("arcus", "trade_xyz")
+
+    def _load_bbo(venue: str, mkts: Sequence[str], bucket_ms: int = 250) -> dict[str, list[tuple[int, float, float, float, float]]]:
+        files = _campaign_parquet_files(lakehouse_dir, "bbo_quotes", venue, c_info["utc_date"], c_info["campaign_id"])
+        if not files or not mkts:
+            return {}
+        f_sql = "[" + ", ".join(f"'{p}'" for p in files) + "]"
+        m_sql = ", ".join(f"'{m}'" for m in sorted(set(mkts)))
+        rows = con.execute(
+            f"""
+            SELECT market,
+                   MIN(available_at_ms) AS ts_ms,
+                   arg_min(bid_px_f64, available_at_ms) AS bid_px,
+                   arg_min(CAST(bid_sz AS DOUBLE), available_at_ms) AS bid_sz,
+                   arg_min(ask_px_f64, available_at_ms) AS ask_px,
+                   arg_min(CAST(ask_sz AS DOUBLE), available_at_ms) AS ask_sz
+            FROM read_parquet({f_sql})
+            WHERE market IN ({m_sql})
+              AND tradable = true
+              AND bid_px_f64 > 0
+              AND ask_px_f64 > bid_px_f64
+            GROUP BY market, (available_at_ms // {int(bucket_ms)})
+            ORDER BY market ASC, ts_ms ASC
+            """
+        ).fetchall()
+        out: dict[str, list[tuple[int, float, float, float, float]]] = defaultdict(list)
+        for mkt, ts_ms, bb, bsz, ba, asz in rows:
+            out[str(mkt)].append((int(ts_ms), float(bb), float(bsz), float(ba), float(asz)))
+        return out
+
+    tgt_mkts = [rh_map[s] for s in CORE_4_SYMBOLS]
+    bbo_tgt = _load_bbo(TARGET_VENUE, tgt_mkts)
+    bbo_refs = {
+        rv: _load_bbo(rv, [VENUE_SYMBOL_MAP[rv][s] for s in CORE_4_SYMBOLS if s in VENUE_SYMBOL_MAP[rv]])
+        for rv in ref_venues
+    }
+
+    tr_files = _campaign_parquet_files(lakehouse_dir, "public_trades", TARGET_VENUE, c_info["utc_date"], c_info["campaign_id"])
+    tr_map: dict[str, list[tuple[int, str, float, float]]] = defaultdict(list)
+    if tr_files and tgt_mkts:
+        tf_sql = "[" + ", ".join(f"'{p}'" for p in tr_files) + "]"
+        tm_sql = ", ".join(f"'{m}'" for m in sorted(set(tgt_mkts)))
+        for mkt, ts_ms, agg_side, px, sz in con.execute(
+            f"""
+            SELECT market, available_at_ms, aggressor_side, price_f64, size_f64
+            FROM read_parquet({tf_sql})
+            WHERE market IN ({tm_sql}) AND price_f64 > 0 AND size_f64 > 0
+            ORDER BY available_at_ms ASC
+            """
+        ).fetchall():
+            tr_map[str(mkt)].append((int(ts_ms), str(agg_side), float(px), float(sz)))
+    con.close()
+
+    base_arms = build_core4_ablation_arms(
+        PRIMARY_LATENCY_TRIPLE,
+        maker_fee_bps=maker_fee_bps,
+        taker_fee_bps=taker_fee_bps,
+        rebate_bps=rebate_bps,
+        arm_names=arm_names,
+    )
+
+    out_rows: list[dict[str, Any]] = []
+    for sym in CORE_4_SYMBOLS:
+        raw_mkt = rh_map[sym]
+        b_rows = bbo_tgt.get(raw_mkt, [])
+        if len(b_rows) < 200:
+            continue
+        events: list[dict[str, Any]] = [
+            {"ts": r[0], "kind": "book", "bb": r[1], "bsz": max(r[2], 1e-9), "ba": r[3], "asz": max(r[4], 1e-9)}
+            for r in b_rows
+        ]
+        for rv in ref_venues:
+            if sym in VENUE_SYMBOL_MAP[rv]:
+                for rr in bbo_refs[rv].get(VENUE_SYMBOL_MAP[rv][sym], []):
+                    events.append({"ts": rr[0], "kind": "ref", "venue": rv, "bid": rr[1], "ask": rr[3]})
+        for ts_ms, agg_side, px, sz in tr_map.get(raw_mkt, []):
+            s_up = agg_side.upper()
+            side_str = "BUY" if s_up in ("BUY", "B", "BID") else "SELL"
+            events.append({"ts": ts_ms, "kind": "trade", "side": side_str, "price": px, "size": sz})
+
+        stream = prepare_replay_stream(events)
+        tick = _infer_tick_from_prices([r[1] for r in b_rows])
+        declared_end = int(b_rows[-1][0])
+        del events
+
+        for sc_id, mode, frac in scenarios:
+            for base_arm in base_arms:
+                arm_cfg = dataclasses.replace(
+                    base_arm,
+                    book_cross_mode=mode,
+                    book_cross_toxic_fill_frac=frac,
+                )
+                sim_res = simulate_core4_arm(stream, tick, arm_cfg, declared_end_ms=declared_end)
+                out_rows.append(
+                    {
+                        "scenario_id": sc_id,
+                        "book_cross_mode": mode,
+                        "book_cross_toxic_fill_frac": frac,
+                        "win": win_id,
+                        "symbol": sym,
+                        "arm": base_arm.name,
+                        "mtm_net_usd": float(sim_res["mtm_net_usd"]),
+                        "realized_net_usd": float(sim_res["realized_net_usd"]),
+                        "spr": float(sim_res["spr"]),
+                        "drft": float(sim_res["drft"]),
+                        "pex": float(sim_res["pex"]),
+                        "tslp": float(sim_res["tslp"]),
+                        "target_executed_fill_notional_usd": float(sim_res["target_executed_fill_notional_usd"]),
+                        "maker_volume_usd": float(sim_res["maker_volume_usd"]),
+                        "taker_volume_usd": float(sim_res["taker_volume_usd"]),
+                        "taker_exit_share_s": float(sim_res["taker_exit_share_s"]),
+                        "unprinted_book_cross_fills": int(sim_res["unprinted_book_cross_fills"]),
+                        "unprinted_book_cross_notional_usd": float(sim_res["unprinted_book_cross_notional_usd"]),
+                        "terminal_residual_notional_usd": float(sim_res["terminal_residual_notional_usd"]),
+                    }
+                )
+        del stream
+    gc.collect()
+    return out_rows
+
+
+def _build_qualitative_from_baseline_rows(
+    rows_out: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Compute Audit ① (spr/drft/pex/tslp), ② (up vs down windows), and ④ (OLS beta) from baseline rows."""
+    active = [r for r in rows_out if not r.get("skipped")]
+
+    # Audit ①: Full spr/drft/pex/tslp decomposition table across all 9 arms (Core 4 & ex-META & S4_600 by symbol/split)
+    decomp_core4: dict[str, Any] = {}
+    decomp_ex_meta: dict[str, Any] = {}
+    for cohort_name, allowed_syms, dst in (
+        ("core4", set(CORE_4_SYMBOLS), decomp_core4),
+        ("ex_meta", set(EX_META_SYMBOLS), decomp_ex_meta),
+    ):
+        for arm_id in CORE4_ABLATION_ARMS_SPEC:
+            grp = [r for r in active if r["arm"] == arm_id and r["symbol"] in allowed_syms]
+            if not grp:
+                continue
+            spr = sum(float(r["spr"]) for r in grp)
+            drft = sum(float(r["drft"]) for r in grp)
+            pex = sum(float(r["pex"]) for r in grp)
+            tslp = sum(float(r["tslp"]) for r in grp)
+            realized_gross = spr + drft + pex + tslp
+            unreal = sum(float(r.get("unrealized_mtm_usd", 0.0)) for r in grp)
+            fee = sum(float(r["fee_usd"]) for r in grp)
+            exec_notl = sum(float(r["target_executed_fill_notional_usd"]) for r in grp)
+            mtm_net = realized_gross + unreal - fee
+            dst[arm_id] = {
+                "cohort": cohort_name,
+                "spr": round(spr, 6),
+                "drft": round(drft, 6),
+                "pex": round(pex, 6),
+                "tslp": round(tslp, 6),
+                "realized_gross_usd": round(realized_gross, 6),
+                "unrealized_mtm_usd": round(unreal, 6),
+                "fee_usd": round(fee, 6),
+                "mtm_net_usd": round(mtm_net, 6),
+                "ledger_mtm_usd_per_m": round((-mtm_net / exec_notl) * 1e6, 4) if exec_notl > 0.0 else None,
+            }
+
+    # Build window returns map from S4_hold600s_only (same underlying stream for every arm)
+    sym_win_ret_bps: dict[tuple[str, str], float] = {}
+    for r in active:
+        if r["arm"] == "S4_hold600s_only" and r.get("underlying_return_bps") is not None:
+            sym_win_ret_bps[(str(r["win"]), str(r["symbol"]))] = float(r["underlying_return_bps"])
+    win_ids = sorted({str(r["win"]) for r in active}, key=_window_sort_key)
+    win_ew_ret_bps: dict[str, float] = {}
+    for w in win_ids:
+        vals = [sym_win_ret_bps[(w, s)] for s in CORE_4_SYMBOLS if (w, s) in sym_win_ret_bps]
+        if vals:
+            win_ew_ret_bps[w] = sum(vals) / len(vals)
+
+    # Audit ②: Up-market vs Down-market windows
+    regime_symmetry: dict[str, Any] = {"portfolio_by_arm": {}, "core4_600s_per_symbol": {}, "core4_600s_pooled_symbol_windows": {}}
+    for arm_id in ("S4_hold600s_only", "S4_hold180s", "S4_speedbump_combined", "P3_patient_600s"):
+        up_list: list[dict[str, Any]] = []
+        dn_list: list[dict[str, Any]] = []
+        for w in win_ids:
+            if w not in win_ew_ret_bps:
+                continue
+            wr = [r for r in active if r["arm"] == arm_id and str(r["win"]) == w and r["symbol"] in CORE_4_SYMBOLS]
+            if not wr:
+                continue
+            rec = {
+                "win": w,
+                "ret_bps": win_ew_ret_bps[w],
+                "mtm_net_usd": sum(float(x["mtm_net_usd"]) for x in wr),
+                "target_executed_fill_notional_usd": sum(float(x["target_executed_fill_notional_usd"]) for x in wr),
+                "spr": sum(float(x["spr"]) for x in wr),
+                "drft": sum(float(x["drft"]) for x in wr),
+                "pex": sum(float(x["pex"]) for x in wr),
+                "tslp": sum(float(x["tslp"]) for x in wr),
+            }
+            if win_ew_ret_bps[w] > 0.0:
+                up_list.append(rec)
+            else:
+                dn_list.append(rec)
+        regime_symmetry["portfolio_by_arm"][arm_id] = compute_regime_symmetry(up_list, dn_list)
+
+    pooled_up: list[dict[str, Any]] = []
+    pooled_dn: list[dict[str, Any]] = []
+    for sym in CORE_4_SYMBOLS:
+        s_up: list[dict[str, Any]] = []
+        s_dn: list[dict[str, Any]] = []
+        for w in win_ids:
+            if (w, sym) not in sym_win_ret_bps:
+                continue
+            matches = [r for r in active if r["arm"] == "S4_hold600s_only" and str(r["win"]) == w and r["symbol"] == sym]
+            if not matches:
+                continue
+            r = matches[0]
+            rec = {
+                "win": w,
+                "symbol": sym,
+                "ret_bps": sym_win_ret_bps[(w, sym)],
+                "mtm_net_usd": float(r["mtm_net_usd"]),
+                "target_executed_fill_notional_usd": float(r["target_executed_fill_notional_usd"]),
+                "spr": float(r["spr"]),
+                "drft": float(r["drft"]),
+                "pex": float(r["pex"]),
+                "tslp": float(r["tslp"]),
+            }
+            if rec["ret_bps"] > 0.0:
+                s_up.append(rec)
+                pooled_up.append(rec)
+            else:
+                s_dn.append(rec)
+                pooled_dn.append(rec)
+        regime_symmetry["core4_600s_per_symbol"][sym] = compute_regime_symmetry(s_up, s_dn)
+    regime_symmetry["core4_600s_pooled_symbol_windows"] = compute_regime_symmetry(pooled_up, pooled_dn)
+
+    # Audit ④: OLS Beta Regressions (`pnl_usd ~ alpha + beta * underlying_ret_pct`)
+    beta_regressions: dict[str, Any] = {"portfolio_by_arm": {}, "s4_hold600s_per_symbol": {}, "s4_hold600s_pooled_84": {}}
+    for arm_id in ("S4_hold600s_only", "S4_hold180s", "S4_speedbump_combined", "P3_patient_600s"):
+        xs_pct: list[float] = []
+        ys_usd: list[float] = []
+        for w in win_ids:
+            if w not in win_ew_ret_bps:
+                continue
+            wr = [r for r in active if r["arm"] == arm_id and str(r["win"]) == w and r["symbol"] in CORE_4_SYMBOLS]
+            if not wr:
+                continue
+            xs_pct.append(win_ew_ret_bps[w] / 100.0)
+            ys_usd.append(sum(float(x["mtm_net_usd"]) for x in wr))
+        beta_regressions["portfolio_by_arm"][arm_id] = {
+            "x_unit": "equal_weight_core4_return_pct",
+            "y_unit": "window_mtm_net_usd",
+            **compute_ols_beta_regression(xs_pct, ys_usd),
+        }
+
+    pooled_x: list[float] = []
+    pooled_y: list[float] = []
+    for sym in CORE_4_SYMBOLS:
+        sx: list[float] = []
+        sy: list[float] = []
+        for w in win_ids:
+            if (w, sym) not in sym_win_ret_bps:
+                continue
+            matches = [r for r in active if r["arm"] == "S4_hold600s_only" and str(r["win"]) == w and r["symbol"] == sym]
+            if not matches:
+                continue
+            ret_pct = sym_win_ret_bps[(w, sym)] / 100.0
+            pnl_usd = float(matches[0]["mtm_net_usd"])
+            sx.append(ret_pct)
+            sy.append(pnl_usd)
+            pooled_x.append(ret_pct)
+            pooled_y.append(pnl_usd)
+        beta_regressions["s4_hold600s_per_symbol"][sym] = {
+            "x_unit": f"{sym}_window_return_pct",
+            "y_unit": f"{sym}_window_mtm_net_usd",
+            **compute_ols_beta_regression(sx, sy),
+        }
+    beta_regressions["s4_hold600s_pooled_84"] = {
+        "x_unit": "symbol_window_return_pct",
+        "y_unit": "symbol_window_mtm_net_usd",
+        **compute_ols_beta_regression(pooled_x, pooled_y),
+    }
+
+    return (
+        {"core4": decomp_core4, "ex_meta": decomp_ex_meta},
+        regime_symmetry,
+        beta_regressions,
+    )
+
+
+def run_core4_qualitative_audit(
+    lakehouse_dir: Path,
+    *,
+    split: str = "all",
+    window_ids: Sequence[str] | None = None,
+    rebate_bps: float = 0.0,
+    fee_evidence_path: Path | None = None,
+    max_workers: int = 4,
+) -> dict[str, Any]:
+    """Run all 4 Track 03 qualitative verification audits (decomposition, up/down symmetry, book-cross toxic fills, beta)."""
+    ablation_payload = run_core4_hold_ablation(
+        lakehouse_dir,
+        split=split,
+        window_ids=window_ids,
+        arm_names=None,
+        rebate_bps=rebate_bps,
+        fee_evidence_path=fee_evidence_path,
+        max_workers=max_workers,
+        include_rows=True,
+        verify_parity=False,
+    )
+    rows_out = ablation_payload.pop("rows", [])
+    decomp, regime_sym, beta_reg = _build_qualitative_from_baseline_rows(rows_out)
+
+    # Audit ③: Unprinted book-cross toxic fill stress across W01-W27
+    all_discovered = discover_campaigns_w27(lakehouse_dir, split, window_ids)
+    selected_windows = {w: m for w, m in all_discovered.items() if "rwa" in m}
+    mk_bps, tk_bps, _, _, _ = resolve_core4_rh_fee_provenance(fee_evidence_path)
+    tox_rows: list[dict[str, Any]] = []
+    work_items = list(selected_windows.items())
+    eff_workers = max(1, min(int(max_workers), len(work_items)))
+    if eff_workers == 1:
+        for win_id, win_map in work_items:
+            tox_rows.extend(
+                _eval_qualitative_toxic_window(
+                    lakehouse_dir,
+                    win_id,
+                    win_map,
+                    mk_bps,
+                    tk_bps,
+                    rebate_bps,
+                    QUALITATIVE_TOXIC_ARMS,
+                    QUALITATIVE_TOXIC_CROSS_SCENARIOS,
+                )
+            )
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=eff_workers) as pool:
+            futs = [
+                pool.submit(
+                    _eval_qualitative_toxic_window,
+                    lakehouse_dir,
+                    win_id,
+                    win_map,
+                    mk_bps,
+                    tk_bps,
+                    rebate_bps,
+                    QUALITATIVE_TOXIC_ARMS,
+                    QUALITATIVE_TOXIC_CROSS_SCENARIOS,
+                )
+                for win_id, win_map in work_items
+            ]
+            for fut in concurrent.futures.as_completed(futs):
+                tox_rows.extend(fut.result())
+
+    assert_no_w28_leak(list(selected_windows.keys()), tox_rows)
+
+    toxic_matrix: dict[str, Any] = {}
+    for sc_id, mode, frac in QUALITATIVE_TOXIC_CROSS_SCENARIOS:
+        sc_arms: dict[str, Any] = {}
+        for arm_id in QUALITATIVE_TOXIC_ARMS:
+            grp_c4 = [r for r in tox_rows if r["scenario_id"] == sc_id and r["arm"] == arm_id and r["symbol"] in CORE_4_SYMBOLS]
+            grp_em = [r for r in tox_rows if r["scenario_id"] == sc_id and r["arm"] == arm_id and r["symbol"] in EX_META_SYMBOLS]
+            if not grp_c4:
+                continue
+
+            def _agg_tox(g: Sequence[dict[str, Any]]) -> dict[str, Any]:
+                by_w: dict[str, float] = defaultdict(float)
+                for r in g:
+                    by_w[str(r["win"])] += float(r["mtm_net_usd"])
+                mtm = sum(by_w.values())
+                exec_n = sum(float(r["target_executed_fill_notional_usd"]) for r in g)
+                ubx_f = sum(int(r["unprinted_book_cross_fills"]) for r in g)
+                ubx_n = sum(float(r["unprinted_book_cross_notional_usd"]) for r in g)
+                spr = sum(float(r["spr"]) for r in g)
+                drft = sum(float(r["drft"]) for r in g)
+                pex = sum(float(r["pex"]) for r in g)
+                tslp = sum(float(r["tslp"]) for r in g)
+                pos_w = sum(1 for v in by_w.values() if v > 0.0)
+                return {
+                    "windows": len(by_w),
+                    "positive_window_ratio": round(pos_w / len(by_w), 4) if by_w else 0.0,
+                    "mtm_net_usd": round(mtm, 4),
+                    "ledger_mtm_usd_per_m": round((-mtm / exec_n) * 1e6, 4) if exec_n > 0.0 else None,
+                    "target_executed_fill_notional_usd": round(exec_n, 2),
+                    "unprinted_book_cross_fills": ubx_f,
+                    "unprinted_book_cross_notional_usd": round(ubx_n, 2),
+                    "spr": round(spr, 4),
+                    "drft": round(drft, 4),
+                    "pex": round(pex, 4),
+                    "tslp": round(tslp, 4),
+                }
+
+            sc_arms[arm_id] = {
+                "core4": _agg_tox(grp_c4),
+                "ex_meta": _agg_tox(grp_em),
+            }
+        toxic_matrix[sc_id] = {
+            "book_cross_mode": mode,
+            "book_cross_toxic_fill_frac": frac,
+            "arms": sc_arms,
+        }
+
+    return {
+        "schema": "track03_core4_qualitative_audit_w01_w27_v1",
+        "w28_excluded": True,
+        "target_venue": TARGET_VENUE,
+        "windows_count": len(selected_windows),
+        "audit_1_decomposition_spr_drft_pex_tslp": decomp,
+        "audit_2_up_vs_down_symmetry": regime_sym,
+        "audit_3_unprinted_book_cross_toxic_fills": toxic_matrix,
+        "audit_4_ols_beta_regressions": beta_reg,
+        "multiple_testing": ablation_payload["multiple_testing"],
+    }
+
+
 def build_w28plus_prereg_plan(
     *,
-    baseline_commit: str = "329d86e",
+    baseline_commit: str = "9c9eaf2",
     candidate_arm: str = "S4_hold600s_only",
+    status: str = "PRE_REGISTERED_FROZEN_HOLD",
     shadow_config_path: str = "examples/track03_core4_patient_shadow.toml",
     shadow_config_sha256: str | None = None,
     fee_evidence_sha256: str = EXPECTED_FEE_EVIDENCE_SHA256,
@@ -2370,13 +3064,13 @@ def build_w28plus_prereg_plan(
     inventory_skew_bps_per_full_limit: float = 2.0,
     min_w28plus_windows: int = 10,
 ) -> dict[str, Any]:
-    """Build deterministic canonical W28+ pre-registered experiment manifest with Roadmap §4 & §5 gates."""
+    """Build deterministic canonical W28+ pre-registered experiment manifest with Roadmap §4 & §5 + qualitative gates."""
     candidate_spec = CORE4_ABLATION_ARMS_SPEC[candidate_arm]
     baseline_spec = CORE4_ABLATION_ARMS_SPEC["S4_speedbump_combined"]
     plan_core: dict[str, Any] = {
-        "schema": "aleph_tx_track03_w28plus_prereg_plan_v1",
+        "schema": "aleph_tx_track03_w28plus_prereg_plan_v2",
         "track": "03_incentive_turnover",
-        "status": "PRE_REGISTERED_FROZEN_HOLD",
+        "status": status,
         "baseline_git_commit": baseline_commit,
         "target_venue": TARGET_VENUE,
         "target_exchange_id": 8,
@@ -2410,7 +3104,8 @@ def build_w28plus_prereg_plan(
             "primary_comparison": f"{candidate_arm} vs frozen S4_speedbump_combined",
             "causal_mechanism": (
                 "Extending max_hold_ms on Core 4 while locking quoting, latency, queue, and drain "
-                "eliminates forced 330 ms IOC churn without adding penny-tick adverse selection."
+                "eliminates forced 330 ms IOC churn without adding penny-tick adverse selection, "
+                "conditional on directional symmetry, market-neutral beta, and unprinted book-cross survival."
             ),
             "baseline_arm": {
                 "name": "S4_speedbump_combined",
@@ -2427,6 +3122,10 @@ def build_w28plus_prereg_plan(
             },
             "secondary_attribution_arm": "P3_patient_600s",
             "pre_registered_trial_cap": 3,
+            "multiple_testing_disclosure": (
+                "Do not treat DSR(N_eff) near 1.0 as standalone robustness evidence when N_eff < 2 across correlated rungs; "
+                "audit cumulative M >= 50 (including universe selection, patient frontier, and latency grid) plus Gates 10-12."
+            ),
         },
         "accounting_contract": {
             "primary_unit_metric": "ledger_mtm_usd_per_m = sum(net_cash_cost_usd) / sum(target_executed_fill_notional_usd) * 1e6",
@@ -2460,14 +3159,14 @@ def build_w28plus_prereg_plan(
                 "max_portfolio_gross_exposure_usd": 1600.0,
             },
             "5_hold_tail_bounds": {
-                "max_hold_p95_ms": 240_000.0,
-                "max_hold_observed_ms": max_inventory_hold_ms + 30_000,
+                "max_hold_p95_ms": 180_000.0,
+                "max_hold_observed_ms": max_inventory_hold_ms + 15_000,
             },
             "6_forced_ioc_share": {
                 "max_taker_exit_share_s": 0.03,
             },
             "7_terminal_residual_cap": {
-                "max_terminal_residual_per_window_usd": 100.0,
+                "max_terminal_residual_per_window_usd": 25.0,
             },
             "8_ex_meta_stability_cap": {
                 "require_ex_meta_ledger_mtm_usd_per_m_le": 0.0,
@@ -2475,6 +3174,22 @@ def build_w28plus_prereg_plan(
             },
             "9_single_symbol_share_cap": {
                 "max_single_symbol_positive_pnl_share": 0.80,
+            },
+            "10_directional_symmetry": {
+                "min_windows_per_direction": 3,
+                "max_up_windows_ledger_mtm_usd_per_m": 0.0,
+                "max_down_windows_ledger_mtm_usd_per_m": 0.0,
+                "min_positive_ratio_each_direction": 0.50,
+            },
+            "11_market_neutrality_beta": {
+                "max_abs_t_beta": 2.0,
+                "max_r_squared": 0.25,
+                "min_alpha_usd_per_window": 0.0,
+            },
+            "12_toxic_book_cross_robustness": {
+                "book_cross_mode": "strict_through",
+                "book_cross_toxic_fill_frac": 0.50,
+                "max_ledger_mtm_usd_per_m": 0.0,
             },
         },
         "capital_and_stop_conditions": {
@@ -2566,6 +3281,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--prereg-hold-ms", type=int, default=600_000)
     ap.add_argument("--prereg-penny-ticks", type=int, default=0)
     ap.add_argument("--prereg-skew-bps", type=float, default=2.0)
+    ap.add_argument("--prereg-status", type=str, default="PRE_REGISTERED_FROZEN_HOLD")
+    ap.add_argument("--qualitative-audit-output", type=Path, default=None)
     ap.add_argument("--shadow-config", type=Path, default=None)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -2579,10 +3296,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(rendered)
         return 0
 
-    if args.prereg_output and not args.windows and not args.output and not args.lakehouse.exists():
+    if args.prereg_output and not args.windows and not args.output and not args.qualitative_audit_output and not args.lakehouse.exists():
         sh_sha = sha256_file(args.shadow_config) if (args.shadow_config and args.shadow_config.is_file()) else None
         plan = build_w28plus_prereg_plan(
             candidate_arm=args.prereg_candidate_arm,
+            status=args.prereg_status,
             max_inventory_hold_ms=args.prereg_hold_ms,
             reduce_only_penny_ticks=args.prereg_penny_ticks,
             inventory_skew_bps_per_full_limit=args.prereg_skew_bps,
@@ -2598,6 +3316,29 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     win_list = [w.strip() for w in args.windows.split(",") if w.strip()] if args.windows else None
     arm_list = [a.strip() for a in args.arms.split(",") if a.strip()] if args.arms else None
+
+    if args.qualitative_audit_output:
+        qual = run_core4_qualitative_audit(
+            args.lakehouse,
+            split=args.split,
+            window_ids=win_list,
+            rebate_bps=args.rebate_bps,
+            fee_evidence_path=args.fee_evidence,
+            max_workers=args.max_workers,
+        )
+        args.qualitative_audit_output.parent.mkdir(parents=True, exist_ok=True)
+        args.qualitative_audit_output.write_text(json.dumps(qual, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "qualitative_audit_output": str(args.qualitative_audit_output),
+                    "sha256": sha256_file(args.qualitative_audit_output),
+                    "windows_count": qual["windows_count"],
+                }
+            )
+        )
+        if not args.output and not args.prereg_output:
+            return 0
 
     result = run_core4_hold_ablation(
         args.lakehouse,
@@ -2632,6 +3373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sh_sha = sha256_file(args.shadow_config) if (args.shadow_config and args.shadow_config.is_file()) else None
         plan = build_w28plus_prereg_plan(
             candidate_arm=args.prereg_candidate_arm,
+            status=args.prereg_status,
             max_inventory_hold_ms=args.prereg_hold_ms,
             reduce_only_penny_ticks=args.prereg_penny_ticks,
             inventory_skew_bps_per_full_limit=args.prereg_skew_bps,

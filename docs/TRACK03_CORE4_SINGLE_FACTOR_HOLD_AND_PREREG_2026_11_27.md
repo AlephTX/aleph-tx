@@ -1,8 +1,8 @@
 # Track 03 (`03_incentive_turnover`): Core 4 Single-Factor Hold Ablation & `W28+` Pre-Registration (`W01–W27`)
 
-**Date:** `2026-11-27` (CST) · **Baseline Commit:** `329d86e` · **Operational Mode:** Strictly **`HOLD`** (zero live orders/cancellations, zero Tokyo deploys/restarts, `-w28` strictly excluded)
+**Date:** `2026-11-27` (CST) · **Baseline Commit:** `9c9eaf2` + Post-Batch-2 Audit · **Operational & Research Mode:** **`HOLD_PENDING_TOXIC_FILL_SURVIVAL_AND_SHADOW_W28`** (zero live orders/cancellations, zero Tokyo deploys/restarts, `-w28` strictly excluded; **not promoted to standalone `W28+` prereg** until unprinted book-cross toxic-fill risk is resolved)
 
-This report isolates the causal driver of Track 03 profitability on `lighter_robinhood` (`USDG`, verified `0.00 / 0.00 bps` `verified_account_tier`, `account_fee_evidence_20261127.json` `sha256: 4d3a9c1aeae5358bb9c55ab448db392ac3edb0a89244f74c23d89817c3359d92`) across `Core 4` (`AAPL, AMZN, META, MSFT`) under `o200_c300_e330` (`21` RWA windows `W01–W27`, `w08` absent, `-w28` excluded, `756` rows, `max_parity_err = 0.0` vs `simulate_prepared_arm`, `max_mtm_cash_err = 1.30e-12`, `max_net_err = 0.0`):
+This report isolates the causal driver of Track 03 profitability on `lighter_robinhood` (`USDG`, verified `0.00 / 0.00 bps` `verified_account_tier`, `account_fee_evidence_20261127.json` `sha256: 4d3a9c1aeae5358bb9c55ab448db392ac3edb0a89244f74c23d89817c3359d92`) across `Core 4` (`AAPL, AMZN, META, MSFT`) under `o200_c300_e330` (`21` RWA windows `W01–W27`, `w08` absent, `-w28` excluded, `756` rows, `max_parity_err = 0.0` vs `simulate_prepared_arm`, `max_mtm_cash_err = 1.30e-12`, `max_net_err = 0.0`) AND documents the four post-Batch-2 qualitative verification experiments (`.agent-state/research/roadmap_upgrade_20261127/track03_core4_qualitative_audit_w01_w27.json`, `sha256: f0aa6af743ad30431da154dba3771193d86b017ab51e76ca3e8035e139695904`):
 
 1. **Pure Single-Factor Hold Ladder (`max_hold_ms in {15s (S4), 60s, 180s, 300s, 600s}`):** Locks every quote parameter, inventory skew (`2.0 bps`), `reduce_only_penny_ticks = 0`, latency (`o200_c300_e330`), queue (`0.5`), and terminal drain (`1,000 ms`) identically to frozen `S4_speedbump_combined`.
 2. **Component Attribution Arms (`600 s` & `W5`):** Isolates `reduce_only_penny_ticks` (`0 → 1`) and `inventory_skew_bps_per_full_limit` (`2.0 → 5.0`) relative to `P3_patient_600s` (`penny = 1, skew = 5.0`) and `W5_nopenn_15bp_180s` (for direct `ex-META` comparison).
@@ -27,7 +27,7 @@ Implemented in [research_track03_core4_hold_ablation.py](../scripts/research_tra
    - Under `P3_patient_600s`, `ex-META` (`AAPL + AMZN + MSFT`) earned `+$35.11` (`-$3.62/M`, `71%` pos windows; collapsing to `+$0.36`, `-$0.21/M`, `50%` pos in `holdout`), leaving `META` at `69.3%` of `W01–W27` net PnL (`98.5%` in `holdout`).
    - Under **`S4_hold600s_only`**, **`ex-META` more than doubles to `+$72.64` (`-$7.97/M`, `20/21` (`95%`) positive windows)** — **`+$53.55` (`-$7.96/M`, `100%` pos) dev → `+$6.52` (`-$3.94/M`, `75%` pos) holdout → `+$12.57` (`-$17.20/M`, `100%` pos) `w26_w27_oos`**, and **all 4 symbols are individually profitable** (`META +$78.61` (`52.0%`), `MSFT +$38.64` (`25.5%`), `AMZN +$27.24` (`18.0%`), `AAPL +$6.76` (`4.5%`)).
    - Compared to `W5_nopenn_15bp_180s` (`ex-META -$9.99/M`, `+$15.59` on `$1.56M`, `71%` pos windows), `S4_hold600s_only` delivers **`4.7x` more `ex-META` cash (`+$72.64` vs `+$15.59`)** and **`5.8x` higher volume (`$9.11M` vs `$1.56M`)** with `95%` vs `71%` positive windows.
-4. **Pre-Registered `W28+` Verdict:** Freeze **`S4_hold600s_only`** (`max_inventory_hold_ms = 600000`, `reduce_only_penny_ticks = 0`, `inventory_skew_bps_per_full_limit = 2.0`) as the sole primary `W28+` candidate in `track03_w28plus_prereg_plan.json` and [track03_core4_patient_shadow.toml](../examples/track03_core4_patient_shadow.toml), remaining operationally **`HOLD`** until uninspected `W28+` windows seal and pass all 9 falsification gates + Rust/Python parity verification.
+4. **Pre-Registered `W28+` Verdict (`HOLD_PENDING_TOXIC_FILL_SURVIVAL_AND_SHADOW_W28`):** Although `S4_hold600s_only` (`max_hold_ms = 600000`, `reduce_only_penny_ticks = 0`, `inventory_skew_bps_per_full_limit = 2.0`) **passes** `spr/drft/pex/tslp` attribution (`drft = -$384.18` is strictly negative adverse selection, not directional drift), **passes** up-vs-down window symmetry (`+$82.92` UP vs `+$68.34` DN, `Welch t = +0.3648, p = 0.7200`), and **passes** OLS beta neutrality (`beta = -0.7223, t = -0.7106, p = 0.4860, R^2 = 0.0259`; pooled 84 `t = +0.1352, p = 0.8928`), **Audit 3 (`unprinted book-cross toxic fills`) exposes material fragility**: at `strict_through 50%` (`book_cross_toxic_fill_frac = 0.50`), `Core 4` collapses from `+$151.88` to `+$15.40` (`-$1.44/M`, `48%` pos windows) while **`ex-META` flips negative to `-$22.34` (`+$2.55/M`, `24%` pos)**, and at `strict_through 100%` or `opposite_touch 50%` the whole portfolio flips negative (`-$118.63` and `-$22.19`). Therefore `S4_hold600s_only` is **NOT promoted to standalone `W28+` preregistration** and remains in **`HOLD_PENDING_TOXIC_FILL_SURVIVAL_AND_SHADOW_W28`** under upgraded 12-gate manifest `aleph_tx_track03_w28plus_prereg_plan_v2` (`plan_sha256: 3c729a3151505a03341bac47122dbe5f19edbc27b4aa30d69db43efd9e996f68`).
 
 ---
 
@@ -122,30 +122,93 @@ Across all `21` RWA windows (`0` zero-fill windows; `w08` absent; `-w28` exclude
 
 ---
 
-## 5. `W28+` Pre-Registered Manifest & Shadow Config (`HOLD` Gate)
+## 5. Post-Batch-2 Qualitative Audits (Decomposition, Symmetry, Toxic Book-Cross, OLS Beta, Cumulative `M`)
 
-- **Canonical Pre-Registered Manifest (untracked):** `.agent-state/research/roadmap_upgrade_20261127/track03_w28plus_prereg_plan.json` (`plan_sha256: ce851712e70d401a090595f601b5261f71fa7a5fc1ecd743a5ebef37c4aa98d1`, `file sha256: 2dd01a7af6f285de0b19a3b5ecf6041f023fb03f1c72d29404b4a9e619351ec0`, `SECRET_HITS = 0`).
-- **Shadow Config (tracked):** [track03_core4_patient_shadow.toml](../examples/track03_core4_patient_shadow.toml) (`sha256: fb2ad2a281926e566b80e8b07bc77c546db42a18ecc4a8c90b00ca25db68e252`), configuring `AAPL` (`1006`), `AMZN` (`1007`), `META` (`1008`), `MSFT` (`1009`) on `target_exchange_id = 8` (`lighter_robinhood`), `ref_exchange_ids = [7, 10]`, `0.0/0.0 bps` `verified_account_tier`, `[defense]` enabled (`defense_enabled = true`), `max_inventory_hold_ms = 600000`, `reduce_only_penny_ticks = 0`, `inventory_skew_bps_per_full_limit = 2.0`, `capital_usd = 10000.0`, `daily_loss_limit_pct = 0.02`.
-- **Pre-Registered `W28+` Falsification Thresholds (`min_independent_windows = 10`, `-w28` / `>= w28` only once sealed):**
-  1. `1_cost_reduction_vs_s4`: `ledger_mtm_usd_per_m < 0.0`, `Δledger_vs_s4 <= -5.0 $/M`, Politis-Romano 95% CI upper bound `< 0.0`.
-  2. `2_volume_floor`: `target_executed_fill_notional_per_window_usd >= $400,000`, `maker_volume_per_window_usd >= $380,000`.
-  3. `3_absolute_cash_cost`: `mtm_net_cash_cost_usd <= 0.0`, `realized_net_cash_cost_usd <= 0.0`, `positive_window_ratio >= 0.70`.
-  4. `4_max_gross_exposure`: `max_single_symbol_gross_exposure_usd <= $650.0` (1.0x `$400` limit + 1x `$200` resting fill + drift buffer), `max_portfolio_gross_exposure_usd <= $1,600.0`.
-  5. `5_hold_tail_bounds`: `hold_p95_ms <= 240,000`, `max_hold_observed_ms <= 630,000`.
-  6. `6_forced_ioc_share`: `taker_exit_share_s <= 0.03`.
-  7. `7_terminal_residual_cap`: `terminal_residual_per_window_usd <= $100.0`.
-  8. `8_ex_meta_stability_cap`: `ex_meta_ledger_mtm_usd_per_m <= 0.0`, `ex_meta_mtm_net_cash_cost_usd <= 0.0`.
-  9. `9_single_symbol_share_cap`: `max_single_symbol_positive_pnl_share <= 0.80`.
+Source artifact: `.agent-state/research/roadmap_upgrade_20261127/track03_core4_qualitative_audit_w01_w27.json` (`sha256: f0aa6af743ad30431da154dba3771193d86b017ab51e76ca3e8035e139695904`, `W01–W27` `NOT -w28`, `21` windows).
+
+### 5.1 Audit ①: Full `spr / drft / pex / tslp` Cash Decomposition (`Core 4` vs. `ex-META`)
+
+Across every arm, `drft` is **strictly negative** (`-$327.03` to `-$384.64` on `Core 4`; `-$271.35` to `-$324.75` on `ex-META`), refuting the hypothesis that `S4_hold600s_only` earns directional inventory MTM drift (`S4_hold600s_only` by symbol: `AAPL spr +101.16 / drft -145.65 / pex +51.29 / tslp -0.03`, `AMZN +74.12 / -87.73 / +41.05 / -0.21`, `META +80.56 / -65.71 / +64.46 / -0.63`, `MSFT +74.75 / -85.09 / +49.14 / -0.15`; by split: `dev +234.46 / -287.84 / +144.63 / -0.81`, `holdout +65.98 / -75.68 / +40.90 / -0.13`, `w26_w27_oos +30.15 / -20.66 / +20.40 / -0.09`). Extending hold `15s -> 600s` replaces `-$210.73` of forced IOC slippage (`tslp`) with `+$205.94` passive exit capture (`pex`) (`+$74.51` extra `pex` and `+$209.70` saved `tslp`), while paying `-$57.15` more adverse `drft` and forfeiting `-$41.95` opening `spr`.
+
+| Arm | `Core 4` `spr` ($) | `drft` ($) | `pex` ($) | `tslp` ($) | `MTM Net` (`$/M`) | `ex-META` `spr` / `drft` / `pex` / `tslp` ($) | `ex-META` `Net` (`$/M`) |
+|---|---:|---:|---:|---:|---:|---|---:|
+| `S4_speedbump_combined` | `+372.54` | `-327.03` | `+131.43` | `-210.73` | `-$33.79` (`+2.64`) | `+277.17 / -271.35 / +93.35 / -146.01` | `-$46.84` (`+4.49`) |
+| `S4_hold60s` | `+342.97` | `-361.10` | `+179.68` | `-69.75` | `+$91.73` (`-7.91`) | `+257.19 / -300.30 / +125.62 / -44.69` | `+$37.82` (`-3.99`) |
+| `S4_hold180s` | `+333.79` | `-382.68` | `+200.87` | `-15.36` | `+$136.56` (`-12.21`) | `+251.38 / -318.21 / +139.08 / -8.28` | `+$63.98` (`-6.97`) |
+| `S4_hold300s` | `+331.62` | `-384.64` | `+204.43` | `-5.60` | `+$145.74` (`-13.13`) | `+250.40 / -317.51 / +140.94 / -2.68` | `+$71.15` (`-7.79`) |
+| **`S4_hold600s_only`** | **`+330.59`** | **`-384.18`** | **`+205.94`** | **`-1.03`** | **`+$151.26` (`-13.66`)** | **`+250.03 / -318.47 / +141.48 / -0.39`** | **`+$72.64` (`-7.97`)** |
+| `S4_hold600s_penny1` | `+350.55` | `-383.46` | `+159.44` | `-0.96` | `+$125.51` (`-10.47`) | `+267.53 / -324.75 / +98.77 / -0.34` | `+$41.21` (`-4.14`) |
+| `S4_hold600s_skew5` | `+311.08` | `-370.00` | `+193.78` | `-0.93` | `+$133.86` (`-12.81`) | `+237.21 / -307.27 / +134.52 / -0.35` | `+$64.11` (`-7.44`) |
+| `P3_patient_600s` | `+336.16` | `-371.76` | `+150.92` | `-0.86` | `+$114.39` (`-9.87`) | `+259.48 / -319.34 / +95.24 / -0.27` | `+$35.11` (`-3.62`) |
+| `W5_nopenn_15bp_180s` | `+84.79` | `-88.88` | `+37.25` | `-2.66` | `+$30.50` (`-15.82`) | `+66.20 / -75.68 / +26.33 / -1.26` | `+$15.59` (`-9.99`) |
+
+### 5.2 Audit ②: Up-Market vs. Down-Market Window Symmetry (`W01–W27`)
+
+Partitioning the `21` windows by equal-weight Core 4 window return (`11` up windows `avg = +69.92 bps` vs. `10` down windows `avg = -76.17 bps`):
+
+| Arm / Scope | Up `n` | Up `Net` (`$/M`, `Pos%`) | Down `n` | Down `Net` (`$/M`, `Pos%`) | Welch `t` (`p`) |
+|---|---:|---|---:|---|---:|
+| Portfolio `S4_hold600s_only` | `11` | `+$82.92` (`-14.85`, `100%`) | `10` | `+$68.34` (`-12.45`, `100%`) | `+0.3648` (`0.7200`) |
+| Portfolio `S4_hold180s` | `11` | `+$74.82` (`-13.24`, `100%`) | `10` | `+$61.73` (`-11.15`, `100%`) | `+0.3359` (`0.7411`) |
+| Portfolio `P3_patient_600s` | `11` | `+$70.54` (`-11.91`, `100%`) | `10` | `+$43.85` (`-7.74`, `90%`) | `+1.0291` (`0.3187`) |
+| Portfolio `S4_speedbump_combined` | `11` | `-$8.74` (`+1.34`, `45%`) | `10` | `-$25.05` (`+3.99`, `20%`) | `+1.1482` (`0.2659`) |
+| `S4_hold600s_only` `AAPL` / `AMZN` | `13` / `11` | `+$3.31` (`46%`) / `+$12.87` (`73%`) | `8` / `10` | `+$3.46` (`63%`) / `+$14.37` (`90%`) | `-0.261` (`0.797`) / `-0.346` (`0.733`) |
+| `S4_hold600s_only` `META` / `MSFT` | `12` / `11` | `+$41.52` (`100%`) / `+$23.78` (`91%`) | `9` / `10` | `+$37.10` (`89%`) / `+$14.86` (`100%`) | `-0.464` (`0.652`) / `+1.136` (`0.273`) |
+| `S4_hold600s_only` Pooled `84` cells | `47` | `+$81.48` (`-13.26`, `77%`) | `37` | `+$69.78` (`-14.16`, `86%`) | `-0.2897` (`0.7729`) |
+
+### 5.3 Audit ③: Unprinted Book-Cross Toxic Fill Sensitivity (`W01–W27`)
+
+Evaluating opt-in `book_cross_toxic_fill_frac` (filling activated resting quotes once when an unprinted `kind == 0` L1 book update moves through the resting quote: `strict_through` = opposite best strictly past quote; `opposite_touch` = opposite best touches/crosses quote; `level_evicted` = same-side best drops behind quote, which conflates non-trade LP quote pulls with toxic fills):
+
+| Scenario (`mode`, `frac`) | `S4_hold600s_only` `Core 4` `Net` (`$/M`, `Pos%`) | `ubx_fills` (`$M`) | `S4_hold600s_only` `ex-META` `Net` (`$/M`, `Pos%`) | `S4_hold180s` `Core 4` `Net` (`$/M`) | `S4_speedbump` `Core 4` `Net` (`$/M`) |
+|---|---:|---:|---:|---:|---:|
+| `baseline` (`0.0`) | `+$151.88` (`-13.72`, `100%`) | `0` (`$0.00M`) | `+$73.40` (`-8.06`, `95%`) | `+$136.44` (`-12.20`) | `-$34.69` (`+2.71`) |
+| `strict_through` (`0.25`) | `+$78.96` (`-7.69`, `86%`) | `11,837` (`$0.44M`) | `+$24.66` (`-2.92`, `81%`) | `+$73.28` (`-7.07`) | `-$69.03` (`+5.90`) |
+| **`strict_through` (`0.50`)** | **`+$15.40` (`-1.44`, `48%`)** | `11,697` (`$0.87M`) | **`-$22.34` (`+2.55`, `24%`)** | `+$10.53` (`-0.98`) | `-$131.28` (`+10.80`) |
+| `strict_through` (`1.00`) | `-$118.63` (`+10.02`, `24%`) | `10,464` (`$1.83M`) | `-$123.67` (`+12.78`, `14%`) | `-$123.52` (`+10.39`) | `-$263.54` (`+19.89`) |
+| `opposite_touch` (`0.25`) | `+$58.69` (`-5.70`, `67%`) | `23,911` (`$0.83M`) | `+$3.65` (`-0.43`, `43%`) | `+$53.36` (`-5.15`) | `-$86.55` (`+7.33`) |
+| `opposite_touch` (`0.50`) | `-$22.19` (`+2.02`, `29%`) | `23,239` (`$1.63M`) | `-$55.39` (`+6.11`, `19%`) | `-$26.94` (`+2.43`) | `-$172.13` (`+13.70`) |
+| `opposite_touch` (`1.00`) | `-$215.95` (`+16.38`, `14%`) | `19,581` (`$3.49M`) | `-$207.97` (`+19.10`, `0%`) | `-$219.26` (`+16.59`) | `-$357.98` (`+24.35`) |
+| `level_evicted` (`0.25` / `0.50`, reference only) | `+$724.13` / `+$1488.40` (`-31.40` / `-38.52`) | `410k` / `412k` (`$13.1M` / `$29.6M`) | `+$361.64` / `+$760.23` | `+$722.31` / `+$1487.60` | `+$341.26` / `+$1134.60` |
+
+### 5.4 Audit ④: Per-Window OLS Beta Regressions & `DSR` Disclosure
+
+OLS regressions `window_mtm_net_usd ~ alpha + beta * window_return_pct` show zero directional exposure:
+- **Portfolio `S4_hold600s_only` (`n = 21`):** `alpha = +$7.205/win`, `beta = -0.7223` (`SE = 1.0165`, `t = -0.7106`, `p = 0.4860`, `R^2 = 0.0259`).
+- **Per-symbol (`n = 21` each):** `AAPL` (`alpha = +$0.33`, `beta = -0.188`, `t = -0.304`, `p = 0.764`), `AMZN` (`alpha = +$1.29`, `beta = -0.026`, `t = -0.078`, `p = 0.939`), `META` (`alpha = +$3.82`, `beta = -0.301`, `t = -0.703`, `p = 0.490`), `MSFT` (`alpha = +$1.90`, `beta = +0.353`, `t = +1.263`, `p = 0.222`).
+- **Pooled 84 symbol-windows:** `alpha = +$1.801`, `beta = +0.0304` (`t = +0.1352`, `p = 0.8928`, `R^2 = 0.00022`).
+- **Multiple-testing disclosure:** Because `N_eff` is `1.00–1.36` across correlated hold rungs (`E[max SR(N_eff)] ~ 0`), `DSR(N_eff) = 1.000000` is structurally near-trivial and must NOT be cited as robustness evidence. Across broader cumulative search counts: **`DSR(M_cum=18) = 0.9861` (`SR_th = 1.249`)**, **`DSR(M_cum=50) = 0.7844` (`SR_th = 1.534`)**, and **`DSR(M_cum=100) = 0.4744` (`SR_th = 1.705`)**.
 
 ---
 
-## 6. Verification & Artifact Provenance
+## 6. `W28+` Upgraded 12-Gate Manifest & Revised Posture (`HOLD_PENDING_TOXIC_FILL_SURVIVAL_AND_SHADOW_W28`)
+
+- **Canonical Manifest (untracked):** `.agent-state/research/roadmap_upgrade_20261127/track03_w28plus_prereg_plan.json` (`schema: aleph_tx_track03_w28plus_prereg_plan_v2`, `status: HOLD_PENDING_TOXIC_FILL_SURVIVAL_AND_SHADOW_W28`, `plan_sha256: 3c729a3151505a03341bac47122dbe5f19edbc27b4aa30d69db43efd9e996f68`, `file sha256: 729b66d524ff8b818c91363dcecf1045ccc9aefbcb97117d285ca5e12ca82a31`).
+- **Shadow Config (tracked):** [track03_core4_patient_shadow.toml](../examples/track03_core4_patient_shadow.toml) (`sha256: fb2ad2a281926e566b80e8b07bc77c546db42a18ecc4a8c90b00ca25db68e252`), configuring `AAPL` (`1006`), `AMZN` (`1007`), `META` (`1008`), `MSFT` (`1009`) on `target_exchange_id = 8` (`lighter_robinhood`), `ref_exchange_ids = [7, 10]`, `0.0/0.0 bps` `verified_account_tier`, `[defense]` enabled (`defense_enabled = true`), `ioc_exit_delay_ms = 330`, `max_inventory_hold_ms = 600000`, `reduce_only_penny_ticks = 0`, `inventory_skew_bps_per_full_limit = 2.0`, `capital_usd = 10000.0`, `daily_loss_limit_pct = 0.02`.
+- **Upgraded 12 Falsification Thresholds (`min_independent_windows = 10`, `-w28` / `>= w28` only once sealed; includes tightened `#5`/`#7` + new `#10`–`#12`):**
+  1. `1_cost_reduction_vs_s4`: `ledger_mtm_usd_per_m < 0.0`, `Δledger_vs_s4 <= -5.0 $/M`, Politis-Romano 95% CI upper bound `< 0.0`.
+  2. `2_volume_floor`: `target_executed_fill_notional_per_window_usd >= $400,000`, `maker_volume_per_window_usd >= $380,000`.
+  3. `3_absolute_cash_cost`: `mtm_net_cash_cost_usd <= 0.0`, `realized_net_cash_cost_usd <= 0.0`, `positive_window_ratio >= 0.70`.
+  4. `4_max_gross_exposure`: `max_single_symbol_gross_exposure_usd <= $650.0`, `max_portfolio_gross_exposure_usd <= $1,600.0`.
+  5. `5_hold_tail_bounds` *(tightened)*: `hold_p95_ms <= 180,000`, `max_hold_observed_ms <= 615,000`.
+  6. `6_forced_ioc_share`: `taker_exit_share_s <= 0.03`.
+  7. `7_terminal_residual_cap` *(tightened)*: `terminal_residual_per_window_usd <= $25.0`.
+  8. `8_ex_meta_stability_cap`: `ex_meta_ledger_mtm_usd_per_m <= 0.0`, `ex_meta_mtm_net_cash_cost_usd <= 0.0`.
+  9. `9_single_symbol_share_cap`: `max_single_symbol_positive_pnl_share <= 0.80`.
+  10. `10_directional_symmetry` *(new)*: up-window and down-window buckets (when `>= 3` windows each) both satisfy `ledger_mtm_usd_per_m <= 0.0` and `positive_window_ratio >= 0.50`.
+  11. `11_market_neutrality_beta` *(new)*: OLS regression of window Core 4 PnL on equal-weight Core 4 window return satisfies `|t_beta| < 2.0`, `R^2 < 0.25`, `alpha > $0.0/win`.
+  12. `12_toxic_book_cross_robustness` *(new)*: under `strict_through` `book_cross_toxic_fill_frac = 0.50`, `ledger_mtm_usd_per_m <= 0.0` (currently `+$15.40` / `-$1.44/M` overall on `Core 4` vs `-$22.34` / `+$2.55/M` on `ex-META`, requiring live shadow telemetry resolution before promotion).
+
+---
+
+## 7. Verification & Artifact Provenance
 
 - **Redacted Research Artifacts (outside Git):**
   - `.agent-state/research/roadmap_upgrade_20261127/track03_core4_hold_ablation_w01_w27.json` (`sha256: 0c69090dabb9f035f3b0dfdb5c8d18b3997b7f5c53c639726f228b129e770a0a`, `SECRET_HITS = 0`, `W28_HITS = 0`).
-  - `.agent-state/research/roadmap_upgrade_20261127/track03_w28plus_prereg_plan.json` (`sha256: 2dd01a7af6f285de0b19a3b5ecf6041f023fb03f1c72d29404b4a9e619351ec0`, `plan_sha256: ce851712e70d401a090595f601b5261f71fa7a5fc1ecd743a5ebef37c4aa98d1`, `SECRET_HITS = 0`).
+  - `.agent-state/research/roadmap_upgrade_20261127/track03_core4_qualitative_audit_w01_w27.json` (`sha256: f0aa6af743ad30431da154dba3771193d86b017ab51e76ca3e8035e139695904`, `SECRET_HITS = 0`, `W28_HITS = 0`).
+  - `.agent-state/research/roadmap_upgrade_20261127/track03_w28plus_prereg_plan.json` (`sha256: 729b66d524ff8b818c91363dcecf1045ccc9aefbcb97117d285ca5e12ca82a31`, `plan_sha256: 3c729a3151505a03341bac47122dbe5f19edbc27b4aa30d69db43efd9e996f68`, `SECRET_HITS = 0`).
 - **Verification Commands:**
-  - `python3 -S -m unittest -v scripts/test_research_track03_core4_hold_ablation.py` (5/5 OK, including isolated `python3 -S` import check blocking `numpy`, `duckdb`, `pyarrow`, `pandas`, `scipy`).
+  - `python3 -S -m unittest -v scripts/test_research_track03_core4_hold_ablation.py` (7/7 OK, including unprinted book-cross parity, OLS beta regression, Welch symmetry, v2 12-gate prereg schema, and isolated `python3 -S` import check blocking `numpy`, `duckdb`, `pyarrow`, `pandas`, `scipy`).
   - `python3 -S scripts/research_track03_core4_hold_ablation.py --self-test` (OK, `max_parity_diff = 0.0`).
-  - `cargo run --locked --bin track01_track02_shadow -- --track 3 --config examples/track03_core4_patient_shadow.toml --check` (`"status": "Configuration OK"`, `"arms": 4`, `"defense_enabled": true`).
-  - `git diff --check` clean; zero edits to untouched/frozen/peer files (`src/strategy/inventory_neutral_mm.rs`, `Cargo.lock`, `feeder/shm/`, `AGENT_HANDOFF.md`, `.agent-state/`, `.env*`, `docs/ALEPHTX_RESEARCH_AND_EXECUTION_ROADMAP_2026_11_27.md`, and the 6 pre-existing modified files).
+  - `cargo run --locked --bin track01_track02_shadow -- --track 3 --config examples/track03_core4_patient_shadow.toml --check` (`"status": "Configuration OK"`, `"arms": 4`, `"arm_ioc_exit_delay_ms": [330, 330, 330, 330]`, `"defense_enabled": true`).
+  - `git diff --check` clean; zero edits to untouched/frozen/peer files (`src/strategy/inventory_neutral_mm.rs`, `Cargo.lock`, `feeder/shm/`, `.agent-state/`, `.env*`, `docs/ALEPHTX_RESEARCH_AND_EXECUTION_ROADMAP_2026_11_27.md`, and the 6 pre-existing modified files).

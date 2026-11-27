@@ -40,6 +40,8 @@ queue_ahead_fraction = 0.5
 # and weekend UTC; suppress opening quotes during us_rth (13:30-20:00 UTC) while keeping reduce_only exits active.
 allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
 account_fee_status = "public_tier0_unverified"
+# Verified Lighter Premium taker execution delay (~140 ms per src/venues.rs).
+ioc_exit_delay_ms = 140
 
 [arms.strategy]
 tick_size = 0.01

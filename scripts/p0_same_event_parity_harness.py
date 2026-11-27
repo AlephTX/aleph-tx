@@ -743,7 +743,26 @@ def run_independent_reference_ledger(
     }
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _to_python_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert raw parity events to Python prepare_replay_stream format.
+
+    NOTE: Python `prepare_replay_stream` models explicit `book` timestamps rather than separate
+    `(now_ms, recv_ms)` tuples, so synthetic stale-arrival BBO ticks (`recv_ms != ts`) are omitted
+    here. Consequently, the Python arm serves as a diagnostic reference on synthetic stale-arrival
+    tests, while `IndependentReferenceSimulator` <-> compiled Rust `track01_track02_shadow`
+    forms the authoritative pair for explicit stale-arrival ticks.
+    """
     out: list[dict[str, Any]] = []
     for ev in events:
         kind = str(ev.get("kind", ""))
@@ -1571,6 +1590,9 @@ def generate_review_bundle(
 ) -> dict[str, Any]:
     """Run full P0 synthetic + W27 parity verification and build Roadmap §5 Review Bundle."""
     rust_bin = _resolve_rust_binary(rust_bin_path)
+    rust_bin_stat = rust_bin.stat()
+    rust_bin_sha256 = _file_sha256(rust_bin)
+    rust_bin_mtime_epoch = round(rust_bin_stat.st_mtime, 6)
     git_head = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
         cwd=REPO_ROOT,
@@ -1620,6 +1642,12 @@ def generate_review_bundle(
             "Events strictly past declared_end_ms alter fills, realized/unrealized PnL, or terminal residual.",
         ],
         "code_version": git_head,
+        "parity_authority_policy": "post_9c9eaf2_fresh_rebuild_required",
+        "rust_binary_path": str(rust_bin.relative_to(REPO_ROOT)) if rust_bin.is_relative_to(REPO_ROOT) else str(rust_bin),
+        "rust_binary_sha256": rust_bin_sha256,
+        "rust_binary_mtime_epoch": rust_bin_mtime_epoch,
+        "authoritative_stale_arrival_pair": ["independent_reference", "rust_shadow_binary"],
+        "python_arm_role": "diagnostic_reference_omits_synthetic_stale_arrival_ticks",
         "fee_evidence_sha256": ACCOUNT_FEE_EVIDENCE_SHA256,
         "w27_slice_sha256": w27_res["slice_sha256"] if w27_res is not None else None,
         "venue_and_fee_tier": {
@@ -1664,6 +1692,10 @@ def generate_review_bundle(
         "independent_review_record": {
             "reviewer_role": "independent_reference_ledger_v1",
             "frozen_plan_sha256": frozen_plan["frozen_plan_sha256"],
+            "parity_authority_policy": "post_9c9eaf2_fresh_rebuild_required",
+            "rust_binary_sha256": rust_bin_sha256,
+            "authoritative_stale_arrival_pair": ["independent_reference", "rust_shadow_binary"],
+            "python_arm_role": "diagnostic_reference_omits_synthetic_stale_arrival_ticks",
             "evidence_signoff": "PASS" if (all_p0_passed and t1_t2_ref["track01_exit_depth_conservation"]["conserved"]) else "FAIL",
             "economic_hypothesis_status": "PENDING_P1_UNSEEN_WINDOW",
             "promotion_recommendation": "HOLD_FOR_P1_CORE4_TRIAL",

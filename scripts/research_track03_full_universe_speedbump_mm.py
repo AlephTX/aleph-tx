@@ -352,6 +352,9 @@ class SpeedbumpArmConfig:
     toxicity_pause_ewma_bps: float = 0.0
     toxicity_pause_ms: int = 0
     toxicity_min_fills: int = 0
+    # Opt-in sensitivity for unprinted book-cross toxic fills (0.0 keeps default parity intact):
+    book_cross_toxic_fill_frac: float = 0.0
+    book_cross_mode: str = "strict_through"
 
     @property
     def latency_label(self) -> str:
@@ -431,6 +434,7 @@ class _RestingOrder:
     activated: bool = False
     cancel_requested_ms: int | None = None
     cancel_effective_ms: int | None = None
+    toxic_cross_handled: bool = False
 
 
 @dataclasses.dataclass
@@ -625,6 +629,10 @@ def simulate_prepared_arm(
     """Run causal FIFO simulation with Codex #140 realism & speed-bump quoting controls."""
     if tick <= 0.0 or not math.isfinite(tick):
         raise ValueError(f"tick must be finite and > 0, got {tick}")
+    if not (0.0 <= arm.book_cross_toxic_fill_frac <= 1.0) or not math.isfinite(arm.book_cross_toxic_fill_frac):
+        raise ValueError(f"book_cross_toxic_fill_frac must be in [0, 1], got {arm.book_cross_toxic_fill_frac}")
+    if arm.book_cross_mode not in ("strict_through", "opposite_touch", "level_evicted"):
+        raise ValueError(f"Unsupported book_cross_mode {arm.book_cross_mode!r}")
     if declared_end_ms is not None:
         if isinstance(declared_end_ms, bool) or not isinstance(declared_end_ms, (int, float)) or not math.isfinite(declared_end_ms):
             raise ValueError(f"declared_end_ms must be finite integer ms or None, got {declared_end_ms!r}")
@@ -713,6 +721,11 @@ def simulate_prepared_arm(
             "tfi_veto_cancels": 0,
             "tfi_veto_blocks": 0,
             "reduce_penny_placements": 0,
+            "unprinted_book_cross_fills": 0,
+            "unprinted_book_cross_notional_usd": 0.0,
+            "first_mid": None,
+            "last_mid": None,
+            "underlying_return_bps": None,
             "terminal_flat": True,
             "_exact_cash_ex_fee_usd": 0.0,
             "_exact_realized_gross_usd": 0.0,
@@ -829,6 +842,10 @@ def simulate_prepared_arm(
     tfi_veto_cancels = 0
     tfi_veto_blocks = 0
     reduce_penny_placements = 0
+    unprinted_book_cross_fills = 0
+    unprinted_book_cross_notional_usd = 0.0
+    first_mid: float | None = None
+    last_mid: float | None = None
 
     maker_fills_log: list[tuple[int, str, float, float]] = []
 
@@ -1415,11 +1432,69 @@ def simulate_prepared_arm(
             if ask_ord is not None and ask_ord.activated and abs(ask_ord.price - cur_ba) <= tol_tick_25 and cur_asz < ask_ord.queue_ahead:
                 ask_ord.queue_ahead = cur_asz
 
+            mid_now = 0.5 * (cur_bb + cur_ba)
+            if mid_now > 0.0:
+                if first_mid is None:
+                    first_mid = mid_now
+                last_mid = mid_now
+
+            if arm.book_cross_toxic_fill_frac > 0.0 and mid_now > 0.0:
+                if bid_ord is not None and bid_ord.activated and not bid_ord.toxic_cross_handled:
+                    if arm.book_cross_mode == "strict_through":
+                        bid_crossed = cur_ba < bid_ord.price - tol_tick_10
+                    elif arm.book_cross_mode == "opposite_touch":
+                        bid_crossed = cur_ba <= bid_ord.price + tol_tick_10
+                    else:  # level_evicted
+                        bid_crossed = cur_bb < bid_ord.price - tol_tick_10
+                    if bid_crossed:
+                        fill_qty = bid_ord.remaining * arm.book_cross_toxic_fill_frac
+                        bid_ord.toxic_cross_handled = True
+                        if fill_qty > 1e-12:
+                            cif = bid_ord.cancel_effective_ms is not None and ts < bid_ord.cancel_effective_ms
+                            record_fill(
+                                ts,
+                                "BUY",
+                                bid_ord.price,
+                                fill_qty,
+                                "maker",
+                                mid_now,
+                                was_cancel_in_flight=cif,
+                            )
+                            unprinted_book_cross_fills += 1
+                            unprinted_book_cross_notional_usd += fill_qty * bid_ord.price
+                            bid_ord.remaining -= fill_qty
+                        if bid_ord.remaining <= 1e-12:
+                            bid_ord = None
+                if ask_ord is not None and ask_ord.activated and not ask_ord.toxic_cross_handled:
+                    if arm.book_cross_mode == "strict_through":
+                        ask_crossed = cur_bb > ask_ord.price + tol_tick_10
+                    elif arm.book_cross_mode == "opposite_touch":
+                        ask_crossed = cur_bb >= ask_ord.price - tol_tick_10
+                    else:  # level_evicted
+                        ask_crossed = cur_ba > ask_ord.price + tol_tick_10
+                    if ask_crossed:
+                        fill_qty = ask_ord.remaining * arm.book_cross_toxic_fill_frac
+                        ask_ord.toxic_cross_handled = True
+                        if fill_qty > 1e-12:
+                            cif = ask_ord.cancel_effective_ms is not None and ts < ask_ord.cancel_effective_ms
+                            record_fill(
+                                ts,
+                                "SELL",
+                                ask_ord.price,
+                                fill_qty,
+                                "maker",
+                                mid_now,
+                                was_cancel_in_flight=cif,
+                            )
+                            unprinted_book_cross_fills += 1
+                            unprinted_book_cross_notional_usd += fill_qty * ask_ord.price
+                            ask_ord.remaining -= fill_qty
+                        if ask_ord.remaining <= 1e-12:
+                            ask_ord = None
+
             # Book refresh may allow queuing a new delayed IOC exit (which must wait exit_delay_ms);
             # never immediately fill a previously stale pending IOC at 0 ms.
             maybe_queue_exit_ioc(ts)
-
-            mid_now = 0.5 * (cur_bb + cur_ba)
             if last_vol_ts >= 0 and ts > last_vol_ts and last_vol_mid > 0.0 and mid_now > 0.0:
                 dt_s = (ts - last_vol_ts) / 1000.0
                 if 0.0 < dt_s <= 10.0:
@@ -1621,6 +1696,15 @@ def simulate_prepared_arm(
         "tfi_veto_cancels": tfi_veto_cancels,
         "tfi_veto_blocks": tfi_veto_blocks,
         "reduce_penny_placements": reduce_penny_placements,
+        "unprinted_book_cross_fills": unprinted_book_cross_fills,
+        "unprinted_book_cross_notional_usd": round(unprinted_book_cross_notional_usd, 6),
+        "first_mid": round(first_mid, 8) if first_mid is not None else None,
+        "last_mid": round(last_mid, 8) if last_mid is not None else None,
+        "underlying_return_bps": (
+            round(((last_mid / first_mid) - 1.0) * 1e4, 6)
+            if (first_mid is not None and last_mid is not None and first_mid > 0.0)
+            else None
+        ),
         "terminal_flat": terminal_flat,
         "_exact_cash_ex_fee_usd": cash_ex_fee_usd + (pos_qty * mid_end if has_book else 0.0),
         "_exact_realized_gross_usd": realized_gross_usd,

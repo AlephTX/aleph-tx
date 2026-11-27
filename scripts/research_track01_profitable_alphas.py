@@ -1626,14 +1626,23 @@ def _evaluate_family_cohort(
         key=lambda kv: (kv[1]["realized_only_net_0_0_usd"], kv[1]["win_sharpe_0_0"], kv[1]["trades"]),
     )[0]
 
-    # Per-symbol positive-dev freeze strictly on selection_dev
+    # Per-symbol positive-dev freeze strictly on selection_dev (reported for dev inspection ONLY;
+    # OOS splits omit unpenalized per-symbol argmax selection to prevent selection-bias leaks).
     sym_league_dev: dict[str, Any] = {}
     frozen_pos_syms: dict[str, tuple[Any, ...]] = {}
-    for sym in sorted({str(r["symbol"]) for r in dev_sub}):
+    all_syms = sorted({str(r["symbol"]) for r in sub})
+    trial_persym_all: dict[str, list[float]] = {}
+    for sym in all_syms:
         s_dev = [r for r in dev_sub if r["symbol"] == sym]
         best_sc = None
         best_sa = None
         for cfg in cfg_keys:
+            sc_rows_all = [r for r in sub if r["symbol"] == sym and row_match_fn(r, cfg)]
+            wa_sym: dict[str, float] = defaultdict(float)
+            for r in sc_rows_all:
+                wa_sym[str(r["win"])] += float(r["mtm_incl_residual_gross_usd"])
+            trial_persym_all[f"{sym}|{cfg_label_fn(cfg)}"] = [wa_sym[w] for w in all_wins]
+
             sc_rows = [r for r in s_dev if row_match_fn(r, cfg)]
             if not sc_rows:
                 continue
@@ -1663,18 +1672,24 @@ def _evaluate_family_cohort(
     for sp in ("selection_dev", "holdout", "w26_w27_oos"):
         sp_global = [r for r in sub if r["split"] == sp and row_match_fn(r, best_cfg)]
         sp_pos_global = [r for r in sp_global if r["symbol"] in frozen_global_pos_syms]
-        sp_pos_persym = [
-            r
-            for r in sub
-            if r["split"] == sp
-            and r["symbol"] in frozen_pos_syms
-            and row_match_fn(r, frozen_pos_syms[str(r["symbol"])])
-        ]
-        splits_eval[sp] = {
+        entry: dict[str, Any] = {
             "all_symbols_best_global": aggregate_rows(sp_global, venue=venue),
             "frozen_global_pos_dev_symbols": aggregate_rows(sp_pos_global, venue=venue),
-            "frozen_persym_pos_dev_symbols": aggregate_rows(sp_pos_persym, venue=venue),
         }
+        if sp == "selection_dev":
+            sp_pos_persym = [
+                r
+                for r in sub
+                if r["split"] == sp
+                and r["symbol"] in frozen_pos_syms
+                and row_match_fn(r, frozen_pos_syms[str(r["symbol"])])
+            ]
+            entry["frozen_persym_pos_dev_symbols"] = aggregate_rows(sp_pos_persym, venue=venue)
+        else:
+            entry["persym_argmax_oos_omitted_reason"] = (
+                "disabled_unpenalized_per_symbol_selection_bypass_see_multiple_testing_persym_w01_w27"
+            )
+        splits_eval[sp] = entry
 
     # Per-window breakdown for best_global across all splits
     per_window_best: dict[str, Any] = {}
@@ -1699,6 +1714,7 @@ def _evaluate_family_cohort(
         "per_window_best_global": per_window_best,
         "multiple_testing_dev": compute_multiple_testing_metrics(trial_dev),
         "multiple_testing_w01_w27": compute_multiple_testing_metrics(trial_all),
+        "multiple_testing_persym_w01_w27": compute_multiple_testing_metrics(trial_persym_all),
     }
 
 

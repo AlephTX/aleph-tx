@@ -130,6 +130,11 @@ Politis–Romano (1994) stationary block bootstrap (`mean_block_len = 3.0` windo
 
 **Final Decision: `NO-GO / HOLD`.** Do not promote `OverreactionReversion` (with or without `tight_spread_le_5bp`) or `OracleDiscoveryMomentum` to live or shadow deployment.
 
+### 3.5 Post-Batch-2 Audit Closures (`research_track01_profitable_alphas.py` & Directional Engines)
+
+- **Closure of Per-Symbol Argmax OOS Bypass**: Removed unpenalized `frozen_persym_pos_dev_symbols` OOS PnL reporting from `holdout` and `w26_w27_oos` inside `_evaluate_family_cohort` in [research_track01_profitable_alphas.py](../scripts/research_track01_profitable_alphas.py), and added `multiple_testing_persym_w01_w27` so any per-symbol × arm grid inspection carries full `symbol × arm` DSR/PBO degrees-of-freedom accounting (regression-guarded by `test_no_unpenalized_persym_argmax_oos_bypass` in [test_research_track01_profitable_alphas.py](../scripts/test_research_track01_profitable_alphas.py)).
+- **Directional Rust Engines Boundary Status (`HOLD`)**: The standalone Track 01 Rust strategy modules added earlier remain intentionally unwired from live/shadow execution under `HOLD`. Any future market-neutral shadow wiring MUST enforce portfolio-level net-exposure and beta neutrality gates at the wiring boundary prior to execution.
+
 ---
 
 ## 4. Verification Summary
