@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import math
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,31 +28,27 @@ class TestResearchStatArbAndOracleReversion(unittest.TestCase):
         self.assertGreater(res["oracle_funding_usd"], 0.0)
 
     def test_pure_stdlib_top_level_and_duckdb_absent_safe(self) -> None:
-        # Ensure importing and running self-test succeeds even if duckdb/numpy/pandas are blocked
-        for pkg in ("duckdb", "numpy", "pandas", "pyarrow", "scipy"):
-            self.assertNotIn(pkg, sys.modules)
-        spec = importlib.util.spec_from_file_location(
-            "statarb_isolated",
-            _SCRIPT_DIR / "research_stat_arb_and_oracle_reversion.py",
+        # Probe in a clean isolated `python3 -S` subprocess so shared unittest-discover
+        # runs (where sibling tests import numpy) do not pollute the top-level import check.
+        probe = "\n".join(
+            [
+                f"import json, sys; sys.path.insert(0, {str(_SCRIPT_DIR)!r})",
+                "for pkg in ('duckdb', 'numpy', 'pandas', 'pyarrow', 'scipy'):",
+                "    sys.modules[pkg] = None",
+                "import research_stat_arb_and_oracle_reversion as iso",
+                "res = iso.run_self_test()",
+                "print(json.dumps(res))",
+            ]
         )
-        assert spec is not None and spec.loader is not None
-        iso = importlib.util.module_from_spec(spec)
-        saved = {}
-        blocked = ("duckdb", "numpy", "pandas", "pyarrow", "scipy")
-        for pkg in blocked:
-            saved[pkg] = sys.modules.get(pkg)
-            sys.modules[pkg] = None  # type: ignore[assignment]
-        sys.modules["statarb_isolated"] = iso
-        try:
-            spec.loader.exec_module(iso)
-            self.assertEqual(iso.run_self_test()["self_test"], "ok")
-        finally:
-            sys.modules.pop("statarb_isolated", None)
-            for pkg, prev in saved.items():
-                if prev is None:
-                    sys.modules.pop(pkg, None)
-                else:
-                    sys.modules[pkg] = prev
+        proc = subprocess.run(
+            [sys.executable, "-S", "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr}\nstdout={proc.stdout}")
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["self_test"], "ok")
 
     def test_market_id_maps_and_window_exclusion(self) -> None:
         self.assertEqual(len(mod.LIGHTER_ROBINHOOD_MARKETS), 18)
