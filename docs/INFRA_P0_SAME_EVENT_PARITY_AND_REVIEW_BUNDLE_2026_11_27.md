@@ -27,7 +27,7 @@ All results below are taken directly from `p0_parity_review_bundle.json` (genera
 | `p0_c4_declared_end_ms_late_ref_immunity` | 1 / 0 | 1 / 0 | 1 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0.0000 | +0.1200 | 200.1200 | PASS |
 | `p0_c5_terminal_drain_ms_flatten` | 1 / 1 | 1 / 1 | 1 / 1 | 0 / 0 / 0 | 0 / 0 / 0 | +0.0400 | 0.0000 | 0.0000 | PASS |
 | `p0_c6_same_ms_book_first` | 2 / 0 | 2 / 0 | 2 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | +0.0800 | +0.0000 | 0.0800 | PASS |
-| `p0_c6_same_ms_trade_first` | 1 / 0 | n/a | 1 / 0 | 0 / - / 0 | 0 / - / 0 | 0.0000 | +0.1200 | 200.1200 | PASS |
+| `p0_c6_same_ms_trade_first` | 1 / 0 | n/a | 1 / 0 | 0 / - / 0 | 0 / - / 0 | 0.0000 | 0.0000 | 200.0000 | PASS |
 
 Notes on `p0_c6`:
 - `py_t3.prepare_replay_stream` canonically sorts same-ms events as `(ts, kind)` (`book` before `trade`), so `p0_c6_same_ms_trade_first` is evaluated on Reference and Rust (`book_first_maker_fills = 2`, `trade_first_maker_fills = 1`, `realized_pnl_usd_bounds = [0.0, 0.079968]`).
@@ -56,7 +56,7 @@ Source slice: `w27_aapl_meta_public_slice.json` (`campaign_id = tokyo-rwa-202611
 | `AAPL` Matched `o200_c0_e330` | Python | 240 | 62 | 18 | +0.057177 | 18,087.54 | -1.58 | 50.07 |
 | `AAPL` Matched `o200_c0_e330` | Rust | 220 | 58 | 19 | +0.048662 | 16,512.07 | -1.47 | 80.68 |
 | `AAPL` Prod `S4` | Python `o200_c300_e330` | 170 | 19 | 1 | -0.056172 | 9,937.55 | +2.83 | 89.67 |
-| `AAPL` Prod `S4` | Rust `o200_c0_e330` | 108 | 41 | 18 | +0.049127 | 7,429.92 | -3.31 | 84.23 |
+| `AAPL` Prod `S4` | Rust `o200_c0_e330` | 108 | 41 | 18 | +0.049126 | 7,429.92 | -3.31 | 84.23 |
 | `META` Matched `o200_c0_e330` | Reference | 54 | 36 | 11 | +0.004455 | 5,490.29 | -0.41 | 29.76 |
 | `META` Matched `o200_c0_e330` | Python | 48 | 40 | 13 | +0.096566 | 5,683.84 | -8.49 | 52.74 |
 | `META` Matched `o200_c0_e330` | Rust | 47 | 30 | 6 | +0.023856 | 5,477.29 | -2.18 | 81.89 |
