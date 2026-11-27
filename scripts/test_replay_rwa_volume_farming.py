@@ -359,6 +359,130 @@ class ReplayRwaVolumeFarmingTests(unittest.TestCase):
         self.assertEqual(summary["by_arm_venue"]["S0_baseline_touch|lighter_robinhood"]["settlement"], "USDG")
         self.assertAlmostEqual(summary["by_arm_venue"]["S0_baseline_touch|arcus"]["gross_ex_fee_bps"], 4.5, places=4)
 
+    def test_verified_fee_profiles_precedence_and_standard_zero_scenario_toggle(self) -> None:
+        # 1. Verified profiles MUST take precedence over tier0 fallbacks for arcus, lighter, lighter_robinhood.
+        profiles_with_both = [
+            vf.VenueFeeProfile(
+                key="arcus_rwa_tier0",
+                venue="arcus",
+                scope="tier0",
+                maker_fee_bps=0.0,
+                taker_fee_bps=2.25,
+                account_fee_status="public_tier0_schedule_only",
+            ),
+            vf.VenueFeeProfile(
+                key="arcus_rwa_verified",
+                venue="arcus",
+                scope="verified",
+                maker_fee_bps=0.0,
+                taker_fee_bps=2.1375,
+                account_fee_status="verified_account_tier",
+                eligible_verified=True,
+            ),
+            vf.VenueFeeProfile(
+                key="lighter_public_tier0",
+                venue="lighter",
+                scope="tier0",
+                maker_fee_bps=0.0,
+                taker_fee_bps=0.0,
+                account_fee_status="public_schedule_only",
+            ),
+            vf.VenueFeeProfile(
+                key="lighter_verified",
+                venue="lighter",
+                scope="verified",
+                maker_fee_bps=0.4,
+                taker_fee_bps=2.8,
+                account_fee_status="verified_account_tier",
+                eligible_verified=True,
+            ),
+            vf.VenueFeeProfile(
+                key="lighter_robinhood_public_tier0",
+                venue="lighter_robinhood",
+                scope="tier0",
+                maker_fee_bps=0.0,
+                taker_fee_bps=0.0,
+                account_fee_status="public_schedule_only",
+            ),
+            vf.VenueFeeProfile(
+                key="lighter_robinhood_verified",
+                venue="lighter_robinhood",
+                scope="verified",
+                maker_fee_bps=0.0,
+                taker_fee_bps=0.0,
+                account_fee_status="verified_account_tier",
+                eligible_verified=True,
+            ),
+        ]
+        verified_targets = rwa.build_default_targets(profiles_with_both)
+        by_v = {t.venue: t for t in verified_targets}
+        self.assertAlmostEqual(by_v["arcus"].taker_fee_bps, 2.1375, places=6)
+        self.assertEqual(by_v["arcus"].account_fee_status, "verified_account_tier")
+        self.assertAlmostEqual(by_v["lighter"].maker_fee_bps, 0.4, places=6)
+        self.assertAlmostEqual(by_v["lighter"].taker_fee_bps, 2.8, places=6)
+        self.assertEqual(by_v["lighter"].account_fee_status, "verified_account_tier")
+        self.assertAlmostEqual(by_v["lighter_robinhood"].maker_fee_bps, 0.0, places=6)
+        self.assertAlmostEqual(by_v["lighter_robinhood"].taker_fee_bps, 0.0, places=6)
+        self.assertEqual(by_v["lighter_robinhood"].account_fee_status, "verified_account_tier")
+
+        # 2. Explicit counterfactual scenario overrides Lighter venues to 0/0 with explicit provenance label.
+        scenario_targets = rwa.build_default_targets(profiles_with_both, assume_lighter_standard_zero=True)
+        sc_by_v = {t.venue: t for t in scenario_targets}
+        self.assertAlmostEqual(sc_by_v["lighter"].maker_fee_bps, 0.0, places=6)
+        self.assertAlmostEqual(sc_by_v["lighter"].taker_fee_bps, 0.0, places=6)
+        self.assertEqual(sc_by_v["lighter"].account_fee_status, "lighter_standard_zero_scenario")
+        self.assertAlmostEqual(sc_by_v["lighter_robinhood"].maker_fee_bps, 0.0, places=6)
+        self.assertAlmostEqual(sc_by_v["lighter_robinhood"].taker_fee_bps, 0.0, places=6)
+        self.assertEqual(sc_by_v["lighter_robinhood"].account_fee_status, "lighter_standard_zero_scenario")
+        # Arcus stays verified
+        self.assertAlmostEqual(sc_by_v["arcus"].taker_fee_bps, 2.1375, places=6)
+        self.assertEqual(sc_by_v["arcus"].account_fee_status, "verified_account_tier")
+
+        # 3. Also test loading a synthetic verified evidence JSON file end-to-end.
+        with tempfile.TemporaryDirectory() as tmp:
+            ev_path = Path(tmp) / "verified_fee.json"
+            ev_path.write_text(
+                json.dumps(
+                    {
+                        "venues": {
+                            "arcus": {
+                                "account_fee_status": "verified_account_tier",
+                                "rwa_maker_fee_bps": "0",
+                                "rwa_taker_fee_bps": "2.1375",
+                            },
+                            "lighter": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "0.4",
+                                "taker_fee_bps": "2.8",
+                            },
+                            "lighter_robinhood": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": "0",
+                                "taker_fee_bps": "0",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = vf.load_fee_profiles_from_evidence(ev_path)
+            loaded_targets = rwa.build_default_targets(loaded)
+            lt_by_v = {t.venue: t for t in loaded_targets}
+            self.assertEqual(lt_by_v["lighter"].maker_fee_bps, 0.4)
+            self.assertEqual(lt_by_v["lighter"].taker_fee_bps, 2.8)
+            self.assertEqual(lt_by_v["lighter"].account_fee_status, "verified_account_tier")
+            self.assertEqual(lt_by_v["lighter_robinhood"].account_fee_status, "verified_account_tier")
+            self.assertAlmostEqual(lt_by_v["arcus"].taker_fee_bps, 2.1375, places=6)
+
+        # 4. Verify CLI exposes --assume-lighter-standard-zero flag cleanly.
+        help_proc = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "replay_rwa_volume_farming.py"), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("--assume-lighter-standard-zero", help_proc.stdout)
+
     def test_cli_self_test(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(SCRIPT_DIR / "replay_rwa_volume_farming.py"), "--self-test"],

@@ -155,6 +155,8 @@ DEFAULT_TARGET_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 def build_default_targets(
     fee_profiles: Sequence[VenueFeeProfile] | None = None,
+    *,
+    assume_lighter_standard_zero: bool = False,
 ) -> list[ReplayTarget]:
     """Construct canonical RWA target matrix with explicit settlement and fee provenance."""
     profile_by_key = {p.key: p for p in (fee_profiles or ())}
@@ -164,16 +166,38 @@ def build_default_targets(
         maker_bps = float(defaults["maker_fee_bps"])
         taker_bps = float(defaults["taker_fee_bps"])
         fee_status = str(defaults["account_fee_status"])
-        if venue == "arcus" and "arcus_rwa_tier0" in profile_by_key:
-            p = profile_by_key["arcus_rwa_tier0"]
-            maker_bps = p.maker_fee_bps
-            taker_bps = p.taker_fee_bps
-            fee_status = p.account_fee_status
-        elif venue in ("lighter", "lighter_robinhood") and "lighter_public_tier0" in profile_by_key:
-            p = profile_by_key["lighter_public_tier0"]
-            maker_bps = p.maker_fee_bps
-            taker_bps = p.taker_fee_bps
-            fee_status = p.account_fee_status
+        if venue == "arcus":
+            p = profile_by_key.get("arcus_rwa_verified") or profile_by_key.get("arcus_rwa_tier0")
+            if p is not None:
+                maker_bps = p.maker_fee_bps
+                taker_bps = p.taker_fee_bps
+                fee_status = p.account_fee_status
+        elif venue == "lighter":
+            if assume_lighter_standard_zero:
+                maker_bps = 0.0
+                taker_bps = 0.0
+                fee_status = "lighter_standard_zero_scenario"
+            else:
+                p = profile_by_key.get("lighter_verified") or profile_by_key.get("lighter_public_tier0")
+                if p is not None:
+                    maker_bps = p.maker_fee_bps
+                    taker_bps = p.taker_fee_bps
+                    fee_status = p.account_fee_status
+        elif venue == "lighter_robinhood":
+            if assume_lighter_standard_zero:
+                maker_bps = 0.0
+                taker_bps = 0.0
+                fee_status = "lighter_standard_zero_scenario"
+            else:
+                p = (
+                    profile_by_key.get("lighter_robinhood_verified")
+                    or profile_by_key.get("lighter_robinhood_public_tier0")
+                    or profile_by_key.get("lighter_public_tier0")
+                )
+                if p is not None:
+                    maker_bps = p.maker_fee_bps
+                    taker_bps = p.taker_fee_bps
+                    fee_status = p.account_fee_status
         targets.append(
             ReplayTarget(
                 venue=venue,
@@ -1260,6 +1284,7 @@ def run_duckdb_rwa_replay(
     targets: Sequence[ReplayTarget] | None = None,
     arm_names: Sequence[str] | None = None,
     rebate_bps: float = 0.0,
+    assume_lighter_standard_zero: bool = False,
 ) -> dict[str, Any]:
     """Load Hive parquet BBO + public_trades via in-memory DuckDB and run causal RWA replay."""
     import duckdb  # Lazy import so stdlib-only CI never needs duckdb at module import time
@@ -1273,7 +1298,11 @@ def run_duckdb_rwa_replay(
     else:
         selected_windows = dict(split_windows)
 
-    active_targets = list(targets) if targets is not None else list(DEFAULT_TARGETS)
+    active_targets = (
+        list(targets)
+        if targets is not None
+        else build_default_targets(assume_lighter_standard_zero=assume_lighter_standard_zero)
+    )
     con = duckdb.connect(":memory:")
     con.execute("SET preserve_insertion_order=false; SET threads=2; SET memory_limit='2GB';")
 
@@ -1488,6 +1517,10 @@ def run_duckdb_rwa_replay(
         "schema": "rwa_volume_farming_replay_v1",
         "split": split,
         "rebate_bps": rebate_bps,
+        "assume_lighter_standard_zero": bool(assume_lighter_standard_zero),
+        "fee_scenario": (
+            "lighter_standard_zero_scenario" if assume_lighter_standard_zero else "verified_or_default"
+        ),
         "windows": selected_windows,
         "targets": [dataclasses.asdict(t) for t in active_targets],
         "rows": rows_out,
@@ -1576,6 +1609,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     ap.add_argument("--whitelist", type=Path, default=None, help="Optional JSON market whitelist path")
     ap.add_argument("--fee-evidence", type=Path, default=None, help="Optional account_fee_evidence JSON path")
+    ap.add_argument(
+        "--assume-lighter-standard-zero",
+        action="store_true",
+        help="Explicit counterfactual scenario overriding Lighter fees to 0/0 bps with lighter_standard_zero_scenario provenance",
+    )
     ap.add_argument("--rebate-bps", type=float, default=0.0, help="Explicit maker rebate bps (default 0.0)")
     ap.add_argument("--arms", type=str, default=None, help="Comma-separated subset of arm names to run")
     ap.add_argument("--output", type=Path, default=None, help="Optional JSON output file path")
@@ -1595,7 +1633,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ap.error("--rebate-bps must be finite and >= 0")
 
     fee_profiles = load_fee_profiles_from_evidence(args.fee_evidence) if args.fee_evidence else None
-    targets = build_default_targets(fee_profiles)
+    targets = build_default_targets(
+        fee_profiles,
+        assume_lighter_standard_zero=args.assume_lighter_standard_zero,
+    )
     if args.whitelist:
         wl = load_whitelist_filter(args.whitelist)
         targets = filter_targets_by_whitelist(targets, wl)
@@ -1612,6 +1653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         targets=targets,
         arm_names=arm_list,
         rebate_bps=args.rebate_bps,
+        assume_lighter_standard_zero=args.assume_lighter_standard_zero,
     )
     rendered = json.dumps(result, indent=2, allow_nan=False)
     if args.output:

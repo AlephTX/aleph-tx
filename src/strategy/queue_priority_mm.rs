@@ -239,6 +239,27 @@ pub struct QueuePriorityMmConfig {
     /// when `sigma_1s > max_vol`, while ALWAYS keeping inventory-reducing exits active.
     #[serde(default)]
     pub quiet_regime_max_entry_vol_bps: Option<f64>,
+    /// Weight in `[0.0, 1.0]` on L1 size-weighted microprice offset relative to mid (`0.0` disables).
+    #[serde(default)]
+    pub microprice_alpha_weight: f64,
+    /// Causal EWMA time constant (ms) for signed trade-flow imbalance (`0.0` disables TFI).
+    #[serde(default)]
+    pub tfi_ewma_tau_ms: f64,
+    /// Directional reservation-price skew (bps) at full `|TFI| == 1.0` (`0.0` disables).
+    #[serde(default)]
+    pub tfi_skew_bps: f64,
+    /// Normalized signed TFI magnitude threshold in `(0, 1]` that pulls/blocks endangered opening quotes (`0.0` disables).
+    #[serde(default)]
+    pub tfi_veto_threshold: f64,
+    /// Immediate same-side opening stepback (bps) added after a passive fill (`0.0` disables).
+    #[serde(default)]
+    pub self_fill_stepback_bps: f64,
+    /// Exponential decay time constant (ms) for post-fill self-adverse-selection stepback (`0` disables).
+    #[serde(default)]
+    pub self_fill_decay_ms: u64,
+    /// Max ticks a `reduce_only` exit may step inside wide spreads (strictly post-only non-crossing; `0` preserves 1-tick default).
+    #[serde(default)]
+    pub reduce_only_penny_ticks: u32,
     pub max_book_age_ms: u64,
     pub max_session_loss_usd: f64,
     pub max_inventory_hold_ms: u64,
@@ -288,6 +309,13 @@ impl Default for QueuePriorityMmConfig {
             directional_markout_skew_mult: 0.0,
             quiet_regime_min_spread_to_vol: 0.0,
             quiet_regime_max_entry_vol_bps: None,
+            microprice_alpha_weight: 0.0,
+            tfi_ewma_tau_ms: 0.0,
+            tfi_skew_bps: 0.0,
+            tfi_veto_threshold: 0.0,
+            self_fill_stepback_bps: 0.0,
+            self_fill_decay_ms: 0,
+            reduce_only_penny_ticks: 0,
             max_book_age_ms: 5_000,
             max_session_loss_usd: 3.0,
             max_inventory_hold_ms: 90_000,
@@ -529,6 +557,30 @@ impl QueuePriorityMmConfig {
                 "quiet_regime_max_entry_vol_bps must be finite and > 0"
             );
         }
+        ensure!(
+            self.microprice_alpha_weight.is_finite()
+                && self.microprice_alpha_weight >= 0.0
+                && self.microprice_alpha_weight <= 1.0,
+            "microprice_alpha_weight must be finite and in [0, 1]"
+        );
+        ensure!(
+            self.tfi_ewma_tau_ms.is_finite() && self.tfi_ewma_tau_ms >= 0.0,
+            "tfi_ewma_tau_ms must be finite and >= 0"
+        );
+        ensure!(
+            self.tfi_skew_bps.is_finite() && self.tfi_skew_bps >= 0.0,
+            "tfi_skew_bps must be finite and >= 0"
+        );
+        ensure!(
+            self.tfi_veto_threshold.is_finite()
+                && self.tfi_veto_threshold >= 0.0
+                && self.tfi_veto_threshold <= 1.0,
+            "tfi_veto_threshold must be finite and in [0, 1]"
+        );
+        ensure!(
+            self.self_fill_stepback_bps.is_finite() && self.self_fill_stepback_bps >= 0.0,
+            "self_fill_stepback_bps must be finite and >= 0"
+        );
         ensure!(self.max_book_age_ms > 0, "max_book_age_ms must be positive");
         ensure!(
             self.max_session_loss_usd.is_finite() && self.max_session_loss_usd > 0.0,
@@ -720,6 +772,8 @@ pub struct EngineTelemetrySnapshot {
     pub ask_markout_ewma_bps: f64,
     pub bid_alo_reject_streak: u32,
     pub ask_alo_reject_streak: u32,
+    pub microprice_offset_bps: f64,
+    pub tfi_norm: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -824,6 +878,13 @@ pub struct QueuePriorityMmEngine {
     ref_lead_states: HashMap<String, RefLeadState>,
     last_mid_for_vol: Option<(u64, f64)>,
     var_bps2_per_s: f64,
+    tfi_signed_vol_ewma: f64,
+    tfi_total_vol_ewma: f64,
+    last_tfi_ts_ms: Option<u64>,
+    bid_self_fill_stepback_bps: f64,
+    ask_self_fill_stepback_bps: f64,
+    bid_self_fill_last_ms: Option<u64>,
+    ask_self_fill_last_ms: Option<u64>,
     last_telemetry: EngineTelemetrySnapshot,
     halted_reason: Option<&'static str>,
 }
@@ -849,6 +910,13 @@ impl QueuePriorityMmEngine {
             ref_lead_states: HashMap::new(),
             last_mid_for_vol: None,
             var_bps2_per_s: 0.0,
+            tfi_signed_vol_ewma: 0.0,
+            tfi_total_vol_ewma: 0.0,
+            last_tfi_ts_ms: None,
+            bid_self_fill_stepback_bps: 0.0,
+            ask_self_fill_stepback_bps: 0.0,
+            bid_self_fill_last_ms: None,
+            ask_self_fill_last_ms: None,
             last_telemetry: EngineTelemetrySnapshot::default(),
             halted_reason: None,
         })
@@ -893,7 +961,7 @@ impl QueuePriorityMmEngine {
         }
     }
 
-    /// Record a fill for causal post-fill adverse-markout feedback (`reduce_only` unwinds remain exempt).
+    /// Record a fill for causal post-fill adverse-markout feedback and optional self-fill stepback (`reduce_only` unwinds remain exempt).
     pub fn on_fill(&mut self, side: QuoteSide, fill_price: f64, qty: f64, fill_ts_ms: u64) {
         if !fill_price.is_finite() || fill_price <= 0.0 || !qty.is_finite() || qty <= 0.0 {
             return;
@@ -906,9 +974,39 @@ impl QueuePriorityMmEngine {
             side,
             fill_price,
         });
+        if self.cfg.self_fill_stepback_bps > 0.0 && self.cfg.self_fill_decay_ms > 0 {
+            let current = self.decayed_self_fill_stepback(side, fill_ts_ms);
+            let updated = (current + self.cfg.self_fill_stepback_bps)
+                .min(3.0 * self.cfg.self_fill_stepback_bps);
+            match side {
+                QuoteSide::Bid => {
+                    self.bid_self_fill_stepback_bps = updated;
+                    self.bid_self_fill_last_ms = Some(
+                        self.bid_self_fill_last_ms
+                            .map_or(fill_ts_ms, |prev| prev.max(fill_ts_ms)),
+                    );
+                }
+                QuoteSide::Ask => {
+                    self.ask_self_fill_stepback_bps = updated;
+                    self.ask_self_fill_last_ms = Some(
+                        self.ask_self_fill_last_ms
+                            .map_or(fill_ts_ms, |prev| prev.max(fill_ts_ms)),
+                    );
+                }
+            }
+        }
     }
 
-    /// Notify engine of an incoming fast trade print to arm side-specific sweep protection.
+    /// Alias for [`Self::on_trade_print`] updating signed Trade-Flow Imbalance (TFI) and sweep shields.
+    pub fn on_market_trade(
+        &mut self,
+        print: FastTradePrint,
+        target_book: Option<&VenueBookUpdate>,
+    ) {
+        self.on_trade_print(print, target_book);
+    }
+
+    /// Notify engine of an incoming fast trade print to update signed TFI EWMA and arm side-specific sweep protection.
     pub fn on_trade_print(&mut self, print: FastTradePrint, target_book: Option<&VenueBookUpdate>) {
         if !print.price.is_finite()
             || !print.size.is_finite()
@@ -917,13 +1015,31 @@ impl QueuePriorityMmEngine {
         {
             return;
         }
+        let trade_notional = print.price * print.size;
+        if self.cfg.tfi_ewma_tau_ms > 0.0 {
+            self.decay_tfi_to(print.received_at_ms);
+            let is_stale_order = self.last_tfi_ts_ms.is_some_and(|prev| {
+                prev.saturating_sub(print.received_at_ms) > self.cfg.max_book_age_ms
+            });
+            if !is_stale_order {
+                let sgn = match print.taker_side {
+                    QuoteSide::Bid => 1.0,
+                    QuoteSide::Ask => -1.0,
+                };
+                self.tfi_signed_vol_ewma += sgn * trade_notional;
+                self.tfi_total_vol_ewma += trade_notional;
+                self.last_tfi_ts_ms = Some(
+                    self.last_tfi_ts_ms
+                        .map_or(print.received_at_ms, |prev| prev.max(print.received_at_ms)),
+                );
+            }
+        }
         let Some(book) = target_book else {
             return;
         };
         if !book.is_valid() {
             return;
         }
-        let trade_notional = print.price * print.size;
         let tol = self.cfg.tick_size * 0.1;
         match print.taker_side {
             QuoteSide::Bid => {
@@ -1050,10 +1166,18 @@ impl QueuePriorityMmEngine {
         {
             return cancel_all_resting(resting, "stale_or_invalid_target_book");
         }
-        let (best_bid, _) = book.best_bid().expect("validated");
-        let (best_ask, _) = book.best_ask().expect("validated");
+        let (best_bid, best_bid_sz) = book.best_bid().expect("validated");
+        let (best_ask, best_ask_sz) = book.best_ask().expect("validated");
         let target_mid = 0.5 * (best_bid + best_ask);
         let target_spread_bps = (best_ask - best_bid) / target_mid * 10_000.0;
+        let l1_sz_sum = best_bid_sz + best_ask_sz;
+        let microprice_offset_bps = if l1_sz_sum > 0.0 && target_mid > 0.0 {
+            let microprice = (best_bid * best_ask_sz + best_ask * best_bid_sz) / l1_sz_sum;
+            ((microprice / target_mid) - 1.0) * 10_000.0
+        } else {
+            0.0
+        };
+        let tfi_norm = self.current_tfi_norm(now_ms);
         let obi = book.weighted_obi();
         self.update_realized_vol(now_ms, target_mid);
         self.mature_fill_markouts(now_ms, target_mid);
@@ -1133,6 +1257,8 @@ impl QueuePriorityMmEngine {
             ask_markout_ewma_bps: self.ask_markout_ewma_bps,
             bid_alo_reject_streak: self.bid_alo_reject_streak,
             ask_alo_reject_streak: self.ask_alo_reject_streak,
+            microprice_offset_bps,
+            tfi_norm,
         };
 
         // 4. Optional external IOC hedge (when net combined exposure exceeds band).
@@ -1209,7 +1335,19 @@ impl QueuePriorityMmEngine {
             0.0
         };
         let skew_bps = skew_factor * self.cfg.inventory_skew_bps_per_full_limit + as_skew_bps;
-        let reservation_px = fair_value * (-skew_bps / 10_000.0).exp();
+        let pre_move_alpha_bps = self.cfg.microprice_alpha_weight * microprice_offset_bps
+            + self.cfg.tfi_skew_bps * tfi_norm;
+        let directional_fair_px = if pre_move_alpha_bps != 0.0 {
+            fair_value * (pre_move_alpha_bps / 10_000.0).exp()
+        } else {
+            fair_value
+        };
+        let reservation_px = directional_fair_px * (-skew_bps / 10_000.0).exp();
+
+        let tfi_bid_vetoed =
+            self.cfg.tfi_veto_threshold > 0.0 && (-tfi_norm) >= self.cfg.tfi_veto_threshold;
+        let tfi_ask_vetoed =
+            self.cfg.tfi_veto_threshold > 0.0 && tfi_norm >= self.cfg.tfi_veto_threshold;
 
         let quiet_ratio_blocked = self.cfg.quiet_regime_min_spread_to_vol > 0.0
             && (target_spread_bps / sigma_bps_per_sqrt_s.max(0.05))
@@ -1222,6 +1360,11 @@ impl QueuePriorityMmEngine {
         let vol_half_spread_bps = self.cfg.vol_spread_mult * sigma_bps_per_sqrt_s;
         let as_max_skew_bps = if self.cfg.as_inventory_skew_gamma > 0.0 {
             1.5 * self.cfg.as_inventory_skew_gamma * (1.0 + self.var_bps2_per_s)
+        } else {
+            0.0
+        };
+        let max_microprice_skew_bps = if self.cfg.microprice_alpha_weight > 0.0 {
+            self.cfg.microprice_alpha_weight * (target_spread_bps * 0.5)
         } else {
             0.0
         };
@@ -1262,8 +1405,15 @@ impl QueuePriorityMmEngine {
             let min_edge_total_bps = self.cfg.min_entry_edge_bps + self.cfg.maker_fee_bps;
             let reducing_edge_floor_bps = self.cfg.maker_fee_bps
                 - self.cfg.inventory_skew_bps_per_full_limit
-                - as_max_skew_bps;
+                - as_max_skew_bps
+                - self.cfg.tfi_skew_bps
+                - max_microprice_skew_bps;
             let max_pos_qty = self.cfg.max_position_notional_usd / target_mid;
+            let tfi_vetoed = match side {
+                QuoteSide::Bid => tfi_bid_vetoed,
+                QuoteSide::Ask => tfi_ask_vetoed,
+            };
+            let side_self_fill_stepback = self.decayed_self_fill_stepback(side, now_ms);
 
             // Track committed exposure across levels on this side so total never breaches max_pos.
             let mut committed_qty = match side {
@@ -1291,16 +1441,31 @@ impl QueuePriorityMmEngine {
                 } else {
                     0.0
                 };
-            let opening_req_half_bps =
-                min_edge_total_bps + vol_half_spread_bps + asym_markout_skew_bps;
+            let opening_req_half_bps = min_edge_total_bps
+                + vol_half_spread_bps
+                + asym_markout_skew_bps
+                + side_self_fill_stepback;
             let use_g4_quote_skew = self.cfg.as_inventory_skew_gamma > 0.0
                 || self.cfg.vol_spread_mult > 0.0
-                || self.cfg.directional_markout_skew_mult > 0.0;
+                || self.cfg.directional_markout_skew_mult > 0.0
+                || self.cfg.microprice_alpha_weight > 0.0
+                || self.cfg.tfi_skew_bps > 0.0
+                || side_self_fill_stepback > 0.0;
 
             for lvl in 0..self.cfg.ladder_levels {
                 let remaining_to_flat = (-committed_qty).max(0.0);
                 let is_reducing = remaining_to_flat > self.cfg.lot_size * 0.5;
-                let can_penny_side = can_penny_open || (is_reducing && spread_ticks >= 2);
+                let opening_penny_ticks = u32::from(can_penny_open);
+                let reducing_penny_ticks = if is_reducing && spread_ticks >= 2 {
+                    self.cfg.reduce_only_penny_ticks.max(1)
+                } else {
+                    0
+                };
+                let penny_ticks = if is_reducing {
+                    reducing_penny_ticks.max(opening_penny_ticks)
+                } else {
+                    opening_penny_ticks
+                };
                 let stepback_ticks = if !is_reducing
                     && self.cfg.alo_reject_stepback_streak > 0
                     && alo_streak >= self.cfg.alo_reject_stepback_streak
@@ -1311,16 +1476,18 @@ impl QueuePriorityMmEngine {
                 };
                 let touch_l1 = match side {
                     QuoteSide::Bid => {
-                        let base = if can_penny_side {
-                            (best_bid + self.cfg.tick_size).min(best_ask - self.cfg.tick_size)
+                        let base = if penny_ticks > 0 {
+                            (best_bid + (penny_ticks as f64) * self.cfg.tick_size)
+                                .min(best_ask - self.cfg.tick_size)
                         } else {
                             best_bid
                         };
                         base - stepback_ticks * self.cfg.tick_size
                     }
                     QuoteSide::Ask => {
-                        let base = if can_penny_side {
-                            (best_ask - self.cfg.tick_size).max(best_bid + self.cfg.tick_size)
+                        let base = if penny_ticks > 0 {
+                            (best_ask - (penny_ticks as f64) * self.cfg.tick_size)
+                                .max(best_bid + self.cfg.tick_size)
                         } else {
                             best_ask
                         };
@@ -1397,15 +1564,24 @@ impl QueuePriorityMmEngine {
                     };
                     // Keep resting queue priority while order stays non-crossing, clears edge,
                     // sits within `max_queue_keep_ticks` of desired_px, stays within position cap,
-                    // and is not an opening order blocked by the quiet-regime gate.
+                    // and is not an opening order blocked by quiet-regime or TFI veto gates.
                     let within_keep = tick_diff <= self.cfg.max_queue_keep_ticks;
+                    let better_reducing_penny = is_reducing
+                        && self.cfg.reduce_only_penny_ticks > 0
+                        && match side {
+                            QuoteSide::Bid => desired_px > r.price + self.cfg.tick_size * 0.1,
+                            QuoteSide::Ask => desired_px < r.price - self.cfg.tick_size * 0.1,
+                        };
                     let would_exceed_cap = committed_qty + r.qty > max_pos_qty + 1e-12;
                     let quiet_blocked_resting = quiet_entry_blocked && r_opens_past_flat;
+                    let tfi_blocked_resting = tfi_vetoed && r_opens_past_flat;
                     if !r_crosses
                         && r_edge_ok
                         && within_keep
+                        && !better_reducing_penny
                         && !would_exceed_cap
                         && !quiet_blocked_resting
+                        && !tfi_blocked_resting
                     {
                         committed_qty += r.qty;
                         actions.push(MmAction::Keep {
@@ -1420,6 +1596,8 @@ impl QueuePriorityMmEngine {
                         side,
                         reason: if quiet_blocked_resting {
                             "quiet_regime_gate"
+                        } else if tfi_blocked_resting {
+                            "tfi_adverse_veto"
                         } else if would_exceed_cap {
                             "position_cap_trim"
                         } else {
@@ -1428,12 +1606,12 @@ impl QueuePriorityMmEngine {
                     });
                 }
 
-                // Opening-only entry gates (quiet-regime gate, ALO cooldown, severe markout shield
+                // Opening-only entry gates (quiet-regime gate, TFI veto, ALO cooldown, severe markout shield
                 // cooldown, OBI veto, and narrow-spread ALO flight-collision guard).
-                // Quiet-regime gate cancels resting opening orders above while preserving pure
+                // Quiet-regime gate and TFI veto cancel resting opening orders above while preserving pure
                 // `reduce_only` exits (`!r_opens_past_flat`); none of these gates block exits.
                 if !is_reducing {
-                    if quiet_entry_blocked {
+                    if quiet_entry_blocked || tfi_vetoed {
                         continue;
                     }
                     if now_ms < alo_cooldown_until || now_ms < markout_cooldown_until {
@@ -1516,6 +1694,55 @@ impl QueuePriorityMmEngine {
         }
 
         actions
+    }
+
+    fn decay_tfi_to(&mut self, now_ms: u64) {
+        if self.cfg.tfi_ewma_tau_ms <= 0.0 {
+            return;
+        }
+        if let Some(prev_ms) = self.last_tfi_ts_ms
+            && now_ms > prev_ms
+        {
+            let dt = now_ms - prev_ms;
+            if dt > self.cfg.max_book_age_ms {
+                self.tfi_signed_vol_ewma = 0.0;
+                self.tfi_total_vol_ewma = 0.0;
+            } else {
+                let decay = (-(dt as f64) / self.cfg.tfi_ewma_tau_ms).exp();
+                self.tfi_signed_vol_ewma *= decay;
+                self.tfi_total_vol_ewma *= decay;
+            }
+            self.last_tfi_ts_ms = Some(now_ms);
+        }
+    }
+
+    fn current_tfi_norm(&mut self, now_ms: u64) -> f64 {
+        if self.cfg.tfi_ewma_tau_ms <= 0.0 {
+            return 0.0;
+        }
+        self.decay_tfi_to(now_ms);
+        if self.tfi_total_vol_ewma > 1e-12 {
+            (self.tfi_signed_vol_ewma / self.tfi_total_vol_ewma).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn decayed_self_fill_stepback(&self, side: QuoteSide, now_ms: u64) -> f64 {
+        if self.cfg.self_fill_stepback_bps <= 0.0 || self.cfg.self_fill_decay_ms == 0 {
+            return 0.0;
+        }
+        let (val, last_ms) = match side {
+            QuoteSide::Bid => (self.bid_self_fill_stepback_bps, self.bid_self_fill_last_ms),
+            QuoteSide::Ask => (self.ask_self_fill_stepback_bps, self.ask_self_fill_last_ms),
+        };
+        match last_ms {
+            Some(prev) if now_ms >= prev => {
+                val * (-((now_ms - prev) as f64) / (self.cfg.self_fill_decay_ms as f64)).exp()
+            }
+            Some(_) => val,
+            None => 0.0,
+        }
     }
 
     fn reset_basis_if_expired(&mut self, now_ms: u64) {
@@ -2868,6 +3095,329 @@ mod tests {
                 } if client_id == "a_open"
             )),
             "long inventory must KEEP pure reducing ask exit, got {acts_long:?}"
+        );
+    }
+
+    #[test]
+    fn microstructure_tfi_self_fill_and_reduce_penny_defaults_remain_off_and_validate() {
+        let cfg = QueuePriorityMmConfig::default();
+        assert_eq!(cfg.microprice_alpha_weight, 0.0);
+        assert_eq!(cfg.tfi_ewma_tau_ms, 0.0);
+        assert_eq!(cfg.tfi_skew_bps, 0.0);
+        assert_eq!(cfg.tfi_veto_threshold, 0.0);
+        assert_eq!(cfg.self_fill_stepback_bps, 0.0);
+        assert_eq!(cfg.self_fill_decay_ms, 0);
+        assert_eq!(cfg.reduce_only_penny_ticks, 0);
+
+        let legacy_json = serde_json::to_value(&cfg).unwrap();
+        let mut obj = legacy_json.as_object().unwrap().clone();
+        for key in [
+            "microprice_alpha_weight",
+            "tfi_ewma_tau_ms",
+            "tfi_skew_bps",
+            "tfi_veto_threshold",
+            "self_fill_stepback_bps",
+            "self_fill_decay_ms",
+            "reduce_only_penny_ticks",
+        ] {
+            obj.remove(key);
+        }
+        let parsed: QueuePriorityMmConfig =
+            serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert_eq!(parsed, cfg);
+
+        let mut bad = base_cfg();
+        bad.microprice_alpha_weight = 1.2;
+        assert!(bad.validate().is_err());
+        bad.microprice_alpha_weight = 0.5;
+        bad.tfi_veto_threshold = 1.1;
+        assert!(bad.validate().is_err());
+        bad.tfi_veto_threshold = 0.5;
+        bad.self_fill_stepback_bps = -0.1;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn microprice_and_tfi_skew_and_veto_pull_endangered_openings_before_mid_jumps() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.min_entry_edge_bps = 0.2;
+        cfg.microprice_alpha_weight = 1.0;
+        cfg.tfi_ewma_tau_ms = 2_000.0;
+        cfg.tfi_skew_bps = 3.0;
+        cfg.tfi_veto_threshold = 0.65;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Book has 4-tick spread (100.00 / 100.04, mid=100.02, half-spread=2 bps) with heavy BID L1
+        // (bid_sz=190, ask_sz=10 => microprice=100.038, offset=+1.8 bps) + aggressive BUY trade flow
+        // sized below sweep_print_pull_ratio (5.0 < 0.6 * 10.0) to isolate TFI veto.
+        let b = book(100.00, 190.0, 100.04, 10.0, 1_000);
+        eng.on_market_trade(
+            FastTradePrint {
+                taker_side: QuoteSide::Bid,
+                price: 100.04,
+                size: 5.0,
+                received_at_ms: 1_000,
+            },
+            Some(&b),
+        );
+        // Existing resting opening Ask at 100.04 and Bid at 100.00.
+        let resting = vec![
+            RestingQuote {
+                client_id: "b_open".into(),
+                side: QuoteSide::Bid,
+                price: 100.00,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 900,
+            },
+            RestingQuote {
+                client_id: "a_open".into(),
+                side: QuoteSide::Ask,
+                price: 100.04,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 900,
+            },
+        ];
+        let acts = eng.evaluate(Some(&b), &[], &resting, InventoryState::default(), 1_050);
+        assert!(eng.telemetry().microprice_offset_bps > 1.5);
+        assert!(eng.telemetry().tfi_norm > 0.9);
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                MmAction::Cancel {
+                    client_id,
+                    side: QuoteSide::Ask,
+                    ..
+                } if client_id == "a_open"
+            )),
+            "expected endangered opening Ask pulled on strong buy TFI + microprice, got {acts:?}"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(
+                a,
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    reduce_only: false,
+                    ..
+                }
+            )),
+            "TFI veto must block new opening Ask during buy surge"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                MmAction::Keep {
+                    client_id,
+                    side: QuoteSide::Bid,
+                    ..
+                } if client_id == "b_open"
+            )),
+            "safe opening Bid should keep queue priority"
+        );
+
+        // With LONG inventory, Ask is reduce_only and MUST NOT be blocked by TFI veto or skew!
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_red = eng.evaluate(Some(&b), &[], &[], inv_long, 1_100);
+        assert!(
+            acts_red.iter().any(|a| matches!(
+                a,
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    reduce_only: true,
+                    qty,
+                    ..
+                } if *qty > 0.0 && *qty <= 0.30 + 1e-6
+            )),
+            "TFI veto must NEVER block reduce_only exits, got {acts_red:?}"
+        );
+    }
+
+    #[test]
+    fn self_fill_stepback_widens_opening_requotes_and_decays_without_blocking_exits() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.self_fill_stepback_bps = 3.0;
+        cfg.self_fill_decay_ms = 1_000;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        let b = book(100.00, 10.0, 100.04, 10.0, 1_000);
+        // Passive Bid fill at t=1_000 adds 3.0 bps stepback -> opening_req_half_bps = 3.2 bps
+        // (mid=100.02 -> skewed bid ~ 99.988 -> rounded down to 99.98 < best_bid 100.00).
+        eng.on_fill(QuoteSide::Bid, 100.00, 0.30, 1_000);
+        let acts_immediate = eng.evaluate(Some(&b), &[], &[], InventoryState::default(), 1_050);
+        let stepped_bid = acts_immediate
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected stepped-back opening bid");
+        assert!(
+            stepped_bid < 100.00,
+            "self-fill stepback should push opening bid below touch 100.00, got {stepped_bid}"
+        );
+
+        // Consecutive same-side fill compounds stepback further!
+        eng.on_fill(QuoteSide::Bid, 99.98, 0.30, 1_100);
+        let acts_compound = eng.evaluate(Some(&b), &[], &[], InventoryState::default(), 1_150);
+        let compounded_bid = acts_compound
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected compounded stepped-back bid");
+        assert!(
+            compounded_bid < stepped_bid,
+            "second same-side fill should compound stepback: {compounded_bid} vs {stepped_bid}"
+        );
+
+        // Short inventory -> Bid is reduce_only and stays at touch/pennied (NOT stepped back!).
+        let inv_short = InventoryState {
+            target_qty: -0.30,
+            ..Default::default()
+        };
+        let acts_red = eng.evaluate(Some(&b), &[], &[], inv_short, 1_150);
+        let red_bid = acts_red
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected reduce_only bid");
+        assert!(
+            red_bid >= 100.00,
+            "reduce_only bid must not be stepped back below touch, got {red_bid}"
+        );
+
+        // After 5s (5x decay_ms), stepback decays back to touch 100.00 (fresh book at t=6_500).
+        let b_decayed = book(100.00, 10.0, 100.04, 10.0, 6_500);
+        let acts_decayed =
+            eng.evaluate(Some(&b_decayed), &[], &[], InventoryState::default(), 6_500);
+        let decayed_bid = acts_decayed
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected decayed opening bid");
+        assert!(
+            (decayed_bid - 100.00).abs() < 1e-6,
+            "stepback should decay back to touch 100.00, got {decayed_bid}"
+        );
+    }
+
+    #[test]
+    fn patient_passive_pennying_unwind_steps_inside_wide_spread_non_crossing() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99; // keep opening quotes strictly at touch
+        cfg.reduce_only_penny_ticks = 2;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // 6-tick wide spread: 100.00 / 100.06, long +0.30 -> Ask reduce_only steps 2 ticks inside to 100.04,
+        // while opening Bid stays at touch 100.00!
+        let b_wide = book(100.00, 10.0, 100.06, 10.0, 1_000);
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_wide = eng.evaluate(Some(&b_wide), &[], &[], inv_long, 1_000);
+        let ask_wide = acts_wide
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected reduce_only ask");
+        let bid_wide = acts_wide
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected opening bid");
+        assert!(
+            (ask_wide - 100.04).abs() < 1e-6,
+            "expected 2-tick patient passive-pennying unwind at 100.04, got {ask_wide}"
+        );
+        assert!(
+            (bid_wide - 100.00).abs() < 1e-6,
+            "opening bid must remain at touch 100.00, got {bid_wide}"
+        );
+
+        // 2-tick spread (100.00 / 100.02): reduce_only_penny_ticks=2 clamps strictly non-crossing at 100.01!
+        let b_two = book(100.00, 10.0, 100.02, 10.0, 1_200);
+        let acts_two = eng.evaluate(Some(&b_two), &[], &[], inv_long, 1_200);
+        let ask_two = acts_two
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected clamped reduce_only ask");
+        assert!(
+            (ask_two - 100.01).abs() < 1e-6 && ask_two > 100.00,
+            "2-tick clamp must keep reduce_only ask strictly post-only at 100.01, got {ask_two}"
+        );
+
+        // 1-tick spread (100.00 / 100.01): never crosses best_bid!
+        let b_one = book(100.00, 10.0, 100.01, 10.0, 1_400);
+        let acts_one = eng.evaluate(Some(&b_one), &[], &[], inv_long, 1_400);
+        let ask_one = acts_one
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected 1-tick touch reduce_only ask");
+        assert!(
+            (ask_one - 100.01).abs() < 1e-6,
+            "1-tick book must stay at best_ask 100.01, got {ask_one}"
         );
     }
 }
