@@ -1,5 +1,5 @@
-//! Read-only shadow and JSONL replay runner for Track 01 (`01_quant_profit`)
-//! and Track 02 (`02_hedge_arbitrage`).
+//! Read-only shadow and JSONL replay runner for Track 01 (`01_quant_profit`),
+//! Track 02 (`02_hedge_arbitrage`), and Track 03 (`03_incentive_turnover`).
 //!
 //! Strictly decoupled from exchange execution clients: never signs, submits,
 //! or cancels live orders.
@@ -8,7 +8,8 @@ use aleph_tx::daily_loss::utc_day_now;
 use aleph_tx::shm_reader::{NUM_EXCHANGES, NUM_SYMBOLS, ShmBboMessage, ShmReader};
 use aleph_tx::strategy::track_shadow::{
     LeadLagTouch, MakerTouch, Track01ShadowConfig, Track01ShadowReport, Track01ShadowSession,
-    Track02ShadowConfig, Track02ShadowReport, Track02ShadowSession, utc_day_from_ms,
+    Track02ShadowConfig, Track02ShadowReport, Track02ShadowSession, Track03ShadowConfig,
+    Track03ShadowReport, Track03ShadowSession, Track03Touch, utc_day_from_ms,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,13 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "Usage: track01_track02_shadow --track <1|2> --config <path.toml> (--check | --replay <events.jsonl> | --shm-path <path> --duration-secs <u64> [--num-symbols <usize>])";
+const USAGE: &str = "Usage: track01_track02_shadow --track <1|2|3> --config <path.toml> (--check | --replay <events.jsonl> | --shm-path <path> --duration-secs <u64> [--num-symbols <usize>])";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackKind {
     Track01,
     Track02,
+    Track03,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,7 +65,8 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
                 track = Some(match val.as_str() {
                     "1" => TrackKind::Track01,
                     "2" => TrackKind::Track02,
-                    other => bail!("invalid --track '{other}', expected 1 or 2\n{USAGE}"),
+                    "3" => TrackKind::Track03,
+                    other => bail!("invalid --track '{other}', expected 1, 2, or 3\n{USAGE}"),
                 });
             }
             "--config" => {
@@ -143,7 +146,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs> {
     })
 }
 
-/// JSONL event schema for offline deterministic Track 01 / Track 02 shadow replay.
+/// JSONL event schema for offline deterministic Track 01 / Track 02 / Track 03 shadow replay.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ReplayEvent {
@@ -154,6 +157,12 @@ enum ReplayEvent {
         ref_bid: f64,
         ref_ask: f64,
         ref_recv_ms: u64,
+        #[serde(default)]
+        confirm_bid: Option<f64>,
+        #[serde(default)]
+        confirm_ask: Option<f64>,
+        #[serde(default)]
+        confirm_recv_ms: Option<u64>,
         tgt_bid: f64,
         tgt_ask: f64,
         tgt_recv_ms: u64,
@@ -177,6 +186,10 @@ enum ReplayEvent {
         hedge_ask: f64,
         hedge_recv_ms: u64,
         #[serde(default)]
+        hedge_bid_sz: Option<f64>,
+        #[serde(default)]
+        hedge_ask_sz: Option<f64>,
+        #[serde(default)]
         utc_day: Option<i32>,
     },
     Track2Print {
@@ -188,6 +201,45 @@ enum ReplayEvent {
         hedge_bid: f64,
         hedge_ask: f64,
         hedge_recv_ms: u64,
+        #[serde(default)]
+        utc_day: Option<i32>,
+    },
+    Track3Ref {
+        symbol_id: u16,
+        exchange_id: u8,
+        now_ms: u64,
+        bid: f64,
+        ask: f64,
+        #[serde(default)]
+        bid_sz: Option<f64>,
+        #[serde(default)]
+        ask_sz: Option<f64>,
+        #[serde(default)]
+        recv_ms: Option<u64>,
+    },
+    Track3Bbo {
+        symbol_id: u16,
+        now_ms: u64,
+        bid: f64,
+        ask: f64,
+        bid_sz: f64,
+        ask_sz: f64,
+        recv_ms: u64,
+        #[serde(default)]
+        bids: Option<Vec<(f64, f64)>>,
+        #[serde(default)]
+        asks: Option<Vec<(f64, f64)>>,
+        #[serde(default)]
+        utc_day: Option<i32>,
+    },
+    Track3Print {
+        symbol_id: u16,
+        now_ms: u64,
+        price: f64,
+        size: f64,
+        is_buy_aggressor: bool,
+        #[serde(default)]
+        recv_ms: Option<u64>,
         #[serde(default)]
         utc_day: Option<i32>,
     },
@@ -204,8 +256,16 @@ impl ReplayEvent {
             }
             | Self::Track2Print {
                 now_ms, utc_day, ..
+            }
+            | Self::Track3Bbo {
+                now_ms, utc_day, ..
+            }
+            | Self::Track3Print {
+                now_ms, utc_day, ..
             } => utc_day.unwrap_or_else(|| utc_day_from_ms(now_ms)),
-            Self::Track2Ref { now_ms, .. } => utc_day_from_ms(now_ms),
+            Self::Track2Ref { now_ms, .. } | Self::Track3Ref { now_ms, .. } => {
+                utc_day_from_ms(now_ms)
+            }
         }
     }
 }
@@ -215,6 +275,7 @@ impl ReplayEvent {
 enum ShadowOutput {
     Track01(Track01ShadowReport),
     Track02(Track02ShadowReport),
+    Track03(Track03ShadowReport),
 }
 
 fn load_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -325,6 +386,18 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "pairs": cfg.pairs.len(),
             }))
         }
+        TrackKind::Track03 => {
+            let cfg: Track03ShadowConfig = load_toml(config_path)?;
+            cfg.validate()?;
+            Ok(serde_json::json!({
+                "status": "Configuration OK",
+                "track": "03_incentive_turnover",
+                "capital_usd": cfg.capital_usd,
+                "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
+                "allowlisted_symbols": cfg.allowlisted_symbols,
+                "arms": cfg.arms.len(),
+            }))
+        }
     }
 }
 
@@ -345,6 +418,9 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                     ref_bid,
                     ref_ask,
                     ref_recv_ms,
+                    confirm_bid,
+                    confirm_ask,
+                    confirm_recv_ms,
                     tgt_bid,
                     tgt_ask,
                     tgt_recv_ms,
@@ -356,7 +432,13 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                     bail!("Track 01 replay encountered non-Track1Bbo event");
                 };
                 let day = utc_day.unwrap_or_else(|| utc_day_from_ms(now_ms));
-                let _ = session.on_bbo_pair(
+                let confirm_touch = match (confirm_bid, confirm_ask, confirm_recv_ms) {
+                    (Some(bid), Some(ask), Some(recv_ms)) => {
+                        Some(LeadLagTouch { bid, ask, recv_ms })
+                    }
+                    _ => None,
+                };
+                let _ = session.on_bbo_pair_with_confirm(
                     symbol_id,
                     now_ms,
                     LeadLagTouch {
@@ -364,6 +446,7 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                         ask: ref_ask,
                         recv_ms: ref_recv_ms,
                     },
+                    confirm_touch,
                     LeadLagTouch {
                         bid: tgt_bid,
                         ask: tgt_ask,
@@ -397,10 +480,13 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                         hedge_bid,
                         hedge_ask,
                         hedge_recv_ms,
+                        hedge_bid_sz,
+                        hedge_ask_sz,
                         utc_day,
                     } => {
                         let day = utc_day.unwrap_or_else(|| utc_day_from_ms(now_ms));
-                        let _ = session.on_pair_books(
+                        let hedge_l1 = hedge_bid_sz.zip(hedge_ask_sz);
+                        let _ = session.on_pair_books_with_l1(
                             symbol_id,
                             now_ms,
                             MakerTouch {
@@ -413,6 +499,7 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                                 ask: hedge_ask,
                                 recv_ms: hedge_recv_ms,
                             },
+                            hedge_l1,
                             day,
                         )?;
                     }
@@ -442,12 +529,102 @@ fn run_replay(track: TrackKind, config_path: &Path, replay_path: &Path) -> Resul
                             day,
                         )?;
                     }
-                    ReplayEvent::Track1Bbo { .. } => {
-                        bail!("Track 02 replay encountered Track1Bbo event");
+                    _ => {
+                        bail!("Track 02 replay encountered non-Track2 event");
                     }
                 }
             }
             Ok(ShadowOutput::Track02(session.report()))
+        }
+        TrackKind::Track03 => {
+            let cfg: Track03ShadowConfig = load_toml(config_path)?;
+            let mut session = Track03ShadowSession::new(cfg, init_day)?;
+            for ev in events {
+                match ev {
+                    ReplayEvent::Track3Ref {
+                        symbol_id,
+                        exchange_id,
+                        now_ms,
+                        bid,
+                        ask,
+                        bid_sz,
+                        ask_sz,
+                        recv_ms,
+                    } => {
+                        let _ = session.on_reference_touch(
+                            symbol_id,
+                            exchange_id,
+                            now_ms,
+                            Track03Touch {
+                                bid,
+                                ask,
+                                bid_sz: bid_sz.unwrap_or(1.0),
+                                ask_sz: ask_sz.unwrap_or(1.0),
+                                recv_ms: recv_ms.unwrap_or(now_ms),
+                            },
+                        );
+                    }
+                    ReplayEvent::Track3Bbo {
+                        symbol_id,
+                        now_ms,
+                        bid,
+                        ask,
+                        bid_sz,
+                        ask_sz,
+                        recv_ms,
+                        bids,
+                        asks,
+                        utc_day,
+                    } => {
+                        let day = utc_day.unwrap_or_else(|| utc_day_from_ms(now_ms));
+                        match (bids.as_deref(), asks.as_deref()) {
+                            (Some(b_lvls), Some(a_lvls)) => {
+                                let _ = session.on_target_l2_bbo(
+                                    symbol_id, now_ms, b_lvls, a_lvls, recv_ms, day,
+                                )?;
+                            }
+                            _ => {
+                                let _ = session.on_target_bbo(
+                                    symbol_id,
+                                    now_ms,
+                                    Track03Touch {
+                                        bid,
+                                        ask,
+                                        bid_sz,
+                                        ask_sz,
+                                        recv_ms,
+                                    },
+                                    day,
+                                )?;
+                            }
+                        }
+                    }
+                    ReplayEvent::Track3Print {
+                        symbol_id,
+                        now_ms,
+                        price,
+                        size,
+                        is_buy_aggressor,
+                        recv_ms,
+                        utc_day,
+                    } => {
+                        let day = utc_day.unwrap_or_else(|| utc_day_from_ms(now_ms));
+                        let _ = session.on_trade_print(
+                            symbol_id,
+                            now_ms,
+                            price,
+                            size,
+                            is_buy_aggressor,
+                            recv_ms.unwrap_or(now_ms),
+                            day,
+                        )?;
+                    }
+                    _ => {
+                        bail!("Track 03 replay encountered non-Track3 event");
+                    }
+                }
+            }
+            Ok(ShadowOutput::Track03(session.report()))
         }
     }
 }
@@ -468,12 +645,14 @@ fn run_shm(
         TrackKind::Track01 => {
             let cfg: Track01ShadowConfig = load_toml(config_path)?;
             let mut session = Track01ShadowSession::new(cfg, init_day)?;
-            let routes: HashMap<u16, (u8, u8)> =
-                session.arm_ids().map(|(sym, r, t)| (sym, (r, t))).collect();
+            let routes: HashMap<u16, (u8, Option<u8>, u8)> = session
+                .arm_ids()
+                .map(|(sym, r, t)| (sym, (r, session.arm_confirm_exchange_id(sym), t)))
+                .collect();
             while start.elapsed() < deadline {
                 let mut progressed = false;
                 while let Some(symbol_id) = reader.try_poll() {
-                    let Some(&(ref_exch, tgt_exch)) = routes.get(&symbol_id) else {
+                    let Some(&(ref_exch, confirm_exch, tgt_exch)) = routes.get(&symbol_id) else {
                         continue;
                     };
                     progressed = true;
@@ -486,13 +665,29 @@ fn run_shm(
                     if matches!(tgt_decoded, ShmSlotDecode::InvalidOrCrossed) {
                         session.record_venue_crossed_drop(symbol_id, tgt_exch);
                     }
+                    let confirm_touch = if let Some(c_exch) = confirm_exch {
+                        match decode_shm_slot(&slots, c_exch, symbol_id) {
+                            ShmSlotDecode::Valid(c_slot) => Some(LeadLagTouch {
+                                bid: c_slot.bid,
+                                ask: c_slot.ask,
+                                recv_ms: c_slot.recv_ms,
+                            }),
+                            ShmSlotDecode::InvalidOrCrossed => {
+                                session.record_venue_crossed_drop(symbol_id, c_exch);
+                                None
+                            }
+                            ShmSlotDecode::Empty => None,
+                        }
+                    } else {
+                        None
+                    };
                     let (ShmSlotDecode::Valid(ref_slot), ShmSlotDecode::Valid(tgt_slot)) =
                         (ref_decoded, tgt_decoded)
                     else {
                         continue;
                     };
                     let now_ms = unix_ms()?;
-                    let _ = session.on_bbo_pair(
+                    let _ = session.on_bbo_pair_with_confirm(
                         symbol_id,
                         now_ms,
                         LeadLagTouch {
@@ -500,6 +695,7 @@ fn run_shm(
                             ask: ref_slot.ask,
                             recv_ms: ref_slot.recv_ms,
                         },
+                        confirm_touch,
                         LeadLagTouch {
                             bid: tgt_slot.bid,
                             ask: tgt_slot.ask,
@@ -584,11 +780,12 @@ fn run_shm(
                         hedge_touch,
                         utc_day,
                     )?;
-                    let _ = session.on_pair_books(
+                    let _ = session.on_pair_books_with_l1(
                         symbol_id,
                         now_ms,
                         maker_touch,
                         hedge_touch,
+                        Some((hedge_slot.bid_sz, hedge_slot.ask_sz)),
                         utc_day,
                     )?;
                 }
@@ -597,6 +794,75 @@ fn run_shm(
                 }
             }
             Ok(ShadowOutput::Track02(session.report()))
+        }
+        TrackKind::Track03 => {
+            let cfg: Track03ShadowConfig = load_toml(config_path)?;
+            let mut session = Track03ShadowSession::new(cfg, init_day)?;
+            session.set_fill_evidence_mode("shm_bbo_cross_diagnostic_no_trades");
+            let routes: HashMap<u16, (u8, Vec<u8>)> = session
+                .arm_ids()
+                .map(|(sym, tgt, refs)| (sym, (tgt, refs.to_vec())))
+                .collect();
+            while start.elapsed() < deadline {
+                let mut progressed = false;
+                while let Some(symbol_id) = reader.try_poll() {
+                    let Some((tgt_exch, ref_exchs)) = routes.get(&symbol_id) else {
+                        continue;
+                    };
+                    progressed = true;
+                    let slots = reader.read_all_exchanges(symbol_id);
+                    let now_ms = unix_ms()?;
+                    for &ref_exch in ref_exchs {
+                        match decode_shm_slot(&slots, ref_exch, symbol_id) {
+                            ShmSlotDecode::Valid(r_slot) => {
+                                let _ = session.on_reference_touch(
+                                    symbol_id,
+                                    ref_exch,
+                                    now_ms,
+                                    Track03Touch {
+                                        bid: r_slot.bid,
+                                        ask: r_slot.ask,
+                                        bid_sz: r_slot.bid_sz,
+                                        ask_sz: r_slot.ask_sz,
+                                        recv_ms: r_slot.recv_ms,
+                                    },
+                                );
+                            }
+                            ShmSlotDecode::InvalidOrCrossed => {
+                                session.record_venue_crossed_drop(symbol_id, ref_exch);
+                            }
+                            ShmSlotDecode::Empty => {}
+                        }
+                    }
+                    let tgt_decoded = decode_shm_slot(&slots, *tgt_exch, symbol_id);
+                    if matches!(tgt_decoded, ShmSlotDecode::InvalidOrCrossed) {
+                        session.record_venue_crossed_drop(symbol_id, *tgt_exch);
+                    }
+                    let ShmSlotDecode::Valid(tgt_slot) = tgt_decoded else {
+                        session.clear_arm_quotes(symbol_id);
+                        continue;
+                    };
+                    let target_touch = Track03Touch {
+                        bid: tgt_slot.bid,
+                        ask: tgt_slot.ask,
+                        bid_sz: tgt_slot.bid_sz,
+                        ask_sz: tgt_slot.ask_sz,
+                        recv_ms: tgt_slot.recv_ms,
+                    };
+                    let utc_day = utc_day_now();
+                    let _ = session.on_bbo_cross_diagnostic(
+                        symbol_id,
+                        now_ms,
+                        target_touch,
+                        utc_day,
+                    )?;
+                    let _ = session.on_target_bbo(symbol_id, now_ms, target_touch, utc_day)?;
+                }
+                if !progressed {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(ShadowOutput::Track03(session.report()))
         }
     }
 }
@@ -887,5 +1153,147 @@ fail_closed_when_unready = true
                 recv_ms: 1_794_712_726_000,
             })
         );
+    }
+
+    #[test]
+    fn cli_parser_accepts_track3_and_rejects_invalid_track() {
+        let args: Vec<String> = [
+            "--track",
+            "3",
+            "--config",
+            "examples/track03_queue_priority_mm_shadow.toml",
+            "--check",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            CliArgs {
+                track: TrackKind::Track03,
+                config: PathBuf::from("examples/track03_queue_priority_mm_shadow.toml"),
+                mode: RunMode::Check,
+            }
+        );
+
+        let bad_track: Vec<String> = ["--track", "4", "--config", "a.toml", "--check"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(parse_args(&bad_track).is_err());
+    }
+
+    #[test]
+    fn check_and_replay_work_for_track03() {
+        let cfg_toml = r#"
+capital_usd = 10000.0
+daily_loss_limit_pct = 0.02
+allowlisted_symbols = ["AAPL"]
+
+[[arms]]
+symbol = "AAPL"
+symbol_id = 1006
+target_exchange_id = 2
+ref_exchange_ids = [7]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "public_tier0_unverified"
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 99
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.50
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_cooldown_ms = 1200
+submit_rtt_ms = 0.0
+as_inventory_skew_gamma = 2.0
+vol_spread_mult = 0.5
+directional_markout_skew_mult = 1.0
+quiet_regime_min_spread_to_vol = 0.80
+quiet_regime_max_entry_vol_bps = 1.2
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 15000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
+"#;
+        let cfg_path = temp_file("t3.toml", cfg_toml);
+        let check = run_check(TrackKind::Track03, &cfg_path).unwrap();
+        assert_eq!(check["status"], "Configuration OK");
+        assert_eq!(check["track"], "03_incentive_turnover");
+        assert_eq!(check["arms"], 1);
+
+        let t0 = 1_795_564_800_000_u64; // Wednesday 00:00 UTC (overnight_asia)
+        let t1 = t0 + 1_200;
+        let t_rth = t0 + 14 * 3_600_000;
+        let lines = vec![
+            format!(
+                r#"{{"kind":"track3_ref","symbol_id":1006,"exchange_id":7,"now_ms":{t0},"bid":99.99,"ask":100.01}}"#
+            ),
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{t0},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{t0},"bids":[[99.98,10.0],[99.97,15.0]],"asks":[[100.02,10.0],[100.03,15.0]]}}"#
+            ),
+            format!(
+                r#"{{"kind":"track3_print","symbol_id":1006,"now_ms":{},"price":99.97,"size":5.0,"is_buy_aggressor":false}}"#,
+                t0 + 100
+            ),
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{t1},"bid":100.02,"ask":100.06,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{t1}}}"#
+            ),
+            format!(
+                r#"{{"kind":"track3_print","symbol_id":1006,"now_ms":{},"price":100.07,"size":5.0,"is_buy_aggressor":true}}"#,
+                t1 + 50
+            ),
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{t_rth},"bid":100.02,"ask":100.06,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{t_rth}}}"#
+            ),
+        ];
+        let replay_path = temp_file("t3.jsonl", &lines.join("\n"));
+
+        let ShadowOutput::Track03(rep) =
+            run_replay(TrackKind::Track03, &cfg_path, &replay_path).unwrap()
+        else {
+            panic!("expected Track03 report");
+        };
+        assert_eq!(rep.track, "03_incentive_turnover");
+        assert_eq!(rep.fill_evidence_mode, "public_trade_prints");
+        assert_eq!(rep.maker_fills, 2);
+        assert_eq!(rep.cycles, 1);
+        assert_eq!(rep.fees_usd, 0.0);
+        assert_eq!(rep.session_gated_ticks, 1);
+        assert!(rep.realized_pnl_usd > 0.0);
+        assert!(rep.double_sided_usd_per_m < 0.0);
+        assert!(rep.markout_1s_bps.unwrap() > 0.0);
+        assert_eq!(rep.stale_book_drops, 0);
+        assert_eq!(rep.venue_feed_health.len(), 2);
+
+        let serialized = serde_json::to_value(&rep).unwrap();
+        assert!(serialized["spread_capture_bps"].is_number());
+        assert!(serialized["holding_drift_bps"].is_number());
+        assert!(serialized["passive_exit_pnl_bps"].is_number());
+        assert!(serialized["taker_exit_slippage_bps"].is_number());
+        assert!(serialized["double_sided_usd_per_m"].is_number());
+        assert_eq!(
+            serialized["arms"][0]["account_fee_status"],
+            "public_tier0_unverified"
+        );
+
+        fs::remove_file(cfg_path).unwrap();
+        fs::remove_file(replay_path).unwrap();
     }
 }

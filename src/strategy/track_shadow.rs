@@ -1,4 +1,5 @@
-//! Decoupled Track 01 (`01_quant_profit`) and Track 02 (`02_hedge_arbitrage`) shadow sessions.
+//! Decoupled Track 01 (`01_quant_profit`), Track 02 (`02_hedge_arbitrage`), and
+//! Track 03 (`03_incentive_turnover`) shadow sessions.
 //!
 //! Strictly isolated from exchange execution adapters (`crate::exchanges::*` is forbidden here)
 //! and strictly isolated from each other: separate configurations, runtime state,
@@ -11,9 +12,13 @@ use crate::strategy::basis_maker_hedge::{
 use crate::strategy::lead_lag_taker::{
     LeadLagAction, LeadLagSide, LeadLagTaker, LeadLagTakerConfig,
 };
+use crate::strategy::queue_priority_mm::{
+    FastTradePrint, InventoryState, MmAction, QueuePriorityMmConfig, QueuePriorityMmEngine,
+    QuoteSide, ReferenceBookUpdate, RestingQuote, VenueBookUpdate, quantize_down,
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 pub use crate::strategy::basis_maker_hedge::Touch as MakerTouch;
@@ -219,6 +224,8 @@ pub struct Track01ArmShadowConfig {
     pub symbol: String,
     pub symbol_id: u16,
     pub ref_exchange_id: u8,
+    #[serde(default)]
+    pub confirm_ref_exchange_id: Option<u8>,
     pub tgt_exchange_id: u8,
     pub clip_usd: f64,
     #[serde(default = "default_max_l1_depth_fraction")]
@@ -233,6 +240,7 @@ impl Default for Track01ArmShadowConfig {
             symbol: String::new(),
             symbol_id: 0,
             ref_exchange_id: 6,
+            confirm_ref_exchange_id: None,
             tgt_exchange_id: 2,
             clip_usd: 250.0,
             max_l1_depth_fraction: default_max_l1_depth_fraction(),
@@ -311,6 +319,13 @@ impl Track01ShadowConfig {
                 "arm '{}' ref_exchange_id and tgt_exchange_id must differ",
                 arm.symbol
             );
+            if let Some(confirm_id) = arm.confirm_ref_exchange_id {
+                ensure!(
+                    confirm_id != arm.tgt_exchange_id && confirm_id != arm.ref_exchange_id,
+                    "arm '{}' confirm_ref_exchange_id must differ from ref_exchange_id and tgt_exchange_id",
+                    arm.symbol
+                );
+            }
             ensure!(
                 arm.clip_usd.is_finite() && arm.clip_usd > 0.0,
                 "arm '{}' clip_usd must be finite and > 0",
@@ -350,6 +365,7 @@ struct Track01ArmRuntime {
     open_pos: Option<OpenShadowPos>,
     last_tgt_touch: Option<LeadLagTouch>,
     ref_feed: VenueFeedTracker,
+    confirm_ref_feed: Option<VenueFeedTracker>,
     tgt_feed: VenueFeedTracker,
     realized_pnl_usd: f64,
     total_fees_usd: f64,
@@ -416,6 +432,8 @@ pub struct Track01ArmReport {
     pub symbol: String,
     pub symbol_id: u16,
     pub ref_exchange_id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_ref_exchange_id: Option<u8>,
     pub tgt_exchange_id: u8,
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
@@ -427,6 +445,8 @@ pub struct Track01ArmReport {
     pub open_side: Option<LeadLagSide>,
     pub open_notional_usd: f64,
     pub ref_feed: VenueFeedHealthReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_ref_feed: Option<VenueFeedHealthReport>,
     pub tgt_feed: VenueFeedHealthReport,
 }
 
@@ -485,6 +505,7 @@ impl Track01ShadowSession {
                 open_pos: None,
                 last_tgt_touch: None,
                 ref_feed: VenueFeedTracker::new(arm_cfg.ref_exchange_id),
+                confirm_ref_feed: arm_cfg.confirm_ref_exchange_id.map(VenueFeedTracker::new),
                 tgt_feed: VenueFeedTracker::new(arm_cfg.tgt_exchange_id),
                 realized_pnl_usd: 0.0,
                 total_fees_usd: 0.0,
@@ -523,6 +544,12 @@ impl Track01ShadowSession {
         })
     }
 
+    pub fn arm_confirm_exchange_id(&self, symbol_id: u16) -> Option<u8> {
+        self.arm_by_symbol_id
+            .get(&symbol_id)
+            .and_then(|&idx| self.arms[idx].cfg.confirm_ref_exchange_id)
+    }
+
     fn equity_usd(&self) -> f64 {
         let pnl: f64 = self
             .arms
@@ -551,6 +578,10 @@ impl Track01ShadowSession {
         let arm = &mut self.arms[arm_idx];
         if arm.cfg.ref_exchange_id == exchange_id {
             arm.ref_feed.record_crossed_drop();
+        } else if arm.cfg.confirm_ref_exchange_id == Some(exchange_id) {
+            if let Some(feed) = arm.confirm_ref_feed.as_mut() {
+                feed.record_crossed_drop();
+            }
         } else if arm.cfg.tgt_exchange_id == exchange_id {
             arm.tgt_feed.record_crossed_drop();
         }
@@ -568,10 +599,29 @@ impl Track01ShadowSession {
         tgt_ask_sz: f64,
         utc_day: i32,
     ) -> Result<Option<LeadLagAction>> {
+        self.on_bbo_pair_with_confirm(
+            symbol_id, now_ms, ref_touch, None, tgt_touch, tgt_bid_sz, tgt_ask_sz, utc_day,
+        )
+    }
+
+    /// Process one synchronized reference/target BBO pair with an optional confirmation leader
+    /// touch wired into [`LeadLagTaker::observe_with_confirm`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_bbo_pair_with_confirm(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        ref_touch: LeadLagTouch,
+        confirm_touch: Option<LeadLagTouch>,
+        tgt_touch: LeadLagTouch,
+        tgt_bid_sz: f64,
+        tgt_ask_sz: f64,
+        utc_day: i32,
+    ) -> Result<Option<LeadLagAction>> {
         let Some(&arm_idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return Ok(None);
         };
-        let (ref_obs, tgt_obs) = {
+        let (ref_obs, confirm_obs, tgt_obs) = {
             let arm = &mut self.arms[arm_idx];
             let max_ref_age_ms = arm.cfg.strategy.max_ref_age_ms;
             let max_tgt_age_ms = arm.cfg.strategy.max_tgt_age_ms;
@@ -582,6 +632,13 @@ impl Track01ShadowSession {
                 ref_touch.recv_ms,
                 max_ref_age_ms,
             );
+            let confirm_obs = confirm_touch.map(|ct| {
+                let fallback_id = arm.cfg.confirm_ref_exchange_id.unwrap_or(0);
+                let feed = arm
+                    .confirm_ref_feed
+                    .get_or_insert_with(|| VenueFeedTracker::new(fallback_id));
+                feed.observe_bbo(now_ms, ct.bid, ct.ask, ct.recv_ms, max_ref_age_ms)
+            });
             let tgt_obs = arm.tgt_feed.observe_bbo(
                 now_ms,
                 tgt_touch.bid,
@@ -592,7 +649,7 @@ impl Track01ShadowSession {
             if tgt_obs == FeedObservation::Fresh {
                 arm.last_tgt_touch = Some(tgt_touch);
             }
-            (ref_obs, tgt_obs)
+            (ref_obs, confirm_obs, tgt_obs)
         };
         // Check MTM equity & daily loss brake before sizing any new entry.
         self.check_equity_and_drawdown(utc_day);
@@ -607,12 +664,15 @@ impl Track01ShadowSession {
         } else {
             f64::NAN
         };
-        let action = self.arms[arm_idx].engine.observe(
+        let confirm_arg = match (confirm_touch, confirm_obs) {
+            (Some(ct), Some(FeedObservation::Fresh)) => Some((ct.mid(), ct.recv_ms)),
+            _ => None,
+        };
+        let action = self.arms[arm_idx].engine.observe_with_confirm(
             now_ms,
-            ref_mid,
-            ref_touch.recv_ms,
-            tgt_mid,
-            tgt_touch.recv_ms,
+            (ref_mid, ref_touch.recv_ms),
+            confirm_arg,
+            (tgt_mid, tgt_touch.recv_ms),
         );
 
         let risk_scale = if self.halted {
@@ -699,6 +759,7 @@ impl Track01ShadowSession {
                     symbol: a.cfg.symbol.clone(),
                     symbol_id: a.cfg.symbol_id,
                     ref_exchange_id: a.cfg.ref_exchange_id,
+                    confirm_ref_exchange_id: a.cfg.confirm_ref_exchange_id,
                     tgt_exchange_id: a.cfg.tgt_exchange_id,
                     realized_pnl_usd: a.realized_pnl_usd,
                     unrealized_pnl_usd: mtm,
@@ -710,6 +771,7 @@ impl Track01ShadowSession {
                     open_side: a.open_pos.map(|p| p.side),
                     open_notional_usd: a.open_pos.map_or(0.0, |p| p.notional_usd),
                     ref_feed: a.ref_feed.report(),
+                    confirm_ref_feed: a.confirm_ref_feed.map(|f| f.report()),
                     tgt_feed: a.tgt_feed.report(),
                 }
             })
@@ -720,7 +782,11 @@ impl Track01ShadowSession {
             stale_book_drops,
             clock_regression_drops,
             crossed_book_drops,
-        ) = aggregate_venue_health(arms.iter().flat_map(|a| [a.ref_feed, a.tgt_feed]));
+        ) = aggregate_venue_health(arms.iter().flat_map(|a| {
+            [Some(a.ref_feed), a.confirm_ref_feed, Some(a.tgt_feed)]
+                .into_iter()
+                .flatten()
+        }));
         Track01ShadowReport {
             track: "01_quant_profit",
             capital_usd: self.cfg.capital_usd,
@@ -1319,6 +1385,20 @@ impl Track02ShadowSession {
         hedge: MakerTouch,
         utc_day: i32,
     ) -> Result<Option<MakerHedgeQuotes>> {
+        self.on_pair_books_with_l1(symbol_id, now_ms, maker, hedge, None, utc_day)
+    }
+
+    /// Update maker/hedge quotes from the latest books with optional hedge L1 sizes wired into
+    /// [`MakerHedgeQuoter::step_with_l1`], enforcing `min_hedge_l1_notional_usd` when configured.
+    pub fn on_pair_books_with_l1(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        maker: MakerTouch,
+        hedge: MakerTouch,
+        hedge_l1_sizes: Option<(f64, f64)>,
+        utc_day: i32,
+    ) -> Result<Option<MakerHedgeQuotes>> {
         let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
             return Ok(None);
         };
@@ -1358,7 +1438,17 @@ impl Track02ShadowSession {
 
         let step_res = {
             let pair = &mut self.pairs[idx];
-            pair.quoter.step(now_ms, maker, hedge, pair.inventory_clips)
+            match hedge_l1_sizes {
+                Some((hedge_bid_sz, hedge_ask_sz)) => pair.quoter.step_with_l1(
+                    now_ms,
+                    maker,
+                    hedge,
+                    hedge_bid_sz,
+                    hedge_ask_sz,
+                    pair.inventory_clips,
+                ),
+                None => pair.quoter.step(now_ms, maker, hedge, pair.inventory_clips),
+            }
         };
         self.check_equity_and_drawdown(utc_day);
 
@@ -1679,6 +1769,1618 @@ impl Track02ShadowSession {
     }
 }
 
+// ============================================================================
+// Track 03: 03_incentive_turnover (Queue-Priority G4 Quiet-Regime MM Shadow)
+// ============================================================================
+
+fn default_queue_ahead_fraction() -> f64 {
+    0.5
+}
+
+fn default_track03_account_fee_status() -> String {
+    "public_tier0_unverified".to_string()
+}
+
+/// Canonical UTC trading session classification consistent with
+/// `scripts/research_track03_multivenue_turnover.py`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UtcSession {
+    UsRth,
+    UsExtended,
+    OvernightAsia,
+    Weekend,
+}
+
+/// Classify Unix epoch milliseconds into canonical UTC session buckets:
+/// - `Weekend`: Saturday / Sunday UTC
+/// - `OvernightAsia`: 00:00 <= UTC < 11:00
+/// - `UsExtended`: 11:00 <= UTC < 13:30 or 20:00 <= UTC < 24:00
+/// - `UsRth`: 13:30 <= UTC < 20:00
+pub fn classify_utc_session(now_ms: u64) -> UtcSession {
+    let days_since_unix = now_ms / 86_400_000;
+    // 1970-01-01 was Thursday (index 3 in Mon=0..Sun=6).
+    let weekday = (days_since_unix + 3) % 7;
+    if weekday >= 5 {
+        return UtcSession::Weekend;
+    }
+    let minute_of_day = ((now_ms / 60_000) % 1_440) as u32;
+    if minute_of_day < 660 {
+        UtcSession::OvernightAsia
+    } else if !(810..1_200).contains(&minute_of_day) {
+        UtcSession::UsExtended
+    } else {
+        UtcSession::UsRth
+    }
+}
+
+/// Top-of-book snapshot with L1 sizes and local receipt time for Track 03 shadow replay.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct Track03Touch {
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_sz: f64,
+    pub ask_sz: f64,
+    pub recv_ms: u64,
+}
+
+impl Track03Touch {
+    pub fn valid(&self) -> bool {
+        valid_bid_ask(self.bid, self.ask)
+            && self.bid_sz.is_finite()
+            && self.ask_sz.is_finite()
+            && self.bid_sz > 0.0
+            && self.ask_sz > 0.0
+    }
+
+    pub fn mid(&self) -> f64 {
+        0.5 * (self.bid + self.ask)
+    }
+}
+
+/// Summary of one Track 03 BBO step (allocation-free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Track03StepOutcome {
+    pub utc_session: UtcSession,
+    pub session_gated: bool,
+    pub halted: bool,
+    pub resting_orders: usize,
+    pub placed: usize,
+    pub cancelled: usize,
+    pub kept: usize,
+    pub taker_exited: bool,
+}
+
+/// Shadow configuration for a single Track 03 queue-priority market-making arm.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Track03ArmShadowConfig {
+    pub symbol: String,
+    pub symbol_id: u16,
+    pub target_exchange_id: u8,
+    pub ref_exchange_ids: Vec<u8>,
+    pub maker_fee_bps: f64,
+    pub taker_fee_bps: f64,
+    pub rebate_bps: f64,
+    #[serde(default = "default_queue_ahead_fraction")]
+    pub queue_ahead_fraction: f64,
+    pub allowed_utc_sessions: Option<Vec<UtcSession>>,
+    #[serde(default = "default_track03_account_fee_status")]
+    pub account_fee_status: String,
+    pub strategy: QueuePriorityMmConfig,
+}
+
+impl Default for Track03ArmShadowConfig {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            symbol_id: 0,
+            target_exchange_id: 2,
+            ref_exchange_ids: Vec::new(),
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
+            rebate_bps: 0.0,
+            queue_ahead_fraction: default_queue_ahead_fraction(),
+            allowed_utc_sessions: None,
+            account_fee_status: default_track03_account_fee_status(),
+            strategy: QueuePriorityMmConfig::default(),
+        }
+    }
+}
+
+/// Isolated shadow session configuration for Track 03 (`03_incentive_turnover`).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Track03ShadowConfig {
+    pub capital_usd: f64,
+    pub daily_loss_limit_pct: f64,
+    pub daily_loss_state_path: Option<PathBuf>,
+    pub allowlisted_symbols: Vec<String>,
+    pub arms: Vec<Track03ArmShadowConfig>,
+}
+
+impl Default for Track03ShadowConfig {
+    fn default() -> Self {
+        Self {
+            capital_usd: 10_000.0,
+            daily_loss_limit_pct: 0.02,
+            daily_loss_state_path: None,
+            allowlisted_symbols: Vec::new(),
+            arms: Vec::new(),
+        }
+    }
+}
+
+impl Track03ShadowConfig {
+    /// Validate capital, loss limits, allowlist, unique symbol IDs, fee invariants, and G4 configs.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.capital_usd.is_finite() && self.capital_usd > 0.0,
+            "capital_usd must be finite and > 0"
+        );
+        ensure!(
+            self.daily_loss_limit_pct.is_finite()
+                && self.daily_loss_limit_pct > 0.0
+                && self.daily_loss_limit_pct < 1.0,
+            "daily_loss_limit_pct must be finite and in (0, 1)"
+        );
+        ensure!(
+            !self.allowlisted_symbols.is_empty(),
+            "allowlisted_symbols must be non-empty"
+        );
+        for sym in &self.allowlisted_symbols {
+            ensure!(
+                !sym.trim().is_empty(),
+                "allowlisted_symbols must not contain blank entries"
+            );
+        }
+        ensure!(!self.arms.is_empty(), "arms must be non-empty");
+
+        let mut seen_symbol_ids = HashSet::with_capacity(self.arms.len());
+        for arm in &self.arms {
+            ensure!(
+                !arm.symbol.trim().is_empty(),
+                "arm.symbol must be non-empty"
+            );
+            ensure!(
+                self.allowlisted_symbols.iter().any(|s| s == &arm.symbol),
+                "arm symbol '{}' is not in allowlisted_symbols",
+                arm.symbol
+            );
+            ensure!(
+                seen_symbol_ids.insert(arm.symbol_id),
+                "duplicate arm symbol_id {}",
+                arm.symbol_id
+            );
+            let mut seen_refs = HashSet::with_capacity(arm.ref_exchange_ids.len());
+            for &ref_id in &arm.ref_exchange_ids {
+                ensure!(
+                    ref_id != arm.target_exchange_id,
+                    "arm '{}' ref_exchange_id {} must differ from target_exchange_id",
+                    arm.symbol,
+                    ref_id
+                );
+                ensure!(
+                    seen_refs.insert(ref_id),
+                    "arm '{}' duplicate ref_exchange_id {}",
+                    arm.symbol,
+                    ref_id
+                );
+            }
+            ensure!(
+                arm.maker_fee_bps.is_finite() && arm.maker_fee_bps >= -5.0,
+                "arm '{}' maker_fee_bps invalid",
+                arm.symbol
+            );
+            ensure!(
+                arm.taker_fee_bps.is_finite() && arm.taker_fee_bps >= 0.0,
+                "arm '{}' taker_fee_bps must be finite and >= 0",
+                arm.symbol
+            );
+            ensure!(
+                arm.rebate_bps.is_finite() && arm.rebate_bps >= 0.0,
+                "arm '{}' rebate_bps must be finite and >= 0",
+                arm.symbol
+            );
+            ensure!(
+                arm.queue_ahead_fraction.is_finite()
+                    && (0.0..=1.0).contains(&arm.queue_ahead_fraction),
+                "arm '{}' queue_ahead_fraction must be in [0, 1]",
+                arm.symbol
+            );
+            if let Some(sessions) = &arm.allowed_utc_sessions {
+                ensure!(
+                    !sessions.is_empty(),
+                    "arm '{}' allowed_utc_sessions must be non-empty when set",
+                    arm.symbol
+                );
+            }
+            arm.strategy.validate()?;
+            ensure!(
+                (arm.maker_fee_bps - arm.strategy.maker_fee_bps).abs() <= 1e-9,
+                "arm '{}' maker_fee_bps ({}) must match strategy.maker_fee_bps ({})",
+                arm.symbol,
+                arm.maker_fee_bps,
+                arm.strategy.maker_fee_bps
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Track03FillRole {
+    Maker,
+    Taker,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Track03OpenLot {
+    sgn: f64,
+    qty: f64,
+    entry_px: f64,
+    entry_mid: f64,
+    entry_ts_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Track03PendingMarkout {
+    eval_ts_ms: u64,
+    side: QuoteSide,
+    fill_px: f64,
+    fill_notional_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Track03OrderMeta {
+    queue_ahead: f64,
+    active_at_ms: u64,
+    activated: bool,
+    reduce_only: bool,
+}
+
+struct Track03RefSlot {
+    exchange_id: u8,
+    venue_id: String,
+    feed: VenueFeedTracker,
+    last_sample: Option<(u64, f64, f64)>,
+    scratch_idx: Option<usize>,
+}
+
+const TRACK03_MAX_RESTING: usize = 6;
+const TRACK03_MAX_PENDING_MARKOUTS: usize = 256;
+
+struct Track03ArmRuntime {
+    cfg: Track03ArmShadowConfig,
+    engine: QueuePriorityMmEngine,
+    target_feed: VenueFeedTracker,
+    last_valid_target_touch: Option<Track03Touch>,
+    ref_slots: Vec<Track03RefSlot>,
+    scratch_book: VenueBookUpdate,
+    scratch_refs: Vec<ReferenceBookUpdate>,
+    scratch_resting: Vec<RestingQuote>,
+    resting_meta: [Track03OrderMeta; TRACK03_MAX_RESTING],
+    resting_seq: u64,
+    open_lots: VecDeque<Track03OpenLot>,
+    pending_markouts: VecDeque<Track03PendingMarkout>,
+    pos_qty: f64,
+    realized_gross_usd: f64,
+    fees_usd: f64,
+    spread_capture_usd: f64,
+    holding_drift_usd: f64,
+    passive_exit_pnl_usd: f64,
+    taker_exit_slippage_usd: f64,
+    closed_notional_usd: f64,
+    maker_volume_usd: f64,
+    taker_volume_usd: f64,
+    markout_1s_num_bps_usd: f64,
+    markout_1s_den_usd: f64,
+    maker_fills: u64,
+    taker_exits: u64,
+    cycles: u64,
+    orders_placed: u64,
+    cancels: u64,
+    queue_preserved: u64,
+    alo_rejects: u64,
+    session_gated_ticks: u64,
+    total_book_ticks: u64,
+    halted: bool,
+}
+
+impl Track03ArmRuntime {
+    fn realized_pnl_usd(&self) -> f64 {
+        self.realized_gross_usd - self.fees_usd
+    }
+
+    fn unrealized_pnl_usd(&self) -> f64 {
+        let Some(touch) = self.last_valid_target_touch else {
+            return 0.0;
+        };
+        let mid = touch.mid();
+        self.open_lots
+            .iter()
+            .map(|lot| lot.sgn * lot.qty * (mid - lot.entry_px))
+            .sum()
+    }
+
+    fn total_pnl_usd(&self) -> f64 {
+        self.realized_pnl_usd() + self.unrealized_pnl_usd()
+    }
+
+    fn session_allows(&self, session: UtcSession) -> bool {
+        self.cfg
+            .allowed_utc_sessions
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&session))
+    }
+
+    fn is_pure_reducing_order(&self, side: QuoteSide, qty: f64, meta: Track03OrderMeta) -> bool {
+        let half_lot = self.cfg.strategy.lot_size * 0.5;
+        if meta.reduce_only {
+            return match side {
+                QuoteSide::Bid => self.pos_qty < -half_lot && qty <= -self.pos_qty + 1e-12,
+                QuoteSide::Ask => self.pos_qty > half_lot && qty <= self.pos_qty + 1e-12,
+            };
+        }
+        match side {
+            QuoteSide::Bid => self.pos_qty < -half_lot && qty <= -self.pos_qty + 1e-12,
+            QuoteSide::Ask => self.pos_qty > half_lot && qty <= self.pos_qty + 1e-12,
+        }
+    }
+
+    fn remove_resting_at(&mut self, idx: usize) {
+        let last = self.scratch_resting.len() - 1;
+        self.scratch_resting.swap_remove(idx);
+        if idx < last {
+            self.resting_meta[idx] = self.resting_meta[last];
+        }
+        self.resting_meta[last] = Track03OrderMeta::default();
+    }
+
+    fn clear_all_resting(&mut self) -> usize {
+        let cancelled = self.scratch_resting.len();
+        self.scratch_resting.clear();
+        self.resting_meta = [Track03OrderMeta::default(); TRACK03_MAX_RESTING];
+        self.cancels += cancelled as u64;
+        cancelled
+    }
+
+    fn cancel_opening_resting(&mut self) -> usize {
+        let mut cancelled = 0;
+        let mut idx = 0;
+        while idx < self.scratch_resting.len() {
+            let side = self.scratch_resting[idx].side;
+            let qty = self.scratch_resting[idx].qty;
+            let meta = self.resting_meta[idx];
+            if self.is_pure_reducing_order(side, qty, meta) {
+                idx += 1;
+            } else {
+                self.remove_resting_at(idx);
+                self.cancels += 1;
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    fn mature_markouts(&mut self, mid_now: f64, now_ms: u64) {
+        if !(mid_now.is_finite() && mid_now > 0.0) {
+            return;
+        }
+        while let Some(&pf) = self.pending_markouts.front() {
+            if now_ms < pf.eval_ts_ms {
+                break;
+            }
+            self.pending_markouts.pop_front();
+            if pf.fill_px <= 0.0 || pf.fill_notional_usd <= 0.0 {
+                continue;
+            }
+            let sgn = match pf.side {
+                QuoteSide::Bid => 1.0,
+                QuoteSide::Ask => -1.0,
+            };
+            let mk_bps = sgn * (mid_now - pf.fill_px) / pf.fill_px * 1e4;
+            if mk_bps.is_finite() {
+                self.markout_1s_num_bps_usd += pf.fill_notional_usd * mk_bps;
+                self.markout_1s_den_usd += pf.fill_notional_usd;
+            }
+        }
+    }
+
+    fn activate_arrivals(&mut self, now_ms: u64, bb: f64, bsz: f64, ba: f64, asz: f64) {
+        let tol_25 = self.cfg.strategy.tick_size * 0.25;
+        let mut idx = 0;
+        while idx < self.scratch_resting.len() {
+            if self.resting_meta[idx].activated {
+                let ord = &self.scratch_resting[idx];
+                match ord.side {
+                    QuoteSide::Bid
+                        if (ord.price - bb).abs() <= tol_25
+                            && bsz < self.resting_meta[idx].queue_ahead =>
+                    {
+                        self.resting_meta[idx].queue_ahead = bsz;
+                    }
+                    QuoteSide::Ask
+                        if (ord.price - ba).abs() <= tol_25
+                            && asz < self.resting_meta[idx].queue_ahead =>
+                    {
+                        self.resting_meta[idx].queue_ahead = asz;
+                    }
+                    _ => {}
+                }
+                idx += 1;
+                continue;
+            }
+            if now_ms < self.resting_meta[idx].active_at_ms {
+                idx += 1;
+                continue;
+            }
+            let side = self.scratch_resting[idx].side;
+            let px = self.scratch_resting[idx].price;
+            let crosses = match side {
+                QuoteSide::Bid => px >= ba - 1e-12,
+                QuoteSide::Ask => px <= bb + 1e-12,
+            };
+            if crosses {
+                self.remove_resting_at(idx);
+                self.alo_rejects += 1;
+                self.engine.on_alo_reject(side, now_ms);
+                continue;
+            }
+            let queue_ahead = match side {
+                QuoteSide::Bid if (px - bb).abs() <= tol_25 || px <= bb + tol_25 => {
+                    self.cfg.queue_ahead_fraction * bsz
+                }
+                QuoteSide::Ask if (px - ba).abs() <= tol_25 || px >= ba - tol_25 => {
+                    self.cfg.queue_ahead_fraction * asz
+                }
+                _ => 0.0,
+            };
+            self.resting_meta[idx].queue_ahead = queue_ahead;
+            self.resting_meta[idx].activated = true;
+            self.engine.on_alo_accepted(side);
+            idx += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_fill(
+        &mut self,
+        ts_ms: u64,
+        side: QuoteSide,
+        fill_px: f64,
+        fill_qty: f64,
+        role: Track03FillRole,
+        mid_now: f64,
+        notify_markout_shield: bool,
+    ) {
+        if !(fill_qty.is_finite() && fill_qty > 1e-12 && fill_px.is_finite() && fill_px > 0.0) {
+            return;
+        }
+        let fill_sgn = match side {
+            QuoteSide::Bid => 1.0,
+            QuoteSide::Ask => -1.0,
+        };
+        let notl = fill_qty * fill_px;
+        let fee_bp = match role {
+            Track03FillRole::Maker => {
+                self.maker_volume_usd += notl;
+                self.maker_fills += 1;
+                if self.pending_markouts.len() >= TRACK03_MAX_PENDING_MARKOUTS {
+                    self.pending_markouts.pop_front();
+                }
+                self.pending_markouts.push_back(Track03PendingMarkout {
+                    eval_ts_ms: ts_ms.saturating_add(1_000),
+                    side,
+                    fill_px,
+                    fill_notional_usd: notl,
+                });
+                if notify_markout_shield {
+                    self.engine.on_fill(side, fill_px, fill_qty, ts_ms);
+                }
+                self.cfg.maker_fee_bps - self.cfg.rebate_bps
+            }
+            Track03FillRole::Taker => {
+                self.taker_volume_usd += notl;
+                self.taker_exits += 1;
+                self.cfg.taker_fee_bps
+            }
+        };
+        self.fees_usd += notl * (fee_bp * 1e-4);
+
+        let mut rem = fill_qty;
+        let mut closed_any = false;
+        while rem > 1e-12 {
+            let Some(lot) = self.open_lots.front_mut() else {
+                break;
+            };
+            if (lot.sgn - fill_sgn).abs() < 0.5 {
+                break;
+            }
+            let closed_qty = rem.min(lot.qty);
+            let entry_spr = closed_qty * lot.sgn * (lot.entry_mid - lot.entry_px);
+            let drft_part = closed_qty * lot.sgn * (mid_now - lot.entry_mid);
+            let exit_edge = closed_qty * lot.sgn * (fill_px - mid_now);
+            self.spread_capture_usd += entry_spr;
+            self.holding_drift_usd += drft_part;
+            match role {
+                Track03FillRole::Maker => self.passive_exit_pnl_usd += exit_edge,
+                Track03FillRole::Taker => self.taker_exit_slippage_usd += exit_edge,
+            }
+            self.realized_gross_usd += entry_spr + drft_part + exit_edge;
+            self.closed_notional_usd += closed_qty * fill_px;
+            closed_any = true;
+            rem -= closed_qty;
+            lot.qty -= closed_qty;
+            if lot.qty <= 1e-12 {
+                self.open_lots.pop_front();
+            }
+        }
+        if closed_any {
+            self.cycles += 1;
+        }
+        if rem > 1e-12 {
+            self.open_lots.push_back(Track03OpenLot {
+                sgn: fill_sgn,
+                qty: rem,
+                entry_px: fill_px,
+                entry_mid: mid_now,
+                entry_ts_ms: ts_ms,
+            });
+        }
+        self.pos_qty = self.open_lots.iter().map(|l| l.sgn * l.qty).sum();
+        if self.open_lots.is_empty() || self.pos_qty.abs() <= 1e-12 {
+            self.pos_qty = 0.0;
+        }
+    }
+
+    fn cost_decomposition(&self) -> (f64, f64, f64, f64, f64, f64, f64) {
+        let ntl = self.closed_notional_usd;
+        if ntl <= 0.0 {
+            let eff_maker_bp = self.cfg.maker_fee_bps - self.cfg.rebate_bps;
+            let double_sided_usd_per_m = eff_maker_bp * 100.0;
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, double_sided_usd_per_m);
+        }
+        let spread_capture_bps = (self.spread_capture_usd / ntl) * 1e4;
+        let holding_drift_bps = (self.holding_drift_usd / ntl) * 1e4;
+        let passive_exit_pnl_bps = (self.passive_exit_pnl_usd / ntl) * 1e4;
+        let taker_exit_slippage_bps = (self.taker_exit_slippage_usd / ntl) * 1e4;
+        let gross_ex_fee_bps = (self.realized_gross_usd / ntl) * 1e4;
+        let s = (self.taker_volume_usd / ntl).clamp(0.0, 1.0);
+        let eff_maker_bp = self.cfg.maker_fee_bps - self.cfg.rebate_bps;
+        let fee_cycle_bp = eff_maker_bp * (2.0 - s) + self.cfg.taker_fee_bps * s;
+        let net_cost_cycle_bp = fee_cycle_bp - gross_ex_fee_bps;
+        let double_sided_usd_per_m = (net_cost_cycle_bp / 2.0) * 100.0;
+        (
+            spread_capture_bps,
+            holding_drift_bps,
+            passive_exit_pnl_bps,
+            taker_exit_slippage_bps,
+            gross_ex_fee_bps,
+            s,
+            double_sided_usd_per_m,
+        )
+    }
+}
+
+/// Per-arm shadow summary for Track 03 (`03_incentive_turnover`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Track03ArmReport {
+    pub symbol: String,
+    pub symbol_id: u16,
+    pub target_exchange_id: u8,
+    pub ref_exchange_ids: Vec<u8>,
+    pub account_fee_status: String,
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub fees_usd: f64,
+    pub spread_capture_usd: f64,
+    pub holding_drift_usd: f64,
+    pub passive_exit_pnl_usd: f64,
+    pub taker_exit_slippage_usd: f64,
+    pub spread_capture_bps: f64,
+    pub holding_drift_bps: f64,
+    pub passive_exit_pnl_bps: f64,
+    pub taker_exit_slippage_bps: f64,
+    pub gross_ex_fee_bps: f64,
+    pub double_sided_usd_per_m: f64,
+    pub maker_volume_usd: f64,
+    pub taker_volume_usd: f64,
+    pub closed_notional_usd: f64,
+    pub taker_exit_share_s: f64,
+    pub markout_1s_bps: Option<f64>,
+    pub markout_1s_den_usd: f64,
+    pub position_qty: f64,
+    pub position_notional_usd: f64,
+    pub fills: u64,
+    pub maker_fills: u64,
+    pub taker_exits: u64,
+    pub cycles: u64,
+    pub orders_placed: u64,
+    pub cancels: u64,
+    pub queue_preserved: u64,
+    pub alo_rejects: u64,
+    pub session_gated_ticks: u64,
+    pub total_book_ticks: u64,
+    pub halted: bool,
+    pub target_feed: VenueFeedHealthReport,
+    pub ref_feeds: Vec<VenueFeedHealthReport>,
+}
+
+/// Aggregate shadow summary for Track 03 (`03_incentive_turnover`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Track03ShadowReport {
+    pub track: &'static str,
+    pub fill_evidence_mode: &'static str,
+    pub fill_evidence_note: &'static str,
+    pub capital_usd: f64,
+    pub equity_usd: f64,
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub fees_usd: f64,
+    pub spread_capture_bps: f64,
+    pub holding_drift_bps: f64,
+    pub passive_exit_pnl_bps: f64,
+    pub taker_exit_slippage_bps: f64,
+    pub gross_ex_fee_bps: f64,
+    pub double_sided_usd_per_m: f64,
+    pub maker_volume_usd: f64,
+    pub taker_volume_usd: f64,
+    pub closed_notional_usd: f64,
+    pub taker_exit_share_s: f64,
+    pub markout_1s_bps: Option<f64>,
+    pub max_drawdown_usd: f64,
+    pub fills: u64,
+    pub maker_fills: u64,
+    pub taker_exits: u64,
+    pub cycles: u64,
+    pub orders_placed: u64,
+    pub cancels: u64,
+    pub queue_preserved: u64,
+    pub alo_rejects: u64,
+    pub session_gated_ticks: u64,
+    pub risk_scale: f64,
+    pub halted: bool,
+    pub max_gap_ms: u64,
+    pub stale_book_drops: u64,
+    pub clock_regression_drops: u64,
+    pub crossed_book_drops: u64,
+    pub venue_feed_health: Vec<VenueFeedHealthReport>,
+    pub arms: Vec<Track03ArmReport>,
+}
+
+/// Decoupled Track 03 queue-priority G4 shadow session with isolated [`DailyLossGuard`].
+pub struct Track03ShadowSession {
+    cfg: Track03ShadowConfig,
+    arms: Vec<Track03ArmRuntime>,
+    arm_by_symbol_id: HashMap<u16, usize>,
+    daily_loss: DailyLossGuard,
+    fill_evidence_mode: &'static str,
+    halted: bool,
+    peak_equity_usd: f64,
+    max_drawdown_usd: f64,
+}
+
+impl Track03ShadowSession {
+    pub fn new(cfg: Track03ShadowConfig, initial_utc_day: i32) -> Result<Self> {
+        cfg.validate()?;
+        let daily_loss = DailyLossGuard::open(
+            cfg.daily_loss_state_path.clone(),
+            cfg.daily_loss_limit_pct,
+            cfg.capital_usd,
+            initial_utc_day,
+        )?;
+        let mut arms = Vec::with_capacity(cfg.arms.len());
+        let mut arm_by_symbol_id = HashMap::with_capacity(cfg.arms.len());
+        for (idx, arm_cfg) in cfg.arms.iter().enumerate() {
+            let engine = QueuePriorityMmEngine::new(arm_cfg.strategy.clone())?;
+            arm_by_symbol_id.insert(arm_cfg.symbol_id, idx);
+            let ref_slots = arm_cfg
+                .ref_exchange_ids
+                .iter()
+                .map(|&exch_id| Track03RefSlot {
+                    exchange_id: exch_id,
+                    venue_id: format!("exch_{exch_id}"),
+                    feed: VenueFeedTracker::new(exch_id),
+                    last_sample: None,
+                    scratch_idx: None,
+                })
+                .collect();
+            arms.push(Track03ArmRuntime {
+                cfg: arm_cfg.clone(),
+                engine,
+                target_feed: VenueFeedTracker::new(arm_cfg.target_exchange_id),
+                last_valid_target_touch: None,
+                ref_slots,
+                scratch_book: VenueBookUpdate {
+                    bids: Vec::with_capacity(8),
+                    asks: Vec::with_capacity(8),
+                    received_at_ms: 0,
+                    source_ms: None,
+                },
+                scratch_refs: Vec::with_capacity(arm_cfg.ref_exchange_ids.len()),
+                scratch_resting: Vec::with_capacity(TRACK03_MAX_RESTING),
+                resting_meta: [Track03OrderMeta::default(); TRACK03_MAX_RESTING],
+                resting_seq: 0,
+                open_lots: VecDeque::with_capacity(32),
+                pending_markouts: VecDeque::with_capacity(TRACK03_MAX_PENDING_MARKOUTS),
+                pos_qty: 0.0,
+                realized_gross_usd: 0.0,
+                fees_usd: 0.0,
+                spread_capture_usd: 0.0,
+                holding_drift_usd: 0.0,
+                passive_exit_pnl_usd: 0.0,
+                taker_exit_slippage_usd: 0.0,
+                closed_notional_usd: 0.0,
+                maker_volume_usd: 0.0,
+                taker_volume_usd: 0.0,
+                markout_1s_num_bps_usd: 0.0,
+                markout_1s_den_usd: 0.0,
+                maker_fills: 0,
+                taker_exits: 0,
+                cycles: 0,
+                orders_placed: 0,
+                cancels: 0,
+                queue_preserved: 0,
+                alo_rejects: 0,
+                session_gated_ticks: 0,
+                total_book_ticks: 0,
+                halted: false,
+            });
+        }
+        Ok(Self {
+            peak_equity_usd: cfg.capital_usd,
+            cfg,
+            arms,
+            arm_by_symbol_id,
+            daily_loss,
+            fill_evidence_mode: "public_trade_prints",
+            halted: false,
+            max_drawdown_usd: 0.0,
+        })
+    }
+
+    pub fn set_fill_evidence_mode(&mut self, mode: &'static str) {
+        self.fill_evidence_mode = mode;
+    }
+
+    pub fn fill_evidence_note(&self) -> &'static str {
+        if self.fill_evidence_mode == "shm_bbo_cross_diagnostic_no_trades" {
+            "BboMatrix SHM has no public trade prints; Track 03 fills are conservative BBO-cross sweep diagnostics only"
+        } else {
+            "trade_print_fifo_queue_and_strict_trade_through"
+        }
+    }
+
+    pub fn config(&self) -> &Track03ShadowConfig {
+        &self.cfg
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn arm_ids(&self) -> impl Iterator<Item = (u16, u8, &[u8])> + '_ {
+        self.arms.iter().map(|a| {
+            (
+                a.cfg.symbol_id,
+                a.cfg.target_exchange_id,
+                a.cfg.ref_exchange_ids.as_slice(),
+            )
+        })
+    }
+
+    fn equity_usd(&self) -> f64 {
+        let pnl: f64 = self.arms.iter().map(Track03ArmRuntime::total_pnl_usd).sum();
+        self.cfg.capital_usd + pnl
+    }
+
+    fn check_equity_and_drawdown(&mut self, utc_day: i32) {
+        let equity = self.equity_usd();
+        if equity.is_finite() {
+            self.peak_equity_usd = self.peak_equity_usd.max(equity);
+            self.max_drawdown_usd = self.max_drawdown_usd.max(self.peak_equity_usd - equity);
+        }
+        if !self.halted && self.daily_loss.check(equity, utc_day).is_err() {
+            self.halted = true;
+            for arm in &mut self.arms {
+                arm.cancel_opening_resting();
+            }
+        }
+    }
+
+    /// Clear all resting quotes for `symbol_id` (fail-closed on SHM invalidation/disconnect).
+    pub fn clear_arm_quotes(&mut self, symbol_id: u16) {
+        if let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) {
+            self.arms[idx].clear_all_resting();
+        }
+    }
+
+    /// Record a crossed or malformed SHM book drop detected before `on_target_bbo` / `on_reference_touch`.
+    pub fn record_venue_crossed_drop(&mut self, symbol_id: u16, exchange_id: u8) {
+        let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return;
+        };
+        let arm = &mut self.arms[idx];
+        if arm.cfg.target_exchange_id == exchange_id {
+            arm.target_feed.record_crossed_drop();
+        }
+        for slot in &mut arm.ref_slots {
+            if slot.exchange_id == exchange_id {
+                slot.feed.record_crossed_drop();
+            }
+        }
+    }
+
+    /// Feed a timestamped external reference BBO snapshot into the arm's multi-venue fair anchor.
+    ///
+    /// Rejects stale, future, clock-regressed, or crossed reference books without overwriting
+    /// healthy history, and deduplicates unchanged `(recv_ms, bid, ask)` SHM snapshots.
+    pub fn on_reference_touch(
+        &mut self,
+        symbol_id: u16,
+        exchange_id: u8,
+        now_ms: u64,
+        ref_touch: Track03Touch,
+    ) -> bool {
+        let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return false;
+        };
+        let arm = &mut self.arms[idx];
+        let max_book_age_ms = arm.cfg.strategy.max_book_age_ms;
+        let Some(slot) = arm
+            .ref_slots
+            .iter_mut()
+            .find(|s| s.exchange_id == exchange_id)
+        else {
+            return false;
+        };
+        let obs = slot.feed.observe_bbo(
+            now_ms,
+            ref_touch.bid,
+            ref_touch.ask,
+            ref_touch.recv_ms,
+            max_book_age_ms,
+        );
+        if obs != FeedObservation::Fresh {
+            return false;
+        }
+        let sample = (ref_touch.recv_ms, ref_touch.bid, ref_touch.ask);
+        if slot.last_sample == Some(sample) {
+            return false;
+        }
+        slot.last_sample = Some(sample);
+        if let Some(ref_idx) = slot.scratch_idx {
+            let entry = &mut arm.scratch_refs[ref_idx];
+            entry.bid = ref_touch.bid;
+            entry.ask = ref_touch.ask;
+            entry.received_at_ms = ref_touch.recv_ms;
+        } else {
+            let ref_idx = arm.scratch_refs.len();
+            slot.scratch_idx = Some(ref_idx);
+            arm.scratch_refs.push(ReferenceBookUpdate {
+                venue_id: slot.venue_id.clone(),
+                bid: ref_touch.bid,
+                ask: ref_touch.ask,
+                received_at_ms: ref_touch.recv_ms,
+            });
+        }
+        true
+    }
+
+    /// Process one target L1 BBO update for `symbol_id`.
+    pub fn on_target_bbo(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        target: Track03Touch,
+        utc_day: i32,
+    ) -> Result<Option<Track03StepOutcome>> {
+        if !target.valid() {
+            let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+                return Ok(None);
+            };
+            self.arms[idx].target_feed.record_crossed_drop();
+            self.arms[idx].clear_all_resting();
+            self.check_equity_and_drawdown(utc_day);
+            return Ok(None);
+        }
+        let bids = [(target.bid, target.bid_sz)];
+        let asks = [(target.ask, target.ask_sz)];
+        self.on_target_l2_bbo(symbol_id, now_ms, &bids, &asks, target.recv_ms, utc_day)
+    }
+
+    /// Process one target L2/BBO snapshot for `symbol_id` using pre-allocated book buffers.
+    pub fn on_target_l2_bbo(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
+        recv_ms: u64,
+        utc_day: i32,
+    ) -> Result<Option<Track03StepOutcome>> {
+        let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return Ok(None);
+        };
+        let valid_levels = |levels: &[(f64, f64)]| -> bool {
+            !levels.is_empty()
+                && levels
+                    .iter()
+                    .all(|(p, s)| p.is_finite() && s.is_finite() && *p > 0.0 && *s > 0.0)
+        };
+        if !valid_levels(bids) || !valid_levels(asks) {
+            self.arms[idx].target_feed.record_crossed_drop();
+            self.arms[idx].clear_all_resting();
+            self.check_equity_and_drawdown(utc_day);
+            return Ok(None);
+        }
+        let (bb, bsz) = bids[0];
+        let (ba, asz) = asks[0];
+
+        let obs = {
+            let arm = &mut self.arms[idx];
+            let max_book_age_ms = arm.cfg.strategy.max_book_age_ms;
+            arm.target_feed
+                .observe_bbo(now_ms, bb, ba, recv_ms, max_book_age_ms)
+        };
+        if obs != FeedObservation::Fresh {
+            self.arms[idx].clear_all_resting();
+            self.check_equity_and_drawdown(utc_day);
+            return Ok(None);
+        }
+
+        let target_touch = Track03Touch {
+            bid: bb,
+            ask: ba,
+            bid_sz: bsz,
+            ask_sz: asz,
+            recv_ms,
+        };
+        {
+            let arm = &mut self.arms[idx];
+            arm.last_valid_target_touch = Some(target_touch);
+            arm.total_book_ticks += 1;
+            arm.scratch_book.bids.clear();
+            arm.scratch_book.bids.extend_from_slice(bids);
+            arm.scratch_book.asks.clear();
+            arm.scratch_book.asks.extend_from_slice(asks);
+            arm.scratch_book.received_at_ms = recv_ms;
+            arm.scratch_book.source_ms = Some(recv_ms);
+
+            arm.mature_markouts(target_touch.mid(), now_ms);
+            arm.activate_arrivals(now_ms, bb, bsz, ba, asz);
+        }
+
+        // Check MTM equity & daily loss brake before sizing any new quotes.
+        self.check_equity_and_drawdown(utc_day);
+        let risk_scale = if self.halted {
+            0.0
+        } else {
+            self.daily_loss.risk_scale()
+        };
+        let session = classify_utc_session(now_ms);
+        let session_halted = self.halted;
+
+        let (placed, cancelled, kept, taker_exited, sess_blocked, resting_orders, arm_halted) = {
+            let arm = &mut self.arms[idx];
+            let sess_blocked = !arm.session_allows(session);
+            if sess_blocked {
+                arm.session_gated_ticks += 1;
+            }
+            let inv = InventoryState {
+                target_qty: arm.pos_qty,
+                external_net_qty: 0.0,
+                inventory_since_ms: arm.open_lots.front().map(|l| l.entry_ts_ms),
+                realized_pnl_usd: arm.realized_pnl_usd(),
+                unrealized_pnl_usd: arm.unrealized_pnl_usd(),
+            };
+            let actions = arm.engine.evaluate(
+                Some(&arm.scratch_book),
+                &arm.scratch_refs,
+                &arm.scratch_resting,
+                inv,
+                now_ms,
+            );
+
+            let mut placed = 0_usize;
+            let mut cancelled = 0_usize;
+            let mut kept = 0_usize;
+            let mut taker_exited = false;
+            let suppress_openings =
+                sess_blocked || session_halted || arm.halted || risk_scale <= 0.0;
+            let delay_ms = arm.cfg.strategy.submit_rtt_ms.max(0.0).round() as u64;
+            let tol_25 = arm.cfg.strategy.tick_size * 0.25;
+
+            for act in actions {
+                match act {
+                    MmAction::Cancel { client_id, .. } => {
+                        if let Some(pos) = arm
+                            .scratch_resting
+                            .iter()
+                            .position(|r| r.client_id == client_id)
+                        {
+                            arm.remove_resting_at(pos);
+                            arm.cancels += 1;
+                            cancelled += 1;
+                        }
+                    }
+                    MmAction::Keep {
+                        client_id, side, ..
+                    } => {
+                        if let Some(pos) = arm
+                            .scratch_resting
+                            .iter()
+                            .position(|r| r.client_id == client_id)
+                        {
+                            let qty = arm.scratch_resting[pos].qty;
+                            let meta = arm.resting_meta[pos];
+                            let is_pure_reduce = arm.is_pure_reducing_order(side, qty, meta);
+                            if suppress_openings && !is_pure_reduce {
+                                arm.remove_resting_at(pos);
+                                arm.cancels += 1;
+                                cancelled += 1;
+                            } else {
+                                arm.resting_meta[pos].reduce_only = is_pure_reduce;
+                                arm.queue_preserved += 1;
+                                kept += 1;
+                            }
+                        }
+                    }
+                    MmAction::PlaceAlo {
+                        side,
+                        price,
+                        qty,
+                        level_idx,
+                        reduce_only,
+                    } => {
+                        if !reduce_only && suppress_openings {
+                            continue;
+                        }
+                        if arm.scratch_resting.len() >= TRACK03_MAX_RESTING {
+                            continue;
+                        }
+                        if arm
+                            .scratch_resting
+                            .iter()
+                            .any(|r| r.side == side && r.level_idx == level_idx)
+                        {
+                            continue;
+                        }
+                        let final_qty = if !reduce_only && risk_scale < 1.0 {
+                            quantize_down(qty * risk_scale, arm.cfg.strategy.lot_size)
+                        } else {
+                            qty
+                        };
+                        if final_qty <= 0.0
+                            || (!reduce_only
+                                && final_qty * price < arm.cfg.strategy.min_notional_usd)
+                        {
+                            continue;
+                        }
+                        let crosses = match side {
+                            QuoteSide::Bid => price >= ba - 1e-12,
+                            QuoteSide::Ask => price <= bb + 1e-12,
+                        };
+                        if delay_ms == 0 && crosses {
+                            arm.alo_rejects += 1;
+                            arm.engine.on_alo_reject(side, now_ms);
+                            continue;
+                        }
+                        let (activated, queue_ahead) = if delay_ms == 0 {
+                            let q_ahead = match side {
+                                QuoteSide::Bid
+                                    if (price - bb).abs() <= tol_25 || price <= bb + tol_25 =>
+                                {
+                                    arm.cfg.queue_ahead_fraction * bsz
+                                }
+                                QuoteSide::Ask
+                                    if (price - ba).abs() <= tol_25 || price >= ba - tol_25 =>
+                                {
+                                    arm.cfg.queue_ahead_fraction * asz
+                                }
+                                _ => 0.0,
+                            };
+                            arm.engine.on_alo_accepted(side);
+                            (true, q_ahead)
+                        } else {
+                            (false, 0.0)
+                        };
+                        let slot_idx = arm.scratch_resting.len();
+                        arm.resting_seq = arm.resting_seq.saturating_add(1);
+                        let client_id = format!(
+                            "{}{}_{}",
+                            match side {
+                                QuoteSide::Bid => "b",
+                                QuoteSide::Ask => "a",
+                            },
+                            level_idx,
+                            arm.resting_seq
+                        );
+                        arm.scratch_resting.push(RestingQuote {
+                            client_id,
+                            side,
+                            price,
+                            qty: final_qty,
+                            level_idx,
+                            placed_at_ms: now_ms,
+                        });
+                        arm.resting_meta[slot_idx] = Track03OrderMeta {
+                            queue_ahead,
+                            active_at_ms: now_ms.saturating_add(delay_ms),
+                            activated,
+                            reduce_only,
+                        };
+                        arm.orders_placed += 1;
+                        placed += 1;
+                    }
+                    MmAction::ReduceOnlyIoc {
+                        side,
+                        limit_price,
+                        qty,
+                        ..
+                    } => {
+                        let (exec_px, crosses_limit) = match side {
+                            QuoteSide::Bid => (ba, ba <= limit_price + 1e-9),
+                            QuoteSide::Ask => (bb, bb >= limit_price - 1e-9),
+                        };
+                        let needed = match side {
+                            QuoteSide::Bid => (-arm.pos_qty).max(0.0).min(qty),
+                            QuoteSide::Ask => arm.pos_qty.max(0.0).min(qty),
+                        };
+                        if crosses_limit && needed > 1e-12 {
+                            arm.record_fill(
+                                now_ms,
+                                side,
+                                exec_px,
+                                needed,
+                                Track03FillRole::Taker,
+                                target_touch.mid(),
+                                false,
+                            );
+                            taker_exited = true;
+                        }
+                    }
+                    MmAction::HedgeIoc { .. } => {}
+                    MmAction::Halt { .. } => {
+                        arm.halted = true;
+                    }
+                }
+            }
+            (
+                placed,
+                cancelled,
+                kept,
+                taker_exited,
+                sess_blocked,
+                arm.scratch_resting.len(),
+                arm.halted || session_halted,
+            )
+        };
+
+        self.check_equity_and_drawdown(utc_day);
+        Ok(Some(Track03StepOutcome {
+            utc_session: session,
+            session_gated: sess_blocked,
+            halted: arm_halted,
+            resting_orders,
+            placed,
+            cancelled,
+            kept,
+            taker_exited,
+        }))
+    }
+
+    /// Process a public trade print using FIFO queue depletion and strict trade-through fill rules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_trade_print(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        price: f64,
+        size: f64,
+        is_buy_aggressor: bool,
+        recv_ms: u64,
+        utc_day: i32,
+    ) -> Result<bool> {
+        let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return Ok(false);
+        };
+        if !(price.is_finite() && price > 0.0 && size.is_finite() && size > 0.0) || recv_ms > now_ms
+        {
+            return Ok(false);
+        }
+        let session_halted = self.halted;
+        let filled_any = {
+            let arm = &mut self.arms[idx];
+            if now_ms - recv_ms > arm.cfg.strategy.max_book_age_ms
+                || arm
+                    .target_feed
+                    .last_now_ms
+                    .is_some_and(|prev| now_ms < prev)
+            {
+                return Ok(false);
+            }
+            let Some(touch) = arm.last_valid_target_touch else {
+                return Ok(false);
+            };
+            if now_ms.saturating_sub(touch.recv_ms) > arm.cfg.strategy.max_book_age_ms {
+                return Ok(false);
+            }
+            arm.activate_arrivals(now_ms, touch.bid, touch.bid_sz, touch.ask, touch.ask_sz);
+
+            let resting_side = if is_buy_aggressor {
+                QuoteSide::Ask
+            } else {
+                QuoteSide::Bid
+            };
+            let tol = arm.cfg.strategy.tick_size * 0.10;
+            let cur_mid = touch.mid();
+            let mut rem_print = size;
+            let mut filled_any = false;
+            let arm_halted = session_halted || arm.halted;
+
+            // Process best-level resting orders on `resting_side` in level_idx order.
+            for lvl in 0..arm.cfg.strategy.ladder_levels {
+                if rem_print <= 1e-12 {
+                    break;
+                }
+                let Some(pos) = arm
+                    .scratch_resting
+                    .iter()
+                    .position(|r| r.side == resting_side && r.level_idx == lvl)
+                else {
+                    continue;
+                };
+                if !arm.resting_meta[pos].activated {
+                    continue;
+                }
+                let ord_px = arm.scratch_resting[pos].price;
+                let ord_qty = arm.scratch_resting[pos].qty;
+                let ord_meta = arm.resting_meta[pos];
+                let is_pure_reduce = arm.is_pure_reducing_order(resting_side, ord_qty, ord_meta);
+                if arm_halted && !is_pure_reduce {
+                    continue;
+                }
+                let trades_through = match resting_side {
+                    QuoteSide::Ask => price > ord_px + tol,
+                    QuoteSide::Bid => price < ord_px - tol,
+                };
+                let at_touch = (price - ord_px).abs() <= tol;
+                let filled_qty = if trades_through {
+                    ord_qty.min(rem_print)
+                } else if at_touch {
+                    if rem_print > arm.resting_meta[pos].queue_ahead {
+                        let overflow = rem_print - arm.resting_meta[pos].queue_ahead;
+                        arm.resting_meta[pos].queue_ahead = 0.0;
+                        ord_qty.min(overflow)
+                    } else {
+                        arm.resting_meta[pos].queue_ahead -= rem_print;
+                        rem_print = 0.0;
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                if filled_qty > 1e-12 {
+                    arm.record_fill(
+                        now_ms,
+                        resting_side,
+                        ord_px,
+                        filled_qty,
+                        Track03FillRole::Maker,
+                        cur_mid,
+                        !is_pure_reduce,
+                    );
+                    filled_any = true;
+                    rem_print -= filled_qty;
+                    let left = arm.scratch_resting[pos].qty - filled_qty;
+                    if left <= 1e-12 {
+                        arm.remove_resting_at(pos);
+                    } else {
+                        arm.scratch_resting[pos].qty = left;
+                    }
+                }
+            }
+
+            let taker_side = if is_buy_aggressor {
+                QuoteSide::Bid
+            } else {
+                QuoteSide::Ask
+            };
+            arm.engine.on_trade_print(
+                FastTradePrint {
+                    taker_side,
+                    price,
+                    size,
+                    received_at_ms: recv_ms,
+                },
+                Some(&arm.scratch_book),
+            );
+            filled_any
+        };
+
+        self.check_equity_and_drawdown(utc_day);
+        Ok(filled_any)
+    }
+
+    /// Diagnostic fill probe for SHM streams lacking public trade prints.
+    ///
+    /// Triggers a synthetic strict trade-through only when the incoming target BBO
+    /// strictly crosses an active resting quote (`target.ask < bid` or `target.bid > ask`).
+    pub fn on_bbo_cross_diagnostic(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        target: Track03Touch,
+        utc_day: i32,
+    ) -> Result<bool> {
+        let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
+            return Ok(false);
+        };
+        if !target.valid()
+            || target.recv_ms > now_ms
+            || now_ms - target.recv_ms > self.arms[idx].cfg.strategy.max_book_age_ms
+            || self.arms[idx]
+                .target_feed
+                .last_recv_ms
+                .is_some_and(|prev| target.recv_ms < prev)
+        {
+            return Ok(false);
+        }
+        let Some(prev_touch) = self.arms[idx].last_valid_target_touch else {
+            return Ok(false);
+        };
+        let (has_cross_bid, has_cross_ask) = {
+            let arm = &self.arms[idx];
+            let bid_px = arm
+                .scratch_resting
+                .iter()
+                .enumerate()
+                .filter(|&(i, r)| r.side == QuoteSide::Bid && arm.resting_meta[i].activated)
+                .map(|(_, r)| r.price)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let ask_px = arm
+                .scratch_resting
+                .iter()
+                .enumerate()
+                .filter(|&(i, r)| r.side == QuoteSide::Ask && arm.resting_meta[i].activated)
+                .map(|(_, r)| r.price)
+                .fold(f64::INFINITY, f64::min);
+            (target.ask < bid_px, target.bid > ask_px)
+        };
+        let _ = prev_touch;
+        let mut bid_hit = false;
+        if has_cross_bid {
+            bid_hit = self.on_trade_print(
+                symbol_id,
+                now_ms,
+                target.ask,
+                target.ask_sz,
+                false,
+                target.recv_ms,
+                utc_day,
+            )?;
+        }
+        let mut ask_hit = false;
+        if has_cross_ask {
+            ask_hit = self.on_trade_print(
+                symbol_id,
+                now_ms,
+                target.bid,
+                target.bid_sz,
+                true,
+                target.recv_ms,
+                utc_day,
+            )?;
+        }
+        Ok(bid_hit || ask_hit)
+    }
+
+    pub fn report(&self) -> Track03ShadowReport {
+        let mut realized = 0.0;
+        let mut unrealized = 0.0;
+        let mut fees_usd = 0.0;
+        let mut spread_capture_usd = 0.0;
+        let mut holding_drift_usd = 0.0;
+        let mut passive_exit_pnl_usd = 0.0;
+        let mut taker_exit_slippage_usd = 0.0;
+        let mut closed_notional_usd = 0.0;
+        let mut maker_volume_usd = 0.0;
+        let mut taker_volume_usd = 0.0;
+        let mut mk1s_num = 0.0;
+        let mut mk1s_den = 0.0;
+        let mut weighted_net_cost_cycle_num = 0.0;
+        let mut maker_fills = 0_u64;
+        let mut taker_exits = 0_u64;
+        let mut cycles = 0_u64;
+        let mut orders_placed = 0_u64;
+        let mut cancels = 0_u64;
+        let mut queue_preserved = 0_u64;
+        let mut alo_rejects = 0_u64;
+        let mut session_gated_ticks = 0_u64;
+
+        let arms: Vec<Track03ArmReport> = self
+            .arms
+            .iter()
+            .map(|a| {
+                let r_pnl = a.realized_pnl_usd();
+                let u_pnl = a.unrealized_pnl_usd();
+                let (
+                    spread_capture_bps,
+                    holding_drift_bps,
+                    passive_exit_pnl_bps,
+                    taker_exit_slippage_bps,
+                    gross_ex_fee_bps,
+                    taker_exit_share_s,
+                    double_sided_usd_per_m,
+                ) = a.cost_decomposition();
+                let mark_mid = a.last_valid_target_touch.map_or(0.0, |t| t.mid());
+                let pos_notional = a.pos_qty * mark_mid;
+                let mk1s = if a.markout_1s_den_usd > 0.0 {
+                    Some(a.markout_1s_num_bps_usd / a.markout_1s_den_usd)
+                } else {
+                    None
+                };
+
+                realized += r_pnl;
+                unrealized += u_pnl;
+                fees_usd += a.fees_usd;
+                spread_capture_usd += a.spread_capture_usd;
+                holding_drift_usd += a.holding_drift_usd;
+                passive_exit_pnl_usd += a.passive_exit_pnl_usd;
+                taker_exit_slippage_usd += a.taker_exit_slippage_usd;
+                closed_notional_usd += a.closed_notional_usd;
+                maker_volume_usd += a.maker_volume_usd;
+                taker_volume_usd += a.taker_volume_usd;
+                mk1s_num += a.markout_1s_num_bps_usd;
+                mk1s_den += a.markout_1s_den_usd;
+                if a.closed_notional_usd > 0.0 {
+                    weighted_net_cost_cycle_num +=
+                        (double_sided_usd_per_m / 50.0) * a.closed_notional_usd;
+                }
+                maker_fills += a.maker_fills;
+                taker_exits += a.taker_exits;
+                cycles += a.cycles;
+                orders_placed += a.orders_placed;
+                cancels += a.cancels;
+                queue_preserved += a.queue_preserved;
+                alo_rejects += a.alo_rejects;
+                session_gated_ticks += a.session_gated_ticks;
+
+                Track03ArmReport {
+                    symbol: a.cfg.symbol.clone(),
+                    symbol_id: a.cfg.symbol_id,
+                    target_exchange_id: a.cfg.target_exchange_id,
+                    ref_exchange_ids: a.cfg.ref_exchange_ids.clone(),
+                    account_fee_status: a.cfg.account_fee_status.clone(),
+                    realized_pnl_usd: r_pnl,
+                    unrealized_pnl_usd: u_pnl,
+                    fees_usd: a.fees_usd,
+                    spread_capture_usd: a.spread_capture_usd,
+                    holding_drift_usd: a.holding_drift_usd,
+                    passive_exit_pnl_usd: a.passive_exit_pnl_usd,
+                    taker_exit_slippage_usd: a.taker_exit_slippage_usd,
+                    spread_capture_bps,
+                    holding_drift_bps,
+                    passive_exit_pnl_bps,
+                    taker_exit_slippage_bps,
+                    gross_ex_fee_bps,
+                    double_sided_usd_per_m,
+                    maker_volume_usd: a.maker_volume_usd,
+                    taker_volume_usd: a.taker_volume_usd,
+                    closed_notional_usd: a.closed_notional_usd,
+                    taker_exit_share_s,
+                    markout_1s_bps: mk1s,
+                    markout_1s_den_usd: a.markout_1s_den_usd,
+                    position_qty: a.pos_qty,
+                    position_notional_usd: pos_notional,
+                    fills: a.maker_fills + a.taker_exits,
+                    maker_fills: a.maker_fills,
+                    taker_exits: a.taker_exits,
+                    cycles: a.cycles,
+                    orders_placed: a.orders_placed,
+                    cancels: a.cancels,
+                    queue_preserved: a.queue_preserved,
+                    alo_rejects: a.alo_rejects,
+                    session_gated_ticks: a.session_gated_ticks,
+                    total_book_ticks: a.total_book_ticks,
+                    halted: self.halted || a.halted,
+                    target_feed: a.target_feed.report(),
+                    ref_feeds: a.ref_slots.iter().map(|s| s.feed.report()).collect(),
+                }
+            })
+            .collect();
+
+        let (
+            venue_feed_health,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+        ) = aggregate_venue_health(
+            arms.iter()
+                .flat_map(|a| std::iter::once(a.target_feed).chain(a.ref_feeds.iter().copied())),
+        );
+
+        let (
+            spread_capture_bps,
+            holding_drift_bps,
+            passive_exit_pnl_bps,
+            taker_exit_slippage_bps,
+            gross_ex_fee_bps,
+            taker_exit_share_s,
+            double_sided_usd_per_m,
+        ) = if closed_notional_usd > 0.0 {
+            let gross_usd = spread_capture_usd
+                + holding_drift_usd
+                + passive_exit_pnl_usd
+                + taker_exit_slippage_usd;
+            let net_cost_cycle_bp = weighted_net_cost_cycle_num / closed_notional_usd;
+            (
+                (spread_capture_usd / closed_notional_usd) * 1e4,
+                (holding_drift_usd / closed_notional_usd) * 1e4,
+                (passive_exit_pnl_usd / closed_notional_usd) * 1e4,
+                (taker_exit_slippage_usd / closed_notional_usd) * 1e4,
+                (gross_usd / closed_notional_usd) * 1e4,
+                (taker_volume_usd / closed_notional_usd).clamp(0.0, 1.0),
+                (net_cost_cycle_bp / 2.0) * 100.0,
+            )
+        } else {
+            let fallback_ds = if arms.len() == 1 {
+                arms[0].double_sided_usd_per_m
+            } else {
+                0.0
+            };
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, fallback_ds)
+        };
+
+        Track03ShadowReport {
+            track: "03_incentive_turnover",
+            fill_evidence_mode: self.fill_evidence_mode,
+            fill_evidence_note: self.fill_evidence_note(),
+            capital_usd: self.cfg.capital_usd,
+            equity_usd: self.cfg.capital_usd + realized + unrealized,
+            realized_pnl_usd: realized,
+            unrealized_pnl_usd: unrealized,
+            fees_usd,
+            spread_capture_bps,
+            holding_drift_bps,
+            passive_exit_pnl_bps,
+            taker_exit_slippage_bps,
+            gross_ex_fee_bps,
+            double_sided_usd_per_m,
+            maker_volume_usd,
+            taker_volume_usd,
+            closed_notional_usd,
+            taker_exit_share_s,
+            markout_1s_bps: (mk1s_den > 0.0).then_some(mk1s_num / mk1s_den),
+            max_drawdown_usd: self.max_drawdown_usd,
+            fills: maker_fills + taker_exits,
+            maker_fills,
+            taker_exits,
+            cycles,
+            orders_placed,
+            cancels,
+            queue_preserved,
+            alo_rejects,
+            session_gated_ticks,
+            risk_scale: if self.halted {
+                0.0
+            } else {
+                self.daily_loss.risk_scale()
+            },
+            halted: self.halted,
+            max_gap_ms,
+            stale_book_drops,
+            clock_regression_drops,
+            crossed_book_drops,
+            venue_feed_health,
+            arms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,6 +3396,7 @@ mod tests {
                 symbol: "ETH".to_string(),
                 symbol_id: 1002,
                 ref_exchange_id: 6,
+                confirm_ref_exchange_id: None,
                 tgt_exchange_id: 2,
                 clip_usd: 500.0,
                 max_l1_depth_fraction: 0.50,
@@ -2875,5 +4578,585 @@ mod tests {
         );
         assert_eq!(s.report().trades, 1);
         assert!(s.report().arms[0].open_side.is_none());
+    }
+
+    fn t3_cfg() -> Track03ShadowConfig {
+        Track03ShadowConfig {
+            capital_usd: 10_000.0,
+            daily_loss_limit_pct: 0.02,
+            daily_loss_state_path: None,
+            allowlisted_symbols: vec!["AAPL".to_string()],
+            arms: vec![Track03ArmShadowConfig {
+                symbol: "AAPL".to_string(),
+                symbol_id: 1006,
+                target_exchange_id: 2,
+                ref_exchange_ids: vec![7],
+                maker_fee_bps: 0.0,
+                taker_fee_bps: 0.0,
+                rebate_bps: 0.0,
+                queue_ahead_fraction: 0.5,
+                allowed_utc_sessions: Some(vec![
+                    UtcSession::OvernightAsia,
+                    UtcSession::UsExtended,
+                    UtcSession::Weekend,
+                ]),
+                account_fee_status: "public_tier0_unverified".to_string(),
+                strategy: QueuePriorityMmConfig {
+                    tick_size: 0.01,
+                    lot_size: 0.01,
+                    min_notional_usd: 10.0,
+                    maker_fee_bps: 0.0,
+                    quote_notional_usd: 200.0,
+                    max_position_notional_usd: 400.0,
+                    ladder_levels: 1,
+                    min_penny_spread_ticks: 99,
+                    min_entry_edge_bps: 0.10,
+                    lead_cancel_threshold_bps: 1.50,
+                    max_queue_keep_ticks: 3,
+                    sweep_print_pull_ratio: 0.75,
+                    sweep_cooldown_ms: 1_200,
+                    submit_rtt_ms: 0.0,
+                    as_inventory_skew_gamma: 2.0,
+                    vol_spread_mult: 0.5,
+                    directional_markout_skew_mult: 1.0,
+                    quiet_regime_min_spread_to_vol: 0.80,
+                    quiet_regime_max_entry_vol_bps: Some(1.2),
+                    max_book_age_ms: 5_000,
+                    max_session_loss_usd: 50.0,
+                    max_inventory_hold_ms: 15_000,
+                    require_fresh_reference: false,
+                    ..QueuePriorityMmConfig::default()
+                },
+            }],
+        }
+    }
+
+    fn t3_touch(bid: f64, ask: f64, sz: f64, recv_ms: u64) -> Track03Touch {
+        Track03Touch {
+            bid,
+            ask,
+            bid_sz: sz,
+            ask_sz: sz,
+            recv_ms,
+        }
+    }
+
+    #[test]
+    fn track01_confirm_leader_wiring_enforces_consensus_and_records_health() {
+        let mut cfg = t1_cfg();
+        cfg.arms[0].confirm_ref_exchange_id = Some(8);
+        cfg.arms[0].strategy.require_dual_leader_confirm = true;
+        let mut s = Track01ShadowSession::new(cfg, utc_day_from_ms(10_000)).unwrap();
+        assert_eq!(s.arm_confirm_exchange_id(1002), Some(8));
+
+        let mut t = 10_000_u64;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair_with_confirm(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    Some(ll_touch(99.99, 100.01, t)),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+
+        // Disagreeing confirm leader suppresses entry -> Idle.
+        let disagree = s
+            .on_bbo_pair_with_confirm(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                Some(ll_touch(99.95, 99.97, t)),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap();
+        assert_eq!(disagree, Some(LeadLagAction::Idle));
+        assert_eq!(s.report().trades, 0);
+
+        // Stale confirm leader (advancing now_ms past max_ref_age_ms while confirm recv_ms stays frozen)
+        // suppresses entry and records stale_book_drops = 1 on confirm_ref_feed.
+        let stale_now = t + 6_000;
+        let stale_confirm = s
+            .on_bbo_pair_with_confirm(
+                1002,
+                stale_now,
+                ll_touch(100.09, 100.11, stale_now),
+                Some(ll_touch(100.09, 100.11, t)),
+                ll_touch(99.99, 100.01, stale_now),
+                10.0,
+                10.0,
+                utc_day_from_ms(stale_now),
+            )
+            .unwrap();
+        assert_eq!(stale_confirm, Some(LeadLagAction::Idle));
+
+        // Re-warm primary & target gently at 100.0, then fresh agreeing confirm leader enters Long.
+        t = stale_now + 100;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair_with_confirm(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    Some(ll_touch(99.99, 100.01, t)),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        let agree = s
+            .on_bbo_pair_with_confirm(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                Some(ll_touch(100.03, 100.05, t)),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap();
+        assert!(matches!(
+            agree,
+            Some(LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            })
+        ));
+        let rep = s.report();
+        assert_eq!(rep.arms[0].confirm_ref_exchange_id, Some(8));
+        let cfeed = rep.arms[0]
+            .confirm_ref_feed
+            .expect("confirm_ref_feed should be reported");
+        assert_eq!(cfeed.exchange_id, 8);
+        assert_eq!(cfeed.stale_book_drops, 1);
+        assert_eq!(rep.venue_feed_health.len(), 3);
+    }
+
+    #[test]
+    fn track02_l1_wiring_gates_thin_hedge_and_preserves_reduce_only() {
+        let mut cfg = t2_cfg();
+        cfg.pairs[0].strategy.e0_bps = 2.0;
+        cfg.pairs[0].strategy.min_hedge_l1_notional_usd = 1_000.0;
+        let (mut s, mut t, _) = warm_track02_session(cfg);
+
+        // Legacy on_pair_books without L1 sizes fails closed on opening sides when min_hedge_l1_notional_usd > 0.
+        t += 50;
+        s.on_reference_mid(1002, t, 100.0);
+        let q_no_l1 = s
+            .on_pair_books(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(q_no_l1.bid, None);
+        assert_eq!(q_no_l1.ask, None);
+
+        // With hedge L1 sizes: bid thin ($500 < $1000), ask deep ($2000 >= $1000).
+        // Opening bid blocked; opening ask allowed.
+        t += 50;
+        s.on_reference_mid(1002, t, 100.0);
+        let q_l1 = s
+            .on_pair_books_with_l1(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t),
+                Some((5.0, 20.0)),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(q_l1.bid, None);
+        let ask_px = q_l1.ask.expect("deep hedge ask should allow maker ask");
+
+        // Fill maker ask to build short inventory (-1 clip).
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                ask_px + 0.01,
+                10.0,
+                true,
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        assert!(s.report().pairs[0].inventory_clips < 0.0);
+
+        // Now short: bid is inventory-reducing so it MUST stay active despite thin hedge bid!
+        t += 50;
+        s.on_reference_mid(1002, t, 100.0);
+        let q_reduce = s
+            .on_pair_books_with_l1(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t),
+                Some((5.0, 20.0)),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            q_reduce.bid.is_some(),
+            "reducing bid must stay active even with thin hedge bid L1"
+        );
+    }
+
+    #[test]
+    fn track03_utc_session_gating_cancels_openings_in_rth_and_keeps_reducing_exits() {
+        // 2026-11-25 is a Wednesday:
+        //   00:00 UTC = 1_795_564_800_000 ms (overnight_asia)
+        //   11:00 UTC = +39_600_000 ms (us_extended)
+        //   13:30 UTC = +48_600_000 ms (us_rth)
+        // 2026-11-28 is a Saturday: +3 days = 1_795_824_000_000 ms (weekend)
+        let wed_00_00 = 1_795_564_800_000_u64;
+        assert_eq!(classify_utc_session(wed_00_00), UtcSession::OvernightAsia);
+        assert_eq!(
+            classify_utc_session(wed_00_00 + 11 * 3_600_000),
+            UtcSession::UsExtended
+        );
+        assert_eq!(
+            classify_utc_session(wed_00_00 + 13 * 3_600_000 + 30 * 60_000),
+            UtcSession::UsRth
+        );
+        assert_eq!(
+            classify_utc_session(wed_00_00 + 3 * 86_400_000 + 15 * 3_600_000),
+            UtcSession::Weekend
+        );
+
+        let mut s = Track03ShadowSession::new(t3_cfg(), utc_day_from_ms(wed_00_00)).unwrap();
+        // US Extended (13:29:55 UTC, 5s before US RTH open): places both Bid & Ask.
+        let t_ext = wed_00_00 + 13 * 3_600_000 + 29 * 60_000 + 55_000;
+        let out_ext = s
+            .on_target_bbo(
+                1006,
+                t_ext,
+                t3_touch(99.98, 100.02, 10.0, t_ext),
+                utc_day_from_ms(t_ext),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_ext.utc_session, UtcSession::UsExtended);
+        assert!(!out_ext.session_gated);
+        assert_eq!(out_ext.resting_orders, 2);
+
+        // Fill our resting Bid via strict trade-through to become LONG 2.0 shares ($200).
+        assert!(
+            s.on_trade_print(
+                1006,
+                t_ext + 50,
+                99.97,
+                5.0,
+                false,
+                t_ext + 50,
+                utc_day_from_ms(t_ext),
+            )
+            .unwrap()
+        );
+        assert!(s.report().arms[0].position_qty > 1.5);
+
+        // Transition into US RTH 6s later (13:30:01 UTC, within max_inventory_hold_ms=15_000):
+        // Opening Bid MUST be suppressed/cancelled, while reducing Ask MUST stay resting!
+        let t_rth = t_ext + 6_000;
+        let out_rth = s
+            .on_target_bbo(
+                1006,
+                t_rth,
+                t3_touch(99.98, 100.02, 10.0, t_rth),
+                utc_day_from_ms(t_rth),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_rth.utc_session, UtcSession::UsRth);
+        assert!(out_rth.session_gated);
+        assert_eq!(out_rth.resting_orders, 1);
+        assert_eq!(s.arms[0].scratch_resting[0].side, QuoteSide::Ask);
+        assert!(s.arms[0].resting_meta[0].reduce_only);
+        assert_eq!(s.report().session_gated_ticks, 1);
+
+        // Weekend session re-enables quoting cleanly.
+        let t_wknd = wed_00_00 + 3 * 86_400_000 + 15 * 3_600_000;
+        let out_wknd = s
+            .on_target_bbo(
+                1006,
+                t_wknd,
+                t3_touch(99.98, 100.02, 10.0, t_wknd),
+                utc_day_from_ms(t_wknd),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_wknd.utc_session, UtcSession::Weekend);
+        assert!(!out_wknd.session_gated);
+    }
+
+    #[test]
+    fn track03_volatile_regime_cancels_resting_openings_and_preserves_reducing_exits() {
+        let mut s =
+            Track03ShadowSession::new(t3_cfg(), utc_day_from_ms(1_795_564_800_000)).unwrap();
+        let mut t = 1_795_564_800_000_u64; // Wednesday 00:00 UTC (overnight_asia)
+        let day = utc_day_from_ms(t);
+
+        // Seed calm book (L1 size 20.0 -> queue_ahead=10.0) -> places Bid & Ask.
+        let out1 = s
+            .on_target_bbo(1006, t, t3_touch(99.98, 100.02, 20.0, t), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out1.resting_orders, 2);
+
+        // Fill Bid at touch via queue overflow (12.0 < 0.75 * 20.0 so sweep cooldown stays off).
+        t += 100;
+        assert!(
+            s.on_trade_print(1006, t, 99.98, 12.0, false, t, day)
+                .unwrap()
+        );
+        // Re-evaluate at calm price -> now Bid (opening) and Ask (reducing) both rest.
+        t += 100;
+        let out2 = s
+            .on_target_bbo(1006, t, t3_touch(99.98, 100.02, 20.0, t), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out2.resting_orders, 2);
+
+        // Spike volatility (+20 bps in 500ms -> sigma_1s > 1.2 bps/sqrt(s)):
+        // Resting opening Bid MUST cancel ("quiet_regime_gate"), while reducing Ask MUST stay!
+        t += 500;
+        let out_storm = s
+            .on_target_bbo(1006, t, t3_touch(100.18, 100.22, 20.0, t), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_storm.resting_orders, 1);
+        assert_eq!(s.arms[0].scratch_resting[0].side, QuoteSide::Ask);
+        assert!(s.report().cancels >= 1);
+    }
+
+    #[test]
+    fn track03_daily_loss_guard_halts_openings_while_preserving_reducing_exit_and_isolation() {
+        let mut cfg3 = t3_cfg();
+        cfg3.capital_usd = 1_000.0;
+        cfg3.daily_loss_limit_pct = 0.02; // $20 budget
+        cfg3.arms[0].strategy.quote_notional_usd = 400.0;
+        cfg3.arms[0].strategy.max_position_notional_usd = 400.0;
+        cfg3.arms[0].strategy.max_session_loss_usd = 100.0; // isolate DailyLossGuard above engine loss breaker
+        cfg3.arms[0].strategy.quiet_regime_max_entry_vol_bps = None;
+        cfg3.arms[0].strategy.quiet_regime_min_spread_to_vol = 0.0;
+
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s3 = Track03ShadowSession::new(cfg3, day).unwrap();
+        let mut s1 = Track01ShadowSession::new(t1_cfg(), day).unwrap();
+
+        let out0 = s3
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out0.resting_orders, 2);
+
+        // Fill Bid for $400 (~4 shares at 99.98).
+        assert!(
+            s3.on_trade_print(1006, t0 + 50, 99.97, 20.0, false, t0 + 50, day)
+                .unwrap()
+        );
+
+        // Price plunges 7% -> MTM loss ~$28 > $20 DailyLossGuard budget -> Track 03 halts!
+        let t1 = t0 + 1_000;
+        let out_drop = s3
+            .on_target_bbo(1006, t1, t3_touch(92.98, 93.02, 20.0, t1), day)
+            .unwrap()
+            .unwrap();
+        assert!(s3.is_halted());
+        assert!(out_drop.halted);
+        // Reducing Ask MUST still be resting while opening Bid is suppressed!
+        assert_eq!(out_drop.resting_orders, 1);
+        assert_eq!(s3.arms[0].scratch_resting[0].side, QuoteSide::Ask);
+        assert!(s3.arms[0].resting_meta[0].reduce_only);
+
+        // Track 01 stays completely unhalted (non-cross-subsidy isolation).
+        assert!(!s1.is_halted());
+        assert!((s1.report().risk_scale - 1.0).abs() < 1e-12);
+        let _ = s1
+            .on_bbo_pair(
+                1002,
+                t1,
+                ll_touch(99.99, 100.01, t1),
+                ll_touch(99.99, 100.01, t1),
+                10.0,
+                10.0,
+                day,
+            )
+            .unwrap();
+
+        // Exit print closes position via the preserved reduce-only Ask; subsequent ticks stay flat.
+        assert!(
+            s3.on_trade_print(1006, t1 + 50, 93.05, 20.0, true, t1 + 50, day)
+                .unwrap()
+        );
+        let out_flat = s3
+            .on_target_bbo(1006, t1 + 200, t3_touch(92.98, 93.02, 20.0, t1 + 200), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_flat.resting_orders, 0);
+        assert_eq!(s3.report().cycles, 1);
+    }
+
+    #[test]
+    fn track03_feed_tracker_rejects_stale_regressed_crossed_and_dedups_refs() {
+        let mut s =
+            Track03ShadowSession::new(t3_cfg(), utc_day_from_ms(1_795_564_800_000)).unwrap();
+        let t = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t);
+
+        assert!(s.on_reference_touch(1006, 7, t, t3_touch(99.99, 100.01, 10.0, t)));
+        // Identical SHM snapshot deduplicates cleanly.
+        assert!(!s.on_reference_touch(1006, 7, t + 50, t3_touch(99.99, 100.01, 10.0, t)));
+        // Stale & clock-regressed ref rejected.
+        assert!(!s.on_reference_touch(1006, 7, t + 6_000, t3_touch(99.99, 100.01, 10.0, t)));
+        assert!(!s.on_reference_touch(1006, 7, t + 6_100, t3_touch(99.99, 100.01, 10.0, t - 10)));
+
+        // Healthy target quote places resting orders.
+        assert_eq!(
+            s.on_target_bbo(1006, t + 100, t3_touch(99.98, 100.02, 10.0, t + 100), day)
+                .unwrap()
+                .unwrap()
+                .resting_orders,
+            2
+        );
+        // Crossed target clears resting quotes fail-closed and increments crossed_book_drops.
+        assert!(
+            s.on_target_bbo(1006, t + 200, t3_touch(100.05, 100.01, 10.0, t + 200), day)
+                .unwrap()
+                .is_none()
+        );
+        assert!(s.arms[0].scratch_resting.is_empty());
+
+        // Clock-regressed target & stale target increment drops cleanly.
+        assert!(
+            s.on_target_bbo(1006, t + 300, t3_touch(99.98, 100.02, 10.0, t + 50), day)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.on_target_bbo(1006, t + 6_500, t3_touch(99.98, 100.02, 10.0, t + 100), day)
+                .unwrap()
+                .is_none()
+        );
+
+        let rep = s.report();
+        assert_eq!(rep.arms[0].ref_feeds[0].stale_book_drops, 1);
+        assert_eq!(rep.arms[0].ref_feeds[0].clock_regression_drops, 1);
+        assert_eq!(rep.arms[0].target_feed.crossed_book_drops, 1);
+        assert_eq!(rep.arms[0].target_feed.clock_regression_drops, 1);
+        assert_eq!(rep.arms[0].target_feed.stale_book_drops, 1);
+        assert_eq!(rep.venue_feed_health.len(), 2);
+    }
+
+    #[test]
+    fn track03_rebate_zero_fifo_queue_markout_and_exact_cost_decomposition() {
+        let mut cfg = t3_cfg();
+        cfg.arms[0].maker_fee_bps = 0.0;
+        cfg.arms[0].taker_fee_bps = 2.0;
+        cfg.arms[0].rebate_bps = 0.0;
+        cfg.arms[0].queue_ahead_fraction = 0.5;
+        cfg.arms[0].strategy.quote_notional_usd = 200.5;
+        cfg.arms[0].strategy.as_inventory_skew_gamma = 0.0;
+        cfg.arms[0].strategy.vol_spread_mult = 0.0;
+        cfg.arms[0].strategy.directional_markout_skew_mult = 0.0;
+        cfg.arms[0].strategy.quiet_regime_min_spread_to_vol = 0.0;
+        cfg.arms[0].strategy.quiet_regime_max_entry_vol_bps = None;
+        cfg.arms[0].strategy.max_inventory_hold_ms = 5_000;
+
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        // Book 99.98 x 10 / 100.02 x 10 -> Bid @ 99.98 with queue_ahead = 0.5 * 10 = 5.0.
+        let out = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 10.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.resting_orders, 2);
+
+        // At-touch sell print of 3.0 only depletes queue_ahead (5.0 -> 2.0), zero fill!
+        assert!(
+            !s.on_trade_print(1006, t0 + 100, 99.98, 3.0, false, t0 + 100, day)
+                .unwrap()
+        );
+        assert_eq!(s.report().fills, 0);
+
+        // Next at-touch sell print of 4.0 overflows queue_ahead (2.0) -> fills 2.0 @ 99.98 (~$199.96)!
+        assert!(
+            s.on_trade_print(1006, t0 + 200, 99.98, 4.0, false, t0 + 200, day)
+                .unwrap()
+        );
+        assert_eq!(s.report().maker_fills, 1);
+
+        // 1.1s later, mid rises to 100.04 (100.02 / 100.06) -> matures 1s markout (+6.0012 bps),
+        // and passive Ask at 100.02 (from prior tick) or new Ask gets lifted by strict trade-through!
+        let t1 = t0 + 1_300;
+        let _ = s
+            .on_target_bbo(1006, t1, t3_touch(100.02, 100.06, 10.0, t1), day)
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t1 + 50, 100.07, 5.0, true, t1 + 50, day)
+                .unwrap()
+        );
+        let rep1 = s.report();
+        assert_eq!(rep1.maker_fills, 2);
+        assert_eq!(rep1.taker_exits, 0);
+        assert_eq!(rep1.cycles, 1);
+        assert!((rep1.arms[0].position_qty).abs() < 1e-12);
+        assert_eq!(rep1.fees_usd, 0.0); // maker_fee_bps = 0.0, rebate_bps = 0.0
+        assert!(rep1.markout_1s_bps.unwrap() > 5.0);
+        let sum_bps = rep1.spread_capture_bps
+            + rep1.holding_drift_bps
+            + rep1.passive_exit_pnl_bps
+            + rep1.taker_exit_slippage_bps;
+        assert!((sum_bps - rep1.gross_ex_fee_bps).abs() < 1e-9);
+        assert!(
+            (rep1.double_sided_usd_per_m - (-rep1.gross_ex_fee_bps / 2.0 * 100.0)).abs() < 1e-6
+        );
+
+        // Cycle 2: enter Long @ 100.02, hold past max_inventory_hold_ms (5000ms) -> ReduceOnlyIoc taker exit!
+        assert!(
+            s.on_trade_print(1006, t1 + 100, 100.01, 5.0, false, t1 + 100, day)
+                .unwrap()
+        );
+        let t2 = t1 + 5_200;
+        let out_ioc = s
+            .on_target_bbo(1006, t2, t3_touch(100.02, 100.06, 10.0, t2), day)
+            .unwrap()
+            .unwrap();
+        assert!(out_ioc.taker_exited);
+        let rep2 = s.report();
+        assert_eq!(rep2.taker_exits, 1);
+        assert!(rep2.fees_usd > 0.0);
+        assert!(rep2.taker_exit_share_s > 0.0);
+        assert!(rep2.taker_exit_slippage_bps < 0.0);
+        let sum2_bps = rep2.spread_capture_bps
+            + rep2.holding_drift_bps
+            + rep2.passive_exit_pnl_bps
+            + rep2.taker_exit_slippage_bps;
+        assert!((sum2_bps - rep2.gross_ex_fee_bps).abs() < 1e-9);
+        let expected_fee_cycle = 2.0 * rep2.taker_exit_share_s; // eff_maker=0, taker=2.0
+        let expected_ds = ((expected_fee_cycle - rep2.gross_ex_fee_bps) / 2.0) * 100.0;
+        assert!((rep2.double_sided_usd_per_m - expected_ds).abs() < 1e-6);
     }
 }
