@@ -912,14 +912,27 @@ def _build_rust_toml(cfg: ParityConfig) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _latest_rust_shadow_source_mtime() -> float:
+    src_paths = (
+        REPO_ROOT / "Cargo.toml",
+        REPO_ROOT / "src" / "strategy" / "track_shadow.rs",
+        REPO_ROOT / "src" / "bin" / "track01_track02_shadow.rs",
+    )
+    return max((p.stat().st_mtime for p in src_paths if p.exists()), default=0.0)
+
+
 def _resolve_rust_binary(explicit_bin: Path | None = None) -> Path:
     if explicit_bin is not None:
         if explicit_bin.is_file():
             return explicit_bin
         raise FileNotFoundError(f"Rust binary not found at {explicit_bin}")
-    for cand in DEFAULT_RUST_BIN_CANDIDATES:
-        if cand.is_file():
-            return cand
+    src_mtime = _latest_rust_shadow_source_mtime()
+    fresh = [
+        cand for cand in DEFAULT_RUST_BIN_CANDIDATES
+        if cand.is_file() and cand.stat().st_mtime >= src_mtime
+    ]
+    if fresh:
+        return max(fresh, key=lambda p: p.stat().st_mtime)
     proc = subprocess.run(
         ["cargo", "build", "--locked", "--bin", "track01_track02_shadow"],
         cwd=REPO_ROOT,
@@ -929,6 +942,9 @@ def _resolve_rust_binary(explicit_bin: Path | None = None) -> Path:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"cargo build failed: {proc.stderr or proc.stdout}")
+    debug_bin = DEFAULT_RUST_BIN_CANDIDATES[0]
+    if debug_bin.is_file():
+        return debug_bin
     for cand in DEFAULT_RUST_BIN_CANDIDATES:
         if cand.is_file():
             return cand
