@@ -2166,6 +2166,10 @@ pub struct Track03ShadowConfig {
     pub arms: Vec<Track03ArmShadowConfig>,
     #[serde(default)]
     pub defense: Option<DefenseFsmConfig>,
+    #[serde(default)]
+    pub declared_end_ms: Option<u64>,
+    #[serde(default)]
+    pub terminal_drain_ms: Option<u64>,
 }
 
 impl Default for Track03ShadowConfig {
@@ -2177,6 +2181,8 @@ impl Default for Track03ShadowConfig {
             allowlisted_symbols: Vec::new(),
             arms: Vec::new(),
             defense: None,
+            declared_end_ms: None,
+            terminal_drain_ms: None,
         }
     }
 }
@@ -2344,6 +2350,8 @@ struct Track03ArmRuntime {
     engine: QueuePriorityMmEngine,
     target_feed: VenueFeedTracker,
     last_valid_target_touch: Option<Track03Touch>,
+    rem_bid_sz: f64,
+    rem_ask_sz: f64,
     ref_slots: Vec<Track03RefSlot>,
     scratch_book: VenueBookUpdate,
     scratch_refs: Vec<ReferenceBookUpdate>,
@@ -2368,6 +2376,7 @@ struct Track03ArmRuntime {
     maker_fills: u64,
     taker_exits: u64,
     depth_clipped_exits: u64,
+    stale_exit_blocks: u64,
     cycles: u64,
     orders_placed: u64,
     cancels: u64,
@@ -2664,9 +2673,9 @@ impl Track03ArmRuntime {
         if !touch.valid() {
             return false;
         }
-        let (exec_px, opposite_l1_sz, crosses_limit) = match side {
-            QuoteSide::Bid => (touch.ask, touch.ask_sz, touch.ask <= limit_price + 1e-9),
-            QuoteSide::Ask => (touch.bid, touch.bid_sz, touch.bid >= limit_price - 1e-9),
+        let (exec_px, rem_avail, crosses_limit) = match side {
+            QuoteSide::Bid => (touch.ask, self.rem_ask_sz, touch.ask <= limit_price + 1e-9),
+            QuoteSide::Ask => (touch.bid, self.rem_bid_sz, touch.bid >= limit_price - 1e-9),
         };
         let needed = match side {
             QuoteSide::Bid => (-self.pos_qty).max(0.0).min(requested_qty),
@@ -2675,12 +2684,16 @@ impl Track03ArmRuntime {
         if !(needed > 1e-12 && crosses_limit) {
             return false;
         }
-        let max_fill_qty = (opposite_l1_sz * self.cfg.max_l1_depth_fraction).max(0.0);
+        let max_fill_qty = rem_avail.max(0.0);
         let exec_qty = needed.min(max_fill_qty);
         if exec_qty + 1e-12 < needed {
             self.depth_clipped_exits += 1;
         }
         if exec_qty > 1e-12 {
+            match side {
+                QuoteSide::Bid => self.rem_ask_sz = (self.rem_ask_sz - exec_qty).max(0.0),
+                QuoteSide::Ask => self.rem_bid_sz = (self.rem_bid_sz - exec_qty).max(0.0),
+            }
             self.record_fill(
                 now_ms,
                 side,
@@ -2696,7 +2709,45 @@ impl Track03ArmRuntime {
         }
     }
 
-    fn process_pending_ioc_exits(&mut self, now_ms: u64, touch: Track03Touch) -> bool {
+    fn queue_or_exec_ioc_exit(
+        &mut self,
+        now_ms: u64,
+        side: QuoteSide,
+        limit_price: f64,
+        qty: f64,
+        touch: Track03Touch,
+    ) -> bool {
+        if self.cfg.ioc_exit_delay_ms == 0 {
+            return self.execute_ioc_exit(now_ms, side, limit_price, qty, touch);
+        }
+        let desired = match side {
+            QuoteSide::Bid => (-self.pos_qty).max(0.0).min(qty),
+            QuoteSide::Ask => self.pos_qty.max(0.0).min(qty),
+        };
+        let already_pending: f64 = self
+            .pending_ioc_exits
+            .iter()
+            .filter(|p| p.side == side)
+            .map(|p| p.qty)
+            .sum();
+        let needed = desired - already_pending;
+        if needed > 1e-12 && self.pending_ioc_exits.len() < TRACK03_MAX_PENDING_IOC_EXITS {
+            self.pending_ioc_exits.push_back(Track03PendingIocExit {
+                exec_at_ms: now_ms.saturating_add(self.cfg.ioc_exit_delay_ms),
+                side,
+                limit_price,
+                qty: needed,
+            });
+        }
+        false
+    }
+
+    fn process_pending_ioc_exits(
+        &mut self,
+        now_ms: u64,
+        prev_touch: Option<Track03Touch>,
+        book_fresh: bool,
+    ) -> bool {
         let mut exited = false;
         let mut rem = self.pending_ioc_exits.len();
         while rem > 0 {
@@ -2708,6 +2759,18 @@ impl Track03ArmRuntime {
                 self.pending_ioc_exits.push_back(p);
                 continue;
             }
+            let Some(touch) = prev_touch.filter(|_| book_fresh) else {
+                self.stale_exit_blocks += 1;
+                if self.pending_ioc_exits.len() < TRACK03_MAX_PENDING_IOC_EXITS {
+                    self.pending_ioc_exits.push_back(Track03PendingIocExit {
+                        exec_at_ms: now_ms.saturating_add(self.cfg.ioc_exit_delay_ms),
+                        side: p.side,
+                        limit_price: p.limit_price,
+                        qty: p.qty,
+                    });
+                }
+                continue;
+            };
             if self.execute_ioc_exit(now_ms, p.side, p.limit_price, p.qty, touch) {
                 exited = true;
             }
@@ -2750,6 +2813,7 @@ pub struct Track03ArmReport {
     pub maker_fills: u64,
     pub taker_exits: u64,
     pub depth_clipped_exits: u64,
+    pub stale_exit_blocks: u64,
     pub cycles: u64,
     pub orders_placed: u64,
     pub cancels: u64,
@@ -2789,6 +2853,7 @@ pub struct Track03ShadowReport {
     pub maker_fills: u64,
     pub taker_exits: u64,
     pub depth_clipped_exits: u64,
+    pub stale_exit_blocks: u64,
     pub terminal_residual_notional_usd: f64,
     pub cycles: u64,
     pub orders_placed: u64,
@@ -2855,6 +2920,8 @@ impl Track03ShadowSession {
                 engine,
                 target_feed: VenueFeedTracker::new(arm_cfg.target_exchange_id),
                 last_valid_target_touch: None,
+                rem_bid_sz: 0.0,
+                rem_ask_sz: 0.0,
                 ref_slots,
                 scratch_book: VenueBookUpdate {
                     bids: Vec::with_capacity(8),
@@ -2884,6 +2951,7 @@ impl Track03ShadowSession {
                 maker_fills: 0,
                 taker_exits: 0,
                 depth_clipped_exits: 0,
+                stale_exit_blocks: 0,
                 cycles: 0,
                 orders_placed: 0,
                 cancels: 0,
@@ -2922,6 +2990,17 @@ impl Track03ShadowSession {
 
     pub fn config(&self) -> &Track03ShadowConfig {
         &self.cfg
+    }
+
+    fn past_declared_end(&self, now_ms: u64) -> bool {
+        self.cfg.declared_end_ms.is_some_and(|end| now_ms > end)
+    }
+
+    fn in_terminal_drain(&self, now_ms: u64) -> bool {
+        matches!(
+            (self.cfg.declared_end_ms, self.cfg.terminal_drain_ms),
+            (Some(end_ms), Some(drain_ms)) if drain_ms > 0 && now_ms >= end_ms.saturating_sub(drain_ms)
+        )
     }
 
     pub fn is_halted(&self) -> bool {
@@ -3005,6 +3084,9 @@ impl Track03ShadowSession {
         now_ms: u64,
         ref_touch: Track03Touch,
     ) -> bool {
+        if self.past_declared_end(now_ms) {
+            return false;
+        }
         let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return false;
         };
@@ -3058,12 +3140,26 @@ impl Track03ShadowSession {
         target: Track03Touch,
         utc_day: i32,
     ) -> Result<Option<Track03StepOutcome>> {
+        if self.past_declared_end(now_ms) {
+            return Ok(None);
+        }
         if !target.valid() {
             let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
                 return Ok(None);
             };
-            self.arms[idx].target_feed.record_crossed_drop();
-            self.arms[idx].clear_all_resting();
+            {
+                let arm = &mut self.arms[idx];
+                arm.target_feed.record_crossed_drop();
+                arm.clear_all_resting();
+                if arm
+                    .target_feed
+                    .last_now_ms
+                    .is_none_or(|prev| now_ms >= prev)
+                {
+                    let prev_touch = arm.last_valid_target_touch;
+                    let _ = arm.process_pending_ioc_exits(now_ms, prev_touch, false);
+                }
+            }
             self.check_equity_and_drawdown(utc_day);
             return Ok(None);
         }
@@ -3082,6 +3178,9 @@ impl Track03ShadowSession {
         recv_ms: u64,
         utc_day: i32,
     ) -> Result<Option<Track03StepOutcome>> {
+        if self.past_declared_end(now_ms) {
+            return Ok(None);
+        }
         let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return Ok(None);
         };
@@ -3092,8 +3191,19 @@ impl Track03ShadowSession {
                     .all(|(p, s)| p.is_finite() && s.is_finite() && *p > 0.0 && *s > 0.0)
         };
         if !valid_levels(bids) || !valid_levels(asks) {
-            self.arms[idx].target_feed.record_crossed_drop();
-            self.arms[idx].clear_all_resting();
+            {
+                let arm = &mut self.arms[idx];
+                arm.target_feed.record_crossed_drop();
+                arm.clear_all_resting();
+                if arm
+                    .target_feed
+                    .last_now_ms
+                    .is_none_or(|prev| now_ms >= prev)
+                {
+                    let prev_touch = arm.last_valid_target_touch;
+                    let _ = arm.process_pending_ioc_exits(now_ms, prev_touch, false);
+                }
+            }
             self.check_equity_and_drawdown(utc_day);
             return Ok(None);
         }
@@ -3107,7 +3217,14 @@ impl Track03ShadowSession {
                 .observe_bbo(now_ms, bb, ba, recv_ms, max_book_age_ms)
         };
         if obs != FeedObservation::Fresh {
-            self.arms[idx].clear_all_resting();
+            {
+                let arm = &mut self.arms[idx];
+                arm.clear_all_resting();
+                if obs != FeedObservation::ClockRegressed {
+                    let prev_touch = arm.last_valid_target_touch;
+                    let _ = arm.process_pending_ioc_exits(now_ms, prev_touch, false);
+                }
+            }
             self.check_equity_and_drawdown(utc_day);
             let dl_util = self.daily_loss.drawdown_budget_ratio(self.equity_usd());
             if let Some(ref mut fsm) = self.defense {
@@ -3144,9 +3261,20 @@ impl Track03ShadowSession {
             ask_sz: asz,
             recv_ms,
         };
+        let in_terminal_drain = self.in_terminal_drain(now_ms);
         let delayed_taker_exited = {
             let arm = &mut self.arms[idx];
+            // P0 Defect A: evaluate pending IOCs against the PRIOR touch & freshness
+            // BEFORE installing the new touch so expired stale IOCs re-queue cleanly.
+            let prev_touch = arm.last_valid_target_touch;
+            let prev_book_fresh = prev_touch.is_some_and(|pt| {
+                now_ms >= pt.recv_ms && now_ms - pt.recv_ms <= arm.cfg.strategy.max_book_age_ms
+            });
+            let ioc_exited = arm.process_pending_ioc_exits(now_ms, prev_touch, prev_book_fresh);
+
             arm.last_valid_target_touch = Some(target_touch);
+            arm.rem_bid_sz = (bsz * arm.cfg.max_l1_depth_fraction).max(0.0);
+            arm.rem_ask_sz = (asz * arm.cfg.max_l1_depth_fraction).max(0.0);
             arm.total_book_ticks += 1;
             arm.scratch_book.bids.clear();
             arm.scratch_book.bids.extend_from_slice(bids);
@@ -3157,7 +3285,7 @@ impl Track03ShadowSession {
 
             arm.mature_markouts(target_touch.mid(), now_ms);
             arm.activate_arrivals(now_ms, bb, bsz, ba, asz);
-            arm.process_pending_ioc_exits(now_ms, target_touch)
+            ioc_exited
         };
 
         // Check MTM equity & daily loss brake before sizing any new quotes.
@@ -3231,8 +3359,11 @@ impl Track03ShadowSession {
             let mut cancelled = 0_usize;
             let mut kept = 0_usize;
             let mut taker_exited = delayed_taker_exited;
-            let suppress_openings =
-                sess_blocked || session_halted || arm.halted || risk_scale <= 0.0;
+            let suppress_openings = sess_blocked
+                || session_halted
+                || arm.halted
+                || risk_scale <= 0.0
+                || in_terminal_drain;
             let delay_ms = arm.cfg.strategy.submit_rtt_ms.max(0.0).round() as u64;
             let tol_25 = arm.cfg.strategy.tick_size * 0.25;
 
@@ -3392,38 +3523,31 @@ impl Track03ShadowSession {
                         qty,
                         ..
                     } => {
-                        if arm.cfg.ioc_exit_delay_ms == 0 {
-                            if arm.execute_ioc_exit(now_ms, side, limit_price, qty, target_touch) {
-                                taker_exited = true;
-                            }
-                        } else {
-                            let desired = match side {
-                                QuoteSide::Bid => (-arm.pos_qty).max(0.0).min(qty),
-                                QuoteSide::Ask => arm.pos_qty.max(0.0).min(qty),
-                            };
-                            let already_pending: f64 = arm
-                                .pending_ioc_exits
-                                .iter()
-                                .filter(|p| p.side == side)
-                                .map(|p| p.qty)
-                                .sum();
-                            let needed = desired - already_pending;
-                            if needed > 1e-12
-                                && arm.pending_ioc_exits.len() < TRACK03_MAX_PENDING_IOC_EXITS
-                            {
-                                arm.pending_ioc_exits.push_back(Track03PendingIocExit {
-                                    exec_at_ms: now_ms.saturating_add(arm.cfg.ioc_exit_delay_ms),
-                                    side,
-                                    limit_price,
-                                    qty: needed,
-                                });
-                            }
+                        if arm.queue_or_exec_ioc_exit(now_ms, side, limit_price, qty, target_touch)
+                        {
+                            taker_exited = true;
                         }
                     }
                     MmAction::HedgeIoc { .. } => {}
                     MmAction::Halt { .. } => {
                         arm.halted = true;
                     }
+                }
+            }
+            if in_terminal_drain && arm.pos_qty.abs() > 1e-12 {
+                let (side, limit_price) = if arm.pos_qty > 0.0 {
+                    (QuoteSide::Ask, bb * 0.999)
+                } else {
+                    (QuoteSide::Bid, ba * 1.001)
+                };
+                if arm.queue_or_exec_ioc_exit(
+                    now_ms,
+                    side,
+                    limit_price,
+                    arm.pos_qty.abs(),
+                    target_touch,
+                ) {
+                    taker_exited = true;
                 }
             }
             (
@@ -3464,6 +3588,9 @@ impl Track03ShadowSession {
         recv_ms: u64,
         utc_day: i32,
     ) -> Result<bool> {
+        if self.past_declared_end(now_ms) {
+            return Ok(false);
+        }
         let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return Ok(false);
         };
@@ -3472,24 +3599,27 @@ impl Track03ShadowSession {
             return Ok(false);
         }
         let session_halted = self.halted;
+        let in_terminal_drain = self.in_terminal_drain(now_ms);
         let filled_any = {
             let arm = &mut self.arms[idx];
-            if now_ms - recv_ms > arm.cfg.strategy.max_book_age_ms
-                || arm
-                    .target_feed
-                    .last_now_ms
-                    .is_some_and(|prev| now_ms < prev)
+            if arm
+                .target_feed
+                .last_now_ms
+                .is_some_and(|prev| now_ms < prev)
             {
+                return Ok(false);
+            }
+            let book_fresh = arm.last_valid_target_touch.is_some_and(|t| {
+                now_ms >= t.recv_ms && now_ms - t.recv_ms <= arm.cfg.strategy.max_book_age_ms
+            });
+            let _ = arm.process_pending_ioc_exits(now_ms, arm.last_valid_target_touch, book_fresh);
+            if !book_fresh || now_ms - recv_ms > arm.cfg.strategy.max_book_age_ms {
                 return Ok(false);
             }
             let Some(touch) = arm.last_valid_target_touch else {
                 return Ok(false);
             };
-            if now_ms.saturating_sub(touch.recv_ms) > arm.cfg.strategy.max_book_age_ms {
-                return Ok(false);
-            }
             arm.activate_arrivals(now_ms, touch.bid, touch.bid_sz, touch.ask, touch.ask_sz);
-            let _ = arm.process_pending_ioc_exits(now_ms, touch);
 
             let resting_side = if is_buy_aggressor {
                 QuoteSide::Ask
@@ -3579,6 +3709,15 @@ impl Track03ShadowSession {
                 },
                 Some(&arm.scratch_book),
             );
+            if in_terminal_drain && arm.pos_qty.abs() > 1e-12 {
+                let (side, limit_price) = if arm.pos_qty > 0.0 {
+                    (QuoteSide::Ask, touch.bid * 0.999)
+                } else {
+                    (QuoteSide::Bid, touch.ask * 1.001)
+                };
+                let _ =
+                    arm.queue_or_exec_ioc_exit(now_ms, side, limit_price, arm.pos_qty.abs(), touch);
+            }
             filled_any
         };
 
@@ -3597,6 +3736,9 @@ impl Track03ShadowSession {
         target: Track03Touch,
         utc_day: i32,
     ) -> Result<bool> {
+        if self.past_declared_end(now_ms) {
+            return Ok(false);
+        }
         let Some(&idx) = self.arm_by_symbol_id.get(&symbol_id) else {
             return Ok(false);
         };
@@ -3676,6 +3818,7 @@ impl Track03ShadowSession {
         let mut maker_fills = 0_u64;
         let mut taker_exits = 0_u64;
         let mut depth_clipped_exits = 0_u64;
+        let mut stale_exit_blocks = 0_u64;
         let mut terminal_residual_notional_usd = 0.0_f64;
         let mut cycles = 0_u64;
         let mut orders_placed = 0_u64;
@@ -3731,6 +3874,7 @@ impl Track03ShadowSession {
                 maker_fills += a.maker_fills;
                 taker_exits += a.taker_exits;
                 depth_clipped_exits += a.depth_clipped_exits;
+                stale_exit_blocks += a.stale_exit_blocks;
                 terminal_residual_notional_usd += arm_residual_notional;
                 cycles += a.cycles;
                 orders_placed += a.orders_placed;
@@ -3771,6 +3915,7 @@ impl Track03ShadowSession {
                     maker_fills: a.maker_fills,
                     taker_exits: a.taker_exits,
                     depth_clipped_exits: a.depth_clipped_exits,
+                    stale_exit_blocks: a.stale_exit_blocks,
                     cycles: a.cycles,
                     orders_placed: a.orders_placed,
                     cancels: a.cancels,
@@ -3853,6 +3998,7 @@ impl Track03ShadowSession {
             maker_fills,
             taker_exits,
             depth_clipped_exits,
+            stale_exit_blocks,
             terminal_residual_notional_usd,
             cycles,
             orders_placed,
@@ -5132,6 +5278,8 @@ mod tests {
                 },
             }],
             defense: None,
+            declared_end_ms: None,
+            terminal_drain_ms: None,
         }
     }
 
@@ -6019,21 +6167,17 @@ mod tests {
         assert_eq!(s.report().taker_exits, 0);
         assert!((s.report().terminal_residual_notional_usd - 200.04).abs() < 1e-6);
 
-        // Intermediate tick before 330ms delay elapses must not execute the IOC early.
+        // Intermediate tick before 330ms delay elapses sets thin opposite touch (bid_sz=2.0 -> 0.50 * 2.0 = 1.0 max),
+        // without executing the IOC early.
         let out_wait = s
-            .on_target_bbo(
-                1006,
-                t1 + 200,
-                t3_touch(100.00, 100.04, 10.0, t1 + 200),
-                day,
-            )
+            .on_target_bbo(1006, t1 + 200, t3_touch(100.00, 100.04, 2.0, t1 + 200), day)
             .unwrap()
             .unwrap();
         assert!(!out_wait.taker_exited);
         assert_eq!(s.report().taker_exits, 0);
 
-        // After 330ms delay on a thin opposite touch (bid_sz=2.0 -> 0.50 * 2.0 = 1.0 share max),
-        // IOC fills only 1.0 share, increments depth_clipped_exits, and leaves 1.0 share open!
+        // After 330ms delay, pre-install evaluation executes against the prior fresh touch (bid_sz=2.0 -> 1.0 max),
+        // filling only 1.0 share, incrementing depth_clipped_exits, and leaving 1.0 share open!
         let t_exec = t1 + 350;
         let out_clip = s
             .on_target_bbo(1006, t_exec, t3_touch(100.00, 100.04, 2.0, t_exec), day)
@@ -6047,7 +6191,8 @@ mod tests {
         assert!((rep_clip.arms[0].position_qty - 1.0).abs() < 1e-9);
         assert!((rep_clip.terminal_residual_notional_usd - 100.02).abs() < 1e-6);
 
-        // Stale book (> max_book_age_ms = 5_000) must NEVER fill the remaining 1.0 share.
+        // Stale book (> max_book_age_ms = 5_000) must NEVER fill the remaining 1.0 share;
+        // instead it increments stale_exit_blocks and re-queues for t_stale + 330ms.
         let t_stale = t_exec + 5_100;
         assert!(
             s.on_target_bbo(1006, t_stale, t3_touch(100.00, 100.04, 20.0, t_exec), day)
@@ -6057,11 +6202,21 @@ mod tests {
         let rep_stale = s.report();
         assert_eq!(rep_stale.taker_exits, 1);
         assert_eq!(rep_stale.stale_book_drops, 1);
+        assert_eq!(rep_stale.stale_exit_blocks, 1);
         assert!((rep_stale.arms[0].position_qty - 1.0).abs() < 1e-9);
         assert!((rep_stale.terminal_residual_notional_usd - 100.02).abs() < 1e-6);
 
-        // Fresh book after retry delay closes the remaining 1.0 share cleanly -> residual becomes 0.0.
-        let t_close = t_stale + 100;
+        // Fresh book at +100ms (< 330ms re-queued delay) must NOT fill at 0ms.
+        let t_early = t_stale + 100;
+        let out_early = s
+            .on_target_bbo(1006, t_early, t3_touch(100.00, 100.04, 4.0, t_early), day)
+            .unwrap()
+            .unwrap();
+        assert!(!out_early.taker_exited);
+        assert_eq!(s.report().taker_exits, 1);
+
+        // Fresh book after full 330ms retry delay closes the remaining 1.0 share cleanly -> residual becomes 0.0.
+        let t_close = t_stale + 350;
         let out_close = s
             .on_target_bbo(1006, t_close, t3_touch(100.00, 100.04, 4.0, t_close), day)
             .unwrap()
@@ -6070,7 +6225,407 @@ mod tests {
         let rep_flat = s.report();
         assert_eq!(rep_flat.taker_exits, 2);
         assert_eq!(rep_flat.depth_clipped_exits, 1);
+        assert_eq!(rep_flat.stale_exit_blocks, 1);
         assert!(rep_flat.arms[0].position_qty.abs() < 1e-9);
         assert!(rep_flat.terminal_residual_notional_usd.abs() < 1e-9);
+    }
+
+    fn t3_p0_cfg() -> Track03ShadowConfig {
+        let mut cfg = t3_cfg();
+        cfg.arms[0].ioc_exit_delay_ms = 330;
+        cfg.arms[0].max_l1_depth_fraction = 1.0;
+        cfg.arms[0].strategy.quote_notional_usd = 200.0;
+        cfg.arms[0].strategy.max_position_notional_usd = 400.0;
+        cfg.arms[0].strategy.as_inventory_skew_gamma = 0.0;
+        cfg.arms[0].strategy.vol_spread_mult = 0.0;
+        cfg.arms[0].strategy.directional_markout_skew_mult = 0.0;
+        cfg.arms[0].strategy.quiet_regime_min_spread_to_vol = 0.0;
+        cfg.arms[0].strategy.quiet_regime_max_entry_vol_bps = None;
+        cfg.arms[0].strategy.max_inventory_hold_ms = 5_000;
+        cfg.arms[0].strategy.max_book_age_ms = 5_000;
+        cfg
+    }
+
+    #[test]
+    fn track03_p0_stale_gap_recovery_requeues_330ms_without_zero_ms_fill() {
+        let cfg = t3_p0_cfg();
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        // Enter long 2.0 shares @ 99.98.
+        let _ = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+
+        // Fresh touch at t0 + 4_900 stays fresh at t0 + 5_100 (age 200ms <= 5_000ms),
+        // scheduling ReduceOnlyIoc for (t0 + 5_100) + 330 = t0 + 5_430.
+        let t_book = t0 + 4_900;
+        let _ = s
+            .on_target_bbo(1006, t_book, t3_touch(100.00, 100.04, 10.0, t_book), day)
+            .unwrap()
+            .unwrap();
+        let t_sched = t0 + 5_100;
+        let out_sched = s
+            .on_target_bbo(1006, t_sched, t3_touch(100.00, 100.04, 10.0, t_sched), day)
+            .unwrap()
+            .unwrap();
+        assert!(!out_sched.taker_exited);
+
+        // Silent gap of 5_500ms (> max_book_age_ms=5_000): at t_recover = t_sched + 5_500,
+        // a brand-new fresh touch arrives, AFTER exec_at_ms = t_sched + 330 has passed.
+        // Pre-install freshness sees prev_touch was stale -> increments stale_exit_blocks = 1,
+        // re-queues for t_recover + 330, and MUST NOT fill at 0ms on t_recover!
+        let t_recover = t_sched + 5_500;
+        let out_recover = s
+            .on_target_bbo(
+                1006,
+                t_recover,
+                t3_touch(100.00, 100.04, 10.0, t_recover),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!out_recover.taker_exited);
+        let rep_rec = s.report();
+        assert_eq!(rep_rec.stale_exit_blocks, 1);
+        assert_eq!(rep_rec.arms[0].stale_exit_blocks, 1);
+        assert_eq!(rep_rec.taker_exits, 0);
+        assert!((rep_rec.arms[0].position_qty - 2.0).abs() < 1e-9);
+
+        // At t_recover + 200 (< 330ms): still waiting.
+        let out_mid = s
+            .on_target_bbo(
+                1006,
+                t_recover + 200,
+                t3_touch(100.00, 100.04, 10.0, t_recover + 200),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!out_mid.taker_exited);
+
+        // At t_recover + 330: fills cleanly on the prior fresh touch!
+        let out_fill = s
+            .on_target_bbo(
+                1006,
+                t_recover + 330,
+                t3_touch(100.00, 100.04, 10.0, t_recover + 330),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(out_fill.taker_exited);
+        let rep_done = s.report();
+        assert_eq!(rep_done.stale_exit_blocks, 1);
+        assert_eq!(rep_done.taker_exits, 1);
+        assert!(rep_done.arms[0].position_qty.abs() < 1e-9);
+    }
+
+    #[test]
+    fn track03_p0_two_iocs_on_same_touch_conserve_single_use_l1_depth() {
+        let mut cfg = t3_p0_cfg();
+        cfg.arms[0].max_l1_depth_fraction = 0.50;
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        // Enter long 2.0 shares @ 99.98.
+        let _ = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+        assert!((s.report().arms[0].position_qty - 2.0).abs() < 1e-9);
+
+        // Install a touch with bid_sz = 3.0 -> 0.50 * 3.0 = 1.50 total L1 IOC budget for this touch.
+        let touch_shared = t3_touch(100.00, 100.04, 3.0, t0 + 200);
+        let _ = s.on_target_bbo(1006, t0 + 200, touch_shared, day).unwrap();
+        assert!((s.arms[0].rem_bid_sz - 1.5).abs() < 1e-12);
+
+        // IOC #1 asks for 1.0 share -> fills 1.0 share, leaving 0.50 share on this same touch!
+        assert!(s.arms[0].execute_ioc_exit(t0 + 250, QuoteSide::Ask, 99.90, 1.0, touch_shared));
+        assert!((s.arms[0].rem_bid_sz - 0.5).abs() < 1e-12);
+        assert!((s.arms[0].pos_qty - 1.0).abs() < 1e-9);
+
+        // IOC #2 on the SAME touch asks for 1.0 share -> MUST only fill 0.50 share (NOT 1.0!),
+        // exhausting rem_bid_sz to 0.0 and incrementing depth_clipped_exits!
+        assert!(s.arms[0].execute_ioc_exit(t0 + 260, QuoteSide::Ask, 99.90, 1.0, touch_shared));
+        assert!(s.arms[0].rem_bid_sz.abs() < 1e-12);
+        assert!((s.arms[0].pos_qty - 0.5).abs() < 1e-9);
+        assert_eq!(s.report().depth_clipped_exits, 1);
+
+        // IOC #3 on the SAME touch fills 0.0 shares and clips again.
+        assert!(!s.arms[0].execute_ioc_exit(t0 + 270, QuoteSide::Ask, 99.90, 0.5, touch_shared));
+        assert_eq!(s.report().depth_clipped_exits, 2);
+
+        // Only a subsequent fresh on_target_bbo replenishes the depth budget.
+        let _ = s
+            .on_target_bbo(1006, t0 + 300, t3_touch(100.00, 100.04, 4.0, t0 + 300), day)
+            .unwrap();
+        assert!((s.arms[0].rem_bid_sz - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn track03_p0_partial_exit_preserves_true_residual_and_mtm() {
+        let mut cfg = t3_p0_cfg();
+        cfg.arms[0].max_l1_depth_fraction = 0.50;
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        let _ = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+
+        // Timeout at t1 = t0 + 5_200 on thin touch (bid_sz=1.0 -> 0.50 max).
+        let t1 = t0 + 5_200;
+        let _ = s
+            .on_target_bbo(1006, t1, t3_touch(100.08, 100.12, 1.0, t1), day)
+            .unwrap()
+            .unwrap();
+        let t_exec = t1 + 350;
+        let out = s
+            .on_target_bbo(1006, t_exec, t3_touch(100.08, 100.12, 1.0, t_exec), day)
+            .unwrap()
+            .unwrap();
+        assert!(out.taker_exited);
+
+        let rep = s.report();
+        // Closed 0.5 share (99.98 -> 100.08 = +$0.05 realized), remaining 1.5 shares marked at mid 100.10.
+        assert!((rep.arms[0].position_qty - 1.5).abs() < 1e-9);
+        assert!((rep.realized_pnl_usd - 0.05).abs() < 1e-6);
+        assert!((rep.unrealized_pnl_usd - 1.5 * (100.10 - 99.98)).abs() < 1e-6);
+        assert!((rep.terminal_residual_notional_usd - 1.5 * 100.10).abs() < 1e-6);
+        assert_eq!(rep.depth_clipped_exits, 1);
+    }
+
+    #[test]
+    fn track03_p0_declared_end_ms_ignores_late_ref_bbo_and_print_ticks() {
+        let t0 = 1_795_564_800_000_u64;
+        let end_ms = t0 + 3_000;
+        let day = utc_day_from_ms(t0);
+
+        let mut cfg_base = t3_p0_cfg();
+        cfg_base.declared_end_ms = Some(end_ms);
+        let mut s_base = Track03ShadowSession::new(cfg_base.clone(), day).unwrap();
+        let mut s_late = Track03ShadowSession::new(cfg_base, day).unwrap();
+
+        for sess in [&mut s_base, &mut s_late] {
+            assert!(sess.on_reference_touch(1006, 7, t0, t3_touch(99.99, 100.01, 10.0, t0)));
+            let _ = sess
+                .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 10.0, t0), day)
+                .unwrap()
+                .unwrap();
+            assert!(
+                sess.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                    .unwrap()
+            );
+            let _ = sess
+                .on_target_bbo(1006, end_ms, t3_touch(100.04, 100.08, 10.0, end_ms), day)
+                .unwrap()
+                .unwrap();
+        }
+
+        // Feed late ref, late BBO, and late trade print strictly after declared_end_ms.
+        assert!(!s_late.on_reference_touch(
+            1006,
+            7,
+            end_ms + 500,
+            t3_touch(105.00, 105.04, 10.0, end_ms + 500)
+        ));
+        assert!(
+            s_late
+                .on_target_bbo(
+                    1006,
+                    end_ms + 1_000,
+                    t3_touch(105.00, 105.04, 10.0, end_ms + 1_000),
+                    day
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !s_late
+                .on_trade_print(
+                    1006,
+                    end_ms + 1_500,
+                    105.10,
+                    20.0,
+                    true,
+                    end_ms + 1_500,
+                    day
+                )
+                .unwrap()
+        );
+
+        let r_base = s_base.report();
+        let r_late = s_late.report();
+        assert_eq!(r_base.fills, r_late.fills);
+        assert_eq!(
+            r_base.arms[0].total_book_ticks,
+            r_late.arms[0].total_book_ticks
+        );
+        assert!((r_base.realized_pnl_usd - r_late.realized_pnl_usd).abs() < 1e-12);
+        assert!((r_base.unrealized_pnl_usd - r_late.unrealized_pnl_usd).abs() < 1e-12);
+        assert!(
+            (r_base.terminal_residual_notional_usd - r_late.terminal_residual_notional_usd).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn track03_p0_terminal_drain_ms_cancels_openings_and_flattens_after_delay() {
+        let t0 = 1_795_564_800_000_u64;
+        let end_ms = t0 + 4_000;
+        let day = utc_day_from_ms(t0);
+
+        let mut cfg = t3_p0_cfg();
+        cfg.arms[0].strategy.max_inventory_hold_ms = 60_000; // long hold so ONLY terminal drain triggers
+        cfg.declared_end_ms = Some(end_ms);
+        cfg.terminal_drain_ms = Some(1_000); // drain starts at t0 + 3_000
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        let _ = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+
+        // Before terminal drain (t0 + 2_000): both opening bid & reducing ask stay resting.
+        let out_pre = s
+            .on_target_bbo(
+                1006,
+                t0 + 2_000,
+                t3_touch(99.98, 100.02, 20.0, t0 + 2_000),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_pre.resting_orders, 2);
+        assert!(!out_pre.taker_exited);
+
+        // At terminal drain start (t0 + 3_000): opening bid cancelled (only reducing ask stays),
+        // and IOC flatten is scheduled for t0 + 3_330 (NOT filled at 0ms).
+        let out_drain = s
+            .on_target_bbo(
+                1006,
+                t0 + 3_000,
+                t3_touch(99.98, 100.02, 20.0, t0 + 3_000),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out_drain.resting_orders, 1);
+        assert_eq!(s.arms[0].scratch_resting[0].side, QuoteSide::Ask);
+        assert!(!out_drain.taker_exited);
+
+        // Before +330ms delay: still open.
+        let out_wait = s
+            .on_target_bbo(
+                1006,
+                t0 + 3_200,
+                t3_touch(99.98, 100.02, 20.0, t0 + 3_200),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!out_wait.taker_exited);
+
+        // At t0 + 3_350 (<= declared_end_ms): terminal drain IOC executes and flattens cleanly!
+        let out_flat = s
+            .on_target_bbo(
+                1006,
+                t0 + 3_350,
+                t3_touch(99.98, 100.02, 20.0, t0 + 3_350),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(out_flat.taker_exited);
+        let rep = s.report();
+        assert_eq!(rep.taker_exits, 1);
+        assert!(rep.arms[0].position_qty.abs() < 1e-9);
+        assert!(rep.terminal_residual_notional_usd.abs() < 1e-9);
+    }
+
+    #[test]
+    fn track03_p0_same_ms_dual_ordering_and_invalid_clock_regression_guards() {
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+
+        // Order A: book first, then trade print at identical t0 + 100 -> resting quote exists, fills 1.
+        let mut s_book_first = Track03ShadowSession::new(t3_p0_cfg(), day).unwrap();
+        let _ = s_book_first
+            .on_target_bbo(1006, t0 + 100, t3_touch(99.98, 100.02, 20.0, t0 + 100), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s_book_first
+                .on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+        assert_eq!(s_book_first.report().maker_fills, 1);
+
+        // Order B: trade print before any book at t0 + 100 -> zero fills, zero state corruption;
+        // then invalid/crossed & clock-regressed ticks are rejected fail-closed.
+        let mut s_print_first = Track03ShadowSession::new(t3_p0_cfg(), day).unwrap();
+        assert!(
+            !s_print_first
+                .on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+        assert_eq!(s_print_first.report().maker_fills, 0);
+
+        // Invalid (crossed) BBO and invalid (NaN / negative) trade print and clock-regressed BBO.
+        assert!(
+            s_print_first
+                .on_target_bbo(
+                    1006,
+                    t0 + 200,
+                    t3_touch(100.05, 100.01, 10.0, t0 + 200),
+                    day
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s_print_first
+                .on_target_bbo(1006, t0 + 300, t3_touch(99.98, 100.02, 10.0, t0 + 300), day)
+                .unwrap()
+                .is_some()
+        );
+        // Clock-regressed BBO (now_ms = t0 + 250 < prev t0 + 300) drops cleanly.
+        assert!(
+            s_print_first
+                .on_target_bbo(1006, t0 + 250, t3_touch(99.98, 100.02, 10.0, t0 + 250), day)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !s_print_first
+                .on_trade_print(1006, t0 + 350, f64::NAN, 1.0, false, t0 + 350, day)
+                .unwrap()
+        );
+        let rep = s_print_first.report();
+        assert_eq!(rep.crossed_book_drops, 1);
+        assert_eq!(rep.clock_regression_drops, 1);
+        assert_eq!(rep.stale_exit_blocks, 0);
     }
 }

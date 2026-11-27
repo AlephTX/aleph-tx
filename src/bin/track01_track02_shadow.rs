@@ -399,6 +399,8 @@ fn run_check(track: TrackKind, config_path: &Path) -> Result<serde_json::Value> 
                 "allowlisted_symbols": cfg.allowlisted_symbols,
                 "arms": cfg.arms.len(),
                 "defense_enabled": cfg.defense.is_some(),
+                "declared_end_ms": cfg.declared_end_ms,
+                "terminal_drain_ms": cfg.terminal_drain_ms,
             }))
         }
     }
@@ -1297,6 +1299,121 @@ mode = "passive_inventory_cycle"
         );
         assert_eq!(serialized["defense_state_transitions"], 0);
         assert_eq!(serialized["defense_blocked_entries"], 0);
+        assert_eq!(serialized["stale_exit_blocks"], 0);
+        assert_eq!(serialized["arms"][0]["stale_exit_blocks"], 0);
+
+        fs::remove_file(cfg_path).unwrap();
+        fs::remove_file(replay_path).unwrap();
+    }
+
+    #[test]
+    fn replay_track03_p0_declared_end_drain_and_stale_requeue() {
+        let t0 = 1_795_564_800_000_u64;
+        let end_ms = t0 + 10_000;
+        let cfg_toml = format!(
+            r#"
+capital_usd = 10000.0
+daily_loss_limit_pct = 0.02
+allowlisted_symbols = ["AAPL"]
+declared_end_ms = {end_ms}
+terminal_drain_ms = 1000
+
+[[arms]]
+symbol = "AAPL"
+symbol_id = 1006
+target_exchange_id = 8
+ref_exchange_ids = [7]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 1.0
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 99
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.50
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_cooldown_ms = 1200
+submit_rtt_ms = 0.0
+as_inventory_skew_gamma = 0.0
+vol_spread_mult = 0.0
+directional_markout_skew_mult = 0.0
+quiet_regime_min_spread_to_vol = 0.0
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 4000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
+"#
+        );
+        let cfg_path = temp_file("t3_p0.toml", &cfg_toml);
+        let check = run_check(TrackKind::Track03, &cfg_path).unwrap();
+        assert_eq!(check["declared_end_ms"], end_ms);
+        assert_eq!(check["terminal_drain_ms"], 1000);
+
+        let lines = vec![
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{t0},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{t0}}}"#
+            ),
+            format!(
+                r#"{{"kind":"track3_print","symbol_id":1006,"now_ms":{},"price":99.97,"size":5.0,"is_buy_aggressor":false}}"#,
+                t0 + 100
+            ),
+            // Hold timeout triggers at t0+4200 on book from t0+4000 -> IOC due at t0+4530.
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{}}}"#,
+                t0 + 4_000,
+                t0 + 4_000
+            ),
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{}}}"#,
+                t0 + 4_200,
+                t0 + 4_200
+            ),
+            // Silent stale gap past 5000ms: recovery at t0+9400 blocks expired IOC (stale_exit_blocks=1)
+            // and re-queues for t0+9730!
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{}}}"#,
+                t0 + 9_400,
+                t0 + 9_400
+            ),
+            format!(
+                r#"{{"kind":"track3_bbo","symbol_id":1006,"now_ms":{},"bid":99.98,"ask":100.02,"bid_sz":10.0,"ask_sz":10.0,"recv_ms":{}}}"#,
+                t0 + 9_750,
+                t0 + 9_750
+            ),
+            // Late ticks past declared_end_ms must be completely ignored.
+            format!(
+                r#"{{"kind":"track3_ref","symbol_id":1006,"exchange_id":7,"now_ms":{},"bid":105.0,"ask":105.04}}"#,
+                end_ms + 500
+            ),
+        ];
+        let replay_path = temp_file("t3_p0.jsonl", &lines.join("\n"));
+        let ShadowOutput::Track03(rep) =
+            run_replay(TrackKind::Track03, &cfg_path, &replay_path).unwrap()
+        else {
+            panic!("expected Track03 report");
+        };
+        assert_eq!(rep.stale_exit_blocks, 1);
+        assert_eq!(rep.taker_exits, 1);
+        assert!(rep.terminal_residual_notional_usd.abs() < 1e-9);
+        assert_eq!(rep.arms[0].total_book_ticks, 5);
 
         fs::remove_file(cfg_path).unwrap();
         fs::remove_file(replay_path).unwrap();
