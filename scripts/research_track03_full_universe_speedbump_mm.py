@@ -620,10 +620,15 @@ def simulate_prepared_arm(
     arm: SpeedbumpArmConfig,
     *,
     markout_horizons_ms: tuple[int, ...] = (1_000, 5_000, 10_000),
+    declared_end_ms: int | None = None,
 ) -> dict[str, Any]:
     """Run causal FIFO simulation with Codex #140 realism & speed-bump quoting controls."""
     if tick <= 0.0 or not math.isfinite(tick):
         raise ValueError(f"tick must be finite and > 0, got {tick}")
+    if declared_end_ms is not None:
+        if isinstance(declared_end_ms, bool) or not isinstance(declared_end_ms, (int, float)) or not math.isfinite(declared_end_ms):
+            raise ValueError(f"declared_end_ms must be finite integer ms or None, got {declared_end_ms!r}")
+        declared_end_ms = int(declared_end_ms)
 
     tuples = stream.tuples
     mid_times = stream.mid_times
@@ -632,7 +637,10 @@ def simulate_prepared_arm(
     has_ref_events = stream.has_ref_events
     evidence_mode = "public_trades" if has_trade_events else "no_trades_in_window"
 
-    if not tuples or not mid_times:
+    bisect_right = bisect.bisect_right
+    cutoff_mid_idx = (bisect_right(mid_times, declared_end_ms) - 1) if (declared_end_ms is not None and mid_times) else (len(mid_times) - 1)
+
+    if not tuples or not mid_times or cutoff_mid_idx < 0:
         cost_bd = compute_volume_farming_cost(
             0.0, 0.0, arm.taker_fee_bps, maker_fee_bps=arm.maker_fee_bps, rebate_bps=arm.rebate_bps
         )
@@ -677,6 +685,9 @@ def simulate_prepared_arm(
             "stale_book_cancels": 0,
             "stale_exit_blocks": 0,
             "toxicity_pauses": 0,
+            "avg_hold_ms": 0.0,
+            "hold_weighted_sum_ms": 0.0,
+            "max_hold_observed_ms": 0,
             "markout_1s_bps": None,
             "markout_5s_bps": None,
             "markout_10s_bps": None,
@@ -710,11 +721,18 @@ def simulate_prepared_arm(
             "_exact_net_usd": 0.0,
         }
 
-    bisect_right = bisect.bisect_right
-    last_mid_ts = mid_times[-1]
-    last_stream_ts = tuples[-1][0]
+    last_mid_ts = mid_times[cutoff_mid_idx]
+    if declared_end_ms is not None:
+        effective_end_ms = declared_end_ms
+    else:
+        target_end_ts: int | None = None
+        for t in reversed(tuples):
+            if t[1] != 1:
+                target_end_ts = t[0]
+                break
+        effective_end_ms = target_end_ts if target_end_ts is not None else tuples[-1][0]
     terminal_drain_start_ts = (
-        last_stream_ts - arm.terminal_flatten_lead_ms if arm.terminal_flatten_lead_ms > 0 else last_stream_ts + 1
+        effective_end_ms - arm.terminal_flatten_lead_ms if arm.terminal_flatten_lead_ms > 0 else effective_end_ms + 1
     )
 
     def mid_at(ts_ms: int) -> float | None:
@@ -797,6 +815,9 @@ def simulate_prepared_arm(
     depth_clipped_exits = 0
     stale_book_cancels = 0
     stale_exit_blocks = 0
+    hold_weighted_sum_ms = 0.0
+    hold_closed_notl = 0.0
+    max_hold_observed_ms = 0
     cancel_in_flight_fills = 0
     cancel_in_flight_notional_usd = 0.0
     cif_fills_log: list[tuple[int, str, float, float]] = []
@@ -866,6 +887,7 @@ def simulate_prepared_arm(
         nonlocal cancel_in_flight_fills, cancel_in_flight_notional_usd
         nonlocal same_side_cluster_fills, same_side_cluster_notional_usd
         nonlocal last_maker_fill_ts_bid, last_maker_fill_ts_ask
+        nonlocal hold_weighted_sum_ms, hold_closed_notl, max_hold_observed_ms
         if fill_qty <= 1e-12 or fill_px <= 0.0:
             return
         fill_sgn = 1.0 if fill_side == "BUY" else -1.0
@@ -926,7 +948,13 @@ def simulate_prepared_arm(
                 pex += exit_edge
             else:
                 tslp += exit_edge
-            ntl += closed_qty * fill_px
+            closed_notl = closed_qty * fill_px
+            ntl += closed_notl
+            hold_ms = max(0, ts_ms - lot.entry_ts)
+            hold_weighted_sum_ms += closed_notl * hold_ms
+            hold_closed_notl += closed_notl
+            if hold_ms > max_hold_observed_ms:
+                max_hold_observed_ms = hold_ms
             closed_any = True
             rem -= closed_qty
             lot.qty -= closed_qty
@@ -1326,7 +1354,7 @@ def simulate_prepared_arm(
                 continue
             if not fresh_now:
                 stale_exit_blocks += 1
-                still.append((exec_ts, iside, iqty))
+                still.append((now_ms + arm.exit_delay_ms, iside, iqty))
                 continue
             if iside == "SELL" and pos_qty > 1e-12:
                 wanted = min(iqty, pos_qty)
@@ -1367,6 +1395,8 @@ def simulate_prepared_arm(
     mk_cd_ms = arm.markout_shield_cooldown_ms
 
     for ts, kind, c2, c3, c4, c5 in tuples:
+        if declared_end_ms is not None and ts > declared_end_ms:
+            break
         if bid_ord is not None and bid_ord.cancel_effective_ms is not None and ts >= bid_ord.cancel_effective_ms:
             bid_ord = None
         if ask_ord is not None and ask_ord.cancel_effective_ms is not None and ts >= ask_ord.cancel_effective_ms:
@@ -1385,8 +1415,8 @@ def simulate_prepared_arm(
             if ask_ord is not None and ask_ord.activated and abs(ask_ord.price - cur_ba) <= tol_tick_25 and cur_asz < ask_ord.queue_ahead:
                 ask_ord.queue_ahead = cur_asz
 
-            # Book refresh may make a previously stale pending IOC or terminal flatten eligible!
-            process_pending_iocs(ts)
+            # Book refresh may allow queuing a new delayed IOC exit (which must wait exit_delay_ms);
+            # never immediately fill a previously stale pending IOC at 0 ms.
             maybe_queue_exit_ioc(ts)
 
             mid_now = 0.5 * (cur_bb + cur_ba)
@@ -1563,6 +1593,9 @@ def simulate_prepared_arm(
         "stale_book_cancels": stale_book_cancels,
         "stale_exit_blocks": stale_exit_blocks,
         "toxicity_pauses": toxicity_pauses,
+        "avg_hold_ms": round(hold_weighted_sum_ms / hold_closed_notl, 2) if hold_closed_notl > 0.0 else 0.0,
+        "hold_weighted_sum_ms": round(hold_weighted_sum_ms, 2),
+        "max_hold_observed_ms": max_hold_observed_ms,
         "markout_1s_bps": markout_bps.get("1s"),
         "markout_5s_bps": markout_bps.get("5s"),
         "markout_10s_bps": markout_bps.get("10s"),
@@ -1603,9 +1636,16 @@ def simulate_arm(
     arm: SpeedbumpArmConfig,
     *,
     markout_horizons_ms: tuple[int, ...] = (1_000, 5_000, 10_000),
+    declared_end_ms: int | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper preparing `events` and simulating `arm`."""
-    return simulate_prepared_arm(prepare_replay_stream(events), tick, arm, markout_horizons_ms=markout_horizons_ms)
+    return simulate_prepared_arm(
+        prepare_replay_stream(events),
+        tick,
+        arm,
+        markout_horizons_ms=markout_horizons_ms,
+        declared_end_ms=declared_end_ms,
+    )
 
 
 def _window_sort_key(win_id: str) -> tuple[int, str]:
@@ -1711,6 +1751,8 @@ def aggregate_rows_bucket(grp: Sequence[dict[str, Any]], *, include_symbol: bool
     stale_cancels = sum(int(r.get("stale_book_cancels", 0)) for r in grp)
     stale_blocks = sum(int(r.get("stale_exit_blocks", 0)) for r in grp)
     tox_pauses = sum(int(r.get("toxicity_pauses", 0)) for r in grp)
+    hold_wsum = sum(float(r.get("hold_weighted_sum_ms", 0.0)) for r in grp)
+    max_hold_obs = max((int(r.get("max_hold_observed_ms", 0)) for r in grp), default=0)
 
     realized_gbp = (realized_gross_usd / ntl) * 1e4 if ntl > 0.0 else 0.0
     mtm_gbp = (mtm_gross_usd / ntl) * 1e4 if ntl > 0.0 else 0.0
@@ -1849,6 +1891,8 @@ def aggregate_rows_bucket(grp: Sequence[dict[str, Any]], *, include_symbol: bool
         "stale_book_cancels": stale_cancels,
         "stale_exit_blocks": stale_blocks,
         "toxicity_pauses": tox_pauses,
+        "avg_hold_ms": round(hold_wsum / ntl, 2) if ntl > 0.0 else 0.0,
+        "max_hold_observed_ms": max_hold_obs,
         "markout_1s_bps": _agg_mk("markout_1s_bps", "markout_1s_den"),
         "markout_5s_bps": _agg_mk("markout_5s_bps", "markout_5s_den"),
         "markout_10s_bps": _agg_mk("markout_10s_bps", "markout_10s_den"),
@@ -2272,7 +2316,7 @@ def _eval_single_window(
             )
 
         for arm_cfg in arms:
-            sim_res = simulate_prepared_arm(stream, tick, arm_cfg)
+            sim_res = simulate_prepared_arm(stream, tick, arm_cfg, declared_end_ms=b_rows[-1][0])
             ex_cash = float(sim_res.pop("_exact_cash_ex_fee_usd"))
             ex_real_gross = float(sim_res.pop("_exact_realized_gross_usd"))
             ex_mtm_gross = float(sim_res.pop("_exact_mtm_gross_usd"))

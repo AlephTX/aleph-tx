@@ -156,6 +156,92 @@ class Track03FullUniverseSpeedbumpTests(unittest.TestCase):
             self.assertIn("mtm_incl_residual_usd_per_m", res)
             self.assertIn("realized_only_usd_per_m", res)
 
+    def test_p0_declared_end_ms_immunity_to_late_ref_ticks(self) -> None:
+        arm = mm.SpeedbumpArmConfig(
+            name="G5_microprice_tfi",
+            order_delay_ms=200,
+            cancel_delay_ms=300,
+            exit_delay_ms=330,
+            quote_usd=200.0,
+            max_pos_usd=400.0,
+            max_hold_ms=10_000,
+            max_book_age_ms=5_000,
+            terminal_flatten_lead_ms=1_000,
+            **mm.G5_BASE_PARAMS,
+        )
+        base_events = [
+            {"ts": 0, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 0, "kind": "ref", "venue": "arcus", "bid": 100.00, "ask": 100.04},
+            {"ts": 250, "kind": "trade", "side": "SELL", "price": 99.99, "size": 5.0},
+            {"ts": 4_100, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 5_000, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+        ]
+        late_ref_events = list(base_events) + [
+            {"ts": 25_000, "kind": "ref", "venue": "arcus", "bid": 100.10, "ask": 100.14},
+            {"ts": 30_000, "kind": "ref", "venue": "trade_xyz", "bid": 100.12, "ask": 100.16},
+        ]
+        res_base = mm.simulate_arm(base_events, 0.01, arm, declared_end_ms=5_000)
+        res_late_explicit = mm.simulate_arm(late_ref_events, 0.01, arm, declared_end_ms=5_000)
+        res_late_auto = mm.simulate_arm(late_ref_events, 0.01, arm)
+
+        self.assertTrue(res_base["terminal_flat"])
+        self.assertEqual(res_base["taker_exits"], 1)
+        for res in (res_late_explicit, res_late_auto):
+            self.assertTrue(res["terminal_flat"])
+            self.assertEqual(res["taker_exits"], 1)
+            self.assertEqual(res["terminal_residual_notional_usd"], 0.0)
+            self.assertAlmostEqual(res["ntl"], res_base["ntl"], places=6)
+            self.assertAlmostEqual(res["net"], res_base["net"], places=8)
+
+        # Even if extra book events exist past declared_end_ms, declared_end_ms cuts off at 5_000 ms.
+        extended_events = list(late_ref_events) + [
+            {"ts": 20_000, "kind": "book", "bids": [(101.00, 10.0)], "asks": [(101.04, 10.0)]},
+        ]
+        res_cutoff = mm.simulate_arm(extended_events, 0.01, arm, declared_end_ms=5_000)
+        self.assertTrue(res_cutoff["terminal_flat"])
+        self.assertAlmostEqual(res_cutoff["net"], res_base["net"], places=8)
+
+    def test_p0_stale_pending_ioc_requeues_330ms_and_tracks_stale_exit_blocks(self) -> None:
+        arm = mm.SpeedbumpArmConfig(
+            name="G5_microprice_tfi",
+            order_delay_ms=200,
+            cancel_delay_ms=300,
+            exit_delay_ms=330,
+            quote_usd=200.0,
+            max_pos_usd=400.0,
+            max_hold_ms=10_000,
+            max_book_age_ms=5_000,
+            terminal_flatten_lead_ms=0,
+            **mm.G5_BASE_PARAMS,
+        )
+        # Book at 5_300 is fresh at 10_250 (age 4_950 <= 5_000), so maybe_queue_exit_ioc(10_250)
+        # queues SELL IOC for exec_ts = 10_580. By 10_580, age is 5_280 > 5_000 (stale!).
+        # When a fresh book arrives at 12_000, the expired IOC hits !book_is_fresh BEFORE update,
+        # increments stale_exit_blocks, and re-queues for 12_000 + 330 = 12_330 (NOT 0 ms fill!).
+        events_before_330 = [
+            {"ts": 0, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 250, "kind": "trade", "side": "SELL", "price": 99.99, "size": 5.0},
+            {"ts": 4_500, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 5_300, "kind": "book", "bids": [(100.00, 10.0)], "asks": [(100.04, 10.0)]},
+            {"ts": 10_250, "kind": "trade", "side": "BUY", "price": 100.05, "size": 0.1},
+            {"ts": 12_000, "kind": "book", "bids": [(99.96, 10.0)], "asks": [(100.00, 10.0)]},
+            {"ts": 12_200, "kind": "book", "bids": [(99.96, 10.0)], "asks": [(100.00, 10.0)]},
+        ]
+        res_early = mm.simulate_arm(events_before_330, 0.01, arm)
+        self.assertEqual(res_early["stale_exit_blocks"], 1)
+        self.assertEqual(res_early["taker_exits"], 0)
+        self.assertFalse(res_early["terminal_flat"])
+
+        # Once a fresh tick arrives at 12_330 (12_000 + 330 ms), the re-queued IOC fills cleanly!
+        events_at_330 = list(events_before_330) + [
+            {"ts": 12_330, "kind": "book", "bids": [(99.96, 10.0)], "asks": [(100.00, 10.0)]},
+        ]
+        res_done = mm.simulate_arm(events_at_330, 0.01, arm)
+        self.assertEqual(res_done["stale_exit_blocks"], 1)
+        self.assertEqual(res_done["taker_exits"], 1)
+        self.assertTrue(res_done["terminal_flat"])
+        self.assertEqual(res_done["terminal_residual_notional_usd"], 0.0)
+
     def test_cli_self_test(self) -> None:
         proc = subprocess.run(
             [sys.executable, "-S", str(SCRIPT_DIR / "research_track03_full_universe_speedbump_mm.py"), "--self-test"],
