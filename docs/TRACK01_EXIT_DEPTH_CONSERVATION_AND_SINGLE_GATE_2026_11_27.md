@@ -66,7 +66,7 @@ Following the research protocol in `docs/ALEPHTX_RESEARCH_AND_EXECUTION_ROADMAP_
 | `selection_dev` (`19`) | `single_gate` | `700,336 -> 3,323 -> 1,088 -> 2,234` | **`+217.70 / +217.70`** | **`+38.67`** | `-84.65` (`w14`) | `135.66` | `$0.00` | `+0.262 / 0.874` | `+117.12` (`NVDA +100.58`) |
 | `selection_dev` (`19`) | `flat` | `0 -> 0 -> 0 -> 0` | `0.00 / 0.00` | `0.00` | `0.00` | `0.00` | `$0.00` | `0.000 / 0.000` | `0.00` (`None`) |
 | `holdout` (`5`) | `baseline` | `252,937 -> 761 -> 0 -> 761` | **`+125.06 / +125.06`** | **`+65.15`** | `-6.67` (`w21`) | `6.67` | `$0.00` | `+1.197 / 0.952` | `+92.85` (`NVDA +32.20`) |
-| `holdout` (`5`) | `single_gate` | `252,937 -> 1,334 -> 572 -> 762` | `+115.15 / +115.15` | `+55.45` | `-8.98` (`w21`) | `8.98` | `$0.00` | `+1.037 / 0.950` | `+82.95` (`NVDA +32.20`) |
+| `holdout` (`5`) | `single_gate` | `252,937 -> 1,334 -> 572 -> 762` | `+115.15 / +115.15` | `+55.45` | `-8.98` (`w21`) | `8.98` | `$0.00` | `+1.037 / 0.950` | `+82.94` (`NVDA +32.20`) |
 | `holdout` (`5`) | `flat` | `0 -> 0 -> 0 -> 0` | `0.00 / 0.00` | `0.00` | `0.00` | `0.00` | `$0.00` | `0.000 / 0.000` | `0.00` (`None`) |
 | `w26_w27_oos` (`2`) | `baseline` | `25,266 -> 93 -> 0 -> 93` | `-35.18 / -35.18` | `-42.13` | `-32.16` (`w27`) | `35.18` | `$0.00` | `0.000 / 0.000` | `-35.18` (`AAPL 0.00`) |
 | `w26_w27_oos` (`2`) | `single_gate` | `25,266 -> 99 -> 7 -> 92` | `-34.68 / -34.68` | `-41.61` | `-31.74` (`w27`) | `34.68` | `$0.00` | `0.000 / 0.000` | `-34.68` (`AAPL 0.00`) |
@@ -93,7 +93,7 @@ Politis–Romano (1994) stationary block bootstrap (`mean_block_len = 3.0` windo
     - `selection_dev` (`19` windows): `N_trials_raw = 2`, `N_eff = 1.0043`, `DSR_raw = 0.8580`, `DSR_eff = 0.8740`, `CSCV PBO = 0.2000` (`70` splits, `16` windows used).
     - `all_w01_w27` (`26` windows): `N_trials_raw = 2`, `N_eff = 1.0061`, `DSR_raw = 0.9229`, `DSR_eff = 0.9306`, **`CSCV PBO = 0.4286`** (`70` splits, `24` windows used).
   - **4-arm discovery-adjusted accounting (`baseline`, `single_gate`, `screen_us_rth_utc`, `screen_l1_ge_1000`)**:
-    - `selection_dev` (`19` windows): `N_trials_raw = 4`, `N_eff = 1.5450`, `DSR_raw = 0.9765`, `DSR_eff = 0.9921`, `CSCV PBO = 0.2143`.
+    - `selection_dev` (`19` windows): `N_trials_raw = 4`, `N_eff = 1.6035`, `DSR_raw = 0.9762`, `DSR_eff = 0.9937`, `CSCV PBO = 0.2143`.
     - `all_w01_w27` (`26` windows): `N_trials_raw = 4`, `N_eff = 1.5822`, `DSR_raw = 0.9944`, `DSR_eff = 0.9992`, **`CSCV PBO = 0.5857`**.
 
 ### 3.3 Conditional Markout Attribution (`1m / 5m / 15m / 60m`)
