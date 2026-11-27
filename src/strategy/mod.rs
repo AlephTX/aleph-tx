@@ -23,6 +23,7 @@ pub mod quote_pipeline;
 pub mod relative_value;
 mod replay_queue_depth;
 pub mod slow_cascade;
+pub mod stat_arb;
 pub mod tail_risk;
 pub mod track_coordinator;
 pub mod track_shadow;
