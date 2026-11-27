@@ -1206,6 +1206,8 @@ struct Track02PairRuntime {
     quoter: MakerHedgeQuoter,
     ref_tracker: RefShieldTracker,
     latest_quotes: Option<MakerHedgeQuotes>,
+    latest_bid_defense_scale: f64,
+    latest_ask_defense_scale: f64,
     last_maker_touch: Option<MakerTouch>,
     last_hedge_touch: Option<MakerTouch>,
     last_ref_sample: Option<(u64, f64)>,
@@ -1333,6 +1335,8 @@ impl Track02ShadowSession {
                 quoter,
                 ref_tracker: RefShieldTracker::default(),
                 latest_quotes: None,
+                latest_bid_defense_scale: 1.0,
+                latest_ask_defense_scale: 1.0,
                 last_maker_touch: None,
                 last_hedge_touch: None,
                 last_ref_sample: None,
@@ -1430,6 +1434,8 @@ impl Track02ShadowSession {
             self.halted = true;
             for pair in &mut self.pairs {
                 pair.latest_quotes = None;
+                pair.latest_bid_defense_scale = 1.0;
+                pair.latest_ask_defense_scale = 1.0;
             }
         }
     }
@@ -1438,6 +1444,8 @@ impl Track02ShadowSession {
     pub fn clear_pair_quotes(&mut self, symbol_id: u16) {
         if let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) {
             self.pairs[idx].latest_quotes = None;
+            self.pairs[idx].latest_bid_defense_scale = 1.0;
+            self.pairs[idx].latest_ask_defense_scale = 1.0;
         }
     }
 
@@ -1587,6 +1595,8 @@ impl Track02ShadowSession {
                 });
             }
             self.pairs[idx].latest_quotes = None;
+            self.pairs[idx].latest_bid_defense_scale = 1.0;
+            self.pairs[idx].latest_ask_defense_scale = 1.0;
             return Ok(None);
         }
 
@@ -1641,6 +1651,8 @@ impl Track02ShadowSession {
         let pair = &mut self.pairs[idx];
         let Ok(mut quotes) = step_res else {
             pair.latest_quotes = None;
+            pair.latest_bid_defense_scale = 1.0;
+            pair.latest_ask_defense_scale = 1.0;
             return Ok(None);
         };
         if pair
@@ -1651,31 +1663,44 @@ impl Track02ShadowSession {
         }
         if self.halted || pair.halted {
             pair.latest_quotes = None;
+            pair.latest_bid_defense_scale = 1.0;
+            pair.latest_ask_defense_scale = 1.0;
             return Ok(None);
         }
         if let Some(ref fsm) = self.defense {
             let bid_is_reduce = pair.inventory_clips < -1e-9;
             let ask_is_reduce = pair.inventory_clips > 1e-9;
-            if quotes.bid.is_some() && !bid_is_reduce {
-                let allowed = fsm.permits_intent(
-                    OrderIntentClass::RiskIncreasingEntry,
-                    Some(DefenseSide::Buy),
-                );
-                if !allowed {
+            if quotes.bid.is_some() {
+                let scale = if bid_is_reduce {
+                    1.0
+                } else {
+                    fsm.entry_size_scale(Some(DefenseSide::Buy))
+                };
+                if scale <= 0.0 {
                     quotes.bid = None;
                     defense_blocked += 1;
                 }
+                pair.latest_bid_defense_scale = scale;
+            } else {
+                pair.latest_bid_defense_scale = 1.0;
             }
-            if quotes.ask.is_some() && !ask_is_reduce {
-                let allowed = fsm.permits_intent(
-                    OrderIntentClass::RiskIncreasingEntry,
-                    Some(DefenseSide::Sell),
-                );
-                if !allowed {
+            if quotes.ask.is_some() {
+                let scale = if ask_is_reduce {
+                    1.0
+                } else {
+                    fsm.entry_size_scale(Some(DefenseSide::Sell))
+                };
+                if scale <= 0.0 {
                     quotes.ask = None;
                     defense_blocked += 1;
                 }
+                pair.latest_ask_defense_scale = scale;
+            } else {
+                pair.latest_ask_defense_scale = 1.0;
             }
+        } else {
+            pair.latest_bid_defense_scale = 1.0;
+            pair.latest_ask_defense_scale = 1.0;
         }
         pair.latest_quotes = Some(quotes);
         self.defense_blocked_entries += defense_blocked;
@@ -1702,6 +1727,8 @@ impl Track02ShadowSession {
         }
         if self.halted || self.pairs[idx].halted {
             self.pairs[idx].latest_quotes = None;
+            self.pairs[idx].latest_bid_defense_scale = 1.0;
+            self.pairs[idx].latest_ask_defense_scale = 1.0;
             return Ok(false);
         }
         let Some(quotes) = self.pairs[idx].latest_quotes else {
@@ -1721,6 +1748,23 @@ impl Track02ShadowSession {
         let Some((fill_side, maker_px)) = hit else {
             return Ok(false);
         };
+        let quote_defense_scale = match fill_side {
+            FillSide::MakerBought => {
+                if self.pairs[idx].inventory_clips < -1e-9 {
+                    1.0
+                } else {
+                    self.pairs[idx].latest_bid_defense_scale
+                }
+            }
+            FillSide::MakerSold => {
+                if self.pairs[idx].inventory_clips > 1e-9 {
+                    1.0
+                } else {
+                    self.pairs[idx].latest_ask_defense_scale
+                }
+            }
+        }
+        .clamp(0.0, 1.0);
 
         let hedge_fresh = valid_bid_ask(hedge.bid, hedge.ask)
             && hedge.recv_ms <= now_ms
@@ -1728,12 +1772,15 @@ impl Track02ShadowSession {
         if !hedge_fresh {
             let pair_clip = self.pairs[idx].cfg.clip_usd;
             let risk_scale = self.daily_loss.risk_scale();
-            let fill_notional = pair_clip.min(trade_px * trade_sz) * risk_scale.max(0.0);
+            let fill_notional =
+                pair_clip.min(trade_px * trade_sz) * risk_scale.max(0.0) * quote_defense_scale;
             let did_fill = {
                 let pair = &mut self.pairs[idx];
                 pair.unhedged_stale_halts += 1;
                 pair.halted = true;
                 pair.latest_quotes = None;
+                pair.latest_bid_defense_scale = 1.0;
+                pair.latest_ask_defense_scale = 1.0;
 
                 if fill_notional.is_finite() && fill_notional > 0.0 {
                     let qty = fill_notional / maker_px;
@@ -1761,11 +1808,11 @@ impl Track02ShadowSession {
         }
 
         let risk_scale = self.daily_loss.risk_scale();
-        if risk_scale <= 0.0 {
+        if risk_scale <= 0.0 || quote_defense_scale <= 0.0 {
             return Ok(false);
         }
         let pair_clip = self.pairs[idx].cfg.clip_usd;
-        let fill_notional = pair_clip.min(trade_px * trade_sz) * risk_scale;
+        let fill_notional = pair_clip.min(trade_px * trade_sz) * risk_scale * quote_defense_scale;
         if !fill_notional.is_finite() || fill_notional <= 0.0 {
             return Ok(false);
         }
@@ -2081,6 +2128,10 @@ pub struct Track03ArmShadowConfig {
     pub allowed_utc_sessions: Option<Vec<UtcSession>>,
     #[serde(default = "default_track03_account_fee_status")]
     pub account_fee_status: String,
+    #[serde(default)]
+    pub ioc_exit_delay_ms: u64,
+    #[serde(default = "default_max_l1_depth_fraction")]
+    pub max_l1_depth_fraction: f64,
     pub strategy: QueuePriorityMmConfig,
 }
 
@@ -2097,6 +2148,8 @@ impl Default for Track03ArmShadowConfig {
             queue_ahead_fraction: default_queue_ahead_fraction(),
             allowed_utc_sessions: None,
             account_fee_status: default_track03_account_fee_status(),
+            ioc_exit_delay_ms: 0,
+            max_l1_depth_fraction: default_max_l1_depth_fraction(),
             strategy: QueuePriorityMmConfig::default(),
         }
     }
@@ -2208,6 +2261,13 @@ impl Track03ShadowConfig {
                 "arm '{}' queue_ahead_fraction must be in [0, 1]",
                 arm.symbol
             );
+            ensure!(
+                arm.max_l1_depth_fraction.is_finite()
+                    && arm.max_l1_depth_fraction > 0.0
+                    && arm.max_l1_depth_fraction <= 1.0,
+                "arm '{}' max_l1_depth_fraction must be in (0, 1]",
+                arm.symbol
+            );
             if let Some(sessions) = &arm.allowed_utc_sessions {
                 ensure!(
                     !sessions.is_empty(),
@@ -2259,6 +2319,14 @@ struct Track03OrderMeta {
     reduce_only: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Track03PendingIocExit {
+    exec_at_ms: u64,
+    side: QuoteSide,
+    limit_price: f64,
+    qty: f64,
+}
+
 struct Track03RefSlot {
     exchange_id: u8,
     venue_id: String,
@@ -2269,6 +2337,7 @@ struct Track03RefSlot {
 
 const TRACK03_MAX_RESTING: usize = 6;
 const TRACK03_MAX_PENDING_MARKOUTS: usize = 256;
+const TRACK03_MAX_PENDING_IOC_EXITS: usize = 16;
 
 struct Track03ArmRuntime {
     cfg: Track03ArmShadowConfig,
@@ -2283,6 +2352,7 @@ struct Track03ArmRuntime {
     resting_seq: u64,
     open_lots: VecDeque<Track03OpenLot>,
     pending_markouts: VecDeque<Track03PendingMarkout>,
+    pending_ioc_exits: VecDeque<Track03PendingIocExit>,
     pos_qty: f64,
     realized_gross_usd: f64,
     fees_usd: f64,
@@ -2297,6 +2367,7 @@ struct Track03ArmRuntime {
     markout_1s_den_usd: f64,
     maker_fills: u64,
     taker_exits: u64,
+    depth_clipped_exits: u64,
     cycles: u64,
     orders_placed: u64,
     cancels: u64,
@@ -2581,6 +2652,68 @@ impl Track03ArmRuntime {
             double_sided_usd_per_m,
         )
     }
+
+    fn execute_ioc_exit(
+        &mut self,
+        now_ms: u64,
+        side: QuoteSide,
+        limit_price: f64,
+        requested_qty: f64,
+        touch: Track03Touch,
+    ) -> bool {
+        if !touch.valid() {
+            return false;
+        }
+        let (exec_px, opposite_l1_sz, crosses_limit) = match side {
+            QuoteSide::Bid => (touch.ask, touch.ask_sz, touch.ask <= limit_price + 1e-9),
+            QuoteSide::Ask => (touch.bid, touch.bid_sz, touch.bid >= limit_price - 1e-9),
+        };
+        let needed = match side {
+            QuoteSide::Bid => (-self.pos_qty).max(0.0).min(requested_qty),
+            QuoteSide::Ask => self.pos_qty.max(0.0).min(requested_qty),
+        };
+        if !(needed > 1e-12 && crosses_limit) {
+            return false;
+        }
+        let max_fill_qty = (opposite_l1_sz * self.cfg.max_l1_depth_fraction).max(0.0);
+        let exec_qty = needed.min(max_fill_qty);
+        if exec_qty + 1e-12 < needed {
+            self.depth_clipped_exits += 1;
+        }
+        if exec_qty > 1e-12 {
+            self.record_fill(
+                now_ms,
+                side,
+                exec_px,
+                exec_qty,
+                Track03FillRole::Taker,
+                touch.mid(),
+                false,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn process_pending_ioc_exits(&mut self, now_ms: u64, touch: Track03Touch) -> bool {
+        let mut exited = false;
+        let mut rem = self.pending_ioc_exits.len();
+        while rem > 0 {
+            rem -= 1;
+            let Some(p) = self.pending_ioc_exits.pop_front() else {
+                break;
+            };
+            if now_ms < p.exec_at_ms {
+                self.pending_ioc_exits.push_back(p);
+                continue;
+            }
+            if self.execute_ioc_exit(now_ms, p.side, p.limit_price, p.qty, touch) {
+                exited = true;
+            }
+        }
+        exited
+    }
 }
 
 /// Per-arm shadow summary for Track 03 (`03_incentive_turnover`).
@@ -2612,9 +2745,11 @@ pub struct Track03ArmReport {
     pub markout_1s_den_usd: f64,
     pub position_qty: f64,
     pub position_notional_usd: f64,
+    pub terminal_residual_notional_usd: f64,
     pub fills: u64,
     pub maker_fills: u64,
     pub taker_exits: u64,
+    pub depth_clipped_exits: u64,
     pub cycles: u64,
     pub orders_placed: u64,
     pub cancels: u64,
@@ -2653,6 +2788,8 @@ pub struct Track03ShadowReport {
     pub fills: u64,
     pub maker_fills: u64,
     pub taker_exits: u64,
+    pub depth_clipped_exits: u64,
+    pub terminal_residual_notional_usd: f64,
     pub cycles: u64,
     pub orders_placed: u64,
     pub cancels: u64,
@@ -2731,6 +2868,7 @@ impl Track03ShadowSession {
                 resting_seq: 0,
                 open_lots: VecDeque::with_capacity(32),
                 pending_markouts: VecDeque::with_capacity(TRACK03_MAX_PENDING_MARKOUTS),
+                pending_ioc_exits: VecDeque::with_capacity(TRACK03_MAX_PENDING_IOC_EXITS),
                 pos_qty: 0.0,
                 realized_gross_usd: 0.0,
                 fees_usd: 0.0,
@@ -2745,6 +2883,7 @@ impl Track03ShadowSession {
                 markout_1s_den_usd: 0.0,
                 maker_fills: 0,
                 taker_exits: 0,
+                depth_clipped_exits: 0,
                 cycles: 0,
                 orders_placed: 0,
                 cancels: 0,
@@ -2974,15 +3113,18 @@ impl Track03ShadowSession {
             if let Some(ref mut fsm) = self.defense {
                 let arm_ref = &self.arms[idx];
                 let tel = arm_ref.engine.telemetry();
-                let vol_shock_ratio = match arm_ref.cfg.strategy.quiet_regime_max_entry_vol_bps {
-                    Some(max_v) if max_v > 0.0 => tel.sigma_bps_per_sqrt_s / max_v,
-                    _ => tel.sigma_bps_per_sqrt_s,
-                };
+                let vol_base = arm_ref
+                    .cfg
+                    .strategy
+                    .quiet_regime_max_entry_vol_bps
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or_else(|| arm_ref.cfg.strategy.lead_cancel_threshold_bps.max(1.0));
+                let vol_shock_ratio = (tel.sigma_bps_per_sqrt_s / vol_base).max(0.0);
                 fsm.evaluate(&DefenseTelemetrySnapshot {
                     now_ms,
                     feed_staleness_ms: now_ms.saturating_sub(recv_ms),
                     feed_gap_ms: arm_ref.target_feed.last_gap_ms,
-                    vol_shock_ratio: vol_shock_ratio.max(0.0),
+                    vol_shock_ratio,
                     trailing_bid_markout_bps: tel.bid_markout_ewma_bps,
                     trailing_ask_markout_bps: tel.ask_markout_ewma_bps,
                     oracle_divergence_bps: tel.lead_gap_bps.abs(),
@@ -3002,7 +3144,7 @@ impl Track03ShadowSession {
             ask_sz: asz,
             recv_ms,
         };
-        {
+        let delayed_taker_exited = {
             let arm = &mut self.arms[idx];
             arm.last_valid_target_touch = Some(target_touch);
             arm.total_book_ticks += 1;
@@ -3015,7 +3157,8 @@ impl Track03ShadowSession {
 
             arm.mature_markouts(target_touch.mid(), now_ms);
             arm.activate_arrivals(now_ms, bb, bsz, ba, asz);
-        }
+            arm.process_pending_ioc_exits(now_ms, target_touch)
+        };
 
         // Check MTM equity & daily loss brake before sizing any new quotes.
         self.check_equity_and_drawdown(utc_day);
@@ -3087,7 +3230,7 @@ impl Track03ShadowSession {
             let mut placed = 0_usize;
             let mut cancelled = 0_usize;
             let mut kept = 0_usize;
-            let mut taker_exited = false;
+            let mut taker_exited = delayed_taker_exited;
             let suppress_openings =
                 sess_blocked || session_halted || arm.halted || risk_scale <= 0.0;
             let delay_ms = arm.cfg.strategy.submit_rtt_ms.max(0.0).round() as u64;
@@ -3249,25 +3392,32 @@ impl Track03ShadowSession {
                         qty,
                         ..
                     } => {
-                        let (exec_px, crosses_limit) = match side {
-                            QuoteSide::Bid => (ba, ba <= limit_price + 1e-9),
-                            QuoteSide::Ask => (bb, bb >= limit_price - 1e-9),
-                        };
-                        let needed = match side {
-                            QuoteSide::Bid => (-arm.pos_qty).max(0.0).min(qty),
-                            QuoteSide::Ask => arm.pos_qty.max(0.0).min(qty),
-                        };
-                        if crosses_limit && needed > 1e-12 {
-                            arm.record_fill(
-                                now_ms,
-                                side,
-                                exec_px,
-                                needed,
-                                Track03FillRole::Taker,
-                                target_touch.mid(),
-                                false,
-                            );
-                            taker_exited = true;
+                        if arm.cfg.ioc_exit_delay_ms == 0 {
+                            if arm.execute_ioc_exit(now_ms, side, limit_price, qty, target_touch) {
+                                taker_exited = true;
+                            }
+                        } else {
+                            let desired = match side {
+                                QuoteSide::Bid => (-arm.pos_qty).max(0.0).min(qty),
+                                QuoteSide::Ask => arm.pos_qty.max(0.0).min(qty),
+                            };
+                            let already_pending: f64 = arm
+                                .pending_ioc_exits
+                                .iter()
+                                .filter(|p| p.side == side)
+                                .map(|p| p.qty)
+                                .sum();
+                            let needed = desired - already_pending;
+                            if needed > 1e-12
+                                && arm.pending_ioc_exits.len() < TRACK03_MAX_PENDING_IOC_EXITS
+                            {
+                                arm.pending_ioc_exits.push_back(Track03PendingIocExit {
+                                    exec_at_ms: now_ms.saturating_add(arm.cfg.ioc_exit_delay_ms),
+                                    side,
+                                    limit_price,
+                                    qty: needed,
+                                });
+                            }
                         }
                     }
                     MmAction::HedgeIoc { .. } => {}
@@ -3339,6 +3489,7 @@ impl Track03ShadowSession {
                 return Ok(false);
             }
             arm.activate_arrivals(now_ms, touch.bid, touch.bid_sz, touch.ask, touch.ask_sz);
+            let _ = arm.process_pending_ioc_exits(now_ms, touch);
 
             let resting_side = if is_buy_aggressor {
                 QuoteSide::Ask
@@ -3524,6 +3675,8 @@ impl Track03ShadowSession {
         let mut weighted_net_cost_cycle_num = 0.0;
         let mut maker_fills = 0_u64;
         let mut taker_exits = 0_u64;
+        let mut depth_clipped_exits = 0_u64;
+        let mut terminal_residual_notional_usd = 0.0_f64;
         let mut cycles = 0_u64;
         let mut orders_placed = 0_u64;
         let mut cancels = 0_u64;
@@ -3548,6 +3701,11 @@ impl Track03ShadowSession {
                 ) = a.cost_decomposition();
                 let mark_mid = a.last_valid_target_touch.map_or(0.0, |t| t.mid());
                 let pos_notional = a.pos_qty * mark_mid;
+                let arm_residual_notional = if a.pos_qty.abs() > 1e-12 {
+                    pos_notional.abs()
+                } else {
+                    0.0
+                };
                 let mk1s = if a.markout_1s_den_usd > 0.0 {
                     Some(a.markout_1s_num_bps_usd / a.markout_1s_den_usd)
                 } else {
@@ -3572,6 +3730,8 @@ impl Track03ShadowSession {
                 }
                 maker_fills += a.maker_fills;
                 taker_exits += a.taker_exits;
+                depth_clipped_exits += a.depth_clipped_exits;
+                terminal_residual_notional_usd += arm_residual_notional;
                 cycles += a.cycles;
                 orders_placed += a.orders_placed;
                 cancels += a.cancels;
@@ -3606,9 +3766,11 @@ impl Track03ShadowSession {
                     markout_1s_den_usd: a.markout_1s_den_usd,
                     position_qty: a.pos_qty,
                     position_notional_usd: pos_notional,
+                    terminal_residual_notional_usd: arm_residual_notional,
                     fills: a.maker_fills + a.taker_exits,
                     maker_fills: a.maker_fills,
                     taker_exits: a.taker_exits,
+                    depth_clipped_exits: a.depth_clipped_exits,
                     cycles: a.cycles,
                     orders_placed: a.orders_placed,
                     cancels: a.cancels,
@@ -3690,6 +3852,8 @@ impl Track03ShadowSession {
             fills: maker_fills + taker_exits,
             maker_fills,
             taker_exits,
+            depth_clipped_exits,
+            terminal_residual_notional_usd,
             cycles,
             orders_placed,
             cancels,
@@ -4938,6 +5102,8 @@ mod tests {
                     UtcSession::Weekend,
                 ]),
                 account_fee_status: "public_tier0_unverified".to_string(),
+                ioc_exit_delay_ms: 0,
+                max_l1_depth_fraction: 0.50,
                 strategy: QueuePriorityMmConfig {
                     tick_size: 0.01,
                     lot_size: 0.01,
@@ -5733,5 +5899,178 @@ mod tests {
         let rep = s.report();
         assert!(rep.defense_state_transitions >= 3);
         assert!(rep.defense_blocked_entries >= 1);
+    }
+
+    #[test]
+    fn track02_defense_fsm_scales_caution_and_keeps_reducing_unthrottled() {
+        let mut cfg = t2_cfg();
+        cfg.pairs[0].clip_usd = 500.0;
+        cfg.defense = Some(DefenseFsmConfig {
+            caution_feed_staleness_ms: 1_000,
+            reduce_only_feed_staleness_ms: 4_000,
+            halt_feed_staleness_ms: 10_000,
+            caution_size_scale: 0.50,
+            min_dwell_ms: 5_000,
+            ..DefenseFsmConfig::default()
+        });
+        let (mut s, mut t, _) = warm_track02_session(cfg);
+
+        // Trigger Caution via hedge feed staleness = 1_500ms (>= 1_000 caution, < 4_000 reduce_only).
+        t += 1_500;
+        s.on_reference_mid(1002, t - 20, 100.0);
+        s.on_reference_mid(1002, t, 100.0);
+        let q_caution = s
+            .on_pair_books(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t - 1_500),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.defense_state(), Some(DefenseState::Caution));
+        let bid = q_caution.bid.expect("opening bid allowed in Caution");
+
+        // Opening fill in Caution must scale by caution_size_scale (0.50 * $500 = $250 -> +0.50 clips).
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                bid - 0.01,
+                10.0,
+                false,
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        let r_after_open = s.report();
+        assert!((r_after_open.pairs[0].inventory_clips - 0.50).abs() < 1e-9);
+        assert!((r_after_open.pairs[0].maker_qty * bid - 250.0).abs() < 1e-6);
+
+        // Now long (+0.50 clips): reducing ask must stay UNTHROTTLED (1.0 * $500) even in Caution!
+        t += 100;
+        s.on_reference_mid(1002, t, 100.0);
+        let q_next = s
+            .on_pair_books(
+                1002,
+                t,
+                mk_touch(99.99, 100.01, t),
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+            .unwrap();
+        let ask = q_next.ask.expect("reducing ask allowed");
+        assert!(
+            s.on_maker_trade_print(
+                1002,
+                t,
+                ask + 0.01,
+                10.0,
+                true,
+                mk_touch(99.99, 100.01, t),
+                utc_day_from_ms(t),
+            )
+            .unwrap()
+        );
+        let r_after_reduce = s.report();
+        // Full 1.0 clip ($500) executed on the reducing ask (+0.50 - 1.00 = -0.50 clips).
+        assert!((r_after_reduce.pairs[0].inventory_clips - (-0.50)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn track03_delayed_and_depth_clamped_ioc_exit_and_stale_terminal_residual() {
+        let mut cfg = t3_cfg();
+        cfg.arms[0].ioc_exit_delay_ms = 330;
+        cfg.arms[0].max_l1_depth_fraction = 0.50;
+        cfg.arms[0].strategy.quote_notional_usd = 200.5;
+        cfg.arms[0].strategy.as_inventory_skew_gamma = 0.0;
+        cfg.arms[0].strategy.vol_spread_mult = 0.0;
+        cfg.arms[0].strategy.directional_markout_skew_mult = 0.0;
+        cfg.arms[0].strategy.quiet_regime_min_spread_to_vol = 0.0;
+        cfg.arms[0].strategy.quiet_regime_max_entry_vol_bps = None;
+        cfg.arms[0].strategy.max_inventory_hold_ms = 5_000;
+        cfg.arms[0].strategy.max_book_age_ms = 5_000;
+
+        let t0 = 1_795_564_800_000_u64;
+        let day = utc_day_from_ms(t0);
+        let mut s = Track03ShadowSession::new(cfg, day).unwrap();
+
+        // Enter long 2.0 shares @ 99.98 via strict trade-through.
+        let _ = s
+            .on_target_bbo(1006, t0, t3_touch(99.98, 100.02, 20.0, t0), day)
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.on_trade_print(1006, t0 + 100, 99.97, 5.0, false, t0 + 100, day)
+                .unwrap()
+        );
+        assert!((s.report().arms[0].position_qty - 2.0).abs() < 1e-9);
+
+        // At timeout (t1 = t0 + 5_200), ReduceOnlyIoc is scheduled for +330ms, NOT filled immediately.
+        let t1 = t0 + 5_200;
+        let out_sched = s
+            .on_target_bbo(1006, t1, t3_touch(100.00, 100.04, 10.0, t1), day)
+            .unwrap()
+            .unwrap();
+        assert!(!out_sched.taker_exited);
+        assert_eq!(s.report().taker_exits, 0);
+        assert!((s.report().terminal_residual_notional_usd - 200.04).abs() < 1e-6);
+
+        // Intermediate tick before 330ms delay elapses must not execute the IOC early.
+        let out_wait = s
+            .on_target_bbo(
+                1006,
+                t1 + 200,
+                t3_touch(100.00, 100.04, 10.0, t1 + 200),
+                day,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!out_wait.taker_exited);
+        assert_eq!(s.report().taker_exits, 0);
+
+        // After 330ms delay on a thin opposite touch (bid_sz=2.0 -> 0.50 * 2.0 = 1.0 share max),
+        // IOC fills only 1.0 share, increments depth_clipped_exits, and leaves 1.0 share open!
+        let t_exec = t1 + 350;
+        let out_clip = s
+            .on_target_bbo(1006, t_exec, t3_touch(100.00, 100.04, 2.0, t_exec), day)
+            .unwrap()
+            .unwrap();
+        assert!(out_clip.taker_exited);
+        let rep_clip = s.report();
+        assert_eq!(rep_clip.taker_exits, 1);
+        assert_eq!(rep_clip.depth_clipped_exits, 1);
+        assert_eq!(rep_clip.arms[0].depth_clipped_exits, 1);
+        assert!((rep_clip.arms[0].position_qty - 1.0).abs() < 1e-9);
+        assert!((rep_clip.terminal_residual_notional_usd - 100.02).abs() < 1e-6);
+
+        // Stale book (> max_book_age_ms = 5_000) must NEVER fill the remaining 1.0 share.
+        let t_stale = t_exec + 5_100;
+        assert!(
+            s.on_target_bbo(1006, t_stale, t3_touch(100.00, 100.04, 20.0, t_exec), day)
+                .unwrap()
+                .is_none()
+        );
+        let rep_stale = s.report();
+        assert_eq!(rep_stale.taker_exits, 1);
+        assert_eq!(rep_stale.stale_book_drops, 1);
+        assert!((rep_stale.arms[0].position_qty - 1.0).abs() < 1e-9);
+        assert!((rep_stale.terminal_residual_notional_usd - 100.02).abs() < 1e-6);
+
+        // Fresh book after retry delay closes the remaining 1.0 share cleanly -> residual becomes 0.0.
+        let t_close = t_stale + 100;
+        let out_close = s
+            .on_target_bbo(1006, t_close, t3_touch(100.00, 100.04, 4.0, t_close), day)
+            .unwrap()
+            .unwrap();
+        assert!(out_close.taker_exited);
+        let rep_flat = s.report();
+        assert_eq!(rep_flat.taker_exits, 2);
+        assert_eq!(rep_flat.depth_clipped_exits, 1);
+        assert!(rep_flat.arms[0].position_qty.abs() < 1e-9);
+        assert!(rep_flat.terminal_residual_notional_usd.abs() < 1e-9);
     }
 }

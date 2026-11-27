@@ -50,6 +50,10 @@ class ReplayRwaVolumeFarmingTests(unittest.TestCase):
         self.assertEqual(rwa.VENUE_SYMBOL_MAP["lighter_robinhood"]["NVDA"], "15")
         self.assertEqual(rwa.VENUE_SYMBOL_MAP["arcus"]["NVDA"], "NVDA-USD")
         self.assertEqual(rwa.VENUE_SYMBOL_MAP["trade_xyz"]["DRAM"], "xyz:DRAM")
+        self.assertEqual(rwa.VENUE_LATENCY_MS["lighter"], (200, 200, 330))
+        self.assertEqual(rwa.VENUE_LATENCY_MS["lighter_robinhood"], (200, 200, 330))
+        self.assertEqual(rwa.build_arms("lighter")[0].exit_delay_ms, 330)
+        self.assertEqual(rwa.build_arms("lighter_robinhood")[0].exit_delay_ms, 330)
 
         by_venue_settlement = {(t.venue, t.settlement, t.account_fee_status) for t in rwa.DEFAULT_TARGETS}
         self.assertIn(("arcus", "USDC", "public_tier0_schedule_only"), by_venue_settlement)

@@ -92,9 +92,10 @@ VENUE_SYMBOL_MAP: dict[str, dict[str, str]] = {
 
 VENUE_LATENCY_MS: dict[str, tuple[int, int, int]] = {
     # (order_delay_ms, cancel_delay_ms, exit_delay_ms)
+    # Matches src/venues.rs: Lighter / LighterRH Standard non-post-only/taker 300ms + ~30ms Tokyo RTT.
     "arcus": (36, 33, 40),
-    "lighter": (200, 200, 220),
-    "lighter_robinhood": (200, 200, 220),
+    "lighter": (200, 200, 330),
+    "lighter_robinhood": (200, 200, 330),
 }
 
 VENUE_SETTLEMENT_DEFAULTS: dict[str, dict[str, Any]] = {

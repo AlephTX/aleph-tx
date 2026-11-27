@@ -1,19 +1,51 @@
 # Track 01 (`01_quant_profit`) Shadow Configuration: Cross-Venue Lead-Lag Taker
 #
-# Parameters frozen from W19 selection (see `.agent-state/research/track01_lead_lag_20261126.json`).
+# Parameters frozen from W19 selection (see `.agent-state/research/track01_lead_lag_20261126.json`)
+# and aligned to `OPT-01` verified fee provenance (`docs/VERIFIED_FEE_W01_W26_THREE_TRACK_REPORT_2026_11_27.md`).
 # Strictly isolated capital and daily loss budget; read-only shadow/replay only.
+#
+# OPT-01 VERIFIED FEE-TIER PROVENANCE:
+#   - Target venue: `lighter_robinhood` (`tgt_exchange_id = 8`, `USDG` settlement,
+#     `user_tier = "standard"`, `standard_zero_confirmed = true`, ticks `0/0`) -> **0.00 / 0.00 bps**.
+#   - `taker_delay_ms = 330`: matches `src/venues.rs` (`taker_delay_ms = 300 ms`) + ~30 ms Tokyo RTT.
+#   - `lighter` (`USDC`, `tgt_exchange_id = 2`) is verified `user_tier = "premium"` (`0.40 / 2.80 bps`,
+#     ticks `40/280`) and flips Track 01 negative under 5.60 bps round-trip taker fees.
+#
 # Exchange indices (`src/shm_reader.rs`): 2=Lighter, 6=Binance, 7=Arcus, 8=LighterRH.
 
 capital_usd = 10000.0
 daily_loss_limit_pct = 0.02
 allowlisted_symbols = ["ETH", "SOL"]
 
-# W19 frozen: lighter ETH <- binance (theta=6.0 bp, hold_steps=100 -> 10_000 ms, tau_s=2.0 -> 2_000 ms)
+# OPT-07 deterministic 5-state defense FSM enabled in shadow mode.
+[defense]
+min_dwell_ms = 3000
+caution_feed_staleness_ms = 2000
+reduce_only_feed_staleness_ms = 4000
+halt_feed_staleness_ms = 10000
+caution_feed_gap_ms = 2500
+reduce_only_feed_gap_ms = 5000
+halt_feed_gap_ms = 15000
+caution_vol_shock_ratio = 2.0
+reduce_only_vol_shock_ratio = 4.0
+halt_vol_shock_ratio = 8.0
+side_defense_adverse_markout_bps = 3.0
+reduce_only_adverse_markout_bps = 8.0
+caution_oracle_divergence_bps = 15.0
+reduce_only_oracle_divergence_bps = 35.0
+halt_oracle_divergence_bps = 75.0
+caution_daily_loss_utilization = 0.50
+reduce_only_daily_loss_utilization = 0.85
+halt_daily_loss_utilization = 1.00
+caution_size_scale = 0.50
+recovery_hysteresis_ratio = 0.80
+
+# W19 frozen: lighter_robinhood ETH <- binance (theta=6.0 bp, hold_steps=100 -> 10_000 ms, tau_s=2.0 -> 2_000 ms)
 [[arms]]
 symbol = "ETH"
 symbol_id = 1002
 ref_exchange_id = 6
-tgt_exchange_id = 2
+tgt_exchange_id = 8
 clip_usd = 250.0
 max_l1_depth_fraction = 0.50
 taker_fee_bps = 0.0
@@ -32,12 +64,12 @@ max_gap_ms = 30000
 [arms.strategy.exit_mode]
 kind = "taker_only"
 
-# W19 frozen: lighter SOL <- binance (theta=4.0 bp, hold_steps=30 -> 3_000 ms, tau_s=120.0 -> 120_000 ms)
+# W19 frozen: lighter_robinhood SOL <- binance (theta=4.0 bp, hold_steps=30 -> 3_000 ms, tau_s=120.0 -> 120_000 ms)
 [[arms]]
 symbol = "SOL"
 symbol_id = 1003
 ref_exchange_id = 6
-tgt_exchange_id = 2
+tgt_exchange_id = 8
 clip_usd = 250.0
 max_l1_depth_fraction = 0.50
 taker_fee_bps = 0.0

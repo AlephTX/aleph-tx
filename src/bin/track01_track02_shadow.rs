@@ -1311,7 +1311,7 @@ mode = "passive_inventory_cycle"
         )
         .unwrap();
         assert_eq!(t1["status"], "Configuration OK");
-        assert_eq!(t1["defense_enabled"], false);
+        assert_eq!(t1["defense_enabled"], true);
 
         let t2 = run_check(
             TrackKind::Track02,
@@ -1319,7 +1319,7 @@ mode = "passive_inventory_cycle"
         )
         .unwrap();
         assert_eq!(t2["status"], "Configuration OK");
-        assert_eq!(t2["defense_enabled"], false);
+        assert_eq!(t2["defense_enabled"], true);
 
         let t3_legacy = run_check(
             TrackKind::Track03,

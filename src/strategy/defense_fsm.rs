@@ -147,8 +147,8 @@ impl DefenseState {
             return 0.0;
         }
         match self {
-            Self::Caution => caution_size_scale,
-            Self::Normal | Self::SideDefense { .. } => 1.0,
+            Self::Normal => 1.0,
+            Self::Caution | Self::SideDefense { .. } => caution_size_scale,
             Self::ReduceOnly | Self::Halt => 0.0,
         }
     }
@@ -1008,5 +1008,31 @@ mod tests {
         let mut nan_vol = healthy_snapshot(1_000);
         nan_vol.vol_shock_ratio = f64::NAN;
         assert_eq!(fsm.evaluate(&nan_vol).current_state, DefenseState::Halt);
+    }
+
+    #[test]
+    fn side_defense_preserves_monotonic_caution_size_scale() {
+        let mut fsm = DefenseFsm::new(DefenseFsmConfig::default()).unwrap();
+        assert!((fsm.entry_size_scale(Some(DefenseSide::Sell)) - 1.0).abs() < 1e-12);
+
+        let mut snap = healthy_snapshot(1_000);
+        snap.vol_shock_ratio = 2.2;
+        assert_eq!(fsm.evaluate(&snap).current_state, DefenseState::Caution);
+        assert!((fsm.entry_size_scale(Some(DefenseSide::Sell)) - 0.50).abs() < 1e-12);
+
+        // Escalating Caution -> SideDefense{Buy} must never expand unblocked Sell sizing back to 1.0.
+        snap.now_ms = 1_200;
+        snap.trailing_bid_markout_bps = -3.5;
+        assert_eq!(
+            fsm.evaluate(&snap).current_state,
+            DefenseState::SideDefense {
+                blocked_side: BlockedSide::Buy,
+            }
+        );
+        assert!((fsm.entry_size_scale(Some(DefenseSide::Buy)) - 0.0).abs() < 1e-12);
+        assert!((fsm.entry_size_scale(Some(DefenseSide::Sell)) - 0.50).abs() < 1e-12);
+        assert!(fsm.permits_intent(OrderIntentClass::ReduceOnlyExit, Some(DefenseSide::Buy)));
+        assert!(fsm.permits_intent(OrderIntentClass::EmergencyHedge, Some(DefenseSide::Buy)));
+        assert!(fsm.permits_intent(OrderIntentClass::Cancel, None));
     }
 }

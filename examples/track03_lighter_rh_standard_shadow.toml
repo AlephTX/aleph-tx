@@ -1,15 +1,20 @@
 # Track 03 (`03_incentive_turnover`) Shadow Configuration: Lighter Robinhood Standard (`0/0 bps` Verified)
 #
-# Verified profile: `lighter_robinhood AAPL G4_quiet_sessions_only` (`USDG` settlement)
-# (see `docs/VERIFIED_FEE_W01_W26_THREE_TRACK_REPORT_2026_11_27.md` & `docs/CORE_ENGINEERING_DEFENSE_AND_QUOTA_UPGRADE_2026_11_27.md`).
+# Verified profile: `lighter_robinhood AAPL G5_microprice_tfi` (`USDG` settlement)
+# (see `docs/VERIFIED_FEE_W01_W26_THREE_TRACK_REPORT_2026_11_27.md`,
+# `docs/TRACK03_MICROSTRUCTURE_AND_STANDARD_LATENCY_UPGRADE_2026_11_27.md`, and
+# `docs/CORE_ENGINEERING_DEFENSE_AND_QUOTA_UPGRADE_2026_11_27.md`).
 # Strictly isolated capital ($10,000) and daily loss budget (2%); read-only shadow/replay only.
 #
 # OPT-01 VERIFIED FEE-TIER PROVENANCE (Lighter Standard vs Premium):
 #   - `lighter_robinhood` (USDG): `account_fee_status = "verified_account_tier"`,
 #     `user_tier = "standard"`, `standard_zero_confirmed = true`, ticks `0/0` -> **0.00 / 0.00 bps**.
-#   - Unlike `lighter` (USDC `user_tier = "premium"`, `0.40 / 2.80 bps`, ticks `40/280`),
-#     `lighter_robinhood` Standard preserves 0/0 bps fees at the cost of a ~200 ms speed-bump
-#     latency regime (`submit_rtt_ms = 200.0`) with higher maker latency sensitivity.
+#   - Unlike `lighter` (USDC `user_tier = "premium"`, `0.40 / 2.80 bps`, ticks `40/280`,
+#     `taker_delay_ms = 140 ms` / `cancel_delay_ms = 0 ms`), `lighter_robinhood` Standard preserves
+#     `0/0 bps` fees at the cost of a `200 ms` post-only/cancel speed bump (`submit_rtt_ms = 200.0`)
+#     and a `300 ms` non-post-only/taker delay (`ioc_exit_delay_ms = 330` incl. ~30 ms Tokyo RTT).
+#   - `G5_microprice_tfi` enabled (`microprice_alpha_weight = 0.25`, `tfi_ewma_tau_ms = 2000.0`,
+#     `tfi_skew_bps = 0.0`, `tfi_veto_threshold = 0.75`) while keeping `G7`/`G8` `reduce_only_penny_ticks = 0`.
 #   - `rebate_bps = 0.0` (conservative baseline; zero unverified rebate credit).
 #   - Cross-domain settlement note: `USDG` vs `USDC` (`arcus`); any cross-stablecoin rebalance
 #     must account for FX conversion drag separately.
@@ -56,6 +61,8 @@ queue_ahead_fraction = 0.5
 # suppress opening quotes during us_rth (13:30-20:00 UTC) while keeping reduce_only exits active.
 allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
 account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 0.50
 
 [arms.strategy]
 tick_size = 0.01
@@ -95,6 +102,11 @@ vol_spread_mult = 0.5
 directional_markout_skew_mult = 1.0
 quiet_regime_min_spread_to_vol = 0.80
 quiet_regime_max_entry_vol_bps = 1.2
+microprice_alpha_weight = 0.25
+tfi_ewma_tau_ms = 2000.0
+tfi_skew_bps = 0.0
+tfi_veto_threshold = 0.75
+reduce_only_penny_ticks = 0
 max_book_age_ms = 5000
 max_session_loss_usd = 20.0
 max_inventory_hold_ms = 15000

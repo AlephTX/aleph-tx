@@ -6,16 +6,17 @@
 #
 # OPT-01 VERIFIED FEE-TIER PROVENANCE (Lighter Standard vs Premium):
 #   - `lighter` (USDC, `user_tier=premium`, `custom_fee_override_detected=true`, ticks `40/280`):
-#     Verified **`0.40 / 2.80 bps`** (maker / taker) with low latency (~35 ms). Under `0.40 bps`
-#     maker fees, passive RWA turnover flips NO-GO (`+$92.16/M` on `lighter AAPL G4_quiet_sessions_only`,
-#     `+$98.94/M` aggregate RWA `G4_all_hours`).
-#   - Lighter Standard (`0.00 / 0.00 bps` post-switch on USDC, or verified `lighter_robinhood` USDG
-#     `user_tier=standard`, `standard_zero_confirmed=true`, ticks `0/0`):
-#     Zero maker/taker fee, BUT carries a ~200-310 ms maker/cancel speed bump with materially
-#     higher maker latency sensitivity (`submit_rtt_ms >= 200.0`, ALO flight guard, and sweep pull).
+#     Verified **`0.40 / 2.80 bps`** (maker / taker) with low latency (`140 ms` taker delay,
+#     `0 ms` maker/cancel delay per `src/venues.rs`). Under `0.40 bps` maker fees, passive RWA
+#     turnover flips NO-GO (`+$92.16/M` on `lighter AAPL G4_quiet_sessions_only`, `+$98.94/M`
+#     aggregate RWA `G4_all_hours`).
+#   - `lighter_robinhood` (USDG, `user_tier=standard`, `standard_zero_confirmed=true`, ticks `0/0`):
+#     Verified **`0.00 / 0.00 bps`** maker/taker, carrying a `200 ms` maker/cancel speed bump
+#     and `300 ms` taker/non-post-only delay (`~330 ms` exit delay incl. ~30 ms Tokyo RTT).
 #   - This legacy `lighter` USDC profile keeps `0.0 / 0.0` placeholder values with
 #     `account_fee_status = "public_tier0_unverified"` for offline regression parity only.
-#   - For the `OPT-01` verified `0/0 bps` Standard shadow profile (`lighter_robinhood` USDG), see
+#   - For the `OPT-01` verified `0/0 bps` Standard shadow profile (`lighter_robinhood` USDG,
+#     with `G5_microprice_tfi`, `ioc_exit_delay_ms = 330`, and `[defense]`), see
 #     `examples/track03_lighter_rh_standard_shadow.toml`.
 #   - `rebate_bps = 0.0` (never assume rebates without signed account verification).
 #

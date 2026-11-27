@@ -1,37 +1,71 @@
 # Track 02 (`02_hedge_arbitrage`) Shadow Configuration: Shielded Maker-Hedge
 #
-# Parameters frozen from W19 selection (see `.agent-state/research/track02_w25_shielded_regression_20261126.json`).
+# Parameters frozen from W19 selection (see `.agent-state/research/track02_w25_shielded_regression_20261126.json`)
+# and aligned to `OPT-01` verified account fee evidence (`account_fee_evidence_20261127.json`).
 # Strictly isolated capital ($20,000) and daily loss budget; read-only shadow/replay only.
-# Enforces fail-closed reference cancel shield, distinct risk domains, and Arcus level_0 fee hurdles
-# (2.30 bp crypto / 2.25 bp RWA, cross_stablecoin = false, same_risk_domain = false).
-# Exchange indices (`src/shm_reader.rs`): 2=Lighter, 6=Binance, 7=Arcus, 9=Entropy, 10=TradeXYZ.
+#
+# OPT-01 VERIFIED FEE & DOMAIN ALIGNMENT:
+#   - Maker leg: `lighter_robinhood` (`maker_exchange_id = 8`, `USDG`, `user_tier = "standard"`,
+#     ticks `0/0`) -> `maker_fee_bps = 0.0`.
+#   - Hedge leg: `arcus` (`hedge_exchange_id = 7`, `USDC`, verified `level_0` w/ 5% discount:
+#     `1.425 / 4.275 bp` Crypto, `0.00 / 2.1375 bp` RWA — correcting the prior mislabeled
+#     `2.30 bp` level_4 Crypto comment).
+#   - Settlement & domain separation: `cross_stablecoin = true` (`USDG` vs `USDC`) with explicit
+#     `cross_stablecoin_drag_bps = 1.0`, `same_risk_domain = false`. ETH/QQQ `e0_bps` &
+#     `expected_gross_edge_bps` are raised (`8.0`/`5.0` bp) so net expected edge clears
+#     `min_net_edge_bps = 0.5` under verified fees + cross-stablecoin FX drag.
+#
+# Exchange indices (`src/shm_reader.rs`): 2=Lighter, 6=Binance, 7=Arcus, 8=LighterRH, 9=Entropy, 10=TradeXYZ.
 
 capital_usd = 20000.0
 daily_loss_limit_pct = 0.02
 
-# W19 frozen: lighter>arcus ETH (e0=6.0 bp, tau_s=3600 -> 3_600_000 ms, crypto level_0 fee 2.30 bp)
+# OPT-07 deterministic 5-state defense FSM enabled in shadow mode.
+[defense]
+min_dwell_ms = 3000
+caution_feed_staleness_ms = 2000
+reduce_only_feed_staleness_ms = 4000
+halt_feed_staleness_ms = 10000
+caution_feed_gap_ms = 2500
+reduce_only_feed_gap_ms = 5000
+halt_feed_gap_ms = 15000
+caution_vol_shock_ratio = 2.0
+reduce_only_vol_shock_ratio = 4.0
+halt_vol_shock_ratio = 8.0
+side_defense_adverse_markout_bps = 3.0
+reduce_only_adverse_markout_bps = 8.0
+caution_oracle_divergence_bps = 15.0
+reduce_only_oracle_divergence_bps = 35.0
+halt_oracle_divergence_bps = 75.0
+caution_daily_loss_utilization = 0.50
+reduce_only_daily_loss_utilization = 0.85
+halt_daily_loss_utilization = 1.00
+caution_size_scale = 0.50
+recovery_hysteresis_ratio = 0.80
+
+# lighter_robinhood>arcus ETH (verified level_0 w/ 5% discount Crypto taker = 4.275 bp + 1.0 bp USDG/USDC drag)
 [[pairs]]
-label = "lighter>arcus ETH"
+label = "lighter_rh>arcus ETH"
 symbol_id = 1002
-maker_exchange_id = 2
+maker_exchange_id = 8
 hedge_exchange_id = 7
 ref_exchange_id = 6
 clip_usd = 500.0
-expected_gross_edge_bps = 6.0
+expected_gross_edge_bps = 8.0
 min_net_edge_bps = 0.5
 max_hedge_stale_ms = 5000
 require_fail_closed_shield = true
 
 [pairs.economics]
 maker_fee_bps = 0.0
-hedge_taker_fee_bps = 2.30
-cross_stablecoin_drag_bps = 0.0
+hedge_taker_fee_bps = 4.275
+cross_stablecoin_drag_bps = 1.0
 expected_hedge_slip_bps = 1.42
-cross_stablecoin = false
+cross_stablecoin = true
 same_risk_domain = false
 
 [pairs.strategy]
-e0_bps = 6.0
+e0_bps = 8.0
 skew_bps_per_clip = 0.5
 q_max_clips = 4.0
 tau_ms = 3600000
@@ -49,29 +83,29 @@ lookback_ms = 200
 allow_reduce_only_through_shield = false
 fail_closed_when_unready = true
 
-# W19 frozen: lighter>arcus QQQ (e0=4.0 bp, tau_s=3600 -> 3_600_000 ms, RWA level_0 fee 2.25 bp)
+# lighter_robinhood>arcus QQQ (verified level_0 w/ 5% discount RWA taker = 2.1375 bp + 1.0 bp USDG/USDC drag)
 [[pairs]]
-label = "lighter>arcus QQQ"
+label = "lighter_rh>arcus QQQ"
 symbol_id = 1004
-maker_exchange_id = 2
+maker_exchange_id = 8
 hedge_exchange_id = 7
 ref_exchange_id = 10
 clip_usd = 500.0
-expected_gross_edge_bps = 4.0
+expected_gross_edge_bps = 5.0
 min_net_edge_bps = 0.5
 max_hedge_stale_ms = 5000
 require_fail_closed_shield = true
 
 [pairs.economics]
 maker_fee_bps = 0.0
-hedge_taker_fee_bps = 2.25
-cross_stablecoin_drag_bps = 0.0
+hedge_taker_fee_bps = 2.1375
+cross_stablecoin_drag_bps = 1.0
 expected_hedge_slip_bps = 0.97
-cross_stablecoin = false
+cross_stablecoin = true
 same_risk_domain = false
 
 [pairs.strategy]
-e0_bps = 4.0
+e0_bps = 5.0
 skew_bps_per_clip = 0.5
 q_max_clips = 4.0
 tau_ms = 3600000
@@ -89,11 +123,11 @@ lookback_ms = 200
 allow_reduce_only_through_shield = false
 fail_closed_when_unready = true
 
-# W19 frozen: lighter>arcus NVDA (e0=6.0 bp, tau_s=600 -> 600_000 ms, shield_bps=4.0, RWA level_0 fee 2.25 bp)
+# lighter_robinhood>arcus NVDA (verified level_0 w/ 5% discount RWA taker = 2.1375 bp + 1.0 bp USDG/USDC drag)
 [[pairs]]
-label = "lighter>arcus NVDA"
+label = "lighter_rh>arcus NVDA"
 symbol_id = 1005
-maker_exchange_id = 2
+maker_exchange_id = 8
 hedge_exchange_id = 7
 ref_exchange_id = 10
 clip_usd = 500.0
@@ -104,10 +138,10 @@ require_fail_closed_shield = true
 
 [pairs.economics]
 maker_fee_bps = 0.0
-hedge_taker_fee_bps = 2.25
-cross_stablecoin_drag_bps = 0.0
+hedge_taker_fee_bps = 2.1375
+cross_stablecoin_drag_bps = 1.0
 expected_hedge_slip_bps = 1.20
-cross_stablecoin = false
+cross_stablecoin = true
 same_risk_domain = false
 
 [pairs.strategy]
