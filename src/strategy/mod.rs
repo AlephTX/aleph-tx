@@ -6,6 +6,7 @@ pub mod cross_sectional;
 pub mod cross_venue;
 pub mod cross_venue_router;
 pub mod defense_fsm;
+pub mod funding_basis_carry;
 pub mod glft;
 pub mod hybrid_exit;
 pub mod inventory_neutral_mm;
