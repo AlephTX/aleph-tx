@@ -71,6 +71,10 @@ path = "src/bin/venue_mm_calibrator.rs"
 name = "track01_track02_shadow"
 path = "src/bin/track01_track02_shadow.rs"
 
+[[bin]]
+name = "arcus_rh_turnover"
+path = "src/bin/arcus_rh_turnover.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

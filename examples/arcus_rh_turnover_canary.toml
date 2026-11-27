@@ -1,0 +1,83 @@
+# Method 2 (法2): Arcus Passive PostOnly Maker (0.00 bps) x Lighter-RH Standard Taker Hedge (0.00 bps)
+#
+# FAIL-CLOSED CANARY DEFAULTS:
+#   - `dry_run = true` and `live_enabled = false` by default.
+#   - `--canary` additionally requires explicit `--confirm-live-canary`, clean intent journal,
+#     verified Robinhood Chain (`chain_id = 466324`) Standard tier, and active Arcus CancelLease.
+#   - Tiny small-capital sizing: $100 clip, $200 max inventory, $25 daily loss cap ($500 capital @ 5%).
+#   - Mandatory non-zero Lighter-RH taker hedge delay (`hedge_delay_ms = 330`).
+#
+# Exchange indices (`src/shm_reader.rs`): 7 = Arcus, 8 = LighterRH.
+
+network = "mainnet"
+symbol = "NVDA"
+arcus_symbol = "NVDA-USD"
+lighter_rh_market_id = 15
+symbol_id = 1005
+arcus_exchange_id = 7
+lighter_rh_exchange_id = 8
+
+# Fail-closed safety gates (keep true / false for --check, --replay, --shadow, --canary-preflight)
+dry_run = true
+live_enabled = false
+require_arcus_cancel_lease = true
+
+# Instrument & small-capital risk limits
+tick_size = 0.01
+lot_size = 0.01
+min_order_size = 0.01
+min_notional_usd = 10.0
+clip_usd = 100.0
+max_inventory_usd = 200.0
+allocated_capital_usd = 500.0
+daily_loss_limit_pct = 0.05
+max_daily_loss_usd = 25.0
+
+# Verified fee & FX assumptions (OPT-01)
+# Arcus RWA Level 0 w/ 5% discount = 0.00 / 2.1375 bps; Lighter-RH Standard = 0.00 / 0.00 bps (USDG)
+arcus_maker_fee_bps = 0.0
+arcus_taker_fee_bps = 2.1375
+rh_taker_fee_bps = 0.0
+fx_drag_bps = 1.0
+
+# Quoting & zero-points turnover calibration
+entry_edge_bps = 0.0
+lead_beta = 0.50
+microprice_alpha_weight = 0.25
+basis_ewma_tau_ms = 120000.0
+lead_ewma_tau_ms = 1500.0
+max_lead_shift_bps = 5.0
+inventory_skew_bps = 1.5
+max_improve_ticks = 1
+requote_threshold_ticks = 1
+
+# Non-zero P0 latencies (ms)
+hedge_delay_ms = 330
+submit_rtt_ms = 50
+cancel_rtt_ms = 50
+hedge_slippage_bps = 5.0
+max_book_age_ms = 2000
+max_venue_clock_skew_ms = 2000
+poll_interval_ms = 100
+
+# Circuit breakers & orphan protection
+max_consecutive_hedge_failures = 3
+max_orphan_retries = 3
+max_orphan_notional_usd = 150.0
+max_usdg_usdc_divergence_bps = 30.0
+max_peg_age_ms = 60000
+require_fresh_usdg_usdc_peg = false
+max_cost_per_million_usd = 5.0
+min_cost_breaker_volume_usd = 1000.0
+
+# Replay realism
+max_l1_depth_fraction = 0.50
+queue_ahead_fraction = 0.50
+
+# Optional SHM BBO matrix feed (falls back cleanly to public REST when absent)
+shm_enabled = false
+bbo_shm_path = "/dev/shm/aleph-matrix"
+
+# Durable restart-barrier state paths (kept outside Git)
+journal_path = "state/arcus_rh_turnover_journal.ndjson"
+daily_loss_state_path = "state/arcus_rh_turnover_daily_loss.json"
