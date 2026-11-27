@@ -535,10 +535,14 @@ fn run_shm(
                     let now_ms = unix_ms()?;
                     match decode_shm_slot(&slots, ref_exch, symbol_id) {
                         ShmSlotDecode::Valid(ref_slot) => {
-                            session.on_reference_mid(
+                            let _ = session.on_reference_touch(
                                 symbol_id,
                                 now_ms,
-                                0.5 * (ref_slot.bid + ref_slot.ask),
+                                MakerTouch {
+                                    bid: ref_slot.bid,
+                                    ask: ref_slot.ask,
+                                    recv_ms: ref_slot.recv_ms,
+                                },
                             );
                         }
                         ShmSlotDecode::InvalidOrCrossed => {

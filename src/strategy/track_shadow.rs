@@ -589,7 +589,7 @@ impl Track01ShadowSession {
                 tgt_touch.recv_ms,
                 max_tgt_age_ms,
             );
-            if tgt_touch.valid() && tgt_obs != FeedObservation::ClockRegressed {
+            if tgt_obs == FeedObservation::Fresh {
                 arm.last_tgt_touch = Some(tgt_touch);
             }
             (ref_obs, tgt_obs)
@@ -634,6 +634,8 @@ impl Track01ShadowSession {
                     .min(arm.cfg.max_l1_depth_fraction * entry_l1_usd);
                 let notional = capped * risk_scale;
                 if self.halted
+                    || ref_obs != FeedObservation::Fresh
+                    || tgt_obs != FeedObservation::Fresh
                     || !tgt_touch.valid()
                     || !entry_l1_usd.is_finite()
                     || entry_l1_usd <= 0.0
@@ -649,13 +651,18 @@ impl Track01ShadowSession {
                 }
             }
             LeadLagAction::Exit { .. } => {
-                if tgt_touch.valid() {
+                if tgt_obs == FeedObservation::Fresh && tgt_touch.valid() {
                     arm.exit(tgt_touch);
                     // Shadow execution immediately confirms flat via authoritative exit fill hook.
                     arm.engine.notify_exit_filled();
                 } else if arm.open_pos.is_none() {
                     // Resynchronize cleanly if somehow out of sync with no shadow position open.
                     arm.engine.clear_position();
+                } else {
+                    arm.blocks += 1;
+                    emitted = LeadLagAction::Blocked(
+                        crate::strategy::lead_lag_taker::LeadLagBlock::StaleTarget,
+                    );
                 }
             }
             LeadLagAction::Blocked(_) => {
@@ -1028,6 +1035,7 @@ struct Track02PairRuntime {
     latest_quotes: Option<MakerHedgeQuotes>,
     last_maker_touch: Option<MakerTouch>,
     last_hedge_touch: Option<MakerTouch>,
+    last_ref_sample: Option<(u64, f64)>,
     maker_feed: VenueFeedTracker,
     hedge_feed: VenueFeedTracker,
     ref_feed: VenueFeedTracker,
@@ -1147,6 +1155,7 @@ impl Track02ShadowSession {
                 latest_quotes: None,
                 last_maker_touch: None,
                 last_hedge_touch: None,
+                last_ref_sample: None,
                 maker_feed: VenueFeedTracker::new(pair_cfg.maker_exchange_id),
                 hedge_feed: VenueFeedTracker::new(pair_cfg.hedge_exchange_id),
                 ref_feed: VenueFeedTracker::new(pair_cfg.ref_exchange_id),
@@ -1265,6 +1274,42 @@ impl Track02ShadowSession {
             .observe(now_ms, ref_mid, pair.cfg.strategy.max_gap_ms);
     }
 
+    /// Feed a timestamped external reference BBO snapshot into the pair's cancel shield.
+    ///
+    /// Rejects stale, future, clock-regressed, or crossed reference books without advancing the
+    /// shield clock with wall time, and deduplicates unchanged `(recv_ms, mid)` SHM snapshots so
+    /// faster-ticking maker/hedge feeds cannot evict crash history from `REF_RING_CAP`.
+    pub fn on_reference_touch(
+        &mut self,
+        symbol_id: u16,
+        now_ms: u64,
+        ref_touch: MakerTouch,
+    ) -> bool {
+        let Some(&idx) = self.pair_by_symbol_id.get(&symbol_id) else {
+            return false;
+        };
+        let pair = &mut self.pairs[idx];
+        let obs = pair.ref_feed.observe_bbo(
+            now_ms,
+            ref_touch.bid,
+            ref_touch.ask,
+            ref_touch.recv_ms,
+            pair.cfg.strategy.max_book_age_ms,
+        );
+        if obs != FeedObservation::Fresh {
+            return false;
+        }
+        let ref_mid = ref_touch.mid();
+        if pair.last_ref_sample == Some((ref_touch.recv_ms, ref_mid)) {
+            return false;
+        }
+        pair.last_ref_sample = Some((ref_touch.recv_ms, ref_mid));
+        pair.quoter.observe_reference(ref_touch.recv_ms, ref_mid);
+        pair.ref_tracker
+            .observe(ref_touch.recv_ms, ref_mid, pair.cfg.strategy.max_gap_ms);
+        true
+    }
+
     /// Update maker/hedge quotes from the latest books and enforce daily loss limits.
     pub fn on_pair_books(
         &mut self,
@@ -1294,10 +1339,10 @@ impl Track02ShadowSession {
                 hedge.recv_ms,
                 max_book_age_ms,
             );
-            if valid_bid_ask(maker.bid, maker.ask) && maker_obs != FeedObservation::ClockRegressed {
+            if maker_obs == FeedObservation::Fresh {
                 pair.last_maker_touch = Some(maker);
             }
-            if valid_bid_ask(hedge.bid, hedge.ask) && hedge_obs != FeedObservation::ClockRegressed {
+            if hedge_obs == FeedObservation::Fresh {
                 pair.last_hedge_touch = Some(hedge);
             }
             (maker_obs, hedge_obs)
@@ -2674,5 +2719,161 @@ mod tests {
         assert_eq!(rep.pairs[0].ref_feed.clock_regression_drops, 1);
         assert_eq!(rep.pairs[0].ref_feed.max_gap_ms, 400);
         assert_eq!(rep.venue_feed_health.len(), 3);
+    }
+
+    #[test]
+    fn track02_on_reference_touch_rejects_stale_and_deduplicates_frozen_shm_slot() {
+        let mut s = Track02ShadowSession::new(t2_cfg(), utc_day_from_ms(10_000)).unwrap();
+        let day = utc_day_from_ms(10_000);
+        let mut t = 10_000_u64;
+        for _ in 0..14 {
+            let _ = s
+                .on_pair_books(
+                    1002,
+                    t,
+                    mk_touch(99.99, 100.01, t),
+                    mk_touch(99.99, 100.01, t),
+                    day,
+                )
+                .unwrap();
+            t += 100;
+        }
+        assert!(s.on_reference_touch(1002, t, mk_touch(99.99, 100.01, t)));
+        t += 100;
+        // Sharp -5 bps move triggers pre-fill cancel shield on the bid leg.
+        let frozen_crash_touch = mk_touch(99.94, 99.96, t);
+        assert!(s.on_reference_touch(1002, t, frozen_crash_touch));
+
+        // 80 faster maker/hedge wakeups repeating the identical SHM ref slot must deduplicate
+        // without evicting the earlier reference sample from REF_RING_CAP (= 64).
+        for step in 1..=80_u64 {
+            assert!(!s.on_reference_touch(1002, t + step, frozen_crash_touch));
+        }
+        let q_shielded = s
+            .on_pair_books(
+                1002,
+                t + 80,
+                mk_touch(99.99, 100.01, t + 80),
+                mk_touch(99.99, 100.01, t + 80),
+                day,
+            )
+            .unwrap()
+            .expect("pair should emit protected ask quote");
+        assert!(q_shielded.bid.is_none());
+        assert!(q_shielded.ask.is_some());
+
+        // Once now_ms - ref_recv_ms exceeds max_book_age_ms (5_000), frozen SHM ref must be
+        // rejected as stale rather than stamped with now_ms -> fail-closed withdraws both legs.
+        let stale_now = t + 5_001;
+        assert!(!s.on_reference_touch(1002, stale_now, frozen_crash_touch));
+        let q_expired = s
+            .on_pair_books(
+                1002,
+                stale_now,
+                mk_touch(99.99, 100.01, stale_now),
+                mk_touch(99.99, 100.01, stale_now),
+                day,
+            )
+            .unwrap()
+            .expect("pair should emit empty quotes when ref shield expires fail-closed");
+        assert!(q_expired.bid.is_none());
+        assert!(q_expired.ask.is_none());
+        let rep = s.report();
+        assert_eq!(rep.pairs[0].ref_feed.stale_book_drops, 1);
+    }
+
+    #[test]
+    fn track01_stale_or_regressed_target_never_overwrites_mtm_or_fills_exit() {
+        let mut s = Track01ShadowSession::new(t1_cfg(), utc_day_from_ms(1_000)).unwrap();
+        let mut t = 1_000_u64;
+        for _ in 0..15 {
+            let _ = s
+                .on_bbo_pair(
+                    1002,
+                    t,
+                    ll_touch(99.99, 100.01, t),
+                    ll_touch(99.99, 100.01, t),
+                    10.0,
+                    10.0,
+                    utc_day_from_ms(t),
+                )
+                .unwrap();
+            t += 100;
+        }
+        assert!(matches!(
+            s.on_bbo_pair(
+                1002,
+                t,
+                ll_touch(100.09, 100.11, t),
+                ll_touch(99.99, 100.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(t),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Enter {
+                side: LeadLagSide::Long,
+                ..
+            })
+        ));
+        let baseline_unrealized = s.report().unrealized_pnl_usd;
+
+        // Stale target quote beyond exit_due_ms & max_tgt_age_ms must not overwrite MTM or fill exit.
+        let stale_now = t + 6_000;
+        assert!(matches!(
+            s.on_bbo_pair(
+                1002,
+                stale_now,
+                ll_touch(100.09, 100.11, stale_now),
+                ll_touch(199.99, 200.01, t),
+                10.0,
+                10.0,
+                utc_day_from_ms(stale_now),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Blocked(_))
+        ));
+        assert_eq!(s.report().trades, 0);
+        assert_eq!(s.report().arms[0].tgt_feed.stale_book_drops, 1);
+        assert!((s.report().unrealized_pnl_usd - baseline_unrealized).abs() < 1e-12);
+
+        // Clock-regressed target quote must also fail closed without mutating MTM or position.
+        let regr_now = stale_now + 100;
+        assert!(matches!(
+            s.on_bbo_pair(
+                1002,
+                regr_now,
+                ll_touch(100.09, 100.11, regr_now),
+                ll_touch(299.99, 300.01, t - 10),
+                10.0,
+                10.0,
+                utc_day_from_ms(regr_now),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Blocked(_))
+        ));
+        assert_eq!(s.report().trades, 0);
+        assert_eq!(s.report().arms[0].tgt_feed.clock_regression_drops, 1);
+        assert!((s.report().unrealized_pnl_usd - baseline_unrealized).abs() < 1e-12);
+
+        // Fresh advancing target touch completes the exit cleanly.
+        let exit_now = regr_now + 100;
+        assert_eq!(
+            s.on_bbo_pair(
+                1002,
+                exit_now,
+                ll_touch(100.09, 100.11, exit_now),
+                ll_touch(100.09, 100.11, exit_now),
+                10.0,
+                10.0,
+                utc_day_from_ms(exit_now),
+            )
+            .unwrap(),
+            Some(LeadLagAction::Exit {
+                side: LeadLagSide::Long
+            })
+        );
+        assert_eq!(s.report().trades, 1);
+        assert!(s.report().arms[0].open_side.is_none());
     }
 }
