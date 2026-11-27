@@ -41,6 +41,19 @@ impl Touch {
     pub fn mid(&self) -> f64 {
         0.5 * (self.bid + self.ask)
     }
+
+    /// L1 size-weighted microprice `(bid * ask_sz + ask * bid_sz) / (bid_sz + ask_sz)`,
+    /// falling back to [`Self::mid`] if sizes are missing or non-positive.
+    pub fn microprice(&self, bid_sz: f64, ask_sz: f64) -> f64 {
+        if self.valid() && bid_sz.is_finite() && ask_sz.is_finite() && bid_sz > 0.0 && ask_sz > 0.0
+        {
+            let tot = bid_sz + ask_sz;
+            if tot > 0.0 && tot.is_finite() {
+                return (self.bid * ask_sz + self.ask * bid_sz) / tot;
+            }
+        }
+        self.mid()
+    }
 }
 
 /// Why no quotes were produced.
@@ -202,6 +215,25 @@ pub struct MakerHedgeQuoterConfig {
     /// Minimum opposite-side hedge BBO L1 notional (`bid * bid_sz` for maker bid,
     /// `ask * ask_sz` for maker ask) required before quoting opening size, USD (`>= 0`). Default `0.0` (off).
     pub min_hedge_l1_notional_usd: f64,
+    /// Minimum favorable basis z-score `|(b - fair) * 1e4| / max(basis_sigma_bps, basis_vol_floor_bps)`
+    /// required to open new inventory (`>= 0.0`). Default `0.0` (off). Never blocks reduce-only exits.
+    pub min_basis_zscore: f64,
+    /// Volatility floor in bps used in the denominator of basis z-score and drift-to-vol ratio (`>= 0.0`).
+    /// Default `0.0`.
+    pub basis_vol_floor_bps: f64,
+    /// Maximum allowed trend drift-to-volatility ratio `|(fast_fair - fair) * 1e4| / denom_bps`
+    /// for opening quotes (`>= 0.0`). Default `0.0` (off). Never blocks reduce-only exits.
+    pub max_drift_to_vol_ratio: f64,
+    /// When `true`, quote only the statistically favorable mean-reverting opening side
+    /// (`bid` when `b < fair`, `ask` when `b > fair`) while keeping reduce-only exits active.
+    /// Default `false`.
+    pub quote_favorable_side_only: bool,
+    /// Anchor basis computation `b = ln(maker_anchor) - ln(hedge_anchor)` on L1 microprice
+    /// instead of simple mid when L1 sizes are supplied via [`MakerHedgeQuoter::step_with_l1_microprice`].
+    /// Default `false`.
+    pub use_microprice_anchor: bool,
+    /// Optional passive-first-then-IOC hedge execution controller config (default-off).
+    pub passive_hedge: PassiveHedgeConfig,
 }
 
 impl Default for MakerHedgeQuoterConfig {
@@ -224,6 +256,12 @@ impl Default for MakerHedgeQuoterConfig {
             basis_drift_guard_bps: 0.0,
             basis_drift_tau_ms: 5_000,
             min_hedge_l1_notional_usd: 0.0,
+            min_basis_zscore: 0.0,
+            basis_vol_floor_bps: 0.0,
+            max_drift_to_vol_ratio: 0.0,
+            quote_favorable_side_only: false,
+            use_microprice_anchor: false,
+            passive_hedge: PassiveHedgeConfig::default(),
         }
     }
 }
@@ -282,7 +320,238 @@ impl MakerHedgeQuoterConfig {
             self.min_hedge_l1_notional_usd.is_finite() && self.min_hedge_l1_notional_usd >= 0.0,
             "min_hedge_l1_notional_usd must be finite and >= 0"
         );
+        ensure!(
+            self.min_basis_zscore.is_finite() && self.min_basis_zscore >= 0.0,
+            "min_basis_zscore must be finite and >= 0"
+        );
+        ensure!(
+            self.basis_vol_floor_bps.is_finite() && self.basis_vol_floor_bps >= 0.0,
+            "basis_vol_floor_bps must be finite and >= 0"
+        );
+        ensure!(
+            self.max_drift_to_vol_ratio.is_finite() && self.max_drift_to_vol_ratio >= 0.0,
+            "max_drift_to_vol_ratio must be finite and >= 0"
+        );
+        self.passive_hedge.validate()?;
         Ok(())
+    }
+}
+
+/// Execution mode chosen by [`evaluate_passive_hedge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum HedgeExecutionMode {
+    /// Rest a passive `reduce_only` limit order at the hedge venue touch.
+    RestPassive,
+    /// Cross the hedge venue spread immediately with an IOC/taker order.
+    CrossIoc,
+    /// Fail closed: halt hedge dispatch on invalid, stale, or regressed hedge book.
+    FailClosedHalt,
+}
+
+/// Configuration for [`evaluate_passive_hedge`] (default-off).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PassiveHedgeConfig {
+    /// Enable passive-first hedge resting before IOC escalation (default `false`).
+    pub enabled: bool,
+    /// Maximum milliseconds to rest passively at hedge touch before escalating to `CrossIoc` (`> 0`).
+    pub max_passive_hedge_ms: u64,
+    /// Immediate IOC escalation threshold on adverse hedge move from anchor, bps (`> 0`).
+    pub hazard_ioc_adverse_bps: f64,
+    /// Maximum allowed hedge book age before [`HedgeExecutionMode::FailClosedHalt`], ms (`> 0`).
+    pub max_hedge_book_age_ms: u64,
+    /// Hedge venue tick size (`> 0`).
+    pub tick_size: f64,
+    /// Improve passive hedge touch by one tick when spread > 1.5 ticks (`false` = join).
+    pub improve_one_tick: bool,
+    /// Enforce `reduce_only = true` on passive hedge orders (`true` by default).
+    pub reduce_only: bool,
+}
+
+impl Default for PassiveHedgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_passive_hedge_ms: 1_500,
+            hazard_ioc_adverse_bps: 2.0,
+            max_hedge_book_age_ms: 5_000,
+            tick_size: 0.01,
+            improve_one_tick: false,
+            reduce_only: true,
+        }
+    }
+}
+
+impl PassiveHedgeConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_passive_hedge_ms > 0,
+            "passive_hedge.max_passive_hedge_ms must be > 0"
+        );
+        ensure!(
+            self.hazard_ioc_adverse_bps.is_finite() && self.hazard_ioc_adverse_bps > 0.0,
+            "passive_hedge.hazard_ioc_adverse_bps must be finite and > 0"
+        );
+        ensure!(
+            self.max_hedge_book_age_ms > 0,
+            "passive_hedge.max_hedge_book_age_ms must be > 0"
+        );
+        ensure!(
+            self.tick_size.is_finite() && self.tick_size > 0.0,
+            "passive_hedge.tick_size must be finite and > 0"
+        );
+        Ok(())
+    }
+}
+
+/// State of an active hedge leg evaluated by [`evaluate_passive_hedge`].
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct PassiveHedgeState {
+    pub fill_side: FillSide,
+    pub started_ms: u64,
+    pub last_eval_ms: u64,
+    pub last_hedge_recv_ms: u64,
+    pub anchor_hedge_mid: f64,
+    pub remaining_qty: f64,
+    pub mode: HedgeExecutionMode,
+}
+
+impl PassiveHedgeState {
+    /// Initialize a passive-first hedge state at `started_ms` from the hedge touch at fill time.
+    pub fn new(
+        fill_side: FillSide,
+        started_ms: u64,
+        initial_hedge: Touch,
+        remaining_qty: f64,
+    ) -> Result<Self> {
+        ensure!(initial_hedge.valid(), "initial_hedge touch must be valid");
+        ensure!(
+            initial_hedge.recv_ms <= started_ms,
+            "initial_hedge.recv_ms cannot be in the future"
+        );
+        ensure!(
+            remaining_qty.is_finite() && remaining_qty > 0.0,
+            "remaining_qty must be finite and > 0"
+        );
+        Ok(Self {
+            fill_side,
+            started_ms,
+            last_eval_ms: started_ms,
+            last_hedge_recv_ms: initial_hedge.recv_ms,
+            anchor_hedge_mid: initial_hedge.mid(),
+            remaining_qty,
+            mode: HedgeExecutionMode::RestPassive,
+        })
+    }
+}
+
+/// Action returned by [`evaluate_passive_hedge`].
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct PassiveHedgeDecision {
+    pub mode: HedgeExecutionMode,
+    pub limit_px: Option<f64>,
+    pub reduce_only: bool,
+    pub adverse_move_bps: f64,
+    pub elapsed_ms: u64,
+}
+
+/// Evaluate whether to rest a `reduce_only` passive hedge at hedge touch, escalate to `CrossIoc`
+/// on adverse move (`>= hazard_ioc_adverse_bps`) or timeout (`>= max_passive_hedge_ms`), or
+/// fail closed (`FailClosedHalt`) on invalid, stale, or timestamp-regressed hedge books.
+pub fn evaluate_passive_hedge(
+    cfg: &PassiveHedgeConfig,
+    state: &mut PassiveHedgeState,
+    now_ms: u64,
+    hedge: Touch,
+) -> PassiveHedgeDecision {
+    let elapsed_ms = now_ms.saturating_sub(state.started_ms);
+    let invalid_state = cfg.validate().is_err()
+        || !state.anchor_hedge_mid.is_finite()
+        || state.anchor_hedge_mid <= 0.0
+        || !state.remaining_qty.is_finite()
+        || state.remaining_qty <= 0.0;
+    let bad_clock = now_ms < state.last_eval_ms || now_ms < state.started_ms;
+    let bad_book = !hedge.valid()
+        || hedge.recv_ms > now_ms
+        || hedge.recv_ms < state.last_hedge_recv_ms
+        || now_ms - hedge.recv_ms > cfg.max_hedge_book_age_ms;
+
+    if state.mode == HedgeExecutionMode::FailClosedHalt || invalid_state || bad_clock || bad_book {
+        state.mode = HedgeExecutionMode::FailClosedHalt;
+        return PassiveHedgeDecision {
+            mode: HedgeExecutionMode::FailClosedHalt,
+            limit_px: None,
+            reduce_only: cfg.reduce_only,
+            adverse_move_bps: f64::NAN,
+            elapsed_ms,
+        };
+    }
+
+    state.last_eval_ms = now_ms;
+    state.last_hedge_recv_ms = hedge.recv_ms;
+
+    let mid = hedge.mid();
+    let adverse_move_bps = match state.fill_side {
+        // MakerBought -> short hedge (sell): adverse when hedge drops.
+        FillSide::MakerBought => (1.0 - mid / state.anchor_hedge_mid) * 1e4,
+        // MakerSold -> long hedge (buy): adverse when hedge rallies.
+        FillSide::MakerSold => (mid / state.anchor_hedge_mid - 1.0) * 1e4,
+    };
+
+    let cross_px = match state.fill_side {
+        FillSide::MakerBought => hedge.bid,
+        FillSide::MakerSold => hedge.ask,
+    };
+
+    if !cfg.enabled || state.mode == HedgeExecutionMode::CrossIoc {
+        state.mode = HedgeExecutionMode::CrossIoc;
+        return PassiveHedgeDecision {
+            mode: HedgeExecutionMode::CrossIoc,
+            limit_px: Some(cross_px),
+            reduce_only: cfg.reduce_only,
+            adverse_move_bps,
+            elapsed_ms,
+        };
+    }
+
+    if elapsed_ms >= cfg.max_passive_hedge_ms || adverse_move_bps >= cfg.hazard_ioc_adverse_bps {
+        state.mode = HedgeExecutionMode::CrossIoc;
+        return PassiveHedgeDecision {
+            mode: HedgeExecutionMode::CrossIoc,
+            limit_px: Some(cross_px),
+            reduce_only: cfg.reduce_only,
+            adverse_move_bps,
+            elapsed_ms,
+        };
+    }
+
+    let tick = cfg.tick_size;
+    let can_improve = cfg.improve_one_tick && (hedge.ask - hedge.bid) > 1.5 * tick;
+    let passive_px = match state.fill_side {
+        FillSide::MakerBought => {
+            let px = if can_improve {
+                ((hedge.ask - tick) / tick + TICK_EPS).floor() * tick
+            } else {
+                hedge.ask
+            };
+            if px > hedge.bid { px } else { hedge.ask }
+        }
+        FillSide::MakerSold => {
+            let px = if can_improve {
+                ((hedge.bid + tick) / tick - TICK_EPS).ceil() * tick
+            } else {
+                hedge.bid
+            };
+            if px < hedge.ask { px } else { hedge.bid }
+        }
+    };
+
+    PassiveHedgeDecision {
+        mode: HedgeExecutionMode::RestPassive,
+        limit_px: Some(passive_px),
+        reduce_only: cfg.reduce_only,
+        adverse_move_bps,
+        elapsed_ms,
     }
 }
 
@@ -411,7 +680,7 @@ impl MakerHedgeQuoter {
         hedge: Touch,
         inventory_clips: f64,
     ) -> std::result::Result<MakerHedgeQuotes, QuoteBlock> {
-        self.step_inner(now_ms, maker, hedge, None, inventory_clips)
+        self.step_inner(now_ms, maker, None, hedge, None, inventory_clips)
     }
 
     /// Quote with explicit hedge BBO L1 sizes (`hedge_bid_sz`, `hedge_ask_sz`) so
@@ -429,6 +698,32 @@ impl MakerHedgeQuoter {
         self.step_inner(
             now_ms,
             maker,
+            None,
+            hedge,
+            Some((hedge_bid_sz, hedge_ask_sz)),
+            inventory_clips,
+        )
+    }
+
+    /// Quote with explicit maker and hedge L1 sizes, anchoring the basis on L1 microprice
+    /// when [`MakerHedgeQuoterConfig::use_microprice_anchor`] is `true` while also enforcing
+    /// [`MakerHedgeQuoterConfig::min_hedge_l1_notional_usd`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_l1_microprice(
+        &mut self,
+        now_ms: u64,
+        maker: Touch,
+        maker_bid_sz: f64,
+        maker_ask_sz: f64,
+        hedge: Touch,
+        hedge_bid_sz: f64,
+        hedge_ask_sz: f64,
+        inventory_clips: f64,
+    ) -> std::result::Result<MakerHedgeQuotes, QuoteBlock> {
+        self.step_inner(
+            now_ms,
+            maker,
+            Some((maker_bid_sz, maker_ask_sz)),
             hedge,
             Some((hedge_bid_sz, hedge_ask_sz)),
             inventory_clips,
@@ -439,6 +734,7 @@ impl MakerHedgeQuoter {
         &mut self,
         now_ms: u64,
         maker: Touch,
+        maker_l1: Option<(f64, f64)>,
         hedge: Touch,
         hedge_l1: Option<(f64, f64)>,
         inventory_clips: f64,
@@ -462,7 +758,20 @@ impl MakerHedgeQuoter {
         if now_ms - hedge.recv_ms > self.cfg.max_book_age_ms {
             return Err(QuoteBlock::StaleHedge);
         }
-        let b = maker.mid().ln() - hedge.mid().ln();
+        let (maker_anchor, hedge_anchor) = if self.cfg.use_microprice_anchor {
+            let ma = match maker_l1 {
+                Some((bs, as_)) => maker.microprice(bs, as_),
+                None => maker.mid(),
+            };
+            let ha = match hedge_l1 {
+                Some((bs, as_)) => hedge.microprice(bs, as_),
+                None => hedge.mid(),
+            };
+            (ma, ha)
+        } else {
+            (maker.mid(), hedge.mid())
+        };
+        let b = maker_anchor.ln() - hedge_anchor.ln();
         let gap = self.last_ms.map(|l| now_ms - l);
         let (prior, prior_var, prior_fast) = match (self.fair, gap) {
             (Some(f), Some(g)) if g <= self.cfg.max_gap_ms => {
@@ -599,14 +908,54 @@ impl MakerHedgeQuoter {
             (false, false)
         };
 
+        // Selective Basis Z-Score & Stationarity Gate (opening sides only; never blocks reduce-only).
+        let disloc_bps = (b - fair) * 1e4;
+        let denom_bps = basis_sigma_bps.max(c.basis_vol_floor_bps);
+        let z_ready = denom_bps.is_finite() && denom_bps > 1e-9;
+
+        let nonstationary = if c.max_drift_to_vol_ratio > 0.0 {
+            match (prior_fast_fair, z_ready) {
+                (Some(ff), true) => {
+                    let trend_bps = (ff - fair).abs() * 1e4;
+                    (trend_bps / denom_bps) > c.max_drift_to_vol_ratio
+                }
+                _ => true,
+            }
+        } else {
+            false
+        };
+
+        let (z_block_bid, z_block_ask) = if c.min_basis_zscore > 0.0 {
+            if !z_ready {
+                (q >= 0.0, q <= 0.0)
+            } else {
+                let z = disloc_bps / denom_bps;
+                (
+                    q >= 0.0 && z > -c.min_basis_zscore,
+                    q <= 0.0 && z < c.min_basis_zscore,
+                )
+            }
+        } else if c.quote_favorable_side_only {
+            (q >= 0.0 && disloc_bps >= 0.0, q <= 0.0 && disloc_bps <= 0.0)
+        } else {
+            (false, false)
+        };
+
+        let stationarity_block_bid = nonstationary && q >= 0.0;
+        let stationarity_block_ask = nonstationary && q <= 0.0;
+
         let block_bid = (raw_block_bid
             && !(c.ref_shield.allow_reduce_only_through_shield && q < 0.0))
             || drift_block_bid
-            || l1_block_bid;
+            || l1_block_bid
+            || z_block_bid
+            || stationarity_block_bid;
         let block_ask = (raw_block_ask
             && !(c.ref_shield.allow_reduce_only_through_shield && q > 0.0))
             || drift_block_ask
-            || l1_block_ask;
+            || l1_block_ask
+            || z_block_ask
+            || stationarity_block_ask;
 
         let mut bid = None;
         if q < c.q_max_clips && !block_bid {
@@ -1397,5 +1746,302 @@ mod tests {
             .unwrap();
         assert_eq!(no_l1.bid, None);
         assert_eq!(no_l1.ask, None);
+    }
+
+    #[test]
+    fn selective_zscore_quotes_only_favorable_side_and_keeps_reduce_only_open() {
+        let mut q = MakerHedgeQuoter::new(MakerHedgeQuoterConfig {
+            e0_bps: 1.0,
+            min_basis_zscore: 2.0,
+            basis_vol_floor_bps: 2.0,
+            basis_vol_tau_ms: 5_000,
+            quote_favorable_side_only: true,
+            ..cfg()
+        })
+        .unwrap();
+        let now = warm(&mut q, (99.99, 100.01), (99.99, 100.01));
+
+        // Near fair (disloc = 0, z = 0 < 2.0): when flat, both opening sides blocked.
+        let flat = q
+            .step(now, t(99.99, 100.01, now), t(99.99, 100.01, now), 0.0)
+            .unwrap();
+        assert_eq!(flat.bid, None);
+        assert_eq!(flat.ask, None);
+
+        // When holding long inventory (q = +1.0) at fair basis, reduce-only ask remains open.
+        let unwind_long = q
+            .step(
+                now + 100,
+                t(99.99, 100.01, now + 100),
+                t(99.99, 100.01, now + 100),
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(unwind_long.bid, None);
+        assert!(unwind_long.ask.is_some());
+
+        // Maker cheap by -10 bps (z = -5.0 <= -2.0): ONLY favorable opening bid quotes.
+        let cheap = q
+            .step(
+                now + 200,
+                t(99.89, 99.91, now + 200),
+                t(99.99, 100.01, now + 200),
+                0.0,
+            )
+            .unwrap();
+        assert!(cheap.bid.is_some());
+        assert_eq!(cheap.ask, None);
+
+        // Maker rich by +10 bps (z >= +2.0): ONLY favorable opening ask quotes.
+        let rich = q
+            .step(
+                now + 300,
+                t(100.09, 100.11, now + 300),
+                t(99.99, 100.01, now + 300),
+                0.0,
+            )
+            .unwrap();
+        assert_eq!(rich.bid, None);
+        assert!(rich.ask.is_some());
+
+        // quote_favorable_side_only alone (min_basis_zscore = 0.0) blocks unfavorable & zero disloc.
+        let mut q_fav = MakerHedgeQuoter::new(MakerHedgeQuoterConfig {
+            e0_bps: 1.0,
+            quote_favorable_side_only: true,
+            ..cfg()
+        })
+        .unwrap();
+        let t_fav = warm(&mut q_fav, (99.99, 100.01), (99.99, 100.01));
+        let zero_disloc = q_fav
+            .step(t_fav, t(99.99, 100.01, t_fav), t(99.99, 100.01, t_fav), 0.0)
+            .unwrap();
+        assert_eq!(zero_disloc.bid, None);
+        assert_eq!(zero_disloc.ask, None);
+        let neg_disloc = q_fav
+            .step(
+                t_fav + 100,
+                t(99.95, 99.97, t_fav + 100),
+                t(99.99, 100.01, t_fav + 100),
+                0.0,
+            )
+            .unwrap();
+        assert!(neg_disloc.bid.is_some());
+        assert_eq!(neg_disloc.ask, None);
+    }
+
+    #[test]
+    fn stationarity_gate_blocks_nonstationary_trend_but_allows_reduce_only() {
+        let mut q = MakerHedgeQuoter::new(MakerHedgeQuoterConfig {
+            e0_bps: 1.0,
+            tau_ms: 600_000,
+            basis_drift_tau_ms: 1_000,
+            basis_vol_tau_ms: 60_000,
+            basis_vol_floor_bps: 2.0,
+            max_drift_to_vol_ratio: 1.5,
+            ..cfg()
+        })
+        .unwrap();
+        let mut now = warm(&mut q, (99.99, 100.01), (99.99, 100.01));
+
+        // Persistent +15 bps regime shift over 10 seconds drives |fast_fair - fair| / denom >> 1.5.
+        for _ in 0..100 {
+            let _ = q.step(now, t(100.14, 100.16, now), t(99.99, 100.01, now), 0.0);
+            now += 100;
+        }
+        let blocked = q
+            .step(now, t(100.14, 100.16, now), t(99.99, 100.01, now), 0.0)
+            .unwrap();
+        assert_eq!(blocked.bid, None);
+        assert_eq!(blocked.ask, None);
+
+        // Existing long inventory (q = +1.0) can still passively reduce via ask.
+        let reduce = q
+            .step(
+                now + 100,
+                t(100.14, 100.16, now + 100),
+                t(99.99, 100.01, now + 100),
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(reduce.bid, None);
+        assert!(reduce.ask.is_some());
+    }
+
+    #[test]
+    fn passive_hedge_fsm_rests_escalates_on_hazard_timeout_and_halts_on_stale() {
+        let p_cfg = PassiveHedgeConfig {
+            enabled: true,
+            max_passive_hedge_ms: 1_000,
+            hazard_ioc_adverse_bps: 2.0,
+            max_hedge_book_age_ms: 500,
+            tick_size: 0.01,
+            improve_one_tick: true,
+            reduce_only: true,
+        };
+
+        // 1. MakerBought -> sell hedge passively inside spread (spread 0.04 > 1.5 * 0.01 -> improve 1 tick).
+        let mut st =
+            PassiveHedgeState::new(FillSide::MakerBought, 10_000, t(99.98, 100.02, 10_000), 1.0)
+                .unwrap();
+        let d0 = evaluate_passive_hedge(&p_cfg, &mut st, 10_100, t(99.98, 100.02, 10_100));
+        assert_eq!(d0.mode, HedgeExecutionMode::RestPassive);
+        assert!(d0.reduce_only);
+        assert!((d0.limit_px.unwrap() - 100.01).abs() < 1e-9);
+
+        // 2. Adverse drop of 3 bps (>= 2.0 bps hazard) escalates immediately to CrossIoc at hedge.bid.
+        let d_haz = evaluate_passive_hedge(&p_cfg, &mut st, 10_200, t(99.95, 99.99, 10_200));
+        assert_eq!(d_haz.mode, HedgeExecutionMode::CrossIoc);
+        assert!(d_haz.adverse_move_bps >= 2.0);
+        assert!((d_haz.limit_px.unwrap() - 99.95).abs() < 1e-9);
+
+        // 3. Timeout (>= 1_000 ms) escalates MakerSold -> CrossIoc buy at hedge.ask.
+        // With 2-tick spread (0.02 > 1.5 * 0.01) and improve_one_tick=true, passive bid steps inside to 100.00.
+        let mut st_to =
+            PassiveHedgeState::new(FillSide::MakerSold, 20_000, t(99.99, 100.01, 20_000), 1.0)
+                .unwrap();
+        let d_wait = evaluate_passive_hedge(&p_cfg, &mut st_to, 20_500, t(99.99, 100.01, 20_500));
+        assert_eq!(d_wait.mode, HedgeExecutionMode::RestPassive);
+        assert!((d_wait.limit_px.unwrap() - 100.00).abs() < 1e-9);
+        // On a 1-tick spread (0.01 <= 1.5 * 0.01), passive bid joins 99.99 without crossing.
+        let d_1t = evaluate_passive_hedge(&p_cfg, &mut st_to, 20_600, t(99.99, 100.00, 20_600));
+        assert_eq!(d_1t.mode, HedgeExecutionMode::RestPassive);
+        assert!((d_1t.limit_px.unwrap() - 99.99).abs() < 1e-9);
+        let d_to = evaluate_passive_hedge(&p_cfg, &mut st_to, 21_000, t(99.99, 100.01, 21_000));
+        assert_eq!(d_to.mode, HedgeExecutionMode::CrossIoc);
+        assert!((d_to.limit_px.unwrap() - 100.01).abs() < 1e-9);
+
+        // 4. Stale hedge book (> 500 ms) triggers sticky FailClosedHalt.
+        let mut st_stale =
+            PassiveHedgeState::new(FillSide::MakerBought, 30_000, t(99.99, 100.01, 30_000), 1.0)
+                .unwrap();
+        let d_stale =
+            evaluate_passive_hedge(&p_cfg, &mut st_stale, 30_600, t(99.99, 100.01, 30_000));
+        assert_eq!(d_stale.mode, HedgeExecutionMode::FailClosedHalt);
+        assert_eq!(d_stale.limit_px, None);
+        // Recovery tick remains FailClosedHalt (fail-closed latch).
+        let d_rec = evaluate_passive_hedge(&p_cfg, &mut st_stale, 30_700, t(99.99, 100.01, 30_700));
+        assert_eq!(d_rec.mode, HedgeExecutionMode::FailClosedHalt);
+
+        // 5. Regressed hedge recv_ms triggers FailClosedHalt.
+        let mut st_reg =
+            PassiveHedgeState::new(FillSide::MakerBought, 40_000, t(99.99, 100.01, 40_000), 1.0)
+                .unwrap();
+        let d_reg = evaluate_passive_hedge(&p_cfg, &mut st_reg, 40_100, t(99.99, 100.01, 39_900));
+        assert_eq!(d_reg.mode, HedgeExecutionMode::FailClosedHalt);
+
+        // 6. Disabled config falls back immediately to CrossIoc on valid fresh book.
+        let mut st_off =
+            PassiveHedgeState::new(FillSide::MakerBought, 50_000, t(99.99, 100.01, 50_000), 1.0)
+                .unwrap();
+        let d_off = evaluate_passive_hedge(
+            &PassiveHedgeConfig::default(),
+            &mut st_off,
+            50_050,
+            t(99.99, 100.01, 50_050),
+        );
+        assert_eq!(d_off.mode, HedgeExecutionMode::CrossIoc);
+        assert!((d_off.limit_px.unwrap() - 99.99).abs() < 1e-9);
+    }
+
+    #[test]
+    fn microprice_anchor_tilts_dislocation_and_falls_back_to_mid_when_off_or_empty() {
+        let mk = t(99.90, 100.10, 20_000);
+        let hd = t(99.90, 100.10, 20_000);
+        // Balanced sizes -> microprice == mid == 100.0.
+        assert!((mk.microprice(10.0, 10.0) - 100.0).abs() < 1e-9);
+        // Heavy bid size (90 vs 10) -> microprice leans toward ask: (99.90*10 + 100.10*90)/100 = 100.08.
+        assert!((mk.microprice(90.0, 10.0) - 100.08).abs() < 1e-9);
+        // Missing/zero sizes fall back to mid.
+        assert!((mk.microprice(0.0, 10.0) - 100.0).abs() < 1e-9);
+        assert!((mk.microprice(f64::NAN, 10.0) - 100.0).abs() < 1e-9);
+
+        let mut q_off = MakerHedgeQuoter::new(MakerHedgeQuoterConfig {
+            e0_bps: 1.0,
+            use_microprice_anchor: false,
+            ..cfg()
+        })
+        .unwrap();
+        let mut q_on = MakerHedgeQuoter::new(MakerHedgeQuoterConfig {
+            e0_bps: 1.0,
+            use_microprice_anchor: true,
+            ..cfg()
+        })
+        .unwrap();
+        let now_off = warm(&mut q_off, (99.90, 100.10), (99.90, 100.10));
+        let now_on = warm(&mut q_on, (99.90, 100.10), (99.90, 100.10));
+
+        let out_off = q_off
+            .step_with_l1_microprice(
+                now_off,
+                t(99.90, 100.10, now_off),
+                90.0,
+                10.0,
+                t(99.90, 100.10, now_off),
+                10.0,
+                10.0,
+                0.0,
+            )
+            .unwrap();
+        let out_on = q_on
+            .step_with_l1_microprice(
+                now_on,
+                t(99.90, 100.10, now_on),
+                90.0,
+                10.0,
+                t(99.90, 100.10, now_on),
+                10.0,
+                10.0,
+                0.0,
+            )
+            .unwrap();
+        assert!(out_off.dislocation_bps.abs() < 1e-9);
+        // Microprice anchor reflects +8 bps maker bid pressure!
+        assert!(out_on.dislocation_bps > 7.5 && out_on.dislocation_bps < 8.5);
+        assert_eq!(hd.mid(), 100.0);
+    }
+
+    #[test]
+    fn legacy_serde_defaults_preserve_opt_off_new_fields_and_validation() {
+        let parsed: MakerHedgeQuoterConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, MakerHedgeQuoterConfig::default());
+        assert_eq!(parsed.min_basis_zscore, 0.0);
+        assert_eq!(parsed.basis_vol_floor_bps, 0.0);
+        assert_eq!(parsed.max_drift_to_vol_ratio, 0.0);
+        assert!(!parsed.quote_favorable_side_only);
+        assert!(!parsed.use_microprice_anchor);
+        assert!(!parsed.passive_hedge.enabled);
+        assert!(parsed.passive_hedge.reduce_only);
+        assert!(parsed.validate().is_ok());
+
+        for bad in [
+            MakerHedgeQuoterConfig {
+                min_basis_zscore: -0.1,
+                ..cfg()
+            },
+            MakerHedgeQuoterConfig {
+                basis_vol_floor_bps: -1.0,
+                ..cfg()
+            },
+            MakerHedgeQuoterConfig {
+                max_drift_to_vol_ratio: -0.5,
+                ..cfg()
+            },
+            MakerHedgeQuoterConfig {
+                passive_hedge: PassiveHedgeConfig {
+                    max_passive_hedge_ms: 0,
+                    ..PassiveHedgeConfig::default()
+                },
+                ..cfg()
+            },
+            MakerHedgeQuoterConfig {
+                passive_hedge: PassiveHedgeConfig {
+                    hazard_ioc_adverse_bps: 0.0,
+                    ..PassiveHedgeConfig::default()
+                },
+                ..cfg()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
     }
 }
