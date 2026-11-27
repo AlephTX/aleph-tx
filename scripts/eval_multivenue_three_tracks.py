@@ -23,6 +23,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import sim_queue_priority_mm as sim
+from track_fee_evidence import (
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    build_fee_provenance,
+    load_track_fee_evidence,
+    resolve_venue_fee,
+)
 
 TEN_HOURS_MS = 36_000_000
 MAX_CONTINUOUS_GAP_MS = 60_000
@@ -166,12 +172,12 @@ VENUE_SYMBOL_MAP: dict[str, dict[str, str]] = {
 VENUE_PROFILES: dict[str, dict[str, Any]] = {
     "arcus": {
         "profile": "fast_zero_fee_alo",
-        "maker_fee_bps_crypto": 0.0,
+        "maker_fee_bps_crypto": 1.50,
         "maker_fee_bps_equity": 0.0,
-        "taker_fee_bps_crypto": 2.30,
-        "taker_fee_bps_equity": 1.15,
+        "taker_fee_bps_crypto": 4.50,
+        "taker_fee_bps_equity": 2.25,
         "settlement": "USDC",
-        "fee_audit_status": "audited",
+        "fee_audit_status": "public_tier0_schedule_only",
         "bbo_cadence": "ws_event",
         "has_trades": True,
     },
@@ -182,7 +188,7 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "taker_fee_bps_crypto": 0.0,
         "taker_fee_bps_equity": 0.0,
         "settlement": "USDG",
-        "fee_audit_status": "audited_standard_zero",
+        "fee_audit_status": "public_tier0_unverified",
         "bbo_cadence": "ws_event",
         "has_trades": True,
     },
@@ -193,7 +199,7 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "taker_fee_bps_crypto": 0.0,
         "taker_fee_bps_equity": 0.0,
         "settlement": "USDC",
-        "fee_audit_status": "audited_standard_zero",
+        "fee_audit_status": "public_tier0_unverified",
         "bbo_cadence": "ws_event",
         "has_trades": True,
     },
@@ -253,6 +259,81 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "has_trades": False,
     },
 }
+
+
+def resolve_venue_profiles(
+    fee_evidence_path: Path | None = None,
+    *,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Return fresh deep-copied venue profiles, parsed fee evidence, and OPT-01 provenance."""
+    ev = load_track_fee_evidence(fee_evidence_path)
+    resolved: dict[str, dict[str, Any]] = {}
+    for venue, base_vp in VENUE_PROFILES.items():
+        vp = dict(base_vp)
+        c_mk, c_tk, c_st, c_src = resolve_venue_fee(
+            venue,
+            "crypto",
+            default_maker_bps=float(vp["maker_fee_bps_crypto"]),
+            default_taker_bps=float(vp["taker_fee_bps_crypto"]),
+            default_status=str(vp["fee_audit_status"]),
+            evidence=ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        r_mk, r_tk, r_st, r_src = resolve_venue_fee(
+            venue,
+            "rwa",
+            default_maker_bps=float(vp["maker_fee_bps_equity"]),
+            default_taker_bps=float(vp["taker_fee_bps_equity"]),
+            default_status=str(vp["fee_audit_status"]),
+            evidence=ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        vp["maker_fee_bps_crypto"] = c_mk
+        vp["taker_fee_bps_crypto"] = c_tk
+        vp["maker_fee_bps_equity"] = r_mk
+        vp["taker_fee_bps_equity"] = r_tk
+        vp["fee_audit_status"] = r_st if venue == "trade_xyz" else c_st
+        vp["fee_source"] = {"crypto": c_src, "rwa": r_src}
+        resolved[venue] = vp
+    prov = build_fee_provenance(
+        ev,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+        venues_in_scope=tuple(VENUE_PROFILES.keys()),
+    )
+    return resolved, ev, prov
+
+
+def resolve_market_fees(
+    venue: str,
+    domain: str,
+    raw_market: str | None,
+    resolved_profiles: dict[str, dict[str, Any]],
+    evidence: dict[str, Any] | None = None,
+    *,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> tuple[float, float, str, str]:
+    """Resolve per-market `(maker_fee_bps, taker_fee_bps, fee_audit_status, fee_source)`."""
+    vp = resolved_profiles[venue]
+    fee_domain = "crypto" if domain == "crypto" else "rwa"
+    default_mk = vp["maker_fee_bps_crypto"] if fee_domain == "crypto" else vp["maker_fee_bps_equity"]
+    default_tk = vp["taker_fee_bps_crypto"] if fee_domain == "crypto" else vp["taker_fee_bps_equity"]
+    return resolve_venue_fee(
+        venue,
+        fee_domain,
+        default_maker_bps=float(default_mk),
+        default_taker_bps=float(default_tk),
+        default_status=str(vp["fee_audit_status"]),
+        evidence=evidence,
+        raw_market=raw_market,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
 
 
 def compute_continuity_stats(timestamps_ms: list[int]) -> dict[str, Any]:
@@ -422,9 +503,22 @@ def _campaign_parquet_files(
     return sorted(set(files))
 
 
-def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> dict[str, Any]:
+def run_duckdb_lakehouse_eval(
+    lakehouse_dir: Path,
+    split: str = "holdout",
+    *,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> dict[str, Any]:
     """Execute ultra-low-memory read-only 3-track evaluation directly on Hive parquet partitions."""
     import duckdb
+
+    resolved_profiles, fee_ev, fee_prov = resolve_venue_profiles(
+        fee_evidence_path,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
 
     # Never open lakehouse.duckdb while background W25 pipelines may hold locks; use :memory: with strict cap.
     con = duckdb.connect(":memory:")
@@ -550,20 +644,31 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
     track1_rows: list[dict[str, Any]] = []
     for venue, canon, domain in track1_targets:
         rows, raw_cont = get_books(venue, canon, domain)
-        vp = VENUE_PROFILES[venue]
-        fee = vp["maker_fee_bps_crypto"] if domain == "crypto" else vp["maker_fee_bps_equity"]
+        vp = resolved_profiles[venue]
+        raw_mkt = VENUE_SYMBOL_MAP[venue][canon]
+        fee, taker_fee, fee_status, fee_src = resolve_market_fees(
+            venue,
+            domain,
+            raw_mkt,
+            resolved_profiles,
+            fee_ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
         metrics = compute_track1_microstructure_metrics(rows, fee)
         metrics["raw_continuity"] = raw_cont
         metrics.update(
             {
                 "venue": venue,
                 "symbol": canon,
-                "raw_market": VENUE_SYMBOL_MAP[venue][canon],
+                "raw_market": raw_mkt,
                 "campaign_id": _campaign_for(venue, domain)["campaign_id"],
                 "domain": domain,
                 "maker_fee_bps": fee,
+                "taker_fee_bps": taker_fee,
                 "bbo_cadence": vp["bbo_cadence"],
-                "fee_audit_status": vp["fee_audit_status"],
+                "fee_audit_status": fee_status,
+                "fee_source": fee_src,
             }
         )
         track1_rows.append(metrics)
@@ -585,10 +690,25 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
     for va, vb, canon, domain in track2_pairs:
         ba, _ = get_books(va, canon, domain)
         bb, _ = get_books(vb, canon, domain)
-        pa, pb = VENUE_PROFILES[va], VENUE_PROFILES[vb]
-        tf_a = pa["taker_fee_bps_crypto"] if domain == "crypto" else pa["taker_fee_bps_equity"]
-        mf_a = pa["maker_fee_bps_crypto"] if domain == "crypto" else pa["maker_fee_bps_equity"]
-        tf_b = pb["taker_fee_bps_crypto"] if domain == "crypto" else pb["taker_fee_bps_equity"]
+        pa, pb = resolved_profiles[va], resolved_profiles[vb]
+        mf_a, tf_a, st_a, _ = resolve_market_fees(
+            va,
+            domain,
+            VENUE_SYMBOL_MAP[va][canon],
+            resolved_profiles,
+            fee_ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        _, tf_b, st_b, _ = resolve_market_fees(
+            vb,
+            domain,
+            VENUE_SYMBOL_MAP[vb][canon],
+            resolved_profiles,
+            fee_ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
         res = compute_track2_basis_pair_metrics(
             [(r[0], r[1], r[3]) for r in ba],
             [(r[0], r[1], r[3]) for r in bb],
@@ -604,6 +724,8 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
                 "domain": domain,
                 "cross_stablecoin": pa["settlement"] != pb["settlement"],
                 "settlement_pair": f"{pa['settlement']}/{pb['settlement']}",
+                "leg_a_fee_status": st_a,
+                "leg_b_fee_status": st_b,
             }
         )
         track2_basis_rows.append(res)
@@ -670,8 +792,17 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
         if len(b_rows) < 200:
             track3_rows.append({"venue": venue, "symbol": canon, "skipped": f"too_few_books:{len(b_rows)}"})
             continue
-        vp = VENUE_PROFILES[venue]
+        vp = resolved_profiles[venue]
         raw_mkt = VENUE_SYMBOL_MAP[venue][canon]
+        fee, taker_fee, fee_status, fee_src = resolve_market_fees(
+            venue,
+            domain,
+            raw_mkt,
+            resolved_profiles,
+            fee_ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
         events: list[dict[str, Any]] = [
             {"ts": r[0], "kind": "book", "bids": [(r[1], max(r[2], 1e-6))], "asks": [(r[3], max(r[4], 1e-6))]}
             for r in b_rows
@@ -689,7 +820,6 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
 
         events.sort(key=lambda e: e["ts"])
         tick = _infer_tick_from_prices([r[1] for r in b_rows])
-        fee = vp["maker_fee_bps_crypto"] if domain == "crypto" else vp["maker_fee_bps_equity"]
         infer_bd = not vp["has_trades"]
         arms_cfg = sim.default_arms_for_profile(vp["profile"], maker_fee_bps=fee, infer_book_diff_sweeps=infer_bd)
         arm_subset = [
@@ -719,9 +849,11 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
             "campaign_id": _campaign_for(venue, domain)["campaign_id"],
             "profile": vp["profile"],
             "maker_fee_bps": fee,
+            "taker_fee_bps": taker_fee,
             "tick_inferred": tick,
             "continuity": raw_cont,
-            "fee_audit_status": vp["fee_audit_status"],
+            "fee_audit_status": fee_status,
+            "fee_source": fee_src,
             "arms": arm_results,
         }
         if venue == "arcus":
@@ -739,6 +871,9 @@ def run_duckdb_lakehouse_eval(lakehouse_dir: Path, split: str = "holdout") -> di
     con.close()
     return {
         "schema": "multivenue_three_tracks_10h_v1",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
+        "fee_provenance": fee_prov,
+        "venue_profiles": resolved_profiles,
         "split": split,
         "campaigns": campaigns,
         "backpack_status": {
@@ -759,9 +894,28 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Multi-venue three-track 10h Aleph lakehouse evaluator")
     ap.add_argument("--lakehouse", type=Path, default=Path(os.path.expanduser("~/aleph-tx-lakehouse")))
     ap.add_argument("--split", choices=tuple(CANONICAL_CAMPAIGNS.keys()), default="holdout")
+    ap.add_argument("--fee-evidence", type=Path, default=None, help="Optional account_fee_evidence_*.json path")
+    ap.add_argument(
+        "--arcus-fee-tier",
+        choices=("level_0", "level_4"),
+        default="level_0",
+        help="Arcus fee tier: default level_0 (public tier0 1.50/4.50 crypto, 0/2.25 equity) or level_4 sensitivity",
+    )
+    ap.add_argument(
+        "--trade-xyz-fee-mode",
+        choices=("growth_mode", "standard"),
+        default="growth_mode",
+        help="trade_xyz HIP-3 fee mode: growth_mode (0.3/0.9 bps) or standard (3.0/9.0 bps)",
+    )
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
-    out = run_duckdb_lakehouse_eval(args.lakehouse, args.split)
+    out = run_duckdb_lakehouse_eval(
+        args.lakehouse,
+        args.split,
+        fee_evidence_path=args.fee_evidence,
+        arcus_fee_tier=args.arcus_fee_tier,
+        trade_xyz_fee_mode=args.trade_xyz_fee_mode,
+    )
     rendered = json.dumps(out, indent=2, allow_nan=False)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

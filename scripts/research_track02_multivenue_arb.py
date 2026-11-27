@@ -44,6 +44,17 @@ import re
 import sys
 from typing import Any, Sequence
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from track_fee_evidence import (  # noqa: E402
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    build_fee_provenance,
+    load_track_fee_evidence,
+    resolve_venue_fee,
+)
+
 TEN_HOURS_MS = 36_000_000
 MAX_CONTINUOUS_GAP_MS = 60_000
 STEP_MS = 100
@@ -113,10 +124,10 @@ VENUE_META: dict[str, dict[str, Any]] = {
         "settlement": "USDC",
         "order_delay_ms": 40,
         "speedbump_ms": 0,
-        "maker_fee_bps": {"crypto": 0.0, "rwa": 0.0},
-        "taker_fee_bps": {"crypto": 2.30, "rwa": 1.15},
+        "maker_fee_bps": {"crypto": 1.50, "rwa": 0.0},
+        "taker_fee_bps": {"crypto": 4.50, "rwa": 2.25},
         "bbo_cadence": "ws_event",
-        "fee_status": "audited",
+        "fee_status": "public_tier0_schedule_only",
     },
     "lighter": {
         "settlement": "USDC",
@@ -155,6 +166,101 @@ VENUE_META: dict[str, dict[str, Any]] = {
         "fee_status": "account_evidence_required",
     },
 }
+
+
+def resolve_venue_meta(
+    fee_evidence_path: Path | None = None,
+    *,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Return fresh copied `VENUE_META`, parsed evidence dict, and sanitized OPT-01 provenance."""
+    ev = load_track_fee_evidence(fee_evidence_path)
+    resolved: dict[str, dict[str, Any]] = {}
+    for venue, base_meta in VENUE_META.items():
+        vm = {
+            **base_meta,
+            "maker_fee_bps": dict(base_meta["maker_fee_bps"]),
+            "taker_fee_bps": dict(base_meta["taker_fee_bps"]),
+        }
+        c_mk, c_tk, c_st, c_src = resolve_venue_fee(
+            venue,
+            "crypto",
+            default_maker_bps=float(vm["maker_fee_bps"]["crypto"]),
+            default_taker_bps=float(vm["taker_fee_bps"]["crypto"]),
+            default_status=str(vm["fee_status"]),
+            evidence=ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        r_mk, r_tk, r_st, r_src = resolve_venue_fee(
+            venue,
+            "rwa",
+            default_maker_bps=float(vm["maker_fee_bps"]["rwa"]),
+            default_taker_bps=float(vm["taker_fee_bps"]["rwa"]),
+            default_status=str(vm["fee_status"]),
+            evidence=ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        vm["maker_fee_bps"] = {"crypto": c_mk, "rwa": r_mk}
+        vm["taker_fee_bps"] = {"crypto": c_tk, "rwa": r_tk}
+        vm["fee_status"] = r_st if venue == "trade_xyz" else c_st
+        vm["fee_source"] = {"crypto": c_src, "rwa": r_src}
+        resolved[venue] = vm
+    prov = build_fee_provenance(
+        ev,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+        venues_in_scope=tuple(VENUE_META.keys()),
+    )
+    return resolved, ev, prov
+
+
+def resolve_pair_fees(
+    pair: ArbPairSpec,
+    venue_meta: dict[str, dict[str, Any]],
+    evidence: dict[str, Any] | None = None,
+    *,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> dict[str, Any]:
+    """Resolve exact pair maker/hedge fees (including Arcus per-market custom tier0 schedules)."""
+    mm = venue_meta[pair.maker_venue]
+    hm = venue_meta[pair.hedge_venue]
+    mk_sym = VENUE_SYMBOL_MAP.get(pair.maker_venue, {}).get(pair.symbol)
+    hd_sym = VENUE_SYMBOL_MAP.get(pair.hedge_venue, {}).get(pair.symbol)
+    mk_mk, mk_tk, mk_st, mk_src = resolve_venue_fee(
+        pair.maker_venue,
+        pair.domain,
+        default_maker_bps=float(mm["maker_fee_bps"][pair.domain]),
+        default_taker_bps=float(mm["taker_fee_bps"][pair.domain]),
+        default_status=str(mm["fee_status"]),
+        evidence=evidence,
+        raw_market=mk_sym,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
+    _, hd_tk, hd_st, hd_src = resolve_venue_fee(
+        pair.hedge_venue,
+        pair.domain,
+        default_maker_bps=float(hm["maker_fee_bps"][pair.domain]),
+        default_taker_bps=float(hm["taker_fee_bps"][pair.domain]),
+        default_status=str(hm["fee_status"]),
+        evidence=evidence,
+        raw_market=hd_sym,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
+    return {
+        "maker_fee_bps": mk_mk,
+        "maker_taker_fee_bps": mk_tk,
+        "hedge_fee_bps": hd_tk,
+        "maker_fee_status": mk_st,
+        "hedge_fee_status": hd_st,
+        "maker_fee_source": mk_src,
+        "hedge_fee_source": hd_src,
+    }
 
 
 @dataclass(frozen=True)
@@ -1149,10 +1255,32 @@ def _load_mean_funding_bps_hr(
     return float(row[0])
 
 
-def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, Any]:
+def evaluate_lakehouse(
+    lakehouse_dir: Path,
+    max_window: int = 25,
+    *,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
+) -> dict[str, Any]:
     """Execute read-only W01..W25 multi-venue Track 02 evaluation window-by-window."""
     con = connect_duckdb()
+    resolved_meta, fee_ev, fee_prov = resolve_venue_meta(
+        fee_evidence_path,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
     all_pairs = build_pair_catalog()
+    pair_fees = {
+        p.label: resolve_pair_fees(
+            p,
+            resolved_meta,
+            fee_ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
+        )
+        for p in all_pairs
+    }
     campaigns_by_dom = {
         "crypto": discover_campaigns(lakehouse_dir, "crypto", min_window=1, max_window=max_window),
         "rwa": discover_campaigns(lakehouse_dir, "rwa", min_window=1, max_window=max_window),
@@ -1166,6 +1294,7 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
     for dom in ("crypto", "rwa"):
         dom_pairs = [p for p in all_pairs if p.domain == dom]
         for p in dom_pairs:
+            pf = pair_fees[p.label]
             pair_meta[p.label] = {
                 "label": p.label,
                 "cohort": p.cohort,
@@ -1176,8 +1305,13 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
                 "cross_stablecoin": p.cross_stablecoin,
                 "same_risk_domain": p.same_risk_domain,
                 "diagnostic_polled_venue": p.diagnostic_polled_venue,
-                "maker_fee_status": VENUE_META[p.maker_venue]["fee_status"],
-                "hedge_fee_status": VENUE_META[p.hedge_venue]["fee_status"],
+                "maker_fee_bps": pf["maker_fee_bps"],
+                "maker_taker_fee_bps": pf["maker_taker_fee_bps"],
+                "hedge_fee_bps": pf["hedge_fee_bps"],
+                "maker_fee_status": pf["maker_fee_status"],
+                "hedge_fee_status": pf["hedge_fee_status"],
+                "maker_fee_source": pf["maker_fee_source"],
+                "hedge_fee_source": pf["hedge_fee_source"],
             }
 
         for camp in campaigns_by_dom[dom]:
@@ -1261,7 +1395,8 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
                     inc_reasons.append(f"hedge_gap_{hd_cont['max_gap_ms']}ms")
 
                 mv, hv = pair.maker_venue, pair.hedge_venue
-                mm, hm = VENUE_META[mv], VENUE_META[hv]
+                mm, hm = resolved_meta[mv], resolved_meta[hv]
+                pf = pair_fees[pair.label]
                 tick = _infer_tick(mk_cols["bid"]) if mk_cols is not None else 0.01
                 n_steps = len(mk_g["bid"])
                 pre_by_step = bucket_trades_by_step(mk_tr, t0, mm["order_delay_ms"], n_steps)
@@ -1298,9 +1433,9 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
                                 hedge_delay_ms=hm["order_delay_ms"],
                                 speedbump_ms=mm["speedbump_ms"],
                                 rtt_ms=40,
-                                maker_fee_bps=mm["maker_fee_bps"][dom],
-                                maker_taker_fee_bps=mm["taker_fee_bps"][dom],
-                                hedge_fee_bps=hm["taker_fee_bps"][dom],
+                                maker_fee_bps=pf["maker_fee_bps"],
+                                maker_taker_fee_bps=pf["maker_taker_fee_bps"],
+                                hedge_fee_bps=pf["hedge_fee_bps"],
                                 cross_stablecoin_bps=fx,
                                 maker_fr_bps_hr=mk_fr,
                                 hedge_fr_bps_hr=hd_fr,
@@ -1370,7 +1505,7 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
     pair_records: list[dict[str, Any]] = []
     for pair in all_pairs:
         meta = pair_meta[pair.label]
-        has_sb = VENUE_META[pair.maker_venue]["speedbump_ms"] > 0
+        has_sb = resolved_meta[pair.maker_venue]["speedbump_ms"] > 0
         cands = selection_grid(has_sb)
         mode_results: dict[str, Any] = {}
         any_dev = False
@@ -1500,6 +1635,9 @@ def evaluate_lakehouse(lakehouse_dir: Path, max_window: int = 25) -> dict[str, A
 
     return {
         "schema": "track02_multivenue_arb_upgrade_v2_w01_w25",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
+        "fee_provenance": fee_prov,
+        "venue_meta": resolved_meta,
         "splits": {"full_dev": "w01..w20 (ex w08 crypto)", "holdout": "w21..w25"},
         "discovered_campaigns": {
             dom: {"count": len(cs), "windows": [c["window"] for c in cs]}
@@ -1612,6 +1750,19 @@ def main() -> int:
     ap.add_argument("--lakehouse", type=Path, default=Path(os.path.expanduser("~/aleph-tx-lakehouse")))
     ap.add_argument("--output", type=Path)
     ap.add_argument("--max-window", type=int, default=25)
+    ap.add_argument("--fee-evidence", type=Path, default=None, help="Optional account_fee_evidence_*.json path")
+    ap.add_argument(
+        "--arcus-fee-tier",
+        choices=("level_0", "level_4"),
+        default="level_0",
+        help="Arcus fee tier: default level_0 (public tier0 1.50/4.50 crypto, 0/2.25 RWA) or level_4 sensitivity",
+    )
+    ap.add_argument(
+        "--trade-xyz-fee-mode",
+        choices=("growth_mode", "standard"),
+        default="growth_mode",
+        help="trade_xyz HIP-3 fee mode: growth_mode (0.3/0.9 bps) or standard (3.0/9.0 bps)",
+    )
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -1619,7 +1770,13 @@ def main() -> int:
         run_self_test()
         return 0
 
-    out = evaluate_lakehouse(args.lakehouse, max_window=args.max_window)
+    out = evaluate_lakehouse(
+        args.lakehouse,
+        max_window=args.max_window,
+        fee_evidence_path=args.fee_evidence,
+        arcus_fee_tier=args.arcus_fee_tier,
+        trade_xyz_fee_mode=args.trade_xyz_fee_mode,
+    )
     rendered = json.dumps(out, indent=2, allow_nan=False) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -201,6 +203,109 @@ class TestResearchTrack02MultivenueArb(unittest.TestCase):
         )
         self.assertEqual(r_l1["blocked_l1_thin"], 2)
         self.assertEqual(r_l1["fills"], 0)
+
+    def test_arcus_default_level0_and_fee_evidence_resolution(self) -> None:
+        venues_rs = (SCRIPT_DIR.parent / "src" / "venues.rs").read_text(encoding="utf-8")
+        m = re.search(r'VENUE_CAPABILITY_SNAPSHOT_VERSION[^"]*"([^"]+)"', venues_rs)
+        self.assertIsNotNone(m)
+        self.assertEqual(mod.VENUE_CAPABILITY_SNAPSHOT_VERSION, m.group(1))
+
+        # Arcus default must be conservative Level 0, never unverified Level 4 marked "audited".
+        self.assertEqual(mod.VENUE_META["arcus"]["fee_status"], "public_tier0_schedule_only")
+        self.assertEqual(mod.VENUE_META["arcus"]["maker_fee_bps"], {"crypto": 1.50, "rwa": 0.0})
+        self.assertEqual(mod.VENUE_META["arcus"]["taker_fee_bps"], {"crypto": 4.50, "rwa": 2.25})
+
+        ev_payload = {
+            "schema_version": "aleph_account_fee_evidence_v1",
+            "audited_at_utc": "2026-11-22T17:26:28+00:00",
+            "venues": {
+                "arcus": {
+                    "account_fee_status": "public_tier0_schedule_only",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_tier0_schedule_summary": {
+                        "tier0_fee_profiles": [
+                            {"maker_fee_bps": "0", "taker_fee_bps": "1.12"},
+                            {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                            {"maker_fee_bps": "1.5", "taker_fee_bps": "4.5"},
+                        ],
+                        "custom_schedule_tier0_bps": {
+                            "ANT-USD": {"maker_fee_bps": "0", "taker_fee_bps": "1.12"},
+                            "AAPL-USD": {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                        },
+                    },
+                },
+                "lighter": {
+                    "account_fee_status": "public_schedule_only_unverified_account_tier",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_schedule_maker_fee_bps": "0",
+                    "public_schedule_taker_fee_bps": "0",
+                },
+                "extended": {
+                    "account_fee_status": "unknown_requires_account_evidence",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                },
+                "trade_xyz": {
+                    "account_fee_status": "verified_account_tier",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "growth_mode_maker_fee_bps": "0.3",
+                    "growth_mode_taker_fee_bps": "0.9",
+                    "standard_maker_fee_bps": "3",
+                    "standard_taker_fee_bps": "9",
+                    "market_growth_mode_summary": {"active_markets": 123, "growth_mode_unspecified_count": 5},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            ev_path = Path(tmp) / "fee_ev.json"
+            ev_path.write_text(json.dumps(ev_payload), encoding="utf-8")
+
+            meta_gm, ev_gm, prov_gm = mod.resolve_venue_meta(
+                ev_path, arcus_fee_tier="level_0", trade_xyz_fee_mode="growth_mode"
+            )
+            self.assertEqual(prov_gm["trade_xyz_market_growth_mode_summary"]["growth_mode_unspecified_count"], 5)
+            self.assertEqual(meta_gm["arcus"]["taker_fee_bps"], {"crypto": 4.50, "rwa": 2.25})
+            self.assertEqual(meta_gm["lighter"]["fee_status"], "public_schedule_only_unverified_account_tier")
+            self.assertEqual(meta_gm["lighter_robinhood"]["fee_status"], "public_tier0_unverified")
+            self.assertEqual(meta_gm["extended"]["fee_status"], "unknown_requires_account_evidence")
+            self.assertEqual(meta_gm["trade_xyz"]["fee_status"], "verified_account_tier")
+            self.assertEqual(meta_gm["trade_xyz"]["taker_fee_bps"]["rwa"], 0.9)
+
+            pair_aapl = mod.ArbPairSpec("USDC/USDC", "lighter", "arcus", "lighter_robinhood", "AAPL", "rwa", "lighter->arcus AAPL")
+            fees_aapl = mod.resolve_pair_fees(pair_aapl, meta_gm, ev_gm, arcus_fee_tier="level_0")
+            self.assertEqual(fees_aapl["maker_fee_bps"], 0.0)
+            self.assertEqual(fees_aapl["hedge_fee_bps"], 2.25)
+            self.assertEqual(fees_aapl["hedge_fee_source"], "evidence_public_tier0_custom_market")
+
+            # Custom ANT-USD schedule (1.12 bps) resolves cleanly via shared helper.
+            _, ant_tk, _, ant_src = mod.resolve_venue_fee(
+                "arcus",
+                "rwa",
+                default_maker_bps=0.0,
+                default_taker_bps=2.25,
+                default_status="public_tier0_schedule_only",
+                evidence=ev_gm,
+                raw_market="ANT-USD",
+                arcus_fee_tier="level_0",
+            )
+            self.assertEqual(ant_tk, 1.12)
+            self.assertEqual(ant_src, "evidence_public_tier0_custom_market")
+
+            # Standard trade_xyz HIP-3 2x fees (3.0/9.0) vs growthMode (0.3/0.9).
+            meta_st, ev_st, _ = mod.resolve_venue_meta(
+                ev_path, arcus_fee_tier="level_4", trade_xyz_fee_mode="standard"
+            )
+            pair_xyz = mod.ArbPairSpec("USDC/USDC", "arcus", "trade_xyz", "lighter", "NVDA", "rwa", "arcus->trade_xyz NVDA")
+            fees_xyz = mod.resolve_pair_fees(
+                pair_xyz, meta_st, ev_st, arcus_fee_tier="level_4", trade_xyz_fee_mode="standard"
+            )
+            self.assertEqual(fees_xyz["maker_taker_fee_bps"], 1.15)
+            self.assertEqual(fees_xyz["maker_fee_status"], "account_evidence_required")
+            self.assertEqual(fees_xyz["hedge_fee_bps"], 9.0)
+            self.assertEqual(fees_xyz["hedge_fee_status"], "verified_account_tier")
 
 
 if __name__ == "__main__":

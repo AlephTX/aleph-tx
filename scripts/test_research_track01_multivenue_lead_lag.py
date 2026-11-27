@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -315,6 +317,71 @@ class TestTrack01MultivenueLeadLag(unittest.TestCase):
         self.assertEqual(arm_cfgs["B_vol_adaptive_theta"].vol_theta_mult, frozen["vol_theta_mult"])
         self.assertTrue(arm_cfgs["C_dual_leader"].require_dual_leader_confirm)
         self.assertEqual(arm_cfgs["D_catchup_exit"].exit_on_catchup_frac, frozen["exit_on_catchup_frac"])
+
+    def test_opt01_snapshot_parity_and_fee_evidence_overrides(self) -> None:
+        venues_rs = (SCRIPT_DIR.parent / "src" / "venues.rs").read_text(encoding="utf-8")
+        m = re.search(r'VENUE_CAPABILITY_SNAPSHOT_VERSION[^"]*"([^"]+)"', venues_rs)
+        self.assertIsNotNone(m)
+        self.assertEqual(mv.VENUE_CAPABILITY_SNAPSHOT_VERSION, m.group(1))
+
+        ev_payload = {
+            "schema_version": "aleph_account_fee_evidence_v1",
+            "audited_at_utc": "2026-11-22T17:26:28+00:00",
+            "venues": {
+                "arcus": {
+                    "account_fee_status": "public_tier0_schedule_only",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_tier0_schedule_summary": {
+                        "tier0_fee_profiles": [{"maker_fee_bps": "1.5", "taker_fee_bps": "4.5"}],
+                        "custom_schedule_tier0_bps": {},
+                    },
+                },
+                "lighter": {
+                    "account_fee_status": "public_schedule_only_unverified_account_tier",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_schedule_maker_fee_bps": "0",
+                    "public_schedule_taker_fee_bps": "0",
+                },
+                "extended": {
+                    "account_fee_status": "unknown_requires_account_evidence",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            ev_path = Path(tmp) / "fee_ev.json"
+            ev_path.write_text(json.dumps(ev_payload), encoding="utf-8")
+
+            resolved, prov = mv.resolve_venue_profiles(ev_path, arcus_fee_tier="level_0")
+            self.assertTrue(prov["fee_evidence_loaded"])
+            self.assertEqual(prov["venue_capability_snapshot_version"], m.group(1))
+            self.assertEqual(len(prov["fee_evidence_sha256"]), 64)
+            # Global defaults remain unmutated.
+            self.assertEqual(mv.VENUE_PROFILES["lighter"]["account_fee_status"], "public_tier0_unverified")
+            self.assertEqual(resolved["lighter"]["account_fee_status"], "public_schedule_only_unverified_account_tier")
+            self.assertEqual(resolved["lighter"]["taker_fee_bps"], 0.0)
+            # Separate USDG domain must not inherit lighter evidence.
+            self.assertEqual(resolved["lighter_robinhood"]["account_fee_status"], "public_tier0_unverified")
+            self.assertEqual(resolved["extended"]["account_fee_status"], "unknown_requires_account_evidence")
+            self.assertEqual(resolved["extended"]["taker_fee_bps"], 2.50)
+            self.assertEqual(resolved["arcus"]["maker_fee_bps"], 1.50)
+            self.assertEqual(resolved["arcus"]["taker_fee_bps"], 4.50)
+
+            sens, _ = mv.resolve_venue_profiles(ev_path, arcus_fee_tier="level_4")
+            self.assertEqual(sens["arcus"]["maker_fee_bps"], 0.0)
+            self.assertEqual(sens["arcus"]["taker_fee_bps"], 2.30)
+            self.assertEqual(sens["arcus"]["account_fee_status"], "account_evidence_required")
+
+            bad_path = Path(tmp) / "bad_ev.json"
+            bad_path.write_text(
+                json.dumps({"venues": {"lighter": {"maker_fee_bps": "-0.1", "taker_fee_bps": "0"}}}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                mv.resolve_venue_profiles(bad_path)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,18 @@ from statistics import median
 import sys
 from typing import Any, Sequence
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from track_fee_evidence import (  # noqa: E402
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    _confirmed_account_pair,
+    build_fee_provenance,
+    load_track_fee_evidence,
+    resolve_venue_fee,
+)
+
 TEN_HOURS_MS = 36_000_000
 MAX_CONTINUOUS_GAP_MS = 60_000
 SUBSESSION_ACTIVE_GAP_MS = 600_000  # 10m; separates distinct session segments across days/blocks
@@ -214,10 +226,10 @@ VENUE_SYMBOL_MAP: dict[str, dict[str, str]] = {
 
 VENUE_PROFILES: dict[str, dict[str, Any]] = {
     "arcus": {
-        "maker_fee_bps_crypto": 0.0,
+        "maker_fee_bps_crypto": 1.50,
         "maker_fee_bps_equity": 0.0,
-        "taker_fee_bps_crypto": 2.30,
-        "taker_fee_bps_equity": 1.15,
+        "taker_fee_bps_crypto": 4.50,
+        "taker_fee_bps_equity": 2.25,
         "settlement": "USDC",
         "fee_audit_status": "public_tier0_schedule_only",
         "bbo_cadence": "ws_event",
@@ -229,7 +241,7 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "taker_fee_bps_crypto": 0.0,
         "taker_fee_bps_equity": 0.0,
         "settlement": "USDG",
-        "fee_audit_status": "audited_standard_zero",
+        "fee_audit_status": "public_tier0_unverified",
         "bbo_cadence": "ws_event",
         "has_trades": True,
     },
@@ -239,7 +251,7 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "taker_fee_bps_crypto": 0.0,
         "taker_fee_bps_equity": 0.0,
         "settlement": "USDC",
-        "fee_audit_status": "audited_standard_zero",
+        "fee_audit_status": "public_tier0_unverified",
         "bbo_cadence": "ws_event",
         "has_trades": True,
     },
@@ -524,64 +536,31 @@ def compute_session_microstructure_metrics(
     return out
 
 
-def load_fee_evidence_overrides(evidence_path: Path | None) -> dict[str, dict[str, Any]]:
-    """Parse optional `account_fee_evidence_*.json` for venue audit status and fee tiers."""
-    if evidence_path is None:
-        return {}
-    data = json.loads(evidence_path.read_text(encoding="utf-8"))
-    venues = data.get("venues")
-    if not isinstance(venues, dict):
-        raise ValueError(f"Expected dict 'venues' in {evidence_path}")
+def load_fee_evidence_overrides(evidence_path: Path | None) -> dict[str, Any]:
+    """Load `account_fee_evidence_*.json` via shared fail-closed `track_fee_evidence` parser."""
+    return load_track_fee_evidence(evidence_path)
 
-    overrides: dict[str, dict[str, Any]] = {}
-    for venue_name, payload in venues.items():
+
+def _normalize_fee_evidence(fee_overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize either a `load_track_fee_evidence` envelope or a flat per-venue override map."""
+    if not fee_overrides:
+        return {"loaded": False, "venues": {}}
+    if "loaded" in fee_overrides and "venues" in fee_overrides:
+        return fee_overrides
+    normalized_venues: dict[str, Any] = {}
+    for venue_name, payload in fee_overrides.items():
         if not isinstance(payload, dict):
-            continue
-        entry: dict[str, Any] = {}
-        if payload.get("account_fee_status"):
-            entry["fee_audit_status"] = str(payload["account_fee_status"])
+            raise ValueError(f"Expected dict fee override for venue {venue_name!r}")
+        entry = dict(payload)
+        if "account_fee_status" not in entry and "fee_audit_status" in entry:
+            entry["account_fee_status"] = entry["fee_audit_status"]
+        _confirmed_account_pair(entry, str(venue_name))
+        normalized_venues[str(venue_name)] = entry
+    return {"loaded": True, "venues": normalized_venues}
 
-        maker = _opt_finite(payload.get("maker_fee_bps"))
-        taker = _opt_finite(payload.get("taker_fee_bps"))
-        if maker is not None:
-            entry["maker_fee_bps"] = maker
-        if taker is not None:
-            entry["taker_fee_bps"] = taker
 
-        if venue_name == "arcus":
-            pub = payload.get("public_tier0_schedule_summary") or {}
-            custom = pub.get("custom_schedule_tier0_bps") or {}
-            per_market: dict[str, tuple[float, float]] = {}
-            for mkt, fees in custom.items():
-                if isinstance(fees, dict):
-                    mk = _opt_finite(fees.get("maker_fee_bps"))
-                    tk = _opt_finite(fees.get("taker_fee_bps"))
-                    if mk is not None and tk is not None:
-                        per_market[str(mkt)] = (mk, tk)
-            if per_market:
-                entry["per_market_fees"] = per_market
-            if maker is None:
-                entry.setdefault("maker_fee_bps_equity", 0.0)
-                entry.setdefault("taker_fee_bps_equity", 2.25)
-
-        if venue_name == "lighter" and maker is None:
-            pub_mk = _opt_finite(payload.get("public_schedule_maker_fee_bps"))
-            pub_tk = _opt_finite(payload.get("public_schedule_taker_fee_bps"))
-            if pub_mk is not None:
-                entry["maker_fee_bps"] = pub_mk
-            if pub_tk is not None:
-                entry["taker_fee_bps"] = pub_tk
-
-        if venue_name == "trade_xyz" and maker is None:
-            gm_mk = _opt_finite(payload.get("growth_mode_maker_fee_bps"))
-            gm_tk = _opt_finite(payload.get("growth_mode_taker_fee_bps"))
-            if gm_mk is not None:
-                entry["maker_fee_bps"] = gm_mk
-            if gm_tk is not None:
-                entry["taker_fee_bps"] = gm_tk
-
-        overrides[str(venue_name)] = entry
-    return overrides
+def _has_venue_override(ev: dict[str, Any], venue: str) -> bool:
+    return bool(ev.get("loaded")) and isinstance(ev.get("venues"), dict) and venue in ev["venues"]
 
 
 def _resolve_venue_metadata(
@@ -589,43 +568,65 @@ def _resolve_venue_metadata(
     symbol: str,
     raw_market: str | None,
     domain: str,
-    fee_overrides: dict[str, dict[str, Any]],
+    fee_overrides: dict[str, Any],
+    *,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
 ) -> dict[str, Any]:
     vp = VENUE_PROFILES.get(venue, {})
     settlement = str(vp.get("settlement") or "USDC")
-    fee_status = str(vp.get("fee_audit_status") or "unknown")
+    default_status = str(vp.get("fee_audit_status") or "unknown")
     is_crypto = domain == "crypto" or symbol in CRYPTO_SYMBOLS
-    maker_fee = float(vp.get("maker_fee_bps_crypto" if is_crypto else "maker_fee_bps_equity", 0.0))
-    taker_fee = float(vp.get("taker_fee_bps_crypto" if is_crypto else "taker_fee_bps_equity", 0.0))
+    fee_domain = "crypto" if is_crypto else "rwa"
+    default_maker = float(vp.get("maker_fee_bps_crypto" if is_crypto else "maker_fee_bps_equity", 0.0))
+    default_taker = float(vp.get("taker_fee_bps_crypto" if is_crypto else "taker_fee_bps_equity", 0.0))
     bbo_cadence = str(vp.get("bbo_cadence") or "unknown")
     has_trades = bool(vp.get("has_trades", True))
-
-    ov = fee_overrides.get(venue)
-    if ov:
-        if "fee_audit_status" in ov:
-            fee_status = str(ov["fee_audit_status"])
-        if "maker_fee_bps" in ov:
-            maker_fee = float(ov["maker_fee_bps"])
-        elif not is_crypto and "maker_fee_bps_equity" in ov:
-            maker_fee = float(ov["maker_fee_bps_equity"])
-        if "taker_fee_bps" in ov:
-            taker_fee = float(ov["taker_fee_bps"])
-        elif not is_crypto and "taker_fee_bps_equity" in ov:
-            taker_fee = float(ov["taker_fee_bps_equity"])
-        per_mkt = ov.get("per_market_fees") or {}
-        if raw_market and raw_market in per_mkt:
-            maker_fee, taker_fee = per_mkt[raw_market]
-
     resolved_market = raw_market or VENUE_SYMBOL_MAP.get(venue, {}).get(symbol, symbol)
+
+    ev = _normalize_fee_evidence(fee_overrides)
+    maker_fee, taker_fee, fee_status, fee_source = resolve_venue_fee(
+        venue,
+        fee_domain,
+        default_maker_bps=default_maker,
+        default_taker_bps=default_taker,
+        default_status=default_status,
+        evidence=ev,
+        raw_market=resolved_market,
+        arcus_fee_tier=arcus_fee_tier,
+        trade_xyz_fee_mode=trade_xyz_fee_mode,
+    )
+
     return {
         "raw_market": resolved_market,
         "settlement": settlement,
         "fee_audit_status": fee_status,
+        "fee_source": fee_source,
         "maker_fee_bps": round(maker_fee, 6),
         "taker_fee_bps": round(taker_fee, 6),
         "bbo_cadence": bbo_cadence,
         "has_trades": has_trades,
     }
+
+
+def _row_agg_weight(row: dict[str, Any]) -> float:
+    """Return positive observation weight (`samples` -> `hours` -> `1.0`) for session pooling."""
+    samples = row.get("samples")
+    if samples is not None and float(samples) > 0.0:
+        return float(samples)
+    hours = row.get("hours")
+    if hours is not None and float(hours) > 0.0:
+        return float(hours)
+    return 1.0
+
+
+def _wmean(pairs: Sequence[tuple[float, float]]) -> float | None:
+    if not pairs:
+        return None
+    w_sum = sum(w for _, w in pairs)
+    if w_sum <= 0.0:
+        return None
+    return sum(v * w for v, w in pairs) / w_sum
 
 
 def _aggregate_session_across_windows(
@@ -654,23 +655,58 @@ def _aggregate_session_across_windows(
             "mean_vol_1s_bps": None,
             "mean_1s_abs_move_bps": None,
             "mean_spread_to_vol_ratio": None,
+            "pooled_spread_to_vol_ratio": None,
             "mean_half_spread_to_1s_move_ratio": None,
             "min_l1_usd": None,
             "mean_trades_per_hour": None,
         }
 
+    weights = [_row_agg_weight(r) for r in valid]
     hs_vals = [float(r["half_spread_minus_fee_bps"]) for r in valid]
-    sp_vals = [float(r["median_spread_bps"]) for r in valid if r.get("median_spread_bps") is not None]
-    vol_vals = [float(r["realized_1s_vol_bps"]) for r in valid if r.get("realized_1s_vol_bps") is not None]
-    mv_vals = [float(r["median_1s_abs_move_bps"]) for r in valid if r.get("median_1s_abs_move_bps") is not None]
-    stv_vals = [float(r["spread_to_vol_ratio"]) for r in valid if r.get("spread_to_vol_ratio") is not None]
-    hsm_vals = [
-        float(r["half_spread_to_1s_move_ratio"])
-        for r in valid
+    sp_pairs = [
+        (float(r["median_spread_bps"]), w)
+        for r, w in zip(valid, weights)
+        if r.get("median_spread_bps") is not None
+    ]
+    vol_pairs = [
+        (float(r["realized_1s_vol_bps"]), w)
+        for r, w in zip(valid, weights)
+        if r.get("realized_1s_vol_bps") is not None
+    ]
+    mv_pairs = [
+        (float(r["median_1s_abs_move_bps"]), w)
+        for r, w in zip(valid, weights)
+        if r.get("median_1s_abs_move_bps") is not None
+    ]
+    stv_pairs = [
+        (float(r["spread_to_vol_ratio"]), w)
+        for r, w in zip(valid, weights)
+        if r.get("spread_to_vol_ratio") is not None
+    ]
+    hsm_pairs = [
+        (float(r["half_spread_to_1s_move_ratio"]), w)
+        for r, w in zip(valid, weights)
         if r.get("half_spread_to_1s_move_ratio") is not None
     ]
     l1_vals = [float(r["median_l1_min_usd"]) for r in valid]
-    tph_vals = [float(r["trades_per_hour"]) for r in valid if r.get("trades_per_hour") is not None]
+    tph_pairs = [
+        (float(r["trades_per_hour"]), w)
+        for r, w in zip(valid, weights)
+        if r.get("trades_per_hour") is not None
+    ]
+
+    mean_hs = _wmean(list(zip(hs_vals, weights)))
+    mean_sp = _wmean(sp_pairs)
+    mean_vol = _wmean(vol_pairs)
+    mean_mv = _wmean(mv_pairs)
+    mean_stv = _wmean(stv_pairs)
+    mean_hsm = _wmean(hsm_pairs)
+    mean_tph = _wmean(tph_pairs)
+    pooled_stv = (
+        round(mean_sp / mean_vol, 4)
+        if (mean_sp is not None and mean_vol is not None and mean_vol > 0.0)
+        else None
+    )
 
     return {
         "session": session,
@@ -679,14 +715,15 @@ def _aggregate_session_across_windows(
         "samples_total": samples_total,
         "hours_total": hours_total,
         "worst_half_spread_minus_fee_bps": round(min(hs_vals), 4),
-        "mean_half_spread_minus_fee_bps": round(sum(hs_vals) / len(hs_vals), 4),
-        "mean_spread_bps": round(sum(sp_vals) / len(sp_vals), 4) if sp_vals else None,
-        "mean_vol_1s_bps": round(sum(vol_vals) / len(vol_vals), 4) if vol_vals else None,
-        "mean_1s_abs_move_bps": round(sum(mv_vals) / len(mv_vals), 4) if mv_vals else None,
-        "mean_spread_to_vol_ratio": round(sum(stv_vals) / len(stv_vals), 4) if stv_vals else None,
-        "mean_half_spread_to_1s_move_ratio": round(sum(hsm_vals) / len(hsm_vals), 4) if hsm_vals else None,
+        "mean_half_spread_minus_fee_bps": round(mean_hs, 4) if mean_hs is not None else None,
+        "mean_spread_bps": round(mean_sp, 4) if mean_sp is not None else None,
+        "mean_vol_1s_bps": round(mean_vol, 4) if mean_vol is not None else None,
+        "mean_1s_abs_move_bps": round(mean_mv, 4) if mean_mv is not None else None,
+        "mean_spread_to_vol_ratio": round(mean_stv, 4) if mean_stv is not None else None,
+        "pooled_spread_to_vol_ratio": pooled_stv,
+        "mean_half_spread_to_1s_move_ratio": round(mean_hsm, 4) if mean_hsm is not None else None,
         "min_l1_usd": round(min(l1_vals), 2),
-        "mean_trades_per_hour": round(sum(tph_vals) / len(tph_vals), 3) if tph_vals else None,
+        "mean_trades_per_hour": round(mean_tph, 3) if mean_tph is not None else None,
     }
 
 
@@ -851,6 +888,7 @@ def evaluate_candidate_records(
 
     out: dict[str, Any] = {
         "schema": "rwa_mm_whitelist_v1",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
         "source_mode": source_mode,
         "session_breakdown_available": session_breakdown_available,
         "session_labels": SESSION_LABELS,
@@ -870,10 +908,12 @@ def screen_streams(
     streams: Sequence[dict[str, Any]],
     *,
     gates: WhitelistGates,
-    fee_overrides: dict[str, dict[str, Any]] | None = None,
+    fee_overrides: dict[str, Any] | None = None,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
 ) -> dict[str, Any]:
     """Screen in-memory `(venue, symbol, window, books, trade_timestamps_ms)` records."""
-    overrides = fee_overrides or {}
+    ev = _normalize_fee_evidence(fee_overrides)
     records_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for item in streams:
         venue = str(item["venue"])
@@ -885,18 +925,27 @@ def screen_streams(
             symbol,
             item.get("raw_market"),
             domain,
-            overrides,
+            ev,
+            arcus_fee_tier=arcus_fee_tier,
+            trade_xyz_fee_mode=trade_xyz_fee_mode,
         )
-        maker_fee = (
-            float(item["maker_fee_bps"])
-            if item.get("maker_fee_bps") is not None
-            else float(meta["maker_fee_bps"])
-        )
-        taker_fee = (
-            float(item["taker_fee_bps"])
-            if item.get("taker_fee_bps") is not None
-            else float(meta["taker_fee_bps"])
-        )
+        has_ev_override = _has_venue_override(ev, venue)
+        if has_ev_override:
+            maker_fee = float(meta["maker_fee_bps"])
+            taker_fee = float(meta["taker_fee_bps"])
+            fee_status = str(meta["fee_audit_status"])
+        else:
+            maker_fee = (
+                float(item["maker_fee_bps"])
+                if item.get("maker_fee_bps") is not None
+                else float(meta["maker_fee_bps"])
+            )
+            taker_fee = (
+                float(item["taker_fee_bps"])
+                if item.get("taker_fee_bps") is not None
+                else float(meta["taker_fee_bps"])
+            )
+            fee_status = str(item.get("fee_audit_status") or meta["fee_audit_status"])
         sess_metrics = compute_session_microstructure_metrics(
             item.get("books") or (),
             trade_timestamps_ms=item.get("trade_timestamps_ms"),
@@ -908,17 +957,27 @@ def screen_streams(
                 "window": window,
                 "raw_market": meta["raw_market"],
                 "settlement": item.get("settlement") or meta["settlement"],
-                "fee_audit_status": item.get("fee_audit_status") or meta["fee_audit_status"],
+                "fee_audit_status": fee_status,
                 "maker_fee_bps": maker_fee,
                 "taker_fee_bps": taker_fee,
                 "sessions": sess_metrics,
             }
         )
+    extra_meta = None
+    if ev.get("loaded"):
+        extra_meta = {
+            "fee_provenance": build_fee_provenance(
+                ev,
+                arcus_fee_tier=arcus_fee_tier,
+                trade_xyz_fee_mode=trade_xyz_fee_mode,
+            )
+        }
     return evaluate_candidate_records(
         records_by_pair,
         gates=gates,
         source_mode="stream_in_memory",
         session_breakdown_available=True,
+        extra_meta=extra_meta,
     )
 
 
@@ -929,15 +988,18 @@ def screen_multivenue_json_files(
     venues_filter: Sequence[str] | None = None,
     symbols_filter: Sequence[str] | None = None,
     include_crypto: bool = False,
-    fee_overrides: dict[str, dict[str, Any]] | None = None,
+    fee_overrides: dict[str, Any] | None = None,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
 ) -> dict[str, Any]:
     """Aggregate `multivenue_three_tracks_*.json` Track 1 rows into `rwa_mm_whitelist_v1`."""
-    overrides = fee_overrides or {}
+    ev = _normalize_fee_evidence(fee_overrides)
     v_set = set(venues_filter) if venues_filter else None
     s_set = set(symbols_filter) if symbols_filter else None
 
     records_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     loaded_files: list[str] = []
+    venues_seen: set[str] = set()
 
     for path in mv_paths:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -961,22 +1023,28 @@ def screen_multivenue_json_files(
                 continue
             if s_set is not None and symbol not in s_set:
                 continue
+            venues_seen.add(venue)
 
             meta = _resolve_venue_metadata(
                 venue,
                 symbol,
                 row.get("raw_market"),
                 domain,
-                overrides,
+                ev,
+                arcus_fee_tier=arcus_fee_tier,
+                trade_xyz_fee_mode=trade_xyz_fee_mode,
             )
+            has_ev_override = _has_venue_override(ev, venue)
             row_maker_fee = _opt_finite(row.get("maker_fee_bps"))
-            maker_fee = row_maker_fee if row_maker_fee is not None else float(meta["maker_fee_bps"])
-            if venue in overrides and "maker_fee_bps" in overrides[venue]:
-                maker_fee = float(overrides[venue]["maker_fee_bps"])
-
-            fee_status = str(meta["fee_audit_status"])
-            if row.get("fee_audit_status") and venue not in overrides:
-                fee_status = str(row["fee_audit_status"])
+            row_taker_fee = _opt_finite(row.get("taker_fee_bps"))
+            if has_ev_override:
+                maker_fee = float(meta["maker_fee_bps"])
+                taker_fee = float(meta["taker_fee_bps"])
+                fee_status = str(meta["fee_audit_status"])
+            else:
+                maker_fee = row_maker_fee if row_maker_fee is not None else float(meta["maker_fee_bps"])
+                taker_fee = row_taker_fee if row_taker_fee is not None else float(meta["taker_fee_bps"])
+                fee_status = str(row.get("fee_audit_status") or meta["fee_audit_status"])
 
             med_sp = _opt_finite(row.get("median_spread_bps"))
             hs_raw = _opt_finite(row.get("half_spread_minus_fee_bps"))
@@ -1011,7 +1079,7 @@ def screen_multivenue_json_files(
                     "settlement": row.get("settlement") or meta["settlement"],
                     "fee_audit_status": fee_status,
                     "maker_fee_bps": maker_fee,
-                    "taker_fee_bps": meta["taker_fee_bps"],
+                    "taker_fee_bps": taker_fee,
                     "all_summary": all_summary,
                 }
             )
@@ -1021,7 +1089,15 @@ def screen_multivenue_json_files(
         gates=gates,
         source_mode="multivenue_json",
         session_breakdown_available=False,
-        extra_meta={"multivenue_sources": loaded_files},
+        extra_meta={
+            "multivenue_sources": loaded_files,
+            "fee_provenance": build_fee_provenance(
+                ev,
+                arcus_fee_tier=arcus_fee_tier,
+                trade_xyz_fee_mode=trade_xyz_fee_mode,
+                venues_in_scope=sorted(venues_seen),
+            ),
+        },
     )
 
 
@@ -1065,12 +1141,14 @@ def screen_lakehouse(
     symbols: Sequence[str],
     gates: WhitelistGates,
     bucket_ms: int = 250,
-    fee_overrides: dict[str, dict[str, Any]] | None = None,
+    fee_overrides: dict[str, Any] | None = None,
+    arcus_fee_tier: str = "level_0",
+    trade_xyz_fee_mode: str = "growth_mode",
 ) -> dict[str, Any]:
     """Load 250ms-bucketed BBO & public_trades via read-only in-memory DuckDB and screen universe."""
     import duckdb  # Lazy import so stdlib-only CI never needs duckdb installed.
 
-    overrides = fee_overrides or {}
+    ev = _normalize_fee_evidence(fee_overrides)
     con = duckdb.connect(":memory:")
     con.execute("SET preserve_insertion_order=false; SET threads=2; SET memory_limit='2GB';")
 
@@ -1089,7 +1167,15 @@ def screen_lakehouse(
                     domain = "crypto" if symbol in CRYPTO_SYMBOLS else "rwa"
                     c_info = win_cfg["bulk"] if (venue == "bulk" and "bulk" in win_cfg) else win_cfg[domain]
                     raw_market = venue_map[symbol]
-                    meta = _resolve_venue_metadata(venue, symbol, raw_market, domain, overrides)
+                    meta = _resolve_venue_metadata(
+                        venue,
+                        symbol,
+                        raw_market,
+                        domain,
+                        ev,
+                        arcus_fee_tier=arcus_fee_tier,
+                        trade_xyz_fee_mode=trade_xyz_fee_mode,
+                    )
 
                     bbo_files = _campaign_parquet_files(
                         lakehouse_dir, "bbo_quotes", venue, c_info["utc_date"], c_info["campaign_id"]
@@ -1161,7 +1247,16 @@ def screen_lakehouse(
         gates=gates,
         source_mode="lakehouse",
         session_breakdown_available=True,
-        extra_meta={"lakehouse_dir": str(lakehouse_dir), "windows_requested": list(windows)},
+        extra_meta={
+            "lakehouse_dir": str(lakehouse_dir),
+            "windows_requested": list(windows),
+            "fee_provenance": build_fee_provenance(
+                ev,
+                arcus_fee_tier=arcus_fee_tier,
+                trade_xyz_fee_mode=trade_xyz_fee_mode,
+                venues_in_scope=list(venues),
+            ),
+        },
     )
 
 
@@ -1286,6 +1381,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--fee-evidence", type=Path, help="Optional account_fee_evidence_*.json path")
     ap.add_argument(
+        "--arcus-fee-tier",
+        choices=("level_0", "level_4"),
+        default="level_0",
+        help="Arcus fee sensitivity tier when account tier is unverified (default: level_0)",
+    )
+    ap.add_argument(
+        "--trade-xyz-fee-mode",
+        choices=("growth_mode", "standard"),
+        default="growth_mode",
+        help="trade_xyz HIP-3 fee mode (default: growth_mode)",
+    )
+    ap.add_argument(
         "--windows",
         nargs="+",
         default=list(DEFAULT_WINDOWS),
@@ -1358,6 +1465,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbols_filter=symbols_parsed or None,
             include_crypto=args.include_crypto,
             fee_overrides=fee_overrides,
+            arcus_fee_tier=args.arcus_fee_tier,
+            trade_xyz_fee_mode=args.trade_xyz_fee_mode,
         )
     else:
         windows_parsed = _parse_csv_list(args.windows) or list(DEFAULT_WINDOWS)
@@ -1368,6 +1477,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbols=symbols_parsed or list(DEFAULT_SYMBOLS),
             gates=gates,
             fee_overrides=fee_overrides,
+            arcus_fee_tier=args.arcus_fee_tier,
+            trade_xyz_fee_mode=args.trade_xyz_fee_mode,
         )
 
     rendered = json.dumps(result, indent=2, allow_nan=False)

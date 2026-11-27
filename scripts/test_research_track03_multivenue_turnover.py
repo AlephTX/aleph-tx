@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -99,9 +100,9 @@ class ResearchTrack03MultivenueTurnoverTests(unittest.TestCase):
         by_venue = {(t.venue, t.settlement, t.account_fee_status, t.has_public_trades) for t in targets}
         self.assertIn(("lighter", "USDC", "public_tier0_unverified", True), by_venue)
         self.assertIn(("lighter_robinhood", "USDG", "public_tier0_unverified", True), by_venue)
-        self.assertIn(("extended", "USDC", "public_tier0_unverified", True), by_venue)
+        self.assertIn(("extended", "USDC", "account_evidence_required", True), by_venue)
         self.assertIn(("arcus", "USDC", "public_tier0_schedule_only", True), by_venue)
-        self.assertIn(("bulk", "USDC", "public_tier0_unverified", False), by_venue)
+        self.assertIn(("bulk", "USDC", "account_evidence_required", False), by_venue)
 
         t_asia = int(datetime(2026, 11, 24, 10, 59, 0, tzinfo=timezone.utc).timestamp() * 1000)
         t_ext1 = int(datetime(2026, 11, 24, 11, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
@@ -250,6 +251,81 @@ class ResearchTrack03MultivenueTurnoverTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["self_test"], "ok")
         self.assertEqual(payload["bulk_mode"], "book_diff_diagnostic")
+
+    def test_opt01_snapshot_and_fee_evidence_overrides(self) -> None:
+        venues_rs = (SCRIPT_DIR.parent / "src" / "venues.rs").read_text(encoding="utf-8")
+        m = re.search(r'VENUE_CAPABILITY_SNAPSHOT_VERSION[^"]*"([^"]+)"', venues_rs)
+        self.assertIsNotNone(m)
+        self.assertEqual(t3.VENUE_CAPABILITY_SNAPSHOT_VERSION, m.group(1))
+
+        ev_payload = {
+            "schema_version": "aleph_account_fee_evidence_v1",
+            "audited_at_utc": "2026-11-22T17:26:28+00:00",
+            "venues": {
+                "arcus": {
+                    "account_fee_status": "public_tier0_schedule_only",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_tier0_schedule_summary": {
+                        "tier0_fee_profiles": [
+                            {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                            {"maker_fee_bps": "1.5", "taker_fee_bps": "4.5"},
+                        ],
+                        "custom_schedule_tier0_bps": {
+                            "AAPL-USD": {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                        },
+                    },
+                },
+                "lighter": {
+                    "account_fee_status": "public_schedule_only_unverified_account_tier",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                    "public_schedule_maker_fee_bps": "0",
+                    "public_schedule_taker_fee_bps": "0",
+                },
+                "extended": {
+                    "account_fee_status": "unknown_requires_account_evidence",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                },
+                "bulk": {
+                    "account_fee_status": "unknown_requires_account_evidence",
+                    "maker_fee_bps": None,
+                    "taker_fee_bps": None,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            ev_path = Path(tmp) / "fee_ev.json"
+            ev_path.write_text(json.dumps(ev_payload), encoding="utf-8")
+
+            targets, prov = t3.build_targets_with_provenance(
+                include_bulk_diagnostic=True, fee_evidence_path=ev_path, arcus_fee_tier="level_0"
+            )
+            self.assertTrue(prov["fee_evidence_loaded"])
+            self.assertEqual(prov["venue_capability_snapshot_version"], m.group(1))
+            by_key = {(t.venue, t.domain, t.symbol): t for t in targets}
+            self.assertEqual(by_key[("lighter", "crypto", "BTC")].account_fee_status, "public_schedule_only_unverified_account_tier")
+            self.assertEqual(by_key[("lighter_robinhood", "crypto", "BTC")].account_fee_status, "public_tier0_unverified")
+            self.assertEqual(by_key[("extended", "crypto", "BTC")].account_fee_status, "unknown_requires_account_evidence")
+            self.assertEqual(by_key[("bulk", "crypto", "BTC")].account_fee_status, "unknown_requires_account_evidence")
+            self.assertEqual(by_key[("arcus", "crypto", "BTC")].maker_fee_bps, 1.50)
+            self.assertEqual(by_key[("arcus", "crypto", "BTC")].taker_fee_bps, 4.50)
+            self.assertEqual(by_key[("arcus", "rwa", "AAPL")].fee_source, "evidence_public_tier0_custom_market")
+            self.assertEqual(by_key[("arcus", "rwa", "AAPL")].taker_fee_bps, 2.25)
+
+            sens_targets, _ = t3.build_targets_with_provenance(
+                include_bulk_diagnostic=False, fee_evidence_path=ev_path, arcus_fee_tier="level_4"
+            )
+            sens_map = {(t.venue, t.domain, t.symbol): t for t in sens_targets}
+            self.assertEqual(sens_map[("arcus", "crypto", "BTC")].taker_fee_bps, 2.30)
+            self.assertEqual(sens_map[("arcus", "rwa", "AAPL")].taker_fee_bps, 1.15)
+            self.assertEqual(sens_map[("arcus", "rwa", "AAPL")].account_fee_status, "account_evidence_required")
+
+            bad_path = Path(tmp) / "bad.json"
+            bad_path.write_text(json.dumps({"venues": {"lighter": {"maker_fee_bps": True, "taker_fee_bps": "0"}}}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                t3.build_targets_with_provenance(fee_evidence_path=bad_path)
 
 
 if __name__ == "__main__":

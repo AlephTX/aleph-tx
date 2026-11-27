@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,252 @@ class ScreenRwaMmUniverseTests(unittest.TestCase):
         parsed = json.loads(proc.stdout)
         self.assertEqual(parsed["self_test"], "ok")
         self.assertTrue(math.isclose(parsed["asia_half_spread_to_1s_move"], 3.0, abs_tol=0.1))
+
+    def test_opt01_defaults_and_duration_weighted_session_aggregation(self) -> None:
+        venues_rs = (SCRIPT_DIR.parent / "src" / "venues.rs").read_text(encoding="utf-8")
+        m = re.search(r'VENUE_CAPABILITY_SNAPSHOT_VERSION[^"]*"([^"]+)"', venues_rs)
+        self.assertIsNotNone(m)
+        self.assertEqual(scr.VENUE_CAPABILITY_SNAPSHOT_VERSION, m.group(1))
+
+        self.assertEqual(scr.VENUE_PROFILES["arcus"]["fee_audit_status"], "public_tier0_schedule_only")
+        self.assertEqual(scr.VENUE_PROFILES["arcus"]["maker_fee_bps_crypto"], 1.50)
+        self.assertEqual(scr.VENUE_PROFILES["arcus"]["taker_fee_bps_crypto"], 4.50)
+        self.assertEqual(scr.VENUE_PROFILES["arcus"]["taker_fee_bps_equity"], 2.25)
+        self.assertEqual(scr.VENUE_PROFILES["lighter"]["fee_audit_status"], "public_tier0_unverified")
+        self.assertEqual(scr.VENUE_PROFILES["lighter_robinhood"]["fee_audit_status"], "public_tier0_unverified")
+
+        # Short thin outlier window (0.1h, ratio=25.0) must not dominate a 6.0h window (ratio=1.3125).
+        sess = scr._aggregate_session_across_windows(
+            [
+                {
+                    "insufficient_samples": False,
+                    "hours": 0.1,
+                    "samples": 30,
+                    "median_spread_bps": 1.0,
+                    "realized_1s_vol_bps": 0.04,
+                    "spread_to_vol_ratio": 25.0,
+                    "half_spread_minus_fee_bps": 0.5,
+                    "median_l1_min_usd": 1000.0,
+                },
+                {
+                    "insufficient_samples": False,
+                    "hours": 6.0,
+                    "samples": 1800,
+                    "median_spread_bps": 0.84,
+                    "realized_1s_vol_bps": 0.64,
+                    "spread_to_vol_ratio": 1.3125,
+                    "half_spread_minus_fee_bps": 0.42,
+                    "median_l1_min_usd": 1000.0,
+                },
+            ],
+            "us_rth",
+        )
+        expected_w_stv = round((30 * 25.0 + 1800 * 1.3125) / 1830, 4)
+        expected_pooled = round((30 * 1.0 + 1800 * 0.84) / (30 * 0.04 + 1800 * 0.64), 4)
+        self.assertLess(sess["mean_spread_to_vol_ratio"], 2.0)
+        self.assertAlmostEqual(sess["mean_spread_to_vol_ratio"], expected_w_stv, places=4)
+        self.assertAlmostEqual(sess["pooled_spread_to_vol_ratio"], expected_pooled, places=4)
+
+        # Synthetic zero-duration records emit snapshot version and evaluate cleanly.
+        res = scr.evaluate_candidate_records(
+            {
+                ("lighter", "AAPL"): [
+                    {
+                        "window": "w23",
+                        "raw_market": "113",
+                        "settlement": "USDC",
+                        "fee_audit_status": "public_tier0_unverified",
+                        "maker_fee_bps": 0.0,
+                        "taker_fee_bps": 0.0,
+                        "all_summary": {
+                            "insufficient_samples": False,
+                            "half_spread_minus_fee_bps": 0.8,
+                            "spread_to_vol_ratio": 1.1,
+                            "median_l1_min_usd": 1200.0,
+                            "realized_1s_vol_bps": 1.0,
+                        },
+                    }
+                ]
+            },
+            gates=scr.WhitelistGates(),
+            source_mode="multivenue_json",
+            session_breakdown_available=False,
+        )
+        self.assertEqual(res["venue_capability_snapshot_version"], m.group(1))
+        self.assertEqual(res["whitelist_count"], 1)
+
+    def test_fee_evidence_delegates_to_track_fee_evidence_and_rejects_unverified_overrides(self) -> None:
+        bad_cases = [
+            ("arcus", "NVDA", "NVDA-USD", "rwa", "public_tier0_schedule_only"),
+            ("trade_xyz", "NVDA", "xyz:NVDA", "rwa", "public_schedule_only_unverified_account_tier"),
+            ("extended", "BTC", "BTC-USD", "crypto", "unknown_requires_account_evidence"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for venue, symbol, raw_mkt, domain, bad_status in bad_cases:
+                bad_payload = {
+                    "schema_version": "aleph_account_fee_evidence_v1",
+                    "venues": {
+                        venue: {
+                            "account_fee_status": bad_status,
+                            "maker_fee_bps": 0.0,
+                            "taker_fee_bps": 0.0,
+                        }
+                    },
+                }
+                bad_path = root / f"{venue}_bad.json"
+                bad_path.write_text(json.dumps(bad_payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "verified_account_tier"):
+                    scr.load_fee_evidence_overrides(bad_path)
+                with self.assertRaisesRegex(ValueError, "verified_account_tier"):
+                    scr.screen_streams(
+                        [
+                            {
+                                "venue": venue,
+                                "symbol": symbol,
+                                "raw_market": raw_mkt,
+                                "domain": domain,
+                                "books": scr._make_synthetic_bbo_stream(
+                                    1_795_000_000_000, 12, spread_bps=3.0, step_move_bps=0.4, l1_usd=1000.0
+                                ),
+                            }
+                        ],
+                        gates=scr.WhitelistGates(),
+                        fee_overrides={venue: bad_payload["venues"][venue]},
+                    )
+
+            verified_path = root / "good_verified.json"
+            verified_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "aleph_account_fee_evidence_v1",
+                        "venues": {
+                            "arcus": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": 0.25,
+                                "taker_fee_bps": 1.25,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = scr.load_fee_evidence_overrides(verified_path)
+            meta = scr._resolve_venue_metadata("arcus", "NVDA", "NVDA-USD", "rwa", loaded)
+            self.assertEqual((meta["maker_fee_bps"], meta["taker_fee_bps"], meta["fee_audit_status"]), (0.25, 1.25, "verified_account_tier"))
+
+            ev_path = root / "real_like_ev.json"
+            ev_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "aleph_account_fee_evidence_v1",
+                        "venues": {
+                            "arcus": {
+                                "account_fee_status": "public_tier0_schedule_only",
+                                "maker_fee_bps": None,
+                                "taker_fee_bps": None,
+                                "public_tier0_schedule_summary": {
+                                    "tier0_fee_profiles": [
+                                        {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                                        {"maker_fee_bps": "1.5", "taker_fee_bps": "4.5"},
+                                    ],
+                                    "custom_schedule_tier0_bps": {
+                                        "ANT-USD": {"maker_fee_bps": "0", "taker_fee_bps": "1.12"},
+                                        "NVDA-USD": {"maker_fee_bps": "0", "taker_fee_bps": "2.25"},
+                                    },
+                                },
+                            },
+                            "trade_xyz": {
+                                "account_fee_status": "verified_account_tier",
+                                "maker_fee_bps": None,
+                                "taker_fee_bps": None,
+                                "growth_mode_maker_fee_bps": "0.3",
+                                "growth_mode_taker_fee_bps": "0.9",
+                                "standard_maker_fee_bps": "3",
+                                "standard_taker_fee_bps": "9",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mv_path = root / "mv.json"
+            mv_path.write_text(
+                json.dumps(
+                    {
+                        "split": "holdout_w25",
+                        "track1_quant_profit": [
+                            {
+                                "venue": "arcus",
+                                "symbol": "ANT",
+                                "raw_market": "ANT-USD",
+                                "domain": "rwa",
+                                "maker_fee_bps": 0.0,
+                                "median_spread_bps": 3.0,
+                                "half_spread_minus_fee_bps": 1.5,
+                                "spread_to_1s_vol_ratio": 1.2,
+                                "median_l1_min_usd": 1200.0,
+                                "realized_1s_vol_bps": 1.5,
+                            },
+                            {
+                                "venue": "arcus",
+                                "symbol": "NVDA",
+                                "raw_market": "NVDA-USD",
+                                "domain": "rwa",
+                                "maker_fee_bps": 0.0,
+                                "median_spread_bps": 3.0,
+                                "half_spread_minus_fee_bps": 1.5,
+                                "spread_to_1s_vol_ratio": 1.2,
+                                "median_l1_min_usd": 1200.0,
+                                "realized_1s_vol_bps": 1.5,
+                            },
+                            {
+                                "venue": "trade_xyz",
+                                "symbol": "NVDA",
+                                "raw_market": "xyz:NVDA",
+                                "domain": "rwa",
+                                "maker_fee_bps": 0.3,
+                                "median_spread_bps": 3.0,
+                                "half_spread_minus_fee_bps": 1.2,
+                                "spread_to_1s_vol_ratio": 1.2,
+                                "median_l1_min_usd": 1200.0,
+                                "realized_1s_vol_bps": 1.5,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out_path = root / "out_std.json"
+            rc = scr.main(
+                [
+                    "--multivenue",
+                    str(mv_path),
+                    "--fee-evidence",
+                    str(ev_path),
+                    "--arcus-fee-tier",
+                    "level_0",
+                    "--trade-xyz-fee-mode",
+                    "standard",
+                    "--output",
+                    str(out_path),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["venue_capability_snapshot_version"], scr.VENUE_CAPABILITY_SNAPSHOT_VERSION)
+            self.assertEqual(payload["fee_provenance"]["arcus_fee_tier"], "level_0")
+            self.assertEqual(payload["fee_provenance"]["trade_xyz_fee_mode"], "standard")
+            by_pair = {
+                (r["venue"], r["symbol"]): r
+                for r in payload["whitelist"] + payload["excluded"]
+            }
+            self.assertEqual(by_pair[("arcus", "ANT")]["taker_fee_bps"], 1.12)
+            self.assertEqual(by_pair[("arcus", "NVDA")]["taker_fee_bps"], 2.25)
+            self.assertEqual(by_pair[("trade_xyz", "NVDA")]["maker_fee_bps"], 3.0)
+            self.assertEqual(by_pair[("trade_xyz", "NVDA")]["taker_fee_bps"], 9.0)
+            self.assertEqual(by_pair[("trade_xyz", "NVDA")]["fee_audit_status"], "verified_account_tier")
+            self.assertAlmostEqual(by_pair[("trade_xyz", "NVDA")]["worst_half_spread_minus_fee_bps"], -1.5, places=4)
 
 
 if __name__ == "__main__":

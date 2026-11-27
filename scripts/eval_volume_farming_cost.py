@@ -12,10 +12,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from track_fee_evidence import (  # noqa: E402
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    _confirmed_account_pair,
+)
 
 BPS_TO_DECIMAL = 1e-4
 USD_PER_MILLION_SCALE = 100.0  # 1 bp per $1 = $100 per $1,000,000
@@ -162,11 +172,16 @@ def _find_tier0_profile(
 
 
 def load_fee_profiles_from_evidence(evidence_path: Path) -> list[VenueFeeProfile]:
-    """Load audited venue fee profiles from `account_fee_evidence_*.json`."""
+    """Load audited venue fee profiles from `account_fee_evidence_*.json` (fail-closed on unverified overrides)."""
     data = json.loads(evidence_path.read_text(encoding="utf-8"))
     venues = data.get("venues")
     if not isinstance(venues, dict):
         raise ValueError(f"Expected dict 'venues' in {evidence_path}")
+
+    for venue_name, payload in venues.items():
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected dict venue record for {venue_name!r} in {evidence_path}")
+        _confirmed_account_pair(payload, str(venue_name))
 
     out: list[VenueFeeProfile] = []
 
@@ -215,15 +230,16 @@ def load_fee_profiles_from_evidence(evidence_path: Path) -> list[VenueFeeProfile
 
     if "hyperliquid" in venues:
         hl = venues["hyperliquid"]
-        if hl.get("maker_fee_bps") is not None and hl.get("taker_fee_bps") is not None:
+        hl_pair = _confirmed_account_pair(hl, "hyperliquid")
+        if hl_pair is not None:
             out.append(
                 VenueFeeProfile(
                     key="hyperliquid_verified",
                     venue="hyperliquid",
                     scope="Verified account Tier 0 (1.5 / 4.5 bps)",
-                    maker_fee_bps=_require_finite(hl["maker_fee_bps"], "hl.maker"),
-                    taker_fee_bps=_require_finite(hl["taker_fee_bps"], "hl.taker"),
-                    account_fee_status=str(hl.get("account_fee_status") or "unknown"),
+                    maker_fee_bps=hl_pair[0],
+                    taker_fee_bps=hl_pair[1],
+                    account_fee_status="verified_account_tier",
                 )
             )
 
@@ -502,6 +518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     profiles = load_fee_profiles_from_evidence(args.fee_evidence)
     out: dict[str, Any] = {
         "schema": "volume_farming_cost_audit_v1",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
         "fee_profiles": [asdict(p) for p in profiles],
         "bookdiff": evaluate_bookdiff_arms(
             args.bookdiff,

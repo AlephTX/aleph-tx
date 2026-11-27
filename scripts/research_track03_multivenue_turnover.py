@@ -7,9 +7,9 @@ Evaluates Track 03 (03_incentive_turnover) across BOTH:
 across all continuous WS venues in the Aleph lakehouse:
   - lighter            (USDC, public_tier0_unverified, 0.0 / 0.0 bps)
   - lighter_robinhood  (USDG, public_tier0_unverified, 0.0 / 0.0 bps)
-  - extended           (USDC, public_tier0_unverified, 0.0 / 2.50 bps, Crypto)
+  - extended           (USDC, account_evidence_required, 0.0 / 2.50 bps, Crypto)
   - arcus              (USDC, public_tier0_schedule_only, RWA 0.0 / 2.25 bps, Crypto 1.50 / 4.50 bps)
-  - bulk               (USDC, public_tier0_unverified, 0.0 / 2.00 bps, tagged `book_diff_diagnostic`)
+  - bulk               (USDC, account_evidence_required, 0.0 / 2.00 bps, tagged `book_diff_diagnostic`)
 
 Supports dynamic Hive campaign discovery across full Aleph W01-W25 history:
   - `full_dev`: Crypto `w01..w20 ex w08` (19w ~195h, includes `w03`), RWA `w01..w20` (15w ~154h), BULK `w01..w20` (20w)
@@ -48,6 +48,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from eval_volume_farming_cost import compute_volume_farming_cost  # noqa: E402
+from track_fee_evidence import (  # noqa: E402
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    build_fee_provenance,
+    load_track_fee_evidence,
+    resolve_venue_fee,
+)
 
 TEN_HOURS_MS = 36_000_000
 MAX_CONTINUOUS_GAP_MS = 60_000
@@ -205,7 +211,7 @@ VENUE_METADATA: dict[str, dict[str, Any]] = {
     },
     "extended": {
         "settlement": "USDC",
-        "account_fee_status": "public_tier0_unverified",
+        "account_fee_status": "account_evidence_required",
         "has_public_trades": True,
         "crypto_fees": (0.0, 2.50),
         "rwa_fees": (0.0, 2.50),
@@ -219,7 +225,7 @@ VENUE_METADATA: dict[str, dict[str, Any]] = {
     },
     "bulk": {
         "settlement": "USDC",
-        "account_fee_status": "public_tier0_unverified",
+        "account_fee_status": "account_evidence_required",
         "has_public_trades": False,
         "crypto_fees": (0.0, 2.00),
         "rwa_fees": (0.0, 2.00),
@@ -240,10 +246,17 @@ class TurnoverTarget:
     account_fee_status: str
     has_public_trades: bool
     ref_venues: tuple[str, ...]
+    fee_source: str = "default"
 
 
-def build_default_targets(*, include_bulk_diagnostic: bool = True) -> list[TurnoverTarget]:
-    """Build canonical Crypto + RWA multi-venue target matrix with explicit USDC vs USDG separation."""
+def build_targets_with_provenance(
+    *,
+    include_bulk_diagnostic: bool = True,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
+) -> tuple[list[TurnoverTarget], dict[str, Any]]:
+    """Build Crypto + RWA target matrix along with sanitized OPT-01 fee provenance."""
+    ev = load_track_fee_evidence(fee_evidence_path)
     targets: list[TurnoverTarget] = []
 
     crypto_venues: tuple[str, ...] = ("lighter", "lighter_robinhood", "extended", "arcus")
@@ -255,17 +268,29 @@ def build_default_targets(*, include_bulk_diagnostic: bool = True) -> list[Turno
         for sym in CRYPTO_SYMBOLS:
             if sym not in VENUE_SYMBOL_MAP[venue]:
                 continue
+            raw_mkt = VENUE_SYMBOL_MAP[venue][sym]
+            eff_mk, eff_tk, eff_st, eff_src = resolve_venue_fee(
+                venue,
+                "crypto",
+                default_maker_bps=float(maker_bp),
+                default_taker_bps=float(taker_bp),
+                default_status=str(meta["account_fee_status"]),
+                evidence=ev,
+                raw_market=raw_mkt,
+                arcus_fee_tier=arcus_fee_tier,
+            )
             targets.append(
                 TurnoverTarget(
                     venue=venue,
                     domain="crypto",
                     symbol=sym,
                     settlement=str(meta["settlement"]),
-                    maker_fee_bps=float(maker_bp),
-                    taker_fee_bps=float(taker_bp),
-                    account_fee_status=str(meta["account_fee_status"]),
+                    maker_fee_bps=eff_mk,
+                    taker_fee_bps=eff_tk,
+                    account_fee_status=eff_st,
                     has_public_trades=bool(meta["has_public_trades"]),
                     ref_venues=("binance",),
+                    fee_source=eff_src,
                 )
             )
 
@@ -278,6 +303,17 @@ def build_default_targets(*, include_bulk_diagnostic: bool = True) -> list[Turno
         for sym in RWA_SYMBOLS:
             if sym not in VENUE_SYMBOL_MAP[venue]:
                 continue
+            raw_mkt = VENUE_SYMBOL_MAP[venue][sym]
+            eff_mk, eff_tk, eff_st, eff_src = resolve_venue_fee(
+                venue,
+                "rwa",
+                default_maker_bps=float(maker_bp),
+                default_taker_bps=float(taker_bp),
+                default_status=str(meta["account_fee_status"]),
+                evidence=ev,
+                raw_market=raw_mkt,
+                arcus_fee_tier=arcus_fee_tier,
+            )
             if venue == "arcus":
                 refs: tuple[str, ...] = (
                     ("trade_xyz",) if sym in ("DRAM", "SNDK") else ("lighter_robinhood", "lighter", "trade_xyz")
@@ -290,13 +326,35 @@ def build_default_targets(*, include_bulk_diagnostic: bool = True) -> list[Turno
                     domain="rwa",
                     symbol=sym,
                     settlement=str(meta["settlement"]),
-                    maker_fee_bps=float(maker_bp),
-                    taker_fee_bps=float(taker_bp),
-                    account_fee_status=str(meta["account_fee_status"]),
+                    maker_fee_bps=eff_mk,
+                    taker_fee_bps=eff_tk,
+                    account_fee_status=eff_st,
                     has_public_trades=bool(meta["has_public_trades"]),
                     ref_venues=refs,
+                    fee_source=eff_src,
                 )
             )
+
+    prov = build_fee_provenance(
+        ev,
+        arcus_fee_tier=arcus_fee_tier,
+        venues_in_scope=tuple(VENUE_METADATA.keys()),
+    )
+    return targets, prov
+
+
+def build_default_targets(
+    *,
+    include_bulk_diagnostic: bool = True,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
+) -> list[TurnoverTarget]:
+    """Build canonical Crypto + RWA multi-venue target matrix with explicit USDC vs USDG separation."""
+    targets, _ = build_targets_with_provenance(
+        include_bulk_diagnostic=include_bulk_diagnostic,
+        fee_evidence_path=fee_evidence_path,
+        arcus_fee_tier=arcus_fee_tier,
+    )
     return targets
 
 
@@ -1687,6 +1745,8 @@ def run_duckdb_multivenue_eval(
     include_bulk_diagnostic: bool = True,
     rebate_bps: float = 0.0,
     regime_thresholds: dict[str, tuple[float, float]] | None = None,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
 ) -> dict[str, Any]:
     """Run read-only DuckDB `:memory:` multi-venue Crypto + RWA evaluation with per-window GC."""
     import duckdb  # Lazy import so stdlib-only CI never needs duckdb at module top level
@@ -1695,7 +1755,11 @@ def run_duckdb_multivenue_eval(
     if not selected_windows:
         raise ValueError(f"No campaigns discovered under {lakehouse_dir} for split={split!r}")
 
-    targets = build_default_targets(include_bulk_diagnostic=include_bulk_diagnostic)
+    targets, fee_prov = build_targets_with_provenance(
+        include_bulk_diagnostic=include_bulk_diagnostic,
+        fee_evidence_path=fee_evidence_path,
+        arcus_fee_tier=arcus_fee_tier,
+    )
     domain_set = set(domains)
     venue_set = set(venues) if venues else None
     sym_set = {s.upper() for s in symbols} if symbols else None
@@ -1908,6 +1972,7 @@ def run_duckdb_multivenue_eval(
                         "raw_market": raw_mkt,
                         "settlement": target.settlement,
                         "account_fee_status": target.account_fee_status,
+                        "fee_source": target.fee_source,
                         "maker_fee_bps": target.maker_fee_bps,
                         "taker_fee_bps": target.taker_fee_bps,
                         "rebate_bps": rebate_bps,
@@ -1934,6 +1999,8 @@ def run_duckdb_multivenue_eval(
 
     return {
         "schema": "track03_multivenue_turnover_v2",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
+        "fee_provenance": fee_prov,
         "split": split,
         "rebate_bps": rebate_bps,
         "windows": selected_windows,
@@ -2029,6 +2096,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--arms", type=str, default=None, help="Optional comma-separated arm subset")
     ap.add_argument("--no-bulk", action="store_true", help="Exclude bulk book_diff_diagnostic targets")
     ap.add_argument("--rebate-bps", type=float, default=0.0, help="Explicit maker rebate bps (default 0.0)")
+    ap.add_argument("--fee-evidence", type=Path, default=None, help="Optional account_fee_evidence_*.json path")
+    ap.add_argument(
+        "--arcus-fee-tier",
+        choices=("level_0", "level_4"),
+        default="level_0",
+        help="Arcus fee tier: default level_0 (public tier0 1.50/4.50 crypto, 0/2.25 RWA) or level_4 sensitivity",
+    )
     ap.add_argument(
         "--regime-thresholds-from",
         type=Path,
@@ -2074,6 +2148,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         include_bulk_diagnostic=not args.no_bulk,
         rebate_bps=args.rebate_bps,
         regime_thresholds=frozen_thresholds,
+        fee_evidence_path=args.fee_evidence,
+        arcus_fee_tier=args.arcus_fee_tier,
     )
     rendered = json.dumps(result, indent=2, allow_nan=False)
     if args.output:

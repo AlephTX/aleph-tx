@@ -47,6 +47,17 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from track_fee_evidence import (  # noqa: E402
+    VENUE_CAPABILITY_SNAPSHOT_VERSION,
+    build_fee_provenance,
+    load_track_fee_evidence,
+    resolve_venue_fee,
+)
+
 TEN_HOURS_MS = 36_000_000
 MAX_CONTINUOUS_GAP_MS = 60_000
 STEP_MS = 250
@@ -125,6 +136,38 @@ VENUE_PROFILES: dict[str, dict[str, Any]] = {
         "fee_note": "Public Level 0 Base crypto schedule 1.50 maker / 4.50 taker bps (Level 4 Platinum 2.30 taker).",
     },
 }
+
+
+def resolve_venue_profiles(
+    fee_evidence_path: Path | None = None,
+    *,
+    arcus_fee_tier: str = "level_0",
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Return fresh deep-copied crypto venue profiles with OPT-01 snapshot/fee-evidence overrides."""
+    ev = load_track_fee_evidence(fee_evidence_path)
+    resolved: dict[str, dict[str, Any]] = {}
+    for venue, base_vp in VENUE_PROFILES.items():
+        vp = dict(base_vp)
+        mk, tk, status, src = resolve_venue_fee(
+            venue,
+            "crypto",
+            default_maker_bps=float(vp["maker_fee_bps"]),
+            default_taker_bps=float(vp["taker_fee_bps"]),
+            default_status=str(vp["account_fee_status"]),
+            evidence=ev,
+            arcus_fee_tier=arcus_fee_tier,
+        )
+        vp["maker_fee_bps"] = mk
+        vp["taker_fee_bps"] = tk
+        vp["account_fee_status"] = status
+        vp["fee_source"] = src
+        resolved[venue] = vp
+    prov = build_fee_provenance(
+        ev,
+        arcus_fee_tier=arcus_fee_tier,
+        venues_in_scope=tuple(VENUE_PROFILES.keys()),
+    )
+    return resolved, prov
 
 # Pre-registered selection grids (evaluated strictly on full_dev / selection_dev only).
 BASELINE_THETAS_BPS: tuple[float, ...] = (4.0, 6.0, 8.0)
@@ -1489,8 +1532,15 @@ def _aggregate_arm_rows(rows: Sequence[dict[str, Any]], *, cont_only: bool = Fal
     }
 
 
-def _arm_configs_from_frozen(pair: CryptoLeadLagPair, frozen: dict[str, Any], *, warmup_ms: int) -> dict[str, LeadLagArmParams]:
-    vp = VENUE_PROFILES[pair.tgt_venue]
+def _arm_configs_from_frozen(
+    pair: CryptoLeadLagPair,
+    frozen: dict[str, Any],
+    *,
+    warmup_ms: int,
+    venue_profiles: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, LeadLagArmParams]:
+    vp_map = venue_profiles if venue_profiles is not None else VENUE_PROFILES
+    vp = vp_map[pair.tgt_venue]
     common = dict(
         theta_bps=float(frozen["theta_bps"]),
         tau_ms=int(frozen["tau_ms"]),
@@ -1525,6 +1575,7 @@ def _select_pair_frozen_params(
     window_streams: dict[str, dict[str, Any]],
     *,
     warmup_ms: int = DEFAULT_WARMUP_MS,
+    venue_profiles: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """In-memory selection helper (used in unit tests or small splits)."""
     pre_by_win: dict[str, PrecomputedPairSignals] = {}
@@ -1536,7 +1587,7 @@ def _select_pair_frozen_params(
         )
         if sig is not None:
             pre_by_win[win_id] = sig
-    return _select_from_precomputed(pair, pre_by_win, warmup_ms=warmup_ms)
+    return _select_from_precomputed(pair, pre_by_win, warmup_ms=warmup_ms, venue_profiles=venue_profiles)
 
 
 def _select_from_precomputed(
@@ -1544,8 +1595,10 @@ def _select_from_precomputed(
     pre_by_win: dict[str, PrecomputedPairSignals],
     *,
     warmup_ms: int = DEFAULT_WARMUP_MS,
+    venue_profiles: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    vp = VENUE_PROFILES[pair.tgt_venue]
+    vp_map = venue_profiles if venue_profiles is not None else VENUE_PROFILES
+    vp = vp_map[pair.tgt_venue]
     taker_fee_bps = float(vp["taker_fee_bps"])
     taker_delay_ms = int(vp["taker_delay_ms"])
 
@@ -1697,10 +1750,13 @@ def run_duckdb_crypto_lead_lag(
     pairs: Sequence[CryptoLeadLagPair] | None = None,
     frozen_params_path: Path | None = None,
     warmup_ms: int = DEFAULT_WARMUP_MS,
+    fee_evidence_path: Path | None = None,
+    arcus_fee_tier: str = "level_0",
 ) -> dict[str, Any]:
     """Run read-only Hive parquet evaluation window-by-window via in-memory DuckDB (`gc.collect()` per window)."""
     import duckdb  # Lazy import so stdlib-only CI never requires duckdb at import time
 
+    resolved_vps, fee_prov = resolve_venue_profiles(fee_evidence_path, arcus_fee_tier=arcus_fee_tier)
     active_pairs = list(pairs) if pairs is not None else build_default_pairs()
     splits_map = resolve_crypto_splits(lakehouse_dir, split)
     dev_split_name = "selection_dev" if split == "selection_dev" else "full_dev"
@@ -1827,11 +1883,13 @@ def run_duckdb_crypto_lead_lag(
 
     out: dict[str, Any] = {
         "schema": "track01_multivenue_crypto_lead_lag_v2",
+        "venue_capability_snapshot_version": VENUE_CAPABILITY_SNAPSHOT_VERSION,
+        "fee_provenance": fee_prov,
         "protocol": (
             "Full W01-W25 dynamic discovery: select & freeze parameters + regime cutoffs strictly on "
             f"{dev_split_name}; replay ONCE untouched on holdout. Strict HOLD, read-only."
         ),
-        "venue_profiles": VENUE_PROFILES,
+        "venue_profiles": resolved_vps,
         "step_ms": STEP_MS,
         "warmup_ms": warmup_ms,
         "l1_depth_cap_frac": DEFAULT_L1_DEPTH_CAP_FRAC,
@@ -1880,7 +1938,7 @@ def run_duckdb_crypto_lead_lag(
                 if sig is None:
                     continue
                 cont_win_count[p.pair_id] += 1
-                vp = VENUE_PROFILES[p.tgt_venue]
+                vp = resolved_vps[p.tgt_venue]
                 for tau_ms in BASELINE_TAU_MS:
                     for hold_ms in BASELINE_HOLD_MS:
                         for theta_bps in BASELINE_THETAS_BPS:
@@ -1951,7 +2009,7 @@ def run_duckdb_crypto_lead_lag(
                 )
                 if sig is None:
                     continue
-                vp = VENUE_PROFILES[p.tgt_venue]
+                vp = resolved_vps[p.tgt_venue]
                 for mult in VOL_THETA_MULT_GRID:
                     cfg = LeadLagArmParams(
                         theta_bps=b_theta,
@@ -2026,7 +2084,7 @@ def run_duckdb_crypto_lead_lag(
         for win_id, win_info in sorted(win_map.items()):
             win_bbo, win_trades = load_one_window(win_info)
             for p in active_pairs:
-                vp = VENUE_PROFILES[p.tgt_venue]
+                vp = resolved_vps[p.tgt_venue]
                 ref_rows, ref_cont = win_bbo[(p.ref_venue, p.symbol)]
                 tgt_rows, tgt_cont = win_bbo[(p.tgt_venue, p.symbol)]
                 conf_rows, conf_cont = win_bbo[(p.confirm_venue, p.symbol)]
@@ -2085,7 +2143,12 @@ def run_duckdb_crypto_lead_lag(
                     continue
                 cont_ok = bool(ref_cont["is_continuous_10h"] and tgt_cont["is_continuous_10h"])
                 hours_cov = round((sig.t1_ms - sig.t0_ms) / 3_600_000.0, 3)
-                arm_cfgs = _arm_configs_from_frozen(p, fr, warmup_ms=warmup_ms)
+                arm_cfgs = _arm_configs_from_frozen(
+                    p,
+                    fr,
+                    warmup_ms=warmup_ms,
+                    venue_profiles=resolved_vps,
+                )
                 for arm_name, cfg in arm_cfgs.items():
                     sim_res = simulate_precomputed_arm(sig, cfg)
                     raw_rows.append(
@@ -2240,6 +2303,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--venues", type=str, default=None, help="Comma-separated subset of target venues")
     ap.add_argument("--symbols", type=str, default=None, help="Comma-separated subset of symbols (BTC,ETH,SOL)")
     ap.add_argument("--warmup-ms", type=int, default=DEFAULT_WARMUP_MS)
+    ap.add_argument("--fee-evidence", type=Path, default=None, help="Optional account_fee_evidence_*.json path")
+    ap.add_argument(
+        "--arcus-fee-tier",
+        choices=("level_0", "level_4"),
+        default="level_0",
+        help="Arcus fee tier: default level_0 (public tier0 1.50/4.50 bps) or level_4 sensitivity (0.0/2.30 bps)",
+    )
     ap.add_argument("--output", type=Path, default=None)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
@@ -2267,6 +2337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         pairs=pairs,
         frozen_params_path=args.frozen_params,
         warmup_ms=args.warmup_ms,
+        fee_evidence_path=args.fee_evidence,
+        arcus_fee_tier=args.arcus_fee_tier,
     )
     rendered = json.dumps(res, indent=2, allow_nan=False)
     if args.output:

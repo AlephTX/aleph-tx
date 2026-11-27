@@ -193,6 +193,22 @@ class VolumeFarmingCostTests(unittest.TestCase):
 
             self.assertEqual(vf.run_self_test()["self_test"], "ok")
 
+    def test_rejects_unverified_account_fee_overrides(self) -> None:
+        bad_cases = [
+            ("arcus", {"account_fee_status": "public_tier0_schedule_only", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
+            ("hyperliquid", {"account_fee_status": "unknown_requires_account_evidence", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
+            ("trade_xyz", {"account_fee_status": "public_schedule_only_unverified_account_tier", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
+            ("extended", {"account_fee_status": "unknown_requires_account_evidence", "maker_fee_bps": 0.0, "taker_fee_bps": 0.0}, "verified_account_tier"),
+            ("hyperliquid", {"account_fee_status": "verified_account_tier", "maker_fee_bps": 1.5, "taker_fee_bps": None}, "both be set"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for idx, (venue, venue_payload, msg_re) in enumerate(bad_cases):
+                bad_path = root / f"bad_{idx}_{venue}.json"
+                bad_path.write_text(json.dumps({"venues": {venue: venue_payload}}), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, msg_re):
+                    vf.load_fee_profiles_from_evidence(bad_path)
+
 
 if __name__ == "__main__":
     unittest.main()
