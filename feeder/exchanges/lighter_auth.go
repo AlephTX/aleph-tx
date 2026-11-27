@@ -24,12 +24,21 @@ type LighterAuth struct {
 	lastAuthExpiry time.Time
 }
 
-// LoadLighterAuthFromEnv loads authentication credentials from .env.lighter
+// LoadLighterAuthFromEnv loads authentication credentials from LIGHTER_* env vars.
 func LoadLighterAuthFromEnv() (*LighterAuth, error) {
-	// Load private key (40 bytes hex)
-	privKeyHex := os.Getenv("LIGHTER_PRIVATE_KEY")
+	return LoadLighterAuthFromEnvPrefix("LIGHTER_")
+}
+
+// LoadLighterAuthFromEnvPrefix loads Lighter authentication credentials using
+// `<prefix>PRIVATE_KEY`, `<prefix>ACCOUNT_INDEX`, `<prefix>API_KEY_INDEX`, and
+// `<prefix>CHAIN_ID` (with `API_KEY_PRIVATE_KEY` fallback when prefix is `LIGHTER_`).
+func LoadLighterAuthFromEnvPrefix(prefix string) (*LighterAuth, error) {
+	privKeyHex := strings.TrimSpace(os.Getenv(prefix + "PRIVATE_KEY"))
+	if privKeyHex == "" && prefix == "LIGHTER_" {
+		privKeyHex = strings.TrimSpace(os.Getenv("API_KEY_PRIVATE_KEY"))
+	}
 	if privKeyHex == "" {
-		privKeyHex = os.Getenv("API_KEY_PRIVATE_KEY")
+		return nil, fmt.Errorf("%sPRIVATE_KEY not set in environment", prefix)
 	}
 	privKeyBytes, err := hex.DecodeString(strings.TrimPrefix(privKeyHex, "0x"))
 	if err != nil {
@@ -38,42 +47,39 @@ func LoadLighterAuthFromEnv() (*LighterAuth, error) {
 	defer clear(privKeyBytes)
 
 	if len(privKeyBytes) != 40 {
-		return nil, fmt.Errorf("API_KEY_PRIVATE_KEY must be 40 bytes, got %d", len(privKeyBytes))
+		return nil, fmt.Errorf("%sPRIVATE_KEY must be 40 bytes, got %d", prefix, len(privKeyBytes))
 	}
 
-	// Create key manager
 	keyManager, err := signer.NewKeyManager(privKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key manager: %w", err)
 	}
 
-	// Load account index
-	accountIndexStr := os.Getenv("LIGHTER_ACCOUNT_INDEX")
+	accountIndexStr := strings.TrimSpace(os.Getenv(prefix + "ACCOUNT_INDEX"))
 	if accountIndexStr == "" {
-		return nil, fmt.Errorf("LIGHTER_ACCOUNT_INDEX not set in environment")
+		return nil, fmt.Errorf("%sACCOUNT_INDEX not set in environment", prefix)
 	}
 	accountIndex, err := strconv.ParseInt(accountIndexStr, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid LIGHTER_ACCOUNT_INDEX: %w", err)
+		return nil, fmt.Errorf("invalid %sACCOUNT_INDEX: %w", prefix, err)
 	}
 	if accountIndex <= 0 {
-		return nil, fmt.Errorf("LIGHTER_ACCOUNT_INDEX must be positive")
+		return nil, fmt.Errorf("%sACCOUNT_INDEX must be positive", prefix)
 	}
 
-	// Load API key index
-	apiKeyIndexStr := os.Getenv("LIGHTER_API_KEY_INDEX")
+	apiKeyIndexStr := strings.TrimSpace(os.Getenv(prefix + "API_KEY_INDEX"))
 	if apiKeyIndexStr == "" {
-		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX not set in environment")
+		return nil, fmt.Errorf("%sAPI_KEY_INDEX not set in environment", prefix)
 	}
 	apiKeyIndexInt, err := strconv.Atoi(apiKeyIndexStr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid LIGHTER_API_KEY_INDEX: %w", err)
+		return nil, fmt.Errorf("invalid %sAPI_KEY_INDEX: %w", prefix, err)
 	}
 	if apiKeyIndexInt < 0 || apiKeyIndexInt > 254 {
-		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX is outside the signing range")
+		return nil, fmt.Errorf("%sAPI_KEY_INDEX is outside the signing range", prefix)
 	}
-	if os.Getenv("LIGHTER_CHAIN_ID") == "466324" && apiKeyIndexInt == 157 {
-		return nil, fmt.Errorf("LIGHTER_API_KEY_INDEX 157 is reserved on Lighter Robinhood Chain")
+	if strings.TrimSpace(os.Getenv(prefix+"CHAIN_ID")) == "466324" && apiKeyIndexInt == 157 {
+		return nil, fmt.Errorf("%sAPI_KEY_INDEX 157 is reserved on Lighter Robinhood Chain", prefix)
 	}
 	apiKeyIndex := uint8(apiKeyIndexInt)
 

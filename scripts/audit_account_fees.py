@@ -197,6 +197,10 @@ _BENIGN_SHORT_INT_KEYS: frozenset[str] = frozenset(
         "growth_mode_enabled_count",
         "growth_mode_disabled_count",
         "growth_mode_unspecified_count",
+        "current_maker_fee_tick",
+        "current_taker_fee_tick",
+        "verified_level",
+        "fee_discount_ppm",
     }
 )
 
@@ -1035,6 +1039,11 @@ def assert_redacted_evidence(payload: Any, forbidden_literals: Iterable[str] = (
         long_literals=long_literals,
         short_digit_literals=short_digit_literals,
     )
+
+
+def validate_redacted_output(payload: Any, forbidden_literals: Iterable[str] = ()) -> None:
+    """Public alias for `assert_redacted_evidence` used by read-only OPT-01 fee auditors."""
+    assert_redacted_evidence(payload, forbidden_literals=forbidden_literals)
 
 
 def _collect_forbidden_literals_from_pub_cfg(pub_cfg: dict[str, str]) -> list[str]:

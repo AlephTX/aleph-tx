@@ -70,6 +70,55 @@ def _confirmed_account_pair(payload: dict[str, Any], venue: str) -> tuple[float,
     return pair
 
 
+def _parse_verified_domain_overrides(payload: dict[str, Any], venue: str) -> tuple[
+    tuple[float, float] | None,
+    tuple[float, float] | None,
+    dict[str, tuple[float, float]],
+]:
+    """Parse optional verified crypto/rwa domain and per-market overrides (fail-closed)."""
+    domain_fees = payload.get("domain_fees")
+    if domain_fees is not None and not isinstance(domain_fees, dict):
+        raise ValueError(f"{venue}.domain_fees must be a dict when present")
+    domain_map = domain_fees or {}
+
+    crypto_src = domain_map.get("crypto") if isinstance(domain_map.get("crypto"), dict) else {}
+    rwa_src = domain_map.get("rwa") if isinstance(domain_map.get("rwa"), dict) else {}
+    crypto_pair = _extract_pair(
+        payload.get("crypto_maker_fee_bps") if payload.get("crypto_maker_fee_bps") is not None else crypto_src.get("maker_fee_bps"),
+        payload.get("crypto_taker_fee_bps") if payload.get("crypto_taker_fee_bps") is not None else crypto_src.get("taker_fee_bps"),
+        f"{venue}.crypto",
+    )
+    rwa_pair = _extract_pair(
+        payload.get("rwa_maker_fee_bps") if payload.get("rwa_maker_fee_bps") is not None else rwa_src.get("maker_fee_bps"),
+        payload.get("rwa_taker_fee_bps") if payload.get("rwa_taker_fee_bps") is not None else rwa_src.get("taker_fee_bps"),
+        f"{venue}.rwa",
+    )
+
+    verified_per_market: dict[str, tuple[float, float]] = {}
+    for field_name in ("verified_custom_schedule_bps", "per_market_fees_bps"):
+        raw_map = payload.get(field_name)
+        if raw_map is None:
+            continue
+        if not isinstance(raw_map, dict):
+            raise ValueError(f"{venue}.{field_name} must be a dict")
+        for mkt, fees in raw_map.items():
+            if not isinstance(fees, dict):
+                raise ValueError(f"{venue}.{field_name}[{mkt!r}] must be a dict")
+            pair = _extract_pair(
+                fees.get("maker_fee_bps"),
+                fees.get("taker_fee_bps"),
+                f"{venue}.{field_name}.{mkt}",
+            )
+            if pair is None:
+                raise ValueError(f"{venue}.{field_name}.{mkt}: missing maker/taker fee bps")
+            verified_per_market[str(mkt)] = pair
+
+    has_verified_override = crypto_pair is not None or rwa_pair is not None or bool(verified_per_market)
+    if has_verified_override and payload.get("account_fee_status") != "verified_account_tier":
+        raise ValueError(f"{venue}: domain or custom fee override requires verified_account_tier evidence")
+    return crypto_pair, rwa_pair, verified_per_market
+
+
 def load_track_fee_evidence(evidence_path: Path | None) -> dict[str, Any]:
     """Load `aleph_account_fee_evidence_v1` JSON strictly via stdlib, preserving provenance hashes."""
     if evidence_path is None:
@@ -102,6 +151,15 @@ def load_track_fee_evidence(evidence_path: Path | None) -> dict[str, Any]:
             "maker_fee_bps": account_pair[0] if account_pair is not None else None,
             "taker_fee_bps": account_pair[1] if account_pair is not None else None,
         }
+
+        if vname in ("arcus", "extended"):
+            verified_crypto, verified_rwa, verified_per_market = _parse_verified_domain_overrides(payload, vname)
+            if verified_crypto is not None:
+                entry["verified_crypto_fees"] = verified_crypto
+            if verified_rwa is not None:
+                entry["verified_rwa_fees"] = verified_rwa
+            if verified_per_market:
+                entry["verified_per_market_fees"] = verified_per_market
 
         if vname == "arcus":
             pub = payload.get("public_tier0_schedule_summary") or {}
@@ -147,14 +205,16 @@ def load_track_fee_evidence(evidence_path: Path | None) -> dict[str, Any]:
             entry["tier0_rwa_fees"] = tier0_rwa
             entry["per_market_fees"] = per_market
 
-        if vname == "lighter":
+        if vname in ("lighter", "lighter_robinhood"):
             pub_pair = _extract_pair(
                 payload.get("public_schedule_maker_fee_bps"),
                 payload.get("public_schedule_taker_fee_bps"),
-                "lighter.public_schedule",
+                f"{vname}.public_schedule",
             )
             if pub_pair is not None:
                 entry["public_schedule_fees"] = pub_pair
+            if payload.get("settlement") is not None:
+                entry["settlement"] = str(payload["settlement"])
 
         if vname == "trade_xyz":
             gm_pair = _extract_pair(
@@ -213,6 +273,24 @@ def resolve_venue_fee(
     entry = ev_venues.get(venue) if ev_loaded and isinstance(ev_venues, dict) else None
 
     if entry is not None:
+        if venue in ("arcus", "extended") and entry.get("account_fee_status") == "verified_account_tier":
+            v_per_market = entry.get("verified_per_market_fees") or {}
+            if raw_market and raw_market in v_per_market:
+                pm_mk, pm_tk = v_per_market[raw_market]
+                return float(pm_mk), float(pm_tk), "verified_account_tier", f"evidence_{venue}_verified_market"
+            v_domain = entry.get("verified_crypto_fees" if domain == "crypto" else "verified_rwa_fees")
+            if v_domain is None:
+                v_crypto, v_rwa, v_pm_raw = _parse_verified_domain_overrides(entry, venue)
+                if raw_market and raw_market in v_pm_raw:
+                    pm_mk, pm_tk = v_pm_raw[raw_market]
+                    return float(pm_mk), float(pm_tk), "verified_account_tier", f"evidence_{venue}_verified_market"
+                v_domain = v_crypto if domain == "crypto" else v_rwa
+            if v_domain is not None:
+                return float(v_domain[0]), float(v_domain[1]), "verified_account_tier", f"evidence_{venue}_verified_{domain}"
+        elif venue in ("arcus", "extended"):
+            # Ensure fail-closed rejection even when resolve_venue_fee is called with raw dict entry.
+            _parse_verified_domain_overrides(entry, venue)
+
         pair = _confirmed_account_pair(entry, venue)
         if pair is not None:
             return pair[0], pair[1], "verified_account_tier", "evidence_account_tier"
@@ -252,7 +330,7 @@ def resolve_venue_fee(
     status = str(default_status)
     if entry is not None:
         ev_status = str(entry.get("account_fee_status") or status)
-        if venue == "lighter" and entry.get("public_schedule_fees") is not None:
+        if venue in ("lighter", "lighter_robinhood") and entry.get("public_schedule_fees") is not None:
             pub_mk, pub_tk = entry["public_schedule_fees"]
             return float(pub_mk), float(pub_tk), ev_status, "evidence_public_schedule"
         return mk, tk, ev_status, "evidence_status_only"
