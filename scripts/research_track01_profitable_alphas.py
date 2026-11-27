@@ -889,8 +889,17 @@ def _execute_exit(
     exit_reason: str,
     passive_exit_reasons: tuple[str, ...],
     exec_mode: str,
+    *,
+    conserve_exit_depth: bool = True,
 ) -> tuple[float, float, float, float, float, float, int, bool, float, int]:
     """Execute exit with optional PostOnly chase + iterative 0.5*L1 IOC unwinds + MTM residual.
+
+    When `conserve_exit_depth=True` (default P0 fix):
+      - Tracks `rem_avail_by_quote` keyed by displayed quote timestamp so a single book snapshot
+        is never reused across subsequent `j_cur` steps or double-counted across maker partial
+        exit + taker fallback on the same touch.
+      - Enforces strict declared cutoff `ts_ms[j_cur] + TAKER_DELAY_MS <= sig.t1_ms` so exits
+        arriving past `t1_ms` stay explicit terminal residual MTM/exposure.
 
     Returns `(realized_px_pnl, realized_fnd, res_mtm_px_pnl, res_fnd, maker_vol, taker_vol,
               last_fill_out, clipped_here, rem_residual, j_next)`.
@@ -905,6 +914,7 @@ def _execute_exit(
     realized_fnd = 0.0
     maker_vol = 0.0
     taker_vol = 0.0
+    rem_avail_by_quote: dict[int, float] = {}
 
     if exec_mode == "maker_postonly" and exit_reason in passive_exit_reasons:
         t_xr = t_exit_dec + MAKER_DELAY_MS
@@ -914,31 +924,54 @@ def _execute_exit(
             rp = q_o[1] if (-side) > 0 else q_o[3]
             rs = q_o[2] if (-side) > 0 else q_o[4]
             if rp > 0.0 and rs > 0.0:
+                q_ts_m = int(q_o[0])
+                cap_m = L1_DEPTH_CAP_FRAC * rp * rs
+                avail_m = rem_avail_by_quote.get(q_ts_m, cap_m) if conserve_exit_depth else cap_m
                 ok_o, fill_o, fo_ts = _check_print_fill(
-                    sig.tr, t_xr, t_xc, -side, rp, rem, rp * rs
+                    sig.tr, t_xr, t_xc, -side, rp, min(rem, avail_m), rp * rs
                 )
                 if ok_o and fill_o > 0.0:
-                    sl = min(rem, fill_o)
-                    realized_px_pnl += side * (rp / px_in - 1.0) * sl
-                    realized_fnd += _funding_cash_usd(
-                        sig.ctx, sig.ctx_ts, t_fill_in, fo_ts, side * sl
-                    )
-                    maker_vol += sl
-                    rem -= sl
-                    last_fill_out = max(last_fill_out, fo_ts)
+                    sl = min(rem, avail_m, fill_o) if conserve_exit_depth else min(rem, fill_o)
+                    if conserve_exit_depth:
+                        rem_avail_by_quote[q_ts_m] = max(0.0, avail_m - sl)
+                    if sl > 0.0:
+                        realized_px_pnl += side * (rp / px_in - 1.0) * sl
+                        realized_fnd += _funding_cash_usd(
+                            sig.ctx, sig.ctx_ts, t_fill_in, fo_ts, side * sl
+                        )
+                        maker_vol += sl
+                        rem -= sl
+                        last_fill_out = max(last_fill_out, fo_ts)
         j_cur = max(j_exit, bisect.bisect_left(ts_ms, t_xc))
     else:
         j_cur = j_exit
 
     while rem > 1e-6 and j_cur < n:
-        t_ex = min(sig.t1_ms, ts_ms[j_cur] + TAKER_DELAY_MS)
+        if conserve_exit_depth and ts_ms[j_cur] + TAKER_DELAY_MS > sig.t1_ms:
+            break
+        t_ex = (
+            ts_ms[j_cur] + TAKER_DELAY_MS
+            if conserve_exit_depth
+            else min(sig.t1_ms, ts_ms[j_cur] + TAKER_DELAY_MS)
+        )
         f_out = _taker_fill(sig.bbo, sig.bbo_ts, t_ex, -side, DEFAULT_MAX_QUOTE_AGE_MS)
         if f_out is not None:
-            cap = L1_DEPTH_CAP_FRAC * f_out[1]
-            sl = min(rem, cap)
+            q_ts = int(f_out[2])
+            cap_raw = L1_DEPTH_CAP_FRAC * f_out[1]
+            if conserve_exit_depth:
+                avail = (
+                    min(cap_raw, rem_avail_by_quote[q_ts])
+                    if q_ts in rem_avail_by_quote
+                    else cap_raw
+                )
+            else:
+                avail = cap_raw
+            sl = min(rem, avail)
             if sl < rem - 1e-6:
                 clipped_here = True
             if sl > 0.0:
+                if conserve_exit_depth:
+                    rem_avail_by_quote[q_ts] = max(0.0, avail - sl)
                 realized_px_pnl += side * (f_out[0] / px_in - 1.0) * sl
                 realized_fnd += _funding_cash_usd(
                     sig.ctx, sig.ctx_ts, t_fill_in, t_ex, side * sl
@@ -953,7 +986,7 @@ def _execute_exit(
     res_mtm_px_pnl = 0.0
     res_fnd = 0.0
     if rem > 1e-6:
-        last_q = sig.bbo[-1]
+        last_q = (_latest_at(sig.bbo, sig.bbo_ts, sig.t1_ms) or sig.bbo[-1]) if conserve_exit_depth else sig.bbo[-1]
         px_mtm = last_q[1] if side > 0 else last_q[3]
         res_mtm_px_pnl = side * (px_mtm / px_in - 1.0) * rem
         res_fnd = _funding_cash_usd(sig.ctx, sig.ctx_ts, t_fill_in, sig.t1_ms, side * rem)
@@ -993,6 +1026,7 @@ def _empty_trade_result() -> dict[str, Any]:
         "avg_hold_ms": 0.0,
         "depth_clipped_entries": 0,
         "depth_clipped_exits": 0,
+        "residual_trades": 0,
         "terminal_flat_all": True,
         "terminal_residual_notional_usd": 0.0,
         "exits_by_reason": {},
@@ -1015,6 +1049,7 @@ def _finalize_trade_result(
     hold_ms_list: Sequence[int],
     depth_clipped_entries: int,
     depth_clipped_exits: int,
+    residual_trades: int,
     terminal_residual_notl: float,
     exits_by_reason: dict[str, int],
 ) -> dict[str, Any]:
@@ -1038,6 +1073,7 @@ def _finalize_trade_result(
         "avg_hold_ms": round(sum(hold_ms_list) / len(hold_ms_list), 1) if hold_ms_list else 0.0,
         "depth_clipped_entries": depth_clipped_entries,
         "depth_clipped_exits": depth_clipped_exits,
+        "residual_trades": residual_trades,
         "terminal_flat_all": terminal_residual_notl <= 1e-6,
         "terminal_residual_notional_usd": round(terminal_residual_notl, 4),
         "exits_by_reason": exits_by_reason,
@@ -1059,6 +1095,7 @@ def simulate_oracle_momentum(
     cooldown_ms: int = MOM_COOLDOWN_MS,
     exec_mode: str = "taker",
     clip_usd: float = CLIP_USD_DEFAULT,
+    conserve_exit_depth: bool = True,
 ) -> dict[str, Any]:
     """Simulate `OracleDiscoveryMomentum` on a precomputed symbol-window timeline."""
     ts_ms = sig.ts_ms
@@ -1075,7 +1112,7 @@ def simulate_oracle_momentum(
     ask_arr = sig.ask_px
 
     trades = long_trades = pv_trades = pv_unverifiable = 0
-    depth_clipped_entries = depth_clipped_exits = 0
+    depth_clipped_entries = depth_clipped_exits = residual_trades = 0
     exits_by_reason: dict[str, int] = defaultdict(int)
     realized_px_pnl = realized_fnd = res_mtm_px_pnl = res_fnd = 0.0
     maker_vol = taker_vol = total_entry_notl = terminal_residual_notl = 0.0
@@ -1176,7 +1213,16 @@ def simulate_oracle_momentum(
             rem_res,
             j_cur,
         ) = _execute_exit(
-            sig, j_exit, side, px_in, notl, t_fill_in, exit_reason, ("take_profit",), exec_mode
+            sig,
+            j_exit,
+            side,
+            px_in,
+            notl,
+            t_fill_in,
+            exit_reason,
+            ("take_profit",),
+            exec_mode,
+            conserve_exit_depth=conserve_exit_depth,
         )
         realized_px_pnl += rpx
         realized_fnd += rfnd
@@ -1186,6 +1232,8 @@ def simulate_oracle_momentum(
         taker_vol += tv
         if ex_clip:
             depth_clipped_exits += 1
+        if rem_res > 1e-6:
+            residual_trades += 1
         terminal_residual_notl += rem_res
 
         total_entry_notl += notl
@@ -1212,6 +1260,7 @@ def simulate_oracle_momentum(
         hold_ms_list=hold_ms_list,
         depth_clipped_entries=depth_clipped_entries,
         depth_clipped_exits=depth_clipped_exits,
+        residual_trades=residual_trades,
         terminal_residual_notl=terminal_residual_notl,
         exits_by_reason=dict(exits_by_reason),
     )
@@ -1232,6 +1281,7 @@ def simulate_overreaction_reversion(
     cooldown_ms: int = REV_COOLDOWN_MS,
     exec_mode: str = "taker",
     clip_usd: float = CLIP_USD_DEFAULT,
+    conserve_exit_depth: bool = True,
 ) -> dict[str, Any]:
     """Simulate `OverreactionReversion` on a precomputed symbol-window timeline."""
     ts_ms = sig.ts_ms
@@ -1249,7 +1299,7 @@ def simulate_overreaction_reversion(
     ask_arr = sig.ask_px
 
     trades = long_trades = pv_trades = pv_unverifiable = 0
-    depth_clipped_entries = depth_clipped_exits = 0
+    depth_clipped_entries = depth_clipped_exits = residual_trades = 0
     exits_by_reason: dict[str, int] = defaultdict(int)
     realized_px_pnl = realized_fnd = res_mtm_px_pnl = res_fnd = 0.0
     maker_vol = taker_vol = total_entry_notl = terminal_residual_notl = 0.0
@@ -1355,7 +1405,16 @@ def simulate_overreaction_reversion(
             rem_res,
             j_cur,
         ) = _execute_exit(
-            sig, j_exit, side, px_in, notl, t_fill_in, exit_reason, ("mean_reversion",), exec_mode
+            sig,
+            j_exit,
+            side,
+            px_in,
+            notl,
+            t_fill_in,
+            exit_reason,
+            ("mean_reversion",),
+            exec_mode,
+            conserve_exit_depth=conserve_exit_depth,
         )
         realized_px_pnl += rpx
         realized_fnd += rfnd
@@ -1365,6 +1424,8 @@ def simulate_overreaction_reversion(
         taker_vol += tv
         if ex_clip:
             depth_clipped_exits += 1
+        if rem_res > 1e-6:
+            residual_trades += 1
         terminal_residual_notl += rem_res
 
         total_entry_notl += notl
@@ -1391,6 +1452,7 @@ def simulate_overreaction_reversion(
         hold_ms_list=hold_ms_list,
         depth_clipped_entries=depth_clipped_entries,
         depth_clipped_exits=depth_clipped_exits,
+        residual_trades=residual_trades,
         terminal_residual_notl=terminal_residual_notl,
         exits_by_reason=dict(exits_by_reason),
     )
@@ -1437,6 +1499,7 @@ def aggregate_rows(rows: Sequence[dict[str, Any]], *, venue: str) -> dict[str, A
     res_notl = sum(float(r["terminal_residual_notional_usd"]) for r in rows)
     clipped_ent = sum(int(r["depth_clipped_entries"]) for r in rows)
     clipped_ex = sum(int(r["depth_clipped_exits"]) for r in rows)
+    res_trades = sum(int(r.get("residual_trades", 0)) for r in rows)
 
     net_prem_realized = sum(net_pnl_for_fee_bps(r, prem_mk, prem_tk, 0.0, realized_only=True) for r in rows)
     net_prem_mtm = sum(net_pnl_for_fee_bps(r, prem_mk, prem_tk, 0.0, realized_only=False) for r in rows)
@@ -1506,6 +1569,7 @@ def aggregate_rows(rows: Sequence[dict[str, Any]], *, venue: str) -> dict[str, A
         "ex_top1_net_0_0_usd": round(ex_top1_usd, 4),
         "depth_clipped_entries": clipped_ent,
         "depth_clipped_exits": clipped_ex,
+        "residual_trades": res_trades,
         "terminal_flat_all": res_notl <= 1e-6,
         "terminal_residual_notional_usd": round(res_notl, 4),
     }

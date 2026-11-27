@@ -126,6 +126,131 @@ class TestResearchTrack01ProfitableAlphas(unittest.TestCase):
         self.assertLess(agg["net_0_0_plus_1bp_usd"], agg["mtm_incl_residual_net_0_0_usd"])
         self.assertLess(agg["net_0_0_plus_2bp_usd"], agg["net_0_0_plus_1bp_usd"])
 
+    def test_p0_exit_depth_conservation_single_book_and_maker_taker_same_touch(self) -> None:
+        # (a) Single $200 L1 bid @ 50% cap -> $100 taker fill + $400 residual across 5s steps
+        steps = [1_000, 2_000, 3_000, 4_000, 5_000]
+        bbo_single = [(1_000, 100.0, 2.0, 100.04, 2.0)]
+        sig_single = mod.PrecomputedDirectionalSeries(
+            t0_ms=0,
+            t1_ms=6_500,
+            ts_ms=steps,
+            mom_ready=[],
+            mom_sig_bps=[],
+            rev_ready=[],
+            rev_r15_bps=[],
+            rev_r60_bps=[],
+            spread_bps=[],
+            fnd_bps=[],
+            bid_px=[],
+            ask_px=[],
+            bbo=bbo_single,
+            bbo_ts=[1_000],
+            tr=None,
+            ctx=[],
+            ctx_ts=[],
+        )
+        res_p0 = mod._execute_exit(sig_single, 0, 1, 100.0, 500.0, 500, "max_hold", (), "taker")
+        self.assertTrue(math.isclose(res_p0[5], 100.0, abs_tol=1e-9))  # taker_vol
+        self.assertEqual(res_p0[6], 1_330)  # last_fill_out
+        self.assertTrue(res_p0[7])  # clipped_here
+        self.assertTrue(math.isclose(res_p0[8], 400.0, abs_tol=1e-9))  # rem_residual
+
+        # Confirm legacy flag reproduces pre-P0 over-fill counterexample
+        res_legacy = mod._execute_exit(
+            sig_single, 0, 1, 100.0, 500.0, 500, "max_hold", (), "taker", conserve_exit_depth=False
+        )
+        self.assertTrue(math.isclose(res_legacy[5], 500.0, abs_tol=1e-9))
+        self.assertTrue(math.isclose(res_legacy[8], 0.0, abs_tol=1e-9))
+
+        # (a2) Maker partial exit ($60) + taker fallback on the SAME touch ($200 L1 @ 50% cap = $100)
+        # -> total exit fill capped at $100 ($60 maker + $40 taker), $400 residual
+        steps_mk = list(range(1_000, 16_000, 1_000))
+        ask_px = 100.04
+        ask_sz = 200.0 / ask_px
+        tr_partial = ([1_500], [1], [ask_px], [120.0 / ask_px])  # $120 print -> 50% = $60 maker fill
+        sig_mk = mod.PrecomputedDirectionalSeries(
+            t0_ms=0,
+            t1_ms=16_500,
+            ts_ms=steps_mk,
+            mom_ready=[],
+            mom_sig_bps=[],
+            rev_ready=[],
+            rev_r15_bps=[],
+            rev_r60_bps=[],
+            spread_bps=[],
+            fnd_bps=[],
+            bid_px=[],
+            ask_px=[],
+            bbo=[(1_000, 100.0, 2.0, ask_px, ask_sz)],
+            bbo_ts=[1_000],
+            tr=tr_partial,
+            ctx=[],
+            ctx_ts=[],
+        )
+        res_mk = mod._execute_exit(
+            sig_mk, 0, 1, 100.0, 500.0, 500, "mean_reversion", ("mean_reversion",), "maker_postonly"
+        )
+        self.assertTrue(math.isclose(res_mk[4], 60.0, abs_tol=1e-9))  # maker_vol
+        self.assertTrue(math.isclose(res_mk[5], 40.0, abs_tol=1e-9))  # taker_vol
+        self.assertTrue(math.isclose(res_mk[8], 400.0, abs_tol=1e-9))  # rem_residual
+
+    def test_p0_exit_depth_new_book_update_unblocks_and_cutoff_leaves_residual(self) -> None:
+        # (b) Explicit new book snapshot at t=3_000 ($1,000 L1 bid) unblocks remaining $400
+        steps = [1_000, 2_000, 3_000, 4_000, 5_000]
+        bbo_upd = [
+            (1_000, 100.0, 2.0, 100.04, 2.0),   # $200 bid -> $100 cap
+            (3_000, 100.0, 10.0, 100.04, 10.0), # $1,000 bid -> $500 cap
+        ]
+        sig_upd = mod.PrecomputedDirectionalSeries(
+            t0_ms=0,
+            t1_ms=6_500,
+            ts_ms=steps,
+            mom_ready=[],
+            mom_sig_bps=[],
+            rev_ready=[],
+            rev_r15_bps=[],
+            rev_r60_bps=[],
+            spread_bps=[],
+            fnd_bps=[],
+            bid_px=[],
+            ask_px=[],
+            bbo=bbo_upd,
+            bbo_ts=[1_000, 3_000],
+            tr=None,
+            ctx=[],
+            ctx_ts=[],
+        )
+        res_upd = mod._execute_exit(sig_upd, 0, 1, 100.0, 500.0, 500, "max_hold", (), "taker")
+        self.assertTrue(math.isclose(res_upd[5], 500.0, abs_tol=1e-9))
+        self.assertEqual(res_upd[6], 3_330)
+        self.assertTrue(math.isclose(res_upd[8], 0.0, abs_tol=1e-9))
+
+        # (c) Exit arrival past declared cutoff t1_ms stays explicit terminal residual MTM
+        sig_cut = mod.PrecomputedDirectionalSeries(
+            t0_ms=0,
+            t1_ms=2_200,
+            ts_ms=[1_000, 2_000],
+            mom_ready=[],
+            mom_sig_bps=[],
+            rev_ready=[],
+            rev_r15_bps=[],
+            rev_r60_bps=[],
+            spread_bps=[],
+            fnd_bps=[],
+            bid_px=[],
+            ask_px=[],
+            bbo=[(1_000, 99.0, 50.0, 99.1, 50.0)],
+            bbo_ts=[1_000],
+            tr=None,
+            ctx=[(0, 100.0, 100.0, 0.0)],
+            ctx_ts=[0],
+        )
+        # j_exit=1 -> ts_ms[1] + 330 = 2_330 > t1_ms (2_200) -> must NOT fill past cutoff
+        res_cut = mod._execute_exit(sig_cut, 1, 1, 100.0, 500.0, 500, "terminal_flatten", (), "taker")
+        self.assertTrue(math.isclose(res_cut[5], 0.0, abs_tol=1e-9))  # zero taker fill past cutoff
+        self.assertTrue(math.isclose(res_cut[8], 500.0, abs_tol=1e-9))  # full $500 terminal residual
+        self.assertTrue(math.isclose(res_cut[2], -5.0, abs_tol=1e-9))  # residual MTM (99/100 - 1)*500
+
 
 if __name__ == "__main__":
     unittest.main()
