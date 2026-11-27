@@ -661,30 +661,39 @@ def simulate_carry_pair_timeline(
     target_notional_usd: float = TARGET_PAIR_NOTIONAL_USD,
     step_ms: int = STEP_MS,
     precomputed_by_win: dict[int, list[tuple[int, float, float, float, float, float, float, float, float, float, float | None, float]]] | None = None,
+    record_trades: bool = False,
 ) -> dict[str, Any]:
     """Simulate a single pair causally across W01..W26 windows with real L1 books & funding."""
     fx_eff = fx_drag_bps if pair.cross_stablecoin else 0.0
     settled_hours = sorted(set(funding_a) & set(funding_b))
+    hours_a = sorted(funding_a)
+    hours_b = sorted(funding_b)
 
     # Build causal funding state tracker incremented monotonically along checkpoints.
     f_idx = 0
     funding_ema: float | None = None
     last_funding_ms: int | None = None
-    basis_fair_ema: float | None = None
-    basis_var_bps2: float | None = None
-    last_book_ms: int | None = None
 
     pos_dir = 0  # +1 = Short A / Long B; -1 = Long A / Short B; 0 = flat
     pos_qty_base = 0.0
     pos_notional_usd = 0.0
     entry_ms = 0
+    leg_a_fill_ms = 0
+    leg_b_fill_ms = 0
     entry_mid_a = 0.0
     entry_mid_b = 0.0
     entry_exec_a = 0.0
     entry_exec_b = 0.0
     entry_mid_basis_bps = 0.0
     entry_passive_is_a: bool | None = None
-    next_pay_idx = 0
+    leg_a_pay_idx = 0
+    leg_b_pay_idx = 0
+    cur_leg_a_funding_usd = 0.0
+    cur_leg_b_funding_usd = 0.0
+
+    # Explicit tracking of any unclosed orphan single-leg exposures awaiting book recovery.
+    open_orphans: list[dict[str, Any]] = []
+    trade_events: list[dict[str, Any]] = []
 
     per_window_rows: list[dict[str, Any]] = []
     terminal_flat_all = True
@@ -710,35 +719,232 @@ def simulate_carry_pair_timeline(
             last_funding_ms = ht
             f_idx += 1
 
-    def _settle_funding_between(prev_t: int, curr_t: int, win_acc: dict[str, Any]) -> None:
-        nonlocal next_pay_idx
-        while next_pay_idx < len(settled_hours) and settled_hours[next_pay_idx] <= prev_t:
-            next_pay_idx += 1
-        while next_pay_idx < len(settled_hours) and settled_hours[next_pay_idx] <= curr_t:
-            ht = settled_hours[next_pay_idx]
-            if pos_dir != 0 and entry_ms <= ht:
-                rate_diff = float(funding_a[ht]) - float(funding_b[ht])
-                # Estimate notional at payment time from latest valid books <= ht (fallback to entry notional).
-                qa = _lookup_bbo_at(bbo_a, ht, max(max_age_a_ms, HOUR_MS))
-                qb = _lookup_bbo_at(bbo_b, ht, max(max_age_b_ms, HOUR_MS))
-                if qa is not None and qb is not None:
-                    px_ref = 0.5 * (0.5 * (qa[0] + qa[1]) + 0.5 * (qb[0] + qb[1]))
-                    notl_t = pos_qty_base * px_ref
+    def _settle_single_leg_funding(
+        *,
+        is_leg_a: bool,
+        receipt_sign: int,
+        qty_base: float,
+        fallback_notl: float,
+        fill_ms: int,
+        up_to_ms: int,
+        pay_idx: int,
+        win_acc: dict[str, Any],
+        settled_set: set[int],
+    ) -> tuple[int, float]:
+        """Settle single-leg funding strictly for `fill_ms < ht <= up_to_ms`."""
+        hours = hours_a if is_leg_a else hours_b
+        funding_map = funding_a if is_leg_a else funding_b
+        bbo = bbo_a if is_leg_a else bbo_b
+        max_age = max_age_a_ms if is_leg_a else max_age_b_ms
+        acc_cash = 0.0
+        while pay_idx < len(hours) and hours[pay_idx] <= fill_ms:
+            pay_idx += 1
+        while pay_idx < len(hours) and hours[pay_idx] <= up_to_ms:
+            ht = hours[pay_idx]
+            if ht > fill_ms:
+                rate_bps = float(funding_map[ht])
+                q = _lookup_bbo_at(bbo, ht, max(max_age, HOUR_MS))
+                if q is not None:
+                    notl_t = qty_base * (0.5 * (q[0] + q[1]))
                 else:
-                    notl_t = pos_notional_usd
-                cash_f = pos_dir * notl_t * rate_diff * 1e-4
+                    notl_t = fallback_notl
+                cash_f = receipt_sign * notl_t * rate_bps * 1e-4
                 win_acc["funding_cash_usd"] += cash_f
-                win_acc["funding_payments"] += 1
-            next_pay_idx += 1
+                acc_cash += cash_f
+                if is_leg_a:
+                    win_acc["leg_a_funding_cash_usd"] += cash_f
+                    win_acc["leg_a_funding_payments"] += 1
+                else:
+                    win_acc["leg_b_funding_cash_usd"] += cash_f
+                    win_acc["leg_b_funding_payments"] += 1
+                if ht not in settled_set:
+                    settled_set.add(ht)
+                    win_acc["funding_payments"] += 1
+            pay_idx += 1
+        return pay_idx, acc_cash
+
+    def _settle_open_position_funding(
+        up_to_a_ms: int,
+        up_to_b_ms: int,
+        win_acc: dict[str, Any],
+        settled_set: set[int],
+    ) -> None:
+        nonlocal leg_a_pay_idx, leg_b_pay_idx, cur_leg_a_funding_usd, cur_leg_b_funding_usd
+        if pos_dir == 0:
+            return
+        leg_a_pay_idx, ca = _settle_single_leg_funding(
+            is_leg_a=True,
+            receipt_sign=pos_dir,
+            qty_base=pos_qty_base,
+            fallback_notl=pos_notional_usd,
+            fill_ms=leg_a_fill_ms,
+            up_to_ms=up_to_a_ms,
+            pay_idx=leg_a_pay_idx,
+            win_acc=win_acc,
+            settled_set=settled_set,
+        )
+        leg_b_pay_idx, cb = _settle_single_leg_funding(
+            is_leg_a=False,
+            receipt_sign=-pos_dir,
+            qty_base=pos_qty_base,
+            fallback_notl=pos_notional_usd,
+            fill_ms=leg_b_fill_ms,
+            up_to_ms=up_to_b_ms,
+            pay_idx=leg_b_pay_idx,
+            win_acc=win_acc,
+            settled_set=settled_set,
+        )
+        cur_leg_a_funding_usd += ca
+        cur_leg_b_funding_usd += cb
+
+    def _try_unwind_orphan(
+        orp: dict[str, Any],
+        t_attempt: int,
+        win_acc: dict[str, Any],
+        settled_set: set[int],
+        *,
+        is_split_end: bool = False,
+        split_end_ms: int | None = None,
+    ) -> bool:
+        """Attempt to unwind an open orphan single-leg exposure and book exact cash PnL."""
+        is_a = bool(orp["is_a"])
+        bbo = bbo_a if is_a else bbo_b
+        trades = trades_a if is_a else trades_b
+        max_age = max_age_a_ms if is_a else max_age_b_ms
+        tk_bps = fee_a_tk_bps if is_a else fee_b_tk_bps
+        uq = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo, t_attempt, max_age), trades, t_attempt)
+        if uq is None:
+            settle_cap = min(t_attempt, split_end_ms) if split_end_ms is not None else t_attempt
+            orp["pay_idx"], cf = _settle_single_leg_funding(
+                is_leg_a=is_a,
+                receipt_sign=orp["receipt_sign"],
+                qty_base=orp["qty_base"],
+                fallback_notl=orp["notional_usd"],
+                fill_ms=orp["fill_ms"],
+                up_to_ms=settle_cap,
+                pay_idx=orp["pay_idx"],
+                win_acc=win_acc,
+                settled_set=settled_set,
+            )
+            orp["funding_usd"] += cf
+            return False
+
+        u_bid, u_ask, u_bsz, u_asz, u_obs_ms = uq
+        u_exit_ms = max(t_attempt, u_obs_ms)
+        if is_split_end and split_end_ms is not None:
+            u_exit_ms = min(u_exit_ms, split_end_ms)
+        orp["pay_idx"], cf = _settle_single_leg_funding(
+            is_leg_a=is_a,
+            receipt_sign=orp["receipt_sign"],
+            qty_base=orp["qty_base"],
+            fallback_notl=orp["notional_usd"],
+            fill_ms=orp["fill_ms"],
+            up_to_ms=u_exit_ms,
+            pay_idx=orp["pay_idx"],
+            win_acc=win_acc,
+            settled_set=settled_set,
+        )
+        orp["funding_usd"] += cf
+
+        is_short = bool(orp["is_short"])
+        u_exec = u_ask if is_short else u_bid
+        u_l1 = (u_ask * u_asz) if is_short else (u_bid * u_bsz)
+        u_mid = 0.5 * (u_bid + u_ask)
+        sgn_pos = -1 if is_short else 1
+        qty = float(orp["qty_base"])
+        orp_mid_pnl = sgn_pos * qty * (u_mid - float(orp["entry_mid"]))
+        orp_exec_pnl = sgn_pos * qty * (u_exec - float(orp["entry_exec"]))
+        orp_half_spr = orp_mid_pnl - orp_exec_pnl
+
+        unwind_notl = qty * u_exec
+        depth_sweep_usd = 0.0
+        if unwind_notl > u_l1:
+            if u_l1 <= 0.0:
+                sweep_bps = 15.0
+            else:
+                sweep_bps = min(2.0 * (unwind_notl / u_l1 - 1.0), 25.0)
+            depth_sweep_usd = unwind_notl * sweep_bps * 1e-4
+
+        unwind_fee = unwind_notl * tk_bps * 1e-4
+        total_slip = orp_half_spr + depth_sweep_usd
+        entry_fee = float(orp["entry_fee_usd"])
+        orp_total_pnl = float(orp["funding_usd"]) + orp_mid_pnl - total_slip - entry_fee - unwind_fee
+
+        win_acc["basis_pnl_usd"] += orp_mid_pnl
+        win_acc["spread_slip_usd"] += total_slip
+        win_acc["fees_usd"] += unwind_fee
+        win_acc["notional_traded_usd"] += unwind_notl
+        win_acc["orphan_unwound_count"] += 1
+        win_acc["orphan_unwind_pnl_usd"] += orp_total_pnl
+        win_acc["orphan_unwind_cost_usd"] += total_slip + entry_fee + unwind_fee
+        if record_trades:
+            trade_events.append(
+                {
+                    "kind": "orphan_unwind",
+                    "leg": "A" if is_a else "B",
+                    "fill_ms": int(orp["fill_ms"]),
+                    "exit_ms": int(u_exit_ms),
+                    "orphan_notional_usd": round(float(orp["notional_usd"]), 4),
+                    "unwind_notional_usd": round(unwind_notl, 4),
+                    "funding_usd": round(float(orp["funding_usd"]), 6),
+                    "mid_pnl_usd": round(orp_mid_pnl, 6),
+                    "slip_usd": round(total_slip, 6),
+                    "fees_usd": round(entry_fee + unwind_fee, 6),
+                    "net_pnl_usd": round(orp_total_pnl, 6),
+                    "reason": str(orp["reason"]),
+                }
+            )
+        return True
+
+    def _book_orphan_fill(
+        *,
+        is_a: bool,
+        is_short: bool,
+        orphan_notl: float,
+        fill_ms: int,
+        rest_px: float,
+        p_mid: float,
+        mk_bps: float,
+        t_hedge: int,
+        reason: str,
+        win_acc: dict[str, Any],
+        settled_set: set[int],
+    ) -> None:
+        qty = orphan_notl / rest_px
+        entry_fee = orphan_notl * mk_bps * 1e-4
+        win_acc["fees_usd"] += entry_fee
+        win_acc["notional_traded_usd"] += orphan_notl
+        win_acc["orphan_entries"] += 1
+        win_acc["orphan_notional_usd"] += orphan_notl
+        orp = {
+            "is_a": is_a,
+            "is_short": is_short,
+            "receipt_sign": 1 if is_short else -1,
+            "qty_base": qty,
+            "notional_usd": orphan_notl,
+            "fill_ms": fill_ms,
+            "entry_exec": rest_px,
+            "entry_mid": p_mid,
+            "entry_fee_usd": entry_fee,
+            "earliest_unwind_ms": t_hedge + TAKER_LATENCY_MS,
+            "pay_idx": _bisect_right(hours_a if is_a else hours_b, fill_ms),
+            "funding_usd": 0.0,
+            "reason": reason,
+        }
+        if not _try_unwind_orphan(orp, orp["earliest_unwind_ms"], win_acc, settled_set):
+            open_orphans.append(orp)
 
     def _close_position(
         t_dec: int,
         win_acc: dict[str, Any],
+        settled_set: set[int],
         reason: str,
         *,
         is_split_end: bool = False,
+        split_end_ms: int | None = None,
     ) -> bool:
         nonlocal pos_dir, pos_qty_base, pos_notional_usd, entry_passive_is_a
+        nonlocal leg_a_fill_ms, leg_b_fill_ms, cur_leg_a_funding_usd, cur_leg_b_funding_usd
         if pos_dir == 0:
             return True
         t_exec = t_dec if is_split_end else (t_dec + TAKER_LATENCY_MS)
@@ -747,8 +953,14 @@ def simulate_carry_pair_timeline(
         if qa is None or qb is None:
             return False
 
-        # Settle any hourly funding payments up to actual exit execution time
-        _settle_funding_between(entry_ms, qa[4] if qa[4] > qb[4] else qb[4], win_acc)
+        leg_a_exit_ms = max(t_exec, qa[4])
+        leg_b_exit_ms = max(t_exec, qb[4])
+        if is_split_end and split_end_ms is not None:
+            leg_a_exit_ms = min(leg_a_exit_ms, split_end_ms)
+            leg_b_exit_ms = min(leg_b_exit_ms, split_end_ms)
+
+        # Settle per-leg hourly funding strictly in `(leg_fill_ms, leg_exit_ms]`
+        _settle_open_position_funding(leg_a_exit_ms, leg_b_exit_ms, win_acc, settled_set)
 
         abid, aask, absz, aasz, _ = qa
         bbid, bask, bbsz, basz, _ = qb
@@ -819,9 +1031,34 @@ def simulate_carry_pair_timeline(
         win_acc["trades_closed"] += 1
         win_acc["exit_reasons"][reason] = win_acc["exit_reasons"].get(reason, 0) + 1
 
+        if record_trades:
+            trade_events.append(
+                {
+                    "kind": "matched_pair",
+                    "pos_dir": pos_dir,
+                    "leg_a_fill_ms": leg_a_fill_ms,
+                    "leg_b_fill_ms": leg_b_fill_ms,
+                    "leg_a_exit_ms": leg_a_exit_ms,
+                    "leg_b_exit_ms": leg_b_exit_ms,
+                    "qty_base": round(pos_qty_base, 8),
+                    "hedged_notional_usd": round(pos_notional_usd, 4),
+                    "leg_a_funding_usd": round(cur_leg_a_funding_usd, 6),
+                    "leg_b_funding_usd": round(cur_leg_b_funding_usd, 6),
+                    "basis_mid_pnl_usd": round(basis_mid_pnl, 6),
+                    "spread_slip_usd": round(spread_slip_usd, 6),
+                    "fees_usd": round(fees, 6),
+                    "fx_cost_usd": round(fx_cost, 6),
+                    "reason": reason,
+                }
+            )
+
         pos_dir = 0
         pos_qty_base = 0.0
         pos_notional_usd = 0.0
+        leg_a_fill_ms = 0
+        leg_b_fill_ms = 0
+        cur_leg_a_funding_usd = 0.0
+        cur_leg_b_funding_usd = 0.0
         entry_passive_is_a = None
         return True
 
@@ -833,17 +1070,25 @@ def simulate_carry_pair_timeline(
         pos_dir = 0
         pos_qty_base = 0.0
         pos_notional_usd = 0.0
+        leg_a_fill_ms = 0
+        leg_b_fill_ms = 0
+        cur_leg_a_funding_usd = 0.0
+        cur_leg_b_funding_usd = 0.0
         entry_passive_is_a = None
+        open_orphans = []
         last_prev_t: int | None = None
 
         for w_idx, w in enumerate(split_wins):
             t_start = int(w["t0_ms"])
             t_end = int(w["t1_ms"])
+            settled_in_win: set[int] = set()
             win_acc: dict[str, Any] = {
                 "window": w["window"],
                 "window_num": int(w["window_num"]),
                 "split": split_name,
                 "funding_cash_usd": 0.0,
+                "leg_a_funding_cash_usd": 0.0,
+                "leg_b_funding_cash_usd": 0.0,
                 "basis_pnl_usd": 0.0,
                 "spread_slip_usd": 0.0,
                 "fees_usd": 0.0,
@@ -853,15 +1098,44 @@ def simulate_carry_pair_timeline(
                 "trades_entered": 0,
                 "trades_closed": 0,
                 "funding_payments": 0,
+                "leg_a_funding_payments": 0,
+                "leg_b_funding_payments": 0,
                 "passive_attempts": 0,
                 "passive_fills": 0,
                 "depth_clipped_entries": 0,
                 "depth_clipped_exits": 0,
+                "orphan_entries": 0,
+                "orphan_unwound_count": 0,
+                "orphan_notional_usd": 0.0,
+                "orphan_unwind_pnl_usd": 0.0,
+                "orphan_unwind_cost_usd": 0.0,
+                "orphan_open_residual_usd": 0.0,
                 "exit_reasons": {},
             }
 
-            if last_prev_t is not None and (t_start - last_prev_t) > MAX_GAP_MS and pos_dir != 0:
-                _close_position(last_prev_t, win_acc, "gap_force_flat", is_split_end=True)
+            if last_prev_t is not None and (t_start - last_prev_t) > MAX_GAP_MS:
+                if pos_dir != 0:
+                    _close_position(
+                        last_prev_t,
+                        win_acc,
+                        settled_in_win,
+                        "gap_force_flat",
+                        is_split_end=True,
+                        split_end_ms=last_prev_t,
+                    )
+                if open_orphans:
+                    rem_orphans: list[dict[str, Any]] = []
+                    for orp in open_orphans:
+                        if not _try_unwind_orphan(
+                            orp,
+                            max(last_prev_t, int(orp["earliest_unwind_ms"])),
+                            win_acc,
+                            settled_in_win,
+                            is_split_end=True,
+                            split_end_ms=last_prev_t,
+                        ):
+                            rem_orphans.append(orp)
+                    open_orphans = rem_orphans
 
             win_steps = (
                 precomputed_by_win[int(w["window_num"])]
@@ -877,7 +1151,6 @@ def simulate_carry_pair_timeline(
                     step_ms=step_ms,
                 )[int(w["window_num"])]
             )
-            prev_step_t = t_start
             for (
                 t_cur,
                 abid,
@@ -893,9 +1166,15 @@ def simulate_carry_pair_timeline(
                 prior_sigma,
             ) in win_steps:
                 _advance_funding(t_cur)
+                if open_orphans:
+                    rem_orphans = []
+                    for orp in open_orphans:
+                        t_try = max(t_cur, int(orp["earliest_unwind_ms"]))
+                        if t_try > t_cur or not _try_unwind_orphan(orp, t_try, win_acc, settled_in_win):
+                            rem_orphans.append(orp)
+                    open_orphans = rem_orphans
                 if pos_dir != 0:
-                    _settle_funding_between(prev_step_t, t_cur, win_acc)
-                prev_step_t = t_cur
+                    _settle_open_position_funding(t_cur, t_cur, win_acc, settled_in_win)
                 mid_a = 0.5 * (abid + aask)
                 mid_b = 0.5 * (bbid + bask)
 
@@ -908,6 +1187,8 @@ def simulate_carry_pair_timeline(
                         eff_f_ab = ca_t - cb_t
 
                 if pos_dir != 0:
+                    if t_cur <= entry_ms:
+                        continue
                     dir_mid = pos_dir * raw_mid_basis_ab
                     dir_fair = pos_dir * (prior_fair if prior_fair is not None else raw_mid_basis_ab)
                     denom = max(prior_sigma, params.basis_vol_floor_bps)
@@ -931,10 +1212,11 @@ def simulate_carry_pair_timeline(
                         exit_reason = "max_hold_expired"
 
                     if exit_reason is not None:
-                        _close_position(t_cur, win_acc, exit_reason)
+                        _close_position(t_cur, win_acc, settled_in_win, exit_reason)
 
                 elif (
-                    eff_f_ab is not None
+                    not open_orphans
+                    and eff_f_ab is not None
                     and prior_fair is not None
                     and last_funding_ms is not None
                     and (t_cur - last_funding_ms) <= MAX_GAP_MS
@@ -1009,6 +1291,9 @@ def simulate_carry_pair_timeline(
                                     )
                                     if fill_res is not None:
                                         fill_ms, filled_notl = fill_res
+                                        win_acc["passive_fills"] += 1
+                                        p_mid = 0.5 * (post_book[0] + post_book[1])
+                                        p_mk_bps = fee_a_mk_bps if passive_is_a else fee_b_mk_bps
                                         # Hedge opposite leg at fill_ms + 330 ms
                                         t_hedge = fill_ms + TAKER_LATENCY_MS
                                         hq = _sync_quote_with_tape(
@@ -1020,41 +1305,79 @@ def simulate_carry_pair_timeline(
                                             trades_b if passive_is_a else trades_a,
                                             t_hedge,
                                         )
+                                        hedged_notl = 0.0
+                                        orphan_reason = "hedge_book_missing"
+                                        h_px = 0.0
+                                        h_mid = 0.0
+                                        h_fill_ms = t_hedge
                                         if hq is not None:
-                                            h_bid, h_ask, h_bsz, h_asz, _ = hq
+                                            h_bid, h_ask, h_bsz, h_asz, h_obs_ms = hq
                                             h_px = h_ask if passive_is_short else h_bid
                                             h_l1 = (h_ask * h_asz) if passive_is_short else (h_bid * h_bsz)
                                             h_mid = 0.5 * (h_bid + h_ask)
-                                            p_mid = 0.5 * (post_book[0] + post_book[1])
+                                            h_fill_ms = max(t_hedge, h_obs_ms)
                                             opp_mid0 = 0.5 * (opp_anchor[0] + opp_anchor[1])
                                             adv_move = ((h_mid / opp_mid0 - 1.0) * 1e4) if passive_is_short else ((1.0 - h_mid / opp_mid0) * 1e4)
-                                            if adv_move < params.hazard_adverse_bps * 5.0 and h_l1 >= MIN_ENTRY_NOTIONAL_USD:
-                                                win_acc["passive_fills"] += 1
-                                                exec_notl = min(filled_notl, max(h_l1, filled_notl))
-                                                if exec_notl < target_notional_usd:
-                                                    win_acc["depth_clipped_entries"] += 1
-                                                pos_dir = cand_dir
-                                                entry_ms = t_hedge
-                                                entry_passive_is_a = passive_is_a
-                                                if passive_is_a:
-                                                    entry_exec_a, entry_exec_b = rest_px, h_px
-                                                    entry_mid_a, entry_mid_b = p_mid, h_mid
-                                                else:
-                                                    entry_exec_a, entry_exec_b = h_px, rest_px
-                                                    entry_mid_a, entry_mid_b = h_mid, p_mid
-                                                ref_e = 0.5 * (entry_mid_a + entry_mid_b)
-                                                pos_qty_base = exec_notl / ref_e
-                                                pos_notional_usd = exec_notl
-                                                entry_mid_basis_bps = pos_dir * ((entry_mid_a - entry_mid_b) / ref_e) * 1e4
-                                                win_acc["trades_entered"] += 1
+                                            if adv_move >= params.hazard_adverse_bps * 5.0:
+                                                orphan_reason = "hedge_adverse_abort"
+                                            elif h_l1 < MIN_ENTRY_NOTIONAL_USD:
+                                                orphan_reason = "hedge_l1_below_min"
+                                            else:
+                                                # P0 Defect 1 fix: clamp hedged notional to available hedge L1 depth!
+                                                hedged_notl = min(filled_notl, h_l1)
+                                                if hedged_notl < filled_notl:
+                                                    orphan_reason = "hedge_partial_l1_clip"
+
+                                        orphan_notl = max(0.0, filled_notl - hedged_notl)
+                                        if orphan_notl > 1e-9:
+                                            # P0 Defect 2 fix: explicitly book & unwind orphan passive-leg exposure!
+                                            _book_orphan_fill(
+                                                is_a=passive_is_a,
+                                                is_short=passive_is_short,
+                                                orphan_notl=orphan_notl,
+                                                fill_ms=fill_ms,
+                                                rest_px=rest_px,
+                                                p_mid=p_mid,
+                                                mk_bps=p_mk_bps,
+                                                t_hedge=t_hedge,
+                                                reason=orphan_reason,
+                                                win_acc=win_acc,
+                                                settled_set=settled_in_win,
+                                            )
+
+                                        if hedged_notl >= MIN_ENTRY_NOTIONAL_USD:
+                                            if hedged_notl < target_notional_usd:
+                                                win_acc["depth_clipped_entries"] += 1
+                                            pos_dir = cand_dir
+                                            entry_passive_is_a = passive_is_a
+                                            if passive_is_a:
+                                                leg_a_fill_ms = fill_ms
+                                                leg_b_fill_ms = h_fill_ms
+                                                entry_exec_a, entry_exec_b = rest_px, h_px
+                                                entry_mid_a, entry_mid_b = p_mid, h_mid
+                                            else:
+                                                leg_a_fill_ms = h_fill_ms
+                                                leg_b_fill_ms = fill_ms
+                                                entry_exec_a, entry_exec_b = h_px, rest_px
+                                                entry_mid_a, entry_mid_b = h_mid, p_mid
+                                            entry_ms = max(leg_a_fill_ms, leg_b_fill_ms)
+                                            leg_a_pay_idx = _bisect_right(hours_a, leg_a_fill_ms)
+                                            leg_b_pay_idx = _bisect_right(hours_b, leg_b_fill_ms)
+                                            cur_leg_a_funding_usd = 0.0
+                                            cur_leg_b_funding_usd = 0.0
+                                            ref_e = 0.5 * (entry_mid_a + entry_mid_b)
+                                            pos_qty_base = hedged_notl / ref_e
+                                            pos_notional_usd = hedged_notl
+                                            entry_mid_basis_bps = pos_dir * ((entry_mid_a - entry_mid_b) / ref_e) * 1e4
+                                            win_acc["trades_entered"] += 1
                             else:
                                 # Immediate dual-taker entry at t_cur + 330 ms
                                 t_exec = t_cur + TAKER_LATENCY_MS
                                 ea = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_a, t_exec, max_age_a_ms), trades_a, t_exec)
                                 eb = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_b, t_exec, max_age_b_ms), trades_b, t_exec)
                                 if ea is not None and eb is not None:
-                                    eabid, eaask, eabsz, eaasz, _ = ea
-                                    ebbid, ebask, ebbsz, ebasz, _ = eb
+                                    eabid, eaask, eabsz, eaasz, ea_obs_ms = ea
+                                    ebbid, ebask, ebbsz, ebasz, eb_obs_ms = eb
                                     ex_a = eabid if cand_dir == 1 else eaask
                                     ex_b = ebask if cand_dir == 1 else ebbid
                                     l1_ea = (eabid * eabsz) if cand_dir == 1 else (eaask * eaasz)
@@ -1064,7 +1387,13 @@ def simulate_carry_pair_timeline(
                                         if cap_notl < target_notional_usd:
                                             win_acc["depth_clipped_entries"] += 1
                                         pos_dir = cand_dir
-                                        entry_ms = t_exec
+                                        leg_a_fill_ms = max(t_exec, ea_obs_ms)
+                                        leg_b_fill_ms = max(t_exec, eb_obs_ms)
+                                        entry_ms = max(leg_a_fill_ms, leg_b_fill_ms)
+                                        leg_a_pay_idx = _bisect_right(hours_a, leg_a_fill_ms)
+                                        leg_b_pay_idx = _bisect_right(hours_b, leg_b_fill_ms)
+                                        cur_leg_a_funding_usd = 0.0
+                                        cur_leg_b_funding_usd = 0.0
                                         entry_passive_is_a = None
                                         entry_exec_a = ex_a
                                         entry_exec_b = ex_b
@@ -1077,18 +1406,54 @@ def simulate_carry_pair_timeline(
                                         win_acc["trades_entered"] += 1
 
             if pos_dir != 0:
-                _settle_funding_between(prev_step_t, t_end, win_acc)
+                _settle_open_position_funding(t_end, t_end, win_acc, settled_in_win)
+            if open_orphans:
+                rem_orphans = []
+                for orp in open_orphans:
+                    t_try = max(t_end, int(orp["earliest_unwind_ms"]))
+                    if t_try > t_end or not _try_unwind_orphan(orp, t_try, win_acc, settled_in_win, split_end_ms=t_end):
+                        rem_orphans.append(orp)
+                open_orphans = rem_orphans
 
             # Force terminal flat at end of split (w20, w25, w26)
             is_last_in_split = (w_idx == len(split_wins) - 1)
-            if is_last_in_split and pos_dir != 0:
-                closed = _close_position(t_end, win_acc, "split_terminal_drain", is_split_end=True)
-                if not closed:
-                    terminal_flat_all = False
-                    terminal_residual_notional_usd += pos_notional_usd
-                    pos_dir = 0
-                    pos_qty_base = 0.0
-                    pos_notional_usd = 0.0
+            if is_last_in_split:
+                if pos_dir != 0:
+                    closed = _close_position(
+                        t_end,
+                        win_acc,
+                        settled_in_win,
+                        "split_terminal_drain",
+                        is_split_end=True,
+                        split_end_ms=t_end,
+                    )
+                    if not closed:
+                        terminal_flat_all = False
+                        terminal_residual_notional_usd += pos_notional_usd
+                        pos_dir = 0
+                        pos_qty_base = 0.0
+                        pos_notional_usd = 0.0
+                        leg_a_fill_ms = 0
+                        leg_b_fill_ms = 0
+                if open_orphans:
+                    rem_orphans = []
+                    for orp in open_orphans:
+                        if not _try_unwind_orphan(
+                            orp,
+                            t_end,
+                            win_acc,
+                            settled_in_win,
+                            is_split_end=True,
+                            split_end_ms=t_end,
+                        ):
+                            rem_orphans.append(orp)
+                    if rem_orphans:
+                        terminal_flat_all = False
+                        for orp in rem_orphans:
+                            res_notl = float(orp["notional_usd"])
+                            terminal_residual_notional_usd += res_notl
+                            win_acc["orphan_open_residual_usd"] += res_notl
+                    open_orphans = []
 
             win_acc["net_pnl_usd"] = (
                 win_acc["funding_cash_usd"]
@@ -1100,7 +1465,7 @@ def simulate_carry_pair_timeline(
             per_window_rows.append(win_acc)
             last_prev_t = t_end
 
-    return {
+    out = {
         "pair": pair.label,
         "symbol": pair.symbol,
         "domain": pair.domain,
@@ -1114,6 +1479,9 @@ def simulate_carry_pair_timeline(
         "terminal_residual_notional_usd": round(terminal_residual_notional_usd, 4),
         "windows": per_window_rows,
     }
+    if record_trades:
+        out["trade_events"] = trade_events
+    return out
 
 
 def aggregate_split_metrics(
@@ -1140,6 +1508,12 @@ def aggregate_split_metrics(
     passive_fills = 0
     depth_clipped_entries = 0
     depth_clipped_exits = 0
+    orphan_entries = 0
+    orphan_unwound_count = 0
+    orphan_notional_usd = 0.0
+    orphan_unwind_pnl_usd = 0.0
+    orphan_unwind_cost_usd = 0.0
+    orphan_open_residual_usd = 0.0
     terminal_flat_all = True
     terminal_residual = 0.0
     win_pnl_by_w: dict[int, float] = {}
@@ -1176,6 +1550,12 @@ def aggregate_split_metrics(
             passive_fills += int(w["passive_fills"])
             depth_clipped_entries += int(w["depth_clipped_entries"])
             depth_clipped_exits += int(w["depth_clipped_exits"])
+            orphan_entries += int(w.get("orphan_entries", 0))
+            orphan_unwound_count += int(w.get("orphan_unwound_count", 0))
+            orphan_notional_usd += float(w.get("orphan_notional_usd", 0.0))
+            orphan_unwind_pnl_usd += float(w.get("orphan_unwind_pnl_usd", 0.0))
+            orphan_unwind_cost_usd += float(w.get("orphan_unwind_cost_usd", 0.0))
+            orphan_open_residual_usd += float(w.get("orphan_open_residual_usd", 0.0))
             win_pnl_by_w[wnum] = win_pnl_by_w.get(wnum, 0.0) + wnet
             pair_pnl[pr["pair"]] = pair_pnl.get(pr["pair"], 0.0) + wnet
 
@@ -1198,6 +1578,12 @@ def aggregate_split_metrics(
         "passive_fill_pct": round(100.0 * passive_fills / passive_attempts, 2) if passive_attempts else 0.0,
         "depth_clipped_entries": depth_clipped_entries,
         "depth_clipped_exits": depth_clipped_exits,
+        "orphan_entries": orphan_entries,
+        "orphan_unwound_count": orphan_unwound_count,
+        "orphan_notional_usd": round(orphan_notional_usd, 4),
+        "orphan_unwind_pnl_usd": round(orphan_unwind_pnl_usd, 4),
+        "orphan_unwind_cost_usd": round(orphan_unwind_cost_usd, 4),
+        "orphan_open_residual_usd": round(orphan_open_residual_usd, 4),
         "terminal_flat_all": terminal_flat_all,
         "terminal_residual_notional_usd": round(terminal_residual, 4),
         "window_pnl_series": {str(k): round(win_pnl_by_w[k], 4) for k in sorted(win_pnl_by_w)},
