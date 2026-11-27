@@ -260,6 +260,27 @@ pub struct QueuePriorityMmConfig {
     /// Max ticks a `reduce_only` exit may step inside wide spreads (strictly post-only non-crossing; `0` preserves 1-tick default).
     #[serde(default)]
     pub reduce_only_penny_ticks: u32,
+    /// Speed-bump cancel RTT (ms) used to scale the latency-adjusted opening spread floor (`0.0` disables).
+    #[serde(default)]
+    pub speed_bump_cancel_ms: f64,
+    /// Multiplier on `sigma_1s * sqrt(speed_bump_cancel_ms / 1000)` added to opening required half-spread (`0.0` disables).
+    #[serde(default)]
+    pub latency_vol_spread_mult: f64,
+    /// Weight in `[0.0, 1.0]` applied to validated cross-venue basis-adjusted fair shift (`0.0` disables).
+    #[serde(default)]
+    pub cross_venue_fair_weight: f64,
+    /// Maximum absolute cross-venue fair-value shift in bps (`0.0` disables the cap).
+    #[serde(default)]
+    pub cross_venue_fair_cap_bps: f64,
+    /// Adverse symbol markout EWMA threshold (bps > 0) triggering the rolling toxicity circuit breaker (`0.0` disables).
+    #[serde(default)]
+    pub toxicity_pause_ewma_bps: f64,
+    /// Duration (ms) opening quotes remain paused after the toxicity circuit breaker triggers (`0` disables).
+    #[serde(default)]
+    pub toxicity_pause_ms: u64,
+    /// Minimum matured fills required before the rolling symbol toxicity circuit breaker can arm (`0` allows immediate trigger).
+    #[serde(default)]
+    pub toxicity_min_fills: u32,
     pub max_book_age_ms: u64,
     pub max_session_loss_usd: f64,
     pub max_inventory_hold_ms: u64,
@@ -316,6 +337,13 @@ impl Default for QueuePriorityMmConfig {
             self_fill_stepback_bps: 0.0,
             self_fill_decay_ms: 0,
             reduce_only_penny_ticks: 0,
+            speed_bump_cancel_ms: 0.0,
+            latency_vol_spread_mult: 0.0,
+            cross_venue_fair_weight: 0.0,
+            cross_venue_fair_cap_bps: 0.0,
+            toxicity_pause_ewma_bps: 0.0,
+            toxicity_pause_ms: 0,
+            toxicity_min_fills: 0,
             max_book_age_ms: 5_000,
             max_session_loss_usd: 3.0,
             max_inventory_hold_ms: 90_000,
@@ -581,6 +609,28 @@ impl QueuePriorityMmConfig {
             self.self_fill_stepback_bps.is_finite() && self.self_fill_stepback_bps >= 0.0,
             "self_fill_stepback_bps must be finite and >= 0"
         );
+        ensure!(
+            self.speed_bump_cancel_ms.is_finite() && self.speed_bump_cancel_ms >= 0.0,
+            "speed_bump_cancel_ms must be finite and >= 0"
+        );
+        ensure!(
+            self.latency_vol_spread_mult.is_finite() && self.latency_vol_spread_mult >= 0.0,
+            "latency_vol_spread_mult must be finite and >= 0"
+        );
+        ensure!(
+            self.cross_venue_fair_weight.is_finite()
+                && self.cross_venue_fair_weight >= 0.0
+                && self.cross_venue_fair_weight <= 1.0,
+            "cross_venue_fair_weight must be finite and in [0, 1]"
+        );
+        ensure!(
+            self.cross_venue_fair_cap_bps.is_finite() && self.cross_venue_fair_cap_bps >= 0.0,
+            "cross_venue_fair_cap_bps must be finite and >= 0"
+        );
+        ensure!(
+            self.toxicity_pause_ewma_bps.is_finite() && self.toxicity_pause_ewma_bps >= 0.0,
+            "toxicity_pause_ewma_bps must be finite and >= 0"
+        );
         ensure!(self.max_book_age_ms > 0, "max_book_age_ms must be positive");
         ensure!(
             self.max_session_loss_usd.is_finite() && self.max_session_loss_usd > 0.0,
@@ -774,6 +824,8 @@ pub struct EngineTelemetrySnapshot {
     pub ask_alo_reject_streak: u32,
     pub microprice_offset_bps: f64,
     pub tfi_norm: f64,
+    pub symbol_toxicity_ewma_bps: f64,
+    pub toxicity_paused: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -885,6 +937,9 @@ pub struct QueuePriorityMmEngine {
     ask_self_fill_stepback_bps: f64,
     bid_self_fill_last_ms: Option<u64>,
     ask_self_fill_last_ms: Option<u64>,
+    symbol_toxicity_ewma_bps: f64,
+    symbol_toxicity_fills: u32,
+    toxicity_pause_until_ms: u64,
     last_telemetry: EngineTelemetrySnapshot,
     halted_reason: Option<&'static str>,
 }
@@ -917,6 +972,9 @@ impl QueuePriorityMmEngine {
             ask_self_fill_stepback_bps: 0.0,
             bid_self_fill_last_ms: None,
             ask_self_fill_last_ms: None,
+            symbol_toxicity_ewma_bps: 0.0,
+            symbol_toxicity_fills: 0,
+            toxicity_pause_until_ms: 0,
             last_telemetry: EngineTelemetrySnapshot::default(),
             halted_reason: None,
         })
@@ -1110,6 +1168,22 @@ impl QueuePriorityMmEngine {
             if !mk_bps.is_finite() {
                 continue;
             }
+            if self.symbol_toxicity_fills == 0 {
+                self.symbol_toxicity_ewma_bps = mk_bps;
+            } else {
+                self.symbol_toxicity_ewma_bps =
+                    0.80 * self.symbol_toxicity_ewma_bps + 0.20 * mk_bps;
+            }
+            self.symbol_toxicity_fills = self.symbol_toxicity_fills.saturating_add(1);
+            if self.cfg.toxicity_pause_ewma_bps > 0.0
+                && self.cfg.toxicity_pause_ms > 0
+                && self.symbol_toxicity_fills >= self.cfg.toxicity_min_fills
+                && self.symbol_toxicity_ewma_bps < -self.cfg.toxicity_pause_ewma_bps
+            {
+                self.toxicity_pause_until_ms = self
+                    .toxicity_pause_until_ms
+                    .max(now_ms.saturating_add(self.cfg.toxicity_pause_ms));
+            }
             let threshold = self.cfg.markout_shield_adverse_threshold_bps;
             match pf.side {
                 QuoteSide::Bid => {
@@ -1143,8 +1217,14 @@ impl QueuePriorityMmEngine {
     ) -> Vec<MmAction> {
         let mut actions = Vec::new();
 
-        // 1. Check session drawdown halt invariant.
+        // 1. Check inventory finiteness & session drawdown halt invariant (fail-closed on NaN/Inf).
         let total_pnl = inventory.realized_pnl_usd + inventory.unrealized_pnl_usd;
+        if !inventory.target_qty.is_finite()
+            || !inventory.external_net_qty.is_finite()
+            || !total_pnl.is_finite()
+        {
+            return cancel_all_resting(resting, "invalid_inventory_state");
+        }
         if let Some(reason) = self.halted_reason {
             return self.fail_closed_with_flatten(target, resting, inventory, reason);
         }
@@ -1237,14 +1317,44 @@ impl QueuePriorityMmEngine {
             self.update_basis_ewma(ref_mid, target_mid, now_ms);
             let raw_basis_bps = (ref_mid / target_mid).ln() * 10_000.0;
             let ewma = self.basis_ewma_bps.unwrap_or(raw_basis_bps);
-            let gap_bps = raw_basis_bps - ewma;
-            let fv = ref_mid * (-ewma / 10_000.0).exp();
+            let gap_bps = if raw_basis_bps.is_finite() && ewma.is_finite() {
+                raw_basis_bps - ewma
+            } else {
+                0.0
+            };
+            let fv = if self.cfg.cross_venue_fair_weight > 0.0 {
+                let weighted_shift = self.cfg.cross_venue_fair_weight * gap_bps;
+                let clamped_shift = if self.cfg.cross_venue_fair_cap_bps > 0.0 {
+                    weighted_shift.clamp(
+                        -self.cfg.cross_venue_fair_cap_bps,
+                        self.cfg.cross_venue_fair_cap_bps,
+                    )
+                } else {
+                    weighted_shift
+                };
+                let shifted = target_mid * (clamped_shift / 10_000.0).exp();
+                if shifted.is_finite() && shifted > 0.0 {
+                    shifted
+                } else {
+                    target_mid
+                }
+            } else {
+                let raw_fv = ref_mid * (-ewma / 10_000.0).exp();
+                if raw_fv.is_finite() && raw_fv > 0.0 {
+                    raw_fv
+                } else {
+                    target_mid
+                }
+            };
             (fv, gap_bps)
         } else {
             self.reset_basis_if_expired(now_ms);
             (target_mid, 0.0)
         };
 
+        let toxicity_paused = self.cfg.toxicity_pause_ewma_bps > 0.0
+            && self.cfg.toxicity_pause_ms > 0
+            && now_ms < self.toxicity_pause_until_ms;
         let sigma_bps_per_sqrt_s = self.var_bps2_per_s.sqrt();
         self.last_telemetry = EngineTelemetrySnapshot {
             fair_value,
@@ -1259,6 +1369,8 @@ impl QueuePriorityMmEngine {
             ask_alo_reject_streak: self.ask_alo_reject_streak,
             microprice_offset_bps,
             tfi_norm,
+            symbol_toxicity_ewma_bps: self.symbol_toxicity_ewma_bps,
+            toxicity_paused,
         };
 
         // 4. Optional external IOC hedge (when net combined exposure exceeds band).
@@ -1358,6 +1470,14 @@ impl QueuePriorityMmEngine {
             .is_some_and(|max_vol| sigma_bps_per_sqrt_s > max_vol);
         let quiet_entry_blocked = quiet_ratio_blocked || quiet_vol_blocked;
         let vol_half_spread_bps = self.cfg.vol_spread_mult * sigma_bps_per_sqrt_s;
+        let latency_vol_half_spread_bps =
+            if self.cfg.speed_bump_cancel_ms > 0.0 && self.cfg.latency_vol_spread_mult > 0.0 {
+                self.cfg.latency_vol_spread_mult
+                    * sigma_bps_per_sqrt_s
+                    * (self.cfg.speed_bump_cancel_ms / 1_000.0).sqrt()
+            } else {
+                0.0
+            };
         let as_max_skew_bps = if self.cfg.as_inventory_skew_gamma > 0.0 {
             1.5 * self.cfg.as_inventory_skew_gamma * (1.0 + self.var_bps2_per_s)
         } else {
@@ -1443,10 +1563,13 @@ impl QueuePriorityMmEngine {
                 };
             let opening_req_half_bps = min_edge_total_bps
                 + vol_half_spread_bps
+                + latency_vol_half_spread_bps
                 + asym_markout_skew_bps
                 + side_self_fill_stepback;
             let use_g4_quote_skew = self.cfg.as_inventory_skew_gamma > 0.0
                 || self.cfg.vol_spread_mult > 0.0
+                || latency_vol_half_spread_bps > 0.0
+                || self.cfg.cross_venue_fair_weight > 0.0
                 || self.cfg.directional_markout_skew_mult > 0.0
                 || self.cfg.microprice_alpha_weight > 0.0
                 || self.cfg.tfi_skew_bps > 0.0
@@ -1575,6 +1698,7 @@ impl QueuePriorityMmEngine {
                     let would_exceed_cap = committed_qty + r.qty > max_pos_qty + 1e-12;
                     let quiet_blocked_resting = quiet_entry_blocked && r_opens_past_flat;
                     let tfi_blocked_resting = tfi_vetoed && r_opens_past_flat;
+                    let toxicity_blocked_resting = toxicity_paused && r_opens_past_flat;
                     if !r_crosses
                         && r_edge_ok
                         && within_keep
@@ -1582,6 +1706,7 @@ impl QueuePriorityMmEngine {
                         && !would_exceed_cap
                         && !quiet_blocked_resting
                         && !tfi_blocked_resting
+                        && !toxicity_blocked_resting
                     {
                         committed_qty += r.qty;
                         actions.push(MmAction::Keep {
@@ -1594,7 +1719,9 @@ impl QueuePriorityMmEngine {
                     actions.push(MmAction::Cancel {
                         client_id: r.client_id.clone(),
                         side,
-                        reason: if quiet_blocked_resting {
+                        reason: if toxicity_blocked_resting {
+                            "toxicity_circuit_breaker"
+                        } else if quiet_blocked_resting {
                             "quiet_regime_gate"
                         } else if tfi_blocked_resting {
                             "tfi_adverse_veto"
@@ -1606,12 +1733,12 @@ impl QueuePriorityMmEngine {
                     });
                 }
 
-                // Opening-only entry gates (quiet-regime gate, TFI veto, ALO cooldown, severe markout shield
-                // cooldown, OBI veto, and narrow-spread ALO flight-collision guard).
-                // Quiet-regime gate and TFI veto cancel resting opening orders above while preserving pure
-                // `reduce_only` exits (`!r_opens_past_flat`); none of these gates block exits.
+                // Opening-only entry gates (quiet-regime gate, TFI veto, toxicity breaker, ALO cooldown,
+                // severe markout shield cooldown, OBI veto, and narrow-spread ALO flight-collision guard).
+                // Quiet-regime gate, TFI veto, and toxicity breaker cancel resting opening orders above while
+                // preserving pure `reduce_only` exits (`!r_opens_past_flat`); none of these gates block exits.
                 if !is_reducing {
-                    if quiet_entry_blocked || tfi_vetoed {
+                    if quiet_entry_blocked || tfi_vetoed || toxicity_paused {
                         continue;
                     }
                     if now_ms < alo_cooldown_until || now_ms < markout_cooldown_until {
@@ -3418,6 +3545,438 @@ mod tests {
         assert!(
             (ask_one - 100.01).abs() < 1e-6,
             "1-tick book must stay at best_ask 100.01, got {ask_one}"
+        );
+    }
+
+    #[test]
+    fn speedbump_defaults_remain_backward_compatible_off_and_validate() {
+        let cfg = QueuePriorityMmConfig::default();
+        assert_eq!(cfg.speed_bump_cancel_ms, 0.0);
+        assert_eq!(cfg.latency_vol_spread_mult, 0.0);
+        assert_eq!(cfg.cross_venue_fair_weight, 0.0);
+        assert_eq!(cfg.cross_venue_fair_cap_bps, 0.0);
+        assert_eq!(cfg.toxicity_pause_ewma_bps, 0.0);
+        assert_eq!(cfg.toxicity_pause_ms, 0);
+        assert_eq!(cfg.toxicity_min_fills, 0);
+        assert_eq!(cfg.reduce_only_penny_ticks, 0);
+
+        let legacy_json = serde_json::to_value(&cfg).unwrap();
+        let mut obj = legacy_json.as_object().unwrap().clone();
+        for key in [
+            "speed_bump_cancel_ms",
+            "latency_vol_spread_mult",
+            "cross_venue_fair_weight",
+            "cross_venue_fair_cap_bps",
+            "toxicity_pause_ewma_bps",
+            "toxicity_pause_ms",
+            "toxicity_min_fills",
+        ] {
+            obj.remove(key);
+        }
+        let parsed: QueuePriorityMmConfig =
+            serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert_eq!(parsed, cfg);
+
+        let mut bad = base_cfg();
+        bad.speed_bump_cancel_ms = -1.0;
+        assert!(bad.validate().is_err());
+        bad.speed_bump_cancel_ms = 300.0;
+        bad.latency_vol_spread_mult = f64::NAN;
+        assert!(bad.validate().is_err());
+        bad.latency_vol_spread_mult = 1.0;
+        bad.cross_venue_fair_weight = 1.25;
+        assert!(bad.validate().is_err());
+        bad.cross_venue_fair_weight = 0.5;
+        bad.cross_venue_fair_cap_bps = -0.1;
+        assert!(bad.validate().is_err());
+        bad.cross_venue_fair_cap_bps = 3.0;
+        bad.toxicity_pause_ewma_bps = f64::INFINITY;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn latency_adjusted_spread_floor_widens_opening_quotes_without_blocking_reduce_only() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.speed_bump_cancel_ms = 300.0;
+        cfg.latency_vol_spread_mult = 4.0;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Warm up realized vol (~2.54 bps/sqrt(s) from 10 bps move over 1s).
+        // Latency floor = 4.0 * 2.54 * sqrt(0.3) ~ 5.56 bps > 2.0 bps book half-spread.
+        let _ = eng.evaluate(
+            Some(&book(100.00, 10.0, 100.04, 10.0, 1_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            1_000,
+        );
+        let acts_open = eng.evaluate(
+            Some(&book(100.10, 10.0, 100.14, 10.0, 2_000)),
+            &[],
+            &[],
+            InventoryState::default(),
+            2_000,
+        );
+        let bid_open = acts_open
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Bid,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected widened opening bid");
+        let ask_open = acts_open
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected widened opening ask");
+        assert!(
+            bid_open < 100.10,
+            "latency spread floor must push opening bid below touch 100.10, got {bid_open}"
+        );
+        assert!(
+            ask_open > 100.14,
+            "latency spread floor must push opening ask above touch 100.14, got {ask_open}"
+        );
+
+        // Long inventory (+0.30): reduce_only Ask must remain exempt (stays at touch <= 100.14).
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_red = eng.evaluate(
+            Some(&book(100.10, 10.0, 100.14, 10.0, 2_250)),
+            &[],
+            &[],
+            inv_long,
+            2_250,
+        );
+        let ask_red = acts_red
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: true,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected exempt reduce_only ask");
+        assert!(
+            ask_red <= 100.14,
+            "reduce_only exit must remain exempt from latency spread widening, got {ask_red}"
+        );
+    }
+
+    #[test]
+    fn cross_venue_fair_shift_clamps_causally_and_skews_reservation_price() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.require_validated_lead_ref = true;
+        cfg.lead_validation_horizon_ms = 500;
+        cfg.lead_validation_min_move_bps = 1.0;
+        cfg.lead_validation_min_samples = 2;
+        cfg.lead_validation_min_score_bps = 0.20;
+        cfg.lead_cancel_threshold_bps = 50.0; // isolate fair-shift quoting without lead-lag cancel
+        cfg.cross_venue_fair_weight = 0.50;
+        cfg.cross_venue_fair_cap_bps = 3.0;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // Warm up causal lead validation across two reference venues (arcus & trade_xyz).
+        let mut t = 1_000_u64;
+        for step in 0..4 {
+            let tgt_px = 100.00 + (step as f64) * 0.03;
+            let ref_px = 100.03 + (step as f64) * 0.03;
+            let b = book(tgt_px - 0.02, 10.0, tgt_px + 0.02, 10.0, t);
+            let refs = [
+                ReferenceBookUpdate {
+                    venue_id: "arcus".into(),
+                    bid: ref_px - 0.01,
+                    ask: ref_px + 0.01,
+                    received_at_ms: t,
+                },
+                ReferenceBookUpdate {
+                    venue_id: "trade_xyz".into(),
+                    bid: ref_px - 0.01,
+                    ask: ref_px + 0.01,
+                    received_at_ms: t,
+                },
+            ];
+            let _ = eng.evaluate(Some(&b), &refs, &[], InventoryState::default(), t);
+            t += 500;
+        }
+        assert_eq!(eng.telemetry().validated_lead_ref_count, 2);
+
+        // External consensus jumps +20 bps (100.20 -> 100.40) while slow target stays at 100.09/100.13 (mid 100.11).
+        // Unclamped 0.5 * ~20 bps = ~10 bps must be clamped strictly to +3.0 bps (~100.1400)!
+        let slow_b = book(100.09, 10.0, 100.13, 10.0, t);
+        let consensus_jump = [
+            ReferenceBookUpdate {
+                venue_id: "arcus".into(),
+                bid: 100.39,
+                ask: 100.41,
+                received_at_ms: t,
+            },
+            ReferenceBookUpdate {
+                venue_id: "trade_xyz".into(),
+                bid: 100.39,
+                ask: 100.41,
+                received_at_ms: t,
+            },
+        ];
+        let acts = eng.evaluate(
+            Some(&slow_b),
+            &consensus_jump,
+            &[],
+            InventoryState::default(),
+            t,
+        );
+        let fv = eng.telemetry().fair_value;
+        let shift_bps = (fv / 100.11).ln() * 10_000.0;
+        assert!(
+            (shift_bps - 3.0).abs() < 0.05,
+            "expected fair shift clamped at +3.0 bps, got {shift_bps:.4} bps"
+        );
+        // Shifted reservation price pushes opening Ask strictly above touch 100.13 while Bid stays <= 100.09.
+        let ask_px = acts
+            .iter()
+            .find_map(|a| match a {
+                MmAction::PlaceAlo {
+                    side: QuoteSide::Ask,
+                    price,
+                    reduce_only: false,
+                    ..
+                } => Some(*price),
+                _ => None,
+            })
+            .expect("expected shifted opening ask");
+        assert!(
+            ask_px > 100.13,
+            "positive cross-venue fair shift must raise opening ask above 100.13, got {ask_px}"
+        );
+    }
+
+    #[test]
+    fn toxicity_circuit_breaker_suppresses_opening_quotes_while_keeping_reduce_only_exits() {
+        let mut cfg = base_cfg();
+        cfg.min_penny_spread_ticks = 99;
+        cfg.markout_shield_horizon_ms = 500;
+        cfg.markout_shield_adverse_threshold_bps = 100.0; // isolate rolling symbol toxicity breaker
+        cfg.toxicity_pause_ewma_bps = 2.0;
+        cfg.toxicity_pause_ms = 3_000;
+        cfg.toxicity_min_fills = 3;
+        let mut eng = QueuePriorityMmEngine::new(cfg).unwrap();
+
+        // 2 toxic fills (< min_fills=3): breaker must NOT arm yet.
+        eng.on_fill(QuoteSide::Bid, 100.10, 0.3, 1_000);
+        eng.on_fill(QuoteSide::Ask, 99.90, 0.3, 1_050);
+        let b_mid = book(99.98, 10.0, 100.02, 10.0, 1_600);
+        let acts_pre = eng.evaluate(Some(&b_mid), &[], &[], InventoryState::default(), 1_600);
+        assert!(!eng.telemetry().toxicity_paused);
+        assert!(acts_pre.iter().any(|a| matches!(
+            a,
+            MmAction::PlaceAlo {
+                reduce_only: false,
+                ..
+            }
+        )));
+
+        // 3rd toxic fill matures -> symbol_toxicity_ewma < -2.0 bps -> circuit breaker arms for 3_000 ms!
+        eng.on_fill(QuoteSide::Bid, 100.10, 0.3, 1_200);
+        let resting = vec![
+            RestingQuote {
+                client_id: "b_open".into(),
+                side: QuoteSide::Bid,
+                price: 99.98,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 1_600,
+            },
+            RestingQuote {
+                client_id: "a_open".into(),
+                side: QuoteSide::Ask,
+                price: 100.02,
+                qty: 0.30,
+                level_idx: 0,
+                placed_at_ms: 1_600,
+            },
+        ];
+        let b_trig = book(99.98, 10.0, 100.02, 10.0, 1_800);
+        let acts_paused = eng.evaluate(
+            Some(&b_trig),
+            &[],
+            &resting,
+            InventoryState::default(),
+            1_800,
+        );
+        assert!(eng.telemetry().toxicity_paused);
+        assert!(eng.telemetry().symbol_toxicity_ewma_bps < -2.0);
+        assert!(acts_paused.iter().any(|a| matches!(
+            a,
+            MmAction::Cancel {
+                client_id,
+                reason: "toxicity_circuit_breaker",
+                ..
+            } if client_id == "b_open"
+        )));
+        assert!(acts_paused.iter().any(|a| matches!(
+            a,
+            MmAction::Cancel {
+                client_id,
+                reason: "toxicity_circuit_breaker",
+                ..
+            } if client_id == "a_open"
+        )));
+        assert!(
+            !acts_paused
+                .iter()
+                .any(|a| matches!(a, MmAction::PlaceAlo { .. })),
+            "flat paused symbol must not place any opening orders"
+        );
+
+        // Long inventory (+0.30) while paused: pure reducing Ask keeps queue priority & places reduce_only=true,
+        // while opening Bid remains suppressed!
+        let inv_long = InventoryState {
+            target_qty: 0.30,
+            ..Default::default()
+        };
+        let acts_red = eng.evaluate(Some(&b_trig), &[], &resting, inv_long, 2_000);
+        assert!(acts_red.iter().any(|a| matches!(
+            a,
+            MmAction::Keep {
+                client_id,
+                side: QuoteSide::Ask,
+                ..
+            } if client_id == "a_open"
+        )));
+        assert!(acts_red.iter().any(|a| matches!(
+            a,
+            MmAction::Cancel {
+                client_id,
+                side: QuoteSide::Bid,
+                reason: "toxicity_circuit_breaker",
+            } if client_id == "b_open"
+        )));
+
+        let acts_red_place = eng.evaluate(Some(&b_trig), &[], &[], inv_long, 2_100);
+        assert!(acts_red_place.iter().any(|a| matches!(
+            a,
+            MmAction::PlaceAlo {
+                side: QuoteSide::Ask,
+                reduce_only: true,
+                ..
+            }
+        )));
+        assert!(!acts_red_place.iter().any(|a| matches!(
+            a,
+            MmAction::PlaceAlo {
+                side: QuoteSide::Bid,
+                ..
+            }
+        )));
+
+        // After 3_000 ms pause expires (1_800 + 3_000 = 4_800), quoting resumes cleanly.
+        let b_resumed = book(99.98, 10.0, 100.02, 10.0, 5_000);
+        let acts_resumed =
+            eng.evaluate(Some(&b_resumed), &[], &[], InventoryState::default(), 5_000);
+        assert!(!eng.telemetry().toxicity_paused);
+        assert_eq!(
+            acts_resumed
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    MmAction::PlaceAlo {
+                        reduce_only: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn nan_or_inf_inputs_fail_closed() {
+        let mut eng = QueuePriorityMmEngine::new(base_cfg()).unwrap();
+        let resting = vec![RestingQuote {
+            client_id: "b1".into(),
+            side: QuoteSide::Bid,
+            price: 100.00,
+            qty: 0.30,
+            level_idx: 0,
+            placed_at_ms: 1_000,
+        }];
+
+        // NaN in target book -> stale_or_invalid_target_book cancel all.
+        let nan_book = VenueBookUpdate {
+            bids: vec![(f64::NAN, 10.0)],
+            asks: vec![(100.04, 10.0)],
+            received_at_ms: 1_000,
+            source_ms: Some(1_000),
+        };
+        assert_eq!(
+            eng.evaluate(
+                Some(&nan_book),
+                &[],
+                &resting,
+                InventoryState::default(),
+                1_000
+            ),
+            vec![MmAction::Cancel {
+                client_id: "b1".into(),
+                side: QuoteSide::Bid,
+                reason: "stale_or_invalid_target_book",
+            }]
+        );
+
+        // Inf in inventory -> invalid_inventory_state cancel all.
+        let good_book = book(100.00, 10.0, 100.04, 10.0, 1_000);
+        let bad_inv = InventoryState {
+            target_qty: f64::INFINITY,
+            ..Default::default()
+        };
+        assert_eq!(
+            eng.evaluate(Some(&good_book), &[], &resting, bad_inv, 1_000),
+            vec![MmAction::Cancel {
+                client_id: "b1".into(),
+                side: QuoteSide::Bid,
+                reason: "invalid_inventory_state",
+            }]
+        );
+
+        // NaN in reference book -> stale_reference_book cancel all.
+        let bad_ref = [ReferenceBookUpdate {
+            venue_id: "arcus".into(),
+            bid: f64::NAN,
+            ask: 100.02,
+            received_at_ms: 1_000,
+        }];
+        assert_eq!(
+            eng.evaluate(
+                Some(&good_book),
+                &bad_ref,
+                &resting,
+                InventoryState::default(),
+                1_000
+            ),
+            vec![MmAction::Cancel {
+                client_id: "b1".into(),
+                side: QuoteSide::Bid,
+                reason: "stale_reference_book",
+            }]
         );
     }
 }
