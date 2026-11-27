@@ -1,0 +1,334 @@
+# Track 03 (`03_incentive_turnover`) W28+ Pre-Registered Shadow Configuration:
+# Lighter Robinhood Standard (`0/0 bps` Verified, `USDG`) Core 4 (`AAPL, AMZN, META, MSFT`)
+#
+# Causal selection (`W01-W27` single-factor hold ablation, `-w28` excluded):
+#   - Arm: `S4_hold600s_only` (`S4_speedbump_combined` + `max_inventory_hold_ms = 600000`,
+#     preserving `reduce_only_penny_ticks = 0` and `inventory_skew_bps_per_full_limit = 2.0`).
+#   - Single-factor hold extension (`15s -> 600s`) delivers `-$13.66/M` (`+$151.26` across 21/21
+#     windows) on `Core 4` and `-$7.97/M` (`+$72.64` across 20/21 windows) `ex-META`, beating
+#     `P3_patient_600s` (`-$9.87/M`, `+$114.39`; `ex-META -$3.62/M`, `+$35.11`) because adding
+#     `reduce_only_penny_ticks = 1` (`-$25.74`) and `skew = 5.0` (`-$17.40`) eroded passive edge.
+#   - Strictly isolated capital ($10,000), 2% daily loss budget, and read-only shadow/replay only.
+#
+# OPT-01 VERIFIED FEE-TIER PROVENANCE:
+#   - `lighter_robinhood` (`USDG`, `target_exchange_id = 8`): `verified_account_tier`,
+#     `standard` (`0.00 / 0.00 bps`, `rebate_bps = 0.0`).
+#   - Latency profile: `200 ms` post-only/cancel speed bump (`submit_rtt_ms = 200.0`,
+#     `speed_bump_cancel_ms = 300.0`) + `330 ms` non-post-only IOC exit (`ioc_exit_delay_ms = 330`).
+#
+# Exchange indices (`src/shm_reader.rs`): 8=LighterRH, 7=Arcus, 10=TradeXYZ.
+
+capital_usd = 10000.0
+daily_loss_limit_pct = 0.02
+allowlisted_symbols = ["AAPL", "AMZN", "META", "MSFT"]
+
+# OPT-07 deterministic 5-state defense FSM enabled in shadow mode.
+[defense]
+min_dwell_ms = 3000
+caution_feed_staleness_ms = 2000
+reduce_only_feed_staleness_ms = 4000
+halt_feed_staleness_ms = 10000
+caution_feed_gap_ms = 2500
+reduce_only_feed_gap_ms = 5000
+halt_feed_gap_ms = 15000
+caution_vol_shock_ratio = 2.0
+reduce_only_vol_shock_ratio = 4.0
+halt_vol_shock_ratio = 8.0
+side_defense_adverse_markout_bps = 3.0
+reduce_only_adverse_markout_bps = 8.0
+caution_oracle_divergence_bps = 15.0
+reduce_only_oracle_divergence_bps = 35.0
+halt_oracle_divergence_bps = 75.0
+caution_daily_loss_utilization = 0.50
+reduce_only_daily_loss_utilization = 0.85
+halt_daily_loss_utilization = 1.00
+caution_size_scale = 0.50
+recovery_hysteresis_ratio = 0.80
+
+[[arms]]
+symbol = "AAPL"
+symbol_id = 1006
+target_exchange_id = 8
+ref_exchange_ids = [7, 10]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 0.50
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 4
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.10
+lead_cancel_spread_mult = 1.8
+require_validated_lead_ref = true
+lead_validation_horizon_ms = 1500
+lead_validation_min_move_bps = 0.40
+lead_validation_min_samples = 5
+lead_validation_min_score_bps = 0.02
+max_ref_spread_to_target_ratio = 3.0
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_min_notional_usd = 200.0
+sweep_cooldown_ms = 1200
+alo_reject_cooldown_ms = 600
+alo_reject_stepback_streak = 2
+markout_shield_horizon_ms = 1000
+markout_shield_adverse_threshold_bps = 1.0
+markout_shield_cooldown_ms = 2000
+markout_shield_size_scale = 0.5
+submit_rtt_ms = 200.0
+alo_flight_guard_sigma_bps = 0.35
+alo_flight_guard_obi_threshold = 0.55
+as_inventory_skew_gamma = 2.0
+vol_spread_mult = 0.5
+directional_markout_skew_mult = 1.0
+quiet_regime_min_spread_to_vol = 0.80
+quiet_regime_max_entry_vol_bps = 1.2
+microprice_alpha_weight = 0.25
+tfi_ewma_tau_ms = 2000.0
+tfi_skew_bps = 0.0
+tfi_veto_threshold = 0.75
+reduce_only_penny_ticks = 0
+speed_bump_cancel_ms = 300.0
+latency_vol_spread_mult = 1.25
+cross_venue_fair_weight = 0.75
+cross_venue_fair_cap_bps = 4.0
+toxicity_pause_ewma_bps = 1.50
+toxicity_pause_ms = 60000
+toxicity_min_fills = 6
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 600000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
+
+[[arms]]
+symbol = "AMZN"
+symbol_id = 1007
+target_exchange_id = 8
+ref_exchange_ids = [7, 10]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 0.50
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 4
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.10
+lead_cancel_spread_mult = 1.8
+require_validated_lead_ref = true
+lead_validation_horizon_ms = 1500
+lead_validation_min_move_bps = 0.40
+lead_validation_min_samples = 5
+lead_validation_min_score_bps = 0.02
+max_ref_spread_to_target_ratio = 3.0
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_min_notional_usd = 200.0
+sweep_cooldown_ms = 1200
+alo_reject_cooldown_ms = 600
+alo_reject_stepback_streak = 2
+markout_shield_horizon_ms = 1000
+markout_shield_adverse_threshold_bps = 1.0
+markout_shield_cooldown_ms = 2000
+markout_shield_size_scale = 0.5
+submit_rtt_ms = 200.0
+alo_flight_guard_sigma_bps = 0.35
+alo_flight_guard_obi_threshold = 0.55
+as_inventory_skew_gamma = 2.0
+vol_spread_mult = 0.5
+directional_markout_skew_mult = 1.0
+quiet_regime_min_spread_to_vol = 0.80
+quiet_regime_max_entry_vol_bps = 1.2
+microprice_alpha_weight = 0.25
+tfi_ewma_tau_ms = 2000.0
+tfi_skew_bps = 0.0
+tfi_veto_threshold = 0.75
+reduce_only_penny_ticks = 0
+speed_bump_cancel_ms = 300.0
+latency_vol_spread_mult = 1.25
+cross_venue_fair_weight = 0.75
+cross_venue_fair_cap_bps = 4.0
+toxicity_pause_ewma_bps = 1.50
+toxicity_pause_ms = 60000
+toxicity_min_fills = 6
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 600000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
+
+[[arms]]
+symbol = "META"
+symbol_id = 1008
+target_exchange_id = 8
+ref_exchange_ids = [7, 10]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 0.50
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 4
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.10
+lead_cancel_spread_mult = 1.8
+require_validated_lead_ref = true
+lead_validation_horizon_ms = 1500
+lead_validation_min_move_bps = 0.40
+lead_validation_min_samples = 5
+lead_validation_min_score_bps = 0.02
+max_ref_spread_to_target_ratio = 3.0
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_min_notional_usd = 200.0
+sweep_cooldown_ms = 1200
+alo_reject_cooldown_ms = 600
+alo_reject_stepback_streak = 2
+markout_shield_horizon_ms = 1000
+markout_shield_adverse_threshold_bps = 1.0
+markout_shield_cooldown_ms = 2000
+markout_shield_size_scale = 0.5
+submit_rtt_ms = 200.0
+alo_flight_guard_sigma_bps = 0.35
+alo_flight_guard_obi_threshold = 0.55
+as_inventory_skew_gamma = 2.0
+vol_spread_mult = 0.5
+directional_markout_skew_mult = 1.0
+quiet_regime_min_spread_to_vol = 0.80
+quiet_regime_max_entry_vol_bps = 1.2
+microprice_alpha_weight = 0.25
+tfi_ewma_tau_ms = 2000.0
+tfi_skew_bps = 0.0
+tfi_veto_threshold = 0.75
+reduce_only_penny_ticks = 0
+speed_bump_cancel_ms = 300.0
+latency_vol_spread_mult = 1.25
+cross_venue_fair_weight = 0.75
+cross_venue_fair_cap_bps = 4.0
+toxicity_pause_ewma_bps = 1.50
+toxicity_pause_ms = 60000
+toxicity_min_fills = 6
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 600000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
+
+[[arms]]
+symbol = "MSFT"
+symbol_id = 1009
+target_exchange_id = 8
+ref_exchange_ids = [7, 10]
+maker_fee_bps = 0.0
+taker_fee_bps = 0.0
+rebate_bps = 0.0
+queue_ahead_fraction = 0.5
+allowed_utc_sessions = ["overnight_asia", "us_extended", "weekend"]
+account_fee_status = "verified_account_tier"
+ioc_exit_delay_ms = 330
+max_l1_depth_fraction = 0.50
+
+[arms.strategy]
+tick_size = 0.01
+lot_size = 0.01
+min_notional_usd = 10.0
+maker_fee_bps = 0.0
+quote_notional_usd = 200.0
+max_position_notional_usd = 400.0
+ladder_levels = 1
+min_penny_spread_ticks = 4
+min_entry_edge_bps = 0.10
+lead_cancel_threshold_bps = 1.10
+lead_cancel_spread_mult = 1.8
+require_validated_lead_ref = true
+lead_validation_horizon_ms = 1500
+lead_validation_min_move_bps = 0.40
+lead_validation_min_samples = 5
+lead_validation_min_score_bps = 0.02
+max_ref_spread_to_target_ratio = 3.0
+basis_ewma_tau_ms = 120000.0
+inventory_skew_bps_per_full_limit = 2.0
+max_queue_keep_ticks = 3
+sweep_print_pull_ratio = 0.75
+sweep_min_notional_usd = 200.0
+sweep_cooldown_ms = 1200
+alo_reject_cooldown_ms = 600
+alo_reject_stepback_streak = 2
+markout_shield_horizon_ms = 1000
+markout_shield_adverse_threshold_bps = 1.0
+markout_shield_cooldown_ms = 2000
+markout_shield_size_scale = 0.5
+submit_rtt_ms = 200.0
+alo_flight_guard_sigma_bps = 0.35
+alo_flight_guard_obi_threshold = 0.55
+as_inventory_skew_gamma = 2.0
+vol_spread_mult = 0.5
+directional_markout_skew_mult = 1.0
+quiet_regime_min_spread_to_vol = 0.80
+quiet_regime_max_entry_vol_bps = 1.2
+microprice_alpha_weight = 0.25
+tfi_ewma_tau_ms = 2000.0
+tfi_skew_bps = 0.0
+tfi_veto_threshold = 0.75
+reduce_only_penny_ticks = 0
+speed_bump_cancel_ms = 300.0
+latency_vol_spread_mult = 1.25
+cross_venue_fair_weight = 0.75
+cross_venue_fair_cap_bps = 4.0
+toxicity_pause_ewma_bps = 1.50
+toxicity_pause_ms = 60000
+toxicity_min_fills = 6
+max_book_age_ms = 5000
+max_session_loss_usd = 20.0
+max_inventory_hold_ms = 600000
+require_fresh_reference = false
+
+[arms.strategy.hedge_mode]
+mode = "passive_inventory_cycle"
