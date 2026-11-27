@@ -436,6 +436,268 @@ class TestResearchFundingBasisCarryPortfolio(unittest.TestCase):
         self.assertEqual(w_eq["leg_a_funding_payments"], 1)
         self.assertEqual(w_eq["leg_b_funding_payments"], 1)
 
+    def test_p0_boundary_stale_ioc_recovery_requeues_taker_latency(self) -> None:
+        # Direct helper test: miss at t_exec=1000, recovery at 1500 -> fills only at t_retry=1500+330=1830!
+        bbo = {
+            "ts": [0, 1500, 1900],
+            "bid": [100.0, 100.1, 100.2],
+            "ask": [100.1, 100.2, 100.3],
+            "bsz": [10.0, 10.0, 10.0],
+            "asz": [10.0, 10.0, 10.0],
+        }
+        hit = mod._lookup_bbo_with_recovery(bbo, 1_000, max_age_ms=500, max_recovery_ms=2_000)
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit[4], 1500 + mod.TAKER_LATENCY_MS)
+        self.assertAlmostEqual(hit[0], 100.1, places=6)
+
+        # If book crosses/vanishes before t_retry=1830, retry MUST fail (None) instead of 0ms fill at 1500!
+        bbo_vanish = {
+            "ts": [0, 1500, 1700],
+            "bid": [100.0, 100.1, 100.5],
+            "ask": [100.1, 100.2, 100.4],  # crossed at 1700
+            "bsz": [10.0, 10.0, 10.0],
+            "asz": [10.0, 10.0, 10.0],
+        }
+        self.assertIsNone(mod._lookup_bbo_with_recovery(bbo_vanish, 1_000, max_age_ms=500, max_recovery_ms=2_000))
+
+        # End-to-end exit recovery test in simulate_carry_pair_timeline:
+        pair = mod.CarryPairSpec("NVDA", "rwa", "lighter", "trade_xyz", "USDC/USDC", False, "lighter<->trade_xyz NVDA", "ws")
+        t0 = 1_700_000_400_000
+        t_end = t0 + 3 * mod.HOUR_MS
+        win = [{"window_num": 1, "window": "w01", "split": "selection_dev", "t0_ms": t0, "t1_ms": t_end}]
+        ts_a, ab, aa, absz, aasz = [], [], [], [], []
+        ts_b, bb, ba, bbsz, basz = [], [], [], [], []
+        t_exit_dec = t0 + 2 * mod.HOUR_MS
+        t_exec_exit = t_exit_dec + mod.TAKER_LATENCY_MS
+        t_recovery = t_exec_exit + 600  # recovers 600ms after IOC expired
+        t_cur = t0
+        while t_cur <= t_end:
+            rich = 0.25 if t_cur >= t0 + mod.HOUR_MS else 0.0
+            # Make Leg A go dark during [t_exit_dec + 100, t_recovery - 1]
+            if not (t_exit_dec + 100 <= t_cur < t_recovery):
+                ts_a.append(t_cur)
+                ab.append(100.0 + rich - 0.02)
+                aa.append(100.0 + rich + 0.02)
+                absz.append(20.0)
+                aasz.append(20.0)
+            ts_b.append(t_cur)
+            bb.append(99.99)
+            ba.append(100.01)
+            bbsz.append(20.0)
+            basz.append(20.0)
+            t_cur += 1_000
+        # Inject crossed/invalid book at t_exit_dec + 100 so IOC at t_exec_exit misses, then recover at t_recovery
+        ins_bad = mod._bisect_left(ts_a, t_exit_dec + 100)
+        ts_a.insert(ins_bad, t_exit_dec + 100)
+        ab.insert(ins_bad, 100.5)
+        aa.insert(ins_bad, 100.4)
+        absz.insert(ins_bad, 0.0)
+        aasz.insert(ins_bad, 0.0)
+        # Inject exact recovery timestamp on Leg A (and fresh tick through t_retry)
+        ins_idx = mod._bisect_left(ts_a, t_recovery)
+        ts_a.insert(ins_idx, t_recovery)
+        ab.insert(ins_idx, 100.23)
+        aa.insert(ins_idx, 100.27)
+        absz.insert(ins_idx, 20.0)
+        aasz.insert(ins_idx, 20.0)
+
+        fa = {t0 + mod.HOUR_MS: 5.0, t_exit_dec: -100.0}
+        fb = {t0 + mod.HOUR_MS: 0.0, t_exit_dec: 0.0}
+        p_tk = mod.CarryArmParams("tk_rec", "C1_basis_timed_taker", funding_tau_h=0.25, min_basis_zscore=0.5, take_profit_basis_bps=200.0, max_hold_h=48.0)
+        res = mod.simulate_carry_pair_timeline(
+            pair=pair,
+            bbo_a={"ts": ts_a, "bid": ab, "ask": aa, "bsz": absz, "asz": aasz},
+            bbo_b={"ts": ts_b, "bid": bb, "ask": ba, "bsz": bbsz, "asz": basz},
+            trades_a=None, trades_b=None, funding_a=fa, funding_b=fb,
+            live_ctx_a=None, live_ctx_b=None, windows=win,
+            fee_a_mk_bps=0.4, fee_a_tk_bps=2.8, fee_b_mk_bps=0.3, fee_b_tk_bps=0.9,
+            max_age_a_ms=500, max_age_b_ms=5_000, params=p_tk, step_ms=1_000, record_trades=True,
+        )
+        matched = [e for e in res["trade_events"] if e["kind"] == "matched_pair"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["leg_a_exit_ms"], t_recovery + mod.TAKER_LATENCY_MS)
+        self.assertGreater(matched[0]["leg_a_exit_ms"], t_recovery)
+
+    def test_p0_boundary_cutoff_split_end_ms_rejects_late_exit_and_keeps_residual(self) -> None:
+        # Recovery before split_end_ms whose t_retry > split_end_ms MUST be rejected!
+        bbo = {
+            "ts": [0, 9_800, 10_500],
+            "bid": [100.0, 100.1, 100.2],
+            "ask": [100.1, 100.2, 100.3],
+            "bsz": [10.0, 10.0, 10.0],
+            "asz": [10.0, 10.0, 10.0],
+        }
+        # t_exec=9_500 misses (9_500 - 0 > 500), recovers at 9_800 -> t_retry=10_130 > cutoff 10_000 -> None!
+        self.assertIsNone(mod._lookup_bbo_with_recovery(bbo, 9_500, max_age_ms=500, cutoff_ms=10_000))
+
+        # End-to-end: open position at split_end_ms where Leg A book is dark at t_end and only exists after t_end!
+        pair = mod.CarryPairSpec("NVDA", "rwa", "lighter", "trade_xyz", "USDC/USDC", False, "lighter<->trade_xyz NVDA", "ws")
+        t0 = 1_700_000_400_000
+        t_end = t0 + 2 * mod.HOUR_MS
+        win = [{"window_num": 1, "window": "w01", "split": "selection_dev", "t0_ms": t0, "t1_ms": t_end}]
+        ts_a, ab, aa, absz, aasz = [], [], [], [], []
+        ts_b, bb, ba, bbsz, basz = [], [], [], [], []
+        t_cur = t0
+        while t_cur <= t_end + 10_000:
+            rich = 0.25 if t_cur >= t0 + mod.HOUR_MS else 0.0
+            # Leg A dark from t_end - 2_000 through t_end, recovers ONLY at t_end + 500 (past split_end_ms!)
+            if t_cur <= t_end - 2_000 or t_cur >= t_end + 500:
+                ts_a.append(t_cur)
+                ab.append(100.0 + rich - 0.02)
+                aa.append(100.0 + rich + 0.02)
+                absz.append(20.0)
+                aasz.append(20.0)
+            ts_b.append(t_cur)
+            bb.append(99.99)
+            ba.append(100.01)
+            bbsz.append(20.0)
+            basz.append(20.0)
+            t_cur += 1_000
+
+        fa = {t0 + mod.HOUR_MS: 5.0}
+        fb = {t0 + mod.HOUR_MS: 0.0}
+        p_tk = mod.CarryArmParams("tk_cut", "C1_basis_timed_taker", min_basis_zscore=0.5, take_profit_basis_bps=200.0, max_hold_h=48.0)
+        res = mod.simulate_carry_pair_timeline(
+            pair=pair,
+            bbo_a={"ts": ts_a, "bid": ab, "ask": aa, "bsz": absz, "asz": aasz},
+            bbo_b={"ts": ts_b, "bid": bb, "ask": ba, "bsz": bbsz, "asz": basz},
+            trades_a=None, trades_b=None, funding_a=fa, funding_b=fb,
+            live_ctx_a=None, live_ctx_b=None, windows=win,
+            fee_a_mk_bps=0.4, fee_a_tk_bps=2.8, fee_b_mk_bps=0.3, fee_b_tk_bps=0.9,
+            max_age_a_ms=500, max_age_b_ms=5_000, params=p_tk, step_ms=10_000,
+        )
+        w0 = res["windows"][0]
+        self.assertEqual(w0["trades_entered"], 1)
+        self.assertEqual(w0["trades_closed"], 0)
+        self.assertFalse(res["terminal_flat"])
+        self.assertAlmostEqual(res["terminal_residual_notional_usd"], 1000.0, places=3)
+        self.assertAlmostEqual(w0["position_open_residual_usd"], 1000.0, places=3)
+
+    def test_p0_boundary_funding_available_at_ms_causal_gate_and_late_revision(self) -> None:
+        pair = mod.CarryPairSpec("NVDA", "rwa", "lighter", "trade_xyz", "USDC/USDC", False, "lighter<->trade_xyz NVDA", "ws")
+        t0 = 1_700_000_400_000
+        h1 = t0 + mod.HOUR_MS
+        h2 = t0 + 2 * mod.HOUR_MS
+        t_end = t0 + 3 * mod.HOUR_MS
+        win = [{"window_num": 1, "window": "w01", "split": "selection_dev", "t0_ms": t0, "t1_ms": t_end}]
+        ts_bbo, ab, aa, absz, aasz, bb, ba, bbsz, basz = [], [], [], [], [], [], [], [], []
+        t_cur = t0
+        while t_cur <= t_end:
+            rich = 0.25 if t_cur >= h1 else 0.0
+            ts_bbo.append(t_cur)
+            ab.append(100.0 + rich - 0.02)
+            aa.append(100.0 + rich + 0.02)
+            absz.append(20.0)
+            aasz.append(20.0)
+            bb.append(99.99)
+            ba.append(100.01)
+            bbsz.append(20.0)
+            basz.append(20.0)
+            t_cur += 10_000
+        bbo_a = {"ts": ts_bbo, "bid": ab, "ask": aa, "bsz": absz, "asz": aasz}
+        bbo_b = {"ts": ts_bbo, "bid": bb, "ask": ba, "bsz": bbsz, "asz": basz}
+
+        # Case 1: Settled funding with available_at_ms=None MUST be completely ignored (no signal, no cash)!
+        fa_unknown = [{"pay_ms": h1, "available_at_ms": None, "rate_bps": 10.0}]
+        fb_unknown = [{"pay_ms": h1, "available_at_ms": None, "rate_bps": 0.0}]
+        p_tk = mod.CarryArmParams("tk_fund", "C1_basis_timed_taker", funding_tau_h=0.25, min_basis_zscore=0.5, take_profit_basis_bps=200.0, max_hold_h=48.0)
+        res_unk = mod.simulate_carry_pair_timeline(
+            pair=pair, bbo_a=bbo_a, bbo_b=bbo_b, trades_a=None, trades_b=None,
+            funding_a=fa_unknown, funding_b=fb_unknown, live_ctx_a=None, live_ctx_b=None,
+            windows=win, fee_a_mk_bps=0.4, fee_a_tk_bps=2.8, fee_b_mk_bps=0.3, fee_b_tk_bps=0.9,
+            max_age_a_ms=30_000, max_age_b_ms=30_000, params=p_tk,
+        )
+        self.assertEqual(res_unk["windows"][0]["trades_entered"], 0)
+        self.assertEqual(res_unk["windows"][0]["funding_cash_usd"], 0.0)
+
+        # Case 2: Late revision test!
+        # At h1, initial settled rate is +5.0 (avail = h1). Position enters at h1.
+        # At h2, initial settled rate is +5.0 (avail = h2), AND a late revision flips it to -100.0 at avail = h2 + 25_000!
+        # Without causal gate, entry/hold at h2+10_000 would have seen -100.0 early and triggered adverse_funding_flip at h2+10_000.
+        # With causal gate, adverse_funding_flip triggers ONLY at h2+30_000 (after avail=h2+25_000)!
+        fa_rev = [
+            {"pay_ms": h1, "available_at_ms": h1, "rate_bps": 5.0},
+            {"pay_ms": h2, "available_at_ms": h2, "rate_bps": 5.0},
+            {"pay_ms": h2, "available_at_ms": h2 + 25_000, "rate_bps": -100.0},
+        ]
+        fb_rev = [
+            {"pay_ms": h1, "available_at_ms": h1, "rate_bps": 0.0},
+            {"pay_ms": h2, "available_at_ms": h2, "rate_bps": 0.0},
+        ]
+        res_rev = mod.simulate_carry_pair_timeline(
+            pair=pair, bbo_a=bbo_a, bbo_b=bbo_b, trades_a=None, trades_b=None,
+            funding_a=fa_rev, funding_b=fb_rev, live_ctx_a=None, live_ctx_b=None,
+            windows=win, fee_a_mk_bps=0.4, fee_a_tk_bps=2.8, fee_b_mk_bps=0.3, fee_b_tk_bps=0.9,
+            max_age_a_ms=30_000, max_age_b_ms=30_000, params=p_tk, record_trades=True,
+        )
+        matched = [e for e in res_rev["trade_events"] if e["kind"] == "matched_pair"]
+        self.assertEqual(len(matched), 1)
+        # Must NOT exit at h2 + TAKER_LATENCY_MS or h2 + 10_000 + TAKER_LATENCY_MS; must exit only at h2 + 30_000 + TAKER_LATENCY_MS!
+        self.assertEqual(matched[0]["reason"], "adverse_funding_flip")
+        self.assertEqual(matched[0]["leg_a_exit_ms"], h2 + 30_000 + mod.TAKER_LATENCY_MS)
+
+        # Case 3: live_ctx causal gate — future live_ctx in the same hour is invisible at earlier t_dec!
+        lc = mod._normalize_live_ctx({"ts": [h1, h1 + 20_000], "rate": [2.0, -50.0]})
+        self.assertAlmostEqual(mod._lookup_live_ctx_at(lc, h1 + 10_000), 2.0, places=6)
+        self.assertAlmostEqual(mod._lookup_live_ctx_at(lc, h1 + 20_000), -50.0, places=6)
+
+    def test_p0_boundary_partial_hedge_and_unknown_terminal_state(self) -> None:
+        pair = mod.CarryPairSpec("NVDA", "rwa", "lighter", "trade_xyz", "USDC/USDC", False, "lighter<->trade_xyz NVDA", "ws")
+        t0 = 1_700_000_400_000
+        t_fill_win = t0 + mod.HOUR_MS
+        t_end = t0 + 2 * mod.HOUR_MS
+        win = [{"window_num": 1, "window": "w01", "split": "selection_dev", "t0_ms": t0, "t1_ms": t_end}]
+        # Keep books valid through t_fill_win + 400 (covers passive entry at +200, fill at +300, partial hedge at +630? Wait: cut after +700)
+        # Wait: let both venues go completely silent for > MAX_GAP_MS before t_end!
+        # Better: make t_end = t_fill_win + 4 * HOUR_MS and cut all books at t_fill_win + 700 so MAX_GAP_MS (3h) is exceeded before t_end -> unknown terminal MTM!
+        t_end_long = t_fill_win + 4 * mod.HOUR_MS
+        win_long = [{"window_num": 1, "window": "w01", "split": "selection_dev", "t0_ms": t0, "t1_ms": t_end_long}]
+        ts_bbo, ab, aa, absz, aasz, bb, ba, bbsz, basz = [], [], [], [], [], [], [], [], []
+        t_cur = t0
+        while t_cur <= t_fill_win + 700:
+            rich = 0.25 if t_cur >= t_fill_win else 0.0
+            ts_bbo.append(t_cur)
+            ab.append(100.0 + rich - 0.03)
+            aa.append(100.0 + rich + 0.03)
+            absz.append(20.0)
+            aasz.append(20.0)
+            bb.append(99.99)
+            ba.append(100.01)
+            bbsz.append(3.5)
+            basz.append(3.5)  # ~$350.035 L1 on B -> partial hedge ($350.035) + $649.965 orphan!
+            t_cur += 100
+        # At t_fill_win + 800, inject a crossed/invalid book on both A and B so orphan unwind and split drain fail & MTM at t_end_long is unknown!
+        ts_bbo.append(t_fill_win + 800)
+        ab.append(100.0); aa.append(99.0); absz.append(0.0); aasz.append(0.0)
+        bb.append(100.0); ba.append(99.0); bbsz.append(0.0); basz.append(0.0)
+
+        fa = {t0 + mod.HOUR_MS: 5.0}
+        fb = {t0 + mod.HOUR_MS: 0.0}
+        tr_a = {"ts": [t_fill_win + 300], "sgn": [1], "px": [100.30], "sz": [20.0]}
+        p_pas = mod.CarryArmParams(
+            "pas_unk", "C2_basis_timed_passive_first", min_basis_zscore=0.5, take_profit_basis_bps=200.0, max_hold_h=48.0, passive_first=True
+        )
+        res = mod.simulate_carry_pair_timeline(
+            pair=pair,
+            bbo_a={"ts": ts_bbo, "bid": ab, "ask": aa, "bsz": absz, "asz": aasz},
+            bbo_b={"ts": ts_bbo, "bid": bb, "ask": ba, "bsz": bbsz, "asz": basz},
+            trades_a=tr_a, trades_b=None, funding_a=fa, funding_b=fb,
+            live_ctx_a=None, live_ctx_b=None, windows=win_long,
+            fee_a_mk_bps=0.4, fee_a_tk_bps=2.8, fee_b_mk_bps=0.3, fee_b_tk_bps=0.9,
+            max_age_a_ms=500, max_age_b_ms=500, params=p_pas, step_ms=10_000,
+        )
+        w0 = res["windows"][0]
+        self.assertEqual(w0["trades_entered"], 1)
+        self.assertEqual(w0["trades_closed"], 0)
+        self.assertEqual(w0["orphan_entries"], 1)
+        self.assertEqual(w0["orphan_unwound_count"], 0)
+        self.assertFalse(res["terminal_flat"])
+        self.assertTrue(w0["terminal_residual_mtm_unknown"])
+        self.assertAlmostEqual(w0["position_open_residual_usd"], 350.035, places=2)
+        self.assertAlmostEqual(w0["orphan_open_residual_usd"], 1000.0 - 350.035, places=2)
+        self.assertAlmostEqual(res["terminal_residual_notional_usd"], 1000.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

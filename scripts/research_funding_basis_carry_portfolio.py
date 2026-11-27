@@ -493,11 +493,17 @@ def _lookup_bbo_with_recovery(
     t_ms: int,
     max_age_ms: int,
     max_recovery_ms: int = MAX_RECOVERY_MS,
+    *,
+    retry_latency_ms: int = TAKER_LATENCY_MS,
+    cutoff_ms: int | None = None,
+    trades: dict[str, Sequence[Any]] | None = None,
 ) -> tuple[float, float, float, float, int] | None:
-    """Lookup L1 BBO at `t_ms` or step forward to next valid book within `max_recovery_ms`."""
+    """Lookup L1 BBO at `t_ms`; on miss, schedule delayed retry `recovery_ts + retry_latency_ms` within `cutoff_ms`."""
+    if cutoff_ms is not None and t_ms > cutoff_ms:
+        return None
     hit = _lookup_bbo_at(bbo, t_ms, max_age_ms)
     if hit is not None:
-        return hit
+        return _sync_quote_with_tape(hit, trades, t_ms) if trades is not None else hit
     ts_arr = bbo["ts"]
     idx = _bisect_right(ts_arr, t_ms)
     n = len(ts_arr)
@@ -505,16 +511,161 @@ def _lookup_bbo_with_recovery(
         cand_ms = int(ts_arr[idx])
         if cand_ms - t_ms > max_recovery_ms:
             return None
+        if cutoff_ms is not None and cand_ms > cutoff_ms:
+            return None
         bid = float(bbo["bid"][idx])
         ask = float(bbo["ask"][idx])
         bsz = float(bbo["bsz"][idx])
         asz = float(bbo["asz"][idx])
-        if math.isfinite(bid) and math.isfinite(ask) and bid > 0.0 and ask > bid:
-            bsz_v = bsz if (math.isfinite(bsz) and bsz >= 0.0) else 0.0
-            asz_v = asz if (math.isfinite(asz) and asz >= 0.0) else 0.0
-            return bid, ask, bsz_v, asz_v, cand_ms
+        if (
+            math.isfinite(bid)
+            and math.isfinite(ask)
+            and bid > 0.0
+            and ask > bid
+            and math.isfinite(bsz)
+            and math.isfinite(asz)
+            and bsz >= 0.0
+            and asz >= 0.0
+        ):
+            t_retry = cand_ms + max(0, int(retry_latency_ms))
+            if cutoff_ms is not None and t_retry > cutoff_ms:
+                return None
+            retry_hit = _lookup_bbo_at(bbo, t_retry, max_age_ms)
+            if retry_hit is None:
+                return None
+            if trades is not None:
+                retry_hit = _sync_quote_with_tape(retry_hit, trades, t_retry)
+                if retry_hit is None:
+                    return None
+            r_bid, r_ask, r_bsz, r_asz, _ = retry_hit
+            return r_bid, r_ask, r_bsz, r_asz, t_retry
         idx += 1
     return None
+
+
+def _normalize_settled_funding(
+    funding_input: Any,
+) -> tuple[list[tuple[int, int, float]], dict[int, list[tuple[int, float]]]]:
+    """Normalize settled funding inputs into causal `(available_at_ms, pay_ms, rate_bps)` lists.
+
+    Records with missing (`None`) or non-finite `available_at_ms` / `rate_bps` are strictly ignored.
+    """
+    events: list[tuple[int, int, float]] = []
+    if not funding_input:
+        return [], {}
+    if isinstance(funding_input, dict):
+        for ht_raw, val in funding_input.items():
+            ht = int(ht_raw)
+            if isinstance(val, dict):
+                av_raw = val.get("available_at_ms")
+                rate_raw = val.get("rate_bps")
+            elif isinstance(val, (tuple, list)):
+                if len(val) < 2:
+                    continue
+                rate_raw, av_raw = val[0], val[1]
+            else:
+                rate_raw, av_raw = val, ht
+            if av_raw is None or rate_raw is None:
+                continue
+            try:
+                av = int(av_raw)
+                rate = float(rate_raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(rate):
+                events.append((av, ht, rate))
+    else:
+        for item in funding_input:
+            if not isinstance(item, dict):
+                continue
+            ht_raw = item.get("pay_ms")
+            av_raw = item.get("available_at_ms")
+            rate_raw = item.get("rate_bps")
+            if ht_raw is None or av_raw is None or rate_raw is None:
+                continue
+            try:
+                ht = int(ht_raw)
+                av = int(av_raw)
+                rate = float(rate_raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(rate):
+                events.append((av, ht, rate))
+
+    events.sort(key=lambda x: (x[0], x[1]))
+    by_pay: dict[int, list[tuple[int, float]]] = {}
+    for av, ht, rate in events:
+        by_pay.setdefault(ht, []).append((av, rate))
+    return events, by_pay
+
+
+def _normalize_live_ctx(live_ctx_input: Any) -> tuple[Sequence[int], Sequence[float]] | None:
+    """Normalize live/predicted funding context into time-ordered `(ts_arr, rate_arr)` keyed by `available_at_ms`."""
+    if not live_ctx_input:
+        return None
+    if isinstance(live_ctx_input, dict) and "ts" in live_ctx_input and "rate" in live_ctx_input:
+        ts_arr = live_ctx_input["ts"]
+        rate_arr = live_ctx_input["rate"]
+        if len(ts_arr) == 0 or len(ts_arr) != len(rate_arr):
+            return None
+        return ts_arr, rate_arr
+    if isinstance(live_ctx_input, dict):
+        pairs: list[tuple[int, float]] = []
+        for k, v in live_ctx_input.items():
+            if v is None:
+                continue
+            try:
+                ts_v = int(k)
+                r_v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(r_v):
+                pairs.append((ts_v, r_v))
+        if not pairs:
+            return None
+        pairs.sort(key=lambda x: x[0])
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+    pairs_seq: list[tuple[int, float]] = []
+    for item in live_ctx_input:
+        if isinstance(item, dict):
+            av_raw = item.get("available_at_ms")
+            r_raw = item.get("rate_bps")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            av_raw, r_raw = item[0], item[1]
+        else:
+            continue
+        if av_raw is None or r_raw is None:
+            continue
+        try:
+            ts_v = int(av_raw)
+            r_v = float(r_raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(r_v):
+            pairs_seq.append((ts_v, r_v))
+    if not pairs_seq:
+        return None
+    pairs_seq.sort(key=lambda x: x[0])
+    return [p[0] for p in pairs_seq], [p[1] for p in pairs_seq]
+
+
+def _lookup_live_ctx_at(
+    live_ctx: tuple[Sequence[int], Sequence[float]] | None,
+    t_dec: int,
+    max_age_ms: int = HOUR_MS,
+) -> float | None:
+    """Strictly causal live/predicted funding lookup for `available_at_ms <= t_dec`."""
+    if live_ctx is None:
+        return None
+    ts_arr, rate_arr = live_ctx
+    idx = _bisect_right(ts_arr, t_dec) - 1
+    if idx < 0:
+        return None
+    avail_ms = int(ts_arr[idx])
+    if t_dec - avail_ms > max_age_ms:
+        return None
+    rate = float(rate_arr[idx])
+    return rate if math.isfinite(rate) else None
 
 
 def _find_passive_fill(
@@ -645,10 +796,10 @@ def simulate_carry_pair_timeline(
     bbo_b: dict[str, Sequence[Any]],
     trades_a: dict[str, Sequence[Any]] | None,
     trades_b: dict[str, Sequence[Any]] | None,
-    funding_a: dict[int, float],
-    funding_b: dict[int, float],
-    live_ctx_a: dict[int, float] | None,
-    live_ctx_b: dict[int, float] | None,
+    funding_a: Any,
+    funding_b: Any,
+    live_ctx_a: Any,
+    live_ctx_b: Any,
     windows: Sequence[dict[str, Any]],
     fee_a_mk_bps: float,
     fee_a_tk_bps: float,
@@ -665,12 +816,19 @@ def simulate_carry_pair_timeline(
 ) -> dict[str, Any]:
     """Simulate a single pair causally across W01..W26 windows with real L1 books & funding."""
     fx_eff = fx_drag_bps if pair.cross_stablecoin else 0.0
-    settled_hours = sorted(set(funding_a) & set(funding_b))
-    hours_a = sorted(funding_a)
-    hours_b = sorted(funding_b)
+    avail_ev_a, pay_ev_a = _normalize_settled_funding(funding_a)
+    avail_ev_b, pay_ev_b = _normalize_settled_funding(funding_b)
+    hours_a = sorted(pay_ev_a)
+    hours_b = sorted(pay_ev_b)
+    live_norm_a = _normalize_live_ctx(live_ctx_a)
+    live_norm_b = _normalize_live_ctx(live_ctx_b)
 
-    # Build causal funding state tracker incremented monotonically along checkpoints.
-    f_idx = 0
+    # Build causal funding state tracker filtered strictly by `available_at_ms <= t_dec`.
+    ev_idx_a = 0
+    ev_idx_b = 0
+    seen_a_by_pay: dict[int, float] = {}
+    seen_b_by_pay: dict[int, float] = {}
+    visible_pair_diffs: dict[int, float] = {}
     funding_ema: float | None = None
     last_funding_ms: int | None = None
 
@@ -686,8 +844,8 @@ def simulate_carry_pair_timeline(
     entry_exec_b = 0.0
     entry_mid_basis_bps = 0.0
     entry_passive_is_a: bool | None = None
-    leg_a_pay_idx = 0
-    leg_b_pay_idx = 0
+    leg_a_settled_cash: dict[int, float] = {}
+    leg_b_settled_cash: dict[int, float] = {}
     cur_leg_a_funding_usd = 0.0
     cur_leg_b_funding_usd = 0.0
 
@@ -705,19 +863,56 @@ def simulate_carry_pair_timeline(
     for w in sorted(windows, key=lambda x: int(x["window_num"])):
         windows_by_split[w["split"]].append(w)
 
-    def _advance_funding(up_to_ms: int) -> None:
-        nonlocal f_idx, funding_ema, last_funding_ms
-        while f_idx < len(settled_hours) and settled_hours[f_idx] <= up_to_ms:
-            ht = settled_hours[f_idx]
-            diff = float(funding_a[ht]) - float(funding_b[ht])
-            if funding_ema is not None and last_funding_ms is not None and (ht - last_funding_ms) <= MAX_GAP_MS:
-                dt_h = max(0.0, (ht - last_funding_ms) / HOUR_MS)
+    def _recompute_funding_ema() -> None:
+        nonlocal funding_ema, last_funding_ms
+        f_ema: float | None = None
+        last_ms: int | None = None
+        for ht in sorted(visible_pair_diffs):
+            diff = visible_pair_diffs[ht]
+            if f_ema is not None and last_ms is not None and (ht - last_ms) <= MAX_GAP_MS:
+                dt_h = max(0.0, (ht - last_ms) / HOUR_MS)
                 alpha_f = 1.0 - math.exp(-dt_h / max(params.funding_tau_h, 0.25))
-                funding_ema = funding_ema + alpha_f * (diff - funding_ema)
+                f_ema = f_ema + alpha_f * (diff - f_ema)
             else:
-                funding_ema = diff
-            last_funding_ms = ht
-            f_idx += 1
+                f_ema = diff
+            last_ms = ht
+        funding_ema = f_ema
+        last_funding_ms = last_ms
+
+    def _advance_funding(up_to_ms: int) -> None:
+        nonlocal ev_idx_a, ev_idx_b, funding_ema, last_funding_ms
+        changed_pays: set[int] = set()
+        while ev_idx_a < len(avail_ev_a) and avail_ev_a[ev_idx_a][0] <= up_to_ms:
+            _, ht, rate = avail_ev_a[ev_idx_a]
+            seen_a_by_pay[ht] = rate
+            if ht in seen_b_by_pay:
+                changed_pays.add(ht)
+            ev_idx_a += 1
+        while ev_idx_b < len(avail_ev_b) and avail_ev_b[ev_idx_b][0] <= up_to_ms:
+            _, ht, rate = avail_ev_b[ev_idx_b]
+            seen_b_by_pay[ht] = rate
+            if ht in seen_a_by_pay:
+                changed_pays.add(ht)
+            ev_idx_b += 1
+        if not changed_pays:
+            return
+        need_recompute = False
+        for ht in sorted(changed_pays):
+            diff = seen_a_by_pay[ht] - seen_b_by_pay[ht]
+            was_present = ht in visible_pair_diffs
+            visible_pair_diffs[ht] = diff
+            if was_present or (last_funding_ms is not None and ht <= last_funding_ms):
+                need_recompute = True
+            elif not need_recompute:
+                if funding_ema is not None and last_funding_ms is not None and (ht - last_funding_ms) <= MAX_GAP_MS:
+                    dt_h = max(0.0, (ht - last_funding_ms) / HOUR_MS)
+                    alpha_f = 1.0 - math.exp(-dt_h / max(params.funding_tau_h, 0.25))
+                    funding_ema = funding_ema + alpha_f * (diff - funding_ema)
+                else:
+                    funding_ema = diff
+                last_funding_ms = ht
+        if need_recompute:
+            _recompute_funding_ema()
 
     def _settle_single_leg_funding(
         *,
@@ -727,72 +922,92 @@ def simulate_carry_pair_timeline(
         fallback_notl: float,
         fill_ms: int,
         up_to_ms: int,
-        pay_idx: int,
+        settled_cash_by_pay: dict[int, float],
         win_acc: dict[str, Any],
         settled_set: set[int],
-    ) -> tuple[int, float]:
-        """Settle single-leg funding strictly for `fill_ms < ht <= up_to_ms`."""
+        avail_cap_ms: int | None = None,
+    ) -> float:
+        """Settle single-leg funding strictly for `fill_ms < ht <= up_to_ms` with known `available_at_ms`."""
         hours = hours_a if is_leg_a else hours_b
-        funding_map = funding_a if is_leg_a else funding_b
+        pay_map = pay_ev_a if is_leg_a else pay_ev_b
         bbo = bbo_a if is_leg_a else bbo_b
         max_age = max_age_a_ms if is_leg_a else max_age_b_ms
         acc_cash = 0.0
-        while pay_idx < len(hours) and hours[pay_idx] <= fill_ms:
-            pay_idx += 1
-        while pay_idx < len(hours) and hours[pay_idx] <= up_to_ms:
-            ht = hours[pay_idx]
-            if ht > fill_ms:
-                rate_bps = float(funding_map[ht])
-                q = _lookup_bbo_at(bbo, ht, max(max_age, HOUR_MS))
-                if q is not None:
-                    notl_t = qty_base * (0.5 * (q[0] + q[1]))
+        lo = bisect_right(hours, fill_ms)
+        hi = bisect_right(hours, up_to_ms)
+        for idx in range(lo, hi):
+            ht = hours[idx]
+            if ht <= fill_ms:
+                continue
+            revs = pay_map.get(ht)
+            if not revs:
+                continue
+            chosen_rate: float | None = None
+            for av_ms, r_bps in revs:
+                if avail_cap_ms is None or av_ms <= avail_cap_ms:
+                    chosen_rate = r_bps
                 else:
-                    notl_t = fallback_notl
-                cash_f = receipt_sign * notl_t * rate_bps * 1e-4
-                win_acc["funding_cash_usd"] += cash_f
-                acc_cash += cash_f
-                if is_leg_a:
-                    win_acc["leg_a_funding_cash_usd"] += cash_f
+                    break
+            if chosen_rate is None:
+                continue
+            q = _lookup_bbo_at(bbo, ht, max(max_age, HOUR_MS))
+            if q is not None:
+                notl_t = qty_base * (0.5 * (q[0] + q[1]))
+            else:
+                notl_t = fallback_notl
+            cash_f = receipt_sign * notl_t * chosen_rate * 1e-4
+            is_new = ht not in settled_cash_by_pay
+            delta = cash_f - settled_cash_by_pay.get(ht, 0.0)
+            settled_cash_by_pay[ht] = cash_f
+            win_acc["funding_cash_usd"] += delta
+            acc_cash += delta
+            if is_leg_a:
+                win_acc["leg_a_funding_cash_usd"] += delta
+                if is_new:
                     win_acc["leg_a_funding_payments"] += 1
-                else:
-                    win_acc["leg_b_funding_cash_usd"] += cash_f
+            else:
+                win_acc["leg_b_funding_cash_usd"] += delta
+                if is_new:
                     win_acc["leg_b_funding_payments"] += 1
-                if ht not in settled_set:
-                    settled_set.add(ht)
-                    win_acc["funding_payments"] += 1
-            pay_idx += 1
-        return pay_idx, acc_cash
+            if ht not in settled_set:
+                settled_set.add(ht)
+                win_acc["funding_payments"] += 1
+        return acc_cash
 
     def _settle_open_position_funding(
         up_to_a_ms: int,
         up_to_b_ms: int,
         win_acc: dict[str, Any],
         settled_set: set[int],
+        *,
+        avail_cap_ms: int | None = None,
     ) -> None:
-        nonlocal leg_a_pay_idx, leg_b_pay_idx, cur_leg_a_funding_usd, cur_leg_b_funding_usd
+        nonlocal cur_leg_a_funding_usd, cur_leg_b_funding_usd
         if pos_dir == 0:
             return
-        leg_a_pay_idx, ca = _settle_single_leg_funding(
+        ca = _settle_single_leg_funding(
             is_leg_a=True,
             receipt_sign=pos_dir,
             qty_base=pos_qty_base,
             fallback_notl=pos_notional_usd,
             fill_ms=leg_a_fill_ms,
             up_to_ms=up_to_a_ms,
-            pay_idx=leg_a_pay_idx,
+            settled_cash_by_pay=leg_a_settled_cash,
             win_acc=win_acc,
             settled_set=settled_set,
+            avail_cap_ms=avail_cap_ms,
         )
-        leg_b_pay_idx, cb = _settle_single_leg_funding(
+        cb = _settle_single_leg_funding(
             is_leg_a=False,
             receipt_sign=-pos_dir,
             qty_base=pos_qty_base,
             fallback_notl=pos_notional_usd,
             fill_ms=leg_b_fill_ms,
             up_to_ms=up_to_b_ms,
-            pay_idx=leg_b_pay_idx,
+            settled_cash_by_pay=leg_b_settled_cash,
             win_acc=win_acc,
             settled_set=settled_set,
+            avail_cap_ms=avail_cap_ms,
         )
         cur_leg_a_funding_usd += ca
         cur_leg_b_funding_usd += cb
@@ -812,37 +1027,60 @@ def simulate_carry_pair_timeline(
         trades = trades_a if is_a else trades_b
         max_age = max_age_a_ms if is_a else max_age_b_ms
         tk_bps = fee_a_tk_bps if is_a else fee_b_tk_bps
-        uq = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo, t_attempt, max_age), trades, t_attempt)
+        if split_end_ms is not None and t_attempt > split_end_ms:
+            cf = _settle_single_leg_funding(
+                is_leg_a=is_a,
+                receipt_sign=orp["receipt_sign"],
+                qty_base=orp["qty_base"],
+                fallback_notl=orp["notional_usd"],
+                fill_ms=orp["fill_ms"],
+                up_to_ms=split_end_ms,
+                settled_cash_by_pay=orp["settled_cash"],
+                win_acc=win_acc,
+                settled_set=settled_set,
+                avail_cap_ms=split_end_ms,
+            )
+            orp["funding_usd"] += cf
+            return False
+        uq = _lookup_bbo_with_recovery(
+            bbo,
+            t_attempt,
+            max_age,
+            cutoff_ms=split_end_ms,
+            trades=trades,
+        )
         if uq is None:
             settle_cap = min(t_attempt, split_end_ms) if split_end_ms is not None else t_attempt
-            orp["pay_idx"], cf = _settle_single_leg_funding(
+            cf = _settle_single_leg_funding(
                 is_leg_a=is_a,
                 receipt_sign=orp["receipt_sign"],
                 qty_base=orp["qty_base"],
                 fallback_notl=orp["notional_usd"],
                 fill_ms=orp["fill_ms"],
                 up_to_ms=settle_cap,
-                pay_idx=orp["pay_idx"],
+                settled_cash_by_pay=orp["settled_cash"],
                 win_acc=win_acc,
                 settled_set=settled_set,
+                avail_cap_ms=split_end_ms,
             )
             orp["funding_usd"] += cf
             return False
 
         u_bid, u_ask, u_bsz, u_asz, u_obs_ms = uq
         u_exit_ms = max(t_attempt, u_obs_ms)
-        if is_split_end and split_end_ms is not None:
-            u_exit_ms = min(u_exit_ms, split_end_ms)
-        orp["pay_idx"], cf = _settle_single_leg_funding(
+        if split_end_ms is not None and u_exit_ms > split_end_ms:
+            return False
+        cf = _settle_single_leg_funding(
             is_leg_a=is_a,
             receipt_sign=orp["receipt_sign"],
             qty_base=orp["qty_base"],
             fallback_notl=orp["notional_usd"],
             fill_ms=orp["fill_ms"],
             up_to_ms=u_exit_ms,
-            pay_idx=orp["pay_idx"],
+            settled_cash_by_pay=orp["settled_cash"],
             win_acc=win_acc,
             settled_set=settled_set,
+            avail_cap_ms=split_end_ms,
         )
         orp["funding_usd"] += cf
 
@@ -909,6 +1147,7 @@ def simulate_carry_pair_timeline(
         reason: str,
         win_acc: dict[str, Any],
         settled_set: set[int],
+        split_end_ms: int | None = None,
     ) -> None:
         qty = orphan_notl / rest_px
         entry_fee = orphan_notl * mk_bps * 1e-4
@@ -927,11 +1166,17 @@ def simulate_carry_pair_timeline(
             "entry_mid": p_mid,
             "entry_fee_usd": entry_fee,
             "earliest_unwind_ms": t_hedge + TAKER_LATENCY_MS,
-            "pay_idx": _bisect_right(hours_a if is_a else hours_b, fill_ms),
+            "settled_cash": {},
             "funding_usd": 0.0,
             "reason": reason,
         }
-        if not _try_unwind_orphan(orp, orp["earliest_unwind_ms"], win_acc, settled_set):
+        if not _try_unwind_orphan(
+            orp,
+            orp["earliest_unwind_ms"],
+            win_acc,
+            settled_set,
+            split_end_ms=split_end_ms,
+        ):
             open_orphans.append(orp)
 
     def _close_position(
@@ -948,19 +1193,38 @@ def simulate_carry_pair_timeline(
         if pos_dir == 0:
             return True
         t_exec = t_dec if is_split_end else (t_dec + TAKER_LATENCY_MS)
-        qa = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_a, t_exec, max_age_a_ms), trades_a, t_exec)
-        qb = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_b, t_exec, max_age_b_ms), trades_b, t_exec)
+        if split_end_ms is not None and t_exec > split_end_ms:
+            return False
+        qa = _lookup_bbo_with_recovery(
+            bbo_a,
+            t_exec,
+            max_age_a_ms,
+            cutoff_ms=split_end_ms,
+            trades=trades_a,
+        )
+        qb = _lookup_bbo_with_recovery(
+            bbo_b,
+            t_exec,
+            max_age_b_ms,
+            cutoff_ms=split_end_ms,
+            trades=trades_b,
+        )
         if qa is None or qb is None:
             return False
 
         leg_a_exit_ms = max(t_exec, qa[4])
         leg_b_exit_ms = max(t_exec, qb[4])
-        if is_split_end and split_end_ms is not None:
-            leg_a_exit_ms = min(leg_a_exit_ms, split_end_ms)
-            leg_b_exit_ms = min(leg_b_exit_ms, split_end_ms)
+        if split_end_ms is not None and (leg_a_exit_ms > split_end_ms or leg_b_exit_ms > split_end_ms):
+            return False
 
         # Settle per-leg hourly funding strictly in `(leg_fill_ms, leg_exit_ms]`
-        _settle_open_position_funding(leg_a_exit_ms, leg_b_exit_ms, win_acc, settled_set)
+        _settle_open_position_funding(
+            leg_a_exit_ms,
+            leg_b_exit_ms,
+            win_acc,
+            settled_set,
+            avail_cap_ms=split_end_ms,
+        )
 
         abid, aask, absz, aasz, _ = qa
         bbid, bask, bbsz, basz, _ = qb
@@ -1057,6 +1321,8 @@ def simulate_carry_pair_timeline(
         pos_notional_usd = 0.0
         leg_a_fill_ms = 0
         leg_b_fill_ms = 0
+        leg_a_settled_cash = {}
+        leg_b_settled_cash = {}
         cur_leg_a_funding_usd = 0.0
         cur_leg_b_funding_usd = 0.0
         entry_passive_is_a = None
@@ -1072,11 +1338,14 @@ def simulate_carry_pair_timeline(
         pos_notional_usd = 0.0
         leg_a_fill_ms = 0
         leg_b_fill_ms = 0
+        leg_a_settled_cash = {}
+        leg_b_settled_cash = {}
         cur_leg_a_funding_usd = 0.0
         cur_leg_b_funding_usd = 0.0
         entry_passive_is_a = None
         open_orphans = []
         last_prev_t: int | None = None
+        split_end_cutoff_ms = int(split_wins[-1]["t1_ms"])
 
         for w_idx, w in enumerate(split_wins):
             t_start = int(w["t0_ms"])
@@ -1110,6 +1379,9 @@ def simulate_carry_pair_timeline(
                 "orphan_unwind_pnl_usd": 0.0,
                 "orphan_unwind_cost_usd": 0.0,
                 "orphan_open_residual_usd": 0.0,
+                "position_open_residual_usd": 0.0,
+                "terminal_residual_mtm_usd": 0.0,
+                "terminal_residual_mtm_unknown": False,
                 "exit_reasons": {},
             }
 
@@ -1170,19 +1442,31 @@ def simulate_carry_pair_timeline(
                     rem_orphans = []
                     for orp in open_orphans:
                         t_try = max(t_cur, int(orp["earliest_unwind_ms"]))
-                        if t_try > t_cur or not _try_unwind_orphan(orp, t_try, win_acc, settled_in_win):
+                        if t_try > t_cur or not _try_unwind_orphan(
+                            orp,
+                            t_try,
+                            win_acc,
+                            settled_in_win,
+                            split_end_ms=split_end_cutoff_ms,
+                        ):
                             rem_orphans.append(orp)
                     open_orphans = rem_orphans
                 if pos_dir != 0:
-                    _settle_open_position_funding(t_cur, t_cur, win_acc, settled_in_win)
+                    _settle_open_position_funding(
+                        t_cur,
+                        t_cur,
+                        win_acc,
+                        settled_in_win,
+                        avail_cap_ms=t_cur,
+                    )
                 mid_a = 0.5 * (abid + aask)
                 mid_b = 0.5 * (bbid + bask)
 
-                # Combine live ctx funding hint if settled hourly funding is not yet ready
+                # Separate settled signal EMA from live/predicted funding rate (`available_at_ms <= t_cur`).
                 eff_f_ab = funding_ema
-                if eff_f_ab is None and live_ctx_a is not None and live_ctx_b is not None:
-                    ca_t = live_ctx_a.get((t_cur // HOUR_MS) * HOUR_MS)
-                    cb_t = live_ctx_b.get((t_cur // HOUR_MS) * HOUR_MS)
+                if eff_f_ab is None and live_norm_a is not None and live_norm_b is not None:
+                    ca_t = _lookup_live_ctx_at(live_norm_a, t_cur)
+                    cb_t = _lookup_live_ctx_at(live_norm_b, t_cur)
                     if ca_t is not None and cb_t is not None:
                         eff_f_ab = ca_t - cb_t
 
@@ -1212,7 +1496,13 @@ def simulate_carry_pair_timeline(
                         exit_reason = "max_hold_expired"
 
                     if exit_reason is not None:
-                        _close_position(t_cur, win_acc, settled_in_win, exit_reason)
+                        _close_position(
+                            t_cur,
+                            win_acc,
+                            settled_in_win,
+                            exit_reason,
+                            split_end_ms=split_end_cutoff_ms,
+                        )
 
                 elif (
                     not open_orphans
@@ -1296,14 +1586,12 @@ def simulate_carry_pair_timeline(
                                         p_mk_bps = fee_a_mk_bps if passive_is_a else fee_b_mk_bps
                                         # Hedge opposite leg at fill_ms + 330 ms
                                         t_hedge = fill_ms + TAKER_LATENCY_MS
-                                        hq = _sync_quote_with_tape(
-                                            _lookup_bbo_with_recovery(
-                                                bbo_b if passive_is_a else bbo_a,
-                                                t_hedge,
-                                                max_age_b_ms if passive_is_a else max_age_a_ms,
-                                            ),
-                                            trades_b if passive_is_a else trades_a,
+                                        hq = _lookup_bbo_with_recovery(
+                                            bbo_b if passive_is_a else bbo_a,
                                             t_hedge,
+                                            max_age_b_ms if passive_is_a else max_age_a_ms,
+                                            cutoff_ms=split_end_cutoff_ms,
+                                            trades=trades_b if passive_is_a else trades_a,
                                         )
                                         hedged_notl = 0.0
                                         orphan_reason = "hedge_book_missing"
@@ -1343,6 +1631,7 @@ def simulate_carry_pair_timeline(
                                                 reason=orphan_reason,
                                                 win_acc=win_acc,
                                                 settled_set=settled_in_win,
+                                                split_end_ms=split_end_cutoff_ms,
                                             )
 
                                         if hedged_notl >= MIN_ENTRY_NOTIONAL_USD:
@@ -1361,8 +1650,8 @@ def simulate_carry_pair_timeline(
                                                 entry_exec_a, entry_exec_b = h_px, rest_px
                                                 entry_mid_a, entry_mid_b = h_mid, p_mid
                                             entry_ms = max(leg_a_fill_ms, leg_b_fill_ms)
-                                            leg_a_pay_idx = _bisect_right(hours_a, leg_a_fill_ms)
-                                            leg_b_pay_idx = _bisect_right(hours_b, leg_b_fill_ms)
+                                            leg_a_settled_cash = {}
+                                            leg_b_settled_cash = {}
                                             cur_leg_a_funding_usd = 0.0
                                             cur_leg_b_funding_usd = 0.0
                                             ref_e = 0.5 * (entry_mid_a + entry_mid_b)
@@ -1373,8 +1662,20 @@ def simulate_carry_pair_timeline(
                             else:
                                 # Immediate dual-taker entry at t_cur + 330 ms
                                 t_exec = t_cur + TAKER_LATENCY_MS
-                                ea = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_a, t_exec, max_age_a_ms), trades_a, t_exec)
-                                eb = _sync_quote_with_tape(_lookup_bbo_with_recovery(bbo_b, t_exec, max_age_b_ms), trades_b, t_exec)
+                                ea = _lookup_bbo_with_recovery(
+                                    bbo_a,
+                                    t_exec,
+                                    max_age_a_ms,
+                                    cutoff_ms=split_end_cutoff_ms,
+                                    trades=trades_a,
+                                )
+                                eb = _lookup_bbo_with_recovery(
+                                    bbo_b,
+                                    t_exec,
+                                    max_age_b_ms,
+                                    cutoff_ms=split_end_cutoff_ms,
+                                    trades=trades_b,
+                                )
                                 if ea is not None and eb is not None:
                                     eabid, eaask, eabsz, eaasz, ea_obs_ms = ea
                                     ebbid, ebask, ebbsz, ebasz, eb_obs_ms = eb
@@ -1390,8 +1691,8 @@ def simulate_carry_pair_timeline(
                                         leg_a_fill_ms = max(t_exec, ea_obs_ms)
                                         leg_b_fill_ms = max(t_exec, eb_obs_ms)
                                         entry_ms = max(leg_a_fill_ms, leg_b_fill_ms)
-                                        leg_a_pay_idx = _bisect_right(hours_a, leg_a_fill_ms)
-                                        leg_b_pay_idx = _bisect_right(hours_b, leg_b_fill_ms)
+                                        leg_a_settled_cash = {}
+                                        leg_b_settled_cash = {}
                                         cur_leg_a_funding_usd = 0.0
                                         cur_leg_b_funding_usd = 0.0
                                         entry_passive_is_a = None
@@ -1406,12 +1707,24 @@ def simulate_carry_pair_timeline(
                                         win_acc["trades_entered"] += 1
 
             if pos_dir != 0:
-                _settle_open_position_funding(t_end, t_end, win_acc, settled_in_win)
+                _settle_open_position_funding(
+                    t_end,
+                    t_end,
+                    win_acc,
+                    settled_in_win,
+                    avail_cap_ms=split_end_cutoff_ms,
+                )
             if open_orphans:
                 rem_orphans = []
                 for orp in open_orphans:
                     t_try = max(t_end, int(orp["earliest_unwind_ms"]))
-                    if t_try > t_end or not _try_unwind_orphan(orp, t_try, win_acc, settled_in_win, split_end_ms=t_end):
+                    if t_try > t_end or not _try_unwind_orphan(
+                        orp,
+                        t_try,
+                        win_acc,
+                        settled_in_win,
+                        split_end_ms=split_end_cutoff_ms,
+                    ):
                         rem_orphans.append(orp)
                 open_orphans = rem_orphans
 
@@ -1430,17 +1743,30 @@ def simulate_carry_pair_timeline(
                     if not closed:
                         terminal_flat_all = False
                         terminal_residual_notional_usd += pos_notional_usd
+                        win_acc["position_open_residual_usd"] += pos_notional_usd
+                        qa_mtm = _lookup_bbo_at(bbo_a, t_end, MAX_GAP_MS)
+                        qb_mtm = _lookup_bbo_at(bbo_b, t_end, MAX_GAP_MS)
+                        if qa_mtm is not None and qb_mtm is not None:
+                            mid_a_end = 0.5 * (qa_mtm[0] + qa_mtm[1])
+                            mid_b_end = 0.5 * (qb_mtm[0] + qb_mtm[1])
+                            res_mtm = pos_dir * pos_qty_base * ((entry_mid_a - mid_a_end) + (mid_b_end - entry_mid_b))
+                            win_acc["terminal_residual_mtm_usd"] += round(res_mtm, 6)
+                        else:
+                            win_acc["terminal_residual_mtm_unknown"] = True
                         pos_dir = 0
                         pos_qty_base = 0.0
                         pos_notional_usd = 0.0
                         leg_a_fill_ms = 0
                         leg_b_fill_ms = 0
+                        leg_a_settled_cash = {}
+                        leg_b_settled_cash = {}
                 if open_orphans:
                     rem_orphans = []
                     for orp in open_orphans:
-                        if not _try_unwind_orphan(
+                        t_try_end = max(t_end, int(orp["earliest_unwind_ms"]))
+                        if t_try_end > t_end or not _try_unwind_orphan(
                             orp,
-                            t_end,
+                            t_try_end,
                             win_acc,
                             settled_in_win,
                             is_split_end=True,
@@ -1453,6 +1779,15 @@ def simulate_carry_pair_timeline(
                             res_notl = float(orp["notional_usd"])
                             terminal_residual_notional_usd += res_notl
                             win_acc["orphan_open_residual_usd"] += res_notl
+                            bbo_orp = bbo_a if orp["is_a"] else bbo_b
+                            q_orp_mtm = _lookup_bbo_at(bbo_orp, t_end, MAX_GAP_MS)
+                            if q_orp_mtm is not None:
+                                mid_orp_end = 0.5 * (q_orp_mtm[0] + q_orp_mtm[1])
+                                sgn_orp = -1 if orp["is_short"] else 1
+                                res_orp_mtm = sgn_orp * float(orp["qty_base"]) * (mid_orp_end - float(orp["entry_mid"])) - float(orp["entry_fee_usd"])
+                                win_acc["terminal_residual_mtm_usd"] += round(res_orp_mtm, 6)
+                            else:
+                                win_acc["terminal_residual_mtm_unknown"] = True
                     open_orphans = []
 
             win_acc["net_pnl_usd"] = (
@@ -1890,74 +2225,116 @@ def _load_symbol_funding(
     venue: str,
     symbol: str,
     raw_market: str,
-) -> tuple[dict[int, float], dict[int, float]]:
-    """Return `(settled_hourly_rates, live_ctx_hourly_rates)` keyed by UTC hour ms."""
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Return `(settled_events_with_avail, live_ctx_series_by_avail)` without global future leakage."""
+    import numpy as np
+
     if not files:
-        return {}, {}
+        return [], None
     src = _sql_list(files)
     candidates = list(dict.fromkeys([symbol, raw_market]))
     ph = ", ".join("?" for _ in candidates)
 
-    settled: dict[int, float] = {}
-    live_ctx: dict[int, float] = {}
+    settled: list[dict[str, Any]] = []
+    live_ctx: dict[str, Any] | None = None
 
     if venue.startswith("lighter"):
         rows = con.execute(
             f"""
             SELECT ((funding_slot_ms // {HOUR_MS}) * {HOUR_MS}) + {HOUR_MS} AS pay_ms,
+                   GREATEST(
+                       MAX(available_at_ms),
+                       ((funding_slot_ms // {HOUR_MS}) * {HOUR_MS}) + {HOUR_MS}
+                   ) AS avail_ms,
                    avg(funding_rate_bps_f64) AS rate_bps
             FROM read_parquet({src})
             WHERE market IN ({ph}) AND ctx_kind = 'market_stats'
-              AND funding_slot_ms IS NOT NULL AND funding_rate_bps_f64 IS NOT NULL
+              AND funding_slot_ms IS NOT NULL
+              AND available_at_ms IS NOT NULL
+              AND funding_rate_bps_f64 IS NOT NULL
               AND available_at_ms >= funding_slot_ms AND available_at_ms < funding_slot_ms + {HOUR_MS}
             GROUP BY 1
+            ORDER BY 2 ASC, 1 ASC
             """,
             candidates,
         ).fetchall()
-        for pay_ms, rate_bps in rows:
-            if pay_ms is not None and rate_bps is not None and math.isfinite(float(rate_bps)):
-                settled[int(pay_ms)] = float(rate_bps)
-        lrows = con.execute(
+        for pay_ms, avail_ms, rate_bps in rows:
+            if (
+                pay_ms is not None
+                and avail_ms is not None
+                and rate_bps is not None
+                and math.isfinite(float(rate_bps))
+            ):
+                settled.append(
+                    {
+                        "pay_ms": int(pay_ms),
+                        "available_at_ms": int(avail_ms),
+                        "rate_bps": float(rate_bps),
+                    }
+                )
+        lcols = con.execute(
             f"""
-            SELECT (available_at_ms // {HOUR_MS}) * {HOUR_MS} AS hr_ms,
-                   arg_max(funding_rate_bps_f64, available_at_ms) AS rate_bps
+            SELECT available_at_ms AS ts,
+                   funding_rate_bps_f64 AS rate_bps
             FROM read_parquet({src})
-            WHERE market IN ({ph}) AND ctx_kind = 'market_stats' AND funding_rate_bps_f64 IS NOT NULL
-            GROUP BY 1
+            WHERE market IN ({ph}) AND ctx_kind = 'market_stats'
+              AND available_at_ms IS NOT NULL
+              AND funding_rate_bps_f64 IS NOT NULL
+            ORDER BY available_at_ms ASC
             """,
             candidates,
-        ).fetchall()
-        for hr_ms, rate_bps in lrows:
-            if hr_ms is not None and rate_bps is not None and math.isfinite(float(rate_bps)):
-                live_ctx[int(hr_ms)] = float(rate_bps)
+        ).fetchnumpy()
+        if len(lcols["ts"]) > 0:
+            live_ctx = {
+                "ts": np.asarray(lcols["ts"], dtype=np.int64),
+                "rate": np.asarray(lcols["rate_bps"], dtype=np.float64),
+            }
     else:
         rows = con.execute(
             f"""
             SELECT (funding_slot_ms // {HOUR_MS}) * {HOUR_MS} AS pay_ms,
-                   arg_max(funding_rate_bps_f64, available_at_ms) AS rate_bps
+                   available_at_ms AS avail_ms,
+                   funding_rate_bps_f64 AS rate_bps
             FROM read_parquet({src})
             WHERE market IN ({ph}) AND ctx_kind = 'hourly_funding_history'
-              AND funding_slot_ms IS NOT NULL AND funding_rate_bps_f64 IS NOT NULL
-            GROUP BY 1
+              AND funding_slot_ms IS NOT NULL
+              AND available_at_ms IS NOT NULL
+              AND funding_rate_bps_f64 IS NOT NULL
+            ORDER BY available_at_ms ASC, 1 ASC
             """,
             candidates,
         ).fetchall()
-        for pay_ms, rate_bps in rows:
-            if pay_ms is not None and rate_bps is not None and math.isfinite(float(rate_bps)):
-                settled[int(pay_ms)] = float(rate_bps)
-        lrows = con.execute(
+        for pay_ms, avail_ms, rate_bps in rows:
+            if (
+                pay_ms is not None
+                and avail_ms is not None
+                and rate_bps is not None
+                and math.isfinite(float(rate_bps))
+            ):
+                settled.append(
+                    {
+                        "pay_ms": int(pay_ms),
+                        "available_at_ms": int(avail_ms),
+                        "rate_bps": float(rate_bps),
+                    }
+                )
+        lcols = con.execute(
             f"""
-            SELECT (available_at_ms // {HOUR_MS}) * {HOUR_MS} AS hr_ms,
-                   arg_max(funding_rate_bps_f64, available_at_ms) AS rate_bps
+            SELECT available_at_ms AS ts,
+                   funding_rate_bps_f64 AS rate_bps
             FROM read_parquet({src})
-            WHERE market IN ({ph}) AND ctx_kind = 'active_asset_ctx' AND funding_rate_bps_f64 IS NOT NULL
-            GROUP BY 1
+            WHERE market IN ({ph}) AND ctx_kind = 'active_asset_ctx'
+              AND available_at_ms IS NOT NULL
+              AND funding_rate_bps_f64 IS NOT NULL
+            ORDER BY available_at_ms ASC
             """,
             candidates,
-        ).fetchall()
-        for hr_ms, rate_bps in lrows:
-            if hr_ms is not None and rate_bps is not None and math.isfinite(float(rate_bps)):
-                live_ctx[int(hr_ms)] = float(rate_bps)
+        ).fetchnumpy()
+        if len(lcols["ts"]) > 0:
+            live_ctx = {
+                "ts": np.asarray(lcols["ts"], dtype=np.int64),
+                "rate": np.asarray(lcols["rate_bps"], dtype=np.float64),
+            }
     return settled, live_ctx
 
 
@@ -2027,7 +2404,7 @@ def run_lakehouse_evaluation(
 
         bbo_cache: dict[str, dict[str, Any] | None] = {}
         tr_cache: dict[str, dict[str, Any] | None] = {}
-        fund_cache: dict[str, tuple[dict[int, float], dict[int, float]]] = {}
+        fund_cache: dict[str, tuple[list[dict[str, Any]], dict[str, Any] | None]] = {}
 
         for v in venues_needed:
             mkt = VENUE_SYMBOL_MAP[v][sym]
@@ -2041,9 +2418,9 @@ def run_lakehouse_evaluation(
         for p in sym_pairs:
             ba = bbo_cache.get(p.venue_a)
             bb = bbo_cache.get(p.venue_b)
-            fa_s, fa_l = fund_cache.get(p.venue_a, ({}, {}))
-            fb_s, fb_l = fund_cache.get(p.venue_b, ({}, {}))
-            overlap_hours = len(set(fa_s) & set(fb_s))
+            fa_s, fa_l = fund_cache.get(p.venue_a, ([], None))
+            fb_s, fb_l = fund_cache.get(p.venue_b, ([], None))
+            overlap_hours = len({int(r["pay_ms"]) for r in fa_s} & {int(r["pay_ms"]) for r in fb_s})
             coverage_summary.append(
                 {
                     "pair": p.label,
